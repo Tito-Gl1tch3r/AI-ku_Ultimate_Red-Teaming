@@ -1,0 +1,716 @@
+use anyhow::Result;
+use reqwest::header::{HeaderName, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use reqwest::{Client, Response};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
+
+use super::shared::send;
+use super::Tester;
+use crate::filters::status_matches_pattern;
+use crate::network::NetConfig;
+use crate::output::UrlData;
+
+/// HTTP status checker for URLs
+#[derive(Clone)]
+pub struct StatusChecker {
+    net: NetConfig,
+    include_status: Option<Vec<String>>,
+    exclude_status: Option<Vec<String>>,
+    /// Record the response facts that come free with the request the checker is
+    /// already making: `Location`, `Content-Length`, `Content-Type`.
+    response_meta: bool,
+    /// Also record the HTML `<title>`. Kept apart from `response_meta` because
+    /// it is the one field that is *not* free — it needs the response body.
+    response_title: bool,
+    /// One HTTP client, built lazily on first use and reused for every tested
+    /// URL. `reqwest::Client` pools connections internally, so building it once
+    /// (rather than per URL) lets TLS handshakes and keep-alive connections be
+    /// reused across the tens of thousands of URLs a `--check-status` run can
+    /// touch. Shared across `clone_box` clones via `Arc<OnceCell>` so all
+    /// concurrent workers share a single connection pool. The cell is populated
+    /// only after `with_network` has applied the settings, so it
+    /// always reflects the final configuration.
+    client: Arc<OnceCell<Client>>,
+}
+
+impl StatusChecker {
+    /// Creates a new StatusChecker with default settings
+    pub fn new() -> Self {
+        StatusChecker {
+            net: NetConfig::default(),
+            include_status: None,
+            exclude_status: None,
+            response_meta: false,
+            response_title: false,
+            client: Arc::new(OnceCell::new()),
+        }
+    }
+
+    /// Sets the status codes to include in the results
+    pub fn with_include_status(&mut self, status_codes: Option<Vec<String>>) {
+        self.include_status = status_codes;
+    }
+
+    /// Sets the status codes to exclude from the results
+    pub fn with_exclude_status(&mut self, status_codes: Option<Vec<String>>) {
+        self.exclude_status = status_codes;
+    }
+
+    /// Record `Location`, `Content-Length` and `Content-Type` alongside the
+    /// status code. These arrive with the response head the checker already
+    /// waits for, so collecting them costs nothing extra.
+    pub fn with_response_meta(&mut self, enabled: bool) {
+        self.response_meta = enabled;
+    }
+
+    /// Also record the HTML `<title>`. This one reads the start of the response
+    /// body, so it is a separate, explicit opt-in.
+    pub fn with_response_title(&mut self, enabled: bool) {
+        self.response_title = enabled;
+    }
+
+    /// Return the shared HTTP client, building it on the first call and reusing
+    /// it thereafter. If a build fails the cell stays empty, so a later call
+    /// retries rather than caching the error.
+    ///
+    /// The client does *not* follow redirects: the status urx reports has to
+    /// belong to the URL it prints, and `--include-status 30x` can only match a
+    /// 3xx that is actually surfaced.
+    async fn client(&self) -> Result<&Client> {
+        self.client
+            .get_or_try_init(|| async { self.net.http.build_client_no_redirect() })
+            .await
+    }
+
+    /// Checks if a status code matches any pattern in the given patterns vector
+    fn matches_any_pattern(&self, status_code: u16, patterns: &[String]) -> bool {
+        if patterns.is_empty() {
+            return false;
+        }
+
+        let status_code = status_code.to_string();
+        patterns.iter().any(|pattern| {
+            // Split the pattern by commas and check if any subpattern matches
+            pattern
+                .split(',')
+                .any(|subpattern| status_matches_pattern(&status_code, subpattern.trim()))
+        })
+    }
+
+    /// Checks if a status code should be included in the results
+    /// Returns true if:
+    /// - include_status is set and the status code matches any of the patterns
+    /// - exclude_status is set and the status code doesn't match any of the patterns
+    /// - neither filter is set
+    ///   Prioritizes include_status over exclude_status if both are set
+    ///   Supports comma-separated patterns like "200,30x,40x"
+    fn should_include_status(&self, status_code: u16) -> bool {
+        // If include_status is set, only include status codes that match
+        if let Some(include_patterns) = &self.include_status {
+            return self.matches_any_pattern(status_code, include_patterns);
+        }
+
+        // If exclude_status is set, exclude status codes that match
+        if let Some(exclude_patterns) = &self.exclude_status {
+            return !self.matches_any_pattern(status_code, exclude_patterns);
+        }
+
+        // If neither filter is set, include all status codes
+        true
+    }
+}
+
+impl Tester for StatusChecker {
+    fn clone_box(&self) -> Box<dyn Tester> {
+        Box::new(self.clone())
+    }
+
+    /// Tests a URL by sending an HTTP request and returning the status code
+    /// If status filtering is enabled, only returns URLs that match the filter criteria
+    fn test_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UrlData>>> + Send + 'a>> {
+        Box::pin(async move {
+            let client = self.client().await?;
+
+            // Unpaced: --rate-limit only ever reached the body-mining testers.
+            let response = send(self.net.retries, None, || client.get(url))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to check status for {}: {:?}", url, e))?;
+            let status = response.status();
+            let status_code = status.as_u16();
+
+            // Check if this status code should be included in results
+            if !self.should_include_status(status_code) {
+                return Ok(vec![]); // Return empty vec if filtered out
+            }
+
+            let status_text = format!(
+                "{} {}",
+                status_code,
+                status.canonical_reason().unwrap_or("")
+            );
+
+            let mut data = UrlData::with_status(url.to_string(), status_text);
+            let content_type = header(&response, CONTENT_TYPE);
+            if self.response_meta {
+                // The redirect target is recorded, never followed —
+                // see `client()`.
+                data.location = header(&response, LOCATION);
+                data.content_length = header(&response, CONTENT_LENGTH);
+                data.content_type = content_type.clone();
+            }
+            if self.response_title {
+                data.title = read_title(response, content_type.as_deref()).await;
+            }
+            Ok(vec![data])
+        })
+    }
+
+    fn with_network(&mut self, net: NetConfig) {
+        self.net = net;
+    }
+}
+
+/// Most bytes of a response body read while looking for a `<title>`.
+///
+/// A title lives in the document head, and a status check must not pull a
+/// hundred-megabyte download across the network to find one.
+const TITLE_SCAN_LIMIT: usize = 64 * 1024;
+
+/// Longest title kept, in characters. A page is free to serve a kilobyte of
+/// `<title>`; an output line is not.
+const TITLE_MAX_CHARS: usize = 200;
+
+/// One response header as a trimmed string, or `None` when it is absent, empty,
+/// or not valid text.
+fn header(response: &Response, name: HeaderName) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Read the start of the body and pull out its HTML `<title>`.
+///
+/// Bounded twice: at most [`TITLE_SCAN_LIMIT`] bytes are read, and the read
+/// stops as soon as the closing tag has arrived. A body the server declared as
+/// something other than HTML is not read at all — which also means a redirect,
+/// an image or a JSON API costs no extra bytes here.
+async fn read_title(mut response: Response, content_type: Option<&str>) -> Option<String> {
+    if content_type.is_some_and(|ct| !ct.to_ascii_lowercase().contains("html")) {
+        return None;
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while body.len() < TITLE_SCAN_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            // End of body, or a read error partway through: parse what arrived
+            // rather than throwing away a title we may already hold.
+            _ => break,
+        }
+        if find_html_tag(&body, b"</title").is_some() {
+            break;
+        }
+    }
+
+    extract_html_title(&body)
+}
+
+/// First position of `needle` in `haystack`, ignoring ASCII case. HTML tag names
+/// are ASCII, so this needs no decoding pass over the bytes.
+fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Find a tag prefix only when the tag name ends here. Without the boundary,
+/// `<title-widget>` and `</title-widget>` were mistaken for title tags because
+/// their bytes start with the same prefix.
+fn find_html_tag(haystack: &[u8], tag: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while offset <= haystack.len().saturating_sub(tag.len()) {
+        let found = offset + find_ascii_ci(&haystack[offset..], tag)?;
+        if haystack
+            .get(found + tag.len())
+            .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>')
+        {
+            return Some(found);
+        }
+        offset = found + 1;
+    }
+    None
+}
+
+/// The text of the first `<title>` element, whitespace collapsed, entities
+/// decoded, cut to [`TITLE_MAX_CHARS`]. `None` when there is no complete title
+/// element or it holds nothing but whitespace.
+fn extract_html_title(body: &[u8]) -> Option<String> {
+    let open = find_html_tag(body, b"<title")?;
+    // `<title>` may carry attributes, so the text starts after the tag's own
+    // closing angle bracket, not at a fixed offset.
+    let text_start = open + body[open..].iter().position(|b| *b == b'>')? + 1;
+    let text_end = text_start + find_html_tag(&body[text_start..], b"</title")?;
+
+    let raw = String::from_utf8_lossy(&body[text_start..text_end]);
+    let collapsed = decode_entities(&raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    let mut title: String = collapsed.chars().take(TITLE_MAX_CHARS).collect();
+    if collapsed.chars().count() > TITLE_MAX_CHARS {
+        title.push('…');
+    }
+    Some(title)
+}
+
+/// Decode the handful of HTML entities that actually turn up in titles.
+///
+/// `&amp;` is decoded last so `&amp;lt;` comes out as the literal `&lt;` the
+/// page meant, rather than being decoded twice into `<`.
+fn decode_entities(text: &str) -> String {
+    text.replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_matches_pattern() {
+        // Exact match test
+        assert!(status_matches_pattern("200", "200"));
+        assert!(!status_matches_pattern("200", "404"));
+
+        // Wildcard match test
+        assert!(status_matches_pattern("200", "2xx"));
+        assert!(status_matches_pattern("200", "20x"));
+        assert!(status_matches_pattern("201", "20x"));
+        assert!(status_matches_pattern("404", "4xx"));
+        assert!(!status_matches_pattern("200", "3xx"));
+        assert!(!status_matches_pattern("200", "4xx"));
+
+        // Case insensitivity test
+        assert!(status_matches_pattern("200", "2XX"));
+        assert!(status_matches_pattern("404", "4XX"));
+    }
+
+    #[test]
+    fn test_status_matches_pattern_edge_cases() {
+        // Wrong length with wildcard
+        assert!(!status_matches_pattern("200", "2x"));
+        assert!(!status_matches_pattern("200", "2xxx"));
+        assert!(!status_matches_pattern("200", "x"));
+
+        // Non-numeric characters in exact match
+        assert!(!status_matches_pattern("200", "20a"));
+        assert!(!status_matches_pattern("200", "abc"));
+        assert!(!status_matches_pattern("200", ""));
+
+        // Non-numeric characters in wildcard patterns
+        assert!(!status_matches_pattern("200", "2ax"));
+        assert!(!status_matches_pattern("200", "abx"));
+
+        // Special chars
+        assert!(!status_matches_pattern("200", "20!"));
+        assert!(!status_matches_pattern("200", "2!x"));
+    }
+
+    #[test]
+    fn test_matches_any_pattern() {
+        let checker = StatusChecker::new();
+
+        // Single pattern test
+        assert!(checker.matches_any_pattern(200, &["200".to_string()]));
+        assert!(!checker.matches_any_pattern(404, &["200".to_string()]));
+
+        // Multiple pattern test
+        assert!(checker.matches_any_pattern(200, &["200".to_string(), "404".to_string()]));
+        assert!(checker.matches_any_pattern(404, &["200".to_string(), "404".to_string()]));
+        assert!(!checker.matches_any_pattern(301, &["200".to_string(), "404".to_string()]));
+
+        // Wildcard pattern test
+        assert!(checker.matches_any_pattern(200, &["2xx".to_string()]));
+        assert!(checker.matches_any_pattern(404, &["2xx".to_string(), "4xx".to_string()]));
+
+        // Comma-separated pattern test
+        assert!(checker.matches_any_pattern(200, &["200,404".to_string()]));
+        assert!(checker.matches_any_pattern(404, &["200,404".to_string()]));
+        assert!(checker.matches_any_pattern(200, &["2xx,404".to_string()]));
+        assert!(!checker.matches_any_pattern(301, &["200,404".to_string()]));
+    }
+
+    #[test]
+    fn test_should_include_status() {
+        let mut checker = StatusChecker::new();
+
+        // Include all status codes when no filters are set
+        assert!(checker.should_include_status(200));
+        assert!(checker.should_include_status(404));
+        assert!(checker.should_include_status(500));
+
+        // include_status filter test
+        checker.with_include_status(Some(vec!["200".to_string(), "3xx".to_string()]));
+        assert!(checker.should_include_status(200));
+        assert!(checker.should_include_status(301));
+        assert!(!checker.should_include_status(404));
+        assert!(!checker.should_include_status(500));
+
+        // exclude_status filter test
+        checker.with_include_status(None);
+        checker.with_exclude_status(Some(vec!["4xx".to_string(), "500".to_string()]));
+        assert!(checker.should_include_status(200));
+        assert!(checker.should_include_status(301));
+        assert!(!checker.should_include_status(404));
+        assert!(!checker.should_include_status(500));
+
+        // include_status has higher priority than exclude_status
+        checker.with_include_status(Some(vec!["200".to_string()]));
+        checker.with_exclude_status(Some(vec!["2xx".to_string()]));
+        assert!(checker.should_include_status(200));
+        assert!(!checker.should_include_status(201));
+    }
+
+    #[tokio::test]
+    async fn test_redirects_are_reported_not_followed() {
+        // Regression: the client followed redirects, so `/redir` was reported
+        // as "200 OK" — the status of a *different* URL than the one printed.
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/redir")
+            .with_status(301)
+            .with_header("location", "/final")
+            .expect(1)
+            .create_async()
+            .await;
+        // Never requested: following the redirect is exactly what must not
+        // happen.
+        let final_page = server
+            .mock("GET", "/final")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let checker = StatusChecker::new();
+        let out = checker
+            .test_url(&format!("{}/redir", server.url()))
+            .await
+            .unwrap();
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].status.as_deref(), Some("301 Moved Permanently"));
+        redirect.assert();
+        final_page.assert();
+    }
+
+    #[tokio::test]
+    async fn test_include_status_30x_matches_a_redirect() {
+        // The documented `--include-status 200,30x` could never match anything:
+        // a followed redirect resolves to its target's status, so no 3xx ever
+        // reached the filter.
+        let mut server = mockito::Server::new_async().await;
+        let _r = server
+            .mock("GET", "/redir")
+            .with_status(302)
+            .with_header("location", "/final")
+            .create_async()
+            .await;
+        let _f = server
+            .mock("GET", "/final")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let mut checker = StatusChecker::new();
+        checker.with_include_status(Some(vec!["30x".to_string()]));
+        let out = checker
+            .test_url(&format!("{}/redir", server.url()))
+            .await
+            .unwrap();
+
+        assert_eq!(out.len(), 1, "--is 30x should keep a redirect: {out:?}");
+        assert_eq!(out[0].status.as_deref(), Some("302 Found"));
+    }
+
+    #[tokio::test]
+    async fn test_no_retries_means_no_backoff_wait() {
+        // Regression: the 500ms back-off was slept after the *final* attempt
+        // too, so even `--retries 0` ("no retries") cost half a second for
+        // every unreachable URL.
+        let mut checker = StatusChecker::new();
+        checker.with_network(NetConfig {
+            retries: 0,
+            ..Default::default()
+        });
+
+        let start = std::time::Instant::now();
+        // Port 0 is never listening, so this fails immediately.
+        let result = checker.test_url("http://127.0.0.1:0/nope").await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "a single failed attempt must not sleep, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_is_built_once_and_reused() {
+        let checker = StatusChecker::new();
+        // Lazy: nothing is built until the first request needs it.
+        assert!(checker.client.get().is_none());
+
+        let first = checker.client().await.unwrap() as *const reqwest::Client;
+        let second = checker.client().await.unwrap() as *const reqwest::Client;
+
+        // Both calls hand back the exact same cached client instead of building
+        // a fresh one per URL — that shared client is what enables connection
+        // pooling across the many URLs a --check-status run touches.
+        assert_eq!(first, second);
+        assert!(checker.client.get().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_clones_share_one_client() {
+        // The tester manager calls clone_box() once per concurrent worker chunk;
+        // clone_box is `Box::new(self.clone())`, so the derived clone here
+        // exercises the same path. All clones share the Arc<OnceCell>, so a
+        // client built by one is visible to every other — that shared client is
+        // what gives the whole run a single connection pool.
+        let checker = StatusChecker::new();
+        let original = checker.client().await.unwrap() as *const reqwest::Client;
+
+        let cloned = checker.clone();
+        // The clone sees the already-built client without building its own.
+        assert!(cloned.client.get().is_some());
+        let cloned_client = cloned.client().await.unwrap() as *const reqwest::Client;
+        assert_eq!(original, cloned_client);
+    }
+
+    #[tokio::test]
+    async fn test_reused_client_checks_multiple_urls() {
+        let mut server = mockito::Server::new_async().await;
+        let ok = server
+            .mock("GET", "/ok")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let missing = server
+            .mock("GET", "/missing")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let checker = StatusChecker::new();
+        let ok_result = checker
+            .test_url(&format!("{}/ok", server.url()))
+            .await
+            .unwrap();
+        let missing_result = checker
+            .test_url(&format!("{}/missing", server.url()))
+            .await
+            .unwrap();
+
+        assert_eq!(ok_result[0].status.as_deref(), Some("200 OK"));
+        assert_eq!(missing_result[0].status.as_deref(), Some("404 Not Found"));
+        // A single client was built and shared across both requests.
+        assert!(checker.client.get().is_some());
+        ok.assert();
+        missing.assert();
+    }
+
+    /// Run one URL through a checker and return the record it produced.
+    async fn check(checker: &StatusChecker, url: &str) -> UrlData {
+        let mut out = checker.test_url(url).await.unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        out.remove(0)
+    }
+
+    #[tokio::test]
+    async fn test_response_metadata_is_off_by_default() {
+        // Without --show-meta / a structured format the record carries the
+        // status alone, so an existing `--check-status` run is unchanged.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/x")
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_header("content-length", "12")
+            .create_async()
+            .await;
+
+        let data = check(&StatusChecker::new(), &format!("{}/x", server.url())).await;
+        assert_eq!(data.url, format!("{}/x", server.url()));
+        assert_eq!(data.status.as_deref(), Some("200 OK"));
+        assert!(!data.has_response_meta(), "{data:?}");
+    }
+
+    #[tokio::test]
+    async fn test_response_metadata_records_the_free_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/x")
+            .with_status(200)
+            .with_header("content-type", "application/json; charset=utf-8")
+            .with_header("content-length", "17")
+            .with_body("{\"hello\":\"world\"}")
+            .create_async()
+            .await;
+
+        let mut checker = StatusChecker::new();
+        checker.with_response_meta(true);
+        let data = check(&checker, &format!("{}/x", server.url())).await;
+
+        assert_eq!(data.url, format!("{}/x", server.url()));
+        assert_eq!(data.status.as_deref(), Some("200 OK"));
+        assert_eq!(
+            data.content_type.as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(data.content_length.as_deref(), Some("17"));
+        // No redirect, so no Location — absent fields stay absent.
+        assert_eq!(data.location, None);
+        assert_eq!(data.title, None);
+    }
+
+    #[tokio::test]
+    async fn test_redirect_location_is_recorded_but_still_not_followed() {
+        // The regression guarded by `test_redirects_are_reported_not_followed`
+        // must survive: the target is written down, never requested.
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/redir")
+            .with_status(301)
+            .with_header("location", "/final")
+            .expect(1)
+            .create_async()
+            .await;
+        let final_page = server
+            .mock("GET", "/final")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut checker = StatusChecker::new();
+        checker.with_response_meta(true);
+        let data = check(&checker, &format!("{}/redir", server.url())).await;
+
+        assert_eq!(data.status.as_deref(), Some("301 Moved Permanently"));
+        assert_eq!(data.location.as_deref(), Some("/final"));
+        redirect.assert();
+        final_page.assert();
+    }
+
+    #[tokio::test]
+    async fn test_title_is_read_only_when_asked_for() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/page")
+            .with_status(200)
+            .with_header("content-type", "text/html; charset=utf-8")
+            .with_body("<html><head><title>  Example &amp; Co\n  Home </title></head></html>")
+            .expect(2)
+            .create_async()
+            .await;
+        let url = format!("{}/page", server.url());
+
+        // Headers only: no title, even though the body carries one.
+        let mut headers_only = StatusChecker::new();
+        headers_only.with_response_meta(true);
+        assert_eq!(check(&headers_only, &url).await.title, None);
+
+        // Whitespace collapsed and entities decoded.
+        let mut with_title = StatusChecker::new();
+        with_title.with_response_title(true);
+        assert_eq!(
+            check(&with_title, &url).await.title.as_deref(),
+            Some("Example & Co Home")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_title_is_not_read_for_non_html_responses() {
+        // A declared non-HTML body is never pulled across the network.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/data.json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("<title>not really html</title>")
+            .create_async()
+            .await;
+
+        let mut checker = StatusChecker::new();
+        checker.with_response_title(true);
+        let data = check(&checker, &format!("{}/data.json", server.url())).await;
+        assert_eq!(data.title, None);
+        // The status line still made it through the record channel.
+        assert_eq!(data.status.as_deref(), Some("200 OK"));
+    }
+
+    #[test]
+    fn test_extract_html_title_handles_the_shapes_that_turn_up() {
+        // Attributes on the tag, mixed case, and a multi-line body.
+        assert_eq!(
+            extract_html_title(b"<HTML><TITLE lang=\"en\">Hi\n there</TITLE>"),
+            Some("Hi there".to_string())
+        );
+        // No title, an unterminated one, and an empty one all yield nothing
+        // rather than an empty line in the output.
+        assert_eq!(extract_html_title(b"<html><body>no head</body>"), None);
+        assert_eq!(extract_html_title(b"<title>never closed"), None);
+        assert_eq!(extract_html_title(b"<title>   </title>"), None);
+    }
+
+    #[test]
+    fn test_extract_html_title_requires_a_tag_name_boundary() {
+        assert_eq!(
+            extract_html_title(
+                b"<title-widget>not the page title</title-widget><title>Actual title</title>"
+            ),
+            Some("Actual title".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_html_title_caps_a_runaway_title() {
+        let body = format!("<title>{}</title>", "a".repeat(TITLE_MAX_CHARS + 50));
+        let title = extract_html_title(body.as_bytes()).unwrap();
+        // Cut to the cap, with a marker so a truncated title does not read as
+        // the page's real one.
+        assert_eq!(title.chars().count(), TITLE_MAX_CHARS + 1);
+        assert!(title.ends_with('…'), "{title}");
+    }
+
+    #[test]
+    fn test_decode_entities_does_not_decode_twice() {
+        // `&amp;lt;` is the page asking for the literal text `&lt;`.
+        assert_eq!(decode_entities("a &amp;lt; b"), "a &lt; b");
+        assert_eq!(
+            decode_entities("&lt;b&gt; &quot;x&quot; &#39;y&#39;"),
+            "<b> \"x\" 'y'"
+        );
+    }
+}

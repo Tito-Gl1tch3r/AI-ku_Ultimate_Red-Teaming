@@ -1,0 +1,49 @@
+﻿
+using System.Management.Automation;
+using DSInternals.SAM;
+
+namespace DSInternals.PowerShell.Commands;
+[Cmdlet(VerbsCommon.Get, "SamPasswordPolicy")]
+[Alias("Get-ADPasswordPolicy", "Get-ADDefaultPasswordPolicy")]
+[OutputType(typeof(SamDomainPasswordInformation))]
+public class GetSamPasswordPolicyCommand : SamCommandBase
+{
+    #region Parameters
+    [Parameter(Mandatory = true)]
+    [ValidateNotNullOrEmpty]
+    public string Domain
+    {
+        get;
+        set;
+    }
+
+    [Parameter]
+    [Alias("UseNamedPipes")]
+    public SwitchParameter UseNamedPipe
+    {
+        get;
+        set;
+    }
+    #endregion Parameters
+
+    #region Cmdlet Overrides
+
+    protected override bool UseNamedPipes => UseNamedPipe.IsPresent;
+
+    protected override void ProcessRecord()
+    {
+        this.WriteVerbose($"Opening domain {this.Domain}.");
+
+        if (this.Domain.Contains('.'))
+        {
+            // This is not a hard check, because dots are actually allowed in NetBIOS names, although not recommended.
+            this.WriteWarning("The domain name supplied appears to be a DNS name instead of NetBIOS name.");
+        }
+        using (var samDomain = this.SamServer.OpenDomain(this.Domain, SamDomainAccessMask.ReadPasswordParameters))
+        {
+            var policy = samDomain.GetPasswordPolicy();
+            this.WriteObject(policy);
+        }
+    }
+    #endregion Cmdlet Overrides
+}

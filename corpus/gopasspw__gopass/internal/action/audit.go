@@ -1,0 +1,156 @@
+package action
+
+import (
+	"context"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/gopasspw/gopass/internal/action/exit"
+	"github.com/gopasspw/gopass/internal/audit"
+	"github.com/gopasspw/gopass/internal/out"
+	"github.com/gopasspw/gopass/internal/tree"
+	"github.com/gopasspw/gopass/pkg/ctxutil"
+	"github.com/gopasspw/gopass/pkg/debug"
+	"github.com/gopasspw/gopass/pkg/fsutil"
+	"github.com/urfave/cli/v3"
+)
+
+// Audit validates passwords against common flaws.
+func (s *auditHandler) Audit(ctx context.Context, cmd *cli.Command) error {
+	ctx = ctxutil.WithGlobalFlags(ctx, cmd)
+
+	_ = s.rem.Reset("audit")
+	out.Print(ctx, "Auditing passwords for common flaws ...")
+
+	t, err := s.Store.Tree(ctx)
+	if err != nil {
+		return exit.Error(exit.List, err, "failed to get store tree: %s", err)
+	}
+
+	if filter := cmd.Args().First(); filter != "" {
+		subtree, err := t.FindFolder(filter)
+		if err != nil {
+			return exit.Error(exit.Unknown, err, "failed to find subtree: %s", err)
+		}
+		debug.Log("subtree for %q: %+v", filter, subtree)
+		t = subtree
+	}
+
+	list := t.List(tree.INF)
+
+	if len(list) < 1 {
+		out.Printf(ctx, "No secrets found")
+
+		return nil
+	}
+
+	nList, err := audit.FilteredList(ctx, s.Store)
+	if err != nil {
+		return exit.Error(exit.List, err, "failed to list secrets: %s", err)
+	}
+	// if a filter was given, restrict the audit to the matching subtree
+	if filter := cmd.Args().First(); filter != "" {
+		allowed := make(map[string]struct{}, len(list))
+		for _, name := range list {
+			allowed[name] = struct{}{}
+		}
+		filtered := make([]string, 0, len(nList))
+		for _, name := range nList {
+			if _, ok := allowed[name]; ok {
+				filtered = append(filtered, name)
+			}
+		}
+		nList = filtered
+	}
+	if len(nList) < len(list) {
+		out.Warningf(ctx, "Excluding %d secrets based on .gopass-audit-ignore", len(list)-len(nList))
+	}
+
+	a := audit.New(ctx, s.Store)
+	r, err := a.Batch(ctx, nList)
+	if err != nil {
+		return exit.Error(exit.Unknown, err, "failed to audit password store: %s", err)
+	}
+
+	if p := cmd.String("template"); p != "" && fsutil.IsFile(p) {
+		r.Template = p
+	}
+
+	switch cmd.String("format") {
+	case "html":
+		return saveReport(ctx, r.RenderHTML, cmd.String("output-file"), "html")
+	case "csv":
+		return saveReport(ctx, r.RenderCSV, cmd.String("output-file"), "csv")
+	case "json":
+		return saveReport(ctx, r.RenderJSON, cmd.String("output-file"), "json")
+	default:
+		var err error
+		if cmd.Bool("full") {
+			debug.Log("Printing full report")
+			err = r.PrintResults(ctx)
+		}
+		if cmd.Bool("summary") {
+			debug.Log("Printing summary")
+
+			nerr := r.PrintSummary(ctx)
+			// do not overwrite err if it is already set
+			if err == nil {
+				err = nerr
+			}
+		}
+		if !cmd.Bool("full") && !cmd.Bool("summary") {
+			nerr := r.PrintSummary(ctx)
+			if err == nil {
+				err = nerr
+			}
+		}
+
+		return err
+	}
+}
+
+func saveReport(ctx context.Context, f func(io.Writer) error, path, suffix string) error {
+	if path == "" {
+		out.Noticef(ctx, "No output filename given. Will use a random file name. Use `--output-file` to specify.")
+	}
+
+	fn, err := writeReport(f, path)
+	if err != nil {
+		return exit.Error(exit.Unknown, err, "failed to write report to %s: %s", fn, err)
+	}
+
+	if !strings.HasSuffix(fn, "."+suffix) {
+		nfn := fn + "." + suffix
+		if err := os.Rename(fn, fn+"."+suffix); err != nil {
+			return exit.Error(exit.IO, err, "failed to rename report to %s: %s", nfn, err)
+		}
+		fn = nfn
+	}
+
+	out.Noticef(ctx, "Wrote report to %s", fn)
+
+	return nil
+}
+
+func writeReport(f func(io.Writer) error, path string) (string, error) {
+	fh, err := openReport(path)
+	if err != nil {
+		return "", err
+	}
+	defer fh.Close() //nolint:errcheck
+
+	if err := f(fh); err != nil {
+		return "", err
+	}
+
+	return fh.Name(), nil
+}
+
+func openReport(path string) (*os.File, error) {
+	if path == "" {
+		return os.CreateTemp("", "gopass-report")
+	}
+
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+}

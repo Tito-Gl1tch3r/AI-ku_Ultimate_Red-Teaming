@@ -1,0 +1,249 @@
+﻿using System.Management.Automation;
+using System.Security.Principal;
+using DSInternals.Common.Data;
+using DSInternals.Replication;
+
+namespace DSInternals.PowerShell.Commands;
+
+[Cmdlet(VerbsCommon.Get, "ADReplAccount")]
+[Alias("Get-ADReplicationAccount")]
+[OutputType(typeof(DSAccount), typeof(DSUser), typeof(DSComputer))]
+public class GetADReplAccountCommand : ADReplPrincipalCommandBase
+{
+    #region Constants
+    protected const string ParameterSetAll = "All";
+    #endregion Constants
+
+    #region Parameters
+    [Parameter(Mandatory = true, ParameterSetName = ParameterSetAll)]
+    [Alias("AllAccounts", "ReturnAllAccounts")]
+    public SwitchParameter All
+    {
+        get;
+        set;
+    }
+
+    [Parameter(Mandatory = false)]
+    [Alias("Property", "PropertySets", "PropertySet")]
+    [PSDefaultValue(Value = "All")]
+    public AccountPropertySets Properties
+    {
+        get;
+        set;
+    } = AccountPropertySets.All;
+
+    [Parameter(Mandatory = false)]
+    [Alias("View", "ExportView", "Format")]
+    [ValidateSet(
+        "JohnNT",
+        "JohnNTHistory",
+        "JohnLM",
+        "JohnLMHistory",
+        "HashcatNT",
+        "HashcatNTHistory",
+        "HashcatLM",
+        "HashcatLMHistory",
+        "NTHash",
+        "NTHashHistory",
+        "LMHash",
+        "LMHashHistory",
+        "Ophcrack",
+        "PWDump",
+        "PWDumpHistory"
+    )]
+    public AccountExportFormat? ExportFormat
+    {
+        get;
+        set;
+    }
+    #endregion Parameters
+
+    #region Cmdlet Overrides
+    protected override void BeginProcessing()
+    {
+        base.BeginProcessing();
+
+        if (this.ExportFormat != null)
+        {
+            // Override the property set to match the requirements of the export formats.
+            AccountPropertySets requiredProperties = this.ExportFormat.GetRequiredProperties();
+
+            if (this.Properties == AccountPropertySets.All)
+            {
+                // The user did not explicitly specify any properties, so we set them to the required ones.
+                this.Properties = requiredProperties;
+            }
+            else
+            {
+                // Merge the required properties with the user-specified ones.
+                this.Properties |= requiredProperties;
+            }
+        }
+
+        // Windows LAPS and legacy LAPS use custom attributes that are not part of the default schema.
+        bool fullSchemaRequired = (this.Properties & AccountPropertySets.LAPS) != AccountPropertySets.None;
+
+        if (fullSchemaRequired)
+        {
+            FetchSchema();
+        }
+    }
+
+    protected override void ProcessRecord()
+    {
+        if (this.ParameterSetName == ParameterSetAll)
+        {
+            this.ReturnAllAccounts();
+        }
+        else
+        {
+            this.ReturnSingleAccount();
+        }
+    }
+
+    protected override void StopProcessing()
+    {
+        _cancellationTokenSource.Cancel();
+        base.StopProcessing();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _cancellationTokenSource.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+    #endregion Cmdlet Overrides
+
+    #region Cancellation
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
+    #endregion Cancellation
+
+    #region Helper Methods
+
+    protected void ReturnAllAccounts()
+    {
+        // Write the initial progress
+        var progressRecord = new ProgressRecord(1, "Account Replication", "Replicating Active Directory objects.");
+        progressRecord.PercentComplete = 0;
+        this.WriteProgress(progressRecord);
+
+        // Update the progress after each replication cycle
+        IProgress<ReplicationProgress> progress = new SynchronousProgress<ReplicationProgress>(report =>
+        {
+            int percentComplete = (int)(((double)report.ProcessedObjectCount / (double)report.TotalObjectCount) * 100);
+            // AD's object count estimate is sometimes lower than the actual count, so we cap the value to 100%.
+            progressRecord.PercentComplete = Math.Min(percentComplete, 100);
+            this.WriteProgress(progressRecord);
+        });
+
+        try
+        {
+            // Replicate all accounts
+            foreach (var account in this.ReplicationClient.GetAccounts(progress, this.Properties, _cancellationTokenSource.Token))
+            {
+                this.WriteObject(account);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The pipeline is stopping (e.g. Ctrl+C). Fall through to a clean progress completion.
+        }
+        finally
+        {
+            // Write progress completed
+            progressRecord.RecordType = ProgressRecordType.Completed;
+            this.WriteProgress(progressRecord);
+        }
+    }
+
+    protected void ReturnSingleAccount()
+    {
+        DSAccount account = null;
+
+        switch (this.ParameterSetName)
+        {
+            case ParameterSetByDN:
+                account = this.ReplicationClient.GetAccount(this.DistinguishedName, this.Properties);
+                break;
+
+            case ParameterSetByName:
+                var accountName = new NTAccount(this.Domain, this.SamAccountName);
+                account = this.ReplicationClient.GetAccount(accountName, this.Properties);
+                break;
+
+            case ParameterSetByGuid:
+                account = this.ReplicationClient.GetAccount(this.ObjectGuid, this.Properties);
+                break;
+
+            case ParameterSetBySid:
+                account = this.ReplicationClient.GetAccount(this.ObjectSid, this.Properties);
+                break;
+
+            case ParameterSetByUPN:
+                var upn = new NTAccount(this.UserPrincipalName);
+                account = this.ReplicationClient.GetAccount(upn, this.Properties);
+                break;
+
+            default:
+                // This should never happen:
+                throw new PSInvalidOperationException(InvalidParameterSetMessage);
+        }
+
+        this.WriteObject(account);
+    }
+
+    protected void FetchSchema()
+    {
+        // Write the initial progress
+        var progressRecord = new ProgressRecord(2, "Schema Replication", "Replicating Active Directory schema.");
+        progressRecord.PercentComplete = 0;
+        this.WriteProgress(progressRecord);
+
+        // Update the progress after each replication cycle
+        IProgress<ReplicationProgress> progress = new SynchronousProgress<ReplicationProgress>(report =>
+        {
+            int percentComplete = (int)(((double)report.ProcessedObjectCount / (double)report.TotalObjectCount) * 100);
+            // AD's object count estimate is sometimes lower than the actual count, so we cap the value to 100%.
+            progressRecord.PercentComplete = Math.Min(percentComplete, 100);
+            this.WriteProgress(progressRecord);
+        });
+
+        try
+        {
+            // Replicate the schema partition
+            this.ReplicationClient.FetchFullSchema(progress, _cancellationTokenSource.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // The pipeline is stopping (e.g. Ctrl+C). Fall through to a clean progress completion.
+        }
+        finally
+        {
+            // Write progress completed
+            progressRecord.RecordType = ProgressRecordType.Completed;
+            this.WriteProgress(progressRecord);
+        }
+    }
+
+    private new void WriteObject(object sendToPipeline)
+    {
+        if (this.ExportFormat != null)
+        {
+            // Add a virtual type to the object to change the default out-of-band View, e.g., DSInternals.Common.Data.DSAccount#PwDump.
+            PSObject psObject = PSObject.AsPSObject(sendToPipeline);
+            string virtualTypeName = $"{typeof(DSAccount).FullName}#{ExportFormat}";
+            psObject.TypeNames.Insert(0, virtualTypeName);
+            base.WriteObject(psObject);
+        }
+        else
+        {
+            // Pass-through the original object without any changes.
+            base.WriteObject(sendToPipeline);
+        }
+    }
+    #endregion Helper Methods
+}

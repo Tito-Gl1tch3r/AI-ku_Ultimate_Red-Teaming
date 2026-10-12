@@ -1,0 +1,3017 @@
+"""Tool execution validation — allowlist, argument sanitization, policy, safe subprocess."""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import ipaddress
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+_parent = str(Path(__file__).resolve().parent.parent)
+if _parent not in sys.path:
+    sys.path.insert(0, _parent)
+
+from mcp_server.audit import (  # noqa: E402
+    log_blocked,
+    log_dns,
+    log_execution,
+    log_pipeline_result,
+    log_pipeline_start,
+    log_pipeline_step,
+    log_rate_limit,
+    log_script_execution,
+    log_script_result,
+    log_validation,
+)
+from mcp_server.sanitize import sanitize_output, truncate_output  # noqa: E402
+from mcp_server.tools_db import ToolsDatabase, resolve_binary_name  # noqa: E402
+
+# Methods that are not directly executable as CLI commands.
+NON_EXECUTABLE_METHODS = {"git", "docker", "snap"}
+
+# System utilities allowed for execution without being in tools_config.json.
+# These are standard Linux/macOS CLI tools commonly used in CTF and security work.
+#
+# EXCLUDED (dangerous / allows arbitrary code execution):
+#   Destructive:  rm, rmdir, dd, mkfs, kill, pkill, killall, chmod, chown,
+#                 chgrp, shutdown, reboot, halt, poweroff, fdisk, wipefs,
+#                 shred, su, sudo, mount, umount, iptables, useradd,
+#                 userdel, passwd, crontab
+#   Interpreters: python3, python, perl, ruby, node, php, bash, sh, zsh
+#                 (these allow arbitrary code execution via -c/-e flags)
+#   Meta-exec:    timeout, xargs, parallel, find
+#                 (these execute other commands as arguments, bypassing allowlist)
+SYSTEM_UTILITIES: frozenset[str] = frozenset(
+    {
+        # File analysis & forensics
+        "file",
+        "strings",
+        "xxd",
+        "hexdump",
+        "od",
+        "readelf",
+        "objdump",
+        "nm",
+        "ldd",
+        "strace",
+        "ltrace",
+        "binwalk",
+        # Encoding & hashing
+        "base64",
+        "base32",
+        "md5sum",
+        "sha1sum",
+        "sha256sum",
+        "sha512sum",
+        "shasum",
+        "cksum",
+        "openssl",
+        # Text processing
+        "grep",
+        "egrep",
+        "fgrep",
+        "sed",
+        "awk",
+        "cut",
+        "sort",
+        "uniq",
+        "wc",
+        "head",
+        "tail",
+        "tr",
+        "tee",
+        "diff",
+        "comm",
+        "paste",
+        "column",
+        "rev",
+        "fold",
+        "expand",
+        "unexpand",
+        "fmt",
+        "nl",
+        # Search & find (note: find is excluded — it supports -exec/-delete)
+        "locate",
+        "which",
+        "whereis",
+        "type",
+        # Network utilities
+        "curl",
+        "wget",
+        "nc",
+        "ncat",
+        "netcat",
+        # socat — excluded (EXEC:/SYSTEM: address types allow arbitrary command execution)
+        "dig",
+        "host",
+        "nslookup",
+        "ping",
+        "traceroute",
+        "tracepath",
+        "whois",
+        "ss",
+        "netstat",
+        "ip",
+        "ifconfig",
+        "arp",
+        # Archive & compression
+        "tar",
+        "gzip",
+        "gunzip",
+        "bzip2",
+        "bunzip2",
+        "xz",
+        "unxz",
+        "zip",
+        "unzip",
+        "7z",
+        "zcat",
+        "zgrep",
+        "zless",
+        # Image & media (CTF stego)
+        "identify",
+        "convert",
+        "exiftool",
+        "exiv2",
+        "foremost",
+        "steghide",
+        "zsteg",
+        "pngcheck",
+        # Crypto
+        "gpg",
+        "age",
+        "ssh-keygen",
+        # Document & data
+        "jq",
+        "yq",
+        "xmllint",
+        "csvtool",
+        "pdftotext",
+        "pdfinfo",
+        # QR & barcode
+        "zbarimg",
+        "qrencode",
+        # System info (read-only)
+        "uname",
+        "hostname",
+        "id",
+        "whoami",
+        "date",
+        "uptime",
+        "df",
+        "du",
+        "free",
+        "locale",
+        # File operations. Read-only ones (cat/ls/stat/...) are unconditionally
+        # safe. The write-capable ones (cp/mv/ln/tee/touch/mkdir) are allowed but
+        # check_policy() runs _is_sensitive_write_target() on their destination
+        # so they cannot overwrite/symlink into dotfiles, shell-rc/login files,
+        # cron, or system dirs (/etc, /usr, ...). Writes to /tmp/CWD stay allowed.
+        "cat",
+        "less",
+        "more",
+        "cp",
+        "mv",
+        "mkdir",
+        "touch",
+        "ln",
+        "ls",
+        "stat",
+        "realpath",
+        "basename",
+        "dirname",
+        "pwd",
+        "tac",
+        "shuf",
+        # Misc CTF
+        "bc",
+        "dc",
+        "expr",
+        "printf",
+        "echo",
+    }
+)
+
+# Block only the command-substitution and pipe vectors (| ` $( ${); no shell is ever
+# used (create_subprocess_exec), so ; & > < $ are harmless literals that tools legitimately
+# need (URL query strings, regex anchors, awk fields, XML/comparisons) and pipes must go
+# through run_pipeline.
+_DANGEROUS_PATTERNS = re.compile(r"[|`]|\$[({]")
+
+# Environment variables never passed to spawned tools/scripts: the server's own
+# process may hold operator credentials, and an allowlisted tool that can read
+# the environment (e.g. awk's ENVIRON) would otherwise disclose them. A denylist
+# keeps PATH/HOME/LANG/proxy and other benign variables that tools rely on.
+_SENSITIVE_ENV_RE = re.compile(
+    r"(TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|APIKEY|DSN"
+    r"|CONNECTION[_-]?STRING"
+    r"|(?:API|ACCESS|PRIVATE|SECRET|SESSION)[_-]?KEY)",
+    re.IGNORECASE,
+)
+_SENSITIVE_ENV_PREFIX_RE = re.compile(
+    r"^(AWS|AZURE|GCP|GOOGLE|GITHUB|GITLAB|STRIPE|SLACK|TWILIO|CLOUDFLARE"
+    r"|DIGITALOCEAN|HEROKU|NPM|PYPI|DOCKER|TF_VAR)_",
+    re.IGNORECASE,
+)
+# Credential-bearing values under a neutral name (DATABASE_URL, REDIS_URL, a DSN):
+# a URL whose userinfo carries a password (scheme://user:pass@host). Matched on the
+# value, not the name, so a URL without embedded credentials is still inherited.
+_CREDENTIAL_URL_VALUE_RE = re.compile(r"://[^/\s:@]*:[^/\s@]+@")
+# Proxy settings are kept even with credentials: tools cannot reach the network without them.
+_PROXY_ENV_RE = re.compile(r"(?:HTTPS?|FTP|ALL|NO)_PROXY", re.IGNORECASE)
+
+
+def _child_env() -> dict[str, str]:
+    """A copy of the process environment with credential-shaped variables removed.
+
+    Drops variables named like a credential and, name-agnostically, any whose
+    value embeds URL userinfo credentials (e.g. ``DATABASE_URL=postgres://u:p@h``),
+    except the standard proxy variables.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not _SENSITIVE_ENV_RE.search(key)
+        and not _SENSITIVE_ENV_PREFIX_RE.match(key)
+        and (_PROXY_ENV_RE.fullmatch(key) or not _CREDENTIAL_URL_VALUE_RE.search(value))
+    }
+
+
+# Execution policy — restrict *what* tools can do, not just *which* tools run
+
+# Flag patterns that are destructive or dangerous in most security tools.
+# Each entry is (compiled regex, human-readable description).
+BLOCKED_FLAGS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"^--delete$"), "destructive flag --delete"),
+    (re.compile(r"^-rf$"), "destructive flag -rf"),
+    (re.compile(r"^--force-?delete"), "destructive flag --force-delete"),
+    (re.compile(r"^--remove-all$"), "destructive flag --remove-all"),
+    (re.compile(r"^--exploit$"), "active exploitation flag --exploit"),
+]
+
+# nc/ncat/netcat -e/--exec/--sh-exec/--lua-exec (and -c on traditional nc) spawn
+# an arbitrary program connected to the socket — the exact bind/reverse-shell
+# primitive socat/bash/sh/python are deliberately excluded for. Best-effort
+# denylist: anchored short-flag forms cover both separated (-e /bin/sh) and the
+# command-bearing long flags (--exec=...). A benign "nc -zv host 80" still passes.
+_NC_BLOCKED_FLAGS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"^-e$"), "nc: -e exec program (arbitrary command execution)"),
+    (re.compile(r"^-c$"), "nc: -c shell command (arbitrary command execution)"),
+    (re.compile(r"^--exec(?:$|=)"), "nc: --exec program (arbitrary command execution)"),
+    (re.compile(r"^--sh-exec(?:$|=)"), "nc: --sh-exec shell command (arbitrary command execution)"),
+    (re.compile(r"^--lua-exec(?:$|=)"), "nc: --lua-exec script (arbitrary command execution)"),
+]
+
+# awk/gawk: the inline system()/pipe-to-getline patterns are blocked, but the
+# same RCE is reachable through an uninspected *program file* or extension load.
+# -f/--file run a script file, --source runs inline program text, and
+# --load/-l/@load dlopen an arbitrary gawk extension (.so) = command execution.
+# Block them so the inline-only checks can't be bypassed.
+_AWK_BLOCKED_FLAGS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"system\s*\(", re.IGNORECASE), "awk: system() command execution"),
+    (re.compile(r"\|\s*getline", re.IGNORECASE), "awk: pipe to getline"),
+    (re.compile(r"\|&?\s*[\"']", re.IGNORECASE), 'awk: pipe/coprocess to command (print | "cmd")'),
+    (re.compile(r"^-f"), "awk: -f program file (uninspected script execution)"),
+    (re.compile(r"^--file(?:$|=)"), "awk: --file program file (uninspected script execution)"),
+    (re.compile(r"^--source(?:$|=)"), "awk: --source inline program (uninspected script execution)"),
+    (re.compile(r"^--load(?:$|=)"), "awk: --load extension (command execution)"),
+    (re.compile(r"^-l$"), "awk: -l load extension (command execution)"),
+    (re.compile(r"(?:^|[\s;])@load\b"), "awk: @load extension directive (command execution)"),
+]
+
+# radare2/r2 share a command interface with shell-escape (`!`), pipe (`#!`) and
+# source (`. file`) syntax, plus -i/-I to run a script file. Best-effort denylist.
+_R2_BLOCKED_FLAGS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"^-i$"), "radare2: -i run script file"),
+    (re.compile(r"^-I$"), "radare2: -I run startup script file"),
+    (re.compile(r"(?:^|[\s;])!"), "radare2: ! shell escape"),
+    (re.compile(r"#!"), "radare2: #! pipe/lang execution"),
+    (re.compile(r"(?:^|[\s;])\.\s"), "radare2: . source/interpret command"),
+]
+
+# Tool-specific blocked flags — dangerous per-tool options.
+TOOL_BLOCKED_FLAGS: dict[str, list[tuple[re.Pattern[str], str]]] = {
+    "sqlmap": [
+        (re.compile(r"^--os-shell$"), "sqlmap: OS shell access"),
+        (re.compile(r"^--os-cmd$"), "sqlmap: OS command execution"),
+        (re.compile(r"^--os-pwn$"), "sqlmap: OOB exploitation"),
+        (re.compile(r"^--priv-esc$"), "sqlmap: privilege escalation"),
+        (re.compile(r"^--file-read$"), "sqlmap: arbitrary file read"),
+        (re.compile(r"^--file-write$"), "sqlmap: arbitrary file write"),
+        (re.compile(r"^--file-dest$"), "sqlmap: file write destination"),
+    ],
+    "sed": [
+        (re.compile(r"^-i"), "sed: in-place file modification"),
+        (re.compile(r"^--in-place"), "sed: in-place file modification"),
+        # GNU sed's e/r/w script commands run a shell command or read/write files.
+        # Match them at a command position: start, or after ; { } newline, a
+        # regex-address close (/), or an address char (digit $ , ~ + !). Prefer
+        # --sandbox at the argv level for exotic forms; this closes the reachable
+        # e/r/w vectors.
+        (re.compile(r"(?:^|[;{}\n/0-9$,~+!])\s*e(?:\s|$)"), "sed: e command (command execution)"),
+        (re.compile(r"(?:^|[;{}\n/0-9$,~+!])\s*[wWrR](?:\s|$)"), "sed: r/w file command"),
+        (re.compile(r"(?:[^a-zA-Z0-9]|^)s(.).*\1.*\1[a-z0-9]*e"), "sed: s///e execute flag"),
+    ],
+    "nmap": [
+        (re.compile(r"^-iL"), "nmap: target list from file (bypasses target validation)"),
+        (re.compile(r"^-iR"), "nmap: random target generation (bypasses target validation)"),
+        # --script / --script-args load arbitrary NSE (Lua with os.execute) = RCE.
+        (re.compile(r"^--script"), "nmap: NSE script execution (--script*)"),
+    ],
+    "masscan": [
+        (re.compile(r"^--includefile(?:$|=)"), "masscan: target list from file"),
+    ],
+    "awk": _AWK_BLOCKED_FLAGS,
+    "gawk": _AWK_BLOCKED_FLAGS,
+    "tar": [
+        (re.compile(r"^--checkpoint-action"), "tar: checkpoint-action command execution"),
+        (re.compile(r"^--to-command"), "tar: to-command command execution"),
+        # -I / --use-compress-program run an arbitrary program as the (de)compressor.
+        (re.compile(r"^-I$"), "tar: -I external compressor (command execution)"),
+        (re.compile(r"^--use-compress-program(?:$|=)"), "tar: external compressor (command execution)"),
+        (re.compile(r"^--rmt-command(?:$|=)"), "tar: --rmt-command (command execution)"),
+        (re.compile(r"^--rsh-command(?:$|=)"), "tar: --rsh-command (command execution)"),
+    ],
+    # Debuggers / disassemblers with interactive command interfaces can shell
+    # out or run inline interpreters — treat their command-bearing flags and
+    # known shell-escape syntax as RCE. Best-effort denylist (use run_script for
+    # advanced debugging); covers the obvious vectors.
+    "gdb": [
+        (re.compile(r"^-x$"), "gdb: -x command file execution"),
+        (re.compile(r"^--command(?:$|=)"), "gdb: command file execution"),
+        (re.compile(r"^--init-command(?:$|=)"), "gdb: init command file"),
+        (re.compile(r"^--init-eval-command(?:$|=)"), "gdb: init eval command"),
+        (re.compile(r"(?:^|[\s'\"(])shell\b", re.IGNORECASE), "gdb: shell command execution"),
+        (re.compile(r"(?:^|[\s'\"(])(?:python|py|pi)\b", re.IGNORECASE), "gdb: python/pipe execution"),
+        (re.compile(r"system\s*\("), "gdb: call system()"),
+        (re.compile(r"(?:^|[\s'\"(])!"), "gdb: shell escape"),
+    ],
+    "tshark": [
+        (re.compile(r"^-X$"), "tshark: -X extension (lua_script: command execution)"),
+        (re.compile(r"lua_script:", re.IGNORECASE), "tshark: lua_script extension (command execution)"),
+    ],
+    "tcpdump": [
+        (re.compile(r"^-z$"), "tcpdump: -z postrotate command execution"),
+        (re.compile(r"^--postrotate-command(?:$|=)"), "tcpdump: postrotate command execution"),
+    ],
+    "radare2": _R2_BLOCKED_FLAGS,
+    "r2": _R2_BLOCKED_FLAGS,
+    "gpg": [
+        (re.compile(r"^--recv-keys?$"), "gpg: key import from external keyserver"),
+        (re.compile(r"^--keyserver$"), "gpg: external keyserver specification"),
+        (re.compile(r"^--fetch-keys?$"), "gpg: key fetch from URL"),
+    ],
+    "socat": [
+        (re.compile(r"EXEC[12]?\s*:", re.IGNORECASE), "socat: EXEC address (arbitrary command execution)"),
+        (re.compile(r"SYSTEM\s*:", re.IGNORECASE), "socat: SYSTEM address (arbitrary command execution)"),
+    ],
+    "nc": _NC_BLOCKED_FLAGS,
+    "ncat": _NC_BLOCKED_FLAGS,
+    "netcat": _NC_BLOCKED_FLAGS,
+    # curl/wget use getopt-style short flags, so the file argument can be attached
+    # (-Kcfg.txt), separated (-K cfg.txt) or =-joined (-K=cfg.txt). Match the flag as
+    # a prefix so all three single-token forms are blocked (these are single-letter
+    # short flags with no same-prefix siblings, so prefix matching is safe).
+    "curl": [
+        (re.compile(r"^-K"), "curl: config file flag bypasses target validation"),
+        (re.compile(r"^--config(?:$|=)"), "curl: config file flag bypasses target validation"),
+        # -T/--upload-file sends an arbitrary host file to the URL (file read → exfil).
+        (re.compile(r"^-T"), "curl: -T uploads an arbitrary host file"),
+        (re.compile(r"^--upload-file(?:$|=)"), "curl: --upload-file reads an arbitrary host file"),
+    ],
+    "wget": [
+        (re.compile(r"^-i"), "wget: URL list from file bypasses target validation"),
+        (re.compile(r"^--input-file(?:$|=)"), "wget: URL list from file bypasses target validation"),
+        (re.compile(r"^--use-askpass(?:$|=)"), "wget: --use-askpass runs an external command"),
+    ],
+    # zip/exiftool/openssl are allowlisted for legitimate archive/metadata/crypto
+    # use, but each has an option that shells out or evaluates code — block those.
+    "zip": [
+        (re.compile(r"^-TT$"), "zip: -TT unzip test command (command execution)"),
+        (re.compile(r"^--unzip-command(?:$|=)"), "zip: --unzip-command (command execution)"),
+    ],
+    "exiftool": [
+        (re.compile(r"^-if\d*$"), "exiftool: -if evaluates a Perl expression"),
+        (re.compile(r"^-p$"), "exiftool: -p print-format can evaluate expressions"),
+        (re.compile(r"^-api$"), "exiftool: -api can set Perl-evaluated options"),
+        (re.compile(r"^-@$"), "exiftool: -@ argfile bypasses argument validation"),
+        (re.compile(r"^-geotag$"), "exiftool: -geotag can run external helpers"),
+    ],
+    "openssl": [
+        (re.compile(r"^-engine(?:_impl)?$"), "openssl: -engine loads an arbitrary shared object"),
+    ],
+    # ProjectDiscovery and similar recon/scan tools read targets from a file via
+    # list flags, which would defeat the private/loopback target allowlist the
+    # same way nmap -iL / wget -i do. Block the file-list flags defensively,
+    # including attached short-flag forms; exact CLI parsing differs by version,
+    # and the policy layer must fail closed.
+    "nuclei": [
+        (re.compile(r"^-l"), "nuclei: target list from file bypasses target validation"),
+        (re.compile(r"^-list(?:$|=)"), "nuclei: target list from file bypasses target validation"),
+    ],
+    "httpx": [
+        (re.compile(r"^-l(?!ocation(?:$|=))"), "httpx: target list from file bypasses target validation"),
+        (re.compile(r"^-list(?:$|=)"), "httpx: target list from file bypasses target validation"),
+    ],
+    "subfinder": [
+        (re.compile(r"^-dL"), "subfinder: domain list from file bypasses target validation"),
+        (re.compile(r"^-list(?:$|=)"), "subfinder: domain list from file bypasses target validation"),
+    ],
+    "amass": [
+        (re.compile(r"^-df"), "amass: domain list from file bypasses target validation"),
+    ],
+    # arjun (argparse) and whatweb (Ruby OptionParser) accept attached short-flag
+    # values (-iurls.txt) as well, so prefix-match the single-letter -i flag.
+    "arjun": [
+        (re.compile(r"^-i"), "arjun: URL list from file bypasses target validation"),
+        (re.compile(r"^--input(?:$|=)"), "arjun: URL list from file bypasses target validation"),
+    ],
+    "whatweb": [
+        (re.compile(r"^-i"), "whatweb: target list from file bypasses target validation"),
+        (re.compile(r"^--input-file(?:$|=)"), "whatweb: target list from file bypasses target validation"),
+    ],
+}
+
+# Parsers that resolve an unambiguous prefix of a long option to the full option
+# (GNU getopt_long, Python argparse/optparse, Ruby OptionParser). For these a
+# blocked long flag can be reached by an abbreviation, so the denylist above,
+# which anchors the full spelling, must also reject prefixes of it.
+_ABBREV_TOOLS = frozenset({"sed", "tar", "gdb", "wget", "zip", "arjun", "whatweb", "sqlmap", "awk", "gawk"})
+
+# Abbreviations that collide with a distinct, safe real option of the same tool.
+# getopt_long resolves an exact match before a prefix, so the tool reads these as
+# the safe option, not the blocked one; blocking them would be a false positive.
+_ABBREV_SAFE: dict[str, frozenset[str]] = {"tar": frozenset({"checkpoint"})}
+
+_LONG_OPT_NAME_RE = re.compile(r"^\^--([a-z0-9][a-z0-9-]*)")
+_LONG_OPT_ARG_RE = re.compile(r"^--([a-z0-9][a-z0-9-]*)(?:=|$)", re.IGNORECASE)
+
+
+def _blocked_long_options(patterns: list[tuple[re.Pattern[str], str]]) -> list[tuple[str, str]]:
+    """Canonical ``--name`` spellings a pattern list blocks, for abbreviation checks."""
+    out: list[tuple[str, str]] = []
+    for pattern, desc in patterns:
+        match = _LONG_OPT_NAME_RE.match(pattern.pattern)
+        if match:
+            out.append((match.group(1), desc))
+    return out
+
+
+# Derived once from the compiled patterns so it cannot drift from TOOL_BLOCKED_FLAGS.
+_ABBREV_BLOCKED: dict[str, list[tuple[str, str]]] = {
+    tool: _blocked_long_options(TOOL_BLOCKED_FLAGS[tool]) for tool in _ABBREV_TOOLS if tool in TOOL_BLOCKED_FLAGS
+}
+# getopt_long resolves a 2-character prefix when unambiguous (e.g. gawk --lo →
+# --load), so 2 is the floor. A prefix that is ambiguous among the tool's own
+# options makes the tool error out, so blocking it is harmless; only an exact
+# safe option (_ABBREV_SAFE) is a real false positive.
+_ABBREV_MIN_LEN = 2
+
+
+def _check_long_option_abbreviations(tool_name: str, binary: str, arg_list: list[str]) -> None:
+    """Reject an abbreviated long flag that resolves to a blocked one.
+
+    Only for parsers in ``_ABBREV_TOOLS``; the exact spelling is already caught by
+    ``TOOL_BLOCKED_FLAGS``. A prefix that is also a distinct safe option
+    (``_ABBREV_SAFE``) is left alone.
+    """
+    blocked: list[tuple[str, str]] = []
+    safe: set[str] = set()
+    for key in (tool_name, binary):
+        blocked += _ABBREV_BLOCKED.get(key, [])
+        safe |= _ABBREV_SAFE.get(key, frozenset())
+    if not blocked:
+        return
+    for arg in arg_list:
+        match = _LONG_OPT_ARG_RE.match(arg)
+        if not match:
+            continue
+        name = match.group(1).lower()
+        if len(name) < _ABBREV_MIN_LEN or name in safe:
+            continue
+        for canonical, desc in blocked:
+            if name != canonical and canonical.startswith(name):
+                raise ValueError(f"Blocked by policy: {desc} (via abbreviation --{name})")
+
+
+# Flags whose values look like a network target to the heuristic but are
+# actually something else for specific tools (e.g. curl's ``-u user:pass``
+# is HTTP Basic auth, not a target). When one of these is present for its
+# owning tool, the flag+value pair is skipped during target validation.
+#
+# Keep this list to flags whose values are *not* connection destinations
+# (headers, credentials, methods, wordlists, output files, template paths).
+# Do not add proxy/resolver/connect-to flags here: those can redirect real
+# network traffic and must still pass target validation.
+_TARGET_FLAG_EXEMPTIONS: dict[str, set[str]] = {
+    "curl": {
+        "-u",
+        "--user",
+        "-H",
+        "--header",
+        "-A",
+        "--user-agent",
+        "-b",
+        "--cookie",
+        "-d",
+        "--data",
+        "--data-raw",
+        "--data-binary",
+        "--data-urlencode",
+        "-X",
+        "--request",
+        "-o",
+        "--output",
+        "-w",
+        "--write-out",
+    },
+    "wget": {
+        "--header",
+        "--user-agent",
+        "--post-data",
+        "--post-file",
+        "-O",
+        "--output-document",
+        "-P",
+        "--directory-prefix",
+    },
+    "ffuf": {"-w", "-H", "-X", "-d", "-b", "-o", "-of", "-e"},
+    "feroxbuster": {"-w", "-H", "-A", "-b", "-x", "-o", "--output"},
+    "gobuster": {"-w", "-H", "-U", "-P", "-x", "-o", "--output"},
+    "hydra": {"-l", "-L", "-p", "-P", "-s", "-t", "-o", "-x"},
+    "patator": {"-x", "-l", "-p", "-L", "-P", "-o", "--output"},
+    "httpx": {"-H", "-header", "-headers", "-path", "-body", "-method", "-o", "-json"},
+    "nuclei": {"-H", "-header", "-t", "-templates", "-tags", "-severity", "-o", "-json-export", "-markdown-export"},
+    "sqlmap": {"-p", "--headers", "--cookie", "--data", "--user-agent", "--method", "--risk", "--level", "-o"},
+    "nmap": {"-oA", "-oN", "-oX", "-oG", "--top-ports", "--max-retries", "-p", "-T"},
+    "masscan": {"-p", "-oL", "-oJ", "-oX", "-oG", "--rate", "--max-rate"},
+}
+
+# Exempt flag values that may still trigger outbound fetches when they are URLs.
+# They are not the scan target, but default-safe MCP mode also promises no
+# unexpected external network access. Validate URL values for these flags before
+# skipping normal target parsing.
+_REMOTE_RESOURCE_FLAGS: dict[str, set[str]] = {
+    "ffuf": {"-w"},
+    "feroxbuster": {"-w"},
+    "gobuster": {"-w"},
+    "nuclei": {"-t", "-templates"},
+}
+
+# Positional words that are command modes/protocol names, not host targets. Keep
+# this narrow: arbitrary single-label hostnames must still be validated/blocked
+# in default-safe mode.
+_NON_TARGET_POSITIONALS: dict[str, set[str]] = {
+    "gobuster": {"dir", "dns", "vhost", "s3", "gcs", "fuzz", "tftp"},
+    "hydra": {
+        "ftp",
+        "ftps",
+        "ssh",
+        "ssh2",
+        "telnet",
+        "smtp",
+        "smtps",
+        "pop3",
+        "pop3s",
+        "imap",
+        "imaps",
+        "ldap2",
+        "ldap3",
+        "smb",
+        "rdp",
+        "vnc",
+        "mysql",
+        "postgres",
+        "mssql",
+        "redis",
+        "mongodb",
+        "http-get",
+        "http-post",
+        "http-head",
+        "http-get-form",
+        "http-post-form",
+    },
+    "openssl": {
+        "asn1parse",
+        "base64",
+        "cms",
+        "crl",
+        "dgst",
+        "enc",
+        "genpkey",
+        "list",
+        "passwd",
+        "pkcs7",
+        "pkcs12",
+        "pkey",
+        "pkeyutl",
+        "prime",
+        "rand",
+        "req",
+        "rsa",
+        "rsautl",
+        "s_client",
+        "s_server",
+        "speed",
+        "verify",
+        "version",
+        "x509",
+    },
+}
+
+
+def _exempt_flag_value(
+    tool_name: str,
+    binary: str,
+    arg: str,
+    next_arg: str | None,
+) -> tuple[bool, int, str | None, str | None]:
+    """Return exemption match details for a flag and optional value.
+
+    The integer is how many argv tokens to consume. The value is populated for
+    separated (``-w words.txt``), equals-joined (``--templates=http://...``), and
+    attached short forms (``-whttp://...``).
+    """
+    exempt = _TARGET_FLAG_EXEMPTIONS.get(tool_name, set()) | _TARGET_FLAG_EXEMPTIONS.get(binary, set())
+    if arg in exempt:
+        if next_arg is not None and not next_arg.startswith("-"):
+            return True, 2, arg, next_arg
+        return True, 1, arg, None
+    if "=" in arg:
+        flag, value = arg.split("=", 1)
+        if flag in exempt:
+            return True, 1, flag, value
+        # An '=' means the flag is exactly the pre-'=' token (handled above). Do
+        # NOT fall through to attached-short prefix matching, or a longer flag like
+        # goflags' -target= would be mis-split as the exempt short flag -t with value
+        # "arget=http://…", laundering the URL past _validate_exempt_remote_resource.
+        return False, 0, None, None
+    for flag in sorted(exempt, key=len, reverse=True):
+        if flag.startswith("--") or len(flag) != 2:
+            continue
+        if arg.startswith(flag) and len(arg) > len(flag):
+            value = arg[len(flag) :]
+            return True, 1, flag, value
+    return False, 0, None, None
+
+
+def _validate_exempt_remote_resource(tool_name: str, binary: str, flag: str | None, value: str | None) -> None:
+    """Validate URL-like values for exempt flags that may fetch remote resources."""
+    if not flag or not value:
+        return
+    remote_flags = _REMOTE_RESOURCE_FLAGS.get(tool_name, set()) | _REMOTE_RESOURCE_FLAGS.get(binary, set())
+    if flag not in remote_flags:
+        return
+    if re.match(r"^https?://", value, re.IGNORECASE) and not _is_safe_target(_network_target_host(value)):
+        raise ValueError(
+            f"Blocked by policy: remote resource '{value}' for {tool_name} {flag} is not in a private/local range. "
+            "Set CYBERSEC_MCP_ALLOW_EXTERNAL=1 for authorized external resource URLs."
+        )
+
+
+def _is_non_target_positional(tool_name: str, binary: str, arg: str) -> bool:
+    """Return True for known positional mode/protocol tokens."""
+    lowered = arg.lower()
+    return lowered in (_NON_TARGET_POSITIONALS.get(tool_name, set()) | _NON_TARGET_POSITIONALS.get(binary, set()))
+
+
+# Tools that perform network operations and need target validation.
+_NETWORK_TOOLS: set[str] = {
+    "nmap",
+    "masscan",
+    "sqlmap",
+    "ffuf",
+    "feroxbuster",
+    "gobuster",
+    "nikto",
+    "nuclei",
+    "httpx",
+    "whatweb",
+    "hydra",
+    "patator",
+    "Responder",
+    "bettercap",
+    "mitmproxy",
+    "reaver",
+    "aircrack-ng",
+    "wifite2",
+    "amass",
+    "subfinder",
+    "shodan",
+    "arjun",
+    "dalfox",
+    "prowler",
+    "pacu",
+    "scapy",
+    "tshark",
+    "tcpdump",
+    # System network utilities
+    "curl",
+    "wget",
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "dig",
+    "host",
+    "nslookup",
+    "ping",
+    "traceroute",
+    "tracepath",
+    "whois",
+    # Utilities that can make outbound network connections
+    "openssl",  # openssl s_client -connect
+    "gpg",  # gpg --recv-keys --keyserver
+    # Registry tools whose targets use the private/loopback allowlist.
+    # Keep synchronized with test_network_tools_cover_registry.
+    # Port / host / service scanners
+    "rustscan",
+    "zmap",
+    "naabu",
+    "nbtscan",
+    "onesixtyone",
+    "fping",
+    "arping",
+    "hping3",
+    "ncrack",
+    "smap",
+    "asnmap",
+    "ssh-audit",
+    # DNS / subdomain enumeration
+    "dnsenum",
+    "dnsrecon",
+    "dnstwist",
+    "dnsx",
+    "massdns",
+    "puredns",
+    "shuffledns",
+    "findomain",
+    "chaos",
+    "github-subdomains",
+    # URL / host harvesting and crawling
+    "gau",
+    "waybackurls",
+    "httprobe",
+    "hakrawler",
+    "hakrevdns",
+    "meg",
+    "gowitness",
+    "theHarvester",
+    "emailharvester",
+    "uncover",
+    "cariddi",
+    "katana",
+    "paramspider",
+    # Recon frameworks that take a target host/domain
+    "bbot",
+    "osmedeus",
+    "reconftw",
+    "Sn1per",
+    "nmapAutomator",
+    "maryam",
+    "metabigor",
+    "parsero",
+    "EyeWitness",
+    "GooFuzz",
+    "raccoon-scanner",
+    "censys",
+    # TLS / web-app scanners
+    "sslscan",
+    "sslyze",
+    "testssl.sh",
+    "tlsx",
+    "wafw00f",
+    "webanalyze",
+    "wpscan",
+    "CMSmap",
+    "droopescan",
+    "subzy",
+    # Web attack tools that take a --url / host
+    "commix",
+    "crlfuzz",
+    "corscanner",
+    "Corsy",
+    "Gxss",
+    "kxss",
+    "NoSQLMap",
+    "jaeles",
+    "smuggler",
+    "h2csmuggler",
+    "git-dumper",
+    "xsrfprobe",
+    "symfony-exploits",
+    "tomcatwardeployer",
+    "kr",
+    "XXEinjector",
+    "PadBuster",
+    "XSStrike",
+    # Tunnels / pivots / proxies that connect to a remote endpoint
+    "chisel",
+    "frpc",
+    "frps",
+    "ligolo-agent",
+    "ligolo-proxy",
+    "dns2tcp",
+    "dnscat2",
+    "iodine",
+    "sshuttle",
+    "pwnat",
+    "sslsplit",
+    # SMB / file services
+    "smbclient",
+    "smbmap",
+    # Directory/content brute-forcers and URL scanners that take an argv target.
+    "dirsearch",
+    "ghauri",
+    "clairvoyance",
+    "graphw00f",
+    "Oralyzer",
+    "nomore403",
+    "x8",
+    "tplmap",
+    # Subdomain / URL enumeration and crawling.
+    "assetfinder",
+    "sublist3r",
+    "waymore",
+    "knock-subdomains",
+    "gospider",
+    "Photon",
+    # Classic external-target scanners not in the registry, covered if added later.
+    "fierce",
+    "dirb",
+}
+
+# Env-configurable: CYBERSEC_MCP_ALLOW_EXTERNAL=1 unlocks external targets.
+# Default: only loopback and RFC 1918 ranges are allowed.
+# Evaluated dynamically so env changes take effect without restart.
+
+
+def _allow_external() -> bool:
+    return os.environ.get("CYBERSEC_MCP_ALLOW_EXTERNAL", "").strip() == "1"
+
+
+# Env-configurable: CYBERSEC_MCP_ALLOW_SCRIPTS=1 unlocks script execution.
+# Default: script execution is disabled.
+
+
+def _allow_scripts() -> bool:
+    return os.environ.get("CYBERSEC_MCP_ALLOW_SCRIPTS", "").strip() == "1"
+
+
+# Private/safe network ranges (loopback + RFC 1918 + link-local + CGNAT/VPN).
+_SAFE_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    # RFC 6598 CGNAT range — used by Tailscale, some VPN providers, and
+    # carrier-grade NAT. Safe for CTF/pentest VPN tunnels.
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+# Link-local cloud metadata endpoints can expose workload credentials and must
+# require the same explicit opt-in as other sensitive external destinations.
+_BLOCKED_SAFE_MODE_NETWORKS = [
+    ipaddress.ip_network("169.254.169.254/32"),
+    ipaddress.ip_network("169.254.170.2/32"),
+    ipaddress.ip_network("fd00:ec2::254/128"),
+]
+
+
+def _address_is_safe(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return whether an address is allowed by the default network policy."""
+    mapped = getattr(addr, "ipv4_mapped", None)
+    effective = mapped if mapped is not None else addr
+    if any(effective in net for net in _BLOCKED_SAFE_MODE_NETWORKS if effective.version == net.version):
+        return False
+    return any(effective in net for net in _SAFE_NETWORKS if effective.version == net.version)
+
+
+def _network_is_safe(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    """Return whether an entire network is allowed by the default policy."""
+    effective: ipaddress.IPv4Network | ipaddress.IPv6Network = net
+    if isinstance(net, ipaddress.IPv6Network) and net.prefixlen >= 96:
+        mapped = net.network_address.ipv4_mapped
+        if mapped is not None:
+            effective = ipaddress.ip_network((mapped, net.prefixlen - 96), strict=False)
+
+    same_version_blocked = (blocked for blocked in _BLOCKED_SAFE_MODE_NETWORKS if blocked.version == effective.version)
+    if any(effective.overlaps(blocked) for blocked in same_version_blocked):
+        return False
+    same_version_safe = (safe for safe in _SAFE_NETWORKS if safe.version == effective.version)
+    return any(effective.subnet_of(safe) for safe in same_version_safe)
+
+
+class _RateLimiter:
+    """Concurrency + sliding-window rate limiter for tool execution."""
+
+    def __init__(self, max_concurrent: int = 10, max_per_minute: int = 60):
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._timestamps: list[float] = []
+        self._max_per_minute = max_per_minute
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            self._timestamps = [t for t in self._timestamps if now - t < 60]
+            current = len(self._timestamps)
+            if current >= self._max_per_minute:
+                log_rate_limit("exceeded", current, self._max_per_minute)
+                raise ValueError(f"Rate limit exceeded: max {self._max_per_minute} tool executions per minute")
+            self._timestamps.append(now)
+            log_rate_limit("acquired", current + 1, self._max_per_minute)
+
+
+_rate_limiter = _RateLimiter()
+
+
+# Thread-safe DNS resolution with per-call timeout (avoids process-global
+# socket.setdefaulttimeout which races under concurrent tool executions).
+
+
+# Bounded DNS resolver pool. Target validation runs before the rate limiter and
+# concurrency semaphore, so without a cap a burst of requests would spawn one daemon
+# thread per call. A fixed-size pool caps concurrent getaddrinfo calls; excess
+# submissions queue instead of allocating unbounded OS threads. A hung lookup still
+# occupies its worker until the OS resolver gives up (future.cancel cannot interrupt
+# getaddrinfo), which is the intended bound, not a leak.
+_DNS_MAX_WORKERS = 8
+_dns_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_DNS_MAX_WORKERS, thread_name_prefix="cybersec-dns")
+
+
+def _resolve_with_timeout(hostname: str, timeout: float = 5.0) -> list:
+    """Resolve hostname via getaddrinfo with a per-call timeout, through a bounded pool."""
+    start = time.monotonic()
+    future = _dns_executor.submit(socket.getaddrinfo, hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    try:
+        result = future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()  # best-effort; a running getaddrinfo cannot be interrupted
+        elapsed = (time.monotonic() - start) * 1000
+        log_dns(hostname, resolved=False, duration_ms=elapsed, error="timeout")
+        raise socket.timeout(f"DNS resolution timed out after {timeout}s") from None
+    except (socket.gaierror, OSError) as exc:
+        elapsed = (time.monotonic() - start) * 1000
+        log_dns(hostname, resolved=False, duration_ms=elapsed, error=str(exc))
+        raise
+    elapsed = (time.monotonic() - start) * 1000
+    if result:
+        first_ip = result[0][4][0]
+        is_safe = all(_address_is_safe(ipaddress.ip_address(sa[4][0])) for sa in result)
+        log_dns(hostname, resolved=True, ip=first_ip, safe=is_safe, duration_ms=elapsed)
+    else:
+        log_dns(hostname, resolved=False, duration_ms=elapsed, error="empty_result")
+    return result
+
+
+def _decode_encoded_ipv4(value: str) -> ipaddress.IPv4Address | None:
+    """Decode a non-dotted IPv4 encoding (decimal/hex/octal) to an address.
+
+    Catches obfuscations like ``134744072`` (== 8.8.8.8) and ``0x08080808``
+    that bare-positional tools (nc, ncat, ping) accept as a host but that the
+    dotted-quad parser misses, letting an external host slip past the allowlist.
+
+    Returns ``None`` when *value* is not a single-integer host encoding — bare
+    decimals <= 65535 are excluded so ports/timeouts (``-p 80``) are not
+    mis-validated as targets.
+    """
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        if s.lower().startswith(("0x", "0o", "0b")):
+            n = int(s, 0)
+        elif s.isdigit():
+            n = int(s, 10)
+            if n <= 65535:  # port / timeout range — not an encoded IP
+                return None
+        else:
+            return None
+    except ValueError:
+        return None
+    if 0 <= n <= 0xFFFFFFFF:
+        return ipaddress.IPv4Address(n)
+    return None
+
+
+def _is_safe_target(value: str) -> bool:
+    """Check if a string looks like a network target and is in a safe range."""
+    if not value:
+        return True  # Empty string is not a network target
+
+    # Non-dotted encoded IPv4 (decimal/hex/octal) — e.g. 134744072 == 8.8.8.8.
+    # Resolve before the dotted-quad parser so obfuscated externals are caught.
+    encoded = _decode_encoded_ipv4(value)
+    if encoded is not None:
+        return _address_is_safe(encoded)
+
+    # Try parsing as IP address directly
+    try:
+        addr = ipaddress.ip_address(value)
+        return _address_is_safe(addr)
+    except ValueError:
+        pass
+
+    # Try parsing as CIDR
+    try:
+        net = ipaddress.ip_network(value, strict=False)
+        return _network_is_safe(net)
+    except (ValueError, TypeError):
+        pass
+
+    # Check for hostname-like strings (contains dots, no path separators)
+    if "." in value and "/" not in value and not value.startswith("-"):
+        # Common local/safe hostnames
+        safe_hosts = {"localhost", "localhost.localdomain"}
+        if value.lower() in safe_hosts:
+            return True
+        # Resolve and check — residual risk: this validation is independent of the tool's
+        # connect-time resolution, so an attacker-controlled short-TTL/multi-answer record
+        # can rebind past the default-safe check (DNS rebinding/TOCTOU); IP/CIDR/IPv6 literals
+        # are validated directly above and are unaffected.
+        try:
+            info = _resolve_with_timeout(value)
+            if not info:
+                return False  # No resolution results — treat as unsafe
+            for _, _, _, _, sockaddr in info:
+                addr = ipaddress.ip_address(sockaddr[0])
+                if not _address_is_safe(addr):
+                    return False
+            return True
+        except (socket.gaierror, OSError, socket.timeout):
+            # Can't resolve — treat as potentially external
+            return False
+
+    # Not a recognizable IP/hostname — could be a decimal IP, bare hostname, etc.
+    # Values that look like file paths or flags are allowed through.
+    if value.startswith(("-", "/", "./", "~")):
+        return True
+
+    # Try DNS resolution as a last resort to catch targets like "google" or "134744072"
+    try:
+        info = _resolve_with_timeout(value)
+        if not info:
+            return False  # No resolution results — treat as unsafe
+        for _, _, _, _, sockaddr in info:
+            addr = ipaddress.ip_address(sockaddr[0])
+            if not _address_is_safe(addr):
+                return False
+        return True
+    except (socket.gaierror, OSError, socket.timeout, ValueError):
+        # Can't resolve — could be a bare hostname with transient DNS failure.
+        # Deny to be safe; genuine non-network values (flags/paths) are caught above.
+        return False
+
+
+_FILE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        # Text / data
+        ".txt",
+        ".json",
+        ".xml",
+        ".csv",
+        ".html",
+        ".htm",
+        ".log",
+        ".md",
+        ".rst",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".env",
+        ".bak",
+        ".old",
+        ".pdf",
+        ".rtf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        # Archives / compression
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".zst",
+        ".lz4",
+        ".zip",
+        ".7z",
+        ".rar",
+        ".tar",
+        ".tgz",
+        ".tar.gz",
+        # Packet captures / network
+        ".pcap",
+        ".pcapng",
+        ".cap",
+        ".netxml",
+        ".gnmap",
+        ".nmap",
+        # Binary / forensics
+        ".bin",
+        ".raw",
+        ".img",
+        ".iso",
+        ".dd",
+        ".dmp",
+        ".mem",
+        ".vmem",
+        ".exe",
+        ".dll",
+        ".elf",
+        ".so",
+        ".dylib",
+        ".o",
+        ".a",
+        ".apk",
+        ".ipa",
+        ".dex",
+        ".class",
+        ".jar",
+        ".war",
+        # Disk / filesystem images
+        ".e01",
+        ".aff",
+        ".qcow2",
+        ".vdi",
+        ".vmdk",
+        ".vhd",
+        # Output / report
+        ".out",
+        ".dat",
+        ".rep",
+        ".report",
+        ".result",
+        ".results",
+        # Images / stego
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".tiff",
+        ".tif",
+        ".svg",
+        ".ico",
+        ".webp",
+        ".ppm",
+        ".pgm",
+        ".pbm",
+        # Audio / video stego
+        ".wav",
+        ".mp3",
+        ".flac",
+        ".ogg",
+        ".mp4",
+        ".avi",
+        ".mkv",
+        # Crypto / certs
+        ".pem",
+        ".crt",
+        ".cer",
+        ".der",
+        ".key",
+        ".p12",
+        ".pfx",
+        ".csr",
+        ".pub",
+        ".asc",
+        ".sig",
+        ".gpg",
+        ".enc",
+        # Code / scripts
+        ".py",
+        ".sh",
+        ".rb",
+        ".js",
+        ".ts",
+        ".go",
+        ".rs",
+        ".c",
+        ".h",
+        ".cpp",
+        ".java",
+        ".php",
+        ".pl",
+        ".ps1",
+        ".bat",
+        ".lua",
+        ".nse",
+        ".sql",
+        ".r",
+        ".m",
+        ".swift",
+        # Web
+        ".css",
+        ".jsx",
+        ".tsx",
+        ".wasm",
+        # Wordlists / rules
+        ".lst",
+        ".dict",
+        ".rule",
+        ".hcrule",
+        ".mask",
+        # Hashes / loot
+        ".hash",
+        ".hashes",
+        ".pot",
+        ".loot",
+        ".creds",
+        # Misc CTF / security
+        ".flag",
+        ".challenge",
+        ".ctf",
+        ".exploit",
+        ".payload",
+        ".yar",
+        ".yara",
+        ".sigma",
+        ".suricata",
+        ".snort",
+        ".burp",
+        ".zap",
+        ".har",
+        # Database
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".mdb",
+        ".ldf",
+        ".mdf",
+    }
+)
+
+
+def _has_file_extension(value: str) -> bool:
+    """Return True if value ends with a known file extension."""
+    lower = value.lower()
+    return any(lower.endswith(ext) for ext in _FILE_EXTENSIONS)
+
+
+# File extensions that are ALSO real public TLDs. A token like "example.zip"
+# or "http://evil.mobi" ends in one of these "extensions" but is a live
+# external host, so it must NOT be treated as a benign local filename when
+# deciding whether to skip target validation after an unknown flag.
+_EXTENSION_TLDS: frozenset[str] = frozenset(
+    {
+        ".zip",
+        ".mobi",
+        ".sh",
+        ".app",
+        ".dev",
+        ".bar",
+        ".dad",
+        ".day",
+        ".foo",
+        ".mov",
+        ".phd",
+        ".prof",
+    }
+)
+
+
+def _is_local_path(value: str) -> bool:
+    """Return True if *value* is clearly a local filesystem path, not a target.
+
+    A token counts as local when it contains a path separator (``/`` or ``\\``)
+    or ends in a known file extension that is NOT also a real TLD. URLs and
+    tokens that only "look like a file" because their extension doubles as a TLD
+    (``.zip``, ``.mobi``, ``.sh``) are deliberately rejected here so an external
+    host such as ``http://evil.zip`` or ``example.zip`` still gets
+    target-validated.
+    """
+    # A URL is never a local path, even though it contains "/".
+    if re.match(r"^https?://", value, re.IGNORECASE):
+        return False
+    lower = value.lower()
+    if any(lower.endswith(ext) for ext in _EXTENSION_TLDS):
+        return False
+    if "/" in value or "\\" in value:
+        return True
+    return _has_file_extension(value)
+
+
+def _looks_like_target(value: str) -> bool:
+    """Heuristic: does this positional arg look like a network target?
+
+    Returns True for IPs, hostnames, URLs, CIDRs.  Returns False for bare
+    numbers (port/timeout values), plain words (flag values like usernames),
+    and other non-target strings.  This prevents flag values from being
+    incorrectly validated as network targets (e.g. ``-p 80`` where ``80`` is
+    a port, not a host).
+    """
+    # URL
+    if re.match(r"^https?://", value):
+        return True
+    # IPv6 (contains colons) — but skip Windows drive letters like C:\path
+    if ":" in value and not re.match(r"^[A-Za-z]:[/\\]", value):
+        return True
+    # CIDR notation
+    if "/" in value and re.match(r"^[\d.]", value):
+        return True
+    # IP-like (digits and dots, at least one dot)
+    if "." in value and re.match(r"^[\d.]+$", value):
+        return True
+    # Hostname (contains dot, starts with alphanumeric)
+    if "." in value and re.match(r"^[a-zA-Z0-9]", value):
+        return True
+    # localhost special case
+    if value.lower() == "localhost":
+        return True
+    # Encoded IPv4 (decimal/hex/octal, e.g. 134744072 == 8.8.8.8). Bare ports
+    # and timeouts (<= 65535) are excluded by _decode_encoded_ipv4 so flag
+    # values like "80" are still skipped.
+    if _decode_encoded_ipv4(value) is not None:
+        return True
+    # Single-label hostname: alphabetic word (possibly with hyphens/digits) that
+    # is not purely numeric.  Values like "google", "scanme" are valid DNS names
+    # and must go through target validation.  Pure numbers ("80", "4") are
+    # skipped — they are port/timeout values.
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9-]*$", value):
+        return True
+    return False
+
+
+def _looks_like_external_target(value: str) -> bool:
+    """Stricter than :func:`_looks_like_target`: match only unambiguous network
+    targets (URL, IP, dotted host, IPv6, CIDR, encoded IPv4), never bare
+    single-label words.
+
+    Used to decide whether a value embedded in an *unrecognized* flag
+    (``-flag=<host>`` or attached ``-f<host>``) must clear the external-target
+    allowlist. Excluding bare words keeps boolean flags (``-silent``) and local
+    output names (``-o=results``) from falsely tripping the gate, while still
+    catching goflags-style ``-target=http://…`` / ``-host=8.8.8.8`` bypasses.
+    """
+    if not _looks_like_target(value):
+        return False
+    if re.match(r"^https?://", value, re.IGNORECASE):
+        return True
+    if "." in value or ":" in value or "/" in value:
+        return True
+    return _decode_encoded_ipv4(value) is not None
+
+
+def _network_target_host(value: str) -> str:
+    """Normalize a URL/host argument to the host value used for allowlist checks."""
+    try:
+        ipaddress.ip_network(value, strict=False)
+        return value
+    except ValueError:
+        pass
+
+    clean = re.sub(r"^https?://", "", value)
+    # Isolate the authority before stripping URL userinfo.
+    clean = re.split(r"[/?#]", clean, maxsplit=1)[0]
+    if "@" in clean:
+        clean = clean.rsplit("@", 1)[-1]
+    if clean.startswith("["):
+        bracket_end = clean.find("]")
+        if bracket_end != -1:
+            return clean[1:bracket_end]
+        return clean
+    if clean.count(":") == 1:
+        return clean.split(":")[0]
+    return clean
+
+
+# Proxy and upstream destinations use the same network scope policy as targets.
+_PROXY_FLAGS: frozenset[str] = frozenset({"-x", "--proxy", "--preproxy", "-proxy", "-http-proxy", "--proxy-host"})
+_ATTACHED_PROXY_FLAGS: frozenset[str] = frozenset({"-x"})
+
+
+def _validate_proxy_target(value: str) -> None:
+    """Raise if the host inside a proxy-flag *value* is not private/loopback.
+
+    Only validates when the extracted host actually looks like a network target,
+    so benign non-host values never produce a spurious block. No-op when external
+    targets are allowed (the caller already returned in that case).
+    """
+    stripped = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", value)
+    if "@" in stripped:
+        stripped = stripped.rsplit("@", 1)[1]
+    host = _network_target_host(stripped)
+    if host and _looks_like_target(host) and not _is_safe_target(host):
+        raise ValueError(
+            f"Blocked by policy: proxy target '{value}' is not in a private/local "
+            "range (set CYBERSEC_MCP_ALLOW_EXTERNAL=1 to allow external proxies)"
+        )
+
+
+# curl --connect-to/--resolve redirect the connection to a host other than the URL, so validate it too.
+_CURL_REDIRECT_FLAGS: frozenset[str] = frozenset({"--connect-to", "--resolve"})
+
+
+def _validate_curl_redirect_target(flag: str, value: str) -> None:
+    """Raise if the connection destination in a curl --connect-to/--resolve value is
+    not private/loopback. No-op when external targets are allowed (caller returned)."""
+    if flag == "--resolve":
+        # [+|-]HOST:PORT:ADDR[,ADDR...] — the removal form ("-HOST:PORT") carries no
+        # address; otherwise validate every mapped address after the 2nd colon.
+        spec = value[1:] if value[:1] in ("+", "-") else value
+        parts = spec.split(":", 2)
+        dests = parts[2].split(",") if len(parts) == 3 else []
+    else:  # --connect-to HOST1:PORT1:HOST2:PORT2 — validate the connect host HOST2:PORT2
+        parts = value.split(":", 2)
+        dests = [parts[2]] if len(parts) == 3 else []
+    for dest in dests:
+        host = _network_target_host(dest.strip())
+        if host and _looks_like_target(host) and not _is_safe_target(host):
+            raise ValueError(
+                f"Blocked by policy: {flag} redirects to '{dest.strip()}' which is not in a "
+                "private/local range (set CYBERSEC_MCP_ALLOW_EXTERNAL=1 to allow external hosts)"
+            )
+
+
+# Write-destination guard
+
+# Allowlisted utilities whose positional arguments can create, overwrite, or
+# symlink a file. Tools with mode-dependent output paths are handled separately
+# in _check_write_destinations().
+_WRITE_CAPABLE_TOOLS: frozenset[str] = frozenset({"cp", "mv", "ln", "tee", "touch", "mkdir"})
+
+# Absolute system directories that must never be written into.
+_SENSITIVE_WRITE_DIRS: tuple[str, ...] = (
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/boot",
+    "/root",
+    "/var/spool/cron",
+    "/var/spool/at",
+)
+
+# Login/shell-rc and other startup files that are dangerous to overwrite even
+# when they sit directly in $HOME (matched by basename anywhere under $HOME).
+_SENSITIVE_BASENAMES: frozenset[str] = frozenset(
+    {
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".bash_logout",
+        ".profile",
+        ".zshrc",
+        ".zprofile",
+        ".zlogin",
+        ".zshenv",
+        ".kshrc",
+        ".cshrc",
+        ".tcshrc",
+        ".login",
+        ".inputrc",
+        ".netrc",
+        ".gitconfig",
+        ".vimrc",
+        "authorized_keys",
+        "crontab",
+    }
+)
+
+
+def _normalize_write_path(path: str) -> str | None:
+    """Expand *path* to an absolute lexical path for prefix checks.
+
+    Returns None for values that are not plausible filesystem destinations
+    (URLs, ``-`` stdout sentinel, empty). Symlink resolution is performed
+    separately so both the path the caller supplied and its real destination
+    are checked.
+    """
+    if not path or path == "-":
+        return None
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", path):
+        return None  # URL, not a local path
+    # os.path.join ignores cwd when the expanded path is already absolute, so
+    # this covers both cases without a separate isabs branch.
+    return os.path.normpath(os.path.join(os.getcwd(), os.path.expanduser(path)))
+
+
+def _write_path_candidates(path: str) -> tuple[str, ...]:
+    """Return lexical and symlink-resolved forms of a possible write path."""
+    norm = _normalize_write_path(path)
+    if norm is None:
+        return ()
+    resolved = os.path.realpath(norm)
+    return (norm,) if resolved == norm else (norm, resolved)
+
+
+def _is_sensitive_normalized_path(norm: str) -> bool:
+    """Classify one absolute, normalized write path."""
+    for directory in _SENSITIVE_WRITE_DIRS:
+        for protected in {directory, os.path.realpath(directory)}:
+            if norm == protected or norm.startswith(protected + os.sep):
+                return True
+
+    if os.path.basename(norm) in _SENSITIVE_BASENAMES:
+        return True
+
+    home = os.path.normpath(os.path.expanduser("~"))
+    if home and home != os.sep and (norm == home or norm.startswith(home + os.sep)):
+        rel = os.path.relpath(norm, home)
+        if any(part.startswith(".") and part not in ("", ".", "..") for part in rel.split(os.sep)):
+            return True
+
+    return False
+
+
+def _is_sensitive_write_target(path: str) -> bool:
+    """Return True if writing to *path* would hit a sensitive location.
+
+    Blocks: any dotfile under $HOME (``~/.bashrc``, ``~/.ssh/``,
+    ``~/.config/autostart/``, ``~/.config/systemd/``, ...), known shell-rc/login
+    files by basename, cron dirs, and system dirs (/etc, /usr, /bin, ...). Does
+    NOT block /tmp, the CWD, or other ordinary working locations.
+    """
+    return any(_is_sensitive_normalized_path(candidate) for candidate in _write_path_candidates(path))
+
+
+def _raise_sensitive_write(name: str, dest: str) -> None:
+    """Raise the consistent policy error for a protected write destination."""
+    if _is_sensitive_write_target(dest):
+        raise ValueError(
+            f"Blocked by policy: {name} target '{dest}' resolves into a sensitive "
+            "location (dotfile/shell-rc/cron/system dir). Write to /tmp or the working dir."
+        )
+
+
+def _flag_values(
+    arg_list: list[str],
+    *,
+    short_flags: frozenset[str] = frozenset(),
+    long_flags: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Extract separated, ``--flag=value``, and attached short-flag values."""
+    values: list[str] = []
+    i = 0
+    while i < len(arg_list):
+        arg = arg_list[i]
+        if arg in short_flags or arg in long_flags:
+            if i + 1 < len(arg_list):
+                values.append(arg_list[i + 1])
+                i += 2
+                continue
+        if "=" in arg and arg.split("=", 1)[0] in long_flags:
+            values.append(arg.split("=", 1)[1])
+        else:
+            for flag in short_flags:
+                if arg.startswith(flag) and arg != flag:
+                    values.append(arg[len(flag) :])
+                    break
+        i += 1
+    return values
+
+
+def _tar_short_flag_values(arg_list: list[str], flag: str) -> list[str]:
+    """Extract values for value-taking tar flags inside short-option bundles."""
+    values: list[str] = []
+    for i, arg in enumerate(arg_list):
+        body = ""
+        if arg.startswith("-") and not arg.startswith("--"):
+            body = arg[1:]
+        elif i == 0 and re.fullmatch(r"[A-Za-z]+", arg):
+            body = arg  # traditional tar syntax: ``tar xzf archive.tar.gz``
+        if flag not in body:
+            continue
+        suffix = body.split(flag, 1)[1]
+        if suffix:
+            values.append(suffix)
+        elif i + 1 < len(arg_list):
+            values.append(arg_list[i + 1])
+    return values
+
+
+def _tar_short_bundles(arg_list: list[str]) -> list[str]:
+    """Return tar's dashed and traditional first-argument option bundles."""
+    bundles: list[str] = []
+    for i, arg in enumerate(arg_list):
+        if arg.startswith("-") and not arg.startswith("--"):
+            bundles.append(arg[1:])
+        elif i == 0 and re.fullmatch(r"[A-Za-z]+", arg):
+            bundles.append(arg)
+    return bundles
+
+
+def _check_curl_file_reads(tool_name: str, binary: str, arg_list: list[str]) -> None:
+    """Block curl data flags that read a host file via the ``@path`` form.
+
+    ``-d @/etc/passwd`` (and --data/--data-binary/--data-ascii/--data-urlencode)
+    reads the file into the request body; ``--data-raw`` does not interpret ``@``
+    and is left alone. Uploads via ``-T``/``--upload-file`` are blocked separately.
+    """
+    if "curl" not in (tool_name, binary):
+        return
+    values = _flag_values(
+        arg_list,
+        short_flags=frozenset({"-d"}),
+        long_flags=frozenset({"--data", "--data-binary", "--data-ascii", "--data-urlencode"}),
+    )
+    for value in values:
+        # @path, or name@path for --data-urlencode; @- is stdin, not a host file.
+        ref = value.split("@", 1)[1] if "@" in value else ""
+        if ref and ref != "-":
+            raise ValueError("Blocked by policy: curl: @file data reads an arbitrary host file")
+
+
+def _check_write_destinations(tool_name: str, binary: str, arg_list: list[str]) -> None:
+    """Block file-mutating invocations that target a sensitive destination.
+
+    Covers the write-capable system utilities (cp/mv/ln/tee/touch/mkdir) and the
+    curl/wget output flags (``-o``/``--output``, ``-O``/``--output-document``).
+    For ln, both the link path and the symlink target are checked. Positional
+    arguments for the file utilities are all checked, since any of them can be a
+    destination (cp/mv) and there is no benign reason to write into the blocked
+    locations.
+    """
+    name = tool_name if tool_name in SYSTEM_UTILITIES else binary
+
+    if name in _WRITE_CAPABLE_TOOLS:
+        positionals = [arg for arg in arg_list if not arg.startswith("-") and arg != "--"]
+        if name == "cp":
+            # cp reads every positional except the last destination.
+            positionals = positionals[-1:]
+        for arg in positionals:
+            if arg.startswith("-") or arg == "--":
+                continue
+            _raise_sensitive_write(name, arg)
+        for dest in _flag_values(
+            arg_list,
+            short_flags=frozenset({"-t"}),
+            long_flags=frozenset({"--target-directory"}),
+        ):
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name == "curl":
+        for dest in _flag_values(
+            arg_list,
+            short_flags=frozenset({"-o", "-D", "-c"}),
+            long_flags=frozenset(
+                {
+                    "--output",
+                    "--dump-header",
+                    "--cookie-jar",
+                    "--trace",
+                    "--trace-ascii",
+                    "--output-dir",
+                }
+            ),
+        ):
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name == "wget":
+        for dest in _flag_values(
+            arg_list,
+            short_flags=frozenset({"-O", "-o", "-a", "-P"}),
+            long_flags=frozenset(
+                {
+                    "--output-document",
+                    "--output-file",
+                    "--append-output",
+                    "--directory-prefix",
+                }
+            ),
+        ):
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name in ("nmap", "masscan"):
+        # Scanner output flags write to an operator-named file; block clobbering a
+        # sensitive path. -oA takes a basename that expands to several files.
+        out_flags = ("-oN", "-oX", "-oG", "-oS", "-oA", "-oL", "-oJ", "-oB")
+        for i, arg in enumerate(arg_list):
+            for f in out_flags:
+                if arg == f and i + 1 < len(arg_list):
+                    _raise_sensitive_write(name, arg_list[i + 1])
+                elif arg.startswith(f) and len(arg) > len(f):
+                    _raise_sensitive_write(name, arg[len(f) :])
+            if arg in ("--output-filename",) and i + 1 < len(arg_list):
+                _raise_sensitive_write(name, arg_list[i + 1])
+        return
+
+    if name in ("tcpdump", "tshark"):
+        for dest in _flag_values(arg_list, short_flags=frozenset({"-w"}), long_flags=frozenset()):
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name == "tar":
+        bundles = _tar_short_bundles(arg_list)
+        # Extraction writes below CWD unless -C/--directory selects a target.
+        extracting = any(arg in ("--extract", "--get") for arg in arg_list) or any("x" in bundle for bundle in bundles)
+        if extracting:
+            directories = _flag_values(
+                arg_list,
+                short_flags=frozenset({"-C"}),
+                long_flags=frozenset({"--directory"}),
+            )
+            directories.extend(_tar_short_flag_values(arg_list, "C"))
+            for dest in directories or [os.getcwd()]:
+                _raise_sensitive_write(name, dest)
+
+        # Create/append/update modes write the archive named by -f/--file.
+        writing_archive = any(arg in ("--create", "--append", "--update") for arg in arg_list) or any(
+            any(mode in bundle for mode in "cru") for bundle in bundles
+        )
+        if writing_archive:
+            archives = _flag_values(
+                arg_list,
+                short_flags=frozenset({"-f"}),
+                long_flags=frozenset({"--file"}),
+            )
+            archives.extend(_tar_short_flag_values(arg_list, "f"))
+            for dest in archives:
+                _raise_sensitive_write(name, dest)
+        return
+
+    if name == "unzip":
+        destinations = _flag_values(arg_list, short_flags=frozenset({"-d"}))
+        for dest in destinations or [os.getcwd()]:
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name == "7z":
+        destinations = _flag_values(arg_list, short_flags=frozenset({"-o"}))
+        command = next((arg for arg in arg_list if not arg.startswith("-")), "")
+        if command in {"x", "e"}:
+            destinations = destinations or [os.getcwd()]
+        elif command in {"a", "u", "d", "rn"}:
+            positionals = [arg for arg in arg_list if not arg.startswith("-")]
+            destinations.extend(positionals[1:2])
+        for dest in destinations:
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name == "zip":
+        for arg in arg_list:
+            if not arg.startswith("-"):
+                _raise_sensitive_write(name, arg)
+                break
+
+    if name in {"gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz"}:
+        # Without stdout mode these tools replace or create files beside each input.
+        if not any(arg in {"-c", "--stdout", "--to-stdout"} for arg in arg_list):
+            for path in (arg for arg in arg_list if not arg.startswith("-")):
+                _raise_sensitive_write(name, path)
+        return
+
+    if name == "openssl":
+        for dest in _flag_values(
+            arg_list,
+            short_flags=frozenset({"-out", "-keyout", "-writerand"}),
+        ):
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name in {"gpg", "age"}:
+        for dest in _flag_values(
+            arg_list,
+            short_flags=frozenset({"-o"}),
+            long_flags=frozenset({"--output"}),
+        ):
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name == "ssh-keygen":
+        for dest in _flag_values(arg_list, short_flags=frozenset({"-f"})):
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name == "convert":
+        positionals = [arg for arg in arg_list if not arg.startswith("-")]
+        if positionals:
+            _raise_sensitive_write(name, positionals[-1])
+        return
+
+    if name in {"foremost", "qrencode"}:
+        for dest in _flag_values(
+            arg_list,
+            short_flags=frozenset({"-o"}),
+            long_flags=frozenset({"--output"}),
+        ):
+            _raise_sensitive_write(name, dest)
+        return
+
+    if name == "pdftotext":
+        positionals = [arg for arg in arg_list if not arg.startswith("-")]
+        if len(positionals) >= 2:
+            _raise_sensitive_write(name, positionals[-1])
+        elif positionals:
+            source = _normalize_write_path(positionals[0])
+            if source:
+                _raise_sensitive_write(name, os.path.splitext(source)[0] + ".txt")
+        return
+
+    if name == "yq" and any(arg in {"-i", "--inplace"} for arg in arg_list):
+        for path in (arg for arg in arg_list if not arg.startswith("-")):
+            _raise_sensitive_write(name, path)
+
+
+def check_policy(tool_name: str, arg_list: list[str], binary: str | None = None) -> None:
+    """Enforce execution policy on the resolved arguments.
+
+    Raises ValueError if the command violates policy.
+    """
+    # 1. Check for blocked flags (universal)
+    for arg in arg_list:
+        for pattern, desc in BLOCKED_FLAGS:
+            if pattern.match(arg):
+                raise ValueError(f"Blocked by policy: {desc}")
+
+    # 1b. Check for tool-specific blocked flags — search() not match(), since patterns
+    # may match anywhere in the arg (e.g. awk's system() inside '{...}').
+    binary = binary or tool_name
+    for blocked_list in (TOOL_BLOCKED_FLAGS.get(tool_name, []), TOOL_BLOCKED_FLAGS.get(binary, [])):
+        for arg in arg_list:
+            for pattern, desc in blocked_list:
+                if pattern.search(arg):
+                    raise ValueError(f"Blocked by policy: {desc}")
+
+    # 1b-ii. A blocked long flag can also be reached by an unambiguous prefix on
+    # parsers that honour abbreviation, so reject those too.
+    _check_long_option_abbreviations(tool_name, binary, arg_list)
+
+    # 1c. Block file-mutating utilities (and curl/wget output flags) from writing
+    # into dotfiles/shell-rc/cron/system dirs. This is a local-write concern, so
+    # it runs regardless of the external-network policy below.
+    _check_write_destinations(tool_name, binary, arg_list)
+    _check_curl_file_reads(tool_name, binary, arg_list)
+
+    # 2. Network target checks (only for network tools, unless external is allowed)
+    if _allow_external():
+        return
+
+    if binary not in _NETWORK_TOOLS and tool_name not in _NETWORK_TOOLS:
+        return
+
+    # Check positional args and unambiguous target flags for external targets; ambiguous
+    # short flags (-t, -h) are excluded and still caught by the positional-arg heuristic below.
+    target_flags = {"--target", "-u", "--url", "--host", "--ip"}
+    i = 0
+    while i < len(arg_list):
+        arg = arg_list[i]
+        value = None
+
+        # Tool-specific exemption: flag+value pair that must not be validated
+        # as a target (e.g. curl's "-u user:pass" is HTTP auth, not a URL).
+        matched, consumed, flag, exempt_value = _exempt_flag_value(
+            tool_name,
+            binary,
+            arg,
+            arg_list[i + 1] if i + 1 < len(arg_list) else None,
+        )
+        if matched:
+            _validate_exempt_remote_resource(tool_name, binary, flag, exempt_value)
+            i += consumed
+            continue
+
+        if arg in target_flags and i + 1 < len(arg_list):
+            value = arg_list[i + 1]
+            i += 2
+        elif "=" in arg and arg.split("=", 1)[0] in target_flags:
+            value = arg.split("=", 1)[1]
+            i += 1
+        elif arg.startswith("@") and len(arg) > 1:
+            # dig/host/nslookup "@server" selects an explicit resolver that must be
+            # allowlist-validated (else "dig @8.8.8.8 localhost" reaches a public resolver),
+            # so strip the '@' and classify the remainder.
+            server = arg[1:]
+            if _looks_like_target(server):
+                value = server
+            i += 1
+        elif (tool_name == "curl" or binary == "curl") and arg in _CURL_REDIRECT_FLAGS and i + 1 < len(arg_list):
+            _validate_curl_redirect_target(arg, arg_list[i + 1])
+            i += 2
+            continue
+        elif (tool_name == "curl" or binary == "curl") and "=" in arg and arg.split("=", 1)[0] in _CURL_REDIRECT_FLAGS:
+            _cr_flag, _cr_val = arg.split("=", 1)
+            _validate_curl_redirect_target(_cr_flag, _cr_val)
+            i += 1
+            continue
+        elif arg in _PROXY_FLAGS and i + 1 < len(arg_list):
+            _validate_proxy_target(arg_list[i + 1])
+            i += 2
+            continue
+        elif any(arg.startswith(flag) and arg != flag for flag in _ATTACHED_PROXY_FLAGS):
+            for flag in _ATTACHED_PROXY_FLAGS:
+                if arg.startswith(flag) and arg != flag:
+                    value = arg[len(flag) :]
+                    if value.startswith("="):
+                        value = value[1:]
+                    _validate_proxy_target(value)
+                    break
+            i += 1
+            continue
+        elif "=" in arg and arg.split("=", 1)[0] in _PROXY_FLAGS:
+            _validate_proxy_target(arg.split("=", 1)[1])
+            i += 1
+            continue
+        elif not arg.startswith("-") and not arg.startswith("/"):
+            # Positional arg — only validate if it looks like a network target.
+            # Skip bare numbers (port/timeout values for flags like -p 80, -T 4)
+            # and plain words (flag values like -l admin, --script vuln).
+            if _looks_like_target(arg) and not _is_non_target_positional(tool_name, binary, arg):
+                value = arg
+            i += 1
+        else:
+            # Unrecognized flag. First close the embedded-value bypass: a target
+            # joined to the flag as -flag=<host> (single/double-dash long flags like
+            # goflags' -target=/-host=/-domain=) or attached as -f<host> never reaches
+            # the separated-token heuristic below, so extract and allowlist-check it
+            # here. Only strong targets are validated (see _looks_like_external_target)
+            # so boolean flags (-silent) and local output names (-o=results) don't trip.
+            _embedded = None
+            if "=" in arg:
+                _embedded = arg.split("=", 1)[1]
+            elif not arg.startswith("--") and len(arg) > 2:
+                _embedded = arg[2:]
+            if (
+                _embedded
+                and _looks_like_external_target(_embedded)
+                and not (_has_file_extension(_embedded) and _is_local_path(_embedded))
+            ):
+                value = _embedded
+                i += 1
+                # fall through (no continue) to the allowlist check below
+            else:
+                # After --long-flags, the next non-flag token may be a flag value
+                # (--script vuln) or a real target after a boolean flag (--open evil.com).
+                # Use the same _looks_like_target heuristic as positional args so
+                # encoded-integer IPs and bare single-label hostnames (which lack
+                # dots/colons/slashes) are still validated — a leading-flag form must
+                # not be more lenient than the positional one. Plain non-target words
+                # are consumed as flag values.
+                if arg.startswith("-") and i + 1 < len(arg_list) and not arg_list[i + 1].startswith("-"):
+                    next_token = arg_list[i + 1]
+                    # Skip tokens with file extensions as flag values (scan.txt, report.json)
+                    # — but only when clearly a LOCAL path, since some extensions are also live
+                    # TLDs (evil.zip, example.mobi) that must fall through to target validation
+                    # and not launder an external host past the allowlist.
+                    if _looks_like_target(next_token) and (
+                        not _has_file_extension(next_token) or not _is_local_path(next_token)
+                    ):
+                        # Looks like a real target — don't consume, validate next iteration
+                        i += 1
+                    else:
+                        # Plain word or filename — likely a flag value, consume it
+                        i += 2
+                else:
+                    i += 1
+                continue
+
+        if value:
+            clean = _network_target_host(value)
+            if not _is_safe_target(clean):
+                raise ValueError(
+                    f"Blocked by policy: target '{value}' is not in a private/local "
+                    f"network range. Set CYBERSEC_MCP_ALLOW_EXTERNAL=1 to allow "
+                    f"external targets."
+                )
+
+
+# Validation and execution logic
+def validate_tool_for_execution(tool_name: str, tools_db: ToolsDatabase) -> str:
+    """Validate that a tool can be executed. Returns the resolved binary name.
+
+    System utilities (cat, grep, curl, etc.) bypass the registry check but
+    still require the binary to be present in PATH.
+
+    Raises ValueError if the tool cannot be executed.
+    """
+    # System utilities: skip registry check, just verify PATH
+    if tool_name in SYSTEM_UTILITIES:
+        path = shutil.which(tool_name)
+        if not path:
+            raise ValueError(f"System utility '{tool_name}' is not installed or not in PATH")
+        return tool_name
+
+    tool = tools_db.tools_by_name.get(tool_name)
+    if not tool:
+        raise ValueError(f"Tool '{tool_name}' not found in tools_config.json")
+
+    if tool["method"] in NON_EXECUTABLE_METHODS:
+        raise ValueError(
+            f"Tool '{tool_name}' uses install method '{tool['method']}' and is not directly executable as a CLI command"
+        )
+
+    # Resolve binary name (pipx packages may have different binary names)
+    binary = resolve_binary_name(tool["method"], tool_name)
+
+    path = shutil.which(binary)
+    if not path:
+        raise ValueError(f"Tool '{tool_name}' (binary: '{binary}') is not installed or not in PATH")
+
+    return binary
+
+
+# Max length for args string to prevent DoS from huge input (100KB is plenty for CLI args)
+MAX_ARGS_LEN = 100_000
+
+# Per-read chunk size for _bounded_communicate.
+_READ_CHUNK = 65_536
+
+
+def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+    """SIGKILL the whole process group so a timed-out tool's forked children die too.
+
+    Each subprocess is started with ``start_new_session=True``, making it the leader
+    of a new group whose id equals its pid. ``process.kill()`` signals only the
+    direct child, leaving grandchildren (workers a tool forked) running past the
+    timeout. Falls back to the direct process if the group is already gone. (SSH
+    remotes are the exception: killing the local ssh client cannot reap a process
+    still running on the remote host.)
+    """
+    pid = process.pid
+    # os.killpg() accepts any object with __index__, and a test double coerces to 1.
+    # killpg(1) is kill(-1): SIGKILL to every process this user owns. killpg(0) would
+    # signal our own group. Neither is ever a valid target, so require a real child pid.
+    if not isinstance(pid, int) or pid <= 1:
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+
+async def _bounded_communicate(
+    process: asyncio.subprocess.Process,
+    *,
+    input_bytes: bytes | None = None,
+    max_stream_bytes: int,
+) -> tuple[bytes, bool, bytes, bool]:
+    """Bounded, concurrent replacement for ``process.communicate()``.
+
+    Streams stdout/stderr off the child concurrently (so a full pipe buffer
+    on either stream does not deadlock the child), keeping at most
+    *max_stream_bytes* in memory per stream. Any bytes past the cap are
+    still drained from the pipe — and discarded — so the child can exit.
+
+    Returns ``(stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated)``.
+
+    Memory stays O(max_stream_bytes) however much the child writes. The caller
+    is still responsible for timeout + kill on hang.
+    """
+    stdout_truncated = [False]
+    stderr_truncated = [False]
+
+    async def _drain(stream: asyncio.StreamReader | None, flag: list[bool]) -> bytes:
+        if stream is None:
+            return b""
+        captured = bytearray()
+        while True:
+            chunk = await stream.read(_READ_CHUNK)
+            if not chunk:
+                break
+            if len(captured) < max_stream_bytes:
+                space = max_stream_bytes - len(captured)
+                captured.extend(chunk[:space])
+                if len(chunk) > space:
+                    flag[0] = True
+            else:
+                flag[0] = True
+        return bytes(captured)
+
+    async def _write_stdin() -> None:
+        if process.stdin is None or input_bytes is None:
+            return
+        try:
+            process.stdin.write(input_bytes)
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+
+    # Drain both pipes concurrently; write stdin alongside so a child that
+    # blocks on a full stdout pipe while we block on its stdin can't deadlock.
+    stdout_task = asyncio.create_task(_drain(process.stdout, stdout_truncated))
+    stderr_task = asyncio.create_task(_drain(process.stderr, stderr_truncated))
+    writer_task: asyncio.Task[None] | None = None
+    if input_bytes is not None and process.stdin is not None:
+        writer_task = asyncio.create_task(_write_stdin())
+
+    stdout_bytes, stderr_bytes = await asyncio.gather(stdout_task, stderr_task)
+    if writer_task is not None:
+        await writer_task
+
+    await process.wait()
+
+    return stdout_bytes, stdout_truncated[0], stderr_bytes, stderr_truncated[0]
+
+
+def _append_truncation_marker(text: str, max_bytes: int) -> str:
+    """Append the truncation marker within max_bytes; forced even when the text
+    fits because the stream was capped upstream.
+    """
+    truncated_text, was_truncated = truncate_output(text, max_bytes)
+    if was_truncated:
+        return truncated_text
+    # truncate_output left text intact (it already fit within max_bytes), but the
+    # stream WAS bounded upstream — append the marker using the same format,
+    # trimming from the tail if needed to stay within max_bytes.
+    marker = f"\n... [truncated at {max_bytes} bytes]"
+    marker_bytes = marker.encode("utf-8")
+    encoded = text.encode("utf-8")
+    if len(encoded) + len(marker_bytes) <= max_bytes:
+        return text + marker
+    cut = max(0, max_bytes - len(marker_bytes))
+    return encoded[:cut].decode("utf-8", errors="ignore") + marker
+
+
+def _finalize_stream(text: str, max_bytes: int, was_capped: bool) -> str:
+    """Sanitize a captured stream, then bound it to ``max_bytes``.
+
+    Order matters: :func:`sanitize_output` inserts ``[SANITIZED] `` prefixes, so
+    applying the byte budget first lets the returned text exceed ``max_bytes``.
+    The budget is applied even when the stream was not capped upstream, for the
+    same reason — sanitizing can push an under-limit stream over it.
+    """
+    text = sanitize_output(text)
+    if was_capped:
+        return _append_truncation_marker(text, max_bytes)
+    bounded, _ = truncate_output(text, max_bytes)
+    return bounded
+
+
+def _step_args_to_str(step: dict) -> str:
+    """Normalize pipeline step 'args' to a string for sanitize_args.
+
+    Accepts str or list of strings (e.g. from JSON API). Other types are stringified.
+    """
+    raw = step.get("args", "")
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        return " ".join(shlex.quote(str(a)) for a in raw)
+    return str(raw) if raw is not None else ""
+
+
+def sanitize_args(args: str) -> list[str]:
+    """Parse and sanitize command-line arguments.
+
+    Raises ValueError on dangerous patterns.
+    """
+    if not isinstance(args, str):
+        args = str(args) if args is not None else ""
+    if not args or not args.strip():
+        return []
+
+    if len(args) > MAX_ARGS_LEN:
+        raise ValueError(
+            f"Arguments string exceeds max length ({MAX_ARGS_LEN} bytes). "
+            "Split into multiple tool calls or shorten arguments."
+        )
+
+    # A NUL byte truncates the arg at the execve boundary, so reject it rather
+    # than let executil raise a raw ValueError past the policy layer.
+    if "\x00" in args:
+        raise ValueError("Arguments contain a NUL byte")
+
+    # Check for dangerous shell metacharacters before parsing
+    if _DANGEROUS_PATTERNS.search(args):
+        raise ValueError(f"Arguments contain blocked shell metacharacters: {args!r}. Blocked patterns: | ` $( ${{")
+
+    try:
+        parsed = shlex.split(args)
+    except ValueError as e:
+        raise ValueError(f"Failed to parse arguments: {e}") from e
+
+    return parsed
+
+
+async def execute_tool(
+    tool_name: str,
+    args: str,
+    tools_db: ToolsDatabase,
+    timeout: int = 120,
+    max_output: int = 200000,
+) -> dict:
+    """Execute a tool safely and return its output.
+
+    Returns dict with: exit_code, stdout, stderr, truncated, command.
+    """
+    exec_start = time.monotonic()
+
+    # Validate, sanitize, and enforce policy — return structured errors
+    try:
+        binary = validate_tool_for_execution(tool_name, tools_db)
+        log_validation(tool_name, "resolve", True, detail=binary)
+        arg_list = sanitize_args(args)
+        log_validation(tool_name, "sanitize", True, detail=f"{len(arg_list)} args")
+        await asyncio.to_thread(check_policy, tool_name, arg_list, binary)
+        log_validation(tool_name, "policy", True)
+    except ValueError as e:
+        log_validation(tool_name, "failed", False, detail=str(e))
+        log_blocked(tool_name=tool_name, args=args, reason=str(e))
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(e),
+            "truncated": False,
+            "command": tool_name + (" " + args if args else ""),
+        }
+
+    timeout = max(1, min(timeout, 300))
+
+    command = [binary] + arg_list
+
+    # Check rate limit BEFORE acquiring semaphore to avoid holding slots on rate-limit errors
+    try:
+        await _rate_limiter.acquire()
+    except ValueError as e:
+        log_blocked(tool_name=tool_name, args=args, reason=str(e))
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(e),
+            "truncated": False,
+            "command": tool_name + (" " + args if args else ""),
+        }
+
+    async with _rate_limiter._semaphore:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # own process group, so killpg reaps forks
+                env=_child_env(),
+            )
+
+            try:
+                stdout_bytes, t_read_stdout, stderr_bytes, t_read_stderr = await asyncio.wait_for(
+                    _bounded_communicate(process, max_stream_bytes=max_output),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                _kill_process_group(process)
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass  # Process may be in D state; leave as zombie rather than hang
+                cmd_str = shlex.join(command)
+                elapsed = (time.monotonic() - exec_start) * 1000
+                log_execution(
+                    tool_name=tool_name,
+                    args=args,
+                    host="localhost",
+                    exit_code=-1,
+                    command=cmd_str,
+                    duration_ms=elapsed,
+                )
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Process timed out after {timeout} seconds",
+                    "truncated": False,
+                    "command": cmd_str,
+                }
+
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+            truncated = t_read_stdout or t_read_stderr
+            stdout = _finalize_stream(stdout, max_output, t_read_stdout)
+            stderr = _finalize_stream(stderr, max_output, t_read_stderr)
+
+            cmd_str = shlex.join(command)
+            rc = process.returncode if process.returncode is not None else -1
+            elapsed = (time.monotonic() - exec_start) * 1000
+            log_execution(
+                tool_name=tool_name,
+                args=args,
+                host="localhost",
+                exit_code=rc,
+                command=cmd_str,
+                duration_ms=elapsed,
+                stdout_len=len(stdout),
+                stderr_len=len(stderr),
+                truncated=truncated,
+            )
+
+            return {
+                "exit_code": rc,
+                "stdout": stdout,
+                "stderr": stderr,
+                "truncated": truncated,
+                "command": cmd_str,
+            }
+
+        except FileNotFoundError:
+            cmd_str = shlex.join(command)
+            elapsed = (time.monotonic() - exec_start) * 1000
+            log_execution(
+                tool_name=tool_name,
+                args=args,
+                host="localhost",
+                exit_code=-1,
+                command=cmd_str,
+                duration_ms=elapsed,
+            )
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Binary '{binary}' not found",
+                "truncated": False,
+                "command": cmd_str,
+            }
+        except OSError as e:
+            cmd_str = shlex.join(command)
+            elapsed = (time.monotonic() - exec_start) * 1000
+            log_execution(
+                tool_name=tool_name,
+                args=args,
+                host="localhost",
+                exit_code=-1,
+                command=cmd_str,
+                duration_ms=elapsed,
+            )
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Failed to execute: {e}",
+                "truncated": False,
+                "command": cmd_str,
+            }
+
+
+# Pipeline execution — safe stdin piping without shell
+
+MAX_PIPELINE_STEPS = 10
+
+
+def _pipeline_error(msg: str) -> dict:
+    """Return a structured error for pipeline failures."""
+    return {
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": msg,
+        "truncated": False,
+        "commands": [],
+        "step_count": 0,
+        "step_results": [],
+        "had_failures": True,
+    }
+
+
+async def _run_pipeline_steps(
+    steps: list[dict],
+    tools_db: ToolsDatabase,
+    timeout: int,
+    max_output: int,
+    pipeline_id: str = "",
+) -> dict:
+    """Execute validated pipeline steps, piping stdout→stdin between them.
+
+    Piped stdin is not scope-validated: a stdin-reading network tool can be fed
+    an external target produced by a prior step. See execute_pipeline and
+    SECURITY.md.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    prev_output: bytes | None = None
+    commands: list[str] = []
+    step_results: list[dict[str, Any]] = []
+    truncated_any = False
+
+    for i, step in enumerate(steps):
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Pipeline timed out at step {i + 1}",
+                "truncated": False,
+                "commands": commands,
+                "step_count": i,
+                "failed_step": i + 1,
+                "step_results": step_results,
+                "had_failures": True,
+            }
+
+        step_start = time.monotonic()
+        binary = validate_tool_for_execution(step["tool"], tools_db)
+        arg_list = sanitize_args(_step_args_to_str(step))
+        command = [binary] + arg_list
+        cmd_str = shlex.join(command)
+        commands.append(cmd_str)
+
+        stdin_mode = asyncio.subprocess.DEVNULL if i == 0 else asyncio.subprocess.PIPE
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=stdin_mode,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                env=_child_env(),
+            )
+
+            try:
+                stdout_bytes, t_read_stdout, stderr_bytes, t_read_stderr = await asyncio.wait_for(
+                    _bounded_communicate(
+                        process,
+                        input_bytes=prev_output if i > 0 else None,
+                        max_stream_bytes=max_output,
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                _kill_process_group(process)
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                step_elapsed = (time.monotonic() - step_start) * 1000
+                log_pipeline_step(pipeline_id, i + 1, step["tool"], -1, step_elapsed)
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Pipeline timed out at step {i + 1} after {timeout}s",
+                    "truncated": False,
+                    "commands": commands,
+                    "step_count": i + 1,
+                    "failed_step": i + 1,
+                    "step_results": step_results
+                    + [
+                        {
+                            "step": i + 1,
+                            "tool": step["tool"],
+                            "exit_code": -1,
+                            "stderr": f"Pipeline timed out after {timeout}s",
+                            "output_bytes": 0,
+                            "truncated": False,
+                        }
+                    ],
+                    "had_failures": True,
+                }
+
+            truncated_any = truncated_any or t_read_stdout or t_read_stderr
+
+            rc = process.returncode if process.returncode is not None else -1
+            step_elapsed = (time.monotonic() - step_start) * 1000
+            log_pipeline_step(
+                pipeline_id,
+                i + 1,
+                step["tool"],
+                rc,
+                step_elapsed,
+                output_bytes=len(stdout_bytes),
+            )
+            step_stderr, step_stderr_truncated = truncate_output(
+                sanitize_output(stderr_bytes.decode("utf-8", errors="replace")),
+                4096,
+            )
+            step_results.append(
+                {
+                    "step": i + 1,
+                    "tool": step["tool"],
+                    "exit_code": rc,
+                    "stderr": step_stderr,
+                    "output_bytes": len(stdout_bytes),
+                    "truncated": t_read_stdout or t_read_stderr or step_stderr_truncated,
+                }
+            )
+            if rc != 0 and i < len(steps) - 1:
+                # Intermediate step with non-zero exit (e.g. grep returning 1
+                # for "no matches") — continue the pipeline with whatever
+                # output was produced, mirroring shell pipe behaviour.
+                prev_output = stdout_bytes
+                continue
+            elif rc != 0:
+                # Last step with non-zero exit — return output along with
+                # the exit code (like a shell pipe does).
+                stdout = _finalize_stream(stdout_bytes.decode("utf-8", errors="replace"), max_output, truncated_any)
+                stderr = _finalize_stream(stderr_bytes.decode("utf-8", errors="replace"), max_output, False)
+                return {
+                    "exit_code": rc,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "truncated": truncated_any,
+                    "commands": commands,
+                    "step_count": len(steps),
+                    "step_results": step_results,
+                    "had_failures": True,
+                }
+            else:
+                prev_output = stdout_bytes
+
+        except FileNotFoundError:
+            step_elapsed = (time.monotonic() - step_start) * 1000
+            log_pipeline_step(pipeline_id, i + 1, step["tool"], -1, step_elapsed)
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Binary not found for step {i + 1}: {cmd_str}",
+                "truncated": False,
+                "commands": commands,
+                "step_count": i + 1,
+                "failed_step": i + 1,
+                "step_results": step_results,
+                "had_failures": True,
+            }
+        except OSError as e:
+            step_elapsed = (time.monotonic() - step_start) * 1000
+            log_pipeline_step(pipeline_id, i + 1, step["tool"], -1, step_elapsed)
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Failed to execute step {i + 1}: {e}",
+                "truncated": False,
+                "commands": commands,
+                "step_count": i + 1,
+                "failed_step": i + 1,
+                "step_results": step_results,
+                "had_failures": True,
+            }
+
+    # Final output — append truncation marker if any step was bounded
+    stdout = _finalize_stream((prev_output or b"").decode("utf-8", errors="replace"), max_output, truncated_any)
+
+    return {
+        "exit_code": 0,
+        "stdout": stdout,
+        "stderr": "",
+        "truncated": truncated_any,
+        "commands": commands,
+        "step_count": len(steps),
+        "step_results": step_results,
+        "had_failures": any(step["exit_code"] != 0 for step in step_results),
+    }
+
+
+async def execute_pipeline(
+    steps: list[dict],
+    tools_db: ToolsDatabase,
+    timeout: int = 120,
+    max_output: int = 200000,
+) -> dict:
+    """Execute a pipeline of tools, piping stdout→stdin between steps.
+
+    Each step is validated (allowlist, sanitize_args, check_policy) before
+    any process is started. Uses asyncio.create_subprocess_exec (no shell).
+
+    Scope note: check_policy inspects each step's argv only. A step that reads
+    its targets from stdin (e.g. httpx/dnsx/naabu) is not scope-checked on the
+    piped-in bytes, so a prior step's stdout can carry an external target that
+    the argv-only external-network policy would reject on a lone run_tool call.
+    Pipelines are a no-shell composition primitive, not a network-scope
+    boundary; see SECURITY.md.
+
+    Args:
+        steps: List of dicts with 'tool' and optional 'args' keys.
+        tools_db: ToolsDatabase for allowlist validation.
+        timeout: Global timeout for entire pipeline (clamped 1-300).
+        max_output: Max output size for final step.
+
+    Returns:
+        Dict with exit_code, stdout, stderr, truncated, commands, step_count,
+        step_results, and had_failures. The final exit code retains shell-pipe
+        compatibility while step_results exposes intermediate failures.
+    """
+    if not steps:
+        return _pipeline_error("Pipeline must have at least 1 step")
+    if len(steps) > MAX_PIPELINE_STEPS:
+        return _pipeline_error(f"Pipeline exceeds max {MAX_PIPELINE_STEPS} steps (got {len(steps)})")
+
+    # Validate step shape before logging, which reads each step's fields.
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            return _pipeline_error(f"Step {i + 1} must be an object with a 'tool' key")
+        if "tool" not in step:
+            return _pipeline_error(f"Step {i + 1} missing required 'tool' key")
+        if not isinstance(step["tool"], str):
+            return _pipeline_error(f"Step {i + 1} 'tool' must be a string")
+
+    pipeline_id = log_pipeline_start(steps, timeout)
+    pipe_start = time.monotonic()
+
+    # Pre-validate ALL steps before executing any (shape already checked above).
+    for i, step in enumerate(steps):
+        try:
+            binary = validate_tool_for_execution(step["tool"], tools_db)
+            args_str = _step_args_to_str(step)
+            arg_list = sanitize_args(args_str)
+            await asyncio.to_thread(check_policy, step["tool"], arg_list, binary)
+        except ValueError as e:
+            log_blocked(tool_name=step["tool"], args=_step_args_to_str(step), reason=str(e))
+            return _pipeline_error(f"Step {i + 1} ({step['tool']}): {e}")
+
+    timeout = max(1, min(timeout, 300))
+
+    # Check rate limit BEFORE acquiring semaphore
+    try:
+        await _rate_limiter.acquire()
+    except ValueError as e:
+        return _pipeline_error(str(e))
+
+    async with _rate_limiter._semaphore:
+        result = await _run_pipeline_steps(steps, tools_db, timeout, max_output, pipeline_id)
+
+    elapsed = (time.monotonic() - pipe_start) * 1000
+    log_pipeline_result(
+        pipeline_id,
+        result.get("exit_code", -1),
+        elapsed,
+        result.get("step_count", 0),
+        result.get("truncated", False),
+    )
+    return result
+
+
+# Script execution — write-and-run Python/Bash scripts
+
+_SCRIPT_LANGUAGES = {"python": ".py", "bash": ".sh"}
+
+
+def _resolve_venv_interpreter(venv_name: str) -> str | None:
+    """Resolve a venv name to its Python interpreter path.
+
+    Searches CYBERSEC_MCP_VENVS_DIR (default ~/.ctf-venvs/) for a venv
+    with the given name and returns the python binary path if it exists.
+
+    The venv name is validated to prevent path traversal outside the
+    venvs directory.
+    """
+    # Reject path separators and traversal components
+    if os.sep in venv_name or "/" in venv_name or "\x00" in venv_name or venv_name in (".", ".."):
+        return None
+    venvs_dir = os.environ.get("CYBERSEC_MCP_VENVS_DIR", "").strip()
+    if not venvs_dir:
+        venvs_dir = os.path.expanduser("~/.ctf-venvs")
+    try:
+        venvs_dir = os.path.realpath(venvs_dir)
+    except OSError:
+        return None
+    venv_root = os.path.join(venvs_dir, venv_name)
+    # Require venv path to exist and be a directory before resolving (avoids realpath on missing path)
+    if not os.path.isdir(venv_root):
+        return None
+    try:
+        if not os.path.realpath(venv_root).startswith(venvs_dir + os.sep):
+            return None
+    except OSError:
+        return None
+    venv_python = os.path.join(venv_root, "bin", "python")
+    if os.path.isfile(venv_python):
+        return venv_python
+    # Windows compat
+    venv_python_win = os.path.join(venv_root, "Scripts", "python.exe")
+    if os.path.isfile(venv_python_win):
+        return venv_python_win
+    return None
+
+
+async def execute_script(
+    code: str,
+    language: str = "python",
+    timeout: int = 120,
+    max_output: int = 200000,
+    working_dir: str | None = None,
+    venv: str | None = None,
+) -> dict:
+    """Write code to a temp file and execute it via python3/bash.
+
+    Gated by CYBERSEC_MCP_ALLOW_SCRIPTS=1 env variable.
+
+    Returns dict with: exit_code, stdout, stderr, truncated, language,
+    script_file, working_dir.
+    """
+    # Env gate
+    if not _allow_scripts():
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": ("Script execution is disabled. Set CYBERSEC_MCP_ALLOW_SCRIPTS=1 to enable."),
+            "truncated": False,
+            "language": language,
+            "script_file": "",
+            "working_dir": "",
+        }
+
+    lang = language.lower().strip()
+    if lang not in _SCRIPT_LANGUAGES:
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Unsupported language '{language}'. Supported: {', '.join(sorted(_SCRIPT_LANGUAGES))}",
+            "truncated": False,
+            "language": language,
+            "script_file": "",
+            "working_dir": "",
+        }
+
+    if not code or not code.strip():
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "Script code is empty",
+            "truncated": False,
+            "language": lang,
+            "script_file": "",
+            "working_dir": "",
+        }
+
+    # Find interpreter
+    if lang == "python":
+        if venv:
+            resolved = _resolve_venv_interpreter(venv)
+            if resolved:
+                interpreter = resolved
+            else:
+                venvs_dir = os.environ.get("CYBERSEC_MCP_VENVS_DIR", "").strip() or os.path.expanduser("~/.ctf-venvs")
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Venv '{venv}' not found. Expected: {venvs_dir}/{venv}/bin/python",
+                    "truncated": False,
+                    "language": lang,
+                    "script_file": "",
+                    "working_dir": "",
+                }
+        else:
+            interpreter = sys.executable
+    else:
+        interpreter = shutil.which("bash")
+        if not interpreter:
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Interpreter 'bash' not found in PATH",
+                "truncated": False,
+                "language": lang,
+                "script_file": "",
+                "working_dir": "",
+            }
+
+    if working_dir:
+        wd = Path(working_dir)
+        if not wd.is_dir():
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Working directory '{working_dir}' does not exist or is not a directory",
+                "truncated": False,
+                "language": lang,
+                "script_file": "",
+                "working_dir": working_dir,
+            }
+        cwd = str(wd)
+    else:
+        cwd = tempfile.gettempdir()
+
+    timeout = max(1, min(timeout, 300))
+
+    suffix = _SCRIPT_LANGUAGES[lang]
+    fd, script_path = tempfile.mkstemp(suffix=suffix, prefix="mcp_script_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(code.encode("utf-8"))
+
+        # Audit log BEFORE execution
+        log_script_execution(
+            language=lang,
+            code=code,
+            script_file=script_path,
+            working_dir=cwd,
+            venv=venv or "",
+        )
+        script_start = time.monotonic()
+
+        # Check rate limit BEFORE acquiring semaphore
+        try:
+            await _rate_limiter.acquire()
+        except ValueError as e:
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": str(e),
+                "truncated": False,
+                "language": lang,
+                "script_file": script_path,
+                "working_dir": cwd,
+            }
+
+        async with _rate_limiter._semaphore:
+            # Execute
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    interpreter,
+                    script_path,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                    start_new_session=True,
+                    env=_child_env(),
+                )
+
+                try:
+                    stdout_bytes, t_read_stdout, stderr_bytes, t_read_stderr = await asyncio.wait_for(
+                        _bounded_communicate(process, max_stream_bytes=max_output),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    _kill_process_group(process)
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    elapsed = (time.monotonic() - script_start) * 1000
+                    log_script_result(lang, -1, elapsed, script_file=script_path)
+                    return {
+                        "exit_code": -1,
+                        "stdout": "",
+                        "stderr": f"Script timed out after {timeout} seconds",
+                        "truncated": False,
+                        "language": lang,
+                        "script_file": script_path,
+                        "working_dir": cwd,
+                    }
+
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+                truncated = t_read_stdout or t_read_stderr
+                stdout = _finalize_stream(stdout, max_output, t_read_stdout)
+                stderr = _finalize_stream(stderr, max_output, t_read_stderr)
+
+                rc = process.returncode if process.returncode is not None else -1
+                elapsed = (time.monotonic() - script_start) * 1000
+                log_script_result(
+                    lang,
+                    rc,
+                    elapsed,
+                    script_file=script_path,
+                    stdout_len=len(stdout),
+                    stderr_len=len(stderr),
+                    truncated=truncated,
+                )
+
+                return {
+                    "exit_code": rc,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "truncated": truncated,
+                    "language": lang,
+                    "script_file": script_path,
+                    "working_dir": cwd,
+                }
+
+            except FileNotFoundError:
+                elapsed = (time.monotonic() - script_start) * 1000
+                log_script_result(lang, -1, elapsed, script_file=script_path)
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Interpreter '{interpreter}' not found",
+                    "truncated": False,
+                    "language": lang,
+                    "script_file": script_path,
+                    "working_dir": cwd,
+                }
+            except OSError as e:
+                elapsed = (time.monotonic() - script_start) * 1000
+                log_script_result(lang, -1, elapsed, script_file=script_path)
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Failed to execute script: {e}",
+                    "truncated": False,
+                    "language": lang,
+                    "script_file": script_path,
+                    "working_dir": cwd,
+                }
+    finally:
+        # Cleanup temp file
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+
+# Remote execution support
+
+
+def validate_tool_for_remote_execution(tool_name: str, tools_db: ToolsDatabase) -> str:
+    """Validate that a tool can be executed remotely. Returns the resolved binary name.
+
+    Like validate_tool_for_execution but skips the local shutil.which() check
+    since the tool only needs to be installed on the remote host.
+    System utilities bypass the registry check entirely for remote execution.
+
+    Raises ValueError if the tool cannot be executed.
+    """
+    # System utilities: no registry or PATH check needed for remote
+    if tool_name in SYSTEM_UTILITIES:
+        return tool_name
+
+    tool = tools_db.tools_by_name.get(tool_name)
+    if not tool:
+        raise ValueError(f"Tool '{tool_name}' not found in tools_config.json")
+
+    if tool["method"] in NON_EXECUTABLE_METHODS:
+        raise ValueError(
+            f"Tool '{tool_name}' uses install method '{tool['method']}' and is not directly executable as a CLI command"
+        )
+
+    return resolve_binary_name(tool["method"], tool_name)
+
+
+async def execute_tool_remote(
+    tool_name: str,
+    args: str,
+    tools_db: ToolsDatabase,
+    remote_config: Any,
+    host: str,
+    timeout: int = 120,
+    max_output: int = 200000,
+) -> dict:
+    """Execute a tool on a remote host via SSH.
+
+    Runs all security checks (sanitize_args, check_policy) locally before
+    sending the command over SSH.
+
+    Returns dict with: exit_code, stdout, stderr, truncated, command, remote.
+    """
+    from mcp_server.remote import execute_remote_command
+
+    # Validate, sanitize, and enforce policy locally
+    try:
+        # Allowlist check first
+        if not remote_config.check_tool_allowed(host, tool_name):
+            raise ValueError(f"Tool '{tool_name}' is not in the allowlist for host '{host}'")
+        binary = validate_tool_for_remote_execution(tool_name, tools_db)
+        arg_list = sanitize_args(args)
+        await asyncio.to_thread(check_policy, tool_name, arg_list, binary)
+        # Target validation may block on DNS.
+        ssh_args = await asyncio.to_thread(remote_config.get_ssh_base_args, host)
+    except ValueError as e:
+        log_blocked(tool_name=tool_name, args=args, reason=str(e), host=host, remote=True)
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(e),
+            "truncated": False,
+            "command": tool_name + (" " + args if args else ""),
+            "remote": True,
+        }
+
+    command = [binary] + arg_list
+
+    # Check rate limit BEFORE acquiring semaphore (consistent with execute_tool)
+    try:
+        await _rate_limiter.acquire()
+    except ValueError as e:
+        log_blocked(tool_name=tool_name, args=args, reason=str(e), host=host, remote=True)
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(e),
+            "truncated": False,
+            "command": tool_name + (" " + args if args else ""),
+            "remote": True,
+        }
+
+    async with _rate_limiter._semaphore:
+        result = await execute_remote_command(ssh_args, command, timeout=timeout, max_output=max_output)
+
+    result["stdout"] = sanitize_output(result.get("stdout", ""))
+    result["stderr"] = sanitize_output(result.get("stderr", ""))
+
+    log_execution(
+        tool_name=tool_name,
+        args=args,
+        host=host,
+        exit_code=result.get("exit_code", -1),
+        command=result.get("command", ""),
+        remote=True,
+    )
+
+    return result

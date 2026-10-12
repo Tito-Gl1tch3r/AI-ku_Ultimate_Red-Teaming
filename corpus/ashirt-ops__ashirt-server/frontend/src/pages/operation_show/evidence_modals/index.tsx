@@ -1,0 +1,818 @@
+import { type ReactNode, useState, useEffect, useCallback, type MouseEvent } from 'react'
+import classnames from 'classnames/bind'
+import {
+  type Evidence,
+  type EvidenceMetadata,
+  type Finding,
+  type Tag,
+  type CodeBlock,
+  type SubmittableEvidence,
+  type Operation,
+  type TagDifference,
+  type SupportedEvidenceType,
+} from 'src/global_types'
+import {
+  codeblockToBlob,
+  highlightSubstring,
+  useForm,
+  useFormField,
+  useWiredData,
+} from 'src/helpers'
+import {
+  createEvidence,
+  createEvidenceMetadata,
+  updateEvidence,
+  deleteEvidence,
+  changeFindingsOfEvidence,
+  getFindingsOfEvidence,
+  getEvidenceAsCodeblock,
+  getOperations,
+  getEvidenceMigrationDifference,
+  moveEvidence,
+  readEvidenceMetadata,
+  updateEvidenceMetadata,
+  runServiceWorkerForEvidence,
+  listActiveServiceWorkers,
+  hasFlag,
+} from 'src/services'
+
+import BinaryUpload from 'src/components/binary_upload'
+import { default as Button, ButtonGroup } from 'src/components/button'
+import Checkbox from 'src/components/checkbox'
+import { CodeBlockEditor } from 'src/components/code_block'
+import ComboBox from 'src/components/combobox'
+import { ExpandableSection } from 'src/components/expandable_area'
+import FindingChooser from 'src/components/finding_chooser'
+import Form from 'src/components/form'
+import ImageUpload from 'src/components/image_upload'
+import { default as Input, TextArea } from 'src/components/input'
+import ModalForm from 'src/components/modal_form'
+import Modal from 'src/components/modal'
+import TagChooser from 'src/components/bullet_chooser/tag_chooser'
+import TabMenu from 'src/components/tabs'
+import TagList from 'src/components/tag_list'
+import DateTimePicker from 'src/components/date_time_picker'
+import SplitInputRow from 'src/components/split_input_row'
+import WithLabel from 'src/components/with_label'
+import { format, isValid } from 'date-fns'
+
+const cx = classnames.bind(require('./stylesheet'))
+
+export const CreateEvidenceModal = (props: {
+  onCreated: () => void
+  onRequestClose: () => void
+  operationSlug: string
+}) => {
+  const descriptionField = useFormField<string>('')
+  const tagsField = useFormField<Array<Tag>>([])
+  const binaryBlobField = useFormField<File | null>(null)
+  const codeblockField = useFormField<CodeBlock>({
+    type: 'codeblock',
+    language: '',
+    code: '',
+    source: null,
+  })
+  const adjustedAtField = useFormField<Date | undefined>(undefined)
+
+  const isATerminalRecording = (file: File) => file.type == ''
+  const isAnHttpRequestCycle = (file: File) => file.name.endsWith('har')
+
+  const evidenceTypeOptions: Array<{
+    name: string
+    value: SupportedEvidenceType
+    content?: ReactNode
+  }> = [
+    {
+      name: 'Screenshot',
+      value: 'image',
+      content: <ImageUpload label="Screenshot" {...binaryBlobField} />,
+    },
+    { name: 'Code Block', value: 'codeblock', content: <CodeBlockEditor {...codeblockField} /> },
+    { name: 'Event', value: 'event', content: <div /> },
+    {
+      name: 'Terminal Recording',
+      value: 'terminal-recording',
+      content: (
+        <BinaryUpload
+          label="Terminal Recording"
+          isSupportedFile={isATerminalRecording}
+          {...binaryBlobField}
+        />
+      ),
+    },
+    {
+      name: 'HTTP Request/Response',
+      value: 'http-request-cycle',
+      content: (
+        <BinaryUpload
+          label="HAR File"
+          isSupportedFile={isAnHttpRequestCycle}
+          {...binaryBlobField}
+        />
+      ),
+    },
+  ]
+
+  const [selectedCBValue, setSelectedCBValue] = useState<string>(evidenceTypeOptions[0].value)
+  const getSelectedOption = () =>
+    evidenceTypeOptions.filter((opt) => opt.value === selectedCBValue)[0]
+
+  const formComponentProps = useForm({
+    fields: [descriptionField, binaryBlobField, adjustedAtField],
+    onSuccess: () => {
+      props.onCreated()
+      props.onRequestClose()
+    },
+    handleSubmit: () => {
+      let data: SubmittableEvidence = { type: 'none' }
+      const selectedOption = getSelectedOption()
+      const fileBasedKeys = ['image', 'terminal-recording', 'http-request-cycle']
+
+      if (selectedOption.value === 'codeblock' && codeblockField.value !== null) {
+        data = { type: 'codeblock', file: codeblockToBlob(codeblockField.value) }
+      } else if (fileBasedKeys.includes(selectedOption.value) && binaryBlobField.value != null) {
+        data = { type: selectedOption.value, file: binaryBlobField.value }
+      } else if (selectedOption.value === 'event') {
+        data = { type: 'event' }
+      }
+
+      return createEvidence({
+        adjustedAt: adjustedAtField.value,
+        operationSlug: props.operationSlug,
+        description: descriptionField.value,
+        evidence: data,
+        tagIds: tagsField.value.map((t) => t.id),
+      })
+    },
+  })
+
+  return (
+    <ModalForm
+      title="New Evidence"
+      submitText="Create Evidence"
+      onRequestClose={props.onRequestClose}
+      {...formComponentProps}
+    >
+      <TextArea label="Description" {...descriptionField} />
+      <ComboBox
+        label="Evidence Type"
+        className={cx('dropdown')}
+        options={evidenceTypeOptions}
+        value={selectedCBValue}
+        onChange={setSelectedCBValue}
+      />
+      {getSelectedOption().content}
+      <TagChooser operationSlug={props.operationSlug} label="Tags" {...tagsField} />
+      <SplitInputRow
+        label="Adjusted Timestamp"
+        inputValue={
+          isValid(adjustedAtField.value)
+            ? format(adjustedAtField.value as Date, 'yyyy-dd-MM hh:mm')
+            : ''
+        }
+      >
+        <DateTimePicker onSelectedDate={(date) => adjustedAtField.onChange(date)} />
+      </SplitInputRow>
+    </ModalForm>
+  )
+}
+
+export const EditEvidenceModal = (props: {
+  evidence: Evidence
+  onEdited: () => void
+  onRequestClose: () => void
+  operationSlug: string
+}) => {
+  const descriptionField = useFormField<string>(props.evidence.description)
+  const tagsField = useFormField<Array<Tag>>(props.evidence.tags)
+  const codeblockField = useFormField<CodeBlock>({
+    type: 'codeblock',
+    language: '',
+    code: '',
+    source: null,
+  })
+  const adjustedAtField = useFormField<Date | undefined>(props.evidence.adjustedAt ?? undefined)
+  useEffect(() => {
+    if (props.evidence.contentType !== 'codeblock') {
+      return
+    }
+    getEvidenceAsCodeblock({
+      operationSlug: props.operationSlug,
+      evidenceUuid: props.evidence.uuid,
+    }).then(codeblockField.onChange)
+  }, [
+    props.evidence.contentType,
+    codeblockField.onChange,
+    props.operationSlug,
+    props.evidence.uuid,
+  ])
+
+  const formComponentProps = useForm({
+    fields: [descriptionField, tagsField, codeblockField],
+    onSuccess: () => {
+      props.onEdited()
+      props.onRequestClose()
+    },
+    handleSubmit: () =>
+      updateEvidence({
+        operationSlug: props.operationSlug,
+        evidenceUuid: props.evidence.uuid,
+        adjustedAt: adjustedAtField.value,
+        description: descriptionField.value,
+        oldTags: props.evidence.tags,
+        newTags: tagsField.value,
+        updatedContent:
+          props.evidence.contentType === 'codeblock' ? codeblockToBlob(codeblockField.value) : null,
+      }),
+  })
+  return (
+    <ModalForm
+      title="Edit Evidence"
+      submitText="Save"
+      onRequestClose={props.onRequestClose}
+      {...formComponentProps}
+    >
+      <TextArea label="Description" {...descriptionField} />
+      {props.evidence.contentType === 'codeblock' && <CodeBlockEditor {...codeblockField} />}
+      <TagChooser operationSlug={props.operationSlug} label="Tags" {...tagsField} />
+      <WithLabel label="Occurred At">
+        <Input
+          readOnly
+          value={
+            isValid(props.evidence.occurredAt)
+              ? format(props.evidence.occurredAt, 'yyyy-dd-MM hh:mm')
+              : ''
+          }
+        />
+      </WithLabel>
+      <SplitInputRow
+        label="Adjusted Timestamp"
+        inputValue={
+          isValid(adjustedAtField.value)
+            ? format(adjustedAtField.value as Date, 'yyyy-dd-MM hh:mm')
+            : ''
+        }
+      >
+        <DateTimePicker
+          onSelectedDate={(date) => adjustedAtField.onChange(isValid(date) ? date : undefined)}
+          selected={adjustedAtField.value}
+        />
+      </SplitInputRow>
+    </ModalForm>
+  )
+}
+
+export const ChangeFindingsOfEvidenceModal = (props: {
+  evidence: Evidence
+  onChanged: () => void
+  onRequestClose: () => void
+  operationSlug: string
+}) => {
+  const wiredFindings = useWiredData<Array<Finding>>(
+    useCallback(
+      () =>
+        getFindingsOfEvidence({
+          operationSlug: props.operationSlug,
+          evidenceUuid: props.evidence.uuid,
+        }),
+      [props.operationSlug, props.evidence.uuid],
+    ),
+  )
+
+  return (
+    <Modal title="Select Findings For Evidence" onRequestClose={props.onRequestClose}>
+      {wiredFindings.render((initialFindings) => (
+        <InternalChangeFindingsOfEvidenceModal {...props} initialFindings={initialFindings} />
+      ))}
+    </Modal>
+  )
+}
+
+const InternalChangeFindingsOfEvidenceModal = (props: {
+  evidence: Evidence
+  onChanged: () => void
+  onRequestClose: () => void
+  operationSlug: string
+  initialFindings: Array<Finding>
+}) => {
+  const oldFindingsField = useFormField<Array<Finding>>(props.initialFindings)
+  const newFindingsField = useFormField<Array<Finding>>(props.initialFindings)
+  const formComponentProps = useForm({
+    fields: [newFindingsField],
+    onSuccess: () => {
+      props.onChanged()
+      props.onRequestClose()
+    },
+    handleSubmit: () =>
+      changeFindingsOfEvidence({
+        operationSlug: props.operationSlug,
+        evidenceUuid: props.evidence.uuid,
+        oldFindings: oldFindingsField.value,
+        newFindings: newFindingsField.value,
+      }),
+  })
+
+  return (
+    <Form
+      submitText="Update Evidence"
+      cancelText="Cancel"
+      onCancel={props.onRequestClose}
+      {...formComponentProps}
+    >
+      <FindingChooser operationSlug={props.operationSlug} {...newFindingsField} />
+    </Form>
+  )
+}
+
+export const DeleteEvidenceModal = (props: {
+  evidence: Evidence
+  onDeleted: () => void
+  onRequestClose: () => void
+  operationSlug: string
+}) => {
+  const deleteAssociatedFindingsField = useFormField(false)
+  const formComponentProps = useForm({
+    fields: [deleteAssociatedFindingsField],
+    onSuccess: () => {
+      props.onDeleted()
+      props.onRequestClose()
+    },
+    handleSubmit: () =>
+      deleteEvidence({
+        operationSlug: props.operationSlug,
+        evidenceUuid: props.evidence.uuid,
+        deleteAssociatedFindings: deleteAssociatedFindingsField.value,
+      }),
+  })
+
+  return (
+    <ModalForm
+      title="Delete Evidence"
+      submitText="Delete Evidence"
+      onRequestClose={props.onRequestClose}
+      {...formComponentProps}
+    >
+      <p>Are you sure you want to delete this evidence?</p>
+      <Checkbox
+        label="Also delete any findings associated with this evidence"
+        {...deleteAssociatedFindingsField}
+      />
+    </ModalForm>
+  )
+}
+
+export const MoveEvidenceModal = (props: {
+  evidence: Evidence
+  operationSlug: string
+  onRequestClose: () => void
+  onEvidenceMoved: () => void
+}) => {
+  const [selectedOperationSlug, setSelectedOperation] = useState(props.operationSlug)
+
+  const wiredOps = useWiredData<Array<Operation>>(
+    useCallback(getOperations, [props.operationSlug, props.evidence.uuid]),
+  )
+  const wiredDiff = useWiredData<TagDifference>(
+    useCallback(
+      () =>
+        getEvidenceMigrationDifference({
+          fromOperationSlug: props.operationSlug,
+          toOperationSlug: selectedOperationSlug,
+          evidenceUuid: props.evidence.uuid,
+        }),
+      [selectedOperationSlug, props.evidence.uuid, props.operationSlug],
+    ),
+  )
+
+  const formComponentProps = useForm({
+    fields: [],
+    onSuccess: () => {
+      props.onEvidenceMoved()
+      props.onRequestClose()
+    },
+    handleSubmit: () => {
+      if (selectedOperationSlug == props.operationSlug) {
+        return Promise.resolve() // no need to do anything if the to and from destinations are the same
+      }
+      return moveEvidence({
+        fromOperationSlug: props.operationSlug,
+        toOperationSlug: selectedOperationSlug,
+        evidenceUuid: props.evidence.uuid,
+      }).then(() => {
+        window.location.href = `/operations/${props.operationSlug}/evidence`
+      })
+    },
+  })
+
+  return (
+    <ModalForm
+      title="Move Evidence To Another Operation"
+      submitText="Move"
+      onRequestClose={props.onRequestClose}
+      {...formComponentProps}
+    >
+      <div>
+        Moving evidence will disconnect this evidence from any findings and some tags may be lost in
+        the transition.
+      </div>
+      {wiredOps.render((operations) => {
+        operations.sort((a, b) => a.name.localeCompare(b.name))
+
+        const mappedOperations = operations.map((op) => ({ name: op.name, value: op }))
+        return (
+          <ComboBox
+            label="Select a destination operation"
+            options={mappedOperations}
+            value={operations.filter((op) => op.slug === selectedOperationSlug)[0]}
+            onChange={(op) => setSelectedOperation(op.slug)}
+          />
+        )
+      })}
+      {wiredDiff.render((data) => (
+        <TagListRenderer
+          sourceSlug={props.operationSlug}
+          destSlug={selectedOperationSlug}
+          tags={data.excluded}
+        />
+      ))}
+    </ModalForm>
+  )
+}
+
+const TagListRenderer = (props: {
+  sourceSlug: string
+  destSlug: string
+  tags: Array<Tag> | null
+}) => {
+  if (props.sourceSlug == props.destSlug) {
+    return <div>This is the current operation, and so no changes will be made</div>
+  } else if (props.tags == null || props.tags.length == 0) {
+    return <div>All tags will carry over</div>
+  }
+
+  return (
+    <>
+      <div>The following tags will be removed:</div>
+      <TagList tags={props.tags} />
+    </>
+  )
+}
+
+export const EvidenceMetadataModal = (props: {
+  operationSlug: string
+  evidence: Evidence
+  onRequestClose: () => void
+  onUpdated: () => void
+}) => {
+  const wiredMetadata = useWiredData(
+    useCallback(
+      () =>
+        Promise.all([
+          readEvidenceMetadata({
+            operationSlug: props.operationSlug,
+            evidenceUuid: props.evidence.uuid,
+          }),
+          hasFlag('allow-metadata-edit'),
+        ]),
+      [props.operationSlug, props.evidence.uuid],
+    ),
+  )
+
+  const containerProps: Omit<ViewEditEvidenceMetadataContainerProps, 'evidenceMetadata'> = {
+    evidenceUuid: props.evidence.uuid,
+    operationSlug: props.operationSlug,
+    onRefresh: wiredMetadata.reload,
+    onRerun: async (metadata) => {
+      await runServiceWorkerForEvidence({
+        operationSlug: props.operationSlug,
+        evidenceUuid: props.evidence.uuid,
+        source: metadata.source,
+      })
+    },
+  }
+
+  return (
+    <Modal title="Evidence Metadata" onRequestClose={props.onRequestClose}>
+      {wiredMetadata.render(([metadata, allowEditing]) => {
+        return (
+          <>
+            {!allowEditing ? (
+              <ViewEditEvidenceMetadataContainer {...containerProps} evidenceMetadata={metadata} />
+            ) : (
+              <TabMenu
+                className={cx('tab-menu')}
+                tabs={[
+                  {
+                    id: 'view',
+                    label: 'View',
+                    content: (
+                      <ViewEditEvidenceMetadataContainer
+                        {...containerProps}
+                        evidenceMetadata={metadata}
+                        onEdited={() => {
+                          props.onUpdated()
+                          props.onRequestClose()
+                        }}
+                      />
+                    ),
+                  },
+                  {
+                    id: 'create',
+                    label: 'Create',
+                    content: (
+                      <AddEvidenceMetadataForm
+                        evidenceUuid={props.evidence.uuid}
+                        onCreated={() => {
+                          props.onUpdated()
+                          props.onRequestClose()
+                        }}
+                        operationSlug={props.operationSlug}
+                      />
+                    ),
+                  },
+                ]}
+              />
+            )}
+          </>
+        )
+      })}
+    </Modal>
+  )
+}
+
+type ViewEditEvidenceMetadataContainerProps = {
+  evidenceUuid: string
+  evidenceMetadata: Array<EvidenceMetadata>
+  operationSlug: string
+  onRefresh: () => void
+  onEdited?: () => void
+  onRerun?: (metadata: EvidenceMetadata) => void
+}
+
+const ViewEditEvidenceMetadataContainer = (props: ViewEditEvidenceMetadataContainerProps) => {
+  const [editedMetadata, setEditedMetadata] = useState<null | EvidenceMetadata>(null)
+  const [filterText, setFilterText] = useState<string>('')
+
+  return editedMetadata ? (
+    <EditEvidenceMetadataForm
+      evidenceUuid={props.evidenceUuid}
+      metadata={editedMetadata}
+      onCancel={() => setEditedMetadata(null)}
+      onEdited={() => {
+        props.onEdited?.()
+        setEditedMetadata(null)
+      }}
+      operationSlug={props.operationSlug}
+    />
+  ) : (
+    <ViewEvidenceMetadataForm
+      metadata={props.evidenceMetadata}
+      onMetadataEdited={props.onEdited ? setEditedMetadata : undefined}
+      onRerun={props.onRerun}
+      filterText={filterText}
+      onFilterUpdated={setFilterText}
+      onRefresh={props.onRefresh}
+    />
+  )
+}
+
+const EditEvidenceMetadataForm = (props: {
+  metadata: EvidenceMetadata
+  operationSlug: string
+  evidenceUuid: string
+  onEdited: () => void
+  onCancel: () => void
+}) => (
+  <EvidenceMetadataEditorForm
+    metadata={props.metadata}
+    readonlySource
+    submitText="Save"
+    onSubmit={(metadata: EvidenceMetadata) => {
+      return updateEvidenceMetadata({
+        operationSlug: props.operationSlug,
+        evidenceUuid: props.evidenceUuid,
+        body: metadata.body,
+        source: metadata.source,
+      })
+    }}
+    onEdited={props.onEdited}
+    onCancel={props.onCancel}
+  />
+)
+
+const AddEvidenceMetadataForm = (props: {
+  operationSlug: string
+  evidenceUuid: string
+  onCreated: () => void
+  onCancel?: () => void
+}) => (
+  <EvidenceMetadataEditorForm
+    metadata={{ body: '', source: '' }}
+    submitText="Create"
+    onSubmit={(metadata: EvidenceMetadata) => {
+      return createEvidenceMetadata({
+        operationSlug: props.operationSlug,
+        evidenceUuid: props.evidenceUuid,
+        body: metadata.body,
+        source: metadata.source,
+      })
+    }}
+    onEdited={props.onCreated}
+  />
+)
+
+const ViewEvidenceMetadataForm = (props: {
+  metadata: Array<EvidenceMetadata>
+  onMetadataEdited?: (metadata: EvidenceMetadata) => void
+  onRerun?: (metadata: EvidenceMetadata) => void
+  onRefresh: () => void
+  filterText: string
+  onFilterUpdated: (val: string) => void
+}) => {
+  const wiredServices = useWiredData(listActiveServiceWorkers)
+
+  const [hide, setHide] = useState(true)
+  const disabledTitleForStatus = (status?: string) =>
+    status === 'Queued'
+      ? 'Work has been queued'
+      : status === 'Processing'
+        ? 'Evidence is being processed'
+        : undefined
+  return (
+    <div className={cx('view-metadata-root')}>
+      {wiredServices.render((wrappedServices) => {
+        const services = wrappedServices.map((s) => s.name)
+        return (
+          <>
+            {props.metadata.length == 0 ? (
+              <em>No metadata exists for this evidence</em>
+            ) : (
+              <>
+                <Input
+                  label="Filter Metadata"
+                  value={props.filterText}
+                  onChange={props.onFilterUpdated}
+                />
+                <Checkbox
+                  label="Hide Unprocessable"
+                  className={cx('unprocessable-cb')}
+                  value={hide}
+                  onChange={setHide}
+                />
+
+                {props.metadata
+                  .filter((meta) => (hide ? meta.canProcess !== false : true))
+                  .map((meta) => {
+                    return (
+                      <EvidenceMetadataItem
+                        key={meta.source}
+                        meta={meta}
+                        filterText={props.filterText}
+                        onMetadataEdited={props.onMetadataEdited}
+                        expanded={props.metadata.length == 1}
+                        onRerun={services.includes(meta.source) ? props.onRerun : undefined}
+                        rerunDisabledLabel={disabledTitleForStatus(meta.status)}
+                      />
+                    )
+                  })}
+              </>
+            )}
+          </>
+        )
+      })}
+
+      <Button
+        className={cx('refresh-button')}
+        icon={require('./refresh.svg')}
+        onClick={props.onRefresh}
+        title="Refresh"
+      ></Button>
+    </div>
+  )
+}
+
+const EvidenceMetadataEditorForm = (props: {
+  metadata: EvidenceMetadata
+  onSubmit: (metadata: EvidenceMetadata) => Promise<void>
+  onEdited: () => void
+  onCancel?: () => void
+  submitText: string
+  readonlySource?: boolean
+}) => {
+  const sourceField = useFormField<string>(props.metadata.source)
+  const contentField = useFormField<string>(props.metadata.body)
+
+  const formComponentProps = useForm({
+    fields: [sourceField, contentField],
+    onSuccess: () => props.onEdited(),
+    handleSubmit: () => {
+      if (sourceField.value.trim() == '') {
+        throw new Error('Must specify a source')
+      }
+      return props.onSubmit({
+        source: sourceField.value,
+        body: contentField.value,
+      })
+    },
+  })
+
+  return (
+    <Form
+      {...formComponentProps}
+      submitText={props.submitText}
+      onCancel={props.onCancel}
+      cancelText="Cancel"
+    >
+      <Input
+        label={'Source' + (props.readonlySource ? ' (locked)' : '')}
+        readOnly={props.readonlySource}
+        {...sourceField}
+      />
+      <TextArea label="Content" {...contentField} />
+    </Form>
+  )
+}
+
+const EvidenceMetadataItem = (props: {
+  meta: EvidenceMetadata
+  filterText: string
+  onMetadataEdited?: (metadata: EvidenceMetadata) => void
+  onRerun?: (metadata: EvidenceMetadata) => void
+  rerunDisabledLabel?: string
+  expanded?: boolean
+}) => {
+  const { onMetadataEdited, onRerun, meta, filterText, expanded } = props
+  const minLength = 3
+  const content = highlightSubstring(meta.body, filterText, cx('content-important'), {
+    regexFlags: 'i',
+    minLength,
+  })
+
+  const editAction: ExpandableSectionLabelActionItem = {
+    label: 'Edit',
+    action: (e) => {
+      e.stopPropagation()
+      onMetadataEdited?.(meta)
+    },
+  }
+
+  const rerunAction: ExpandableSectionLabelActionItem = {
+    label: 'Re-Run',
+    action: (e) => {
+      e.stopPropagation()
+      onRerun?.(meta)
+    },
+    disabled: props.rerunDisabledLabel !== undefined,
+    title: props.rerunDisabledLabel,
+  }
+
+  const actions: Array<ExpandableSectionLabelActionItem> = [
+    ...(onMetadataEdited ? [editAction] : []),
+    ...(onRerun ? [rerunAction] : []),
+  ]
+
+  return (
+    <ExpandableSection
+      label={<ExpandableSectionLabel label={meta.source} actions={actions} />}
+      initiallyExpanded={expanded}
+      labelClassName={cx(
+        content.length === 1 && filterText.length >= minLength ? 'label-not-important' : '',
+      )}
+    >
+      <pre className={cx('metadata-content')}>{...content}</pre>
+    </ExpandableSection>
+  )
+}
+
+type ExpandableSectionLabelActionItem = {
+  label: string
+  action: (e: MouseEvent<Element>) => void
+  disabled?: boolean
+  title?: string
+}
+
+const ExpandableSectionLabel = (props: {
+  label: string
+  actions: Array<ExpandableSectionLabelActionItem>
+}) => {
+  return (
+    <div className={cx('expandable-section-label-container')}>
+      <span className={cx('expandable-section-label')}>{props.label}</span>
+      {props.actions.length > 0 && (
+        <ButtonGroup className={cx('expandable-section-button-group')}>
+          {props.actions.map((act) => (
+            <Button
+              small
+              key={act.label}
+              disabled={act.disabled}
+              title={act.title}
+              onClick={act.action}
+            >
+              {act.label}
+            </Button>
+          ))}
+        </ButtonGroup>
+      )}
+    </div>
+  )
+}

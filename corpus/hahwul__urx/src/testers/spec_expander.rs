@@ -1,0 +1,1286 @@
+//! `--expand-specs`: read the API descriptions the run already collected.
+//!
+//! An `--preset only-api` sweep finds `/swagger.json`, `/v3/api-docs` and
+//! `/openapi.json` and then does nothing with them. `--extract-links` parses
+//! HTML; `--extract-js-endpoints` deliberately drops `application/json`
+//! bodies (see its `classify`); `--archive-body` runs the HTML parser over
+//! whatever the archive returns. So the single most information-dense file on
+//! the target is collected as one URL and never opened.
+//!
+//! One such document lists every documented route, which makes the exchange
+//! rate far better than mining bundles: one request buys hundreds of
+//! endpoints, already exact and already parameterised, instead of a megabyte
+//! of minified strings that then has to be filtered down.
+//!
+//! Supported inputs: OpenAPI 3.x, Swagger 2.0, and GraphQL introspection
+//! responses, as JSON or YAML. YAML is converted to the same
+//! `serde_json::Value` shape before expansion, so one reader covers both.
+
+use anyhow::Result;
+use reqwest::Client;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
+use url::Url;
+use yaml_rust2::parser::{Event, Parser};
+use yaml_rust2::yaml::{Yaml, YamlLoader};
+
+use super::shared::{content_type, found, path_extension, send, FetchBudget};
+use super::Tester;
+use crate::network::client::read_body_capped;
+use crate::network::NetConfig;
+use crate::output::UrlData;
+
+/// Cap on bytes read from one document before parsing.
+///
+/// The same guard, for the same reason, as the link and JS extractors: the
+/// URL list comes from archives that will hand back whatever they recorded,
+/// and no single response may be buffered whole. 10 MiB is far above any real
+/// specification (a very large one is a few hundred KiB).
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Extensions a specification is served with. A URL carrying any *other*
+/// extension is not one whatever its name says — `swagger-ui.html` is the
+/// viewer, `swagger-ui-bundle.js` is its code — so the request is never made.
+const SPEC_EXTENSIONS: &[&str] = &["json", "yaml", "yml"];
+
+/// Path fragments that name an API description.
+///
+/// Matched as substrings of the lower-cased path so that every spelling in
+/// the wild is covered by one entry: `openapi` catches `/openapi.json`,
+/// `/.well-known/openapi` and `/v1/openapi.yaml`; `swagger` catches
+/// `/swagger.json` and `/swagger/v1/swagger.json`; `api-docs` catches
+/// springdoc's `/v2/api-docs` and `/v3/api-docs`.
+///
+/// This is the first of the two signals the tester uses. It is deliberately a
+/// *name* test only — cheap, and made before any request — with
+/// [`classify`] applying the second signal, `Content-Type`, to the response.
+const SPEC_MARKERS: &[&str] = &[
+    "swagger",
+    "openapi",
+    "api-docs",
+    "apidocs",
+    "api_docs",
+    "graphql",
+    "introspection",
+];
+
+/// File-name stems that name the *file* rather than the endpoint, so a
+/// GraphQL schema saved under one is attributed to its directory.
+const GENERIC_SCHEMA_STEMS: &[&str] = &["schema", "introspection", "index", "graphql-schema"];
+
+/// Whether the URL is worth a request as a specification document.
+///
+/// Unlike the JS extractor — which fetches anything not obviously non-script,
+/// because a bundle can be called anything — a specification is a named file,
+/// and the name is the only cheap evidence there is. Requiring a marker keeps
+/// the tester from re-requesting the entire result set to find three files.
+fn looks_like_spec(url: &Url) -> bool {
+    if let Some(ext) = path_extension(url) {
+        if !SPEC_EXTENSIONS.contains(&ext.as_str()) {
+            return false;
+        }
+    }
+    let path = url.path().to_ascii_lowercase();
+    SPEC_MARKERS.iter().any(|marker| path.contains(marker))
+}
+
+/// How a fetched body should be parsed, decided from `Content-Type` and the
+/// URL's extension.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(super) enum BodyKind {
+    Json,
+    Yaml,
+    /// Type and extension are both uninformative — decide from the body.
+    Sniff,
+    /// Nothing here can be a specification; don't read the body.
+    Skip,
+}
+
+/// Classify a response by its `Content-Type`, falling back to the extension
+/// and then to the body itself.
+///
+/// The second of the two target signals. `Content-Type` wins over the name
+/// whenever it says something definite: a `swagger.json` served as `text/html`
+/// is a login redirect or an error page, not the document. It loses only for
+/// the deliberately vague types (`text/plain`, `application/octet-stream`)
+/// that static hosts hand out for `.json` — the same one-directional rule
+/// `js_endpoint_extractor::classify` applies to `.js`.
+fn classify(headers: &reqwest::header::HeaderMap, url: &Url) -> BodyKind {
+    let ext_kind = match path_extension(url).as_deref() {
+        Some("json") => Some(BodyKind::Json),
+        Some("yaml" | "yml") => Some(BodyKind::Yaml),
+        _ => None,
+    };
+
+    match content_type(headers).as_deref() {
+        // `application/json`, and the registered specification types
+        // `application/vnd.oai.openapi+json` / `application/schema+json`.
+        Some(ct) if ct.contains("json") => BodyKind::Json,
+        Some(ct) if ct.contains("yaml") || ct.contains("yml") => BodyKind::Yaml,
+        // Swagger UI's own page, an error page, an SSO redirect: HTML is
+        // never the document.
+        Some(ct) if ct.contains("html") => BodyKind::Skip,
+        // Loose types: trust the name, then the body. `/v3/api-docs` with no
+        // extension and `text/plain` is a real springdoc configuration.
+        Some(ct) if ct.contains("text/plain") || ct.contains("octet-stream") => {
+            ext_kind.unwrap_or(BodyKind::Sniff)
+        }
+        None => ext_kind.unwrap_or(BodyKind::Sniff),
+        // An explicit, unrelated type (image, css, javascript, ...) is
+        // skipped even when the name says `swagger.json`: the server knows
+        // what it served.
+        Some(_) => BodyKind::Skip,
+    }
+}
+
+/// Resolve [`BodyKind::Sniff`] from the body: a JSON document's first
+/// non-whitespace byte is `{`. Anything else is read as YAML, which fails
+/// harmlessly when the body was neither.
+fn sniff(body: &str) -> BodyKind {
+    match body.trim_start().as_bytes().first() {
+        Some(b'{') => BodyKind::Json,
+        _ => BodyKind::Yaml,
+    }
+}
+
+/// The most a YAML document's aliases may add to it, in approximate bytes of
+/// parsed nodes.
+///
+/// YAML aliases are expanded by copying, so a document that references a
+/// growing anchor from inside the next anchor multiplies its own size at every
+/// level — the "billion laughs" shape: a few hundred bytes that expand to
+/// gigabytes of nodes. [`MAX_BODY_BYTES`] cannot catch it, because the input
+/// really is tiny, and no YAML parser in the ecosystem bounds the expansion
+/// (libyaml does not either), so it is bounded here, before the loader builds
+/// anything. That matters more for this tester than for most: the body comes
+/// from whatever host the URL list happened to name.
+///
+/// Published specifications use `$ref`, which is a plain string and costs
+/// nothing; the rare document that uses YAML anchors copies a few small nodes.
+const MAX_YAML_ALIAS_BYTES: usize = MAX_BODY_BYTES;
+
+/// What one parsed YAML node costs beyond its text, for
+/// [`MAX_YAML_ALIAS_BYTES`] accounting.
+const YAML_NODE_COST: usize = 64;
+
+/// Whether expanding `body`'s aliases stays within [`MAX_YAML_ALIAS_BYTES`].
+///
+/// Walks the parser's event stream — no tree is built — tracking the size
+/// each anchored node would expand to and charging that size every time an
+/// alias copies it. Bounding the copies themselves, rather than counting
+/// `*name` tokens in the text, means no spelling of an anchor name and no
+/// arrangement of a handful of aliases gets past it. A stream that does not
+/// parse is refused too; the loader would reject it anyway.
+fn yaml_expansion_within_budget(body: &str) -> bool {
+    // No `*`, no alias: skip the extra parse for the usual `$ref`-only spec.
+    if !body.contains('*') {
+        return true;
+    }
+    let mut parser = Parser::new_from_str(body);
+    let mut anchored: HashMap<usize, usize> = HashMap::new();
+    // Each open collection's anchor and the size of what it holds so far.
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    let mut copied = 0usize;
+    loop {
+        let Ok((event, _)) = parser.next_token() else {
+            return false;
+        };
+        let (anchor, size) = match event {
+            Event::StreamEnd => return true,
+            Event::Scalar(text, _, anchor, _) => (anchor, YAML_NODE_COST + text.len()),
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                open.push((anchor, YAML_NODE_COST));
+                continue;
+            }
+            Event::SequenceEnd | Event::MappingEnd => match open.pop() {
+                Some(closed) => closed,
+                None => return false,
+            },
+            Event::Alias(id) => {
+                let size = anchored.get(&id).copied().unwrap_or(YAML_NODE_COST);
+                copied = copied.saturating_add(size);
+                if copied > MAX_YAML_ALIAS_BYTES {
+                    return false;
+                }
+                (0, size)
+            }
+            _ => continue,
+        };
+        // Anchor id 0 is the parser's "no anchor".
+        if anchor != 0 {
+            anchored.insert(anchor, size);
+        }
+        if let Some((_, parent)) = open.last_mut() {
+            *parent = parent.saturating_add(size);
+        }
+    }
+}
+
+/// A YAML mapping key as a string. YAML permits any node as a key; a
+/// specification never uses anything but a scalar.
+fn yaml_key(key: &Yaml) -> Option<String> {
+    match key {
+        Yaml::String(s) => Some(s.clone()),
+        Yaml::Integer(n) => Some(n.to_string()),
+        Yaml::Real(raw) => Some(raw.clone()),
+        Yaml::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Convert a YAML node into the `serde_json::Value` shape the rest of this
+/// module reads, so one expander covers both serialisations.
+fn yaml_to_json(node: &Yaml) -> Value {
+    match node {
+        Yaml::Real(raw) => raw
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map_or(Value::Null, Value::Number),
+        Yaml::Integer(n) => Value::Number((*n).into()),
+        Yaml::String(s) => Value::String(s.clone()),
+        Yaml::Boolean(b) => Value::Bool(*b),
+        Yaml::Array(items) => Value::Array(items.iter().map(yaml_to_json).collect()),
+        Yaml::Hash(map) => Value::Object(
+            map.iter()
+                .filter_map(|(key, value)| Some((yaml_key(key)?, yaml_to_json(value))))
+                .collect(),
+        ),
+        // The loader resolves anchors as it goes, so `Alias` survives only for
+        // a reference the document never defined. It, `Null` and the parser's
+        // `BadValue` all mean "nothing here".
+        Yaml::Alias(_) | Yaml::Null | Yaml::BadValue => Value::Null,
+    }
+}
+
+/// The first YAML document in `body`, as a [`Value`].
+///
+/// A specification is one document; the rest of a multi-document stream is
+/// something else and is ignored rather than merged.
+fn parse_yaml(body: &str) -> Option<Value> {
+    if !yaml_expansion_within_budget(body) {
+        return None;
+    }
+    let docs = YamlLoader::load_from_str(body).ok()?;
+    Some(yaml_to_json(docs.first()?))
+}
+
+/// `url` without query or fragment and without a trailing slash: the string a
+/// documented path is appended to.
+fn base_prefix(url: &Url) -> String {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.as_str().trim_end_matches('/').to_string()
+}
+
+/// `url`'s origin as a URL, i.e. everything below `/` discarded.
+fn root_of(url: &Url) -> Url {
+    let mut root = url.clone();
+    root.set_path("/");
+    root.set_query(None);
+    root.set_fragment(None);
+    root
+}
+
+/// `url`'s host with its port, as a Swagger 2.0 `host` value would spell it.
+fn authority(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
+}
+
+/// Replace `{name}` placeholders in a server URL with the variable's default.
+///
+/// OpenAPI requires a `default` on every server variable, so a well-formed
+/// document always resolves; an `enum`'s first value covers the documents
+/// that omit it anyway.
+fn substitute_variables(raw: &str, variables: Option<&Value>) -> String {
+    let Some(vars) = variables.and_then(Value::as_object) else {
+        return raw.to_string();
+    };
+    let mut out = raw.to_string();
+    for (name, var) in vars {
+        let value = var
+            .get("default")
+            .and_then(Value::as_str)
+            .or_else(|| var.get("enum")?.as_array()?.first()?.as_str());
+        if let Some(value) = value {
+            out = out.replace(&format!("{{{name}}}"), value);
+        }
+    }
+    out
+}
+
+/// The base URLs of an OpenAPI 3 `servers` array.
+///
+/// A relative `url` ("/api/v3", "v3") is relative to the document's own
+/// location, which is what `spec_url.join` does. A server whose template
+/// variables did not all resolve is dropped rather than emitted with a
+/// percent-encoded `%7Bcustomer%7D` in the host: it is not a base, and the
+/// caller falls back to the document's origin.
+fn servers_bases(spec_url: &Url, servers: &Value) -> Vec<String> {
+    let Some(list) = servers.as_array() else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|server| {
+            let raw = server.get("url").and_then(Value::as_str)?;
+            let resolved = substitute_variables(raw, server.get("variables"));
+            if resolved.contains('{') {
+                return None;
+            }
+            let url = spec_url.join(&resolved).ok()?;
+            matches!(url.scheme(), "http" | "https").then(|| base_prefix(&url))
+        })
+        .collect()
+}
+
+/// The base URLs of a Swagger 2.0 document: `schemes` × `host` + `basePath`.
+///
+/// Each part falls back to the corresponding part of the document's own URL
+/// when omitted, which is what the specification says to do.
+fn swagger2_bases(spec_url: &Url, doc: &Value) -> Vec<String> {
+    let host = doc
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| authority(spec_url));
+    // `host` is an authority, never a URL: a value with a scheme or a path in
+    // it is malformed and would build a nonsense base.
+    if host.is_empty() || host.contains('/') {
+        return Vec::new();
+    }
+    let base_path = doc.get("basePath").and_then(Value::as_str).unwrap_or("");
+    let declared: Vec<&str> = doc
+        .get("schemes")
+        .and_then(Value::as_array)
+        .map(|s| s.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let schemes = if declared.is_empty() {
+        vec![spec_url.scheme()]
+    } else {
+        declared
+    };
+    schemes
+        .into_iter()
+        // `schemes` also admits `ws`/`wss`. urx collects URLs something can
+        // request over HTTP; a WebSocket endpoint is not one.
+        .filter(|scheme| matches!(*scheme, "http" | "https"))
+        .filter_map(|scheme| Url::parse(&format!("{scheme}://{host}{base_path}")).ok())
+        .map(|url| base_prefix(&url))
+        .collect()
+}
+
+/// Every base the document's paths hang off.
+fn spec_bases(spec_url: &Url, doc: &Value) -> Vec<String> {
+    // A document carrying both forms is malformed; `servers` (OpenAPI 3, the
+    // newer form) wins.
+    if let Some(servers) = doc.get("servers") {
+        let bases = servers_bases(spec_url, servers);
+        if !bases.is_empty() {
+            return bases;
+        }
+    }
+    let bases = swagger2_bases(spec_url, doc);
+    if !bases.is_empty() {
+        return bases;
+    }
+    // "If the servers property is not provided, or is an empty array, the
+    // default value would be a Server Object with a url value of /" — and a
+    // relative server URL resolves against the document's own location.
+    vec![base_prefix(&root_of(spec_url))]
+}
+
+/// `base` + `path`, textually.
+///
+/// Deliberately *not* `Url::join`: a documented path carries its template
+/// parameters (`/users/{id}`), and `url::Url` percent-encodes `{` and `}` in
+/// a path, which would turn every parameter into `%7Bid%7D`. What makes the
+/// output worth reading is that it is the route as the document writes it, so
+/// the URL is assembled as a string. (`--normalize-url`, if the user asks for
+/// it, re-parses and encodes it downstream — that is the user's choice.)
+fn join_path(base: &str, path: &str) -> String {
+    format!("{base}{path}")
+}
+
+/// Expand an OpenAPI 3.x / Swagger 2.0 document into one URL per documented
+/// path per base.
+fn openapi_urls(spec_url: &Url, doc: &Value) -> Vec<String> {
+    let Some(paths) = doc.get("paths").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let document_bases = spec_bases(spec_url, doc);
+    let mut out = Vec::new();
+    for (path, item) in paths {
+        // `x-`-prefixed extensions and `$ref` live in the same object as the
+        // routes; a real path always starts with `/`.
+        if !path.starts_with('/') {
+            continue;
+        }
+        // OpenAPI 3 lets a path item override the document's servers, and
+        // gateways that front several backends actually use it.
+        let bases = item
+            .get("servers")
+            .map(|servers| servers_bases(spec_url, servers))
+            .filter(|bases| !bases.is_empty())
+            .unwrap_or_else(|| document_bases.clone());
+        for base in &bases {
+            out.push(join_path(base, path));
+        }
+    }
+    out
+}
+
+/// The `__schema` object of an introspection response, wherever it sits.
+///
+/// A raw `POST /graphql` response wraps it as `{"data": {"__schema": …}}`;
+/// tools that save a schema to a file usually unwrap it first.
+fn introspection_schema(doc: &Value) -> Option<&Value> {
+    doc.get("data")
+        .and_then(|data| data.get("__schema"))
+        .or_else(|| doc.get("__schema"))
+}
+
+/// The root operation types, and the GraphQL document keyword each one needs
+/// when written into a `?query=`.
+const ROOT_TYPES: &[(&str, &str)] = &[
+    ("queryType", ""),
+    ("mutationType", "mutation"),
+    ("subscriptionType", "subscription"),
+];
+
+/// Where the schema's operations are served.
+///
+/// In the common case the introspection response *was* the endpoint's
+/// response, so the fetched URL is the endpoint minus its query. When it is a
+/// saved copy instead, the file name is resolved away: `/graphql.json` is the
+/// `/graphql` endpoint, and `/graphql/schema.json` names its directory.
+fn graphql_endpoint(spec_url: &Url) -> String {
+    let mut url = spec_url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    if path_extension(&url).is_none() {
+        return url.to_string();
+    }
+    let path = url.path().to_string();
+    let cut = path.rfind('/').map_or(0, |i| i + 1);
+    let stem = path[cut..].rsplit_once('.').map_or("", |(stem, _)| stem);
+    let replacement = if GENERIC_SCHEMA_STEMS.contains(&stem.to_ascii_lowercase().as_str()) {
+        ""
+    } else {
+        stem
+    };
+    let mut new_path = format!("{}{replacement}", &path[..cut]);
+    if new_path.len() > 1 {
+        new_path = new_path.trim_end_matches('/').to_string();
+    }
+    url.set_path(&new_path);
+    url.to_string()
+}
+
+/// Reduce an introspection response to one URL per documented operation.
+///
+/// A GraphQL API has a single endpoint, so the *URL* surface of its schema is
+/// not a set of paths — it is the set of operations that one endpoint
+/// accepts. GraphQL-over-GET spells an operation as `?query=…`, which is both
+/// a request a server may genuinely answer and, in a result list, a legible
+/// name for what the schema exposes. Braces stay unencoded for the same
+/// reason OpenAPI's `{id}` does.
+fn graphql_operations(spec_url: &Url, schema: &Value) -> Vec<String> {
+    let endpoint = graphql_endpoint(spec_url);
+    let types = schema.get("types").and_then(Value::as_array);
+    let mut out = Vec::new();
+    for (root, keyword) in ROOT_TYPES {
+        let Some(type_name) = schema
+            .get(root)
+            .and_then(|root| root.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let fields = types.and_then(|types| {
+            types
+                .iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(type_name))
+                .and_then(|t| t.get("fields"))
+                .and_then(Value::as_array)
+        });
+        for field in fields.into_iter().flatten() {
+            let Some(name) = field.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            // Introspection's own meta-fields (`__schema`, `__type`) are on
+            // every schema and say nothing about this one.
+            if name.starts_with("__") || name.is_empty() {
+                continue;
+            }
+            out.push(format!("{endpoint}?query={keyword}{{{name}}}"));
+        }
+    }
+    out
+}
+
+/// Keep the first occurrence of each URL, in order.
+fn dedup(urls: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    urls.into_iter()
+        .filter(|u| seen.insert(u.clone()))
+        .collect()
+}
+
+/// How this response should be read as a specification, or `None` when it is
+/// not one.
+///
+/// Both target signals — the URL's name and the response's `Content-Type` —
+/// in one decision, made before the body is read. Split out of
+/// [`SpecExpander::test_url`] because `--archive-body` makes the same
+/// judgement about a body it fetched from the archive.
+pub(super) fn spec_body_kind(headers: &reqwest::header::HeaderMap, url: &Url) -> Option<BodyKind> {
+    if !looks_like_spec(url) {
+        return None;
+    }
+    match classify(headers, url) {
+        BodyKind::Skip => None,
+        kind => Some(kind),
+    }
+}
+
+/// Expand a body already in hand, resolving [`BodyKind::Sniff`] from it.
+///
+/// A document truncated by the size cap, or one that does not parse after
+/// all, expands to nothing rather than failing: neither is a failure of the
+/// run.
+pub(super) fn expand_spec_body(url: &Url, kind: BodyKind, body: &str) -> Vec<String> {
+    let kind = if kind == BodyKind::Sniff {
+        sniff(body)
+    } else {
+        kind
+    };
+    let doc = match kind {
+        BodyKind::Json => serde_json::from_str::<Value>(body).ok(),
+        BodyKind::Yaml => parse_yaml(body),
+        // Resolved just above: `Sniff` became one of those two, and `Skip`
+        // never reaches here — `spec_body_kind` returns `None` for it.
+        BodyKind::Skip | BodyKind::Sniff => None,
+    };
+    doc.map(|doc| SpecExpander::expand(url, &doc))
+        .unwrap_or_default()
+}
+
+/// API specification expander: fetches the specification documents among the
+/// collected URLs and expands the endpoints they describe.
+#[derive(Clone)]
+pub struct SpecExpander {
+    net: NetConfig,
+    /// Upper bound on documents fetched across the whole run.
+    budget: FetchBudget,
+    /// One HTTP client, built lazily and shared across clones.
+    client: Arc<OnceCell<Client>>,
+}
+
+impl SpecExpander {
+    /// Default cap on specification documents fetched per run.
+    ///
+    /// An order of magnitude below the JS extractor's 500 because the
+    /// candidate set is smaller by construction: [`looks_like_spec`] admits a
+    /// handful of named files per host, not every bundle in the list.
+    pub const DEFAULT_MAX_FILES: usize = 50;
+
+    pub fn new() -> Self {
+        SpecExpander {
+            net: NetConfig::default(),
+            budget: FetchBudget::new(Self::DEFAULT_MAX_FILES),
+            client: Arc::new(OnceCell::new()),
+        }
+    }
+
+    /// Cap the number of documents fetched; `0` means no cap.
+    pub fn with_max_files(&mut self, max: usize) {
+        self.budget.max = max;
+    }
+
+    async fn client(&self) -> Result<&Client> {
+        self.client
+            .get_or_try_init(|| async { self.net.http.build_client() })
+            .await
+    }
+
+    /// Expand one parsed document into the absolute URLs it describes,
+    /// deduplicated in first-seen order.
+    ///
+    /// `spec_url` is where the document was fetched from: relative `servers`
+    /// entries resolve against it, it supplies the parts a Swagger 2.0
+    /// document omits, and it is the fallback base when the document names no
+    /// server at all.
+    ///
+    /// The document's own shape decides how it is read — a `__schema` is an
+    /// introspection response, a `paths` object is OpenAPI or Swagger — so a
+    /// document served under an unexpected name still parses, and one that is
+    /// neither yields nothing rather than guesswork.
+    pub fn expand(spec_url: &Url, doc: &Value) -> Vec<String> {
+        if let Some(schema) = introspection_schema(doc) {
+            return dedup(graphql_operations(spec_url, schema));
+        }
+        dedup(openapi_urls(spec_url, doc))
+    }
+}
+
+impl Default for SpecExpander {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Tester for SpecExpander {
+    fn clone_box(&self) -> Box<dyn Tester> {
+        Box::new(self.clone())
+    }
+
+    fn test_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UrlData>>> + Send + 'a>> {
+        Box::pin(async move {
+            let spec_url =
+                Url::parse(url).map_err(|_| anyhow::anyhow!("Failed to parse URL: {}", url))?;
+
+            if !looks_like_spec(&spec_url) {
+                return Ok(Vec::new());
+            }
+            // The cap is on requests actually made, so it is checked after the
+            // free name test and before the request.
+            if !self.budget.try_reserve() {
+                return Ok(Vec::new());
+            }
+
+            let client = self.client().await?;
+            let response = send(self.net.retries, self.net.rate_limit.as_ref(), || {
+                client.get(url)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to expand API specification {}: {:?}", url, e))?;
+            // An error page under `/swagger.json` describes
+            // nothing; only a served document does.
+            if !response.status().is_success() {
+                return Ok(Vec::new());
+            }
+            // A relative `servers` entry resolves against where the document
+            // was actually served from, which a redirect may have moved.
+            let spec_url = response.url().clone();
+            let Some(kind) = spec_body_kind(response.headers(), &spec_url) else {
+                return Ok(Vec::new());
+            };
+            let body = read_body_capped(response, MAX_BODY_BYTES).await?;
+            Ok(found(expand_spec_body(&spec_url, kind, &body)))
+        })
+    }
+
+    fn with_network(&mut self, net: NetConfig) {
+        self.net = net;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testers::urls;
+    use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+    use serde_json::json;
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    fn expand(spec_url: &str, doc: Value) -> Vec<String> {
+        SpecExpander::expand(&url(spec_url), &doc)
+    }
+
+    // ---- target selection --------------------------------------------------
+
+    #[test]
+    fn test_only_specification_shaped_urls_are_fetched() {
+        for candidate in [
+            "https://x.com/swagger.json",
+            "https://x.com/openapi.yaml",
+            "https://x.com/OpenAPI.YML",
+            "https://x.com/v2/api-docs",
+            "https://x.com/v3/api-docs",
+            "https://x.com/swagger/v1/swagger.json",
+            "https://x.com/.well-known/openapi",
+            "https://x.com/graphql",
+            "https://x.com/graphql/schema.json",
+            "https://x.com/api/introspection.json",
+        ] {
+            assert!(looks_like_spec(&url(candidate)), "{candidate}");
+        }
+
+        for candidate in [
+            // Right name, wrong file: the Swagger UI viewer and its bundle.
+            "https://x.com/swagger-ui.html",
+            "https://x.com/swagger-ui-bundle.js",
+            "https://x.com/openapi.css",
+            // Right extension, no marker: every other JSON on the host.
+            "https://x.com/config.json",
+            "https://x.com/api/users",
+            "https://x.com/",
+        ] {
+            assert!(!looks_like_spec(&url(candidate)), "{candidate}");
+        }
+    }
+
+    #[test]
+    fn test_classify_uses_content_type_then_name_then_body() {
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        let json = url("https://x.com/swagger.json");
+        let yaml = url("https://x.com/openapi.yaml");
+        let bare = url("https://x.com/v3/api-docs");
+
+        assert_eq!(classify(&with("application/json"), &bare), BodyKind::Json);
+        assert_eq!(
+            classify(&with("application/vnd.oai.openapi+json;version=3.0"), &bare),
+            BodyKind::Json
+        );
+        assert_eq!(classify(&with("text/yaml"), &bare), BodyKind::Yaml);
+        // A definite, unrelated type beats the name — the server knows what it
+        // served.
+        assert_eq!(classify(&with("text/html"), &json), BodyKind::Skip);
+        assert_eq!(classify(&with("image/png"), &json), BodyKind::Skip);
+        assert_eq!(
+            classify(&with("application/javascript"), &json),
+            BodyKind::Skip
+        );
+        // Vague types and missing headers fall back to the name, then the body.
+        assert_eq!(classify(&with("text/plain"), &json), BodyKind::Json);
+        assert_eq!(
+            classify(&with("application/octet-stream"), &yaml),
+            BodyKind::Yaml
+        );
+        assert_eq!(classify(&with("text/plain"), &bare), BodyKind::Sniff);
+        assert_eq!(classify(&HeaderMap::new(), &json), BodyKind::Json);
+        assert_eq!(classify(&HeaderMap::new(), &bare), BodyKind::Sniff);
+
+        assert_eq!(sniff("  \n{\"openapi\":\"3.0.0\"}"), BodyKind::Json);
+        assert_eq!(sniff("openapi: 3.0.0\n"), BodyKind::Yaml);
+    }
+
+    // ---- OpenAPI 3.x -------------------------------------------------------
+
+    #[test]
+    fn test_openapi3_servers_and_paths_become_absolute_urls() {
+        let doc = json!({
+            "openapi": "3.0.3",
+            "servers": [{"url": "https://api.example.com/v3"}],
+            "paths": {
+                "/users": {"get": {}},
+                "/users/{id}": {"get": {}},
+                "/orders/{orderId}/items": {"post": {}},
+            }
+        });
+        let mut got = expand("https://example.com/openapi.json", doc);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                // The path template is emitted exactly as the document writes
+                // it — no `%7Bid%7D`.
+                "https://api.example.com/v3/orders/{orderId}/items",
+                "https://api.example.com/v3/users",
+                "https://api.example.com/v3/users/{id}",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_openapi3_relative_and_multiple_servers() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "servers": [
+                {"url": "/api/v2"},
+                {"url": "https://staging.example.com/api/v2"},
+                // Not something a scanner can request.
+                {"url": "ws://example.com/socket"},
+            ],
+            "paths": {"/ping": {}}
+        });
+        let got = expand("https://example.com/docs/openapi.json", doc);
+        assert_eq!(
+            got,
+            vec![
+                "https://example.com/api/v2/ping",
+                "https://staging.example.com/api/v2/ping",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_openapi3_server_variables_resolve_from_defaults() {
+        let doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{
+                "url": "https://{region}.example.com/{stage}",
+                "variables": {
+                    "region": {"default": "eu"},
+                    "stage": {"enum": ["v1", "v2"]},
+                }
+            }],
+            "paths": {"/health": {}}
+        });
+        assert_eq!(
+            expand("https://example.com/openapi.json", doc),
+            vec!["https://eu.example.com/v1/health"]
+        );
+    }
+
+    #[test]
+    fn test_unresolvable_server_falls_back_to_the_documents_own_origin() {
+        // No `variables`, so `{customer}` never resolves and the server is not
+        // a base at all. Emitting the routes against the host that served the
+        // document beats emitting nothing.
+        let doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://{customer}.example.com/v1"}],
+            "paths": {"/admin": {}}
+        });
+        assert_eq!(
+            expand("https://docs.example.com/spec/openapi.json", doc),
+            vec!["https://docs.example.com/admin"]
+        );
+    }
+
+    #[test]
+    fn test_path_level_servers_override_the_documents() {
+        let doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://api.example.com"}],
+            "paths": {
+                "/users": {"get": {}},
+                "/legacy": {"servers": [{"url": "https://old.example.com/v1"}], "get": {}},
+            }
+        });
+        let mut got = expand("https://example.com/openapi.json", doc);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "https://api.example.com/users",
+                "https://old.example.com/v1/legacy",
+            ]
+        );
+    }
+
+    // ---- Swagger 2.0 -------------------------------------------------------
+
+    #[test]
+    fn test_swagger2_host_base_path_and_schemes() {
+        let doc = json!({
+            "swagger": "2.0",
+            "host": "api.example.com:8443",
+            "basePath": "/v2",
+            "schemes": ["https", "http", "wss"],
+            "paths": {"/pet/{petId}": {"get": {}}}
+        });
+        let mut got = expand("https://example.com/v2/api-docs", doc);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "http://api.example.com:8443/v2/pet/{petId}",
+                "https://api.example.com:8443/v2/pet/{petId}",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_swagger2_omitted_parts_come_from_the_documents_url() {
+        let doc = json!({
+            "swagger": "2.0",
+            "paths": {"/status": {}}
+        });
+        assert_eq!(
+            expand("http://intranet.example.com:8080/v2/api-docs", doc),
+            vec!["http://intranet.example.com:8080/status"]
+        );
+    }
+
+    // ---- shape and noise ---------------------------------------------------
+
+    #[test]
+    fn test_non_path_keys_and_documents_without_paths_yield_nothing() {
+        let doc = json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "x-internal-note": {},
+                "$ref": "other.json",
+                "/real": {},
+            }
+        });
+        assert_eq!(
+            expand("https://example.com/openapi.json", doc),
+            vec!["https://example.com/real"]
+        );
+
+        // Not a specification at all: a plain configuration document served
+        // under a specification-shaped name.
+        assert_eq!(
+            expand(
+                "https://example.com/openapi.json",
+                json!({"name": "app", "version": 3})
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_duplicate_urls_are_emitted_once() {
+        // Two servers that resolve to the same base.
+        let doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://api.example.com/"}, {"url": "https://api.example.com"}],
+            "paths": {"/one": {}}
+        });
+        assert_eq!(
+            expand("https://example.com/openapi.json", doc),
+            vec!["https://api.example.com/one"]
+        );
+    }
+
+    // ---- GraphQL introspection --------------------------------------------
+
+    fn introspection() -> Value {
+        json!({
+            "data": {"__schema": {
+                "queryType": {"name": "Query"},
+                "mutationType": {"name": "Mutation"},
+                "types": [
+                    {"name": "Query", "fields": [
+                        {"name": "me"}, {"name": "users"}, {"name": "__schema"},
+                    ]},
+                    {"name": "Mutation", "fields": [{"name": "deleteUser"}]},
+                    {"name": "User", "fields": [{"name": "email"}]},
+                ]
+            }}
+        })
+    }
+
+    #[test]
+    fn test_graphql_introspection_becomes_one_url_per_operation() {
+        assert_eq!(
+            expand(
+                "https://example.com/graphql?query=%7B__schema%7D",
+                introspection()
+            ),
+            vec![
+                "https://example.com/graphql?query={me}",
+                "https://example.com/graphql?query={users}",
+                "https://example.com/graphql?query=mutation{deleteUser}",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_graphql_schema_saved_as_a_file_is_attributed_to_its_endpoint() {
+        // Both the unwrapped shape and the file-name resolution.
+        let schema = introspection()["data"].clone();
+        for (spec_url, endpoint) in [
+            (
+                "https://example.com/graphql/schema.json",
+                "https://example.com/graphql",
+            ),
+            (
+                "https://example.com/graphql.json",
+                "https://example.com/graphql",
+            ),
+            (
+                "https://example.com/api/graphql",
+                "https://example.com/api/graphql",
+            ),
+        ] {
+            let got = expand(spec_url, schema.clone());
+            assert_eq!(got[0], format!("{endpoint}?query={{me}}"), "{spec_url}");
+        }
+    }
+
+    // ---- YAML --------------------------------------------------------------
+
+    #[test]
+    fn test_yaml_documents_expand_exactly_as_their_json_twin() {
+        // Unquoted `{petId}` is a plain scalar in block context, which is how
+        // every real specification writes a path template.
+        let yaml = "\
+openapi: 3.0.3
+servers:
+  - url: https://api.example.com/v3
+  - url: /local
+paths:
+  /pets:
+    get: {}
+  /pets/{petId}:
+    get: {}
+";
+        let doc = parse_yaml(yaml).expect("valid YAML");
+        let mut got = SpecExpander::expand(&url("https://example.com/openapi.yaml"), &doc);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "https://api.example.com/v3/pets",
+                "https://api.example.com/v3/pets/{petId}",
+                "https://example.com/local/pets",
+                "https://example.com/local/pets/{petId}",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_yaml_scalars_convert_to_the_shapes_the_expander_reads() {
+        let doc = parse_yaml(
+            "\
+swagger: '2.0'
+host: api.example.com
+basePath: /v2
+schemes:
+  - https
+paths:
+  /status: {}
+",
+        )
+        .expect("valid YAML");
+        assert_eq!(
+            SpecExpander::expand(&url("http://example.com/swagger.yaml"), &doc),
+            vec!["https://api.example.com/v2/status"]
+        );
+    }
+
+    #[test]
+    fn test_yaml_anchors_resolve_but_an_expansion_bomb_is_refused() {
+        // A legitimate anchor is expanded like any other value...
+        let doc = parse_yaml(
+            "\
+openapi: 3.0.0
+x-common: &base
+  url: https://api.example.com/v1
+servers:
+  - *base
+paths:
+  /ok: {}
+",
+        )
+        .expect("valid YAML");
+        assert_eq!(
+            SpecExpander::expand(&url("https://example.com/openapi.yaml"), &doc),
+            vec!["https://api.example.com/v1/ok"]
+        );
+
+        // ...but a billion-laughs document is refused before the parser sees
+        // it. Each level here multiplies the last by nine.
+        let mut bomb = String::from("a: &a [x,x,x,x,x,x,x,x,x]\n");
+        for (level, prev) in [('b', 'a'), ('c', 'b'), ('d', 'c'), ('e', 'd'), ('f', 'e')] {
+            bomb.push_str(&format!(
+                "{level}: &{level} [{}]\n",
+                vec![format!("*{prev}"); 9].join(",")
+            ));
+        }
+        assert!(!yaml_expansion_within_budget(&bomb));
+        assert!(parse_yaml(&bomb).is_none());
+    }
+
+    #[test]
+    fn test_alias_bombs_are_refused_however_the_anchors_are_spelled() {
+        // Regression: the guard counted `*name` tokens in the raw text, so
+        // anchor names outside `[A-Za-z0-9_-]` (`&.1`, `*$x`) were never
+        // counted, and even 32 counted aliases could double a large leaf 16
+        // times over.
+        let mut dotted = String::from("l0: &.0 [x,x,x,x,x,x,x,x,x]\n");
+        for level in 1..9 {
+            dotted.push_str(&format!(
+                "l{level}: &.{level} [{}]\n",
+                vec![format!("*.{}", level - 1); 9].join(",")
+            ));
+        }
+        assert!(!yaml_expansion_within_budget(&dotted));
+        assert!(parse_yaml(&dotted).is_none());
+
+        let mut doubling = format!("a0: &a0 {}\n", "x".repeat(4096));
+        for level in 1..=16 {
+            let prev = level - 1;
+            doubling.push_str(&format!("a{level}: &a{level} [*a{prev}, *a{prev}]\n"));
+        }
+        assert!(!yaml_expansion_within_budget(&doubling));
+    }
+
+    #[test]
+    fn test_ordinary_yaml_passes_the_expansion_budget() {
+        // `*` in prose, in a regex and in a glob is not an alias at all.
+        let benign = "\
+description: use * with care, a * b
+pattern: '^/api/v[0-9]*$'
+glob: /assets/*
+";
+        assert!(yaml_expansion_within_budget(benign));
+        assert!(yaml_expansion_within_budget(
+            "a: &a {x: 1}\nb: &b [y]\nservers: [*a, *b]\n"
+        ));
+    }
+
+    // ---- transport ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fetches_and_expands_over_http() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/swagger.json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"swagger":"2.0","basePath":"/v1","paths":{"/a":{},"/b/{id}":{}}}"#)
+            .create_async()
+            .await;
+        let expander = SpecExpander::new();
+        let mut got = expander
+            .test_url(&format!("{}/swagger.json", server.url()))
+            .await
+            .map(urls)
+            .unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                format!("{}/v1/a", server.url()),
+                format!("{}/v1/b/{{id}}", server.url()),
+            ]
+        );
+        assert_eq!(expander.budget.fetched(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unrelated_urls_error_pages_and_html_cost_nothing_or_yield_nothing() {
+        let mut server = mockito::Server::new_async().await;
+        // Never requested: no specification marker in the name.
+        let untouched = server
+            .mock("GET", "/app.json")
+            .expect(0)
+            .create_async()
+            .await;
+        let _missing = server
+            .mock("GET", "/v3/api-docs")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"paths":{"/from-an-error-page":{}}}"#)
+            .create_async()
+            .await;
+        let _ui = server
+            .mock("GET", "/swagger-ui/swagger.json")
+            .with_status(200)
+            .with_header("content-type", "text/html")
+            .with_body("<html><body>login</body></html>")
+            .create_async()
+            .await;
+        let _garbage = server
+            .mock("GET", "/openapi.json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{not json at all")
+            .create_async()
+            .await;
+
+        let expander = SpecExpander::new();
+        for path in [
+            "/app.json",
+            "/v3/api-docs",
+            "/swagger-ui/swagger.json",
+            "/openapi.json",
+        ] {
+            let got = expander
+                .test_url(&format!("{}{path}", server.url()))
+                .await
+                .map(urls)
+                .unwrap();
+            assert!(got.is_empty(), "{path}: {got:?}");
+        }
+        // Only the three specification-shaped URLs were requested.
+        assert_eq!(expander.budget.fetched(), 3);
+        untouched.assert();
+    }
+
+    #[tokio::test]
+    async fn test_untyped_bodies_are_sniffed_as_json_or_yaml() {
+        let mut server = mockito::Server::new_async().await;
+        let _json = server
+            .mock("GET", "/v3/api-docs")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body(r#"{"openapi":"3.0.0","paths":{"/sniffed-json":{}}}"#)
+            .create_async()
+            .await;
+        let _yaml = server
+            .mock("GET", "/openapi")
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body("openapi: 3.0.0\npaths:\n  /sniffed-yaml: {}\n")
+            .create_async()
+            .await;
+
+        let expander = SpecExpander::new();
+        for (path, expected) in [
+            ("/v3/api-docs", "/sniffed-json"),
+            ("/openapi", "/sniffed-yaml"),
+        ] {
+            assert_eq!(
+                expander
+                    .test_url(&format!("{}{path}", server.url()))
+                    .await
+                    .map(urls)
+                    .unwrap(),
+                vec![format!("{}{expected}", server.url())],
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_cap_is_global_across_clones() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/\d+/swagger\.json$".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"openapi":"3.0.0","paths":{"/a":{}}}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let mut expander = SpecExpander::new();
+        expander.with_max_files(2);
+        let clone = expander.clone_box();
+
+        for (n, tester) in [(1, &expander as &dyn Tester), (2, clone.as_ref())] {
+            let got = tester
+                .test_url(&format!("{}/{n}/swagger.json", server.url()))
+                .await
+                .map(urls)
+                .unwrap();
+            assert_eq!(got.len(), 1);
+        }
+        let third = expander
+            .test_url(&format!("{}/3/swagger.json", server.url()))
+            .await
+            .map(urls)
+            .unwrap();
+        assert!(third.is_empty(), "third fetch must be refused by the cap");
+        assert_eq!(expander.budget.fetched(), 2);
+        m.assert();
+    }
+}

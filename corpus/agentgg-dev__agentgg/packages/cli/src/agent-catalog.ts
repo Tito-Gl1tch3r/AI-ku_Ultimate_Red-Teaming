@@ -1,0 +1,210 @@
+import { existsSync, readdirSync } from "node:fs";
+import { basename, extname, join } from "node:path";
+import {
+  type Agent,
+  type AgentPreFilterRegex,
+  getOfficialAgentsDir,
+  hasFileScope,
+  isRegexPreFilter,
+  isSemgrepPreFilter,
+  loadAgentsFromDir,
+} from "@agentgg/core";
+import { compileAgentRegex } from "./agent-regex.js";
+import { getCustomAgentsDir } from "./agents-fs.js";
+
+/** Official subtree that is opt-in only, never part of the default set. */
+const OPT_IN_DIRS = new Set(["deep"]);
+
+/**
+ * The agent dirs `scan`/`recon` run when no `-t` is given: every category
+ * under `agents/` except the opt-in ones. `deep/` agents scan far more
+ * files per run, so they stay reachable via `-t agents/deep/` but never default.
+ *
+ * Falls back to the pre-restructure `base/` layout so a CLI that has not
+ * re-run `agentgg agents update` keeps working. Returns `[]` when neither
+ * exists — the caller then uses the whole catalog.
+ */
+export function defaultAgentDirs(officialAgentsDir: string): string[] {
+  const agentsDir = join(officialAgentsDir, "agents");
+  if (existsSync(agentsDir)) {
+    return readdirSync(agentsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !OPT_IN_DIRS.has(e.name))
+      .map((e) => join(agentsDir, e.name));
+  }
+  const legacyBaseDir = join(officialAgentsDir, "base");
+  return existsSync(legacyBaseDir) ? [legacyBaseDir] : [];
+}
+
+/**
+ * Build the active agent catalog: official agents downloaded from the
+ * agentgg-agents repo first, then any the user installed via
+ * `agentgg agents add`. Both `agents list` and `scan` read from this so
+ * they're always in sync.
+ *
+ * Parse errors from either directory are collected, not thrown — one
+ * malformed file shouldn't block a scan that doesn't even reference it.
+ * Run `agentgg agents update` to install or refresh official agents.
+ *
+ * Structural checks (slug uniqueness, filename == slug) live in
+ * `lintOfficialAgents` and are intentionally NOT run here. The
+ * agentgg-agents repo's pre-commit hook is the gate. At scan time we
+ * trust the published catalog and let `-t <slug>` resolve to every
+ * matching agent — official-vs-custom shadowing is allowed by design
+ * (the fork-and-tweak workflow), and `resolveTemplates` runs both.
+ */
+export function loadAllAgents(env: NodeJS.ProcessEnv = process.env): {
+  agents: Agent[];
+  errors: string[];
+} {
+  const errors: string[] = [];
+  const all: Agent[] = [];
+
+  // Official agents — downloaded from agentgg-dev/agentgg-agents
+  const officialDir = getOfficialAgentsDir(env);
+  if (existsSync(officialDir)) {
+    const loaded = loadAgentsFromDir(officialDir, {
+      kind: "official",
+      collectErrors: true,
+    });
+    all.push(...loaded.agents);
+    for (const err of loaded.errors) {
+      errors.push(`${err.filePath ?? "?"}: ${err.message}`);
+    }
+  }
+
+  // Custom agents — user-installed via `agentgg agents add`
+  const customDir = getCustomAgentsDir(env);
+  if (existsSync(customDir)) {
+    const loaded = loadAgentsFromDir(customDir, {
+      kind: "custom",
+      collectErrors: true,
+    });
+    all.push(...loaded.agents);
+    for (const err of loaded.errors) {
+      errors.push(`${err.filePath ?? "?"}: ${err.message}`);
+    }
+  }
+
+  return { agents: all, errors };
+}
+
+/**
+ * Structural checks for an official agent tree. Run by `agentgg agents
+ * lint` (CLI) and the agentgg-agents pre-commit hook. Two invariants:
+ *
+ *   1. Slug uniqueness — every official agent has a globally unique
+ *      slug. Lets users rely on slug as a stable identifier even though
+ *      `resolveTemplates` itself does not depend on this (it returns all
+ *      slug matches, supporting official-vs-custom shadowing).
+ *   2. Filename matches slug — `<slug>.md` is the only filename allowed,
+ *      so a `grep`/`find` by filename and a slug lookup are equivalent.
+ *      Subdirectory location is irrelevant (taxonomy is free).
+ *
+ * Custom agents are exempt: hand-dropped files in the custom dir don't
+ * have to follow the convention, and shadowing official slugs is allowed
+ * intentionally.
+ */
+export function lintOfficialAgents(agents: ReadonlyArray<Agent>): string[] {
+  const violations: string[] = [];
+
+  // Duplicate slug check — bucket by slug, report any bucket > 1 with all paths.
+  const bySlug = new Map<string, string[]>();
+  for (const a of agents) {
+    const path = a.source?.path ?? "(unknown path)";
+    const bucket = bySlug.get(a.slug);
+    if (bucket) bucket.push(path);
+    else bySlug.set(a.slug, [path]);
+  }
+  for (const [slug, paths] of bySlug) {
+    if (paths.length > 1) {
+      violations.push(
+        `duplicate slug '${slug}' in ${paths.length} files:\n` +
+          paths.map((p) => `    ${p}`).join("\n"),
+      );
+    }
+  }
+
+  // Filename-matches-slug check.
+  for (const a of agents) {
+    const path = a.source?.path;
+    if (!path) continue;
+    const expected = `${a.slug}.md`;
+    const actual = basename(path);
+    if (actual !== expected && extname(actual).toLowerCase() === ".md") {
+      violations.push(
+        `filename does not match slug: '${actual}' should be '${expected}'\n    ${path}`,
+      );
+    }
+  }
+
+  // Unrecognized preFilter forms. The schema lets these through so a newer
+  // agent file degrades instead of killing the agent on an older CLI, but
+  // they do nothing at scan time — so the repo's own gate must catch them.
+  // In practice this is either a typo (`semgreprule`) or a catalog that has
+  // outrun the installed CLI.
+  for (const a of agents) {
+    const path = a.source?.path ?? "(unknown path)";
+    a.where.preFilter.forEach((p, i) => {
+      if (isRegexPreFilter(p) || isSemgrepPreFilter(p)) return;
+      violations.push(
+        `where.preFilter[${i}] is not a form this agentgg understands ` +
+          `(expected 'regex' or 'semgrepRule'; got ${JSON.stringify(Object.keys(p))}). ` +
+          `Check for a typo, or update agentgg — this catalog may be newer than your CLI.\n    ${path}`,
+      );
+    });
+  }
+
+  // Regex-compilation check. Every regex an agent declares — in
+  // `where.preFilter` and in `precondition.regex.patterns` — must compile
+  // under `new RegExp`, or it silently does nothing at scan time (the
+  // evaluators swallow bad patterns). Catch them here instead.
+  for (const a of agents) {
+    const path = a.source?.path ?? "(unknown path)";
+    const patterns: Array<{ regex: string; field: string }> = [
+      ...a.where.preFilter
+        .filter((p): p is AgentPreFilterRegex => isRegexPreFilter(p))
+        .map((p) => ({ regex: p.regex, field: "where.preFilter" })),
+      ...(a.precondition?.regex?.patterns ?? []).map((p) => ({
+        regex: p.regex,
+        field: "precondition.regex.patterns",
+      })),
+    ];
+    for (const { regex, field } of patterns) {
+      try {
+        compileAgentRegex(regex);
+      } catch (err) {
+        violations.push(
+          `invalid regex in ${field}: /${regex}/ — ${(err as Error).message}\n    ${path}`,
+        );
+      }
+    }
+  }
+
+  return violations;
+}
+
+/**
+ * Non-fatal notices for the agents repo's pre-commit hook.
+ *
+ * Separate from `lintOfficialAgents` because a warning must not fail the
+ * build: everything reported here is legal. It is reported because it is
+ * more often a mistake than an intention.
+ */
+export function warnOfficialAgents(agents: ReadonlyArray<Agent>): string[] {
+  const warnings: string[] = [];
+
+  // An empty file scope is how an agent asks for the whole repository. It is
+  // also what a forgotten `extensions:` line looks like, and the two are
+  // indistinguishable on disk. Say so once per agent.
+  for (const a of agents) {
+    if (hasFileScope(a)) continue;
+    const path = a.source?.path ?? "(unknown path)";
+    warnings.push(
+      `${a.slug} declares no extensions and no filePatterns, so its scope is ` +
+        `the whole repository and it will receive no candidate files. Add ` +
+        `extensions or filePatterns if that was not intended.\n    ${path}`,
+    );
+  }
+
+  return warnings;
+}

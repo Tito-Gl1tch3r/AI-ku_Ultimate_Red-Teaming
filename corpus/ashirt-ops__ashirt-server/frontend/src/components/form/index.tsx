@@ -1,0 +1,56 @@
+import { type ReactNode, type FormEvent, type MouseEvent } from 'react'
+import Button from 'src/components/button'
+import classnames from 'classnames/bind'
+import { type Result } from 'src/global_types'
+const cx = classnames.bind(require('./stylesheet'))
+
+const DisplayResult = (props: { result: Result<string> }) => {
+  const result = props.result
+  if ('err' in result) return <div className={cx('result', 'error')}>{result.err.message}</div>
+  return <div className={cx('result', 'success')}>{result.success}</div>
+}
+
+export default function Form(props: {
+  children?: ReactNode
+  result: Result<string> | null
+  loading: boolean
+  onSubmit: (e: FormEvent) => void
+  onCancel?: () => void
+  submitText?: string
+  cancelText?: string
+  submitDanger?: boolean
+  disableSubmit?: boolean
+  disableCancel?: boolean
+  autoFocus?: boolean
+}) {
+  const onCancel = (e: MouseEvent) => {
+    e.preventDefault()
+    if (props.onCancel) props.onCancel()
+  }
+
+  return (
+    <form className={cx('root')} onSubmit={props.onSubmit}>
+      {props.result && <DisplayResult result={props.result} />}
+      <div className={cx('children')}>{props.children}</div>
+      {props.submitText && (
+        <Button
+          primary={!props.submitDanger}
+          danger={props.submitDanger}
+          className={cx('button')}
+          loading={props.loading}
+          disabled={props.disableSubmit}
+          children={props.submitText}
+          autoFocus={props?.autoFocus}
+        />
+      )}
+      {props.onCancel && (
+        <Button
+          onClick={onCancel}
+          className={cx('button')}
+          disabled={props.loading || props.disableCancel}
+          children={props.cancelText}
+        />
+      )}
+    </form>
+  )
+}

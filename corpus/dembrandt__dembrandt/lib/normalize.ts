@@ -1,0 +1,106 @@
+/**
+ * Ingest helpers for consumers that STORE or DIFF extractions (drift engine,
+ * dembrandt-next). The CLI output type is deliberately loose where it has to be
+ * (a flag-driven producer), but that looseness is toxic downstream: a weight
+ * that is sometimes a string and sometimes a number breaks diff math.
+ *
+ * Rule of thumb: keep the loose type at the input boundary, run it through here
+ * once at ingest, and store the tight, canonical form. The CLI itself does not
+ * need these — they live in core so every consumer shares one implementation
+ * instead of each repo re-deriving it.
+ */
+import type { BrandingResult, Colors } from './types.js';
+
+const TRANSIENT_KEYS = ['_discoveredLinks', '_extractedUrls', '_pageResults'] as const;
+
+/**
+ * Remove internal crawl/merge fields that must never be persisted, even if a raw
+ * crawl object is fed in. Returns a shallow copy; the input is untouched.
+ * `colors._raw` is the same category one level down.
+ */
+export function stripTransient<T extends BrandingResult>(result: T): T {
+  const clean = { ...result } as T & Record<string, unknown>;
+  for (const key of TRANSIENT_KEYS) delete clean[key];
+
+  const colors: Colors | undefined = clean.colors;
+  if (colors && '_raw' in colors) {
+    const { _raw, ...rest } = colors;
+    (clean as Record<string, unknown>).colors = rest;
+  }
+
+  return clean;
+}
+
+const toNumber = (v: unknown): number | undefined => {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : undefined;
+  if (typeof v === 'string') {
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return undefined;
+};
+
+/**
+ * Canonicalize the loose unions to a single shape so the engine and UI never see
+ * variants. Conservative: only touches the documented offenders, leaves the rest
+ * untouched, and never throws. Run after stripTransient() at ingest.
+ *
+ *  - typography weight       : string | number  -> number
+ *  - spacing px              : number | string  -> number
+ *  - spacing display         : guaranteed "Npx" string (backfilled if absent)
+ *  - typography adobeFonts   : string[] | bool  -> string[]
+ *  - components inputs/badges : array | object  -> array
+ */
+export function normalizeExtraction<T extends BrandingResult>(result: T): T {
+  const out = stripTransient(result);
+
+  for (const s of out.typography?.styles ?? []) {
+    const w = toNumber(s.weight);
+    if (w !== undefined) s.weight = w;
+  }
+  for (const v of out.spacing?.commonValues ?? []) {
+    const px = toNumber(v.px);
+    if (px !== undefined) v.px = px;
+    if (v.display === undefined) {
+      v.display = px !== undefined ? `${px}px` : String(v.px);
+    }
+  }
+  if (out.typography?.sources && typeof out.typography.sources.adobeFonts === 'boolean') {
+    out.typography.sources.adobeFonts = [];
+  }
+  if (out.components) {
+    const c = out.components;
+    if (c.inputs && !Array.isArray(c.inputs)) c.inputs = c.inputs.text ?? [];
+    if (c.badges && !Array.isArray(c.badges)) c.badges = c.badges.all ?? [];
+  }
+
+  return out;
+}
+
+/**
+ * Base grid in px from a spacing scaleType, 0 when none was detected.
+ * The extractor writes "8px"/"4px"; normalized payloads carry "base-8"/"base-4".
+ * Both name the same rhythm, and reading only one of them silently disables
+ * every off-grid check downstream.
+ */
+export function spacingBase(scaleType: unknown): number {
+  const s = String(scaleType ?? '');
+  const m = /^base-(\d+)$/.exec(s) ?? /^(\d+)px$/.exec(s);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * Whether a parsed object is a dembrandt extraction at all.
+ *
+ * Deliberately shallow: `colors` is the one block every extraction has carried
+ * since the first release, and a deeper check would reject an older contract
+ * this build can still read. The point is to tell an extraction from some other
+ * JSON file, not to validate it.
+ *
+ * It lives here because both sides need the same answer. The App had its own
+ * copy, and the CLI had none, so `--compare` against a JSON file that was not an
+ * extraction read every token as added and reported total drift.
+ */
+export function isExtraction(value: unknown): value is BrandingResult {
+  return Boolean(value && typeof value === 'object' && 'colors' in (value as Record<string, unknown>));
+}

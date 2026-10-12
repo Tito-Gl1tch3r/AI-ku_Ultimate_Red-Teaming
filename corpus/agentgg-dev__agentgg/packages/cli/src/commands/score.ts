@@ -1,0 +1,350 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import type { FileRecord, Finding, Provider } from "@agentgg/core";
+import {
+  completeRun,
+  createRunMeta,
+  effectiveVerdict,
+  loadAllFileRecords,
+  readReconReport,
+  readScanMeta,
+  writeFileRecord,
+  writeRunMeta,
+} from "@agentgg/core";
+import type { Command } from "commander";
+import { runConcurrent } from "../concurrent.js";
+import { handleDetectorError } from "../diagnostics.js";
+import { loadOrSynthesizeConfig, resolveDetector } from "../llm.js";
+import { logError } from "../log.js";
+import {
+  buildCredentialsFromOpts,
+  REGION_FLAG_HELP,
+  validateProviderFlags,
+} from "../providers/index.js";
+import { findingFilenameSlug, writeMarkdownReport } from "../reporters/md.js";
+import { createUsageMeter } from "../usage-meter.js";
+import { buildInvocation } from "./invocation.js";
+
+interface ScoreOpts {
+  provider?: string;
+  apiKey?: string;
+  oauthToken?: string;
+  baseUrl?: string;
+  region?: string;
+  project?: string;
+  model?: string;
+  /** `--openrouter-routing`: see the twin option on `scan`. */
+  openrouterRouting?: string;
+  /** Re-score findings that already carry a CVSS score on disk. */
+  force?: boolean;
+  /**
+   * Include findings the combined verdict rejects as false-positive /
+   * out-of-scope. Off by default — same logic as the in-scan phase: don't
+   * pay tokens scoring findings that won't ship. Duplicates are skipped
+   * regardless; their primary carries the score.
+   */
+  includeDisqualified?: boolean;
+  /** Drop false-positive findings from the markdown report (kept by default). */
+  excludeFalsePositives?: boolean;
+  verbose?: boolean;
+  /** Override the scanned root recorded in scan.json — rare. */
+  root?: string;
+  /**
+   * `--no-summary` → `summary: false`. Skip re-rendering the markdown report
+   * (`summary.md` + `findings/*.md`) after scoring. Scores are still persisted
+   * to `state/files/*`; render later with `agentgg summary`. Commander
+   * defaults this to `true`; the bare flag sets it `false`.
+   */
+  summary?: boolean;
+  /** Findings scored in parallel (in-flight LLM calls). Default 5. */
+  concurrency?: number;
+}
+
+/**
+ * Stand-alone scoring command — pick CVSS 3.1 metrics for every
+ * confirmed/uncertain finding on disk, assemble the full `CvssScore`
+ * deterministically from those metrics, and write it back into the
+ * per-file FileRecord. Mirrors `revalidate` in shape so the two
+ * post-scan passes feel symmetric.
+ *
+ * By default skips findings that already have `cvss`. Pass `--force`
+ * to redo them. By default skips findings the validator disqualified
+ * (false-positive / out-of-scope); pass `--include-disqualified` to
+ * score them anyway (useful when you want a score column for *every*
+ * finding regardless of verdict).
+ */
+export async function runScore(
+  outputArg: string,
+  opts: ScoreOpts,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const outputDir = resolve(outputArg);
+  const scanMeta = readScanMeta(outputDir);
+  if (!scanMeta) {
+    throw new Error(
+      `No scan state at ${outputDir}. Run \`agentgg scan <path> -o ${outputArg}\` first.`,
+    );
+  }
+  const rootPath = opts.root ? resolve(opts.root) : scanMeta.root;
+
+  // Recon brief, if the scan produced one. It anchors the deployment-
+  // dependent CVSS metrics (Attack Vector, Privileges Required) so a
+  // local CLI/library target isn't scored as a network-reachable
+  // service. Absent (older scan, or --no-recon) → scored without it.
+  const recon = readReconReport(outputDir) ?? undefined;
+
+  const config = loadOrSynthesizeConfig(env, opts.provider);
+  const activeProvider = (opts.provider ?? config.provider) as Provider;
+  validateProviderFlags(activeProvider, opts);
+  const detector = resolveDetector(config, {
+    provider: opts.provider,
+    model: opts.model,
+    credentials: buildCredentialsFromOpts(opts),
+    verbose: opts.verbose,
+    openrouterRouting: opts.openrouterRouting,
+  });
+
+  // See scan.ts for the design note. On a fatal quota / auth diagnostic,
+  // sibling in-flight scoring calls cancel at the SDK layer.
+  const scoreAbortController = new AbortController();
+
+  const records = loadAllFileRecords(outputDir);
+  if (records.length === 0) {
+    console.log(`No FileRecords in ${outputDir}/state/files/.`);
+    console.log("  Run `agentgg scan` first to populate findings.");
+    return;
+  }
+
+  const isDisqualified = (f: Finding): boolean => {
+    const v = effectiveVerdict(f);
+    return v === "false-positive" || v === "out-of-scope";
+  };
+
+  type Task = { record: FileRecord; finding: Finding };
+  const tasks: Task[] = [];
+  let skippedHasScore = 0;
+  let skippedDisq = 0;
+  let skippedDupes = 0;
+  for (const record of records) {
+    for (const finding of record.findings) {
+      if (!opts.force && finding.cvss) {
+        skippedHasScore++;
+        continue;
+      }
+      // A duplicate never ships on its own; its primary carries the score.
+      if (finding.dedup) {
+        skippedDupes++;
+        continue;
+      }
+      if (!opts.includeDisqualified && isDisqualified(finding)) {
+        skippedDisq++;
+        continue;
+      }
+      tasks.push({ record, finding });
+    }
+  }
+
+  if (tasks.length === 0) {
+    console.log(
+      `Nothing to score. ${records.length} file(s) on disk; ${skippedHasScore} already scored, ${skippedDisq} disqualified by validation, ${skippedDupes} duplicate(s).`,
+    );
+    console.log(
+      "  Pass --force to rescore everything, --include-disqualified to include FP/out-of-scope findings.",
+    );
+    return;
+  }
+
+  console.log(`Scoring ${tasks.length} finding(s) in ${outputDir}`);
+  console.log(`  Root:        ${rootPath}`);
+  console.log(`  Provider:    ${detector.name}`);
+  if (skippedHasScore > 0) console.log(`  Skipped:     ${skippedHasScore} already scored`);
+  if (skippedDisq > 0) console.log(`  Skipped:     ${skippedDisq} FP/out-of-scope`);
+  if (opts.force) console.log(`  Force:       re-scoring everything`);
+  console.log("");
+
+  const runMeta = createRunMeta({
+    type: "scan",
+    invocation: buildInvocation({ command: "score" }),
+  });
+  writeRunMeta(outputDir, runMeta);
+
+  // Token-usage metering — scoring is an LLM pass, so it's recorded too.
+  // Checkpoints to state/usage.json incrementally and is flushed at finalize.
+  // (No SIGTERM handler here, matching this command's existing shape; a cancel
+  // relies on the last incremental checkpoint.)
+  const usageMeter = createUsageMeter(outputDir, detector.name);
+  detector.attachUsageMeter?.(usageMeter);
+
+  const startedAt = new Date();
+  const buckets: Record<string, number> = {};
+  const fileCache = new Map<string, string | null>();
+  const dirtyRecords = new Set<FileRecord>();
+
+  // One bounded pool over findings, same as revalidate. Each finding is a
+  // distinct object; buckets, fileCache, and dirtyRecords are only touched
+  // in await-free regions, so concurrent workers can't race.
+  const concurrency = Math.max(1, opts.concurrency ?? 5);
+  await runConcurrent(tasks, concurrency, async ({ record, finding }) => {
+    const absPath = resolve(rootPath, finding.filePath);
+    let content = fileCache.get(finding.filePath);
+    if (content === undefined) {
+      try {
+        content = readFileSync(absPath, "utf8");
+      } catch {
+        content = null;
+      }
+      fileCache.set(finding.filePath, content);
+    }
+    if (content === null) {
+      if (opts.verbose) {
+        console.log(`  skip ${finding.filePath}: file not readable`);
+      }
+      return;
+    }
+    try {
+      const cvss = await detector.scoreFinding({
+        finding,
+        fileContent: content,
+        recon,
+        signal: scoreAbortController.signal,
+      });
+      // Mutate in place — the record holds the same Finding object.
+      finding.cvss = cvss;
+      finding.severity = cvss.severity;
+      buckets[cvss.severity] = (buckets[cvss.severity] ?? 0) + 1;
+      dirtyRecords.add(record);
+      if (opts.verbose) {
+        const loc = finding.lineRange ? `:${finding.lineRange[0]}` : "";
+        console.log(
+          `  ${cvss.severity.padEnd(8)} ${cvss.baseScore.toFixed(1).padStart(4)}  ${findingFilenameSlug(finding)}  ${finding.filePath}${loc}`,
+        );
+      }
+    } catch (err) {
+      handleDetectorError(opts, `score:${finding.id}`, err, scoreAbortController);
+    }
+  });
+
+  for (const record of dirtyRecords) {
+    const scoredHere = record.findings.filter((f) => f.cvss);
+    record.analysisHistory.push({
+      runId: runMeta.runId,
+      phase: "score",
+      ranAt: new Date().toISOString(),
+      durationMs: 0,
+      provider: detector.name,
+      agentSlugs: Array.from(new Set(scoredHere.map((f) => f.agentSlug))),
+      findingCount: scoredHere.length,
+    });
+    try {
+      writeFileRecord(outputDir, record);
+    } catch (err) {
+      logError(`persist failed for ${record.filePath}: ${(err as Error).message}`);
+    }
+  }
+
+  const completedAt = new Date();
+  completeRun(outputDir, runMeta.runId, "done", {
+    findingsCount: tasks.length,
+    totalDurationMs: completedAt.getTime() - startedAt.getTime(),
+  });
+  usageMeter.flush();
+
+  // Re-render reports so `findings/*.md` and `summary.md` reflect the
+  // new scores. Mirrors the post-revalidate re-render. `--no-summary`
+  // skips it — scores are already persisted to state/files/*, so
+  // `agentgg summary` can render the report later.
+  if (opts.summary !== false) {
+    const allFindings = records.flatMap((r) => r.findings);
+    const byAgent: Record<string, number> = {};
+    for (const f of allFindings) {
+      byAgent[f.agentSlug] = (byAgent[f.agentSlug] ?? 0) + 1;
+    }
+    writeMarkdownReport({
+      outDir: outputDir,
+      root: rootPath,
+      startedAt,
+      completedAt,
+      findings: allFindings,
+      filesScanned: records.length,
+      byAgent,
+      excludeFalsePositives: opts.excludeFalsePositives,
+    });
+  }
+
+  const summary = Object.entries(buckets)
+    .sort()
+    .map(([s, n]) => `${s}=${n}`)
+    .join(", ");
+  console.log(`Done. Severity: ${summary || "(none)"}`);
+  console.log(`  Rewrote ${dirtyRecords.size} FileRecord(s).`);
+  if (opts.summary === false) {
+    console.log("  Summary: skipped (--no-summary). Run `agentgg summary` to render it.");
+  }
+}
+
+export function registerScoreCommand(program: Command): void {
+  program
+    .command("score")
+    .description(
+      "run the CVSS 3.1 scoring phase against persisted findings in an --output directory",
+    )
+    .argument(
+      "[output-dir]",
+      "path to the scan's --output directory (defaults to ./scan-results)",
+      "./scan-results",
+    )
+    .option(
+      "--root <path>",
+      "override the scanned root recorded in scan.json (only needed if the working copy moved)",
+    )
+    .option(
+      "--provider <name>",
+      "LLM provider for this run: anthropic | openai | ollama (overrides saved default)",
+    )
+    .option(
+      "--api-key <key>",
+      "One-shot API key (not persisted). Valid for: anthropic, openai, openrouter.",
+    )
+    .option("--oauth-token <token>", "One-shot Anthropic OAuth token (sk-ant-oat…). Not persisted.")
+    .option("--base-url <url>", "One-shot Ollama base URL (not persisted)")
+    .option("--region <name>", REGION_FLAG_HELP)
+    .option(
+      "--project <id>",
+      "GCP project ID for Vertex AI. Falls back to $GOOGLE_CLOUD_PROJECT / $GCLOUD_PROJECT. Vertex only.",
+    )
+    .option("--model <name>", "One-shot model override for the selected provider (not persisted)")
+    .option(
+      "--openrouter-routing <json|file>",
+      "OpenRouter provider-routing block, overriding OPENROUTER_* env for this run: inline JSON (must start with {) or a path to a .json file (avoids shell-quoting JSON on Windows). Invalid JSON aborts before any LLM call. OpenRouter only.",
+    )
+    .option("--force", "re-score findings that already carry a CVSS score (default: skip them)")
+    .option(
+      "--include-disqualified",
+      "score findings the combined verdict rejects as false-positive or out-of-scope (default: skip them). Duplicates stay skipped either way.",
+    )
+    .option(
+      "--exclude-false-positives",
+      "Drop false-positive findings from the markdown report (default: keep them).",
+    )
+    .option(
+      "--no-summary",
+      "Skip re-rendering the markdown report (summary.md + findings/*.md) after scoring. Scores still persist to state/files/*; render later with `agentgg summary`.",
+    )
+    .option(
+      "--concurrency <n>",
+      "findings scored in parallel (in-flight LLM calls)",
+      (v) => parseInt(v, 10),
+      5,
+    )
+    .option("-v, --verbose", "verbose output")
+    .action(async (outputDir: string, opts: ScoreOpts) => {
+      try {
+        await runScore(outputDir, opts);
+      } catch (err) {
+        logError(`score failed: ${err instanceof Error ? err.message : String(err)}`);
+        // See scan.ts comment — let the event loop drain so libuv can
+        // close in-flight subprocess handles cleanly on Windows.
+        process.exitCode = 1;
+      }
+    });
+}

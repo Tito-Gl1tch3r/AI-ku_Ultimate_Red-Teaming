@@ -1,0 +1,182 @@
+// GHOST RECOVER — signature carving.
+#pragma once
+
+#include "ghost/io.h"
+
+namespace ghost {
+
+// How a carver determines where the file ends.
+enum class SizeMode : u8 {
+    Footer,        // scan forward for a terminator byte string
+    Header,        // the header contains the length (BMP, PNG-chunks, RIFF, ...)
+    Container,     // walk the container's structure (MP4 atoms, EBML, OGG pages)
+    FrameStream,   // walk a stream of frames (MP3, AAC, AC3, TS, AMR)
+    Text,          // run of printable bytes
+    Fixed,         // constant size
+    Heuristic,     // no reliable end marker — read up to max_size, trimmed
+};
+
+struct CarveSpec;
+class  ByteSource;
+
+// A validator inspects the start of a candidate and returns:
+//   >0  exact size in bytes
+//    0  structurally valid but size unknown (caller falls back)
+//   -1  reject the candidate
+using SizeFn = i64 (*)(ByteSource&, i64 offset, i64 maxSize, const CarveSpec& spec);
+
+// Cheap scan-time admission test for weak signatures (single-byte magics
+// such as the dBase family, which otherwise hit in every binary and flood
+// the candidate list). `p` points at the hit; `n` is how many bytes follow
+// it inside the scan buffer. Return true to admit, false to discard. May
+// admit when n is too small to decide; the validator re-checks everything.
+using ScanFilter = bool (*)(const u8* p, i64 n);
+
+struct CarveSpec {
+    std::string name;             // "JPEG"
+    std::string ext;              // "jpg"
+    std::string category;         // "image" | "video" | "audio" | "document" | "archive" |
+                                  // "database" | "email" | "crypto" | "executable" |
+                                  // "forensic" | "vm" | "code" | "text" | "font" | "misc"
+    std::vector<u8> magic;        // primary signature
+    int  magic_offset = 0;        // where `magic` sits relative to the file start
+    i64  min_size = 32;
+    i64  max_size = 64LL * 1024 * 1024;
+
+    SizeMode        mode = SizeMode::Heuristic;
+    std::vector<u8> footer;       // for SizeMode::Footer
+    int             footer_extra = 0;   // bytes to keep after the footer match
+
+    // Disambiguation: a second byte string that must be present, either at an
+    // exact offset (confirm_offset >= 0) or anywhere within confirm_window.
+    std::vector<u8> confirm;
+    int             confirm_offset = -1;
+    int             confirm_window = 4096;
+
+    SizeFn validator = nullptr;   // structural walker, when the format has one
+    // True when the validator walks the file's internal chain from start to
+    // end (PNG chunk list, ZIP central directory, MP4 atom tree, frame
+    // streams...). Such a result proves every byte in between is intact, which
+    // header-only checks like BMP's size field or an ELF section table do not.
+    bool whole_file = false;
+    // True for stream formats whose walk has no hard end marker (MAT element
+    // chains, pickles, DER containers, binary plists, qcow/VHDX/VHD/VDI block
+    // walks). Their validator walks on past the file's real end into whatever
+    // follows, so the engine must clamp the size at the next signature.
+    bool bound_to_next = false;
+    double min_entropy = -1.0;    // reject below this (unset = no check)
+    double max_entropy = -1.0;    // reject above this (rejects random noise)
+    int    priority = 0;          // higher wins when two specs match at one offset
+    ScanFilter scan_filter = nullptr;  // scan-time admission test (weak magics)
+};
+
+// Reads that a validator performs. Backed by the DiskReader but with its own
+// small window so validators cannot run away across the device. Small reads
+// (byte(), be32(), ... — validators issue millions of them) are served from a
+// cached window instead of one heap allocation + pread per access.
+class ByteSource {
+public:
+    ByteSource(DiskReader& d, i64 limit) : d_(d), limit_(limit) {}
+    std::vector<u8> read(i64 off, i64 len);
+    u8  byte(i64 off);
+    u32 be32(i64 off);
+    u32 le32(i64 off);
+    u16 be16(i64 off);
+    u16 le16(i64 off);
+    u64 be64(i64 off);
+    u64 le64(i64 off);
+    i64 limit() const { return limit_; }
+    // Formats whose length field lives behind the signature (DMG's koly
+    // trailer sits at the end of the file) report how many bytes of the file
+    // precede the signature. The engine then carves [off-backscan, off+size).
+    void setBackscan(i64 n) { backscan_ = n; }
+    i64 backscan() const { return backscan_; }
+private:
+    bool fill(i64 off, i64 len);   // make [off, off+len) available in win_
+    DiskReader& d_;
+    i64 limit_;
+    std::vector<u8> win_;
+    i64 win_start_ = -1;           // device offset of win_[0]
+    i64 win_len_   = 0;            // valid bytes in win_
+    i64 backscan_  = 0;
+    static constexpr i64 kWin = 64 * 1024;
+};
+
+const std::vector<CarveSpec>& carverRegistry();
+std::vector<std::string>      carverCategories();
+
+struct CarveOptions {
+    std::string output_dir;
+    i64  max_files      = 20000;
+    i64  min_file_size  = 32;
+    i64  max_file_size  = 4LL * 1024 * 1024 * 1024;
+    bool write_files    = true;
+    bool compute_hashes = true;
+    bool validate       = true;      // run format validators
+    bool dedup          = true;      // drop byte-identical results
+    bool text_carving   = false;     // recover loose printable-text runs
+    bool skip_allocated = false;     // only look at space the filesystem calls free
+    int  threads        = 0;         // 0 = auto
+    i64  start_offset   = 0;
+    i64  length         = 0;         // 0 = to end of window
+    std::vector<std::string> categories;   // empty = all
+    std::vector<std::string> extensions;   // empty = all
+    std::vector<Extent>      regions;      // explicit regions (unallocated map)
+    // Regions already accounted for by a filesystem scan (a deep job passes the
+    // scanned files' extents). Signature hits inside them are duplicates the
+    // merge would drop anyway — the dedup does that after a full validation
+    // walk, which on a real disk means reading every live file twice. Skipping
+    // them in pass 1 collapses the flood of in-file junk candidates and makes
+    // the carve validate only what the scan does not already cover.
+    std::vector<Extent>      skip_regions;
+    // Optional per-file callback, fired in accept order as each file is
+    // recovered (before it is recorded in the result). The server uses it to
+    // publish files to the UI live, while the carve itself runs.
+    std::function<void(const CarvedFile&)> on_file;
+};
+
+CarveResult carveDevice(DiskReader& disk, const CarveOptions& opt, Progress& prog);
+
+// ---------------------------------------------------------------------------
+// Aho-Corasick multi-pattern matcher.
+//
+// The old carver ran std::search once per signature per chunk — roughly 180
+// full passes over every byte of the device. This walks each byte once and
+// reports every signature that ends at it.
+// ---------------------------------------------------------------------------
+class MultiMatcher {
+public:
+    void add(const std::vector<u8>& pattern, int id);
+    // Determinises the trie into a flat 256-way transition table so matching
+    // costs one array lookup per byte regardless of how many signatures are
+    // loaded.
+    void build();
+
+    // Feeds `len` bytes starting at absolute position `base`. `state` is the
+    // caller's automaton state and must persist across consecutive chunks;
+    // each worker thread keeps its own so the shared table stays read-only.
+    // `cb(startOffset, patternId)` fires for every match.
+    void scan(const u8* data, size_t len, i64 base, int& state,
+              const std::function<void(i64, int)>& cb) const;
+
+    int    initialState() const { return 0; }
+    size_t patternCount() const { return patterns_; }
+    size_t maxPatternLen() const { return max_len_; }
+    size_t stateCount() const { return goto_.size() / 256; }
+
+private:
+    // Trie edges during construction; replaced by `goto_` after build().
+    std::vector<std::map<u8, int>> edges_{1};
+    std::vector<int> goto_;          // stateCount * 256 flat transition table
+    std::vector<int> fail_;
+    // Every pattern id that terminates at this state. Several formats share a
+    // signature (RIFF is WAV, AVI, WEBP and CDR; ftyp is a dozen containers),
+    // so a state has to be able to report all of them.
+    std::vector<std::vector<int>> out_;
+    std::vector<int> out_link_;      // next state in the suffix output chain
+    std::vector<int> pat_len_;
+    size_t patterns_ = 0, max_len_ = 0;
+    bool   built_ = false;
+};
+
+}  // namespace ghost

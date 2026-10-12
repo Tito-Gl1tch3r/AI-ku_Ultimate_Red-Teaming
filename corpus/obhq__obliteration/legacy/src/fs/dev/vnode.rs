@@ -1,0 +1,233 @@
+use super::dirent::Dirent;
+use super::{AllocVnodeError, CdevFileBackend, DevFs};
+use crate::errno::{Errno, EIO, ENOENT, ENOTDIR, ENXIO};
+use crate::fs::{
+    check_access, Access, FileBackend, IoCmd, IoLen, IoVec, IoVecMut, RevokeFlags, Vnode,
+    VnodeAttrs, VnodeFileBackend, VnodeItem, VnodeType,
+};
+use crate::process::VThread;
+use macros::Errno;
+use std::ops::Deref;
+use std::sync::Arc;
+use thiserror::Error;
+
+/// An implementation of [`crate::fs::VnodeBackend`] for devfs.
+///
+/// This implementation merge `devfs_vnodeops` and `devfs_specops` together.
+#[derive(Debug)]
+pub struct VnodeBackend {
+    fs: Arc<DevFs>,
+    dirent: Arc<Dirent>,
+}
+
+impl VnodeBackend {
+    pub fn new(fs: Arc<DevFs>, dirent: Arc<Dirent>) -> Self {
+        Self { fs, dirent }
+    }
+}
+
+impl crate::fs::VnodeBackend for VnodeBackend {
+    fn access(
+        &self,
+        vn: &Arc<Vnode>,
+        td: Option<&VThread>,
+        mode: Access,
+    ) -> Result<(), Box<dyn Errno>> {
+        // Get dirent.
+        let mut dirent = self.dirent.clone();
+        let is_dir = match vn.ty() {
+            VnodeType::Directory(_) => {
+                if let Some(v) = dirent.dir() {
+                    // Is it possible the parent will be gone here?
+                    dirent = v.upgrade().unwrap();
+                }
+
+                true
+            }
+            _ => false,
+        };
+
+        // Get credential.
+        let cred = match td {
+            Some(v) => v.cred(),
+            None => return Ok(()),
+        };
+
+        // Get file permissions as atomic.
+        let (fuid, fgid, fmode) = {
+            let uid = dirent.uid();
+            let gid = dirent.gid();
+            let mode = dirent.mode();
+
+            (*uid, *gid, *mode)
+        };
+
+        // Check access.
+        let err = match check_access(cred, fuid, fgid, fmode, mode, is_dir) {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+
+        // TODO: Check if file is a controlling terminal.
+        Err(Box::new(err))
+    }
+
+    fn getattr(&self, vn: &Arc<Vnode>) -> Result<VnodeAttrs, Box<dyn Errno>> {
+        // Populate devices.
+        self.fs.populate();
+
+        // Get dirent.
+        let mut dirent = self.dirent.clone();
+
+        if vn.is_directory() {
+            if let Some(v) = dirent.dir() {
+                // Is it possible the parent will be gone here?
+                dirent = v.upgrade().unwrap();
+            }
+        }
+
+        // Atomic get attributes.
+        let uid = dirent.uid();
+        let gid = dirent.gid();
+        let mode = dirent.mode();
+        let size = match vn.ty() {
+            VnodeType::Directory(_) => 512,
+            VnodeType::Link => todo!(), /* TODO: strlen(dirent.de_symlink) */
+            _ => 0,
+        };
+
+        Ok(VnodeAttrs {
+            uid: *uid,
+            gid: *gid,
+            mode: *mode,
+            size,
+            fsid: u32::MAX,
+        })
+    }
+
+    fn ioctl(
+        &self,
+        #[allow(unused_variables)] vn: &Arc<Vnode>,
+        #[allow(unused_variables)] cmd: IoCmd,
+        #[allow(unused_variables)] td: Option<&VThread>,
+    ) -> Result<(), Box<dyn Errno>> {
+        todo!()
+    }
+
+    fn lookup(
+        &self,
+        vn: &Arc<Vnode>,
+        td: Option<&VThread>,
+        name: &str,
+    ) -> Result<Arc<Vnode>, Box<dyn Errno>> {
+        // Populate devices.
+        self.fs.populate();
+
+        // Check if directory.
+        match vn.ty() {
+            VnodeType::Directory(root) => {
+                if name == ".." && *root {
+                    return Err(Box::new(LookupError::DotdotOnRoot));
+                }
+            }
+            _ => return Err(Box::new(LookupError::NotDirectory)),
+        }
+
+        // Check if directory is accessible.
+        if let Err(e) = vn.access(td, Access::EXEC) {
+            return Err(Box::new(LookupError::AccessDenied(e)));
+        }
+
+        // Check name.
+        match name {
+            "." => Ok(vn.clone()),
+            ".." => {
+                let parent = match self.dirent.parent() {
+                    Some(v) => v,
+                    None => return Err(Box::new(LookupError::NoParent)),
+                };
+
+                match self.fs.alloc_vnode(vn.mount(), parent) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(Box::new(LookupError::AllocVnodeFailed(e))),
+                }
+            }
+            _ => {
+                // Lookup.
+                let item = match self.dirent.find(name, None) {
+                    Some(v) => {
+                        // TODO: Implement devfs_prison_check.
+                        v
+                    }
+                    None => todo!("devfs lookup with non-existent file"),
+                };
+
+                match self.fs.alloc_vnode(vn.mount(), item) {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(Box::new(LookupError::AllocVnodeFailed(e))),
+                }
+            }
+        }
+    }
+
+    fn revoke(&self, vn: &Arc<Vnode>, _flags: RevokeFlags) -> Result<(), Box<dyn Errno>> {
+        todo!()
+    }
+
+    fn read(
+        &self,
+        vn: &Arc<Vnode>,
+        off: u64,
+        buf: &mut [IoVecMut],
+        td: Option<&VThread>,
+    ) -> Result<IoLen, Box<dyn Errno>> {
+        todo!()
+    }
+
+    fn write(
+        &self,
+        vn: &Arc<Vnode>,
+        off: u64,
+        buf: &[IoVec],
+        td: Option<&VThread>,
+    ) -> Result<IoLen, Box<dyn Errno>> {
+        todo!()
+    }
+
+    fn to_file_backend(&self, vn: &Arc<Vnode>) -> Box<dyn FileBackend> {
+        match vn.item().deref() {
+            Some(VnodeItem::Device(d)) => Box::new(CdevFileBackend::new(vn.clone(), d.clone())),
+            _ => Box::new(VnodeFileBackend::new(vn.clone())),
+        }
+    }
+}
+
+/// Represents an error when [`lookup()`] is failed.
+#[derive(Debug, Error, Errno)]
+enum LookupError {
+    #[error("file is not a directory")]
+    #[errno(ENOTDIR)]
+    NotDirectory,
+
+    #[error("cannot resolve '..' on the root directory")]
+    #[errno(EIO)]
+    DotdotOnRoot,
+
+    #[error("access denied")]
+    AccessDenied(#[source] Box<dyn Errno>),
+
+    #[error("file have no parent")]
+    #[errno(ENOENT)]
+    NoParent,
+
+    #[error("cannot allocate a vnode")]
+    AllocVnodeFailed(#[source] AllocVnodeError),
+}
+
+/// Represents an error when [`open()`] is failed.
+#[derive(Debug, Error, Errno)]
+enum OpenError {
+    #[error("destination file is required")]
+    #[errno(ENXIO)]
+    NeedFile,
+}

@@ -1,0 +1,965 @@
+/**
+ * Drift engine — the product core.
+ *
+ * Compares two Dembrandt native extracts (a baseline and a candidate) and
+ * returns a drift report: a 0-100 score (0 = identical), a pass/fail verdict,
+ * and a list of what changed. Pure functions, no dependencies, no infra.
+ *
+ * Baseline-agnostic by design: it does not know or care whether the baseline is
+ * a rolling `main` snapshot or a pinned `ds-vN` release. The caller decides what
+ * to compare against. Two-baseline workflows just call this twice.
+ */
+
+import type { BrandingResult as ExtractionResult, TypographyStyle, Confidence } from "./types.js";
+// The palette compares on `normalized`, which is already hex. The semantic map
+// has no normalized twin: it carries whatever notation the page authored, so it
+// must be parsed before comparison or a page declaring oklch() would read as
+// drift against the same colour written as hex. One spec parser, not a second
+// copy of one living here.
+import { parseCssColor } from "./color-parse.js";
+// One Lab conversion for the whole tree; see the note on deltaE below (DEM-211).
+import { rgbToLab } from "./colors.js";
+
+export interface DriftConfig {
+  /** ΔE at or below this: colors treated as identical. */
+  colorSame: number;
+  /** ΔE at or below this (and above colorSame): a color "shifted". Beyond: removed/added. */
+  colorShift: number;
+  /** Percent change at or below this: a dimension is unchanged. */
+  dimPct: number;
+  /** Percent change at or below this (and above dimPct): "shifted". Beyond: removed/added. */
+  dimShiftPct: number;
+  /** Relative weight of each category in the overall score. */
+  weights: { color: number; typography: number; spacing: number; radius: number; shadow: number; logo: number; tech: number };
+  /** score > failThreshold => fail. */
+  failThreshold: number;
+}
+
+export const DEFAULT_DRIFT_CONFIG: DriftConfig = {
+  colorSame: 2.3, // ~ just-noticeable difference
+  colorShift: 15,
+  dimPct: 4,
+  dimShiftPct: 25,
+  weights: { color: 1, typography: 1, spacing: 0.8, radius: 0.6, shadow: 0.6, logo: 0.8, tech: 0.6 },
+  failThreshold: 10,
+};
+
+export type DriftKind = "changed" | "added" | "removed";
+export type DriftCategory = "color" | "typography" | "spacing" | "radius" | "shadow" | "logo" | "tech";
+
+export interface DriftChange {
+  category: DriftCategory;
+  kind: DriftKind;
+  label: string;
+  before?: string;
+  after?: string;
+  /** ΔE for colors, percent change for dimensions. */
+  delta?: number;
+}
+
+export interface CategoryResult {
+  category: DriftCategory;
+  score: number; // 0..1
+  changed: number;
+  added: number;
+  removed: number;
+}
+
+export interface DriftReport {
+  score: number; // 0..100, 0 = identical
+  status: "stable" | "drift";
+  threshold: number;
+  summary: { changed: number; added: number; removed: number };
+  categories: CategoryResult[];
+  changes: DriftChange[];
+  /** Comparison-validity caveats (e.g. baseline and candidate extracted at
+   *  different viewport widths). The score stands, but changes may be
+   *  environment-induced rather than design drift. */
+  warnings?: string[];
+  /** True when degradation excluded every comparable category: the score is 0
+   *  by construction, not evidence. A gate must treat this as "could not
+   *  evaluate", not as a pass. */
+  inconclusive?: boolean;
+}
+
+/* ----------------------------- color math ----------------------------- */
+
+function parseColor(input: string): [number, number, number] | null {
+  const s = input.trim();
+  let h = s.replace(/^#/, "");
+  if (/^[0-9a-fA-F]{3}$/.test(h)) h = h.split("").map((c) => c + c).join("");
+  if (/^[0-9a-fA-F]{8}$/.test(h)) h = h.slice(0, 6);
+  if (/^[0-9a-fA-F]{6}$/.test(h)) {
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+  }
+  const m = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+  if (m) return [Number(m[1]), Number(m[2]), Number(m[3])];
+  return null;
+}
+
+/**
+ * CIE76 distance between two colour strings.
+ *
+ * The Lab conversion is imported, not rewritten: this file used to carry its
+ * own copy with truncated matrix coefficients, so the same metric computed here
+ * and in lib/colors.ts disagreed by up to 0.03 (DEM-211).
+ *
+ * The failure convention is this file's own and deliberately differs from
+ * colors.ts, which returns 999 so a dedup threshold treats unparseable colours
+ * as distinct. Drift needs the stronger claim: two values it cannot read are
+ * incomparable, not far apart. Identical unreadable strings (`var(--brand)`
+ * against itself) are 0 because nothing changed; different ones are Infinity,
+ * which callers must handle rather than report as a distance.
+ */
+function deltaE(a: string, b: string): number {
+  const ra = parseColor(a);
+  const rb = parseColor(b);
+  if (!ra || !rb) return a.trim() === b.trim() ? 0 : Infinity;
+  const la = rgbToLab(ra[0], ra[1], ra[2]);
+  const lb = rgbToLab(rb[0], rb[1], rb[2]);
+  return Math.sqrt((la.l - lb.l) ** 2 + (la.a - lb.a) ** 2 + (la.b - lb.b) ** 2);
+}
+
+/* ------------------------------ helpers ------------------------------- */
+
+const round = (n: number) => Math.round(n * 10) / 10;
+const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+
+function pctChange(a: number, b: number): number {
+  if (a === 0) return b === 0 ? 0 : 100;
+  return Math.abs(a - b) / Math.abs(a) * 100;
+}
+
+/** Score a set of changes into 0..1 against the baseline size. */
+function categoryScore(penalty: number, baseCount: number, candCount: number): number {
+  if (baseCount === 0) return candCount > 0 ? 1 : 0;
+  return clamp01(penalty / baseCount);
+}
+
+/* ---------------------------- comparisons ----------------------------- */
+
+/** A palette color with the signals that weight its drift: how heavily it is
+ * used (count) and whether it plays a brand role (derived from the semantic map). */
+interface ColorEntry {
+  hex: string;
+  count: number;
+  role?: string;
+}
+
+// Brand-critical roles dominate the score; structural greys barely move it.
+const ROLE_WEIGHT: Record<string, number> = {
+  accent: 3, primary: 3, brand: 3, cta: 2, secondary: 1.5, surface: 0.3, background: 0.3,
+};
+
+function colorWeight(e: ColorEntry): number {
+  const roleW = ROLE_WEIGHT[(e.role ?? "").toLowerCase()] ?? 1;
+  // Square-root dampening so a color used 1000x does not completely drown the rest.
+  return roleW * Math.sqrt(Math.max(1, e.count));
+}
+
+/** Semantic values are authored strings, so normalise to hex identity before
+ * comparing. Falls back to the raw string when the parser cannot read it, which
+ * keeps an unparseable value comparing equal to itself rather than fabricating
+ * drift. */
+function semanticHex(value: string): string {
+  const parsed = parseCssColor(value);
+  if (!parsed) return value;
+  const h = (n: number) => n.toString(16).padStart(2, "0");
+  return `#${h(parsed.r)}${h(parsed.g)}${h(parsed.b)}`;
+}
+
+/** A role is present only if it names a colour that actually paints. An empty
+ * string is not a value, and a fully transparent one is a role the page does
+ * not render — treating rgba(0,0,0,0) as a colour made two different "nothing
+ * painted" values compare as a delta-100 change, and hid a brand colour being
+ * turned invisible (alpha 1 -> 0) as no change at all. */
+function present(value: string | undefined): string | undefined {
+  if (!value || !String(value).trim()) return undefined;
+  const parsed = parseCssColor(value);
+  if (parsed && parsed.a === 0) return undefined;
+  return value;
+}
+
+/** Spec-parser fallback for the notations parseColor cannot read. */
+function rgbFromCss(value: string): [number, number, number] | null {
+  const parsed = parseCssColor(value);
+  return parsed ? [parsed.r, parsed.g, parsed.b] : null;
+}
+
+/**
+ * Compare the semantic map role by role: primary against primary, not against
+ * whatever else is on the page.
+ *
+ * The palette pass cannot see this. It matches colours to their nearest
+ * neighbour by delta-E, so a rebrand that promotes an existing palette colour to
+ * primary leaves the palette set identical and scores zero — the roles moved,
+ * the colours did not. The semantic map used to be read only to attach
+ * role labels to palette entries, so changing the brand primary produced no
+ * drift at all (DEM-208).
+ *
+ * A role that moves is the most severe colour event there is, so these use the
+ * same ROLE_WEIGHT ladder as the palette and are folded into the colour
+ * category.
+ *
+ * A role appearing or disappearing is reported but never scored. Semantic
+ * presence is a derived claim, not evidence. `accent` is emitted only when
+ * confidence, chroma and hue-distance predicates all pass, and those flip
+ * between runs of an unchanged page — scoring that alone produced 11 against a
+ * threshold of 10, a red gate with zero design change. The colour evidence
+ * underneath already sits in the palette, which is scored: if the colour truly
+ * left the page, the palette charges for it there. Charging again here is
+ * double-counting the detector's opinion on top of the fact. So a vanished role
+ * shows up in the report, where a human can read it, and moves no score. Only a
+ * role whose value actually changed is scored.
+ */
+function compareSemantic(
+  base: Record<string, string> | undefined,
+  cand: Record<string, string> | undefined,
+  cfg: DriftConfig,
+): { changes: DriftChange[]; penalty: number; weight: number; changed: number; added: number; removed: number } {
+  const changes: DriftChange[] = [];
+  let penalty = 0;
+  let weight = 0;
+  let changed = 0;
+  let added = 0;
+  let removed = 0;
+
+  const b = base ?? {};
+  const c = cand ?? {};
+  const roles = [...new Set([...Object.keys(b), ...Object.keys(c)])].sort();
+
+  for (const role of roles) {
+    const before = present(b[role]);
+    const after = present(c[role]);
+    // Role weight only; there is no usage count on a semantic entry, and the
+    // sqrt(count) dampening the palette applies would understate it anyway.
+    const w = ROLE_WEIGHT[role.toLowerCase()] ?? 1;
+
+    if (before && after) {
+      const d = deltaE(semanticHex(before), semanticHex(after));
+      // An unchanged role contributes NOTHING — not penalty, and not weight.
+      // Adding its weight to the denominator would let a stable semantic map
+      // dilute real palette drift, which turned a measured score of 11 (drift)
+      // into 9 (stable) and could flip an existing gate from red to green.
+      // Only roles that actually moved take part in the score.
+      if (d <= cfg.colorSame) continue;
+      weight += w;
+      changes.push({
+        category: "color",
+        kind: "changed",
+        label: `semantic.${role}`,
+        before,
+        after,
+        // deltaE returns Infinity for two different unparseable values
+        // (var(--a) vs var(--b)); Infinity serialises to null and renders as
+        // "delta Infinity" in CI annotations, so omit it rather than emit it.
+        ...(Number.isFinite(d) ? { delta: round(d) } : {}),
+      });
+      // Beyond colorShift the role did not shift, it was replaced: full weight.
+      penalty += d <= cfg.colorShift ? clamp01(d / cfg.colorShift) * w : w;
+      changed++;
+    } else if (before) {
+      changes.push({ category: "color", kind: "removed", label: `semantic.${role}`, before });
+      removed++;
+    } else if (after) {
+      changes.push({ category: "color", kind: "added", label: `semantic.${role}`, after });
+      added++;
+    }
+  }
+
+  return { changes, penalty, weight, changed, added, removed };
+}
+
+function compareColors(
+  base: ColorEntry[],
+  cand: ColorEntry[],
+  cfg: DriftConfig,
+  semantic?: { base: Record<string, string> | undefined; cand: Record<string, string> | undefined },
+): { changes: DriftChange[]; result: CategoryResult } {
+  const changes: DriftChange[] = [];
+  const used = new Set<number>();
+  let penalty = 0;
+  let totalWeight = 0;
+  let changed = 0;
+  let removed = 0;
+
+  for (const bc of base) {
+    const w = colorWeight(bc);
+    totalWeight += w;
+    let bestIdx = -1;
+    let best = Infinity;
+    cand.forEach((cc, i) => {
+      if (used.has(i)) return;
+      const d = deltaE(bc.hex, cc.hex);
+      if (d < best) {
+        best = d;
+        bestIdx = i;
+      }
+    });
+
+    if (bestIdx !== -1 && best <= cfg.colorSame) {
+      used.add(bestIdx);
+    } else if (bestIdx !== -1 && best <= cfg.colorShift) {
+      used.add(bestIdx);
+      changes.push({ category: "color", kind: "changed", label: bc.hex, before: bc.hex, after: cand[bestIdx].hex, delta: round(best) });
+      penalty += clamp01(best / cfg.colorShift) * w;
+      changed++;
+    } else {
+      changes.push({ category: "color", kind: "removed", label: bc.hex, before: bc.hex });
+      penalty += w;
+      removed++;
+    }
+  }
+
+  let added = 0;
+  cand.forEach((cc, i) => {
+    if (used.has(i)) return;
+    changes.push({ category: "color", kind: "added", label: cc.hex, after: cc.hex });
+    penalty += 0.5 * colorWeight(cc);
+    added++;
+  });
+
+  // The semantic map is a colour claim and belongs in this category, but it
+  // must not share a denominator with the palette. Folding it in divided a
+  // moved primary by every stable palette entry, and the brand colour of
+  // stripe.com turned magenta scored stable 0 and exited 0 (DEM-376).
+  //
+  // Scoring them apart and taking the worse one keeps both truths: the palette
+  // keeps its churn tolerance, so an A/B variant appearing in one run does not
+  // fail a gate, and a role that actually moved carries its own weight to the
+  // threshold. The category is as bad as its worst evidence.
+  const sem = compareSemantic(semantic?.base, semantic?.cand, cfg);
+  changes.push(...sem.changes);
+  changed += sem.changed;
+  added += sem.added;
+  removed += sem.removed;
+
+  // Weighted: a primary/accent shift dominates a background-tint shift instead
+  // of counting the same. Score stays 0..1 (penalty divided by total weight).
+  const paletteScore = totalWeight > 0 ? clamp01(penalty / totalWeight) : (cand.length > 0 ? 1 : 0);
+  const semScore = sem.weight > 0 ? clamp01(sem.penalty / sem.weight) : 0;
+  const score = Math.max(paletteScore, semScore);
+  return { changes, result: { category: "color", score, changed, added, removed } };
+}
+
+function normFamily(f: string | undefined): string {
+  return (f ?? "").split(",")[0].trim().replace(/^["']|["']$/g, "").toLowerCase();
+}
+
+function fieldDiffs(b: TypographyStyle, c: TypographyStyle, cfg: DriftConfig): number {
+  let d = 0;
+  if (normFamily(b.family) !== normFamily(c.family)) d++;
+  if (pctChange(parseFloat(b.size), parseFloat(c.size)) > cfg.dimPct) d++;
+  if (String(b.weight) !== String(c.weight)) d++;
+  return d;
+}
+
+// Typography severities. Two invariants pull against each other and both must
+// hold with the default weights (sum 4.0) and threshold (10):
+//  - a single CONFIRMED in-place family change must flag drift (damped peak
+//    must exceed 0.4), and mass deletion must flag drift (removal must carry
+//    full weight in the accumulating penalty so 6/10 styles removed → 0.6);
+//  - a single removed style must NOT flag drift (removals are the noisiest
+//    signal live-DOM extraction produces — usually crawl variance), and no
+//    single change may read as the whole type system being replaced (peak
+//    never maxes the category).
+const TYPO_FAMILY_PENALTY = 1.0;
+const TYPO_REMOVED_PENALTY = 1.0; // accumulating penalty: deletions scale linearly
+const TYPO_REMOVED_PEAK = 0.6; // peak: one removal (0.3 damped, overall 7.5) stays stable
+const TYPO_ADDED_PENALTY = 0.5;
+// The peak floor keeps one large regression visible among many unchanged
+// styles, damped so severity 1.0 floors the category at 50% (overall 12.5,
+// drifts) instead of 100%.
+const TYPO_PEAK_DAMP = 0.5;
+
+// Severity of one style's change, scaled by magnitude (0..1). A doubled font
+// size weighs far more than a 5% nudge — binary field counting hid that, making
+// a hero-size regression look as mild as a rounding tweak.
+function fieldPenalty(b: TypographyStyle, c: TypographyStyle, cfg: DriftConfig): number {
+  let p = 0;
+  if (normFamily(b.family) !== normFamily(c.family)) p += TYPO_FAMILY_PENALTY;
+  if (String(b.weight) !== String(c.weight)) p += 0.5;
+  const sizePct = pctChange(parseFloat(b.size), parseFloat(c.size));
+  if (sizePct > cfg.dimPct) p += clamp01(sizePct / cfg.dimShiftPct);
+  return clamp01(p);
+}
+
+function compareTypography(base: TypographyStyle[], cand: TypographyStyle[], cfg: DriftConfig): { changes: DriftChange[]; result: CategoryResult } {
+  const changes: DriftChange[] = [];
+  const key = (s: TypographyStyle) => (s.context ?? "").toLowerCase().trim();
+  const fmt = (s: TypographyStyle) => `${s.family} ${s.size}/${s.weight}`;
+
+  // Bucket candidates by context so duplicate/empty contexts do not collapse.
+  const buckets = new Map<string, TypographyStyle[]>();
+  for (const c of cand) {
+    const k = key(c);
+    const arr = buckets.get(k);
+    if (arr) arr.push(c);
+    else buckets.set(k, [c]);
+  }
+
+  let penalty = 0;
+  let peak = 0;
+  let changed = 0;
+  let removed = 0;
+
+  for (const b of base) {
+    const bucket = buckets.get(key(b));
+    if (!bucket || bucket.length === 0) {
+      changes.push({ category: "typography", kind: "removed", label: b.context, before: fmt(b) });
+      penalty += TYPO_REMOVED_PENALTY;
+      peak = Math.max(peak, TYPO_REMOVED_PEAK);
+      removed++;
+      continue;
+    }
+    // Within the same context, consume the nearest candidate by field diffs.
+    let bi = 0;
+    let bd = Infinity;
+    bucket.forEach((c, i) => {
+      const d = fieldDiffs(b, c, cfg);
+      if (d < bd) {
+        bd = d;
+        bi = i;
+      }
+    });
+    const c = bucket.splice(bi, 1)[0];
+    if (bd > 0) {
+      // Magnitude-aware: a doubled font size weighs far more than a 5% nudge.
+      const sev = fieldPenalty(b, c, cfg);
+      changes.push({ category: "typography", kind: "changed", label: b.context, before: fmt(b), after: fmt(c) });
+      penalty += sev;
+      peak = Math.max(peak, sev);
+      changed++;
+    }
+  }
+
+  let added = 0;
+  for (const arr of buckets.values()) {
+    for (const c of arr) {
+      changes.push({ category: "typography", kind: "added", label: c.context, after: fmt(c) });
+      penalty += TYPO_ADDED_PENALTY;
+      peak = Math.max(peak, TYPO_ADDED_PENALTY);
+      added++;
+    }
+  }
+
+  return {
+    changes,
+    // Damped peak keeps a single large regression from being diluted by many
+    // unchanged styles without letting it max the category (see TYPO_PEAK_DAMP).
+    result: {
+      category: "typography",
+      score: Math.max(categoryScore(penalty, base.length, cand.length), peak * TYPO_PEAK_DAMP),
+      changed,
+      added,
+      removed,
+    },
+  };
+}
+
+function compareDimensions(
+  category: "spacing" | "radius",
+  base: string[],
+  cand: string[],
+  cfg: DriftConfig
+): { changes: DriftChange[]; result: CategoryResult } {
+  const changes: DriftChange[] = [];
+  const candVals = cand.map((v) => ({ raw: v, num: parseFloat(v) })).filter((x) => Number.isFinite(x.num));
+  const used = new Set<number>();
+  let penalty = 0;
+  let changed = 0;
+  let removed = 0;
+
+  for (const raw of base) {
+    const num = parseFloat(raw);
+    if (!Number.isFinite(num)) continue;
+    let bestIdx = -1;
+    let bestPct = Infinity;
+    candVals.forEach((c, i) => {
+      if (used.has(i)) return;
+      const p = pctChange(num, c.num);
+      if (p < bestPct) {
+        bestPct = p;
+        bestIdx = i;
+      }
+    });
+
+    if (bestIdx !== -1 && bestPct <= cfg.dimPct) {
+      used.add(bestIdx);
+    } else if (bestIdx !== -1 && bestPct <= cfg.dimShiftPct) {
+      used.add(bestIdx);
+      changes.push({ category, kind: "changed", label: raw, before: raw, after: candVals[bestIdx].raw, delta: round(bestPct) });
+      penalty += clamp01(bestPct / cfg.dimShiftPct);
+      changed++;
+    } else {
+      changes.push({ category, kind: "removed", label: raw, before: raw });
+      penalty += 1;
+      removed++;
+    }
+  }
+
+  let added = 0;
+  candVals.forEach((c, i) => {
+    if (used.has(i)) return;
+    changes.push({ category, kind: "added", label: c.raw, after: c.raw });
+    penalty += 0.5;
+    added++;
+  });
+
+  const baseCount = base.filter((v) => Number.isFinite(parseFloat(v))).length;
+  return { changes, result: { category, score: categoryScore(penalty, baseCount, candVals.length), changed, added, removed } };
+}
+
+function compareShadows(base: string[], cand: string[]): { changes: DriftChange[]; result: CategoryResult } {
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+  const changes: DriftChange[] = [];
+  const candSet = new Set(cand.map(norm));
+  const baseSet = new Set(base.map(norm));
+  let penalty = 0;
+  let removed = 0;
+  let added = 0;
+
+  for (const b of base) {
+    if (!candSet.has(norm(b))) {
+      changes.push({ category: "shadow", kind: "removed", label: b, before: b });
+      penalty += 1;
+      removed++;
+    }
+  }
+  for (const c of cand) {
+    if (!baseSet.has(norm(c))) {
+      changes.push({ category: "shadow", kind: "added", label: c, after: c });
+      penalty += 0.5;
+      added++;
+    }
+  }
+
+  return { changes, result: { category: "shadow", score: categoryScore(penalty, base.length, cand.length), changed: 0, added, removed } };
+}
+
+
+/**
+ * A logo's identity at each tier, strongest first. Comparison uses the
+ * strongest tier both sides carry: a baseline taken before the extractor
+ * inlined asset bytes has only a url, and must not read as a changed logo.
+ * The url tier is normalised because an image optimizer rewrites w/q/dpl/dpr
+ * on every deploy while serving the same mark.
+ */
+export function logoIdentity(e: ExtractionResult): { markup?: string; bytes?: string; url?: string } | null {
+  const logo = e.logo;
+  if (!logo) return null;
+  const id: { markup?: string; bytes?: string; url?: string } = {};
+  if (logo.markup) id.markup = logo.markup;
+  if (logo.dataUri) id.bytes = logo.dataUri;
+  if (logo.url) {
+    try {
+      const u = new URL(logo.url);
+      for (const p of ["w", "q", "dpl", "dpr", "s"]) u.searchParams.delete(p);
+      id.url = `${u.origin}${u.pathname}${u.search}`;
+    } catch {
+      id.url = logo.url;
+    }
+  }
+  return Object.keys(id).length ? id : null;
+}
+
+type LogoId = NonNullable<ReturnType<typeof logoIdentity>>;
+
+function sameLogo(base: LogoId, cand: LogoId): boolean | null {
+  for (const tier of ["markup", "bytes", "url"] as const) {
+    if (base[tier] !== undefined && cand[tier] !== undefined) return base[tier] === cand[tier];
+  }
+  return null;
+}
+
+function compareLogo(base: LogoId | null, cand: LogoId | null): { changes: DriftChange[]; result: CategoryResult } {
+  const label = "logo";
+  const none = { changes: [], result: { category: "logo" as const, score: 0, changed: 0, added: 0, removed: 0 } };
+  const short = (id: LogoId) => {
+    const v = id.url ?? id.bytes ?? id.markup ?? "";
+    return v.length > 60 ? `${v.slice(0, 57)}…` : v;
+  };
+  if (base && !cand) {
+    return { changes: [{ category: "logo", kind: "removed", label, before: short(base) }], result: { category: "logo", score: 1, changed: 0, added: 0, removed: 1 } };
+  }
+  if (!base && cand) {
+    return { changes: [{ category: "logo", kind: "added", label, after: short(cand) }], result: { category: "logo", score: 0.5, changed: 0, added: 1, removed: 0 } };
+  }
+  if (!base || !cand) return none;
+  // No shared tier: the two snapshots describe the logo differently, which is
+  // not evidence that the mark changed.
+  if (sameLogo(base, cand) === false) {
+    return { changes: [{ category: "logo", kind: "changed", label, before: short(base), after: short(cand) }], result: { category: "logo", score: 1, changed: 1, added: 0, removed: 0 } };
+  }
+  return none;
+}
+
+function techEntries(e: ExtractionResult): Map<string, string | undefined> {
+  const out = new Map<string, string | undefined>();
+  for (const f of e.frameworks ?? []) if (f.confidence === "high") out.set(f.name, f.version);
+  for (const i of e.iconSystem ?? []) if (i.name !== "SVG Icons") out.set(i.name, i.version);
+  return out;
+}
+
+function statesTech(e: ExtractionResult): boolean {
+  const [major, minor] = String(e.meta?.schemaVersion ?? "").split(".").map(Number);
+  return major > 1 || (major === 1 && minor >= 18);
+}
+
+const majorOf = (version: string) => version.match(/\d+/)?.[0];
+
+function compareTech(baseline: ExtractionResult, candidate: ExtractionResult): { changes: DriftChange[]; result: CategoryResult } {
+  const changes: DriftChange[] = [];
+  const result: CategoryResult = { category: "tech", score: 0, changed: 0, added: 0, removed: 0 };
+  const sameRules = baseline.meta?.dembrandtVersion === candidate.meta?.dembrandtVersion;
+  if (!sameRules || !statesTech(baseline) || !statesTech(candidate)) return { changes, result };
+  const base = techEntries(baseline);
+  const cand = techEntries(candidate);
+  let penalty = 0;
+  for (const [name, before] of base) {
+    if (!cand.has(name)) {
+      changes.push({ category: "tech", kind: "removed", label: name, ...(before ? { before } : {}) });
+      result.removed++;
+      penalty += 1;
+      continue;
+    }
+    const after = cand.get(name);
+    if (!before || !after || before === after) continue;
+    changes.push({ category: "tech", kind: "changed", label: name, before, after });
+    result.changed++;
+    if (majorOf(before) !== majorOf(after)) penalty += 1;
+  }
+  for (const [name, after] of cand) {
+    if (base.has(name)) continue;
+    changes.push({ category: "tech", kind: "added", label: name, ...(after ? { after } : {}) });
+    result.added++;
+    penalty += 0.5;
+  }
+  result.score = clamp01(penalty / Math.max(base.size, 1));
+  return { changes, result };
+}
+
+/* ------------------------------- entry -------------------------------- */
+
+/** Map the palette to weighted entries: keep usage count, and attach a brand
+ * role when the color matches a semantic role. PaletteColor itself carries no
+ * role, so derive it from colors.semantic (role -> hex). */
+function paletteEntries(e: ExtractionResult): ColorEntry[] {
+  const roleByRgb = new Map<string, string>();
+  for (const [role, hex] of Object.entries(e.colors?.semantic ?? {})) {
+    // parseColor reads hex and legacy rgb() only. A page that authors its
+    // semantic colours in oklch/lch — what --color-format emits, and what
+    // modern token pipelines write — attached no role at all, so the same
+    // palette shift scored 30 in hex and 19 in oklch. Use the spec parser.
+    const rgb = parseColor(hex) ?? rgbFromCss(hex);
+    if (rgb) roleByRgb.set(rgb.join(","), role);
+  }
+  return (e.colors?.palette ?? [])
+    .map((c): ColorEntry | null => {
+      const hex = c.normalized || c.color;
+      if (!hex) return null;
+      const rgb = parseColor(hex);
+      return { hex, count: c.count ?? 1, role: rgb ? roleByRgb.get(rgb.join(",")) : undefined };
+    })
+    .filter((x): x is ColorEntry => x !== null);
+}
+
+/** Radius values outside a sane range (negative, or pill-style 9999px) are not
+ * part of a scale; comparing them only adds noise. */
+function isRealisticDimension(v: string): boolean {
+  const n = parseFloat(v);
+  return Number.isFinite(n) && n >= 0 && n <= 500;
+}
+
+/** oklab/oklch/color() shadows are not handled by the string compare below;
+ * comparing them produces phantom drift, so drop them rather than mis-score. */
+function isSupportedShadow(s: string): boolean {
+  return Boolean(s) && !s.includes("oklab(") && !s.includes("oklch(") && !s.includes("color(");
+}
+
+/** Low-confidence tokens are single-use, margin-of-detection elements the
+ * extractor itself is unsure about. They surface inconsistently between two
+ * extractions of the same design, so counting them produces phantom drift.
+ * Only compare tokens the extractor is reasonably sure are real. */
+function notLowConfidence(t: { confidence?: Confidence }): boolean {
+  return t.confidence !== "low";
+}
+
+/** Layout-dependent tokens vary by viewport width, so a baseline and candidate
+ * extracted at different widths diff the responsive layout, not the design.
+ * Old snapshots lack meta.viewport; only warn when both sides carry it. */
+function viewportWarning(baseline: ExtractionResult, candidate: ExtractionResult): string | null {
+  const b = baseline.meta?.viewport;
+  const c = candidate.meta?.viewport;
+  if (!b || !c) return null;
+  // Persisted blobs are untrusted: widths may be strings, null, or absent.
+  // Coerce, and stay silent unless both widths are real positive numbers —
+  // Number(null) and Number('') are 0, which is finite but not a viewport.
+  const px = (v: unknown) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const bw = px(b.width);
+  const cw = px(c.width);
+  if (bw === null || cw === null || bw === cw) return null;
+  const dim = (v: { width: unknown; height: unknown }) => `${px(v.width)}x${px(v.height) ?? "?"}`;
+  return (
+    `baseline extracted at ${dim(b)}, candidate at ${dim(c)} — ` +
+    `layout-dependent changes below may be viewport-induced, not design drift. ` +
+    `Re-extract both at the same width (--screen-size).`
+  );
+}
+
+/** Both extracts must come from the same page: result.url is the final URL
+ * after redirects, so a baseline that landed on /fi/ diffed against a candidate
+ * on / compares two different surfaces. */
+function pageMismatchWarning(baseline: ExtractionResult, candidate: ExtractionResult): string | null {
+  let b: URL;
+  let c: URL;
+  try {
+    b = new URL(baseline.url);
+    c = new URL(candidate.url);
+  } catch {
+    return null;
+  }
+  const norm = (u: URL) => u.host.replace(/^www\./, "") + u.pathname.replace(/\/+$/, "");
+  if (norm(b) === norm(c)) return null;
+  return (
+    `baseline was extracted from ${b.href}, candidate from ${c.href} — ` +
+    `different pages after redirects, the diff compares two different surfaces.`
+  );
+}
+
+/** --dark-mode and --mobile merge extra passes into the palette, so extracts
+ * with and without them are not comparable: the whole palette "changes". */
+function flagMismatchWarnings(baseline: ExtractionResult, candidate: ExtractionResult): string[] {
+  const out: string[] = [];
+  for (const flag of ["darkMode", "mobile"] as const) {
+    const b = Boolean(baseline.meta?.flags?.[flag]);
+    const c = Boolean(candidate.meta?.flags?.[flag]);
+    if (b === c) continue;
+    const name = flag === "darkMode" ? "--dark-mode" : "--mobile";
+    out.push(
+      `${name} was on for the ${b ? "baseline" : "candidate"} only — ` +
+      `palette drift may be flag-induced, not design drift. Re-extract with matching flags.`
+    );
+  }
+  return out;
+}
+
+const CONTEXT_DIALS = ["deviceScaleFactor", "isMobile", "hasTouch", "colorScheme", "reducedMotion", "forcedColors", "locale"] as const;
+
+/** Two contexts that differ in a rendering dial are two measurements of the
+ * same brand, not a before and an after. Old snapshots lack meta.context. */
+function contextMismatchWarning(baseline: ExtractionResult, candidate: ExtractionResult): string | null {
+  const b = baseline.meta?.context;
+  const c = candidate.meta?.context;
+  if (!b || !c) return null;
+  const moved = CONTEXT_DIALS.filter((d) => String(b[d]) !== String(c[d]))
+    .map((d) => `${d} ${String(b[d])} -> ${String(c[d])}`);
+  if (moved.length === 0) return null;
+  return (
+    `baseline and candidate were measured under different browser contexts (${moved.join(", ")}) — ` +
+    `the diff compares two renderings, not one design over time. Re-extract both under the same context.`
+  );
+}
+
+/** A snapshot taken before web fonts finished loading carries fallback
+ * families; family drift against it is suspect. */
+function fontsWarning(baseline: ExtractionResult, candidate: ExtractionResult): string | null {
+  const sides: string[] = [];
+  if (baseline.meta?.fontsReady === false) sides.push("baseline");
+  if (candidate.meta?.fontsReady === false) sides.push("candidate");
+  if (sides.length === 0) return null;
+  const pending = [
+    ...(baseline.meta?.pendingFonts ?? []),
+    ...(candidate.meta?.pendingFonts ?? []),
+  ];
+  const detail = pending.length ? ` (pending: ${[...new Set(pending)].join(", ")})` : "";
+  return (
+    `web fonts had not finished loading in the ${sides.join(" and ")} extraction${detail} — ` +
+    `typography family changes may be fallback fonts, not design drift.`
+  );
+}
+
+/** Stage names the extractor records in meta.errors / meta.degraded, mapped to
+ * the drift category they invalidate. Every pass that merges colors into the
+ * palette (dark-mode, mobile, reveal, hover-focus, gradient-colors,
+ * svg-logo-colors) degrades color when it fails: its colors go missing and
+ * would read as removed brand colors. */
+const STAGE_CATEGORY: Record<string, DriftCategory> = {
+  colors: "color",
+  typography: "typography",
+  spacing: "spacing",
+  borderRadius: "radius",
+  shadows: "shadow",
+  logo: "logo",
+  frameworks: "tech",
+  iconSystem: "tech",
+  "dark-mode": "color",
+  mobile: "color",
+  reveal: "color",
+  "hover-focus": "color",
+  "gradient-colors": "color",
+  "svg-logo-colors": "color",
+  manifest: "color",
+};
+
+function degradedDriftCategories(r: ExtractionResult): Set<DriftCategory> {
+  const out = new Set<DriftCategory>();
+  for (const e of r.meta?.errors ?? []) {
+    const cat = STAGE_CATEGORY[e.stage];
+    if (cat) out.add(cat);
+  }
+  for (const stage of r.meta?.degraded ?? []) {
+    const cat = STAGE_CATEGORY[stage];
+    if (cat) out.add(cat);
+  }
+  return out;
+}
+
+export function computeDrift(
+  baseline: ExtractionResult,
+  candidate: ExtractionResult,
+  config: Partial<DriftConfig> = {}
+): DriftReport {
+  const cfg: DriftConfig = { ...DEFAULT_DRIFT_CONFIG, ...config, weights: { ...DEFAULT_DRIFT_CONFIG.weights, ...config.weights } };
+
+  const basePalette = paletteEntries(baseline);
+  const candPalette = paletteEntries(candidate);
+  const baseTypo = baseline.typography?.styles ?? [];
+  const candTypo = candidate.typography?.styles ?? [];
+  // Filter before the comparable check, like radius/shadows below: a list of
+  // only unparseable entries must count as "nothing to compare", not enter the
+  // average as a guaranteed-zero category.
+  const baseSpacing = (baseline.spacing?.commonValues ?? []).map((s) => String(s.px)).filter(isRealisticDimension);
+  const candSpacing = (candidate.spacing?.commonValues ?? []).map((s) => String(s.px)).filter(isRealisticDimension);
+  const baseRadius = (baseline.borderRadius?.values ?? []).filter(notLowConfidence).map((r) => r.value).filter(isRealisticDimension);
+  const candRadius = (candidate.borderRadius?.values ?? []).filter(notLowConfidence).map((r) => r.value).filter(isRealisticDimension);
+  const baseLogo = logoIdentity(baseline);
+  const candLogo = logoIdentity(candidate);
+  const baseShadows = (baseline.shadows ?? []).filter(notLowConfidence).map((s) => s.shadow).filter(isSupportedShadow);
+  const candShadows = (candidate.shadows ?? []).filter(notLowConfidence).map((s) => s.shadow).filter(isSupportedShadow);
+
+  // A category empty on BOTH sides carries no information; letting it enter the
+  // average at score 0 dilutes real drift in the categories that were measured.
+  const comparable = (b: unknown[], c: unknown[]) => b.length + c.length > 0;
+
+  const parts = [
+    {
+      ...compareColors(basePalette, candPalette, cfg, {
+        base: baseline.colors?.semantic,
+        cand: candidate.colors?.semantic,
+      }),
+      w: cfg.weights.color,
+      // A page with no palette but a detected semantic map still has colour to
+      // compare, so the comparable check has to see both sources.
+      comparable:
+        comparable(basePalette, candPalette) ||
+        comparable(Object.keys(baseline.colors?.semantic ?? {}), Object.keys(candidate.colors?.semantic ?? {})),
+    },
+    {
+      ...compareTypography(baseTypo, candTypo, cfg),
+      w: cfg.weights.typography,
+      comparable: comparable(baseTypo, candTypo),
+    },
+    {
+      ...compareDimensions("spacing", baseSpacing, candSpacing, cfg),
+      w: cfg.weights.spacing,
+      comparable: comparable(baseSpacing, candSpacing),
+    },
+    {
+      ...compareDimensions("radius", baseRadius, candRadius, cfg),
+      w: cfg.weights.radius,
+      comparable: comparable(baseRadius, candRadius),
+    },
+    {
+      ...compareShadows(baseShadows, candShadows),
+      w: cfg.weights.shadow,
+      comparable: comparable(baseShadows, candShadows),
+    },
+    {
+      ...compareLogo(baseLogo, candLogo),
+      w: cfg.weights.logo,
+      comparable: Boolean(baseLogo || candLogo),
+    },
+    { ...compareTech(baseline, candidate), w: cfg.weights.tech, comparable: false },
+  ];
+
+  const warnings: string[] = [];
+  for (const w of [
+    viewportWarning(baseline, candidate),
+    pageMismatchWarning(baseline, candidate),
+    ...flagMismatchWarnings(baseline, candidate),
+    contextMismatchWarning(baseline, candidate),
+    fontsWarning(baseline, candidate),
+  ]) {
+    if (w) warnings.push(w);
+  }
+
+  const baseDegraded = degradedDriftCategories(baseline);
+  const candDegraded = degradedDriftCategories(candidate);
+
+  // Weighted average over categories that actually have something to compare.
+  let weighted = 0;
+  let totalW = 0;
+  const categories: CategoryResult[] = [];
+  const changes: DriftChange[] = [];
+  for (const p of parts) {
+    const cat = p.result.category;
+    const degradedSides = [
+      baseDegraded.has(cat) ? "baseline" : null,
+      candDegraded.has(cat) ? "candidate" : null,
+    ].filter(Boolean);
+    if (degradedSides.length > 0) {
+      // Engine rule (see ExtractionMeta.degraded): a degraded category failed
+      // extraction, the brand did not change — its phantom tokens must not
+      // enter the score, the change list, the summary, or CI annotations.
+      categories.push({ category: cat, score: 0, changed: 0, added: 0, removed: 0 });
+      warnings.push(
+        `${cat} extraction was degraded in the ${degradedSides.join(" and ")} — ` +
+        `category excluded from the drift score.`
+      );
+      continue;
+    }
+    categories.push(p.result);
+    changes.push(...p.changes);
+    if (p.comparable) {
+      weighted += p.result.score * p.w;
+      totalW += p.w;
+    }
+  }
+
+  // Degradation can exclude every comparable category. The score is then 0 by
+  // construction, not by evidence — a gate must not treat that as a clean pass.
+  const inconclusive = totalW === 0 && (baseDegraded.size > 0 || candDegraded.size > 0);
+  if (inconclusive) {
+    warnings.push(
+      "no category could be scored: every comparable category was degraded — " +
+      "this compare is inconclusive, not stable. Re-extract and retry."
+    );
+  }
+
+  const techScore = categories.find((c) => c.category === "tech")?.score ?? 0;
+  const tokens = totalW > 0 ? weighted / totalW : 0;
+  const withTech = techScore > 0 ? (weighted + techScore * cfg.weights.tech) / (totalW + cfg.weights.tech) : 0;
+  const score = Math.round(Math.max(tokens, withTech) * 100);
+  const summary = changes.reduce(
+    (acc, c) => {
+      acc[c.kind]++;
+      return acc;
+    },
+    { changed: 0, added: 0, removed: 0 } as Record<DriftKind, number>
+  );
+
+  return {
+    score,
+    status: score > cfg.failThreshold ? "drift" : "stable",
+    threshold: cfg.failThreshold,
+    summary,
+    categories,
+    changes,
+    ...(warnings.length ? { warnings } : {}),
+    ...(inconclusive ? { inconclusive: true } : {}),
+  };
+}

@@ -1,0 +1,759 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+
+use super::ApiKeyRotator;
+use super::{Provider, UrlRecord};
+use crate::network::client::send_with_retry;
+use crate::network::NetConfig;
+use crate::progress::ProgressReporter;
+
+#[derive(Clone)]
+pub struct UrlscanProvider {
+    api_key_rotator: ApiKeyRotator,
+    include_subdomains: bool,
+    net: NetConfig,
+    base_url: String,
+    page_limit: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UrlscanResponse {
+    status: Option<i32>,
+    #[serde(default)]
+    results: Vec<SearchResult>,
+    #[serde(default)]
+    has_more: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SearchResult {
+    page: ArchivedPage,
+    #[serde(default)]
+    sort: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ArchivedPage {
+    domain: String,
+    #[serde(default)]
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    url: String,
+    #[serde(default)]
+    status: String,
+}
+
+/// Hard ceiling on urlscan result pages walked for one domain (100 results
+/// each), so a huge or misbehaving result set can't spin indefinitely.
+const URLSCAN_MAX_PAGES: usize = 100;
+
+/// Turn a result's `sort` array into the `search_after` cursor urlscan expects:
+/// the array values rendered as a comma-separated string. Returns `None` when
+/// the result carries no sort key (so we can't page further).
+///
+/// The result is percent-encoded, because it is spliced straight back into the
+/// next request's query string. The values come from urlscan's response, not
+/// from us: a sort value containing `&` or `=` would otherwise end the parameter
+/// and inject arbitrary query parameters into the follow-up request.
+fn sort_to_search_after(sort: &[serde_json::Value]) -> Option<String> {
+    if sort.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = sort
+        .iter()
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+    Some(url::form_urlencoded::byte_serialize(parts.join(",").as_bytes()).collect::<String>())
+}
+
+impl UrlscanProvider {
+    pub fn new_with_keys(api_keys: Vec<String>) -> Self {
+        UrlscanProvider {
+            api_key_rotator: ApiKeyRotator::new(api_keys),
+            include_subdomains: false,
+            net: NetConfig::default(),
+            base_url: "https://urlscan.io".to_string(),
+            page_limit: URLSCAN_MAX_PAGES,
+        }
+    }
+
+    /// Fetch and parse a single search page with retry/back-off. Returns the
+    /// parsed response or the last error after exhausting retries.
+    async fn fetch_page(&self, client: &reqwest::Client, url: &str) -> Result<UrlscanResponse> {
+        send_with_retry(
+            self.net.retries,
+            self.net.rate_limit.as_ref(),
+            |_| true,
+            || {
+                // Rotate the key per attempt so a rate-limited key is retried
+                // with a different one when several are configured.
+                let api_key = self.api_key_rotator.next_key().unwrap_or_default();
+                let req = client.get(url);
+                if api_key.is_empty() {
+                    req
+                } else {
+                    req.header("API-Key", api_key)
+                }
+            },
+            |_, body| {
+                serde_json::from_str(&body)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse Urlscan response: {e}"))
+            },
+        )
+        .await
+    }
+}
+
+impl Provider for UrlscanProvider {
+    fn clone_box(&self) -> Box<dyn Provider> {
+        Box::new(self.clone())
+    }
+
+    fn fetch_urls<'a>(
+        &'a self,
+        domain: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UrlRecord>>> + Send + 'a>> {
+        self.fetch_urls_with_progress(domain, None)
+    }
+
+    fn fetch_urls_with_progress<'a>(
+        &'a self,
+        domain: &'a str,
+        reporter: Option<ProgressReporter>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UrlRecord>>> + Send + 'a>> {
+        Box::pin(async move {
+            // urlscan.io's public search allows unauthenticated queries
+            // (rate-limited to ~30 req/min per IP), so we always query. When no
+            // API key is configured the request simply omits the API-Key header
+            // (see `fetch_page`); a key only raises the limits and enables
+            // rotation.
+
+            // Use the url crate for encoding the domain
+            let encoded_domain =
+                url::form_urlencoded::byte_serialize(domain.as_bytes()).collect::<String>();
+
+            let base_query = format!(
+                "{}/api/v1/search/?q=domain:{encoded_domain}&size=100",
+                self.base_url
+            );
+
+            let client = self.net.http.build_client()?;
+
+            if let Some(r) = &reporter {
+                r.detail("fetching…");
+            }
+
+            // urlscan returns at most 100 results per request and signals more
+            // via `has_more`; the next page is requested by passing the last
+            // result's `sort` values as `search_after`. The previous code never
+            // paginated, silently capping every domain at 100 URLs.
+            let mut all_urls = Vec::new();
+            let mut search_after: Option<String> = None;
+            let mut seen_cursors = HashSet::new();
+            let mut pages = 0;
+
+            loop {
+                pages += 1;
+                if pages > self.page_limit {
+                    if let Some(r) = &reporter {
+                        r.mark_partial();
+                    }
+                    break;
+                }
+
+                let url = match &search_after {
+                    Some(cursor) => format!("{base_query}&search_after={cursor}"),
+                    None => base_query.clone(),
+                };
+
+                let response = match self.fetch_page(&client, &url).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        // A failure on the very first page is fatal; a later
+                        // failure keeps the pages already collected.
+                        if all_urls.is_empty() {
+                            return Err(e);
+                        }
+                        // ...and flags them as truncated. Without this the run
+                        // reports a clean ✓ over an incomplete crawl, which is
+                        // indistinguishable from "the domain really has this few
+                        // URLs".
+                        if let Some(r) = &reporter {
+                            r.mark_partial();
+                        }
+                        break;
+                    }
+                };
+
+                if response.results.is_empty() {
+                    if response.has_more {
+                        if let Some(r) = &reporter {
+                            r.mark_partial();
+                        }
+                    }
+                    break;
+                }
+
+                // Capture the cursor before consuming the results.
+                let next_cursor = response
+                    .results
+                    .last()
+                    .and_then(|r| sort_to_search_after(&r.sort));
+
+                let more = response.has_more;
+                for result in response.results {
+                    all_urls.push(result.page.url);
+                }
+
+                if let Some(r) = &reporter {
+                    r.detail(format!("{} URLs…", all_urls.len()));
+                    // The run asked us to stop (--max-time elapsed, or
+                    // Ctrl-C). Hand back the pages already walked instead of
+                    // losing them to the hard cancel after the grace window.
+                    if r.stop_requested() {
+                        r.mark_partial();
+                        break;
+                    }
+                }
+
+                if !more {
+                    break;
+                }
+
+                match next_cursor {
+                    Some(cursor) => {
+                        if !seen_cursors.insert(cursor.clone()) {
+                            if let Some(r) = &reporter {
+                                r.mark_partial();
+                            }
+                            break;
+                        }
+                        search_after = Some(cursor);
+                    }
+                    // No usable cursor — can't page further without risking an
+                    // infinite loop re-requesting page one. `has_more` was true,
+                    // so this is a truncated result rather than a clean end.
+                    None => {
+                        if let Some(r) = &reporter {
+                            r.mark_partial();
+                        }
+                        break;
+                    }
+                }
+            }
+
+            Ok(all_urls.into_iter().map(UrlRecord::bare).collect())
+        })
+    }
+
+    fn with_subdomains(&mut self, include: bool) {
+        self.include_subdomains = include;
+    }
+
+    fn with_network(&mut self, net: NetConfig) {
+        self.net = net;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::urls_of;
+
+    #[test]
+    fn test_sort_cursor_is_percent_encoded() {
+        // The cursor is spliced into the next request's query string, and its
+        // values come from urlscan's response — an unencoded '&' or '=' used to
+        // end the parameter and inject query parameters of the server's choosing.
+        let sort = vec![
+            serde_json::Value::from(1699999999999i64),
+            serde_json::Value::from("a&size=1&x=y"),
+        ];
+        let cursor = sort_to_search_after(&sort).unwrap();
+        assert!(!cursor.contains('&'), "{cursor}");
+        assert!(!cursor.contains('='), "{cursor}");
+        assert!(cursor.starts_with("1699999999999%2C"), "{cursor}");
+    }
+
+    #[test]
+    fn test_sort_cursor_none_when_absent() {
+        assert!(sort_to_search_after(&[]).is_none());
+    }
+
+    #[test]
+    fn test_new_provider_with_multiple_keys() {
+        let api_keys = vec!["key1".to_string(), "key2".to_string(), "key3".to_string()];
+        let provider = UrlscanProvider::new_with_keys(api_keys.clone());
+
+        assert!(provider.api_key_rotator.has_keys());
+
+        // Test rotation
+        assert_eq!(
+            provider.api_key_rotator.next_key(),
+            Some("key1".to_string())
+        );
+        assert_eq!(
+            provider.api_key_rotator.next_key(),
+            Some("key2".to_string())
+        );
+        assert_eq!(
+            provider.api_key_rotator.next_key(),
+            Some("key3".to_string())
+        );
+        assert_eq!(
+            provider.api_key_rotator.next_key(),
+            Some("key1".to_string())
+        ); // Should wrap
+    }
+
+    #[test]
+    fn test_new_provider_filters_empty_keys() {
+        let api_keys = vec![
+            "key1".to_string(),
+            "".to_string(),
+            "key2".to_string(),
+            "".to_string(),
+        ];
+        let provider = UrlscanProvider::new_with_keys(api_keys);
+
+        assert!(provider.api_key_rotator.has_keys());
+        assert_eq!(
+            provider.api_key_rotator.next_key(),
+            Some("key1".to_string())
+        );
+        assert_eq!(
+            provider.api_key_rotator.next_key(),
+            Some("key2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_new_provider_with_empty_key() {
+        let provider = UrlscanProvider::new_with_keys(vec!["".to_string()]);
+        assert!(!provider.api_key_rotator.has_keys());
+    }
+
+    #[test]
+    fn test_with_subdomains() {
+        let provider = &mut UrlscanProvider::new_with_keys(vec!["test_api_key".to_string()]);
+        provider.with_subdomains(true);
+        assert!(provider.include_subdomains);
+    }
+
+    #[test]
+    fn test_clone_box() {
+        let provider = UrlscanProvider::new_with_keys(vec!["test_api_key".to_string()]);
+        let _cloned = provider.clone_box();
+        // Just testing that cloning works without error
+    }
+
+    #[test]
+    fn test_urlscan_response_deserialize() {
+        let json = r#"{
+            "status": 200,
+            "results": [
+                {
+                    "page": {
+                        "domain": "example.com",
+                        "mimeType": "text/html",
+                        "url": "https://example.com/page1",
+                        "status": "200"
+                    },
+                    "sort": ["2023-04-01", "example.com"]
+                },
+                {
+                    "page": {
+                        "domain": "example.com",
+                        "mimeType": "application/javascript",
+                        "url": "https://example.com/page2",
+                        "status": "200"
+                    },
+                    "sort": ["2023-04-02", "example.com"]
+                }
+            ],
+            "has_more": false
+        }"#;
+
+        let response: UrlscanResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status, Some(200));
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].page.url, "https://example.com/page1");
+        assert_eq!(response.results[1].page.url, "https://example.com/page2");
+        assert_eq!(response.results[0].page.domain, "example.com");
+        assert_eq!(response.results[0].page.mime_type, "text/html");
+        assert!(!response.has_more);
+    }
+
+    #[test]
+    fn test_urlscan_response_empty_deserialize() {
+        let json = r#"{}"#;
+
+        let response: UrlscanResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status, None);
+        assert_eq!(response.results.len(), 0);
+        assert!(!response.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_keyless_queries_without_api_key_header() {
+        // With no API key, urlscan still queries the public search endpoint —
+        // it must just omit the API-Key header rather than returning nothing.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Any)
+            .match_header("API-Key", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"status":200,"has_more":false,"results":[{"page":{"domain":"example.com","url":"https://example.com/anon","status":"200"}}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut provider = UrlscanProvider::new_with_keys(vec!["".to_string()]);
+        provider.base_url = server.url();
+
+        let urls = urls_of(provider.fetch_urls("example.com").await.unwrap());
+        assert_eq!(urls, vec!["https://example.com/anon".to_string()]);
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_retry_rotates_to_next_key() {
+        let mut server = mockito::Server::new_async().await;
+        // The first key is rate-limited...
+        let k1 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Any)
+            .match_header("API-Key", "key1")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+        // ...so the retry must use the second key, which succeeds.
+        let k2 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Any)
+            .match_header("API-Key", "key2")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"status":200,"has_more":false,"results":[{"page":{"domain":"example.com","url":"https://example.com/ok","status":"200"}}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut provider = UrlscanProvider::new_with_keys(vec!["key1".into(), "key2".into()]);
+        provider.base_url = server.url();
+
+        let urls = urls_of(provider.fetch_urls("example.com").await.unwrap());
+        assert_eq!(urls, vec!["https://example.com/ok".to_string()]);
+        k1.assert();
+        k2.assert();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_paginates_with_search_after() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Page one signals more results and carries a sort cursor.
+        let page1 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex("size=100$".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"status":200,"has_more":true,"results":[{"page":{"domain":"example.com","url":"https://example.com/p1","status":"200"},"sort":[1700000000000,"abc"]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        // Page two is requested via search_after=<cursor> and ends the walk.
+        let page2 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex("search_after=1700000000000".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"status":200,"has_more":false,"results":[{"page":{"domain":"example.com","url":"https://example.com/p2","status":"200"},"sort":[1700000000001,"def"]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut provider = UrlscanProvider::new_with_keys(vec!["k".to_string()]);
+        provider.base_url = server.url();
+
+        let urls = urls_of(provider.fetch_urls("example.com").await.unwrap());
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/p1".to_string(),
+                "https://example.com/p2".to_string(),
+            ]
+        );
+        page1.assert();
+        page2.assert();
+    }
+
+    #[tokio::test]
+    async fn test_page_limit_marks_results_partial_when_urlscan_has_more() {
+        let mut server = mockito::Server::new_async().await;
+        let page1 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex("size=100$".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"has_more":true,"results":[{"page":{"domain":"example.com","url":"https://example.com/a"},"sort":[1,"a"]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "search_after".into(),
+                "1,a".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"has_more":false,"results":[]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut provider = UrlscanProvider::new_with_keys(vec!["k".to_string()]);
+        provider.base_url = server.url();
+        provider.page_limit = 1;
+
+        let reporter = ProgressReporter::new(indicatif::ProgressBar::hidden(), "test · ");
+        let urls = urls_of(
+            provider
+                .fetch_urls_with_progress("example.com", Some(reporter.clone()))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(urls, vec!["https://example.com/a"]);
+        assert!(
+            reporter.is_partial(),
+            "the page ceiling truncates this crawl"
+        );
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_missing_search_after_cursor_marks_results_partial() {
+        let mut server = mockito::Server::new_async().await;
+        let _page1 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex("size=100$".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"has_more":true,"results":[{"page":{"domain":"example.com","url":"https://example.com/a"}}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut provider = UrlscanProvider::new_with_keys(vec!["k".to_string()]);
+        provider.base_url = server.url();
+        provider.net.retries = 0;
+        let reporter = ProgressReporter::new(indicatif::ProgressBar::hidden(), "test · ");
+
+        let urls = urls_of(
+            provider
+                .fetch_urls_with_progress("example.com", Some(reporter.clone()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(urls, vec!["https://example.com/a"]);
+        assert!(reporter.is_partial());
+    }
+
+    #[tokio::test]
+    async fn test_empty_page_with_has_more_marks_results_partial() {
+        let mut server = mockito::Server::new_async().await;
+        let _page1 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex("size=100$".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"has_more":true,"results":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut provider = UrlscanProvider::new_with_keys(vec!["k".to_string()]);
+        provider.base_url = server.url();
+        provider.net.retries = 0;
+        let reporter = ProgressReporter::new(indicatif::ProgressBar::hidden(), "test · ");
+
+        let urls = urls_of(
+            provider
+                .fetch_urls_with_progress("example.com", Some(reporter.clone()))
+                .await
+                .unwrap(),
+        );
+        assert!(urls.is_empty());
+        assert!(reporter.is_partial());
+    }
+
+    #[tokio::test]
+    async fn test_repeated_search_after_cursor_stops_and_marks_partial() {
+        let mut server = mockito::Server::new_async().await;
+        let page1 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex("size=100$".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"has_more":true,"results":[{"page":{"domain":"example.com","url":"https://example.com/a"},"sort":["A"]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "search_after".into(),
+                "A".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"has_more":true,"results":[{"page":{"domain":"example.com","url":"https://example.com/b"},"sort":["A"]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut provider = UrlscanProvider::new_with_keys(vec!["k".to_string()]);
+        provider.base_url = server.url();
+        provider.page_limit = 3;
+        provider.net.retries = 0;
+        let reporter = ProgressReporter::new(indicatif::ProgressBar::hidden(), "test · ");
+
+        let urls = urls_of(
+            provider
+                .fetch_urls_with_progress("example.com", Some(reporter.clone()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(urls.len(), 2);
+        assert!(reporter.is_partial());
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_truncated_pagination_is_reported_as_partial() {
+        // Regression: urlscan kept the pages it had when a later page failed, but
+        // only implemented `fetch_urls` — so the trait's default
+        // `fetch_urls_with_progress` dropped the reporter and `mark_partial()`
+        // could never fire. A truncated crawl printed a clean ✓, which looks
+        // exactly like "this domain really has one URL".
+        let mut server = mockito::Server::new_async().await;
+
+        let _page1 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex("size=100$".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"status":200,"has_more":true,"results":[{"page":{"domain":"example.com","url":"https://example.com/p1","status":"200"},"sort":[1700000000000,"abc"]}]}"#,
+            )
+            .create_async()
+            .await;
+        // The continuation is permanently broken.
+        let _page2 = server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex("search_after=1700000000000".into()))
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let mut provider = UrlscanProvider::new_with_keys(vec!["k".to_string()]);
+        provider.base_url = server.url();
+        provider.net.retries = 0; // fail fast, don't sleep through back-off
+
+        let reporter = ProgressReporter::new(indicatif::ProgressBar::hidden(), "test · ");
+        let urls = urls_of(
+            provider
+                .fetch_urls_with_progress("example.com", Some(reporter.clone()))
+                .await
+                .expect("page one must survive the continuation's failure"),
+        );
+
+        assert_eq!(urls, vec!["https://example.com/p1".to_string()]);
+        assert!(reporter.is_partial());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_with_mock() {
+        // Create a mock server - use new_async to avoid nested runtime issues
+        let mut mock_server = mockito::Server::new_async().await;
+
+        // Create a mock response
+        let mock_response = r#"{
+            "status": 200,
+            "results": [
+                {
+                    "page": {
+                        "domain": "example.com",
+                        "mimeType": "text/html",
+                        "url": "https://example.com/page1",
+                        "status": "200"
+                    },
+                    "sort": ["2023-04-01", "example.com"]
+                },
+                {
+                    "page": {
+                        "domain": "example.com",
+                        "mimeType": "application/javascript",
+                        "url": "https://example.com/page2",
+                        "status": "200"
+                    },
+                    "sort": ["2023-04-02", "example.com"]
+                }
+            ],
+            "has_more": false
+        }"#;
+
+        // Setup the mock
+        let _m = mock_server
+            .mock("GET", "/api/v1/search/")
+            .match_query(mockito::Matcher::Regex(
+                "q=domain:example.com&size=100".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("API-Key", "test_api_key")
+            .with_body(mock_response)
+            .create_async()
+            .await;
+
+        // Create the provider using mock server URL
+        let mut provider = UrlscanProvider::new_with_keys(vec!["test_api_key".to_string()]);
+        provider.base_url = mock_server.url();
+
+        let result = provider.fetch_urls("example.com").await;
+        assert!(result.is_ok(), "Expected success with mock API");
+
+        let urls = urls_of(result.unwrap());
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "https://example.com/page1");
+        assert_eq!(urls[1], "https://example.com/page2");
+    }
+}

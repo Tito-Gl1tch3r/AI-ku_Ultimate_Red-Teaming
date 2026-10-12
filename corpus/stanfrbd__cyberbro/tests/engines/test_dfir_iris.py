@@ -1,0 +1,748 @@
+import json
+import logging
+
+import pytest
+import requests
+import responses
+
+from engines.dfir_iris import DFIRIrisEngine
+from models.observable import Observable, ObservableType
+from utils.config import Secrets
+
+logger = logging.getLogger(__name__)
+
+
+@pytest.fixture
+def secrets_with_both_keys():
+    s = Secrets()
+    s.dfir_iris_api_key = "test_api_key_12345"
+    s.dfir_iris_url = "https://dfir-iris.example.com"
+    return s
+
+
+@pytest.fixture
+def secrets_without_api_key():
+    s = Secrets()
+    s.dfir_iris_api_key = ""
+    s.dfir_iris_url = "https://dfir-iris.example.com"
+    return s
+
+
+@pytest.fixture
+def secrets_without_url():
+    s = Secrets()
+    s.dfir_iris_api_key = "test_api_key_12345"
+    s.dfir_iris_url = ""
+    return s
+
+
+@pytest.fixture
+def secrets_with_notes_enabled():
+    s = Secrets()
+    s.dfir_iris_api_key = "test_api_key_12345"
+    s.dfir_iris_url = "https://dfir-iris.example.com"
+    s.dfir_iris_search_notes = True
+    return s
+
+
+@pytest.fixture
+def ipv4_observable():
+    return Observable(value="192.168.1.1", type=ObservableType.IPV4)
+
+
+@pytest.fixture
+def ipv6_observable():
+    return Observable(value="2001:db8::1", type=ObservableType.IPV6)
+
+
+@pytest.fixture
+def md5_observable():
+    return Observable(value="5d41402abc4b2a76b9719d911017c592", type=ObservableType.MD5)
+
+
+@pytest.fixture
+def sha1_observable():
+    return Observable(value="aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d", type=ObservableType.SHA1)
+
+
+@pytest.fixture
+def sha256_observable():
+    return Observable(value="2c26b46911185131006ba5991d4e39ffe58fc1ed", type=ObservableType.SHA256)
+
+
+@pytest.fixture
+def fqdn_observable():
+    return Observable(value="example.com", type=ObservableType.FQDN)
+
+
+@pytest.fixture
+def url_observable():
+    return Observable(value="https://example.com/path", type=ObservableType.URL)
+
+
+@pytest.fixture
+def bogon_observable():
+    return Observable(value="127.0.0.1", type=ObservableType.BOGON)
+
+
+# ============================================================================
+# High Priority: Credentials + Success Paths
+# ============================================================================
+
+
+@responses.activate
+def test_analyze_success_ipv4_with_credentials(secrets_with_both_keys, ipv4_observable):
+    """Test successful analysis of IPv4 with credentials."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {
+        "data": [
+            {"case_id": 1, "case_name": "Case 1"},
+            {"case_id": 2, "case_name": "Case 2"},
+        ]
+    }
+
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    assert result["reports"] == 2
+    assert len(result["links"]) == 2
+    # Verify both case IDs appear in the links
+    for cid in [1, 2]:
+        assert any(f"cid={cid}" in link for link in result["links"])
+
+
+@responses.activate
+def test_analyze_missing_api_key(secrets_without_api_key, ipv4_observable, caplog):
+    """Test behavior when API key is missing."""
+    engine = DFIRIrisEngine(secrets_without_api_key, proxies={}, ssl_verify=True)
+    url = f"{secrets_without_api_key.dfir_iris_url}/search?cid=1"
+
+    # With empty API key, auth header will be "Bearer " (invalid)
+    # API should reject it with 401
+    responses.add(responses.POST, url, json={"error": "unauthorized"}, status=401)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    assert "Error querying DFIR-IRIS" in caplog.text
+
+
+@responses.activate
+def test_analyze_missing_iris_url(secrets_without_url, ipv4_observable, caplog):
+    """Test behavior when DFIR-IRIS URL is missing."""
+    engine = DFIRIrisEngine(secrets_without_url, proxies={}, ssl_verify=True)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    # URL construction will fail with empty URL
+    assert result is None
+    assert "Error querying DFIR-IRIS" in caplog.text
+
+
+@responses.activate
+def test_analyze_unauthorized_401(secrets_with_both_keys, ipv4_observable, caplog):
+    """Test handling of 401 Unauthorized response."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, json={"error": "unauthorized"}, status=401)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    assert "Error querying DFIR-IRIS" in caplog.text
+
+
+@responses.activate
+def test_analyze_forbidden_403(secrets_with_both_keys, ipv4_observable, caplog):
+    """Test handling of 403 Forbidden response."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, json={"error": "forbidden"}, status=403)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    assert "Error querying DFIR-IRIS" in caplog.text
+
+
+@responses.activate
+def test_analyze_response_missing_data_key(secrets_with_both_keys, ipv4_observable):
+    """Test handling of valid 200 response missing 'data' key."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"error": "No data"}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+
+
+@responses.activate
+def test_analyze_response_empty_data(secrets_with_both_keys, ipv4_observable):
+    """Test handling of response with empty data array."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": []}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+
+
+@responses.activate
+def test_analyze_success_with_duplicate_links(secrets_with_both_keys, ipv4_observable):
+    """Test that duplicate case_ids are deduplicated."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {
+        "data": [
+            {"case_id": 1, "case_name": "Case 1"},
+            {"case_id": 2, "case_name": "Case 2"},
+            {"case_id": 1, "case_name": "Case 1 Duplicate"},
+        ]
+    }
+
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    # Should only have 2 unique links even though 3 case_ids
+    assert result["reports"] == 2
+    assert len(result["links"]) == 2
+
+
+# ============================================================================
+# Medium Priority: Observable Types + Wildcard Patterns
+# ============================================================================
+
+
+@responses.activate
+def test_analyze_ipv4_prefix_wildcard(secrets_with_both_keys, ipv4_observable):
+    """Test that IPv4 uses prefix wildcard pattern (%value)."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    # Verify the request body contained prefix wildcard
+    request_body = json.loads(responses.calls[0].request.body)
+    assert request_body["search_value"] == f"%{ipv4_observable.value}"
+    assert request_body["search_type"] == "ioc"
+
+
+@responses.activate
+def test_analyze_ipv6_prefix_wildcard(secrets_with_both_keys, ipv6_observable):
+    """Test that IPv6 uses prefix wildcard pattern (%value)."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv6_observable)
+
+    assert result is not None
+    request_body = json.loads(responses.calls[0].request.body)
+    assert request_body["search_value"] == f"%{ipv6_observable.value}"
+
+
+@responses.activate
+def test_analyze_md5_prefix_wildcard(secrets_with_both_keys, md5_observable):
+    """Test that MD5 uses prefix wildcard pattern (%value)."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(md5_observable)
+
+    assert result is not None
+    request_body = json.loads(responses.calls[0].request.body)
+    assert request_body["search_value"] == f"%{md5_observable.value}"
+
+
+@responses.activate
+def test_analyze_sha1_prefix_wildcard(secrets_with_both_keys, sha1_observable):
+    """Test that SHA1 uses prefix wildcard pattern (%value)."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(sha1_observable)
+
+    assert result is not None
+    request_body = json.loads(responses.calls[0].request.body)
+    assert request_body["search_value"] == f"%{sha1_observable.value}"
+
+
+@responses.activate
+def test_analyze_sha256_prefix_wildcard(secrets_with_both_keys, sha256_observable):
+    """Test that SHA256 uses prefix wildcard pattern (%value)."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(sha256_observable)
+
+    assert result is not None
+    request_body = json.loads(responses.calls[0].request.body)
+    assert request_body["search_value"] == f"%{sha256_observable.value}"
+
+
+@responses.activate
+def test_analyze_bogon_prefix_wildcard(secrets_with_both_keys, bogon_observable):
+    """Test that BOGON uses prefix wildcard pattern (%value)."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(bogon_observable)
+
+    assert result is not None
+    request_body = json.loads(responses.calls[0].request.body)
+    assert request_body["search_value"] == f"%{bogon_observable.value}"
+
+
+@responses.activate
+def test_analyze_fqdn_suffix_wildcard(secrets_with_both_keys, fqdn_observable):
+    """Test that FQDN uses suffix wildcard pattern (value%)."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(fqdn_observable)
+
+    assert result is not None
+    request_body = json.loads(responses.calls[0].request.body)
+    # FQDN should use suffix wildcard (different from IPs/hashes!)
+    assert request_body["search_value"] == f"{fqdn_observable.value}%"
+
+
+@responses.activate
+def test_analyze_url_suffix_wildcard(secrets_with_both_keys, url_observable):
+    """Test that URL uses suffix wildcard pattern (value%)."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(url_observable)
+
+    assert result is not None
+    request_body = json.loads(responses.calls[0].request.body)
+    # URL should use suffix wildcard (different from IPs/hashes!)
+    assert request_body["search_value"] == f"{url_observable.value}%"
+
+
+# ============================================================================
+# Medium Priority: Error Handling + Response Processing
+# ============================================================================
+
+
+@responses.activate
+def test_analyze_http_error_500(secrets_with_both_keys, ipv4_observable, caplog):
+    """Test handling of HTTP 500 Internal Server Error."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, json={"error": "server error"}, status=500)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    assert "Error querying DFIR-IRIS" in caplog.text
+
+
+@responses.activate
+def test_analyze_invalid_json_response(secrets_with_both_keys, ipv4_observable, caplog):
+    """Test handling of 200 status but invalid JSON response."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, body="invalid json{", status=200)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    assert "Error querying DFIR-IRIS" in caplog.text
+
+
+@responses.activate
+def test_analyze_connection_error(secrets_with_both_keys, ipv4_observable, caplog):
+    """Test handling of connection timeout."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    timeout_error = requests.exceptions.ConnectTimeout("Connection timed out")
+    responses.add(responses.POST, url, body=timeout_error)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    assert "Error querying DFIR-IRIS" in caplog.text
+
+
+@responses.activate
+def test_analyze_multiple_cases_sorted(secrets_with_both_keys, ipv4_observable):
+    """Test that multiple case results are sorted alphabetically."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    # Provide unsorted case IDs
+    mock_resp = {
+        "data": [
+            {"case_id": 10, "case_name": "Case 10"},
+            {"case_id": 5, "case_name": "Case 5"},
+            {"case_id": 1, "case_name": "Case 1"},
+            {"case_id": 20, "case_name": "Case 20"},
+        ]
+    }
+
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    assert result["reports"] == 4
+    # Links should be sorted alphabetically
+    links = result["links"]
+    assert links == sorted(links)
+
+
+@responses.activate
+def test_analyze_request_timeout(secrets_with_both_keys, ipv4_observable, caplog):
+    """Test handling of request timeout."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    timeout_error = requests.exceptions.ReadTimeout("Read timed out")
+    responses.add(responses.POST, url, body=timeout_error)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    assert "Error querying DFIR-IRIS" in caplog.text
+
+
+# ============================================================================
+# Low Priority: Export Row & Properties
+# ============================================================================
+
+
+@responses.activate
+def test_create_export_row_with_data(secrets_with_both_keys):
+    """Test export row with analysis results."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+
+    analysis_result = {
+        "reports": 3,
+        "links": [
+            "https://dfir-iris.example.com/case/ioc?cid=1",
+            "https://dfir-iris.example.com/case/ioc?cid=2",
+            "https://dfir-iris.example.com/case/ioc?cid=3",
+        ],
+    }
+
+    row = engine.create_export_row(analysis_result)
+
+    assert row["dfir_iris_total_count"] == 3
+    assert "case/ioc?cid=1" in row["dfir_iris_link"]
+    assert "case/ioc?cid=2" in row["dfir_iris_link"]
+    assert "case/ioc?cid=3" in row["dfir_iris_link"]
+    # Should be comma-separated
+    assert ", " in row["dfir_iris_link"]
+
+
+def test_create_export_row_with_none():
+    """Test export row with None analysis result."""
+    engine = DFIRIrisEngine(Secrets(), proxies={}, ssl_verify=True)
+
+    row = engine.create_export_row(None)
+
+    assert row["dfir_iris_total_count"] is None
+    assert row["dfir_iris_link"] is None
+
+
+def test_create_export_row_empty_links():
+    """Test export row with empty links list."""
+    engine = DFIRIrisEngine(Secrets(), proxies={}, ssl_verify=True)
+
+    analysis_result = {
+        "reports": 0,
+        "links": [],
+    }
+
+    row = engine.create_export_row(analysis_result)
+
+    assert row["dfir_iris_total_count"] == 0
+    assert row["dfir_iris_link"] is None
+
+
+def test_engine_properties():
+    """Test BaseEngine property inheritance and values."""
+    engine = DFIRIrisEngine(Secrets(), proxies={}, ssl_verify=True)
+
+    assert engine.name == "dfir_iris"
+    expected_types = (
+        ObservableType.BOGON
+        | ObservableType.FQDN
+        | ObservableType.IPV4
+        | ObservableType.IPV6
+        | ObservableType.MD5
+        | ObservableType.SHA1
+        | ObservableType.SHA256
+        | ObservableType.URL
+    )
+    assert engine.supported_types == expected_types
+    assert engine.execute_after_reverse_dns is False
+    assert engine.is_pivot_engine is False
+
+
+@responses.activate
+def test_analyze_authorization_header_format(secrets_with_both_keys, ipv4_observable):
+    """Test that Authorization header is properly formatted."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    # Verify Authorization header format
+    auth_header = responses.calls[0].request.headers.get("Authorization")
+    assert auth_header == f"Bearer {secrets_with_both_keys.dfir_iris_api_key}"
+
+
+@responses.activate
+def test_analyze_content_type_header(secrets_with_both_keys, ipv4_observable):
+    """Test that Content-Type header is set to application/json."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    # Verify Content-Type header
+    content_type = responses.calls[0].request.headers.get("Content-Type")
+    assert content_type == "application/json"
+
+
+@responses.activate
+def test_analyze_url_includes_cid_parameter(secrets_with_both_keys, ipv4_observable):
+    """Test that URL includes cid=1 query parameter."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    # Verify the request was made to the correct URL
+    assert "cid=1" in responses.calls[0].request.url
+
+
+# ============================================================================
+# Notes search feature
+# ============================================================================
+
+
+def test_dfir_iris_search_notes_defaults_to_false():
+    """Test that the DFIR_IRIS_SEARCH_NOTES config field defaults to False."""
+    assert Secrets().dfir_iris_search_notes is False
+
+
+@responses.activate
+def test_analyze_notes_disabled_by_default_only_queries_ioc(
+    secrets_with_both_keys, ipv4_observable
+):
+    """Test that only a single ioc search request is made when notes search is disabled."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    mock_resp = {"data": [{"case_id": 1}]}
+    responses.add(responses.POST, url, json=mock_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    assert len(responses.calls) == 1
+    request_body = json.loads(responses.calls[0].request.body)
+    assert request_body["search_type"] == "ioc"
+
+
+@responses.activate
+def test_analyze_notes_enabled_queries_both_ioc_and_notes(
+    secrets_with_notes_enabled, ipv4_observable
+):
+    """Test that both ioc and notes searches are performed when notes search is enabled."""
+    engine = DFIRIrisEngine(secrets_with_notes_enabled, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_notes_enabled.dfir_iris_url}/search?cid=1"
+
+    ioc_resp = {"data": [{"case_id": 1}]}
+    notes_resp = {"data": [{"case_id": 2}]}
+    responses.add(responses.POST, url, json=ioc_resp, status=200)
+    responses.add(responses.POST, url, json=notes_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    assert len(responses.calls) == 2
+
+    first_body = json.loads(responses.calls[0].request.body)
+    second_body = json.loads(responses.calls[1].request.body)
+    assert first_body["search_type"] == "ioc"
+    assert second_body["search_type"] == "notes"
+    # Same wildcard pattern is reused for both search types
+    assert first_body["search_value"] == second_body["search_value"]
+
+
+@responses.activate
+def test_analyze_notes_enabled_merges_ioc_and_notes_links(
+    secrets_with_notes_enabled, ipv4_observable
+):
+    """Test that ioc and notes links are merged into a single links list when both have hits."""
+    engine = DFIRIrisEngine(secrets_with_notes_enabled, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_notes_enabled.dfir_iris_url}/search?cid=1"
+
+    ioc_resp = {"data": [{"case_id": 1}]}
+    notes_resp = {"data": [{"case_id": 2}]}
+    responses.add(responses.POST, url, json=ioc_resp, status=200)
+    responses.add(responses.POST, url, json=notes_resp, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    assert result["reports"] == 2
+    ioc_link = f"{secrets_with_notes_enabled.dfir_iris_url}/case/ioc?cid=1"
+    notes_link = f"{secrets_with_notes_enabled.dfir_iris_url}/case/notes?cid=2"
+    assert ioc_link in result["links"]
+    assert notes_link in result["links"]
+
+
+@responses.activate
+def test_analyze_notes_only_hit_returns_notes_link(secrets_with_notes_enabled, ipv4_observable):
+    """Test that a notes-only hit (no ioc hits) still returns a result with the notes link."""
+    engine = DFIRIrisEngine(secrets_with_notes_enabled, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_notes_enabled.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, json={"data": []}, status=200)
+    responses.add(responses.POST, url, json={"data": [{"case_id": 3}]}, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    assert result["reports"] == 1
+    notes_link = f"{secrets_with_notes_enabled.dfir_iris_url}/case/notes?cid=3"
+    assert result["links"] == [notes_link]
+
+
+@responses.activate
+def test_analyze_ioc_only_hit_with_notes_enabled(secrets_with_notes_enabled, ipv4_observable):
+    """Test that an ioc-only hit (no notes hits) still returns a result with the ioc link."""
+    engine = DFIRIrisEngine(secrets_with_notes_enabled, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_notes_enabled.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, json={"data": [{"case_id": 1}]}, status=200)
+    responses.add(responses.POST, url, json={"data": []}, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    assert result["reports"] == 1
+    ioc_link = f"{secrets_with_notes_enabled.dfir_iris_url}/case/ioc?cid=1"
+    assert result["links"] == [ioc_link]
+
+
+@responses.activate
+def test_analyze_notes_search_failure_is_non_fatal(
+    secrets_with_notes_enabled, ipv4_observable, caplog
+):
+    """Test that a failed notes search does not fail the whole analysis; ioc results are kept."""
+    engine = DFIRIrisEngine(secrets_with_notes_enabled, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_notes_enabled.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, json={"data": [{"case_id": 1}]}, status=200)
+    responses.add(responses.POST, url, json={"error": "server error"}, status=500)
+
+    caplog.set_level(logging.WARNING)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is not None
+    assert result["reports"] == 1
+    ioc_link = f"{secrets_with_notes_enabled.dfir_iris_url}/case/ioc?cid=1"
+    assert result["links"] == [ioc_link]
+    assert "Error querying DFIR-IRIS notes" in caplog.text
+
+
+@responses.activate
+def test_analyze_ioc_search_failure_remains_fatal_with_notes_enabled(
+    secrets_with_notes_enabled, ipv4_observable, caplog
+):
+    """Test that a failed ioc search still returns None even when notes search is enabled."""
+    engine = DFIRIrisEngine(secrets_with_notes_enabled, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_notes_enabled.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, json={"error": "server error"}, status=500)
+
+    caplog.set_level(logging.ERROR)
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    # Only the ioc request should have been attempted
+    assert len(responses.calls) == 1
+    assert "Error querying DFIR-IRIS for" in caplog.text
+
+
+@responses.activate
+def test_analyze_notes_disabled_no_hits_returns_none(secrets_with_both_keys, ipv4_observable):
+    """Test that no ioc hits and notes disabled returns None."""
+    engine = DFIRIrisEngine(secrets_with_both_keys, proxies={}, ssl_verify=True)
+    url = f"{secrets_with_both_keys.dfir_iris_url}/search?cid=1"
+
+    responses.add(responses.POST, url, json={"data": []}, status=200)
+
+    result = engine.analyze(ipv4_observable)
+
+    assert result is None
+    assert len(responses.calls) == 1

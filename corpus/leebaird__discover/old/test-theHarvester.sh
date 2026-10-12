@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+
+# by Lee Baird (@discoverscripts)
+
+# Colors
+BLUE='\033[1;34m'
+NC='\033[0m'
+RED='\033[1;31m'
+YELLOW='\033[1;33m'
+
+###############################################################################################################################
+
+if [ $# -eq 0 ]; then
+    echo
+    echo "Usage:"
+    echo "  $0 www.example.com           # Use free sources"
+    echo "  $0 www.example.com api       # Use API sources"
+    echo
+    exit 1
+fi
+
+DOMAIN="$1"
+USE_API=false
+
+if [ $# -eq 1 ]; then
+    USE_API=false
+elif [ $# -eq 2 ] && [ "$2" = "api" ]; then
+    USE_API=true
+else
+    echo
+    echo -e "${RED}[!] Invalid argument.${NC}"
+    echo
+    echo "Usage:"
+    echo "  $0 www.example.com           # Use free sources"
+    echo "  $0 www.example.com api       # Use API sources"
+    echo
+    exit 1
+fi
+
+# Validate domain
+if [[ ! $DOMAIN =~ ^([a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\.)+[a-zA-Z]+[aeiouy][a-zA-Z]*\.[a-zA-Z]{2,}$ ]]; then
+    echo
+    echo -e "${RED}[!] '$DOMAIN' does not look like a valid domain.${NC}"
+    echo
+    exit 1
+fi
+
+TH_DIR="$HOME/theHarvester"
+WORK_DIR="$HOME/${DOMAIN}-test"
+
+# Keep in lockstep with recon/passive.sh. Split is theHarvester README "API key":
+# No → free; Required or Optional → api.
+sources_no_api=(apis-guru arquivo baidu certspotter commoncrawl crt-name crtsh duckduckgo gitlab haveibeenpwned hudsonrock otx rapiddns robtex shodanct shodanInternetDB sourcegraph subdomainapi subdomaincenter subdomainfinderc99 thc urlscan waybackarchive yahoo)
+sources_api=(bevigil brave bufferoverun builtwith censys criminalip dehashed dnsdb dnsdumpster dymo fofa fullhunt github-code hackertarget hibpverified hunter hunterhow intelx jsmon leakix leaklookup mojeek netlas onyphe pentesttools projectdiscovery rocketreach securityscorecard securityTrails sherlockeye shodan tomba virustotal whoisxml windvane zoomeye)
+
+###############################################################################################################################
+
+mkdir -p "$WORK_DIR" || { echo -e "${RED}[!] Cannot create $WORK_DIR${NC}" >&2; exit 2; }
+
+cd "$TH_DIR" || { echo -e "${RED}[!] Cannot cd to $TH_DIR${NC}" >&2; exit 3; }
+
+echo
+echo "[*] Updating packages."
+uv sync || echo -e "${YELLOW}Warning: uv sync failed – continuing.${NC}"
+# shellcheck disable=SC1091
+source .venv/bin/activate || { echo -e "${RED}[!] Failed to activate venv.${NC}" >&2; exit 4; }
+
+echo
+
+if $USE_API; then
+    sources=("${sources_api[@]}")
+    total=${#sources_api[@]}
+    echo -e "${BLUE}[*] Running $total API sources.${NC}"
+    echo
+else
+    sources=("${sources_no_api[@]}")
+    total=${#sources_no_api[@]}
+    echo -e "${BLUE}[*] Running $total free sources.${NC}"
+    echo
+fi
+
+###############################################################################################################################
+
+COUNT=0
+
+run_harvester() {
+    local source="$1"
+    ((COUNT++))
+
+    printf "    %-22s  (%2d / %2d)\n" "$source" "$COUNT" "$total"
+
+    theHarvester -d "$DOMAIN" -b "$source" -n -r 2>&1 \
+        | grep -Ev ' - INFO - ' \
+        | grep -Eiv '(!|\*|--|=|\[|\:\:|failed to detect|no response|retrying|searching|yaml)' \
+        | sed '/^$/d;/:$/d; /^AS/d; s|https://||g; s|www\.||g' \
+        | sort -u > "z${source}.tmp" || true
+
+    if [ -s "z${source}.tmp" ]; then
+        mv "z${source}.tmp" "z${source}"
+    else
+        rm -f "z${source}.tmp"
+        printf "      └─ (no results)\n"
+    fi
+
+}
+
+for src in "${sources[@]}"; do
+    run_harvester "$src"
+done
+
+###############################################################################################################################
+
+if ls z* >/dev/null 2>&1; then
+    mv z* "$WORK_DIR/" 2>/dev/null || true
+    echo
+    echo -e "${BLUE}[*] Finished.${NC}"
+    echo
+    echo -e "[*] Results saved to ${YELLOW}$WORK_DIR${NC}"
+else
+    echo
+    echo -e "${YELLOW}[*] No results files were created.${NC}"
+fi
+
+deactivate
+

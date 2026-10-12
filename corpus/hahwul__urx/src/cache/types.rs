@@ -1,0 +1,588 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Cache key that uniquely identifies a scan configuration
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CacheKey {
+    pub domain: String,
+    pub providers: Vec<String>,
+    pub filters_hash: String,
+}
+
+impl CacheKey {
+    /// Create a new cache key from scan parameters
+    pub fn new(domain: &str, providers: &[String], filters: &CacheFilters) -> Self {
+        let mut providers = providers.to_vec();
+        providers.sort(); // Ensure consistent ordering
+
+        let filters_hash = filters.compute_hash();
+
+        Self {
+            domain: domain.to_string(),
+            providers,
+            filters_hash,
+        }
+    }
+}
+
+/// Feed one field into the hasher length-prefixed, so that adjacent fields can
+/// never be confused for one another. Without this, concatenating raw bytes
+/// lets distinct configs collide (e.g. domain `"ab"`+provider `"c"` hashes the
+/// same as domain `"a"`+provider `"bc"`), which would cross-pollinate caches.
+fn feed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// Feed a list of strings unambiguously: element count, then each element
+/// length-prefixed.
+fn feed_list(hasher: &mut Sha256, items: &[String]) {
+    hasher.update((items.len() as u64).to_le_bytes());
+    for item in items {
+        feed(hasher, item.as_bytes());
+    }
+}
+
+impl std::fmt::Display for CacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut hasher = Sha256::new();
+        feed(&mut hasher, self.domain.as_bytes());
+        feed_list(&mut hasher, &self.providers);
+        feed(&mut hasher, self.filters_hash.as_bytes());
+        let result = hasher.finalize();
+        for byte in result {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
+    }
+}
+
+/// Everything about a scan's configuration that changes *which URLs it would
+/// produce*. Any option that narrows or widens the result set has to be in
+/// here, or two different runs collide on one cache entry and the second gets
+/// served the first one's answer.
+///
+/// That includes the archive-side predicates, not just the local filters:
+/// `--from 2020` and `--from 2024` ask the CDX index two different questions.
+///
+/// [`Default`] is derived deliberately — it means a new option can be added to
+/// this struct without having to touch every construction site, so the "we
+/// forgot to put the new flag in the cache key" bug can't come back quietly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CacheFilters {
+    pub subs: bool,
+    pub extensions: Vec<String>,
+    pub exclude_extensions: Vec<String>,
+    pub patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    /// `--match-regex` / `--filter-regex`: stored as the source patterns, which
+    /// is what distinguishes two runs.
+    pub match_regex: Vec<String>,
+    pub filter_regex: Vec<String>,
+    pub presets: Vec<String>,
+    pub min_length: Option<usize>,
+    pub max_length: Option<usize>,
+    pub strict: bool,
+    pub normalize_url: bool,
+    pub merge_endpoint: bool,
+    pub dedup_similar: bool,
+    /// `--cc-index`: distinct Common Crawl indexes are distinct corpora.
+    pub cc_index: Vec<String>,
+    /// `--from` / `--to`: the CDX date window.
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// `--archive-*`: status-code and MIME predicates the archive applies.
+    pub archive_status: Vec<String>,
+    pub archive_exclude_status: Vec<String>,
+    pub archive_mime: Vec<String>,
+    pub archive_exclude_mime: Vec<String>,
+    /// `--archived-discovery`: adds URLs from archived robots.txt / sitemap
+    /// versions, so a run with it asks a different question from one without.
+    pub archived_discovery: bool,
+    /// `--cdx-endpoint` URLs and `--cdx-dialect`. The provider id names only
+    /// the endpoint's host, so two collections on one server — or one server
+    /// read in two dialects — would otherwise share an entry.
+    #[serde(default)]
+    pub cdx_endpoints: Vec<String>,
+    #[serde(default)]
+    pub cdx_dialect: Option<String>,
+    /// `--archived-discovery-limit`, when archived discovery is on and the
+    /// limit is not the default.
+    #[serde(default)]
+    pub archived_discovery_limit: Option<usize>,
+}
+
+impl CacheFilters {
+    /// Compute a hash of the filter configuration.
+    ///
+    /// Every field is fed length-prefixed (see [`feed`]/[`feed_list`]) so that
+    /// no two distinct filter sets can hash to the same value through field-
+    /// boundary ambiguity — e.g. `presets=["a"], min_length=Some(1)` must not
+    /// collide with `presets=["a1"], min_length=None`.
+    pub fn compute_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+
+        hasher.update([self.subs as u8]);
+        feed_list(&mut hasher, &self.extensions);
+        feed_list(&mut hasher, &self.exclude_extensions);
+        feed_list(&mut hasher, &self.patterns);
+        feed_list(&mut hasher, &self.exclude_patterns);
+        feed_list(&mut hasher, &self.match_regex);
+        feed_list(&mut hasher, &self.filter_regex);
+        feed_list(&mut hasher, &self.presets);
+        feed(
+            &mut hasher,
+            self.min_length
+                .map(|l| l.to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        feed(
+            &mut hasher,
+            self.max_length
+                .map(|l| l.to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        hasher.update([self.strict as u8]);
+        hasher.update([self.normalize_url as u8]);
+        hasher.update([self.merge_endpoint as u8]);
+        hasher.update([self.dedup_similar as u8]);
+        feed_list(&mut hasher, &self.cc_index);
+        feed(
+            &mut hasher,
+            self.from.as_deref().unwrap_or_default().as_bytes(),
+        );
+        feed(
+            &mut hasher,
+            self.to.as_deref().unwrap_or_default().as_bytes(),
+        );
+        feed_list(&mut hasher, &self.archive_status);
+        feed_list(&mut hasher, &self.archive_exclude_status);
+        feed_list(&mut hasher, &self.archive_mime);
+        feed_list(&mut hasher, &self.archive_exclude_mime);
+        hasher.update([self.archived_discovery as u8]);
+        // Fed tagged and only when set: keys from before these fields existed
+        // stay what they were, rather than every `--incremental` baseline
+        // being reset by an upgrade.
+        if !self.cdx_endpoints.is_empty() {
+            feed(&mut hasher, b"cdx_endpoints");
+            feed_list(&mut hasher, &self.cdx_endpoints);
+        }
+        if let Some(dialect) = &self.cdx_dialect {
+            feed(&mut hasher, b"cdx_dialect");
+            feed(&mut hasher, dialect.as_bytes());
+        }
+        if let Some(limit) = self.archived_discovery_limit {
+            feed(&mut hasher, b"archived_discovery_limit");
+            feed(&mut hasher, &limit.to_le_bytes());
+        }
+
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+}
+
+/// Cache entry containing URLs and metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheEntry {
+    pub urls: Vec<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl CacheEntry {
+    /// Create a new cache entry
+    pub fn new(urls: Vec<String>) -> Self {
+        Self {
+            urls,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Check if the cache entry is expired
+    ///
+    /// A negative age — the entry was written by a machine whose clock is ahead,
+    /// or this one's went backwards — is not expiry. Casting it straight to
+    /// `u64` wrapped it to ~1.8e19 seconds, so any such entry looked ancient and
+    /// was deleted on sight.
+    pub fn is_expired(&self, ttl_seconds: u64) -> bool {
+        let elapsed = Utc::now()
+            .signed_duration_since(self.timestamp)
+            .num_seconds();
+        elapsed >= 0 && (elapsed as u64) >= ttl_seconds
+    }
+}
+
+/// Trait defining the interface for cache backends
+#[async_trait]
+pub trait CacheBackend: Send + Sync {
+    /// Get a cache entry by key
+    async fn get(&self, key: &CacheKey) -> Result<Option<CacheEntry>>;
+
+    /// Set a cache entry
+    async fn set(&self, key: &CacheKey, entry: &CacheEntry) -> Result<()>;
+
+    /// Delete a cache entry
+    async fn delete(&self, key: &CacheKey) -> Result<()>;
+
+    /// The whole-store side of this backend, for the post-run expiry sweep.
+    /// Test backends that only serve a scan leave it `None`.
+    fn admin(&self) -> Option<&dyn super::CacheAdmin> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_key_creation() {
+        let filters = CacheFilters {
+            subs: true,
+            extensions: vec!["js".to_string(), "php".to_string()],
+            exclude_extensions: vec!["jpg".to_string()],
+            patterns: vec!["admin".to_string()],
+            exclude_patterns: vec!["logout".to_string()],
+            presets: vec!["no-images".to_string()],
+            min_length: Some(10),
+            max_length: Some(100),
+            strict: true,
+            normalize_url: true,
+            ..Default::default()
+        };
+
+        let key = CacheKey::new(
+            "example.com",
+            &["wayback".to_string(), "cc".to_string()],
+            &filters,
+        );
+
+        assert_eq!(key.domain, "example.com");
+        assert_eq!(key.providers, vec!["cc", "wayback"]); // sorted
+        assert!(!key.filters_hash.is_empty());
+    }
+
+    #[test]
+    fn test_cache_filters_hash_consistency() {
+        let filters1 = CacheFilters {
+            subs: true,
+            extensions: vec!["js".to_string(), "php".to_string()],
+            strict: true,
+            ..Default::default()
+        };
+
+        let filters2 = CacheFilters {
+            subs: true,
+            extensions: vec!["js".to_string(), "php".to_string()],
+            strict: true,
+            ..Default::default()
+        };
+
+        assert_eq!(filters1.compute_hash(), filters2.compute_hash());
+    }
+
+    #[test]
+    fn test_cache_filters_hash_different() {
+        let filters1 = CacheFilters {
+            subs: true,
+            extensions: vec!["js".to_string()],
+            strict: true,
+            ..Default::default()
+        };
+
+        let filters2 = CacheFilters {
+            subs: false, // Different
+            extensions: vec!["js".to_string()],
+            strict: true,
+            ..Default::default()
+        };
+
+        assert_ne!(filters1.compute_hash(), filters2.compute_hash());
+    }
+
+    #[test]
+    fn test_cache_entry_expiry() {
+        let mut entry = CacheEntry::new(vec!["https://example.com".to_string()]);
+
+        // Fresh entry should not be expired
+        assert!(!entry.is_expired(3600)); // 1 hour TTL
+
+        // Simulate old entry
+        entry.timestamp = Utc::now() - chrono::Duration::hours(2);
+        assert!(entry.is_expired(3600)); // Should be expired
+    }
+
+    #[test]
+    fn test_entry_from_the_future_is_not_treated_as_expired() {
+        // Regression: a negative age was cast straight to u64 and wrapped to
+        // ~1.8e19 seconds, so an entry written by a machine whose clock runs
+        // ahead (or after a local clock step back) looked ancient and was
+        // deleted on sight.
+        let mut entry = CacheEntry::new(vec!["https://example.com".to_string()]);
+        entry.timestamp = Utc::now() + chrono::Duration::minutes(5);
+        assert!(!entry.is_expired(3600));
+    }
+
+    #[test]
+    fn test_cache_key_string_representation() {
+        let filters = CacheFilters {
+            strict: true,
+            ..Default::default()
+        };
+
+        let key1 = CacheKey::new("example.com", &["wayback".to_string()], &filters);
+        let key2 = CacheKey::new("example.com", &["wayback".to_string()], &filters);
+        let key3 = CacheKey::new("different.com", &["wayback".to_string()], &filters);
+
+        // Same keys should have same string representation
+        assert_eq!(format!("{}", key1), format!("{}", key2));
+
+        // Different keys should have different string representation
+        assert_ne!(format!("{}", key1), format!("{}", key3));
+    }
+
+    #[test]
+    fn test_cache_entry_new() {
+        let urls = vec![
+            "https://example.com/page1".to_string(),
+            "https://example.com/page2".to_string(),
+        ];
+        let entry = CacheEntry::new(urls.clone());
+
+        assert_eq!(entry.urls, urls);
+        // Timestamp should be close to now (within 5 seconds to account for slow CI)
+        let now = Utc::now();
+        let diff = now.signed_duration_since(entry.timestamp).num_seconds();
+        assert!(diff.abs() < 5);
+    }
+
+    #[test]
+    fn test_cache_entry_empty_urls() {
+        let entry = CacheEntry::new(vec![]);
+        assert!(entry.urls.is_empty());
+    }
+
+    #[test]
+    fn test_cache_entry_is_expired_boundary() {
+        let mut entry = CacheEntry::new(vec!["https://example.com".to_string()]);
+
+        // Entry that is exactly at TTL should be expired
+        entry.timestamp = Utc::now() - chrono::Duration::seconds(3600);
+        assert!(entry.is_expired(3600));
+
+        // Entry that is just under TTL should not be expired
+        entry.timestamp = Utc::now() - chrono::Duration::seconds(3599);
+        assert!(!entry.is_expired(3600));
+    }
+
+    #[test]
+    fn test_cache_filters_hash_with_different_extensions() {
+        let filters1 = CacheFilters {
+            subs: true,
+            extensions: vec!["js".to_string()],
+            strict: true,
+            ..Default::default()
+        };
+
+        let filters2 = CacheFilters {
+            subs: true,
+            extensions: vec!["php".to_string()], // Different
+            strict: true,
+            ..Default::default()
+        };
+
+        assert_ne!(filters1.compute_hash(), filters2.compute_hash());
+    }
+
+    #[test]
+    fn test_cache_filters_hash_with_different_patterns() {
+        let filters1 = CacheFilters {
+            subs: true,
+            patterns: vec!["admin".to_string()],
+            strict: true,
+            ..Default::default()
+        };
+
+        let filters2 = CacheFilters {
+            subs: true,
+            patterns: vec!["api".to_string()], // Different
+            strict: true,
+            ..Default::default()
+        };
+
+        assert_ne!(filters1.compute_hash(), filters2.compute_hash());
+    }
+
+    #[test]
+    fn test_cache_filters_hash_with_length_options() {
+        let filters1 = CacheFilters {
+            subs: true,
+            min_length: Some(10),
+            max_length: Some(100),
+            strict: true,
+            ..Default::default()
+        };
+
+        let filters2 = CacheFilters {
+            subs: true,
+            min_length: Some(20), // Different
+            max_length: Some(100),
+            strict: true,
+            ..Default::default()
+        };
+
+        assert_ne!(filters1.compute_hash(), filters2.compute_hash());
+    }
+
+    #[test]
+    fn test_cache_filters_hash_with_normalize_url() {
+        let filters1 = CacheFilters {
+            subs: true,
+            strict: true,
+            normalize_url: true,
+            ..Default::default()
+        };
+
+        let filters2 = CacheFilters {
+            subs: true,
+            strict: true,
+            normalize_url: false, // Different
+            ..Default::default()
+        };
+
+        assert_ne!(filters1.compute_hash(), filters2.compute_hash());
+    }
+
+    #[test]
+    fn test_cache_filters_hash_with_merge_endpoint() {
+        let filters1 = CacheFilters {
+            subs: true,
+            strict: true,
+            merge_endpoint: true,
+            ..Default::default()
+        };
+
+        let filters2 = CacheFilters {
+            subs: true,
+            strict: true,
+            merge_endpoint: false, // Different
+            ..Default::default()
+        };
+
+        assert_ne!(filters1.compute_hash(), filters2.compute_hash());
+    }
+
+    #[test]
+    fn test_cache_key_providers_sorted() {
+        let filters = CacheFilters {
+            strict: true,
+            ..Default::default()
+        };
+
+        // Providers in different order should result in same sorted list
+        let key1 = CacheKey::new(
+            "example.com",
+            &["wayback".to_string(), "cc".to_string(), "otx".to_string()],
+            &filters,
+        );
+        let key2 = CacheKey::new(
+            "example.com",
+            &["otx".to_string(), "wayback".to_string(), "cc".to_string()],
+            &filters,
+        );
+
+        assert_eq!(key1.providers, key2.providers);
+        assert_eq!(format!("{}", key1), format!("{}", key2));
+    }
+
+    #[test]
+    fn test_cache_filters_hash_no_field_boundary_collision() {
+        // presets=["a"] + min_length=Some(1) must NOT hash the same as
+        // presets=["a1"] + min_length=None (the old concatenation collided).
+        let a = CacheFilters {
+            presets: vec!["a".to_string()],
+            min_length: Some(1),
+            ..Default::default()
+        };
+        let b = CacheFilters {
+            presets: vec!["a1".to_string()],
+            min_length: None,
+            ..Default::default()
+        };
+        assert_ne!(a.compute_hash(), b.compute_hash());
+    }
+
+    #[test]
+    fn test_archive_scope_changes_the_hash() {
+        // Regression: these options were absent from the key, so
+        // `urx example.com --from 2020` and `--from 2024` shared one cache
+        // entry and the second run was served the first one's URLs.
+        let base = CacheFilters::default();
+        let variants = [
+            CacheFilters {
+                cc_index: vec!["CC-MAIN-2025-51".to_string()],
+                ..Default::default()
+            },
+            CacheFilters {
+                from: Some("20200101000000".to_string()),
+                ..Default::default()
+            },
+            CacheFilters {
+                to: Some("20201231235959".to_string()),
+                ..Default::default()
+            },
+            CacheFilters {
+                archive_status: vec!["200".to_string()],
+                ..Default::default()
+            },
+            CacheFilters {
+                archive_exclude_status: vec!["404".to_string()],
+                ..Default::default()
+            },
+            CacheFilters {
+                archive_mime: vec!["application/json".to_string()],
+                ..Default::default()
+            },
+            CacheFilters {
+                archive_exclude_mime: vec!["text/html".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(base.compute_hash());
+        for v in &variants {
+            assert!(
+                seen.insert(v.compute_hash()),
+                "archive scope must alter the cache key: {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_key_no_field_boundary_collision() {
+        let filters = CacheFilters::default();
+        // domain "ab" + provider "c" vs domain "a" + provider "bc".
+        let k1 = CacheKey::new("ab", &["c".to_string()], &filters);
+        let k2 = CacheKey::new("a", &["bc".to_string()], &filters);
+        assert_ne!(format!("{}", k1), format!("{}", k2));
+    }
+
+    #[test]
+    fn test_cache_key_empty_providers() {
+        let filters = CacheFilters {
+            strict: true,
+            ..Default::default()
+        };
+
+        let key = CacheKey::new("example.com", &[], &filters);
+        assert!(key.providers.is_empty());
+    }
+}

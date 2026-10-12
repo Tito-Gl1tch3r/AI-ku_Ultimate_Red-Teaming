@@ -1,0 +1,916 @@
+// human.cpp — human-readable rendering. See human.hpp.
+#include "human.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace ft {
+
+namespace {
+
+// ANSI helpers (no-ops when color is off).
+struct Palette {
+    bool on;
+    const char* dim() const { return on ? "\033[2m" : ""; }
+    const char* bold() const { return on ? "\033[1m" : ""; }
+    const char* reset() const { return on ? "\033[0m" : ""; }
+    const char* tier(const std::string& t) const {
+        if (!on) return "";
+        if (t == "verified") return "\033[32m";    // green
+        if (t == "consistent") return "\033[36m";  // cyan
+        if (t == "structural") return "\033[33m";  // yellow
+        return "\033[2m";                          // magic / other: faint
+    }
+    const char* off() const { return on ? "\033[35m" : ""; }  // magenta offsets
+    // Red = security-sensitive (act on it): a private key. A certificate is a
+    // public artifact, not a finding to act on.
+    const char* sec(const Finding& f) const {
+        if (!on) return "";
+        if (f.type == "private_key") return "\033[31m";  // red
+        return "";
+    }
+    const char* sev(const std::string& s) const {
+        if (!on) return "";
+        if (s == "error") return "\033[31m";    // red
+        if (s == "warning") return "\033[33m";   // yellow
+        return "\033[2m";                        // info: faint
+    }
+    // Entropy (bits/byte): high = likely encrypted/packed (red), mid = compressed
+    // (yellow), low = plain. Threshold 7.2 matches the -E "likely encrypted" hint.
+    const char* ent(double e) const {
+        if (!on) return "";
+        if (e >= 7.2) return "\033[31m";   // red
+        if (e >= 6.0) return "\033[33m";   // yellow
+        return "";
+    }
+};
+
+// "7.98", or empty when not computed (entropy < 0). Two decimals, fixed width.
+std::string ent_str(double e) {
+    if (e < 0) return {};
+    char b[16];
+    std::snprintf(b, sizeof(b), "%.2f", e);
+    return b;
+}
+
+std::string human_size(size_t n) {
+    static const std::array<const char*, 5> unit{"B", "KB", "MB", "GB", "TB"};
+    double v = static_cast<double>(n);
+    size_t u = 0;
+    while (v >= 1024.0 && u + 1 < unit.size()) {
+        v /= 1024.0;
+        ++u;
+    }
+    char buf[32];
+    if (u == 0)
+        std::snprintf(buf, sizeof(buf), "%zu B", n);
+    else if (v >= 100)
+        std::snprintf(buf, sizeof(buf), "%.0f %s", v, unit[u]);
+    else
+        std::snprintf(buf, sizeof(buf), "%.1f %s", v, unit[u]);
+    return buf;
+}
+
+std::string hex_off(size_t o) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%zx", o);
+    return buf;
+}
+
+// Printable, control-stripped rendering of an embedded label. Capped with an
+// ellipsis unless `verbose` (the -v flag) asks for the full value.
+std::string clean_label(const std::string& s, size_t cap = 40, bool verbose = false) {
+    std::string out;
+    for (char c : s) {
+        unsigned char u = static_cast<unsigned char>(c);
+        out += (u >= 0x20 && u < 0x7f) ? c : '.';
+        if (!verbose && out.size() >= cap) {
+            out += "…";  // ellipsis
+            break;
+        }
+    }
+    return out;
+}
+
+// Compact "notes" column: endianness, arch, version, compression, label, etc.
+// The caller renders the whole string dim; diagnostic tags are re-colored by
+// severity (a warning is yellow) so they catch the eye down the NOTES column
+// while the rest stays faint. Tags come last, so the color escapes don't bleed.
+std::string notes_for(const Finding& f, const Palette& p, bool verbose = false) {
+    std::vector<std::string> parts;
+    std::string ev = endian_name(f.endian);
+    if (!f.arch.empty()) ev += "/" + f.arch;
+    parts.push_back(ev);
+    if (!f.version.empty()) parts.push_back("v" + f.version);
+    if (!f.compression.empty()) parts.push_back(f.compression);
+    if (f.coalesced_count > 1) parts.push_back("x" + std::to_string(f.coalesced_count));
+    if (!f.members.empty())
+        parts.push_back(std::to_string(f.members.size()) + (f.members_truncated ? "+ members" : " members"));
+    std::string s;
+    for (size_t i = 0; i < parts.size(); ++i) s += (i ? " " : "") + parts[i];
+    if (!f.label.empty())
+        s += (s.empty() ? "" : "  ") + ("\"" + clean_label(f.label, 40, verbose) + "\"");
+    // Terse per-finding diagnostic tags, e.g. "[warn: no-oob]". The short tag is
+    // the code with a redundant leading "<type>-" stripped; the full message is
+    // in the diagnostics section. Identical tags are collapsed to one with a count
+    // (e.g. "[warn: sensitive-key ×12]") so a finding with many same-code
+    // diagnostics — an NVS partition full of credential keys — doesn't flood NOTES.
+    std::vector<std::pair<std::string, const Diagnostic*>> seen;  // tag -> first diag, in order
+    std::vector<size_t> counts;
+    for (const auto& d : f.diagnostics) {
+        std::string tag = d.code;
+        std::string pfx = f.type + "-";
+        if (tag.rfind(pfx, 0) == 0) tag = tag.substr(pfx.size());
+        size_t j = 0;
+        for (; j < seen.size(); ++j)
+            if (seen[j].first == tag && seen[j].second->severity == d.severity) break;
+        if (j == seen.size()) {
+            seen.push_back({tag, &d});
+            counts.push_back(1);
+        } else {
+            ++counts[j];
+        }
+    }
+    for (size_t j = 0; j < seen.size(); ++j) {
+        const Diagnostic& d = *seen[j].second;
+        std::string sev = d.severity == "error" ? "err" : d.severity == "warning" ? "warn" : "info";
+        std::string body = sev + ": " + seen[j].first;
+        if (counts[j] > 1) body += " ×" + std::to_string(counts[j]);  // ×N
+        s += (s.empty() ? "" : " ");
+        s += p.sev(d.severity) + ("[" + body + "]") + p.reset();
+    }
+    return s;
+}
+
+// Left-pad-to-width then wrap in optional color; width counts the plain text.
+void col(std::string& line, const std::string& text, size_t width, const char* color,
+         const char* reset) {
+    line += color;
+    line += text;
+    line += reset;
+    if (text.size() < width) line.append(width - text.size(), ' ');
+}
+
+}  // namespace
+
+// A swarm of same-type siblings (a cert bundle, a pile of icons) collapses to
+// one row + a count, unless -A. High-value or structural kinds never collapse.
+constexpr size_t SWARM = 4;
+bool keep_expanded(const Finding& f) {
+    if (f.type == "private_key") return true;
+    return f.category == "container" || f.category == "filesystem" ||
+           f.category == "bootloader" || f.category == "executable";
+}
+
+// Render the findings as a containment tree: a finding whose byte range sits
+// inside a container (filesystem/container category) is drawn indented beneath
+// it with tree connectors, recursively. Collapses per-parent swarms. Columns
+// (SIZE/TYPE/TIER/NOTES) stay aligned; the tree glyphs live in the OFFSET column.
+void emit_findings_tree(std::string& o, const Palette& p, const std::vector<Finding>& fs,
+                        bool all, bool verbose = false) {
+    const size_t n = fs.size();
+    auto is_container = [](const Finding& f) {
+        return f.category == "filesystem" || f.category == "container";
+    };
+    // parent[i] = tightest container that strictly encloses finding i.
+    std::vector<int> parent(n, -1);
+    for (size_t i = 0; i < n; ++i) {
+        size_t best = SIZE_MAX;
+        for (size_t j = 0; j < n; ++j) {
+            if (j == i || !is_container(fs[j])) continue;
+            size_t aS = fs[j].offset, aE = aS + fs[j].size;
+            size_t bS = fs[i].offset, bE = bS + fs[i].size;
+            if (aS <= bS && bE <= aE && fs[j].size > fs[i].size && fs[j].size < best) {
+                best = fs[j].size;
+                parent[i] = static_cast<int>(j);
+            }
+        }
+    }
+    std::vector<std::vector<int>> kids(n);
+    std::vector<int> roots;
+    for (size_t i = 0; i < n; ++i)
+        (parent[i] < 0 ? roots : kids[parent[i]]).push_back(static_cast<int>(i));
+
+    // One rendered line: a finding row, a member (volume) row, or a swarm note.
+    struct Row {
+        std::string first;    // tree prefix + offset/name (or prefix for a note)
+        const Finding* f = nullptr;
+        const Member* mem = nullptr;
+        std::string note;     // summary text
+    };
+    std::vector<Row> rows;
+
+    struct Item {
+        int idx = -1;                 // finding child index, or -1
+        const Member* mem = nullptr;  // member (volume) child
+        std::string sum_type;         // swarm summary
+        size_t sum_more = 0, sum_bytes = 0;
+    };
+
+    // Render a flat list of leaf findings (a volume's embedded keys/certs) under
+    // `prefix`, with the same per-parent swarm collapse (keys kept, certs folded).
+    auto leaf = [&](const std::vector<const Finding*>& cs, const std::string& prefix) {
+        std::map<std::string, size_t> cnt, bytes;
+        for (auto* c : cs) { cnt[c->type]++; bytes[c->type] += c->size; }
+        struct LI { const Finding* f; std::string st; size_t more, by; };
+        std::vector<LI> items;
+        std::set<std::string> em;
+        for (auto* c : cs) {
+            bool coll = !all && !keep_expanded(*c) && cnt[c->type] > SWARM;
+            if (coll) {
+                if (em.count(c->type)) continue;
+                em.insert(c->type);
+                items.push_back({c, "", 0, 0});
+                items.push_back({nullptr, c->type, cnt[c->type] - 1, bytes[c->type]});
+            } else {
+                items.push_back({c, "", 0, 0});
+            }
+        }
+        for (size_t i = 0; i < items.size(); ++i) {
+            std::string conn = (i + 1 == items.size()) ? "└─ " : "├─ ";
+            if (!items[i].f) {
+                rows.push_back({prefix + conn, nullptr, nullptr,
+                                "… +" + std::to_string(items[i].more) + " more " + items[i].st +
+                                    " (" + human_size(items[i].by) + ", -A to list)"});
+                continue;
+            }
+            rows.push_back({prefix + conn + hex_off(items[i].f->offset), items[i].f, nullptr, ""});
+        }
+    };
+
+    // Render the children of `pidx` (its members first, then contained findings
+    // with per-parent swarm collapse). pidx = -1 for the top-level roots.
+    std::function<void(int, const std::vector<int>&, const std::string&, bool)> render =
+        [&](int pidx, const std::vector<int>& ch, const std::string& prefix, bool top) {
+            std::vector<Item> items;
+            if (pidx >= 0)
+                for (const auto& m : fs[pidx].members) { Item it; it.mem = &m; items.push_back(it); }
+            std::map<std::string, size_t> cnt, bytes;
+            for (int c : ch) { cnt[fs[c].type]++; bytes[fs[c].type] += fs[c].size; }
+            std::set<std::string> emitted;
+            for (int c : ch) {
+                const Finding& f = fs[c];
+                bool coll = !all && !keep_expanded(f) && cnt[f.type] > SWARM;
+                if (coll) {
+                    if (emitted.count(f.type)) continue;
+                    emitted.insert(f.type);
+                    Item a; a.idx = c; items.push_back(a);
+                    Item s; s.sum_type = f.type; s.sum_more = cnt[f.type] - 1;
+                    s.sum_bytes = bytes[f.type]; items.push_back(s);
+                } else {
+                    Item a; a.idx = c; items.push_back(a);
+                }
+            }
+            for (size_t i = 0; i < items.size(); ++i) {
+                bool last = (i + 1 == items.size());
+                std::string conn = top ? "" : (last ? "└─ " : "├─ ");
+                const Item& it = items[i];
+                if (it.mem) {
+                    // A located member (a partition) leads with its magenta offset,
+                    // then the name; a plain member (a UBI volume) is name-only.
+                    std::string loc = it.mem->offset != SIZE_MAX
+                                          ? hex_off(it.mem->offset) + " " + it.mem->name
+                                          : it.mem->name;
+                    Row r; r.first = prefix + conn + loc; r.mem = it.mem;
+                    rows.push_back(r);
+                    if (!it.mem->children.empty()) {
+                        std::vector<const Finding*> cs;
+                        for (const auto& c : it.mem->children) cs.push_back(&c);
+                        leaf(cs, prefix + (top ? "" : (last ? "   " : "│  ")));
+                    }
+                    continue;
+                }
+                if (it.idx < 0) {  // swarm summary
+                    rows.push_back({prefix + conn, nullptr, nullptr,
+                                    "… +" + std::to_string(it.sum_more) + " more " + it.sum_type +
+                                        " (" + human_size(it.sum_bytes) + ", -A to list)"});
+                    continue;
+                }
+                int idx = it.idx;
+                rows.push_back({prefix + conn + hex_off(fs[idx].offset), &fs[idx], nullptr, ""});
+                if (!fs[idx].members.empty() || !kids[idx].empty())
+                    render(idx, kids[idx], prefix + (top ? "" : (last ? "   " : "│  ")), false);
+            }
+        };
+    render(-1, roots, "", true);
+
+    // Column widths (first column counts the tree glyphs; they are ASCII-width
+    // box chars, 3 bytes/1 col in UTF-8, so measure display width, not bytes).
+    auto disp_w = [](const std::string& s) {
+        size_t w = 0;
+        for (size_t i = 0; i < s.size();) {
+            unsigned char c = s[i];
+            i += (c < 0x80) ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+            ++w;
+        }
+        return w;
+    };
+    // Under -E every sized finding is annotated with entropy, so show an ENTROPY
+    // column (between TIER and NOTES) whenever any row carries a computed value.
+    bool show_entropy = false;
+    for (const auto& r : rows) {
+        if (r.f && r.f->entropy >= 0) { show_entropy = true; break; }
+        if (r.mem && r.mem->entropy >= 0) { show_entropy = true; break; }
+    }
+    size_t w_off = 6, w_size = 4, w_type = 4, w_tier = 4;
+    const size_t w_ent = 7;  // "ENTROPY"; values are "7.98"
+    for (const auto& r : rows) {
+        if (r.f) {
+            w_off = std::max(w_off, disp_w(r.first));
+            w_size = std::max(w_size, human_size(r.f->size).size());
+            w_type = std::max(w_type, r.f->type.size());
+            w_tier = std::max(w_tier, r.f->confidence_tier.size());
+        } else if (r.mem) {
+            w_off = std::max(w_off, disp_w(r.first));
+            w_size = std::max(w_size, human_size(r.mem->size).size());
+            w_type = std::max(w_type, r.mem->note.size());
+        }
+    }
+    o += p.dim();
+    std::string h;
+    col(h, "OFFSET", w_off, "", "");
+    h += "  ";
+    col(h, "SIZE", w_size, "", "");
+    h += "  ";
+    col(h, "TYPE", w_type, "", "");
+    h += "  ";
+    col(h, "TIER", w_tier, "", "");
+    if (show_entropy) {
+        h += "  ";
+        col(h, "ENTROPY", w_ent, "", "");
+    }
+    h += "  NOTES";
+    o += h + p.reset() + "\n";
+
+    for (const auto& r : rows) {
+        size_t pad = w_off > disp_w(r.first) ? w_off - disp_w(r.first) : 0;
+        if (!r.f && !r.mem) {  // summary note, indented under its parent
+            o += p.dim() + r.first + r.note + p.reset() + "\n";
+            continue;
+        }
+        if (r.mem) {  // volume/partition row: name (bold) in the OFFSET col, size, type
+            std::string name = r.mem->name;
+            std::string pre = r.first.substr(0, r.first.size() - name.size());
+            std::string line = p.dim() + pre + p.reset() + p.bold() + name + p.reset();
+            // A located member's offset lives in `pre` just before the name; recolor
+            // that hex magenta so it reads like a finding offset.
+            if (r.mem->offset != SIZE_MAX) {
+                std::string offhex = hex_off(r.mem->offset);
+                std::string glyphs = pre.substr(0, pre.size() - offhex.size() - 1);  // drop "<hex> "
+                line = p.dim() + glyphs + p.reset() + p.off() + offhex + p.reset() + " " +
+                       p.bold() + name + p.reset();
+            }
+            line.append(pad, ' ');
+            line += "  ";
+            col(line, human_size(r.mem->size), w_size, "", "");
+            line += "  ";
+            // A member has no TIER; under -E fill it blank so the ENTROPY column
+            // stays aligned with the finding rows.
+            col(line, r.mem->note, w_type, p.dim(), p.reset());
+            if (show_entropy) {
+                line += "  ";
+                col(line, "", w_tier, "", "");  // blank TIER
+                line += "  ";
+                col(line, ent_str(r.mem->entropy), w_ent, p.ent(r.mem->entropy), p.reset());
+            }
+            while (!line.empty() && line.back() == ' ') line.pop_back();
+            o += line + "\n";
+            continue;
+        }
+        // Finding row: dim tree glyphs, magenta offset. Split the trailing hex.
+        std::string offhex = hex_off(r.f->offset);
+        std::string pre = r.first.substr(0, r.first.size() - offhex.size());
+        std::string line = p.dim() + pre + p.reset() + p.off() + offhex + p.reset();
+        line.append(pad, ' ');
+        line += "  ";
+        col(line, human_size(r.f->size), w_size, "", "");
+        line += "  ";
+        col(line, r.f->type, w_type, p.sec(*r.f), p.reset());
+        line += "  ";
+        col(line, r.f->confidence_tier, w_tier, p.tier(r.f->confidence_tier), p.reset());
+        if (show_entropy) {
+            line += "  ";
+            col(line, ent_str(r.f->entropy), w_ent, p.ent(r.f->entropy), p.reset());
+        }
+        line += "  ";
+        line += p.dim() + notes_for(*r.f, p, verbose) + p.reset();
+        while (!line.empty() && line.back() == ' ') line.pop_back();
+        o += line + "\n";
+    }
+}
+
+// A flattened diagnostic for rendering: the finding's offset/type + the message.
+struct DiagRow {
+    std::string severity, code, type, message;
+    size_t offset;
+};
+
+std::vector<DiagRow> gather_diagnostics(const std::vector<Finding>& fs) {
+    std::vector<DiagRow> rows;
+    for (const auto& f : fs)
+        for (const auto& d : f.diagnostics)
+            rows.push_back({d.severity, d.code, f.type, d.message, f.offset});
+    // errors first, then warnings, then info; ties by offset.
+    auto rank = [](const std::string& s) { return s == "error" ? 0 : s == "warning" ? 1 : 2; };
+    std::sort(rows.begin(), rows.end(), [&](const DiagRow& a, const DiagRow& b) {
+        if (rank(a.severity) != rank(b.severity)) return rank(a.severity) < rank(b.severity);
+        return a.offset < b.offset;
+    });
+    return rows;
+}
+
+// Every manifest root begins with the top-level "0x<hex>-<type>" dir; that hex is
+// the container's offset in the input file — the useful offset for a nested entry,
+// whose own e.offset is relative to its parent payload.
+size_t parse_root_offset(const std::string& root) {
+    if (root.size() > 2 && root[0] == '0' && (root[1] == 'x' || root[1] == 'X'))
+        return static_cast<size_t>(std::strtoull(root.c_str() + 2, nullptr, 16));
+    return 0;
+}
+
+// Compact identifier for a nested extraction: the deepest "<name>.extracted" path
+// segment minus the suffix (e.g. "vol_3.img"). Empty for a top-level entry.
+std::string extraction_label(const std::string& root) {
+    const std::string ext = ".extracted";
+    std::string best;
+    for (size_t start = 0; start <= root.size();) {
+        size_t slash = root.find('/', start);
+        size_t len = (slash == std::string::npos) ? root.size() - start : slash - start;
+        std::string seg = root.substr(start, len);
+        if (seg.size() > ext.size() && seg.compare(seg.size() - ext.size(), ext.size(), ext) == 0)
+            best = seg.substr(0, seg.size() - ext.size());
+        if (slash == std::string::npos) break;
+        start = slash + 1;
+    }
+    return best;
+}
+
+// Extraction-side trouble for the diagnostics table: every manifest entry's
+// warnings (e.g. a lost+found recovery) and hard statuses (error/unsupported).
+// This keeps the detail in one scannable place so the NOTES column stays terse.
+void gather_extraction_diags(std::vector<DiagRow>& rows, const Manifest& man) {
+    std::set<std::string> seen;  // dedupe identical severity+message
+    for (const auto& e : man.entries) {
+        const size_t off = parse_root_offset(e.root);
+        const std::string label = extraction_label(e.root);
+        auto add = [&](const std::string& sev, const std::string& msg) {
+            std::string full = label.empty() ? msg : label + ": " + msg;
+            if (!seen.insert(sev + "\x1f" + full).second) return;
+            rows.push_back({sev, "extract", e.type, full, off});
+        };
+        for (const auto& w : e.warnings) add("warning", w);
+        if (e.status != "ok" && e.status != "partial") add("error", e.status);
+    }
+}
+
+// The diagnostics section: a table SEVERITY | OFFSET | TYPE | MESSAGE listing
+// every finding's diagnostics. The single place to scan for trouble; the NOTES
+// column flags each in situ.
+void emit_diagnostics_section(std::string& o, const Palette& p, const std::vector<DiagRow>& rows) {
+    if (rows.empty()) return;
+    size_t w_sev = 8, w_off = 6, w_type = 4;
+    for (const auto& r : rows) {
+        w_sev = std::max(w_sev, r.severity.size());
+        w_off = std::max(w_off, hex_off(r.offset).size());
+        w_type = std::max(w_type, r.type.size());
+    }
+    o += p.dim();
+    o += "\ndiagnostics:\n";
+    o += p.reset();
+    std::string h = "  ";
+    col(h, "SEVERITY", w_sev, "", "");
+    h += "  ";
+    col(h, "OFFSET", w_off, "", "");
+    h += "  ";
+    col(h, "TYPE", w_type, "", "");
+    h += "  MESSAGE";
+    o += p.dim() + h + p.reset() + "\n";
+    for (const auto& r : rows) {
+        std::string line = "  ";
+        col(line, r.severity, w_sev, p.sev(r.severity), p.reset());
+        line += "  ";
+        col(line, hex_off(r.offset), w_off, p.off(), p.reset());
+        line += "  ";
+        col(line, r.type, w_type, "", "");
+        line += "  ";
+        line += r.message;
+        o += line + "\n";
+    }
+}
+
+// Output filenames moria's own extractors write for a container's sole decoded
+// payload (a uImage body, a decompressed stream, a UPX-unpacked ELF, ...), as
+// opposed to a named member of an archive/filesystem. In the extraction tree
+// these add nothing over the parent row that already names the transform, so the
+// breadcrumb is dropped and only the offset is shown.
+static bool is_synthetic_payload_name(const std::string& base) {
+    return base == "payload" || base == "decompressed" || base == "descrambled.bin" ||
+           base == "unpacked.elf" || base == "unsparsed.img";
+}
+
+// Render the extraction manifest as a tree: each top-level finding is a root row
+// (with its normal metadata), and the files its extraction produced hang beneath
+// it, recursively, keyed by the manifest's output paths. The locator column shows
+// each node's byte offset within the file it was found in, plus that file's name
+// when it is a real member (dropped for the synthetic single-payload names above).
+void emit_extraction_tree(std::string& o, const Palette& p, const std::vector<Finding>& findings,
+                          const Manifest& man, bool all, bool verbose = false) {
+    const auto& es = man.entries;
+    const size_t n = es.size();
+
+    // parent[i] = the entry whose root is the longest '/'-boundary prefix of es[i]'s
+    // root (-1 for a top-level / depth-1 node).
+    auto is_prefix = [](const std::string& pre, const std::string& s) {
+        return s.size() > pre.size() && s.compare(0, pre.size(), pre) == 0 && s[pre.size()] == '/';
+    };
+    std::vector<int> parent(n, -1);
+    for (size_t i = 0; i < n; ++i) {
+        size_t best = 0;
+        for (size_t j = 0; j < n; ++j) {
+            if (j != i && is_prefix(es[j].root, es[i].root) && es[j].root.size() > best) {
+                best = es[j].root.size();
+                parent[i] = static_cast<int>(j);
+            }
+        }
+    }
+    std::vector<std::vector<int>> kids(n);
+    for (size_t i = 0; i < n; ++i)
+        if (parent[i] >= 0) kids[parent[i]].push_back(static_cast<int>(i));
+
+    // Breadcrumb: the segment between a child's parent root and its own final
+    // "0x<off>-<type>" dir, minus a trailing ".extracted". Empty for a top-level
+    // node or a synthetic single-payload name.
+    auto breadcrumb = [&](int idx) -> std::string {
+        int par = parent[idx];
+        if (par < 0) return "";
+        std::string rel = es[idx].root.substr(es[par].root.size() + 1);
+        auto slash = rel.rfind('/');
+        std::string mid = (slash == std::string::npos) ? rel : rel.substr(0, slash);
+        const std::string ext = ".extracted";
+        if (mid.size() > ext.size() && mid.compare(mid.size() - ext.size(), ext.size(), ext) == 0)
+            mid.erase(mid.size() - ext.size());
+        auto b = mid.rfind('/');
+        std::string base = (b == std::string::npos) ? mid : mid.substr(b + 1);
+        return is_synthetic_payload_name(base) ? "" : base;
+    };
+
+    // Stable child order: by offset, then breadcrumb, then type.
+    for (auto& ch : kids)
+        std::sort(ch.begin(), ch.end(), [&](int a, int b) {
+            if (es[a].offset != es[b].offset) return es[a].offset < es[b].offset;
+            std::string ba = breadcrumb(a), bb = breadcrumb(b);
+            if (ba != bb) return ba < bb;
+            return es[a].type < es[b].type;
+        });
+
+    auto manifest_node_for = [&](const Finding& f) -> int {
+        // Prefer an exact offset+type match; else fall back to a unique offset
+        // match, so a container whose top extraction entry is labelled by its inner
+        // filesystem (a `ubi` finding whose extraction entry is `ubifs`) still links
+        // to its subtree instead of dropping it from the human view.
+        int exact = -1, by_off = -1, off_count = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (parent[i] >= 0 || es[i].offset != f.offset) continue;
+            if (es[i].type == f.type) exact = static_cast<int>(i);
+            by_off = static_cast<int>(i);
+            ++off_count;
+        }
+        if (exact >= 0) return exact;
+        return off_count == 1 ? by_off : -1;
+    };
+
+    // Extraction-side NOTES: warnings, plus a bare status when it is not clean. A
+    // payload kept raw (compression not decoded) is dropped once we descended into
+    // real children — there the raw copy is moot; likewise a bare "partial" is only
+    // worth showing on a dead-end node. Hard problems (errors, unsupported codecs,
+    // encrypted/truncated members) always surface.
+    auto ex_notes = [](const Extracted& e, bool has_children) -> std::string {
+        std::string s;
+        for (const auto& w : e.warnings) {
+            if (has_children && w.find("compression not decoded") != std::string::npos) continue;
+            // Terse flag in NOTES; the full sentence goes to the diagnostics table.
+            std::string tag = (w.find("lost+found") != std::string::npos) ? "→ lost+found" : w;
+            s += (s.empty() ? "" : " · ") + tag;
+        }
+        if (e.status != "ok" && e.status != "partial")
+            s += (s.empty() ? "" : " · ") + e.status;  // error:<why> / unsupported:<codec>
+        else if (e.status == "partial" && s.empty() && !has_children)
+            s = "partial";
+        return s;
+    };
+
+    struct Row {
+        std::string prefix, off_hex, name;
+        const Finding* f = nullptr;    // set on a top-level finding row
+        const Extracted* e = nullptr;  // set on an extracted-descendant row
+        const Finding* fnd = nullptr;  // finding to draw TIER/NOTES/colors from
+        std::string note;  // swarm-summary line (f == e == nullptr)
+        std::string size_str, type_str, tier_str, notes_str;
+    };
+    std::vector<Row> rows;
+
+    // Recursively emit a node's children, collapsing a large group of same-type
+    // childless leaves to one row + a count (unless -A). A node with its own
+    // children (a filesystem/container) is always shown, so structure is kept.
+    std::function<void(int, const std::string&)> emit_kids = [&](int node,
+                                                                 const std::string& prefix) {
+        const std::vector<int>& ch = kids[node];
+        std::map<std::string, size_t> cnt, bytes;
+        std::map<std::string, bool> has_child;
+        for (int c : ch) {
+            cnt[es[c].type]++;
+            bytes[es[c].type] += es[c].bytes;
+            if (!kids[c].empty()) has_child[es[c].type] = true;
+        }
+        struct It { int idx; std::string sum_type; size_t more, by; };
+        std::vector<It> items;
+        std::set<std::string> emitted;
+        for (int c : ch) {
+            const std::string& t = es[c].type;
+            bool coll = !all && cnt[t] > SWARM && !has_child[t];
+            if (coll) {
+                if (emitted.count(t)) continue;
+                emitted.insert(t);
+                items.push_back({c, "", 0, 0});
+                items.push_back({-1, t, cnt[t] - 1, bytes[t]});
+            } else {
+                items.push_back({c, "", 0, 0});
+            }
+        }
+        for (size_t i = 0; i < items.size(); ++i) {
+            bool last = (i + 1 == items.size());
+            std::string conn = last ? "└─ " : "├─ ";
+            if (items[i].idx < 0) {
+                Row r;
+                r.prefix = prefix + conn;
+                r.note = "… +" + std::to_string(items[i].more) + " more " + items[i].sum_type +
+                         " (" + human_size(items[i].by) + ", -A to list)";
+                rows.push_back(r);
+                continue;
+            }
+            int idx = items[i].idx;
+            const Extracted& e = es[idx];
+            bool has_children = !kids[idx].empty();
+            Row r;
+            r.prefix = prefix + conn;
+            r.name = breadcrumb(idx);
+            // Offset 0 on an extracted child means "the whole/start of the parent's
+            // payload" — no locating value — so drop it, but only when a member name
+            // is there to carry the locator. A nameless (synthetic-payload) child
+            // keeps its 0x0 so the line is never bare.
+            r.off_hex = (e.offset == 0 && !r.name.empty()) ? "" : hex_off(e.offset);
+            r.e = &e;
+            r.fnd = &e.finding;
+            r.size_str = human_size(e.bytes);
+            r.type_str = e.type;
+            r.tier_str = e.finding.confidence_tier;
+            // Identification notes (endian/arch, compression, label, diagnostics),
+            // then any extraction-specific status/warnings the child didn't already
+            // convey by descending successfully.
+            r.notes_str = notes_for(e.finding, p, verbose);
+            std::string exn = ex_notes(e, has_children);
+            if (!exn.empty()) r.notes_str += (r.notes_str.empty() ? "" : "  ") + exn;
+            rows.push_back(r);
+            if (!kids[idx].empty()) emit_kids(idx, prefix + (last ? "   " : "│  "));
+        }
+    };
+
+    for (const auto& f : findings) {
+        Row r;
+        r.off_hex = hex_off(f.offset);
+        r.f = &f;
+        r.fnd = &f;
+        r.size_str = human_size(f.size);
+        r.type_str = f.type;
+        r.tier_str = f.confidence_tier;
+        r.notes_str = notes_for(f, p, verbose);
+        int node = manifest_node_for(f);
+        // A finding's own extraction status/warning (e.g. a lost+found recovery on
+        // a rootless UBIFS, or a bare "partial") lives on its manifest node, not on
+        // a child, so surface it on the finding row itself — emit_kids only annotates
+        // descendant rows.
+        if (node >= 0) {
+            std::string exn = ex_notes(es[node], !kids[node].empty());
+            if (!exn.empty()) r.notes_str += (r.notes_str.empty() ? "" : "  ") + exn;
+        }
+        rows.push_back(r);
+        if (node >= 0) emit_kids(node, "");
+    }
+
+    auto disp_w = [](const std::string& s) {
+        size_t w = 0;
+        for (size_t i = 0; i < s.size();) {
+            unsigned char c = s[i];
+            i += (c < 0x80) ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+            ++w;
+        }
+        return w;
+    };
+    auto firstcol = [](const Row& r) {
+        std::string s = r.prefix + r.off_hex;
+        if (!r.name.empty()) s += (r.off_hex.empty() ? "" : " ") + r.name;
+        return s;
+    };
+    size_t w_off = 6, w_size = 4, w_type = 4, w_tier = 4;
+    for (const auto& r : rows) {
+        if (!r.f && !r.e) continue;  // swarm note spans the row
+        w_off = std::max(w_off, disp_w(firstcol(r)));
+        w_size = std::max(w_size, r.size_str.size());
+        w_type = std::max(w_type, r.type_str.size());
+        w_tier = std::max(w_tier, r.tier_str.size());
+    }
+
+    o += p.dim();
+    std::string h;
+    col(h, "OFFSET", w_off, "", "");
+    h += "  ";
+    col(h, "SIZE", w_size, "", "");
+    h += "  ";
+    col(h, "TYPE", w_type, "", "");
+    h += "  ";
+    col(h, "TIER", w_tier, "", "");
+    h += "  NOTES";
+    o += h + p.reset() + "\n";
+
+    for (const auto& r : rows) {
+        if (!r.f && !r.e) {  // swarm note, indented under its parent
+            o += p.dim() + r.prefix + r.note + p.reset() + "\n";
+            continue;
+        }
+        std::string fc = firstcol(r);
+        size_t pad = w_off > disp_w(fc) ? w_off - disp_w(fc) : 0;
+        // Locator: dim tree glyphs, magenta offset (only when nonzero), dim name.
+        std::string line = p.dim() + r.prefix + p.reset();
+        if (!r.off_hex.empty()) line += std::string(p.off()) + r.off_hex + p.reset();
+        if (!r.name.empty())
+            line += (r.off_hex.empty() ? "" : " ") + std::string(p.dim()) + r.name + p.reset();
+        line.append(pad, ' ');
+        line += "  ";
+        col(line, r.size_str, w_size, "", "");
+        line += "  ";
+        col(line, r.type_str, w_type, r.fnd ? p.sec(*r.fnd) : "", p.reset());
+        line += "  ";
+        col(line, r.tier_str, w_tier, r.fnd ? p.tier(r.tier_str) : "", p.reset());
+        line += "  ";
+        line += p.dim() + r.notes_str + p.reset();
+        while (!line.empty() && line.back() == ' ') line.pop_back();
+        o += line + "\n";
+    }
+}
+
+std::string emit_file_human(const std::vector<Finding>& findings,
+                            const std::vector<Region>& regions, const std::string& footer,
+                            bool color, bool all, bool verbose, const Manifest* extraction) {
+    Palette p{color};
+    std::string o;
+
+    // Diagnostics drive an errors-only banner emitted lower down (just above the
+    // footer). Warnings/info live only in the diagnostics section and the NOTES
+    // column; extraction warnings/statuses are merged in below.
+    auto diags = gather_diagnostics(findings);
+    if (extraction) {
+        gather_extraction_diags(diags, *extraction);
+        auto rank = [](const std::string& s) { return s == "error" ? 0 : s == "warning" ? 1 : 2; };
+        std::sort(diags.begin(), diags.end(), [&](const DiagRow& a, const DiagRow& b) {
+            if (rank(a.severity) != rank(b.severity)) return rank(a.severity) < rank(b.severity);
+            return a.offset < b.offset;
+        });
+    }
+    size_t nerr = 0;
+    for (const auto& d : diags)
+        if (d.severity == "error") ++nerr;
+
+    if (findings.empty()) {
+        o += p.dim();
+        o += "No known structures identified.\n";
+        o += p.reset();
+    } else if (extraction && !extraction->entries.empty()) {
+        emit_extraction_tree(o, p, findings, *extraction, all, verbose);
+    } else {
+        emit_findings_tree(o, p, findings, all, verbose);
+    }
+
+    // What's wrong with what's here — after the table, before the regions/footer.
+    emit_diagnostics_section(o, p, diags);
+
+    if (!regions.empty()) {
+        o += p.dim();
+        o += "\nunidentified regions:\n";
+        o += p.reset();
+        for (const auto& r : regions) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "  %-10s %-9s  entropy %.2f%s\n", hex_off(r.offset).c_str(),
+                          human_size(r.size).c_str(), r.entropy,
+                          r.entropy >= 7.2 ? "  (likely encrypted/compressed)" : "");
+            o += buf;
+        }
+    }
+
+    // Errors-only banner, just above the footer: a "moria could not do this"
+    // result sits right before the "-> extracted to ..." line so it is the last
+    // thing before the run summary, not buried at the top.
+    if (nerr > 0) {
+        o += "\n";
+        o += p.sev("error");
+        o += (nerr == 1 ? "! 1 error" : "! " + std::to_string(nerr) + " errors");
+        o += " — see diagnostics above";
+        o += p.reset();
+        o += "\n";
+    }
+
+    if (!footer.empty()) {
+        o += "\n";
+        o += p.dim() + footer + p.reset();
+    }
+    return o;
+}
+
+// Split a root-relative path into (directory-with-trailing-slash, basename).
+// A path with no slash is a root-level file: directory "./".
+static std::pair<std::string, std::string> split_dir(const std::string& path) {
+    auto slash = path.rfind('/');
+    if (slash == std::string::npos) return {"./", path};
+    return {path.substr(0, slash + 1), path.substr(slash + 1)};
+}
+
+std::string emit_tree_human(const TreeResult& tr, const std::string& footer, bool color, bool all,
+                            bool verbose) {
+    Palette p{color};
+    std::string o;
+
+    if (!tr.by_type.empty()) {
+        o += p.dim();
+        o += "by type:  ";
+        o += p.reset();
+        for (size_t i = 0; i < tr.by_type.size(); ++i) {
+            if (i) o += p.dim(), o += " · ", o += p.reset();
+            o += tr.by_type[i].first + " " + std::to_string(tr.by_type[i].second);
+        }
+        o += "\n";
+    }
+
+    if (!tr.notable.empty()) {
+        constexpr size_t kMaxNotable = 40;  // keep the view scannable; JSON has all
+        size_t shown = all ? tr.notable.size() : std::min(tr.notable.size(), kMaxNotable);
+
+        // Width of the basename column, over the rows we will actually print.
+        size_t w_base = 4, w_type = 4;
+        for (size_t i = 0; i < shown; ++i) {
+            w_base = std::max(w_base, split_dir(tr.notable[i].path).second.size());
+            w_type = std::max(w_type, tr.notable[i].finding.type.size());
+        }
+        w_base = std::min<size_t>(w_base, 52);
+
+        o += p.dim();
+        o += "\nnotable (" + std::to_string(tr.notable.size()) + "):\n";
+        o += p.reset();
+
+        // Notable is path-sorted, so entries in the same directory are already
+        // consecutive: print each directory once as a heading, its files under it.
+        std::string cur_dir;
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& n = tr.notable[i];
+            auto [dir, base] = split_dir(n.path);
+            if (dir != cur_dir) {
+                cur_dir = dir;
+                o += "  " + std::string(p.dim()) + dir + p.reset() + "\n";
+            }
+            if (!verbose && base.size() > 52) base = "…" + base.substr(base.size() - 51);
+            std::string row = "    ";
+            col(row, base, w_base, "", "");
+            row += "  ";
+            // Red = security-sensitive (a private key to act on); otherwise the
+            // confidence tier. Matches the single-file findings tree.
+            const char* tc = p.sec(n.finding);
+            if (!*tc) tc = p.tier(n.finding.confidence_tier);
+            col(row, n.finding.type, w_type, tc, p.reset());
+            row += "  ";
+            row += p.dim();
+            row += notes_for(n.finding, p, verbose);
+            row += p.reset();
+            while (!row.empty() && row.back() == ' ') row.pop_back();
+            o += row + "\n";
+        }
+        if (tr.notable.size() > shown) {
+            o += p.dim();
+            o += "  … and " + std::to_string(tr.notable.size() - shown) +
+                 " more (-A for all, or use JSON)\n";
+            o += p.reset();
+        }
+    }
+
+    if (!footer.empty()) {
+        if (!o.empty()) o += "\n";  // blank separator only when there's content above
+        o += p.dim() + footer + p.reset();
+    }
+    return o;
+}
+
+}  // namespace ft

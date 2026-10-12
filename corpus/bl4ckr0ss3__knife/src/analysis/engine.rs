@@ -1,0 +1,1733 @@
+//! The analysis engine: recursive-descent disassembly that recovers functions,
+//! basic blocks, a control-flow graph, and cross-references, the backbone of
+//! an interactive disassembler.
+//!
+//! Everything works in **virtual-address space**. PE section vaddrs are RVAs,
+//! so the image base is added up front; ELF/Mach-O are already VA. That makes
+//! the address column, branch operands, and symbol names all agree.
+
+use crate::model::{Binary, Format, SymKind};
+use iced_x86::{
+    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, InstructionInfoFactory,
+    IntelFormatter, Mnemonic, OpAccess,
+};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+// Several fields here (instruction length/flow, block end/successors, xref
+// kind) are part of the CFG model for the upcoming interactive/graph views and
+// are not all read by the current text output yet.
+/// The longest instruction x86 permits. AArch64 is always 4, so one inline
+/// buffer covers both architectures.
+pub const MAX_INSN_BYTES: usize = 15;
+
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
+pub struct EngineInsn {
+    pub addr: u64,
+    /// A branch/call target address, if this instruction has one.
+    pub target: Option<u64>,
+    /// A resolved symbolic target (function name / import), if any. Boxed
+    /// rather than a `String`: it is `None` for almost every instruction, and
+    /// at millions of instructions the two words a `String` spends on capacity
+    /// it never uses are megabytes.
+    pub target_name: Option<Box<str>>,
+    /// The instruction's raw bytes, held inline. A `Vec` here costs a heap
+    /// allocation per instruction, and a large image has millions of them.
+    /// Formatting is deferred to `text`, because most commands (function
+    /// lists, sinks, xrefs) never print an operand, and formatting every
+    /// instruction of a kernel image only to count it twice is the kind of
+    /// waste that shows up as seconds.
+    raw: [u8; MAX_INSN_BYTES],
+    len: u8,
+    #[serde(with = "flow_control_serde")]
+    pub flow: FlowControl,
+}
+
+impl EngineInsn {
+    /// Record one decoded instruction. `bytes` longer than the architecture
+    /// allows is a decoder bug rather than a possible input, so the excess is
+    /// dropped instead of failing the whole analysis.
+    pub fn new(
+        addr: u64,
+        bytes: &[u8],
+        flow: FlowControl,
+        target: Option<u64>,
+        target_name: Option<Box<str>>,
+    ) -> EngineInsn {
+        let len = bytes.len().min(MAX_INSN_BYTES);
+        let mut raw = [0u8; MAX_INSN_BYTES];
+        raw[..len].copy_from_slice(&bytes[..len]);
+        EngineInsn {
+            addr,
+            target,
+            target_name,
+            raw,
+            len: len as u8,
+            flow,
+        }
+    }
+
+    /// The instruction's raw bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.raw[..self.len as usize]
+    }
+
+    /// Render the instruction, formatted on demand from the stored bytes.
+    pub fn text(&self, bits: u32, arch: crate::model::Arch) -> String {
+        if arch.is_x86() {
+            let mut fmt = IntelFormatter::new();
+            fmt.options_mut().set_uppercase_hex(false);
+            fmt.options_mut().set_hex_prefix("0x");
+            fmt.options_mut().set_hex_suffix("");
+            fmt.options_mut().set_space_after_operand_separator(true);
+
+            let mut decoder = Decoder::with_ip(bits, self.bytes(), self.addr, DecoderOptions::NONE);
+            if !decoder.can_decode() {
+                return String::new();
+            }
+            let insn = decoder.decode();
+            let mut s = String::new();
+            fmt.format(&insn, &mut s);
+            s
+        } else {
+            crate::analysis::aarch64::text(self.bytes(), self.addr)
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
+pub struct BasicBlock {
+    pub start: u64,
+    pub end: u64,
+    pub insns: Vec<EngineInsn>,
+    pub succ: Vec<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Function {
+    pub addr: u64,
+    pub name: String,
+    pub blocks: Vec<BasicBlock>,
+    pub size: u64,
+    pub incoming: usize,
+    pub calls: Vec<u64>,
+    pub named: bool,
+    /// Virtual addresses of jump tables this function dispatches through.
+    pub tables: Vec<u64>,
+}
+
+impl Function {
+    /// A deterministic fingerprint of the function's raw instruction bytes.
+    /// Blocks are visited in address order and every instruction contributes
+    /// its address and bytes, so two otherwise-identical functions that differ
+    /// by a single edited byte hash differently. `knife diff` uses this to
+    /// flag a changed body even when the size lines up.
+    pub fn body_hash(&self) -> u64 {
+        let mut h = 0x9e37_79b9_7f4a_7c15u64;
+        for b in &self.blocks {
+            h = h.rotate_left(5) ^ b.start.wrapping_mul(0x8000_0000_0000_0000);
+            h ^= b.end;
+            for i in &b.insns {
+                for byte in i.bytes() {
+                    h = h.rotate_left(1) ^ u64::from(*byte);
+                }
+                h ^= i.addr;
+            }
+        }
+        h
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Xref {
+    pub from: u64,
+    pub kind: XrefKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XrefKind {
+    Call,
+    Jump,
+    Branch,
+    /// An instruction that names an address without transferring control to it:
+    /// `lea rax, [rip+str]`, a global load, a function pointer being taken.
+    Data,
+}
+
+/// A reference *from* an instruction: what it reaches. The mirror of `Xref`,
+/// kept because "what does this line point at" is the question the listing and
+/// the interactive view ask at every cursor stop.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ref {
+    pub to: u64,
+    pub kind: XrefKind,
+}
+
+impl XrefKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            XrefKind::Call => "call",
+            XrefKind::Jump => "jmp",
+            XrefKind::Branch => "branch",
+            XrefKind::Data => "data",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Analysis {
+    pub functions: Vec<Function>,
+    /// Function name -> index in `functions`. Kept private so callers cannot
+    /// make it disagree with the address-sorted function vector.
+    #[serde(skip)]
+    function_names: BTreeMap<String, usize>,
+    pub xrefs_to: BTreeMap<u64, Vec<Xref>>,
+    /// The reverse lookup: instruction address -> what it references, whether
+    /// that is a call, a branch, or a data operand pointing at a string.
+    pub xrefs_from: BTreeMap<u64, Vec<Ref>>,
+    pub names: BTreeMap<u64, String>,
+    /// Every address that reaches an imported function, whether it is a PLT/ILT
+    /// stub or the import slot itself, mapped to its full decorated name. This
+    /// is the lookup that turns "where is `strcpy` called" into a set of
+    /// addresses to pull cross-references for.
+    pub imports: BTreeMap<u64, String>,
+    /// Kept for API symmetry; addresses are already absolute, so this is 0.
+    pub display_base: u64,
+    pub bits: u32,
+    pub arch: crate::model::Arch,
+    pub truncated: bool,
+}
+
+impl Analysis {
+    /// An analysis for architectures the engine cannot lift (wasm, MIPS, …).
+    /// Read-tools keep working off the container facts; code views must refuse
+    /// through [`crate::workspace::Session`]'s architecture gate.
+    pub fn empty(arch: crate::model::Arch) -> Analysis {
+        Analysis {
+            functions: Vec::new(),
+            function_names: BTreeMap::new(),
+            xrefs_to: BTreeMap::new(),
+            xrefs_from: BTreeMap::new(),
+            names: BTreeMap::new(),
+            imports: BTreeMap::new(),
+            display_base: 0,
+            bits: arch.bits(),
+            arch,
+            truncated: false,
+        }
+    }
+
+    /// Rebuild lookup-only state omitted from the persistent cache.
+    pub(crate) fn rebuild_indexes(&mut self) {
+        self.function_names.clear();
+        for (index, function) in self.functions.iter().enumerate() {
+            self.function_names
+                .entry(function.name.clone())
+                .or_insert(index);
+        }
+    }
+
+    pub fn label(&self, addr: u64) -> String {
+        // Import slots have a name but no code, so they are not in `names`;
+        // without this fallback an IAT entry renders as an anonymous `sub_`.
+        match self.names.get(&addr).or_else(|| self.imports.get(&addr)) {
+            Some(n) => n.clone(),
+            None => format!("sub_{addr:x}"),
+        }
+    }
+    pub fn find_function(&self, addr: u64) -> Option<&Function> {
+        self.functions
+            .binary_search_by_key(&addr, |f| f.addr)
+            .ok()
+            .map(|i| &self.functions[i])
+    }
+    pub fn find_by_name(&self, needle: &str) -> Option<&Function> {
+        self.function_names.get(needle).map(|&i| &self.functions[i])
+    }
+
+    /// The function whose body contains `addr`, which is how a cross-reference
+    /// address becomes "inside `parse_header`" rather than a bare number.
+    pub fn function_at(&self, addr: u64) -> Option<&Function> {
+        // Functions are address-sorted, so an address is overwhelmingly likely
+        // to belong to the nearest preceding entry. Keep the full scan as a
+        // correctness fallback for overlaps and backward control-flow edges.
+        let next = self.functions.partition_point(|f| f.addr <= addr);
+        if next > 0 {
+            let candidate = &self.functions[next - 1];
+            if candidate
+                .blocks
+                .iter()
+                .any(|b| addr >= b.start && addr < b.end)
+            {
+                return Some(candidate);
+            }
+        }
+        self.functions
+            .iter()
+            .find(|f| f.blocks.iter().any(|b| addr >= b.start && addr < b.end))
+    }
+
+    /// Every address a selector could mean.
+    ///
+    /// One name can legitimately map to several addresses: an imported API is
+    /// reachable through both its stub and its slot, and the same API may be
+    /// imported from more than one module. Returning all of them is what makes
+    /// "who calls `memcpy`" complete rather than merely plausible.
+    pub fn resolve(&self, sel: &str, literal: Option<u64>) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new();
+        let push = |a: u64, out: &mut Vec<u64>| {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        };
+
+        for (addr, name) in &self.names {
+            if name == sel {
+                push(*addr, &mut out);
+            }
+        }
+        // Imports match on the bare API name, so `strcpy` finds `strcpy@plt`
+        // and `KERNEL32!lstrcpyA` alike.
+        for (addr, name) in &self.imports {
+            if crate::analysis::thunks::bare_name(name).eq_ignore_ascii_case(sel) {
+                push(*addr, &mut out);
+            }
+        }
+        // A bare address is only used when nothing was named, so a symbol that
+        // happens to look like a number still wins.
+        if out.is_empty() {
+            if let Some(v) = literal {
+                push(v, &mut out);
+            }
+        }
+        out
+    }
+}
+
+/// `iced_x86::FlowControl` does not implement serde. Store its stable semantic
+/// variants explicitly rather than serializing the dependency's memory layout.
+mod flow_control_serde {
+    use super::*;
+
+    pub fn serialize<S>(flow: &FlowControl, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(*flow as u8)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<FlowControl, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        match value {
+            0 => Ok(FlowControl::Next),
+            1 => Ok(FlowControl::UnconditionalBranch),
+            2 => Ok(FlowControl::IndirectBranch),
+            3 => Ok(FlowControl::ConditionalBranch),
+            4 => Ok(FlowControl::Return),
+            5 => Ok(FlowControl::Call),
+            6 => Ok(FlowControl::IndirectCall),
+            7 => Ok(FlowControl::Interrupt),
+            8 => Ok(FlowControl::XbeginXabortXend),
+            9 => Ok(FlowControl::Exception),
+            _ => Err(serde::de::Error::custom("invalid cached flow-control kind")),
+        }
+    }
+}
+
+/// A call chain from an entry point to a target, as a list of addresses.
+pub type Path = Vec<u64>;
+
+impl Analysis {
+    /// Shortest call chains that reach `target`.
+    ///
+    /// The search runs backwards from the target over call edges, because the
+    /// question being asked is "what can get here", and a reverse breadth-first
+    /// walk answers it in one pass while naturally yielding shortest paths.
+    ///
+    /// `strict` decides what counts as the start of a chain. When a caller asks
+    /// about specific roots it means them literally, so only chains arriving at
+    /// one are reported. When the roots are just "the entry point and the
+    /// exports", a function that nothing calls also counts, because static
+    /// analysis routinely misses indirect callers and dropping those chains
+    /// would hide real reachability rather than prove its absence.
+    pub fn paths_to(
+        &self,
+        target: u64,
+        roots: &[u64],
+        max_paths: usize,
+        strict: bool,
+    ) -> Vec<Path> {
+        // Callee -> callers, built from the recovered call edges.
+        let mut callers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        for f in &self.functions {
+            for c in &f.calls {
+                callers.entry(*c).or_default().insert(f.addr);
+            }
+        }
+        let root_set: BTreeSet<u64> = roots.iter().copied().collect();
+
+        let mut out: Vec<Path> = Vec::new();
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
+        // Each queue item is a full chain ending at the target, held in
+        // reverse; the frontier is its first element.
+        let mut queue: VecDeque<Path> = VecDeque::new();
+        queue.push_back(vec![target]);
+        visited.insert(target);
+
+        while let Some(chain) = queue.pop_front() {
+            if out.len() >= max_paths {
+                break;
+            }
+            let head = chain[0];
+            let ups = callers.get(&head);
+            let is_root = root_set.contains(&head);
+            let unreached = ups.is_none_or(BTreeSet::is_empty);
+
+            if is_root || unreached {
+                if chain.len() > 1 && (is_root || !strict) {
+                    out.push(chain);
+                }
+                continue;
+            }
+
+            for up in ups.into_iter().flatten() {
+                if !visited.insert(*up) {
+                    continue;
+                }
+                let mut next = Vec::with_capacity(chain.len() + 1);
+                next.push(*up);
+                next.extend_from_slice(&chain);
+                queue.push_back(next);
+            }
+        }
+        out
+    }
+}
+
+/// File offset → virtual address, via the section that contains it. The inverse
+/// of the lookup the disassembler uses, needed to turn a string's position in
+/// the file into the address code would reference it by.
+pub fn off_to_va(bin: &Binary, base: u64, off: u64) -> Option<u64> {
+    bin.sections.iter().find_map(|s| {
+        (s.file_size > 0 && off >= s.file_off && off < s.file_off + s.file_size)
+            .then(|| base + s.vaddr + (off - s.file_off))
+    })
+}
+
+pub fn display_base(bin: &Binary) -> u64 {
+    match bin.format {
+        Format::Pe => bin.image_base,
+        _ => 0,
+    }
+}
+
+/// VA → file offset (subtract the base to get an RVA, then walk sections).
+/// Public because the listing and the interactive view turn addresses back
+/// into bytes the same way the disassembler does.
+pub fn va_to_off(bin: &Binary, base: u64, va: u64) -> Option<usize> {
+    let rva = va.checked_sub(base)?;
+    for s in &bin.sections {
+        let span = s.vsize.max(s.file_size);
+        if s.vaddr != 0 && rva >= s.vaddr && rva < s.vaddr + span {
+            let delta = rva - s.vaddr;
+            // Only the file-backed part of a section has an offset; an address
+            // in the virtual-only tail (a .bss, or a vsize larger than the raw
+            // data) has no bytes to point at. Sections are clamped to the file
+            // at parse time, so `file_off + delta` here is always in bounds.
+            return (delta < s.file_size).then_some((s.file_off + delta) as usize);
+        }
+    }
+    None
+}
+
+fn in_exec(bin: &Binary, base: u64, va: u64) -> bool {
+    let Some(rva) = va.checked_sub(base) else {
+        return false;
+    };
+    bin.sections.iter().any(|s| {
+        s.exec && s.file_size > 0 && rva >= s.vaddr && rva < s.vaddr + s.vsize.max(s.file_size)
+    })
+}
+
+/// Does this address land in any mapped section?
+/// Whether an address the code computed is one worth remembering as a base.
+///
+/// The image base is not inside any section — it is where the headers are — and
+/// it is the single most common base an x64 switch is addressed from: a
+/// `lea r14, [rip+x]` that resolves to it, then `[r14 + i*4 + table]`. Excluding
+/// it is why no table in any 64-bit binary was ever found.
+fn known_address(bin: &Binary, base: u64, va: u64) -> bool {
+    va == base || is_mapped(bin, base, va)
+}
+
+fn is_mapped(bin: &Binary, base: u64, va: u64) -> bool {
+    let Some(rva) = va.checked_sub(base) else {
+        return false;
+    };
+    bin.sections
+        .iter()
+        .any(|s| s.vaddr != 0 && rva >= s.vaddr && rva < s.vaddr + s.vsize.max(s.file_size))
+}
+
+/// The address an instruction *names* without jumping to it: the source of a
+/// data cross-reference.
+///
+/// Two shapes matter. RIP-relative operands (`lea rax, [rip+0x1234]`) are
+/// unambiguous and are taken as-is. Bare immediates and absolute displacements
+/// are how 32-bit code refers to globals, but they are also just numbers, so
+/// they only count when they land somewhere the image actually maps; that
+/// filter is what keeps loop counters from being reported as string references.
+fn data_ref(bin: &Binary, base: u64, insn: &Instruction) -> Option<u64> {
+    if insn.is_ip_rel_memory_operand() {
+        let t = insn.ip_rel_memory_address();
+        return is_mapped(bin, base, t).then_some(t);
+    }
+
+    // Absolute memory operand with no base or index register.
+    if insn.memory_base() == iced_x86::Register::None
+        && insn.memory_index() == iced_x86::Register::None
+    {
+        let d = insn.memory_displacement64();
+        if d != 0 && is_mapped(bin, base, d) {
+            return Some(d);
+        }
+    }
+
+    // `push offset str` / `mov esi, offset str`: an immediate that happens to
+    // be an address. Restricted to non-executable targets, because an immediate
+    // pointing into code is far more often arithmetic than a pointer.
+    for i in 0..insn.op_count() {
+        let v = match insn.op_kind(i) {
+            iced_x86::OpKind::Immediate32 => insn.immediate32() as u64,
+            iced_x86::OpKind::Immediate64 => insn.immediate64(),
+            _ => continue,
+        };
+        if v != 0 && !in_exec(bin, base, v) && is_mapped(bin, base, v) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// The start address of a jump table if `insn` is an indexed branch into one.
+///
+/// x86 has no RIP-relative indexed addressing, so a switch works in exactly
+/// two shapes, both resolved here:
+///
+/// * `jmp qword ptr [kind*8 + disp32]`: the displacement is the table's
+///   absolute address (non-PIE);
+/// * `lea rax, [rip+disp]; jmp qword ptr [rax*8]`: the LEA wrote the table
+///   address into `regs`, MSVC's favorite for PIE.
+///
+/// Anything else (bare `jmp rax`, unindexed memory jumps) has no table.
+fn jump_table_base(
+    bin: &Binary,
+    insn: &iced_x86::Instruction,
+    regs: &HashMap<iced_x86::Register, u64>,
+) -> Option<u64> {
+    if !matches!(
+        bin.arch,
+        crate::model::Arch::X86 | crate::model::Arch::X86_64
+    ) {
+        return None;
+    }
+    let idx = insn.memory_index();
+    if idx == iced_x86::Register::None {
+        return None;
+    }
+    let disp = insn.memory_displacement64();
+    if let Some(t) = regs.get(&idx) {
+        // The base came from an earlier `lea [rip+x]`, with an optional small
+        // displacement folded into the addressing (rare but real).
+        return Some(t.wrapping_add(disp));
+    }
+    if insn.memory_base() == iced_x86::Register::None && disp != 0 {
+        return Some(disp);
+    }
+    None
+}
+
+/// The most entries a jump table may have.
+///
+/// The count comes out of the file, so a corrupt one must cost a bounded amount
+/// of work rather than whatever the input asks for. Real switches are far
+/// smaller than this; the ceiling is for the dishonest case, not the honest one.
+const MAX_TABLE_ENTRIES: usize = 4096;
+
+/// A switch dispatch being assembled, tracked across the straight line it always
+/// occupies.
+///
+/// x64 does not address a switch the way 32-bit code does. There is no indexed
+/// branch: the table holds 32-bit displacements, the code loads one, adds the
+/// base back, and jumps through a register. Nothing about the `jmp` says where
+/// the table was, so the two instructions in front of it have to be remembered.
+#[derive(Clone, Copy)]
+struct PendingTable {
+    /// Register holding the loaded offset, and then the resolved target.
+    dst: iced_x86::Register,
+    /// The selector, as indexed into the table.
+    index: iced_x86::Register,
+    /// The value added back to turn an entry into an address.
+    base: u64,
+    /// Absolute address of the table of offsets.
+    table: u64,
+    /// Whether the `add` that completes the shape has been seen.
+    ready: bool,
+}
+
+/// Advance the x64 switch shape by one instruction, or report that this
+/// instruction is not part of it.
+fn pending_step(
+    insn: &Instruction,
+    regs: &HashMap<iced_x86::Register, u64>,
+    pending: Option<PendingTable>,
+) -> Option<PendingTable> {
+    // `mov r32, [B + I*4 + D]` where B is a base we watched being loaded: the
+    // table starts at B + D and this is the load of one of its entries.
+    if insn.mnemonic() == iced_x86::Mnemonic::Mov
+        && insn.op_count() == 2
+        && insn.op0_kind() == iced_x86::OpKind::Register
+        && insn.op1_kind() == iced_x86::OpKind::Memory
+        && insn.memory_index_scale() == 4
+        && insn.memory_index() != iced_x86::Register::None
+    {
+        if let Some(&b) = regs.get(&insn.memory_base().full_register()) {
+            return Some(PendingTable {
+                dst: insn.op0_register().full_register(),
+                index: insn.memory_index().full_register(),
+                base: b,
+                table: b.wrapping_add(insn.memory_displacement64()),
+                ready: false,
+            });
+        }
+    }
+    // `add dst, B` with the same base completes it: the offset has become an
+    // address. Requiring the *same* base is what keeps an unrelated `add` from
+    // turning a half-recognised shape into a table that was never there.
+    let mut p = pending?;
+    if !p.ready
+        && insn.mnemonic() == iced_x86::Mnemonic::Add
+        && insn.op_count() == 2
+        && insn.op0_kind() == iced_x86::OpKind::Register
+        && insn.op0_register().full_register() == p.dst
+        && insn.op1_kind() == iced_x86::OpKind::Register
+        && regs.get(&insn.op1_register().full_register()) == Some(&p.base)
+    {
+        p.ready = true;
+        return Some(p);
+    }
+    None
+}
+
+/// Table entries that are absolute addresses: the 32-bit `jmp [table + i*4]`
+/// shape and its 64-bit spelling.
+///
+/// Stops at the first entry that is not code, which is the only thing the table
+/// itself says about where it ends.
+fn absolute_table(bin: &Binary, base: u64, bytes: &[u8], table: u64) -> Vec<u64> {
+    let width = if bin.bits == 64 { 8usize } else { 4 };
+    let mut out = Vec::new();
+    let mut at = table;
+    for _ in 0..MAX_TABLE_ENTRIES {
+        let Some(off) = va_to_off(bin, base, at) else {
+            break;
+        };
+        let Some(e) = bytes.get(off..off + width) else {
+            break;
+        };
+        let t = if width == 8 {
+            u64::from_le_bytes(e.try_into().expect("eight bytes"))
+        } else {
+            u64::from(u32::from_le_bytes(e.try_into().expect("four bytes")))
+        };
+        if t == 0 || !in_exec(bin, base, t) {
+            break;
+        }
+        out.push(t);
+        at += width as u64;
+    }
+    out
+}
+
+/// Table entries that are 32-bit offsets from a base the code adds back: how
+/// x64 addresses a switch.
+///
+/// Returns nothing unless this jump is through the very register the tracked
+/// shape resolved into — a bare `jmp rax` that no table explains stays an
+/// unresolved indirect branch rather than becoming a guess.
+fn offset_table(
+    bin: &Binary,
+    base: u64,
+    bytes: &[u8],
+    insn: &Instruction,
+    pending: Option<PendingTable>,
+) -> Option<(u64, Vec<u64>)> {
+    let p = pending?;
+    if !p.ready
+        || insn.op0_kind() != iced_x86::OpKind::Register
+        || insn.op0_register().full_register() != p.dst
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut at = p.table;
+    for _ in 0..MAX_TABLE_ENTRIES {
+        let Some(off) = va_to_off(bin, base, at) else {
+            break;
+        };
+        let Some(e) = bytes.get(off..off + 4) else {
+            break;
+        };
+        let t = p.base.wrapping_add(u64::from(u32::from_le_bytes(
+            e.try_into().expect("four bytes"),
+        )));
+        if !in_exec(bin, base, t) {
+            break;
+        }
+        out.push(t);
+        at += 4;
+    }
+    Some((p.table, out))
+}
+
+/// Turn the flat list of references collected during recovery into the map the
+/// rest of the tool reads.
+///
+/// Sorting once over one vector replaces a tree descent per reference, and the
+/// per-address vectors come out at exactly the length they need instead of the
+/// four slots a single `push` would have reserved. `order` supplies the
+/// secondary key, which is also what de-duplicates the same reference found
+/// twice through overlapping code.
+fn group_refs<V: Copy, K: Ord + Eq>(
+    mut flat: Vec<(u64, V)>,
+    order: impl Fn(&V) -> K,
+) -> BTreeMap<u64, Vec<V>> {
+    flat.sort_unstable_by(|(a_key, a), (b_key, b)| {
+        a_key.cmp(b_key).then_with(|| order(a).cmp(&order(b)))
+    });
+    flat.dedup_by(|(a_key, a), (b_key, b)| a_key == b_key && order(a) == order(b));
+
+    let mut groups: Vec<(u64, Vec<V>)> = Vec::new();
+    for (key, value) in flat {
+        match groups.last_mut() {
+            Some((at, run)) if *at == key => run.push(value),
+            _ => groups.push((key, vec![value])),
+        }
+    }
+    // Already sorted by address, which `BTreeMap` builds from in bulk.
+    groups.into_iter().collect()
+}
+
+pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db) -> Analysis {
+    let base = display_base(bin);
+
+    // Forwarding stubs are discovered rather than declared: no symbol table
+    // lists them, but they are what call sites actually target.
+    let stubs = crate::analysis::thunks::resolve(bin, bytes, base);
+
+    // Names and import slots, keyed by absolute VA.
+    let mut names: BTreeMap<u64, String> = BTreeMap::new();
+    let mut import_slots: BTreeMap<u64, String> = BTreeMap::new();
+    let mut imports: BTreeMap<u64, String> = BTreeMap::new();
+    for s in bin.symbols.iter().chain(stubs.iter()) {
+        let va = s.addr + base;
+        match s.kind {
+            SymKind::Import => {
+                import_slots.insert(va, s.name.clone());
+                imports.insert(va, s.name.clone());
+            }
+            SymKind::Thunk => {
+                names.entry(va).or_insert_with(|| s.name.clone());
+                imports.insert(va, s.name.clone());
+            }
+            SymKind::Func | SymKind::Export => {
+                names
+                    .entry(va)
+                    .or_insert_with(|| crate::analysis::demangle::display_name(&s.name));
+            }
+        }
+    }
+
+    // Seeds: entry + every named code symbol.
+    let entry_va = bin.entry + base;
+    let mut seeds: VecDeque<u64> = VecDeque::new();
+    let mut is_seed: BTreeSet<u64> = BTreeSet::new();
+    if in_exec(bin, base, entry_va) {
+        seeds.push_back(entry_va);
+        is_seed.insert(entry_va);
+        // A native-subsystem image is a kernel driver: its entry point is the
+        // driver's `DriverEntry`, and that is the name an analyst will look for.
+        names.entry(entry_va).or_insert_with(|| {
+            if bin.subsystem.as_deref() == Some("native") {
+                "DriverEntry".to_string()
+            } else {
+                "entry".to_string()
+            }
+        });
+    }
+    for s in bin.symbols.iter().chain(stubs.iter()) {
+        let va = s.addr + base;
+        if matches!(s.kind, SymKind::Func | SymKind::Export | SymKind::Thunk)
+            && in_exec(bin, base, va)
+            && is_seed.insert(va)
+        {
+            seeds.push_back(va);
+        }
+    }
+
+    // Container-metadata function starts (the PE exception directory, a
+    // prologue sweep). These carry no name, so they seed and bound the descent
+    // but leave the function to render as `sub_`. This is what finds the code a
+    // stripped C++ binary only ever reaches through indirect calls.
+    for rva in &bin.func_hints {
+        let va = rva + base;
+        if in_exec(bin, base, va) && is_seed.insert(va) {
+            seeds.push_back(va);
+        }
+    }
+
+    // Your own names win, and they also create work: naming an address the
+    // symbol table never mentioned is how you tell the engine there is a
+    // function there, which is most of the point of naming something in a
+    // stripped binary.
+    for (rva, name) in &db.names {
+        let va = rva + base;
+        names.insert(va, name.clone());
+        if in_exec(bin, base, va) && is_seed.insert(va) {
+            seeds.push_back(va);
+        }
+    }
+
+    // A named symbol marks a function boundary: descent must not cross into it.
+    let boundaries: BTreeSet<u64> = is_seed.iter().copied().collect();
+
+    let mut functions: Vec<Function> = Vec::new();
+    // Collected flat and grouped once at the end. Recording a reference into
+    // a `BTreeMap<_, Vec<_>>` as it is found costs a tree descent and, for
+    // every address seen for the first time, a heap allocation for a vector
+    // that usually holds a single element. A large image has millions of
+    // references, and pushing onto one vector instead is the difference
+    // between millions of allocations and none.
+    let mut xrefs_to_flat: Vec<(u64, Xref)> = Vec::new();
+    let mut xrefs_from_flat: Vec<(u64, Ref)> = Vec::new();
+    let mut done: BTreeSet<u64> = BTreeSet::new();
+    let mut budget = max_insns;
+    let mut truncated = false;
+
+    while let Some(func_va) = seeds.pop_front() {
+        if done.contains(&func_va) {
+            continue;
+        }
+        if budget == 0 {
+            truncated = true;
+            break;
+        }
+        done.insert(func_va);
+
+        let (func, discovered, spent) = build_function(
+            bin,
+            bytes,
+            func_va,
+            base,
+            &names,
+            &import_slots,
+            &boundaries,
+            &mut xrefs_to_flat,
+            &mut xrefs_from_flat,
+            budget,
+        );
+        budget = budget.saturating_sub(spent);
+
+        for c in discovered {
+            if in_exec(bin, base, c) && is_seed.insert(c) {
+                seeds.push_back(c);
+            }
+        }
+        if func.size > 0 {
+            functions.push(func);
+        }
+    }
+
+    // Overlapping code can be decoded under more than one function, which would
+    // otherwise report the same instruction as several distinct references.
+    let xrefs_to = group_refs(xrefs_to_flat, |x| (x.from, x.kind as u8));
+    let xrefs_from = group_refs(xrefs_from_flat, |x| (x.to, x.kind as u8));
+
+    let mut incoming: BTreeMap<u64, usize> = BTreeMap::new();
+    for (target, refs) in &xrefs_to {
+        incoming.insert(*target, refs.len());
+    }
+    for f in &mut functions {
+        f.incoming = incoming.get(&f.addr).copied().unwrap_or(0);
+        f.named = names.contains_key(&f.addr);
+        if !f.named {
+            // A nameless function whose opening bytes match a known helper
+            // gets the helper's name instead of a flow-graph serial number.
+            if let Some(off) = va_to_off(bin, base, f.addr) {
+                if let Some(sig) = crate::analysis::flirt::identify(bytes, off, f.size as usize) {
+                    names.insert(f.addr, sig.to_string());
+                    f.name = sig.to_string();
+                    f.named = true;
+                }
+            }
+        }
+        if !f.named {
+            f.name = format!("sub_{:x}", f.addr);
+        }
+    }
+    functions.sort_by_key(|f| f.addr);
+
+    let mut function_names = BTreeMap::new();
+    for (index, function) in functions.iter().enumerate() {
+        // Preserve the previous linear-search behavior for duplicate names:
+        // the lowest-address function wins.
+        function_names.entry(function.name.clone()).or_insert(index);
+    }
+
+    Analysis {
+        functions,
+        function_names,
+        xrefs_to,
+        xrefs_from,
+        names,
+        imports,
+        display_base: 0,
+        bits: bin.bits,
+        arch: bin.arch,
+        truncated,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_function(
+    bin: &Binary,
+    bytes: &[u8],
+    entry: u64,
+    base: u64,
+    names: &BTreeMap<u64, String>,
+    import_slots: &BTreeMap<u64, String>,
+    boundaries: &BTreeSet<u64>,
+    xrefs_to: &mut Vec<(u64, Xref)>,
+    xrefs_from: &mut Vec<(u64, Ref)>,
+    budget: usize,
+) -> (Function, Vec<u64>, usize) {
+    let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
+    let mut worklist: VecDeque<u64> = VecDeque::new();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    let mut calls: Vec<u64> = Vec::new();
+    let mut tables: Vec<u64> = Vec::new();
+    let mut spent = 0usize;
+    let mut min_start = entry;
+    let mut max_end = entry;
+    // Addresses the code is known to have written into registers (only ever
+    // via `lea r64,[rip+x]` / `mov r64, imm`), which is what makes a switch's
+    // table address knowable. Inaccurate across conditional paths by design: a
+    // value set on one branch is used on all of them, so a table can be missed.
+    //
+    // It must not be inaccurate in the other direction. An entry is dropped as
+    // soon as anything writes the register, because a stale one does not merely
+    // miss a table — it supplies a wrong base, and the addresses read there
+    // become successors of a block that never goes to them.
+    let mut regs: HashMap<iced_x86::Register, u64> = HashMap::new();
+
+    // A block target inside this function that is not another function's entry.
+    let queue_block = |t: u64, seen: &mut BTreeSet<u64>, wl: &mut VecDeque<u64>| -> bool {
+        // never absorb another named function's body
+        if t != entry && boundaries.contains(&t) {
+            return false;
+        }
+        if va_to_off(bin, base, t).is_none() {
+            return false;
+        }
+        if seen.insert(t) {
+            wl.push_back(t);
+        }
+        true
+    };
+
+    worklist.push_back(entry);
+    seen.insert(entry);
+
+    while let Some(block_start) = worklist.pop_front() {
+        if spent >= budget {
+            break;
+        }
+        let Some(off) = va_to_off(bin, base, block_start) else {
+            continue;
+        };
+        // A corrupted section header can map a valid-looking address to an
+        // offset past the end of the file; the bounds check keeps that from
+        // becoming a crash on a hostile binary.
+        let Some(code) = bytes.get(off..) else {
+            continue;
+        };
+        min_start = min_start.min(block_start);
+        let mut decoder = Decoder::with_ip(bin.bits, code, block_start, DecoderOptions::NONE);
+        // AArch64 has no variable-width decoding: the cursor is just +4 each
+        // instruction.
+        let mut apos = 0usize;
+        let is_a64 = bin.arch == crate::model::Arch::Aarch64;
+        let mut insns = Vec::new();
+        let mut succ = Vec::new();
+        let mut end = block_start;
+        // Block-local, unlike `regs`: the load, the add and the jump are always
+        // consecutive, so a shape that crosses a branch is not one.
+        let mut pending: Option<PendingTable> = None;
+
+        loop {
+            if spent >= budget {
+                break;
+            }
+            // One decoded instruction, normalized to what the flow handling
+            // needs, plus the iced view for the x86-only bits (IAT slots,
+            // jump tables, register tracking).
+            let mut ice: Option<Instruction> = None;
+            let (addr, len, raw, flow, dtarget) = if is_a64 {
+                let at = block_start + apos as u64;
+                let Some(chunk) = bytes.get(off + apos..) else {
+                    break;
+                };
+                let Some(w) = crate::analysis::aarch64::decode(chunk, at) else {
+                    break;
+                };
+                spent += 1;
+                let raw = &chunk[..w.len];
+                apos += w.len;
+                (w.addr, w.len, raw, w.flow, w.target)
+            } else {
+                if !decoder.can_decode() {
+                    break;
+                }
+                let pos = decoder.position();
+                let insn = decoder.decode();
+                if insn.is_invalid() {
+                    break;
+                }
+                spent += 1;
+                let flow = insn.flow_control();
+                let dtarget = if matches!(
+                    flow,
+                    FlowControl::Call
+                        | FlowControl::UnconditionalBranch
+                        | FlowControl::ConditionalBranch
+                ) && matches!(
+                    insn.op0_kind(),
+                    iced_x86::OpKind::NearBranch16
+                        | iced_x86::OpKind::NearBranch32
+                        | iced_x86::OpKind::NearBranch64
+                ) {
+                    Some(insn.near_branch_target())
+                } else {
+                    None
+                };
+                let addr = insn.ip();
+                let len = insn.len();
+                // Borrowed straight out of the image: `EngineInsn` copies
+                // what it needs inline, so nothing is allocated per
+                // instruction.
+                let raw = &bytes[off + pos..off + pos + len];
+                ice = Some(insn);
+                (addr, len, raw, flow, dtarget)
+            };
+            end = addr + len as u64;
+            max_end = max_end.max(end);
+            let mut target = dtarget;
+            let mut target_name = None;
+
+            // Constant register tracking (see `regs`), general-case limited to
+            // the two shapes real compilers use to address switch tables.
+            if let Some(insn) = &ice {
+                // Anything written stops being the address we recorded. Without
+                // this the entry outlived the value: `lea rax,[table]` then
+                // `add rax, rbx` left `rax` still mapped to the table, so a
+                // later indexed jump read a table that was never there and
+                // invented successors for it. Implicit writes count — a `call`
+                // clobbers the caller-saved registers, a `div` writes rdx:rax.
+                let mut info = InstructionInfoFactory::new();
+                let used = info.info(insn).used_registers();
+                for u in used {
+                    if matches!(
+                        u.access(),
+                        OpAccess::Write
+                            | OpAccess::CondWrite
+                            | OpAccess::ReadWrite
+                            | OpAccess::ReadCondWrite
+                    ) {
+                        regs.remove(&u.register().full_register());
+                        regs.remove(&u.register());
+                    }
+                }
+                if insn.op0_kind() == iced_x86::OpKind::Register {
+                    let reg = insn.op0_register();
+                    let known = if insn.mnemonic() == iced_x86::Mnemonic::Lea
+                        && insn.is_ip_rel_memory_operand()
+                    {
+                        let t = insn.ip_rel_memory_address();
+                        known_address(bin, base, t).then_some(t)
+                    } else if insn.mnemonic() == iced_x86::Mnemonic::Mov
+                        && insn.op_count() == 2
+                        && insn.op1_kind() == iced_x86::OpKind::Immediate64
+                    {
+                        let t = insn.immediate64();
+                        known_address(bin, base, t).then_some(t)
+                    } else {
+                        None
+                    };
+                    if let Some(t) = known {
+                        regs.insert(reg, t);
+                    }
+                }
+
+                // The instruction that starts or completes the switch shape is
+                // not a disturbance to it. Anything else that writes either of
+                // its registers is, and afterwards it no longer describes what
+                // the machine holds — the same rule `regs` above follows, and
+                // for the same reason: a stale shape does not miss a table, it
+                // invents one.
+                pending = match pending_step(insn, &regs, pending) {
+                    Some(p) => Some(p),
+                    None => pending.filter(|p| {
+                        !used.iter().any(|u| {
+                            matches!(
+                                u.access(),
+                                OpAccess::Write
+                                    | OpAccess::CondWrite
+                                    | OpAccess::ReadWrite
+                                    | OpAccess::ReadCondWrite
+                            ) && {
+                                let w = u.register().full_register();
+                                w == p.dst || w == p.index
+                            }
+                        })
+                    }),
+                };
+            }
+
+            match flow {
+                FlowControl::Call => {
+                    if let Some(t) = target {
+                        target_name = names.get(&t).map(|n| n.as_str().into());
+                        calls.push(t);
+                        xrefs_to.push((
+                            t,
+                            Xref {
+                                from: addr,
+                                kind: XrefKind::Call,
+                            },
+                        ));
+                        xrefs_from.push((
+                            addr,
+                            Ref {
+                                to: t,
+                                kind: XrefKind::Call,
+                            },
+                        ));
+                    }
+                }
+                FlowControl::UnconditionalBranch => {
+                    if let Some(t) = target {
+                        target_name = names.get(&t).map(|n| n.as_str().into());
+                        let kind = XrefKind::Jump;
+                        xrefs_to.push((t, Xref { from: addr, kind }));
+                        xrefs_from.push((addr, Ref { to: t, kind }));
+                        // tail-call to another function, or an intra-function
+                        // jump?
+                        if boundaries.contains(&t) && t != entry {
+                            calls.push(t); // treat as a tail call
+                        } else if queue_block(t, &mut seen, &mut worklist) {
+                            succ.push(t);
+                        }
+                    }
+                }
+                FlowControl::ConditionalBranch => {
+                    if let Some(t) = target {
+                        target_name = names.get(&t).map(|n| n.as_str().into());
+                        xrefs_to.push((
+                            t,
+                            Xref {
+                                from: addr,
+                                kind: XrefKind::Branch,
+                            },
+                        ));
+                        xrefs_from.push((
+                            addr,
+                            Ref {
+                                to: t,
+                                kind: XrefKind::Branch,
+                            },
+                        ));
+                        if queue_block(t, &mut seen, &mut worklist) {
+                            succ.push(t);
+                        }
+                    }
+                }
+                // `call [rip+disp]` / `jmp [rip+disp]` through an import slot.
+                // iced classifies these as *indirect* flow, which is the whole
+                // reason they have to be matched separately from the near-branch
+                // arms above.
+                FlowControl::IndirectCall | FlowControl::IndirectBranch => {
+                    // AArch64 register branches (br/blr) have the same flow
+                    // class but nothing resolvable here; the x86 slot and
+                    // table machinery needs the iced view, which is absent.
+                    if let Some(insn) = &ice {
+                        let slot = if insn.is_ip_rel_memory_operand() {
+                            Some(insn.ip_rel_memory_address())
+                        } else if insn.memory_base() == iced_x86::Register::None
+                            && insn.memory_index() == iced_x86::Register::None
+                            && insn.memory_displacement64() != 0
+                        {
+                            // 32-bit builds address the IAT absolutely rather
+                            // than relative to the instruction pointer.
+                            Some(insn.memory_displacement64())
+                        } else {
+                            None
+                        };
+                        if let Some(slot) = slot {
+                            if let Some(n) = import_slots.get(&slot) {
+                                target = Some(slot);
+                                target_name = Some(n.as_str().into());
+                                // The slot is a call-graph edge like any other,
+                                // and without it every path that runs through
+                                // an import is invisible. It is never seeded
+                                // as a function: an import slot lives in data,
+                                // and the executable check below filters it.
+                                calls.push(slot);
+                                let kind = if flow == FlowControl::IndirectCall {
+                                    XrefKind::Call
+                                } else {
+                                    XrefKind::Jump
+                                };
+                                xrefs_to.push((slot, Xref { from: addr, kind }));
+                                xrefs_from.push((addr, Ref { to: slot, kind }));
+                            }
+                        }
+                        // An indirect branch that no import slot explains is
+                        // a switch, in one of the two shapes a compiler writes:
+                        // 32-bit code branches through the table, x64 code loads
+                        // an offset out of it and adds the base back. The
+                        // entries are real control-flow edges either way, and
+                        // without them the cases look unreachable.
+                        if target.is_none() && flow == FlowControl::IndirectBranch {
+                            let found = jump_table_base(bin, insn, &regs)
+                                .map(|t| (t, absolute_table(bin, base, bytes, t)))
+                                .or_else(|| offset_table(bin, base, bytes, insn, pending));
+                            if let Some((table, targets)) = found {
+                                if !targets.is_empty() {
+                                    tables.push(table);
+                                }
+                                for t in targets {
+                                    xrefs_to.push((
+                                        t,
+                                        Xref {
+                                            from: addr,
+                                            kind: XrefKind::Jump,
+                                        },
+                                    ));
+                                    xrefs_from.push((
+                                        addr,
+                                        Ref {
+                                            to: t,
+                                            kind: XrefKind::Jump,
+                                        },
+                                    ));
+                                    if queue_block(t, &mut seen, &mut worklist) {
+                                        succ.push(t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            // A data reference is recorded whatever the instruction does with
+            // the address, as long as the flow handling above did not already
+            // account for it (an import slot is a control-flow edge, not data).
+            if target.is_none() {
+                if let Some(insn) = &ice {
+                    if let Some(t) = data_ref(bin, base, insn) {
+                        xrefs_to.push((
+                            t,
+                            Xref {
+                                from: addr,
+                                kind: XrefKind::Data,
+                            },
+                        ));
+                        xrefs_from.push((
+                            addr,
+                            Ref {
+                                to: t,
+                                kind: XrefKind::Data,
+                            },
+                        ));
+                    }
+                }
+            }
+
+            insns.push(EngineInsn::new(addr, raw, flow, target, target_name));
+
+            // A conditional branch also falls through to the next instruction.
+            if flow == FlowControl::ConditionalBranch {
+                if queue_block(end, &mut seen, &mut worklist) {
+                    succ.push(end);
+                }
+                break;
+            }
+            // If the next instruction begins a block we already know about, this
+            // block falls through into it. Stop here and record the edge rather
+            // than decoding the shared tail again: without this, a run with many
+            // branch targets gets re-decoded once per target, which turns a
+            // dense function into near-quadratic work and silently exhausts the
+            // instruction budget on real binaries.
+            if end != block_start && seen.contains(&end) {
+                succ.push(end);
+                break;
+            }
+            // An indirect branch ends the block just as firmly as a direct one:
+            // its successors are unknown, so decoding past it walks into bytes
+            // that are not necessarily instructions.
+            let stop = matches!(
+                flow,
+                FlowControl::Return
+                    | FlowControl::UnconditionalBranch
+                    | FlowControl::IndirectBranch
+                    | FlowControl::Interrupt
+            ) || ice
+                .as_ref()
+                .is_some_and(|i| i.mnemonic() == Mnemonic::Int3)
+                // stop if we are about to run into another function's entry
+                || boundaries.contains(&end) && end != entry;
+            if stop {
+                break;
+            }
+        }
+
+        blocks.insert(
+            block_start,
+            BasicBlock {
+                start: block_start,
+                end,
+                insns,
+                succ,
+            },
+        );
+    }
+
+    // Split overlapping blocks. When a branch lands in the middle of a run
+    // already decoded, the worklist produces two blocks covering the same
+    // instructions: one starting earlier and one at the join point. Trimming
+    // each block where the next one begins gives every instruction exactly one
+    // home, which is what makes a function listing readable and the block
+    // count mean something.
+    let starts: Vec<u64> = blocks.keys().copied().collect();
+    for (i, start) in starts.iter().enumerate() {
+        let Some(&next) = starts.get(i + 1) else {
+            continue;
+        };
+        let Some(b) = blocks.get_mut(start) else {
+            continue;
+        };
+        if b.end > next {
+            b.insns.retain(|ins| ins.addr < next);
+            b.end = next;
+            // Whatever this block used to branch to belongs to the tail that
+            // is now the next block; what is left simply falls through.
+            b.succ = vec![next];
+        }
+    }
+
+    let name = names
+        .get(&entry)
+        .cloned()
+        .unwrap_or_else(|| format!("sub_{entry:x}"));
+    let discovered = calls.clone();
+    let func = Function {
+        addr: entry,
+        name,
+        blocks: blocks.into_values().collect(),
+        size: max_end.saturating_sub(min_start),
+        incoming: 0,
+        calls,
+        named: names.contains_key(&entry),
+        tables,
+    };
+    (func, discovered, spent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+    use crate::model::{Arch, Section};
+
+    /// A binary that is nothing but one executable section of raw code.
+    fn code_at(vaddr: u64, code: &[u8]) -> (Binary, Vec<u8>) {
+        let mut bin = Binary::stub(Format::Elf, Arch::X86_64);
+        bin.entry = vaddr;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr,
+            vsize: code.len() as u64,
+            file_off: vaddr,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        // File offset equals the address, so the padding in front is the
+        // simplest way to keep the two in step.
+        let mut bytes = vec![0u8; vaddr as usize];
+        bytes.extend_from_slice(code);
+        (bin, bytes)
+    }
+
+    #[test]
+    fn a_func_hint_recovers_code_no_control_flow_reaches() {
+        // Two functions back to back. The entry (0x1000) just returns; the
+        // second (0x1002) is never called from anywhere the engine can see, so
+        // recursive descent alone never finds it. A func_hint is the only way
+        // in, which is the whole point of the PE exception directory.
+        let code = [
+            0xc3, // 0x1000  ret         (entry)
+            0x90, // 0x1001  padding
+            0x31, 0xc0, // 0x1002  xor eax, eax  (second function)
+            0xc3, // 0x1004  ret
+        ];
+        let (mut bin, bytes) = code_at(0x1000, &code);
+
+        // Without a hint, only the entry is recovered.
+        let bare = analyze(&bin, &bytes, 1000, &Db::default());
+        assert!(bare.find_function(0x1002).is_none());
+
+        // With the hint, the second function appears.
+        bin.func_hints = vec![0x1002];
+        let with_hint = analyze(&bin, &bytes, 1000, &Db::default());
+        let f = with_hint
+            .find_function(0x1002)
+            .expect("the hinted function should be recovered");
+        assert!(!f.blocks.is_empty());
+        // It has no name, so it renders as sub_ like any discovered function.
+        assert_eq!(with_hint.label(0x1002), "sub_1002");
+        assert_eq!(
+            with_hint
+                .find_by_name("sub_1002")
+                .map(|function| function.addr),
+            Some(0x1002)
+        );
+        assert_eq!(
+            with_hint.function_at(0x1003).map(|function| function.addr),
+            Some(0x1002)
+        );
+    }
+
+    #[test]
+    fn a_branch_into_a_decoded_run_does_not_duplicate_instructions() {
+        // The conditional at 0x1002 targets 0x1006 and falls through to 0x1004.
+        // Decoding from 0x1004 runs straight through 0x1006, so without block
+        // splitting the `ret` belongs to two blocks and prints twice.
+        let code = [
+            0x31, 0xc0, // 0x1000  xor eax, eax
+            0x74, 0x02, // 0x1002  je 0x1006
+            0x90, // 0x1004  nop
+            0x90, // 0x1005  nop
+            0xc3, // 0x1006  ret
+        ];
+        let (bin, bytes) = code_at(0x1000, &code);
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let f = an.find_function(0x1000).expect("entry recovered");
+
+        let mut seen: Vec<u64> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter().map(|i| i.addr))
+            .collect();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "every instruction belongs to one block");
+
+        // And the blocks tile the range rather than overlapping it.
+        let mut spans: Vec<(u64, u64)> = f.blocks.iter().map(|b| (b.start, b.end)).collect();
+        spans.sort_unstable();
+        for w in spans.windows(2) {
+            assert!(
+                w[0].1 <= w[1].0,
+                "blocks overlap: {:x?} then {:x?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_signature_match_names_the_function() {
+        let code = [
+            0xe8, 0x00, 0x00, 0x00, 0x00, // 0x1000  call 0x1005 (the helper)
+            0x48, 0x8b, 0x05, 0x12, 0x34, 0x56, 0x78, 0x48, 0x3b, 0x04, 0x24, 0x75, 0x02, 0xf3,
+            0xc3, // 0x1005  the cookie check itself
+            0xc3, // 0x1014  trailing ret
+        ];
+        let (bin, bytes) = code_at(0x1000, &code);
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let helper = an
+            .functions
+            .iter()
+            .find(|f| f.addr == 0x1005)
+            .expect("helper recovered");
+        assert!(helper.named);
+        assert_eq!(helper.name, "__security_check_cookie");
+    }
+
+    #[test]
+    fn a_jump_table_brings_the_cases_in() {
+        // MSVC PIE switch shape:
+        //   0x4000: lea rax, [rip+0xff9]        -> rax = 0x5000 (the table)
+        //   0x4007: jmp qword ptr [rax*8 + 0]   (ff 24 c5 00 00 00 00)
+        // table at 0x5000: 0x6000, 0x6007, 0x600e, 0 (all code, zero ends)
+        let mut code = vec![0u8; 0x5018];
+        code[0x0000] = 0x48; // lea rax, [rip + 0xff9]   (0x4007 -> 0x5000)
+        code[0x0001] = 0x8d;
+        code[0x0002] = 0x05;
+        code[0x0003..0x0007].copy_from_slice(&0xff9i32.to_le_bytes());
+        code[0x0007] = 0xff; // jmp qword ptr [rax*8 + 0]
+        code[0x0008] = 0x24;
+        code[0x0009] = 0xc5;
+        // table
+        code[0x1000..0x1008].copy_from_slice(&0x6000u64.to_le_bytes());
+        code[0x1008..0x1010].copy_from_slice(&0x6007u64.to_le_bytes());
+        code[0x1010..0x1018].copy_from_slice(&0x600eu64.to_le_bytes());
+        // cases
+        code[0x2000] = 0xc3;
+        code[0x2007] = 0xc3;
+        code[0x200e] = 0xc3;
+
+        let (bin, bytes) = code_at(0x4000, &code);
+        let an = analyze(&bin, &bytes, 10_000, &Db::default());
+        let sw = an.find_function(0x4000).expect("entry recovered");
+        assert_eq!(sw.tables, vec![0x5000], "the table is attributed");
+        for case in [0x6000u64, 0x6007, 0x600e] {
+            assert!(
+                an.xrefs_from.get(&0x4007).is_some_and(|r| r
+                    .iter()
+                    .any(|x| x.to == case && matches!(x.kind, XrefKind::Jump))),
+                "case {case:#x} reachable from the dispatch"
+            );
+        }
+        // the cases were decoded as real code: they are blocks of the switch
+        // function, not dangling pointers that never got decoded
+        for case in [0x6000u64, 0x6007, 0x600e] {
+            assert!(
+                sw.blocks.iter().any(|b| b.start == case),
+                "case {case:#x} became a block"
+            );
+        }
+    }
+
+    #[test]
+    fn an_x64_offset_table_brings_the_cases_in() {
+        // The shape MSVC actually emits for a 64-bit switch. There is no indexed
+        // branch: the table holds 32-bit displacements from a base, the code
+        // loads one, adds the base back, and jumps through the register.
+        //
+        //   0x4000: lea r14, [rip-0x4007]          -> r14 = 0 (the image base)
+        //   0x4007: mov ecx, [r14+rax*4+0x5000]    -> an entry of the table
+        //   0x400f: add rcx, r14                   -> displacement becomes address
+        //   0x4012: jmp rcx
+        let mut code = vec![0u8; 0x2010];
+        code[0x0000] = 0x4c; // lea r14, [rip + d]
+        code[0x0001] = 0x8d;
+        code[0x0002] = 0x35;
+        code[0x0003..0x0007].copy_from_slice(&(-0x4007i32).to_le_bytes());
+        code[0x0007] = 0x41; // mov ecx, [r14 + rax*4 + 0x5000]
+        code[0x0008] = 0x8b;
+        code[0x0009] = 0x8c;
+        code[0x000a] = 0x86;
+        code[0x000b..0x000f].copy_from_slice(&0x5000u32.to_le_bytes());
+        code[0x000f] = 0x49; // add rcx, r14
+        code[0x0010] = 0x03;
+        code[0x0011] = 0xce;
+        code[0x0012] = 0xff; // jmp rcx
+        code[0x0013] = 0xe1;
+        // The table: displacements from a zero base, so they read as addresses.
+        code[0x1000..0x1004].copy_from_slice(&0x6000u32.to_le_bytes());
+        code[0x1004..0x1008].copy_from_slice(&0x6007u32.to_le_bytes());
+        code[0x1008..0x100c].copy_from_slice(&0x600eu32.to_le_bytes());
+        // cases
+        code[0x2000] = 0xc3;
+        code[0x2007] = 0xc3;
+        code[0x200e] = 0xc3;
+
+        let (bin, bytes) = code_at(0x4000, &code);
+        let an = analyze(&bin, &bytes, 10_000, &Db::default());
+        let sw = an.find_function(0x4000).expect("entry recovered");
+        assert_eq!(sw.tables, vec![0x5000], "the table is attributed");
+        for case in [0x6000u64, 0x6007, 0x600e] {
+            assert!(
+                an.xrefs_from
+                    .get(&0x4012)
+                    .is_some_and(|r| r.iter().any(|x| x.to == case)),
+                "case 0x{case:x} should be an edge from the jump"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_indirect_jump_invents_no_table() {
+        // The same jump with nothing in front of it explaining a table. It must
+        // stay an unresolved indirect branch: a guess here would put edges into
+        // whatever the bytes after some unrelated address happen to be.
+        let mut code = vec![0u8; 0x2010];
+        code[0x0000] = 0xff; // jmp rcx
+        code[0x0001] = 0xe1;
+        code[0x1000..0x1004].copy_from_slice(&0x6000u32.to_le_bytes());
+        code[0x2000] = 0xc3;
+
+        let (bin, bytes) = code_at(0x4000, &code);
+        let an = analyze(&bin, &bytes, 10_000, &Db::default());
+        let f = an.find_function(0x4000).expect("entry recovered");
+        assert!(
+            f.tables.is_empty(),
+            "no table should be claimed: {:?}",
+            f.tables
+        );
+    }
+
+    #[test]
+    fn a_note_annotates_without_renaming() {
+        // Notes are for the reader. Only a name changes what things are called,
+        // so a note must leave the entry point's own label alone.
+        let code = [0x90, 0xc3]; // nop; ret
+        let (bin, bytes) = code_at(0x1000, &code);
+        let mut db = Db::default();
+        db.set_note(0x1000, "parses the header");
+        let an = analyze(&bin, &bytes, 1000, &db);
+        assert_eq!(an.label(0x1000), "entry");
+    }
+
+    #[test]
+    fn a_name_takes_precedence_over_the_derived_label() {
+        let code = [0x90, 0xc3];
+        let (bin, bytes) = code_at(0x1000, &code);
+        let mut db = Db::default();
+        db.set_name(0x1000, "parse_header");
+        let an = analyze(&bin, &bytes, 1000, &db);
+        assert_eq!(an.label(0x1000), "parse_header");
+    }
+
+    #[test]
+    fn xrefs_from_mirrors_the_call_edges() {
+        // entry calls sub at 0x1006, both return.
+        let code = [
+            0xe8, 0x01, 0x00, 0x00, 0x00, // 0x1000 call 0x1006
+            0xc3, // 0x1005 ret
+            0xc3, // 0x1006 ret
+        ];
+        let (bin, bytes) = code_at(0x1000, &code);
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let refs = an.xrefs_from.get(&0x1000).expect("call recorded");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].to, 0x1006);
+        assert_eq!(refs[0].kind, XrefKind::Call);
+        // and the reverse index agrees with the forward one.
+        assert!(an.xrefs_to.get(&0x1006).is_some_and(|r| r
+            .iter()
+            .any(|x| x.from == 0x1000 && x.kind == XrefKind::Call)));
+    }
+
+    #[test]
+    fn xrefs_from_records_a_string_operand() {
+        // lea rax, [rip+0x17] at 0x1000 ends at 0x1007, so it names 0x101e,
+        // which is where the literal sits in the read-only section.
+        let mut bin = Binary::stub(Format::Elf, Arch::X86_64);
+        bin.entry = 0x1000;
+        bin.sections = vec![
+            Section {
+                name: ".text".into(),
+                vaddr: 0x1000,
+                vsize: 8,
+                file_off: 0,
+                file_size: 8,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: true,
+            },
+            Section {
+                name: ".rodata".into(),
+                vaddr: 0x101e,
+                vsize: 5,
+                file_off: 8,
+                file_size: 5,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: false,
+            },
+        ];
+        let mut bytes = vec![0x48, 0x8d, 0x05, 0x17, 0x00, 0x00, 0x00, 0xc3];
+        bytes.extend_from_slice(b"hello");
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let refs = an.xrefs_from.get(&0x1000).expect("operand recorded");
+        assert!(refs
+            .iter()
+            .any(|r| r.to == 0x101e && r.kind == XrefKind::Data));
+    }
+
+    #[test]
+    fn the_aarch64_fixture_flows_without_x86() {
+        let bytes = crate::formats::fixture::elf_aarch64_call();
+        let bin = crate::formats::analyze("stub", &bytes).expect("parses");
+        assert_eq!(bin.arch, Arch::Aarch64);
+
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let entry = an.find_function(bin.entry).expect("entry recovered");
+        assert!(entry.blocks.iter().any(|b| b.start == bin.entry));
+        // the `bl` resolved to an internal helper, with the xref recorded
+        let helper = bin.entry + 0x10;
+        assert!(
+            an.xrefs_from.get(&bin.entry).is_some_and(|rs| rs
+                .iter()
+                .any(|r| r.to == helper && r.kind == XrefKind::Call)),
+            "call edge into the helper"
+        );
+        let h = an.find_function(helper).expect("helper recovered");
+        assert_eq!(h.blocks.len(), 1);
+        assert_eq!(h.blocks[0].insns.len(), 3);
+
+        // formatting comes from the A64 renderer, not iced's x86 decoder
+        let insns = &entry.blocks[0].insns;
+        assert!(
+            insns[0].text(bin.bits, bin.arch).starts_with("bl"),
+            "{}",
+            insns[0].text(bin.bits, bin.arch)
+        );
+        assert_eq!(h.blocks[0].insns[2].text(bin.bits, bin.arch), "ret");
+    }
+
+    #[test]
+    fn the_aarch64_linear_disassembler_names_the_common_forms() {
+        let bytes = crate::formats::fixture::elf_aarch64_call();
+        let bin = crate::formats::analyze("stub", &bytes).unwrap();
+        let insns = crate::analysis::disasm::disassemble(
+            &bytes, bin.entry, bin.entry, bin.bits, bin.arch, 8,
+        );
+        let texts: Vec<&str> = insns.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts.len(), 8, "{texts:?}");
+        assert!(texts[0].starts_with("bl"), "{texts:?}");
+        assert_eq!(texts[1], "movz    x0, #0x2a", "{texts:?}");
+        assert_eq!(texts[2], "ret", "{texts:?}");
+        assert_eq!(texts[3], "nop", "{texts:?}");
+        assert_eq!(texts[4], "add     x0, x1, x2", "{texts:?}");
+        assert_eq!(texts[5], "ldr     x1, [x0, #0]", "{texts:?}");
+        assert_eq!(texts[6], "ret", "{texts:?}");
+        assert!(texts[7].starts_with("dword"), "{texts:?}");
+    }
+}

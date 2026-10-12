@@ -1,0 +1,211 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { parseVariableAxes, parseOpenTypeFeatures, pickBodyFamily, filterFontUrls, applyFamilyUsageFloor, resolveCustomFonts } from '../lib/extractors/typography.js';
+
+/**
+ * The typography extractor reads computed styles in the browser, but the
+ * variable-axis and OpenType parsing is pure Node and exported, so it is tested
+ * directly with synthetic font-variation-settings / font-feature-settings
+ * strings — no page required.
+ */
+
+test('parseVariableAxes folds settings into per-axis ranges, widest wins', () => {
+  const axes = parseVariableAxes(['"wght" 400', '"wght" 700, "slnt" -4', '"wght" 600']);
+  const wght = axes.find(a => a.axis === 'wght')!;
+  assert.equal(wght.min, 400);
+  assert.equal(wght.max, 700);
+  assert.equal(wght.count, 3);
+  const slnt = axes.find(a => a.axis === 'slnt')!;
+  assert.equal(slnt.min, -4);
+  assert.equal(slnt.max, -4);
+});
+
+test('parseVariableAxes sorts by usage count', () => {
+  const axes = parseVariableAxes(['"wght" 400', '"wght" 500', '"opsz" 14']);
+  assert.equal(axes[0].axis, 'wght');
+});
+
+test('parseVariableAxes returns nothing when no explicit settings exist', () => {
+  assert.deepEqual(parseVariableAxes([]), []);
+});
+
+test('parseOpenTypeFeatures dedupes and sorts enabled tags', () => {
+  const f = parseOpenTypeFeatures(['"ss01" on, "calt" 1', '"ss01"', '"liga"']);
+  assert.deepEqual(f, ['calt', 'liga', 'ss01']);
+});
+
+test('parseOpenTypeFeatures excludes features explicitly switched off', () => {
+  const f = parseOpenTypeFeatures(['"ss01" on, "tnum" off', '"kern" 0']);
+  assert.deepEqual(f, ['ss01']);
+});
+
+test('pickBodyFamily trusts the body base font when text renders in it', () => {
+  // Apple case: large lead paragraphs (Display) out-volume the 17px copy (Text)
+  // in the body bucket, but body's inherited base font is the canonical answer
+  // and real text uses it, so it wins despite lower coverage.
+  assert.equal(pickBodyFamily('SF Pro Text', { 'SF Pro Display': 5000, 'SF Pro Text': 400 }), 'SF Pro Text');
+});
+
+test('pickBodyFamily ignores the UA-default serif even when a sliver of text uses it', () => {
+  // NYT case: <body> sets no font-family -> UA default "Times". A little
+  // unstyled text renders in Times, but the real body font is the most-used
+  // custom family, not the browser default.
+  assert.equal(pickBodyFamily('Times', { 'nyt-franklin': 4000, Times: 200 }), 'nyt-franklin');
+});
+
+test('pickBodyFamily falls back to highest body-text coverage when body has no family', () => {
+  assert.equal(pickBodyFamily(null, { 'SF Pro Text': 5000, fontIvoryLl: 120 }), 'SF Pro Text');
+  assert.equal(pickBodyFamily('', { Inter: 100, Roboto: 50 }), 'Inter');
+});
+
+test('pickBodyFamily uses the body base as last resort when no text was measured', () => {
+  assert.equal(pickBodyFamily('Georgia', {}), 'Georgia');
+});
+
+test('pickBodyFamily breaks coverage ties on first-seen for determinism', () => {
+  assert.equal(pickBodyFamily(null, { Inter: 100, Roboto: 100 }), 'Inter');
+});
+
+test('pickBodyFamily returns null when neither signal yields a family', () => {
+  assert.equal(pickBodyFamily(null, {}), null);
+  assert.equal(pickBodyFamily('', { Inter: 0 }), null);
+});
+
+test('filterFontUrls dedupes repeated URLs', () => {
+  const urls = filterFontUrls([
+    'https://example.com/fonts/a.woff2',
+    'https://example.com/fonts/a.woff2',
+  ]);
+  assert.deepEqual(urls, ['https://example.com/fonts/a.woff2']);
+});
+
+test('filterFontUrls drops data: URIs', () => {
+  const urls = filterFontUrls([
+    'data:font/woff2;base64,AAAA',
+    'https://example.com/fonts/a.woff2',
+  ]);
+  assert.deepEqual(urls, ['https://example.com/fonts/a.woff2']);
+});
+
+test('filterFontUrls keeps font file extensions with and without query strings', () => {
+  const urls = filterFontUrls([
+    'https://example.com/a.woff2',
+    'https://example.com/b.woff?v=2',
+    'https://example.com/c.ttf#hash',
+    'https://example.com/d.otf',
+    'https://example.com/e.eot',
+  ]);
+  assert.deepEqual(urls, [
+    'https://example.com/a.woff2',
+    'https://example.com/b.woff?v=2',
+    'https://example.com/c.ttf#hash',
+    'https://example.com/d.otf',
+    'https://example.com/e.eot',
+  ].sort());
+});
+
+test('filterFontUrls keeps webfont provider stylesheet URLs without a font extension', () => {
+  const urls = filterFontUrls([
+    'https://fonts.googleapis.com/css2?family=Inter',
+    'https://fonts.gstatic.com/s/inter/v1/foo.woff2',
+    'https://use.typekit.net/abc123.css',
+    'https://fonts.bunny.net/css?family=inter',
+  ]);
+  assert.deepEqual(urls, [
+    'https://fonts.googleapis.com/css2?family=Inter',
+    'https://fonts.gstatic.com/s/inter/v1/foo.woff2',
+    'https://use.typekit.net/abc123.css',
+    'https://fonts.bunny.net/css?family=inter',
+  ].sort());
+});
+
+test('filterFontUrls drops unrelated URLs', () => {
+  const urls = filterFontUrls([
+    'https://example.com/images/logo.png',
+    'https://example.com/analytics.js',
+  ]);
+  assert.deepEqual(urls, []);
+});
+
+test('filterFontUrls returns [] for empty input', () => {
+  assert.deepEqual(filterFontUrls([]), []);
+});
+
+test('filterFontUrls rejects non-http(s) schemes even with a font-like path', () => {
+  const urls = filterFontUrls([
+    'javascript:alert(1)//a.woff2',
+    'data:font/woff2;base64,AAAA',
+    'file:///etc/passwd.woff2',
+  ]);
+  assert.deepEqual(urls, []);
+});
+
+// A page's type system is the families it sets text in. Third-party embeds drag
+// their own faces onto a handful of elements, and those arrived looking exactly
+// like a brand token: dembrandt.com reported six families, four of which covered
+// under 1% of counted text between them.
+
+const style = (family: string, count: number) => ({ family, count, size: '16px', weight: 400 });
+
+test('applyFamilyUsageFloor drops an embed face that covers a sliver of the page', () => {
+  const { styles, filteredFamilies } = applyFamilyUsageFloor([
+    style('ui-sans-serif', 313),
+    style('JetBrains Mono', 73),
+    style('Inter', 4),
+    style('Montserrat', 2),
+    style('Nohemi', 1),
+  ]);
+  assert.deepEqual(styles.map((s) => s.family), ['ui-sans-serif', 'JetBrains Mono']);
+  assert.deepEqual(filteredFamilies, ['Inter', 'Montserrat', 'Nohemi']);
+});
+
+test('applyFamilyUsageFloor keeps a genuine second family on a small page', () => {
+  const { styles, filteredFamilies } = applyFamilyUsageFloor([
+    style('Inter', 30),
+    style('Playfair Display', 8),
+  ]);
+  assert.equal(styles.length, 2);
+  assert.deepEqual(filteredFamilies, []);
+});
+
+test('applyFamilyUsageFloor never strips a page bare when nothing clears the floor', () => {
+  const input = [style('Inter', 1), style('Georgia', 1)];
+  const { styles, filteredFamilies } = applyFamilyUsageFloor(input);
+  assert.equal(styles.length, 2);
+  assert.deepEqual(filteredFamilies, []);
+});
+
+test('applyFamilyUsageFloor treats a missing count as one element', () => {
+  const { styles } = applyFamilyUsageFloor([
+    { family: 'Inter', size: '16px', weight: 400 },
+    ...Array.from({ length: 60 }, () => style('Inter', 1)),
+    { family: 'Widget Sans', size: '16px', weight: 400 },
+  ]);
+  assert.ok(styles.every((s) => s.family === 'Inter'));
+});
+
+test('applyFamilyUsageFloor is a no-op on empty input', () => {
+  const { styles, filteredFamilies } = applyFamilyUsageFloor([]);
+  assert.deepEqual(styles, []);
+  assert.deepEqual(filteredFamilies, []);
+});
+
+test('resolveCustomFonts prefers declared @font-face families', () => {
+  const out = resolveCustomFonts(['Charlie Text', 'Charlie Display', 'Charlie Text'], [], ['Arial'], []);
+  assert.deepEqual(out, ['Charlie Display', 'Charlie Text']);
+});
+
+test('resolveCustomFonts falls back to used families the browser actually loaded', () => {
+  const out = resolveCustomFonts(
+    [],
+    ['charlie text', 'Charlie Display', 'Inter', 'icons-font'],
+    ['Charlie Text', 'Charlie Display', 'Charlie Text', 'sans-serif', '-apple-system', 'Inter', 'Roboto'],
+    ['Inter'],
+  );
+  assert.deepEqual(out, ['Charlie Display', 'Charlie Text']);
+});
+
+test('resolveCustomFonts stays empty when no used family loaded', () => {
+  assert.deepEqual(resolveCustomFonts([], [], ['Charlie Text'], []), []);
+  assert.deepEqual(resolveCustomFonts([], ['icons-font'], ['Helvetica Neue'], []), []);
+});

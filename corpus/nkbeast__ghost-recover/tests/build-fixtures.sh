@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+# Builds the filesystem images the verification suite runs against.
+# Nothing here needs root: every filesystem is populated without mounting.
+set -euo pipefail
+
+# The default lives on real disk (NOT /tmp, which is tmpfs on many distros):
+# 2 GiB of images in RAM-backed tmpfs both fills it and pins memory, and it
+# vanishes on reboot. $HOME/.cache survives reboots and keeps RAM free.
+OUT="${1:-${XDG_CACHE_HOME:-$HOME/.cache}/ghost-recover/fixtures}"
+SRC="$OUT/corpus"
+IMG="$OUT/img"
+
+# Rebuild-from-scratch is slow (2 GiB of images, 20+ mkfs runs) and verify.sh
+# runs it on every invocation. Cache by the builder's own hash: identical
+# script, identical fixtures — reuse what is already on disk.
+STAMP_FILE="$OUT/.builder-sha1"
+STAMP="$(sha1sum "$0" | awk '{print $1}')"
+if [ -f "$IMG/ext4.img" ] && [ -f "$STAMP_FILE" ] && \
+   [ "$(cat "$STAMP_FILE")" = "$STAMP" ]; then
+  echo "fixtures -> $OUT (cached)"
+  echo "$OUT"
+  exit 0
+fi
+
+rm -rf "$OUT"
+mkdir -p "$SRC/docs" "$SRC/media" "$IMG"
+
+echo "fixtures -> $OUT"
+
+python3 - "$SRC" <<'PY'
+import os, sys, struct, zlib, json, io, zipfile, sqlite3, tempfile, shutil
+root = sys.argv[1]
+def w(p, b):
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(p, 'wb').write(b)
+
+def png(width, height, colour):
+    raw = b''.join(b'\x00' + bytes(colour) * width for _ in range(height))
+    def chunk(t, d):
+        c = t + d
+        return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n'
+            + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+
+w(root + '/media/red.png',  png(64, 64, (220, 30, 40)))
+w(root + '/media/blue.png', png(128, 96, (20, 60, 200)))
+
+jpeg = bytes.fromhex(
+ 'ffd8ffe000104a46494600010100000100010000ffdb004300ffffffffffffffffffffffffffff'
+ 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+ 'ffffffffffffffffffffffffffffffffffffffc00011080010001003012200021101031101'
+ 'ffc4001f0000010501010101010100000000000000000102030405060708090a0b'
+ 'ffc400b5100002010303020403050504040000017d01020300041105122131410613516107'
+ '227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738'
+ '393a434445464748494a535455565758595a636465666768696a737475767778797a8384858687'
+ '88898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9ca'
+ 'd2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9fa'
+ 'ffda0008010100003f00fbfeffd9')
+w(root + '/media/photo.jpg', jpeg)
+
+w(root + '/media/tiny.gif',
+  b'GIF89a' + struct.pack('<HH', 4, 4) + b'\xf0\x00\x00' + b'\x00\x00\x00\xff\xff\xff'
+  + b'\x2c' + struct.pack('<HHHH', 0, 0, 4, 4) + b'\x00' + b'\x02\x04\x84\x8f\x09\x05\x00' + b'\x3b')
+
+samples = b''.join(struct.pack('<h', int(3000 * ((i % 100) / 50 - 1))) for i in range(8000))
+w(root + '/media/tone.wav',
+  b'RIFF' + struct.pack('<I', 36 + len(samples)) + b'WAVE'
+  + b'fmt ' + struct.pack('<IHHIIHH', 16, 1, 1, 8000, 16000, 2, 16)
+  + b'data' + struct.pack('<I', len(samples)) + samples)
+
+w(root + '/docs/report.pdf',
+  b'%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n'
+  b'2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n'
+  b'3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n'
+  b'trailer<</Root 1 0 R>>\n%%EOF\n')
+
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+    z.writestr('notes.txt', 'ghost recover archive test\n' * 40)
+    z.writestr('data/values.csv', 'id,name\n1,alpha\n2,beta\n')
+w(root + '/docs/bundle.zip', buf.getvalue())
+
+tmp = tempfile.mktemp(suffix='.sqlite')
+c = sqlite3.connect(tmp)
+c.execute('CREATE TABLE contacts(id INTEGER PRIMARY KEY, name TEXT, email TEXT)')
+for i in range(50):
+    c.execute('INSERT INTO contacts(name,email) VALUES(?,?)', (f'user{i}', f'u{i}@example.com'))
+c.commit(); c.close()
+w(root + '/docs/contacts.sqlite', open(tmp, 'rb').read()); os.unlink(tmp)
+
+w(root + '/docs/readme.txt', ('GHOST RECOVER verification corpus.\n' * 60).encode())
+w(root + '/docs/config.json', json.dumps({"engine": "ghost", "version": 3}, indent=2).encode())
+w(root + '/docs/script.sh', b'#!/bin/bash\necho "recovered"\nexit 0\n' + b'# padding\n' * 40)
+shutil.copyfile('/bin/true', root + '/docs/true.elf')
+# Large enough to need several blocks and an indirect/extent chain.
+w(root + '/media/large.bin', bytes((i * 7 + 13) % 251 for i in range(600 * 1024)))
+# Compressible files: the btrfs fixture is patched so these are stored as
+# compressed extents (inline zlib/lzo/zstd, and a regular zlib extent).
+for name, ch in (('inline-a.txt', 'a'), ('inline-b.txt', 'b'), ('inline-c.txt', 'c')):
+    w(root + '/docs/' + name, (ch * 200).encode())
+w(root + '/media/compressible.bin',
+  b''.join(('GHOST RECOVER compression fixture line %06d\n' % i).encode()
+           for i in range(5000)))
+print('corpus files:', sum(len(f) for _, _, f in os.walk(root)))
+PY
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have mkfs.ext4  && mkfs.ext4 -q -F -L GHOSTEXT4 -d "$SRC" -b 4096 "$IMG/ext4.img" 40M
+have mkfs.ext2  && mkfs.ext2 -q -F -L GHOSTEXT2 -d "$SRC" -b 1024 "$IMG/ext2.img" 40M
+have mksquashfs && mksquashfs "$SRC" "$IMG/squashfs.img" -quiet -noappend -comp gzip
+have genisoimage && genisoimage -quiet -J -R -V GHOSTISO -o "$IMG/iso9660.img" "$SRC"
+
+if have mkfs.btrfs; then
+  truncate -s 400M "$IMG/btrfs.img"
+  mkfs.btrfs -q -f -L GHOSTBTRFS -r "$SRC" "$IMG/btrfs.img"
+  # Rewrite selected extents as compressed ones; byte-identical recovery then
+  # proves the codec paths (the raw bytes are gone once this runs).
+  if python3 - "$IMG/btrfs.img" "$SRC" < tests/btrfs_compress_fixture.py
+  then :; else
+    echo "btrfs compressed-fixture patching failed" >&2
+    exit 1
+  fi
+fi
+
+if have mkfs.vfat && have mcopy; then
+  truncate -s 40M "$IMG/fat32.img"
+  mkfs.vfat -F 32 -n GHOSTFAT "$IMG/fat32.img" >/dev/null
+  MTOOLS_SKIP_CHECK=1 mmd -i "$IMG/fat32.img" ::docs ::media
+  (cd "$SRC" && find . -type f | sed 's|^\./||') | while read -r f; do
+    MTOOLS_SKIP_CHECK=1 mcopy -i "$IMG/fat32.img" "$SRC/$f" "::$f"
+  done
+fi
+
+if have mkntfs && have ntfscp; then
+  truncate -s 60M "$IMG/ntfs.img"
+  mkntfs -Q -F -L GHOSTNTFS "$IMG/ntfs.img" >/dev/null 2>&1
+  for f in "$SRC"/docs/* "$SRC"/media/*; do
+    ntfscp -q "$IMG/ntfs.img" "$f" "$(basename "$f")" >/dev/null 2>&1 || true
+  done
+  # Rewrite compressible.bin as an LZNT1-compressed stream; recovery must
+  # decode it to match the corpus (the raw bytes are gone once this runs).
+  if python3 - "$IMG/ntfs.img" "$SRC" < tests/ntfs_compress_fixture.py
+  then :; else
+    echo "ntfs compressed-fixture patching failed" >&2
+    exit 1
+  fi
+fi
+
+if have mkfs.xfs; then
+  { echo ghostproto; echo "0 0"; echo "d--755 0 0"
+    echo "docs d--755 0 0"; for f in "$SRC"/docs/*; do echo "$(basename "$f") ---644 0 0 $f"; done; echo '$'
+    echo "media d--755 0 0"; for f in "$SRC"/media/*; do echo "$(basename "$f") ---644 0 0 $f"; done; echo '$'
+    echo '$'; } > "$OUT/xfs.proto"
+  truncate -s 320M "$IMG/xfs.img"
+  mkfs.xfs -q -f -L GHOSTXFS -p "$OUT/xfs.proto" "$IMG/xfs.img"
+fi
+
+if have mkfs.exfat; then
+  truncate -s 64M "$IMG/exfat.img"
+  mkfs.exfat -n GHOSTEXFAT "$IMG/exfat.img" >/dev/null 2>&1
+  # Pure-python population: entry sets, contiguous NoFatChain runs, FAT and
+  # allocation bitmap are written without mounting.
+  if python3 - "$IMG/exfat.img" "$SRC" < tests/exfat_fixture.py
+  then :; else
+    echo "exfat fixture population failed" >&2
+    exit 1
+  fi
+fi
+if have mkfs.minix; then
+  truncate -s 20M "$IMG/minix.img"
+  mkfs.minix -3 "$IMG/minix.img" >/dev/null 2>&1
+  # Populate without mounting: append one directory entry per corpus file to
+  # the root directory and give each an inode plus data zones (direct, then a
+  # single-indirect block past seven zones). A fresh mkfs image holds only the
+  # root inode, which parsed correctly even back when the driver walked v3
+  # inodes with the wrong stride — only multi-inode images catch that.
+  if python3 - "$IMG/minix.img" "$SRC" <<'PY'
+import math, os, struct, sys
+img, src = sys.argv[1], sys.argv[2]
+d = bytearray(open(img, 'rb').read())
+SB = 1024
+K = 1024
+ninodes   = struct.unpack_from('<I', d, SB + 0)[0]
+imap_blk  = struct.unpack_from('<H', d, SB + 6)[0]
+zmap_blk  = struct.unpack_from('<H', d, SB + 8)[0]
+firstdata = struct.unpack_from('<H', d, SB + 10)[0]
+nzones    = struct.unpack_from('<I', d, SB + 20)[0]
+it_off    = (2 + imap_blk + zmap_blk) * K
+
+def bit_set(buf_off, n):
+    d[buf_off + n // 8] |= 1 << (n % 8)
+
+def bit_test(buf_off, n):
+    return (d[buf_off + n // 8] >> (n % 8)) & 1
+
+def free_inode():
+    # Inode numbers are 1-based: record r of the table is inode r+1. Record 0
+    # is the root, so allocation starts at record 1 (= inode 2).
+    for rec in range(1, ninodes):
+        off = it_off + rec * 64
+        if struct.unpack_from('<H', d, off)[0] == 0:
+            bit_set(2 * K, rec + 1)
+            return rec + 1
+    raise SystemExit('no free inodes')
+
+next_zone = firstdata + 1
+def alloc_zone():
+    global next_zone
+    while next_zone < nzones and bit_test(3 * K, next_zone):
+        next_zone += 1
+    if next_zone >= nzones:
+        raise SystemExit('image full')
+    z = next_zone
+    next_zone += 1
+    bit_set(3 * K, z)
+    return z
+
+root_ino = 1
+root = it_off + (root_ino - 1) * 64
+root_size = struct.unpack_from('<I', d, root + 8)[0]
+files = sorted(
+    os.path.join(dp, f) for dp, _, fs in os.walk(src) for f in fs
+)
+# The fresh root directory is a single 1 KiB zone with "." and ".." already
+# in it; 17 more entries do not fit. Extend it across as many consecutive
+# fresh zones as needed and chain them through the root inode's direct
+# slots — the driver reads them exactly like any other extent run.
+dir_need = root_size + 64 * len(files)
+dir_zones = []
+for _ in range(max(1, math.ceil(dir_need / K))):
+    dir_zones.append(alloc_zone())
+zs_root = [0] * 10
+zs_root[:len(dir_zones)] = dir_zones
+struct.pack_into('<10I', d, root + 24, *zs_root)
+for path in files:
+    name = os.path.basename(path).encode()[:60]
+    data = open(path, 'rb').read()
+    need = max(1, math.ceil(len(data) / K))
+    blocks = [bytes(data[i*K:(i+1)*K].ljust(K, b'\0')) for i in range(need)]
+    zones = [alloc_zone() for _ in range(need)]
+    for z, blk in zip(zones, blocks):
+        d[z*K:(z+1)*K] = blk
+    zz = [0]*10
+    direct = zones[:7]
+    zz[:len(direct)] = direct
+    rest = zones[7:]
+    if rest:
+        # Indirect mapping, mirroring the on-disk format: zone 7 points at a
+        # table of up to 256 data zones (single-indirect); beyond that zone 8
+        # points at a table of such tables (double-indirect).
+        def ind_table(entries):
+            t = b''.join(struct.pack('<I', x) for x in entries)
+            return t.ljust(K, b'\0')
+        per = K // 4
+        lvl1 = []
+        while rest:
+            chunk, rest = rest[:per], rest[per:]
+            tz = alloc_zone()
+            d[tz*K:(tz+1)*K] = ind_table(chunk)
+            lvl1.append(tz)
+        if len(lvl1) == 1:
+            zz[7] = lvl1[0]
+        else:
+            top = alloc_zone()
+            d[top*K:(top+1)*K] = ind_table(lvl1)
+            zz[8] = top
+    ino = free_inode()
+    off = it_off + (ino - 1) * 64
+    struct.pack_into('<H', d, off + 0, 0o100644)          # mode: regular
+    struct.pack_into('<H', d, off + 2, 1)                 # nlinks
+    struct.pack_into('<I', d, off + 8, len(data))         # size
+    struct.pack_into('<10I', d, off + 24, *zz)
+    # Entries may straddle two dir zones: write per-zone chunks.
+    ent = struct.pack('<I', ino) + name.ljust(60, b'\0')
+    abs_pos = dir_zones[0] * K + root_size
+    end_abs = abs_pos + 64
+    for zi, z in enumerate(dir_zones):
+        zlo, zhi = z * K, (z + 1) * K
+        lo, hi = max(abs_pos, zlo), min(end_abs, zhi)
+        if lo < hi:
+            d[lo:hi] = ent[(lo - abs_pos):(hi - abs_pos)]
+    root_size += 64
+
+struct.pack_into('<I', d, root + 8, root_size)
+open(img, 'wb').write(bytes(d))
+print(f'minix.img populated with {len(files)} corpus files')
+PY
+  then :; else
+    echo "minix fixture population failed" >&2
+    exit 1
+  fi
+fi
+
+if have mkfs.hfs && have hcopy; then
+  # Classic HFS via hfsutils. hcopy converts LF->CR in .txt files and refuses
+  # large.bin/compressible.bin, so verify.sh builds a dedicated expectation.
+  dd if=/dev/zero of="$IMG/hfs.img" bs=1M count=24 status=none
+  mkfs.hfs -v GHOSTHFS "$IMG/hfs.img" >/dev/null 2>&1
+  ( cd "$SRC" && find . -type f ) | while read -r f; do
+    b=$(basename "$f")
+    [ "$b" = large.bin ] && continue
+    [ "$b" = compressible.bin ] && continue
+    d=$(dirname "$f" | sed 's|^\./||')
+    printf 'y\n' | hmount "$IMG/hfs.img" >/dev/null 2>&1
+    hls ":$d" >/dev/null 2>&1 || hmkdir ":$d" 2>/dev/null
+    printf 'y\n' | hcopy "$SRC/$f" ":$d/$b" >/dev/null 2>&1
+    hsumount >/dev/null 2>&1 || humount >/dev/null 2>&1 || true
+  done
+fi
+
+# ROMFS via genromfs (root-free; single-file tool from the genromfs package).
+have genromfs && genromfs -f "$IMG/romfs.img" -d "$SRC" -V GHOSTROM >/dev/null 2>&1
+
+# UFS1/UFS2 via NetBSD makefs (root-free, builds from a directory tree).
+if have makefs; then
+  makefs -t ffs -o version=1 -s 128m "$IMG/ufs.img" "$SRC" >/dev/null 2>&1
+  makefs -t ffs -o version=2 -s 128m "$IMG/ufs2.img" "$SRC" >/dev/null 2>&1
+fi
+
+# ---------------------------------------------------------------------------
+# The remaining walkers (hfsplus/hfsx, f2fs, ufs/ufs2, jfs) are populated
+# through kernel loop mounts, which need root. Running
+#   sudo tests/build-fixtures.sh <dir>
+# builds them; otherwise the suite skips those filesystems.
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" -eq 0 ] && [ -x "$IMG" ]; then
+  loop_mount_populate() { # <img> <dir> <fs> : mount, copy corpus, unmount
+    local img="$1" mnt="$2" fs="$3"
+    mkdir -p "$mnt"
+    if ! mount -t "$fs" -o loop "$img" "$mnt" >/dev/null 2>&1; then rmdir "$mnt" 2>/dev/null; return 1; fi
+    ( cd "$SRC" && tar cf - . ) | ( cd "$mnt" && tar xf - ) 2>/dev/null || true
+    umount "$mnt" 2>/dev/null || true
+    rmdir "$mnt" 2>/dev/null || true
+  }
+
+  if have mkfs.hfsplus; then
+    for sig in "hfsplus:" "hfsx:-s"; do
+      name="${sig%%:*}"; opt="${sig#*:}"
+      truncate -s 100M "$IMG/$name.img"
+      mkfs.hfsplus -v "GHOST$(echo "$name" | tr a-z A-Z)" $opt "$IMG/$name.img" >/dev/null 2>&1
+      loop_mount_populate "$IMG/$name.img" "$OUT/mnt-$name" hfsplus || echo "hfsplus mount unavailable ($name skipped)" >&2
+    done
+  fi
+
+  if have mkfs.f2fs; then
+    truncate -s 100M "$IMG/f2fs.img"
+    mkfs.f2fs -l GHOSTF2FS "$IMG/f2fs.img" >/dev/null 2>&1
+    loop_mount_populate "$IMG/f2fs.img" "$OUT/mnt-f2fs" f2fs || echo "f2fs mount unavailable (skipped)" >&2
+  fi
+
+  if have mkfs.jfs; then
+    truncate -s 100M "$IMG/jfs.img"
+    mkfs.jfs -q -L GHOSTJFS "$IMG/jfs.img" >/dev/null 2>&1
+    loop_mount_populate "$IMG/jfs.img" "$OUT/mnt-jfs" jfs || echo "jfs mount unavailable (skipped)" >&2
+  fi
+
+  # ReiserFS: kernels >= 6.13 dropped the driver entirely, so the volume can
+  # no longer be populated and an unpopulated image makes the walker fail the
+  # suite. No fixture is built; the suite SKIPs reiserfs cleanly until the
+  # driver returns (the engine code path remains intact).
+  if false; then
+    if have mkfs.reiserfs; then
+      truncate -s 100M "$IMG/reiserfs.img"
+      mkfs.reiserfs -f -q -l GHOSTREISER "$IMG/reiserfs.img" >/dev/null 2>&1
+      loop_mount_populate "$IMG/reiserfs.img" "$OUT/mnt-reiserfs" reiserfs || echo "reiserfs mount unavailable (skipped)" >&2
+    fi
+  fi
+fi
+
+if have mkfs.jffs2; then
+  # Read-only population; every data node is zlib-compressed by default, so
+  # byte-identical recovery exercises the JFFS2 walker and zlib decode.
+  mkfs.jffs2 -q -l -r "$SRC" -o "$IMG/jffs2.img" --eraseblock=64KiB
+fi
+
+# Deleted-file fixtures: unlink without mounting.
+if [ -f "$IMG/ext4.img" ] && have debugfs; then
+  cp "$IMG/ext4.img" "$IMG/ext4-deleted.img"
+  for f in /docs/report.pdf /media/photo.jpg /docs/contacts.sqlite; do
+    debugfs -w -R "rm $f" "$IMG/ext4-deleted.img" >/dev/null 2>&1
+  done
+fi
+if [ -f "$IMG/fat32.img" ] && have mdel; then
+  cp "$IMG/fat32.img" "$IMG/fat32-deleted.img"
+  for f in docs/report.pdf media/photo.jpg docs/contacts.sqlite; do
+    MTOOLS_SKIP_CHECK=1 mdel -i "$IMG/fat32-deleted.img" "::$f" 2>/dev/null || true
+  done
+fi
+
+# A partitioned disk, plus a copy with both GPT headers destroyed.
+if have sfdisk && [ -f "$IMG/ext4.img" ] && [ -f "$IMG/fat32.img" ]; then
+  truncate -s 200M "$IMG/disk-gpt.img"
+  sfdisk -q "$IMG/disk-gpt.img" >/dev/null 2>&1 <<'EOT'
+label: gpt
+start=2048, size=81920, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="linux-data"
+start=86016, size=122880, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7, name="windows-data"
+EOT
+  dd if="$IMG/ext4.img"  of="$IMG/disk-gpt.img" bs=512 seek=2048  count=81920  conv=notrunc status=none
+  dd if="$IMG/fat32.img" of="$IMG/disk-gpt.img" bs=512 seek=86016 count=122880 conv=notrunc status=none
+  cp "$IMG/disk-gpt.img" "$IMG/disk-gpt-wiped.img"
+  dd if=/dev/zero of="$IMG/disk-gpt-wiped.img" bs=512 count=34 conv=notrunc status=none
+  dd if=/dev/zero of="$IMG/disk-gpt-wiped.img" bs=512 seek=409566 count=34 conv=notrunc status=none
+fi
+
+# An MBR disk with logical partitions inside an extended partition.
+if have sfdisk && [ -f "$IMG/ext4.img" ] && [ -f "$IMG/fat32.img" ]; then
+  truncate -s 260M "$IMG/disk-mbr.img"
+  sfdisk -q "$IMG/disk-mbr.img" >/dev/null 2>&1 <<'EOT'
+label: dos
+start=2048,   size=81920,  type=83
+start=86016,  size=368640, type=5
+start=88064,  size=122880, type=c
+start=212992, size=81920,  type=83
+EOT
+  dd if="$IMG/ext4.img"  of="$IMG/disk-mbr.img" bs=512 seek=2048   count=81920  conv=notrunc status=none
+  dd if="$IMG/fat32.img" of="$IMG/disk-mbr.img" bs=512 seek=88064  count=122880 conv=notrunc status=none
+  dd if="$IMG/ext2.img"  of="$IMG/disk-mbr.img" bs=512 seek=212992 count=81920  conv=notrunc status=none
+fi
+
+have mkfs.cramfs && mkfs.cramfs "$SRC" "$IMG/cramfs.img" >/dev/null 2>&1
+# genisoimage can produce a *populated* UDF volume; mkudffs cannot.
+have genisoimage && genisoimage -quiet -udf -V GHOSTUDF -o "$IMG/udf.img" "$SRC" 2>/dev/null
+
+# RAID fixtures. A near-empty array is genuinely ambiguous — a chunk size of N
+# and N/2 map its start identically — so a filled one is built as well, and the
+# suite checks both the exact answer and the honest "cannot tell" report.
+if [ -f "$IMG/ext4.img" ] && have mkfs.ext4; then
+  mkdir -p "$IMG/raid" "$IMG/raid-filled"
+  python3 - "$OUT" <<'PY'
+import os, sys, struct, zlib, random, subprocess
+out = sys.argv[1]
+src = os.path.join(out, 'filled-src', 'photos')
+os.makedirs(src, exist_ok=True)
+def png(w, h, seed):
+    rnd = random.Random(seed)
+    raw = b''.join(b'\x00' + bytes(rnd.randrange(256) for _ in range(w*3)) for _ in range(h))
+    def chunk(t, d):
+        c = t + d
+        return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(raw, 1)) + chunk(b'IEND', b''))
+for i in range(6):
+    open(f'{src}/img{i}.png', 'wb').write(png(320, 240, i))
+PY
+  mkfs.ext4 -q -F -L FILLED -d "$OUT/filled-src" -b 4096 "$IMG/filled.img" 40M
+  python3 - "$IMG" <<'PY'
+import sys, os
+img = sys.argv[1]
+C = 65536
+def stripe0(src, outdir, n=2):
+    data = open(src,'rb').read()
+    outs = [open(f'{outdir}/member{i}.img','wb') for i in range(n)]
+    for i in range(0, len(data), C):
+        outs[(i//C) % n].write(data[i:i+C])
+    for o in outs: o.close()
+def raid5(src, outdir, N=4):
+    data = open(src,'rb').read(); dd = N-1
+    nC = (len(data)+C-1)//C; nS = (nC+dd-1)//dd
+    mem = [bytearray(nS*C) for _ in range(N)]
+    for s in range(nS):
+        pd = N-1-(s % N); par = bytearray(C)
+        for i in range(dd):
+            ci = s*dd+i
+            ch = data[ci*C:(ci+1)*C].ljust(C, b'\x00')
+            mem[(pd+1+i) % N][s*C:(s+1)*C] = ch
+            for k in range(C): par[k] ^= ch[k]
+        mem[pd][s*C:(s+1)*C] = par
+    for i,m in enumerate(mem):
+        open(f'{outdir}/member{i}.img','wb').write(bytes(m))
+stripe0(f'{img}/ext4.img',   f'{img}/raid')          # sparse: ambiguous by nature
+stripe0(f'{img}/filled.img', f'{img}/raid-filled')   # filled: determinable
+os.makedirs(f'{img}/raid5-filled', exist_ok=True)
+raid5(f'{img}/filled.img',   f'{img}/raid5-filled')
+def gfmul(a, b):
+    r = 0
+    for _ in range(8):
+        if b & 1: r ^= a
+        b >>= 1
+        a <<= 1
+        if a & 0x100: a ^= 0x11d
+    return r & 0xff
+def raid6(src, outdir, N=4):
+    # left-symmetric RAID 6 (the md default): P at n-1-(s%n), Q at pd+1,
+    # data chunk i at (pd+2+i)%n, Q = sum D_i * g^i over GF(2^8).
+    data = open(src,'rb').read(); dd = N-2
+    nC = (len(data)+C-1)//C; nS = (nC+dd-1)//dd
+    g = [1]
+    for i in range(1, dd+1): g.append(gfmul(g[-1], 2))
+    mem = [bytearray(nS*C) for _ in range(N)]
+    for s in range(nS):
+        pd = N-1-(s % N); qd = (pd+1) % N
+        par = bytearray(C); q = bytearray(C)
+        for i in range(dd):
+            ci = s*dd+i
+            ch = data[ci*C:(ci+1)*C].ljust(C, b'\x00')
+            mem[(pd+2+i) % N][s*C:(s+1)*C] = ch
+            for k in range(C): par[k] ^= ch[k]
+            for k in range(C): q[k] ^= gfmul(ch[k], g[i])
+        mem[pd][s*C:(s+1)*C] = par
+        mem[qd][s*C:(s+1)*C] = q
+    for i,m in enumerate(mem):
+        open(f'{outdir}/member{i}.img','wb').write(bytes(m))
+os.makedirs(f'{img}/raid6-filled', exist_ok=True)
+raid6(f'{img}/filled.img', f'{img}/raid6-filled')
+PY
+
+  # Same arrays, but stamped with real Linux md superblocks (1.x and 0.90,
+  # field layouts from include/uapi/linux/raid/md_p.h) so the superblock
+  # parsers are exercised: geometry must come from the metadata, not from
+  # brute force. The superblock is appended, so the data offsets stay zero.
+  python3 - "$IMG" <<'PY'
+import sys, os, struct, random, shutil
+img = sys.argv[1]
+rnd = random.Random(0x900)
+C = 65536
+
+def sb1(member_size, level, layout, n, devs, role):
+    # superblock 1.0: sits in the last 4 KiB block, 8 KiB from the end.
+    S = member_size + 8192
+    sb = bytearray(4096)
+    def w32(off, v): sb[off:off+4] = struct.pack('<I', v & 0xffffffff)
+    def w64(off, v): sb[off:off+8] = struct.pack('<Q', v & 0xffffffffffffffff)
+    w32(0,  0xA92B4EFC)                      # md_magic
+    sb[4] = 1                                # major version 1 (1.0: sb at end)
+    sb[8:24] = os.urandom(16)                # set_uuid
+    w64(64, 1700000000)                      # ctime
+    w32(72, level)                           # level
+    w32(76, layout)                          # layout (raid10: near copies in low byte)
+    w64(80, member_size // 512)              # size in sectors
+    w32(88, C // 512)                        # chunk size in 512-byte units
+    w32(92, n)                               # raid_disks
+    w64(128, 0)                              # data_offset (0 for 1.0)
+    w64(136, member_size // 512)             # data_size
+    w64(144, (S - 8192) // 512)              # super_offset
+    w32(160, role)                           # this device's number
+    sb[168:184] = os.urandom(16)             # device_uuid
+    w64(192, 1700000000)                     # utime
+    w64(200, 100 + role)                     # events
+    w32(220, n)                              # max_dev
+    for i, d in enumerate(devs):             # dev_roles[]
+        sb[256 + 2*i:258 + 2*i] = struct.pack('<H', d)
+    return bytes(sb) + bytes(4096)
+
+def sb090(member_size, level, layout, n, role):
+    S = member_size + 65536
+    sb = bytearray(4096)
+    def w32(off, v): sb[off:off+4] = struct.pack('<I', v & 0xffffffff)
+    w32(0,  0xA92B4EFC)                      # md_magic
+    w32(4,  0)                               # major 0.90
+    w32(8,  90)                              # minor
+    w32(20, rnd.getrandbits(32))             # set_uuid0
+    w32(24, 1700000000)                      # ctime
+    w32(28, level)                           # level
+    w32(32, member_size // 512)              # size in sectors (usable size)
+    w32(40, n)                               # raid_disks
+    w32(52, rnd.getrandbits(32))             # set_uuid1
+    w32(56, rnd.getrandbits(32))             # set_uuid2
+    w32(60, rnd.getrandbits(32))             # set_uuid3
+    w32(256, layout)                         # md_layout
+    w32(260, C)                              # chunk_size in bytes
+    w32(3968, role)                          # this_disk.number
+    w32(3980, role)                          # this_disk.raid_disk
+    for i in range(n):                       # disks[] array
+        base = 512 + i * 128
+        w32(base, i)                         # number
+        w32(base + 12, i)                    # raid_disk
+    return bytes(sb) + bytes(65536 - 4096)
+
+def stamp(dirname, maker, *args):
+    for name in sorted(os.listdir(f'{img}/{dirname}')):
+        if not name.startswith('member'): continue
+        p = f'{img}/{dirname}/{name}'
+        data = open(p, 'rb').read()
+        role = int(name[len('member'):name.index('.')])
+        open(p, 'wb').write(data + maker(len(data), *args, role=role))
+
+# 1.x on the RAID 5 array, kept separate from the superblock-less fixture.
+shutil.copytree(f'{img}/raid5-filled', f'{img}/raid5-md')
+stamp('raid5-md', sb1, 5, 2, 4, [0, 1, 2, 3])
+
+# 0.90 on the RAID 0 array.
+shutil.copytree(f'{img}/raid-filled', f'{img}/raid0-md')
+stamp('raid0-md', sb090, 0, 0, 2)
+
+# 1.x on the RAID 6 array (left-symmetric, the md default).
+shutil.copytree(f'{img}/raid6-filled', f'{img}/raid6-md')
+stamp('raid6-md', sb1, 6, 2, 4, [0, 1, 2, 3])
+
+# near-2 RAID 10 (1.x) built from the filled image.
+def raid10_near2(src, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    data = open(src, 'rb').read()
+    nC = (len(data) + C - 1) // C
+    mem = [bytearray(nC * C) for _ in range(4)]
+    for c in range(nC):
+        pair = (c % 2) * 2
+        ch = data[c*C:(c+1)*C].ljust(C, b'\x00')
+        mem[pair][(c // 2)*C:(c // 2 + 1)*C] = ch
+        mem[pair + 1][(c // 2)*C:(c // 2 + 1)*C] = ch
+    for i, m in enumerate(mem):
+        open(f'{outdir}/member{i}.img', 'wb').write(bytes(m))
+raid10_near2(f'{img}/filled.img', f'{img}/raid10-md')
+stamp('raid10-md', sb1, 10, 2, 4, [0, 1, 2, 3])
+PY
+fi
+
+printf '%s' "$STAMP" > "$STAMP_FILE"
+echo "$OUT"

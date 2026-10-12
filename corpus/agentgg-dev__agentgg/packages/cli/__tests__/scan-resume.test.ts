@@ -1,0 +1,795 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Finding, UserConfig } from "@agentgg/core";
+import {
+  loadAllFileRecords,
+  readAgentRun,
+  readFileRecord,
+  readScanPlan,
+  saveUserConfig,
+} from "@agentgg/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Synthesize a minimal unified agent .md so these tests don't depend on
+// whatever the live agentgg-agents catalog ships. The detector is mocked,
+// so the prompt body doesn't matter — only the frontmatter shape. `where`
+// scopes to `.js`; no preFilter means every matched file is a candidate.
+function writeTestAgent(dir: string, slug: string): string {
+  const body = `---
+slug: ${slug}
+name: ${slug}
+description: Synthetic agent for scan-resume tests.
+where:
+  extensions:
+    - js
+---
+Stub agent body. Detector is mocked.
+`;
+  const path = join(dir, `${slug}.md`);
+  writeFileSync(path, body, "utf8");
+  return path;
+}
+
+function mockFinding(slug: string, filePath: string): Finding {
+  return {
+    id: `${slug}-${filePath}`,
+    agentSlug: slug,
+    title: "mock finding",
+    vulnSlug: slug,
+    filePath,
+    summary: "s",
+    details: "d",
+    poc: "p",
+    impact: "i",
+    references: [],
+    confidence: 0.9,
+    notifications: [],
+  };
+}
+
+// The unified detector contract: recon + checkPrecondition + runAgent +
+// validateFinding. The scope/score passes aren't exercised here, so they
+// are omitted from the mock.
+const detectorMock = vi.hoisted(() => ({
+  recon: vi.fn(async () => ({
+    purpose: "test fixture",
+    languages: ["javascript"],
+    frameworks: [] as string[],
+    authModel: null as string | null,
+    integrations: [] as string[],
+    notableDirs: [] as string[],
+    summary: "A small JS test fixture.",
+  })),
+  checkPrecondition: vi.fn(async () => ({ relevant: true, reason: "stub" })),
+  runAgent: vi.fn(
+    async (_args: { agent: { slug: string }; candidates: { filePath: string }[] }) =>
+      [] as Finding[],
+  ),
+  validateFinding: vi.fn(async () => ({
+    verdict: "confirmed" as const,
+    reasoning: "default",
+  })),
+}));
+
+vi.mock("../src/llm.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/llm.js")>("../src/llm.js");
+  return {
+    ...actual,
+    resolveDetector: () => ({
+      name: "test-mock",
+      recon: detectorMock.recon,
+      checkPrecondition: detectorMock.checkPrecondition,
+      runAgent: detectorMock.runAgent,
+      validateFinding: detectorMock.validateFinding,
+    }),
+  };
+});
+
+// --diff shells out to git (listChangedFiles / loadCommitPatch). Stub that
+// boundary so the --diff tests stay hermetic and deterministic — no git repo,
+// no platform-specific git behavior. `changedFiles` is the set --diff scopes to.
+const diffMock = vi.hoisted(() => ({
+  changedFiles: [] as string[],
+  patch: "diff --git a/x b/x",
+}));
+
+vi.mock("../src/diff.js", () => ({
+  listChangedFiles: () => diffMock.changedFiles,
+  loadCommitPatch: () => diffMock.patch,
+}));
+
+import { runScan } from "../src/commands/scan.js";
+import { VALIDATION_CUT_SHORT } from "../src/validator.js";
+
+let agentggHome: string;
+let projectRoot: string;
+let outputDir: string;
+let agentsDir: string;
+let agentA: string;
+let agentB: string;
+let env: NodeJS.ProcessEnv;
+
+beforeEach(() => {
+  agentggHome = mkdtempSync(join(tmpdir(), "agentgg-home-"));
+  projectRoot = mkdtempSync(join(tmpdir(), "agentgg-target-"));
+  outputDir = mkdtempSync(join(tmpdir(), "agentgg-out-"));
+  agentsDir = mkdtempSync(join(tmpdir(), "agentgg-agents-"));
+  agentA = writeTestAgent(agentsDir, "test-detector-a");
+  agentB = writeTestAgent(agentsDir, "test-detector-b");
+  env = { AGENTGG_HOME: agentggHome };
+
+  writeFileSync(
+    join(projectRoot, "server.js"),
+    "const x = 'sk-test'; require('cp').exec(process.argv[2]);",
+    "utf8",
+  );
+  writeFileSync(join(projectRoot, "util.js"), "module.exports = (a) => a + 1;", "utf8");
+
+  const cfg: UserConfig = {
+    provider: "anthropic",
+    anthropic: { apiKey: "sk-ant-test", model: "claude-sonnet-4-6" },
+    schemaVersion: 1,
+  };
+  saveUserConfig(cfg, env);
+
+  // Reset the --diff stub; each --diff test sets its own changed-file set.
+  diffMock.changedFiles = [];
+
+  detectorMock.recon.mockImplementation(async () => ({
+    purpose: "test fixture",
+    languages: ["javascript"],
+    frameworks: [],
+    authModel: null,
+    integrations: [],
+    notableDirs: [],
+    summary: "A small JS test fixture.",
+  }));
+  detectorMock.checkPrecondition.mockImplementation(async () => ({
+    relevant: true,
+    reason: "stub",
+  }));
+  detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) =>
+    candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+  );
+  detectorMock.validateFinding.mockImplementation(async () => ({
+    verdict: "confirmed",
+    reasoning: "default",
+  }));
+});
+
+afterEach(() => {
+  rmSync(agentggHome, { recursive: true, force: true });
+  rmSync(projectRoot, { recursive: true, force: true });
+  rmSync(outputDir, { recursive: true, force: true });
+  rmSync(agentsDir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+  detectorMock.recon.mockReset();
+  detectorMock.checkPrecondition.mockReset();
+  detectorMock.runAgent.mockReset();
+  detectorMock.validateFinding.mockReset();
+  for (const h of process.listeners("SIGINT")) {
+    process.removeListener("SIGINT", h);
+  }
+});
+
+function suppressLogs() {
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+}
+
+// Flatten every file path the agent was asked to analyze across all
+// runAgent calls — order-independent, batch-size-independent.
+type RunAgentCall = { agent: { slug: string }; candidates: { filePath: string }[] };
+function ranFiles(): string[] {
+  return (detectorMock.runAgent.mock.calls as unknown as [RunAgentCall][]).flatMap(([a]) =>
+    a.candidates.map((c) => c.filePath),
+  );
+}
+
+// A batch that fails writes no FileRecords, so its candidate files were NOT
+// analyzed. The closing line counts analyzed files, not candidates: while an
+// empty batch was laundered into `{findings: []}` every candidate got a record
+// either way, so counting candidates was harmless. Once an empty batch started
+// failing honestly, that count began overstating the work done: the closing
+// line named far more files than actually had records.
+describe("a failed batch is not counted as analyzed", () => {
+  it("reports only the files that actually got a record", async () => {
+    suppressLogs();
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    // agentA has 2 candidate files; force one batch per file, and fail one.
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) => {
+      if (candidates.some((c) => c.filePath.includes("server.js"))) {
+        throw new Error("the model ended its tool loop without writing an answer");
+      }
+      return candidates.map((c) => mockFinding(agent.slug, c.filePath));
+    });
+
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+
+    const records = loadAllFileRecords(outputDir).length;
+    const done = log.mock.calls.map((c) => String(c[0])).find((l) => l.includes("Done."));
+    expect(done).toContain(`across ${records} file(s)`);
+    expect(done).not.toContain("across 2 file(s)");
+  });
+
+  it("says how many files were skipped and that they re-run", async () => {
+    suppressLogs();
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    detectorMock.runAgent.mockImplementation(async ({ candidates }) => {
+      throw new Error(`no analysis for ${candidates.length} file(s)`);
+    });
+
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+
+    const lines = log.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes("batch(es) failed"))).toBe(true);
+    expect(lines.some((l) => l.includes("re-run on the next scan"))).toBe(true);
+  });
+
+  // Regression: a resumed file has a record but persistDetection is never
+  // called for it, so counting only this run's writes undercounts the files
+  // that have records and overcounts the ones said to re-run: the closing line
+  // names fewer files than there are records on disk, and claims files were not
+  // analyzed when they were.
+  it("counts files reused from a prior run as analyzed", async () => {
+    suppressLogs();
+    // Run 1: analyze one of the two files, fail the batch holding the other.
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) => {
+      if (candidates.some((c) => c.filePath.includes("server.js"))) {
+        throw new Error("no analysis");
+      }
+      return candidates.map((c) => mockFinding(agent.slug, c.filePath));
+    });
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+
+    // Run 2: the previously failed file now succeeds; the other is reused.
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) =>
+      candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+    );
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+
+    const records = loadAllFileRecords(outputDir).length;
+    const done = log.mock.calls.map((c) => String(c[0])).find((l) => l.includes("Done."));
+    // The reported count must equal what is actually on disk, reused included.
+    expect(done).toContain(`across ${records} file(s)`);
+  });
+
+  it("stays silent about failures when every batch succeeded", async () => {
+    suppressLogs();
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+    expect(
+      log.mock.calls.map((c) => String(c[0])).some((l) => l.includes("batch(es) failed")),
+    ).toBe(false);
+  });
+});
+
+describe("scan resume — agent level", () => {
+  it("runs the agent on the first scan; an unchanged re-run reuses it", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+    expect(loadAllFileRecords(outputDir).length).toBe(2);
+
+    detectorMock.runAgent.mockClear();
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+    expect(detectorMock.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("--rescan forces the agent to re-run", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+    detectorMock.runAgent.mockClear();
+
+    await runScan(projectRoot, { template: [agentA], output: outputDir, rescan: true }, env);
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+  });
+
+  it("a different agent does not reuse another agent's cache", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+    detectorMock.runAgent.mockClear();
+
+    await runScan(projectRoot, { template: [agentB], output: outputDir }, env);
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+  });
+
+  it("a different --output dir is a fresh scan", async () => {
+    suppressLogs();
+    const secondOut = mkdtempSync(join(tmpdir(), "agentgg-out2-"));
+    try {
+      await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+      detectorMock.runAgent.mockClear();
+      await runScan(projectRoot, { template: [agentA], output: secondOut }, env);
+      expect(detectorMock.runAgent).toHaveBeenCalled();
+    } finally {
+      rmSync(secondOut, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("scan resume — per-file (interrupted agent)", () => {
+  // First scan: util.js's batch throws (a non-fatal error → that batch is
+  // skipped, the agent gets no completion sidecar), but server.js's batch
+  // persists. maxFilesPerBatch: 1 makes each file its own batch.
+  async function interruptedFirstScan() {
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) => {
+      if (candidates.some((c) => c.filePath === "util.js")) {
+        throw new Error("simulated interruption");
+      }
+      return candidates.map((c) => mockFinding(agent.slug, c.filePath));
+    });
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+  }
+
+  it("re-runs only the files not yet analyzed", async () => {
+    suppressLogs();
+    await interruptedFirstScan();
+    // server.js persisted, util.js did not, no completion sidecar.
+    expect(readFileRecord(outputDir, "test-detector-a", "server.js")).not.toBeNull();
+    expect(readFileRecord(outputDir, "test-detector-a", "util.js")).toBeNull();
+
+    detectorMock.runAgent.mockClear();
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) =>
+      candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+    );
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+
+    // Only util.js is re-analyzed; server.js is reused from disk.
+    expect(ranFiles()).toEqual(["util.js"]);
+  });
+
+  it("completing a resumed agent writes the sidecar so a later run reuses it", async () => {
+    suppressLogs();
+    await interruptedFirstScan();
+
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) =>
+      candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+    );
+    // This run finishes util.js → agent now fully complete.
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+
+    detectorMock.runAgent.mockClear();
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+    expect(detectorMock.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("re-analyzes a file whose content changed since it was analyzed", async () => {
+    suppressLogs();
+    await interruptedFirstScan();
+
+    // Change the already-analyzed file: its contentHash no longer matches.
+    writeFileSync(join(projectRoot, "server.js"), "const CHANGED = 1;", "utf8");
+
+    detectorMock.runAgent.mockClear();
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) =>
+      candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+    );
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+
+    // Both run: server.js because it changed, util.js because it was pending.
+    expect(ranFiles().sort()).toEqual(["server.js", "util.js"]);
+  });
+
+  it("--rescan re-analyzes even already-analyzed files", async () => {
+    suppressLogs();
+    await interruptedFirstScan();
+
+    detectorMock.runAgent.mockClear();
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) =>
+      candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+    );
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, maxFilesPerBatch: 1, rescan: true },
+      env,
+    );
+
+    // --rescan bypasses the per-file skip; server.js (already on disk) re-runs.
+    expect(ranFiles().sort()).toEqual(["server.js", "util.js"]);
+  });
+
+  // The model can report a finding in a file it read on its own. That file is
+  // no candidate, so no shard marks it done and resume never reached it.
+  async function interruptedScanWithOffCandidateFinding() {
+    // Not a .js file, so never a candidate for this agent.
+    writeFileSync(join(projectRoot, "notes.txt"), "admin password: hunter2", "utf8");
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) => {
+      if (candidates.some((c) => c.filePath === "util.js")) {
+        throw new Error("simulated interruption");
+      }
+      return [
+        ...candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+        mockFinding(agent.slug, "notes.txt"),
+      ];
+    });
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+    expect(readFileRecord(outputDir, "test-detector-a", "notes.txt")?.findings).toHaveLength(1);
+    detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) =>
+      candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+    );
+  }
+
+  it("keeps a finding the agent reported on a file outside its candidates", async () => {
+    suppressLogs();
+    await interruptedScanWithOffCandidateFinding();
+
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, maxFilesPerBatch: 1, validate: true },
+      env,
+    );
+
+    const record = readFileRecord(outputDir, "test-detector-a", "notes.txt");
+    expect(record?.findings[0]?.validation?.verdict).toBe("confirmed");
+  });
+
+  it("does not keep that finding once its file changed", async () => {
+    suppressLogs();
+    await interruptedScanWithOffCandidateFinding();
+    writeFileSync(join(projectRoot, "notes.txt"), "nothing to see", "utf8");
+
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, maxFilesPerBatch: 1, validate: true },
+      env,
+    );
+
+    const record = readFileRecord(outputDir, "test-detector-a", "notes.txt");
+    expect(record?.findings[0]?.validation).toBeUndefined();
+  });
+});
+
+describe("scan resume — validation phase", () => {
+  it("skips findings that already have a verdict on disk", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+    expect(detectorMock.validateFinding).toHaveBeenCalled();
+
+    detectorMock.runAgent.mockClear();
+    detectorMock.validateFinding.mockClear();
+    await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+    expect(detectorMock.runAgent).not.toHaveBeenCalled();
+    expect(detectorMock.validateFinding).not.toHaveBeenCalled();
+  });
+
+  it("--revalidate-all re-runs validation even when verdicts exist", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+    detectorMock.validateFinding.mockClear();
+
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, validate: true, revalidateAll: true },
+      env,
+    );
+    expect(detectorMock.validateFinding).toHaveBeenCalled();
+  });
+
+  it("a persisted verdict carries over to a resumed run", async () => {
+    suppressLogs();
+    detectorMock.validateFinding.mockImplementation(async () => ({
+      verdict: "false-positive",
+      reasoning: "stub",
+    }));
+    await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+
+    detectorMock.validateFinding.mockClear();
+    await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+
+    const record = readFileRecord(outputDir, "test-detector-a", "server.js");
+    expect(record?.findings[0]?.validation?.verdict).toBe("false-positive");
+  });
+
+  // A validator that burns every turn on tool calls returns no text at all.
+  // That used to be laundered through the reformat fallback into a confident
+  // `uncertain` ("No validation content or finding was provided to analyze"),
+  // indistinguishable from a real judgement. Validation DID run, so the verdict
+  // stays `uncertain`, but the reasoning now says the run was cut short.
+  describe("validator produced nothing", () => {
+    const cutShort = async () => ({
+      verdict: "uncertain" as const,
+      reasoning: VALIDATION_CUT_SHORT,
+    });
+
+    it("records uncertain with cut-short reasoning, not an invented analysis", async () => {
+      suppressLogs();
+      detectorMock.validateFinding.mockImplementation(cutShort);
+      await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+
+      const validation = readFileRecord(outputDir, "test-detector-a", "server.js")?.findings[0]
+        ?.validation;
+      expect(validation?.verdict).toBe("uncertain");
+      expect(validation?.reasoning).toBe(VALIDATION_CUT_SHORT);
+    });
+
+    it("is distinguishable from a real uncertain by its reasoning", async () => {
+      suppressLogs();
+      detectorMock.validateFinding.mockImplementation(async () => ({
+        verdict: "uncertain" as const,
+        reasoning: "Traced the sink but could not confirm reachability.",
+      }));
+      await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+
+      const validation = readFileRecord(outputDir, "test-detector-a", "server.js")?.findings[0]
+        ?.validation;
+      expect(validation?.verdict).toBe("uncertain");
+      expect(validation?.reasoning).not.toBe(VALIDATION_CUT_SHORT);
+    });
+
+    // Consequence of recording a verdict rather than leaving it unset: the
+    // resume skip treats it like any other verdict. Recovering it takes an
+    // explicit --revalidate-all, same as re-examining a real one.
+    it("is skipped on a plain resume, and retried under --revalidate-all", async () => {
+      suppressLogs();
+      detectorMock.validateFinding.mockImplementation(cutShort);
+      await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+
+      detectorMock.validateFinding.mockClear();
+      await runScan(projectRoot, { template: [agentA], output: outputDir, validate: true }, env);
+      expect(detectorMock.validateFinding).not.toHaveBeenCalled();
+
+      detectorMock.validateFinding.mockImplementation(async () => ({
+        verdict: "confirmed" as const,
+        reasoning: "recovered on retry",
+      }));
+      await runScan(
+        projectRoot,
+        { template: [agentA], output: outputDir, validate: true, revalidateAll: true },
+        env,
+      );
+
+      const record = readFileRecord(outputDir, "test-detector-a", "server.js");
+      expect(record?.findings[0]?.validation?.verdict).toBe("confirmed");
+    });
+  });
+});
+
+describe("scan resume — RunMeta + persistence", () => {
+  it("first scan writes a FileRecord; an unchanged re-run preserves it", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+    const before = readFileRecord(outputDir, "test-detector-a", "server.js");
+    expect(before).not.toBeNull();
+    expect(before?.findings.length).toBe(1);
+    const contentHashBefore = before?.contentHash;
+
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+
+    const after = readFileRecord(outputDir, "test-detector-a", "server.js");
+    expect(after?.findings.length).toBe(1);
+    expect(after?.contentHash).toBe(contentHashBefore);
+  });
+
+  it("registers a SIGINT handler during the scan and removes it afterwards", async () => {
+    suppressLogs();
+    const before = process.listenerCount("SIGINT");
+    await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+    expect(process.listenerCount("SIGINT")).toBe(before);
+  });
+});
+
+describe("scan — --max-batches cap", () => {
+  // The fixture has 2 files (server.js, util.js); maxFilesPerBatch:1 makes
+  // each file its own batch, so batch count is predictable.
+  it("stops after the given number of batches", async () => {
+    suppressLogs();
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, maxFilesPerBatch: 1, maxBatches: 1 },
+      env,
+    );
+    // 2 batches available, capped to 1 → runAgent called once.
+    expect(detectorMock.runAgent).toHaveBeenCalledTimes(1);
+    expect(ranFiles().length).toBe(1);
+  });
+
+  it("caps across all agents combined, not per agent", async () => {
+    suppressLogs();
+    // 2 agents × 2 files @ maxFilesPerBatch:1 = 4 batches; cap to 3.
+    await runScan(
+      projectRoot,
+      { template: [agentA, agentB], output: outputDir, maxFilesPerBatch: 1, maxBatches: 3 },
+      env,
+    );
+    expect(detectorMock.runAgent).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not cap when the batch count is at or below the limit", async () => {
+    suppressLogs();
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, maxFilesPerBatch: 1, maxBatches: 99 },
+      env,
+    );
+    expect(ranFiles().sort()).toEqual(["server.js", "util.js"]);
+  });
+
+  it("treats maxBatches false (--no-max-batches) as no cap (runs every batch)", async () => {
+    suppressLogs();
+    // `--no-max-batches` sets the opt to false → no cap, every batch runs.
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, maxFilesPerBatch: 1, maxBatches: false },
+      env,
+    );
+    expect(detectorMock.runAgent).toHaveBeenCalledTimes(2);
+    expect(ranFiles().sort()).toEqual(["server.js", "util.js"]);
+  });
+
+  it("re-runs an agent whose batches were dropped on the next (uncapped) scan", async () => {
+    suppressLogs();
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, maxFilesPerBatch: 1, maxBatches: 1 },
+      env,
+    );
+    // Only 1 of 2 batches ran → no completion sidecar → agent is not cached.
+    detectorMock.runAgent.mockClear();
+    await runScan(projectRoot, { template: [agentA], output: outputDir, maxFilesPerBatch: 1 }, env);
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+    // Both files end up analyzed once the cap is lifted.
+    expect(readFileRecord(outputDir, "test-detector-a", "server.js")).not.toBeNull();
+    expect(readFileRecord(outputDir, "test-detector-a", "util.js")).not.toBeNull();
+  });
+});
+
+// --diff, --max-files-per-agent, and --max-batches are applied in the
+// provider-agnostic orchestrator (scan.ts), around the single Detector that
+// resolveDetector returns. Every provider funnels through that one seam, so
+// proving the composition here with the mock detector proves it for all five
+// providers — there is no per-provider copy of this logic to drift out of sync.
+// This is the guard: add an orchestration flag, cover it here, and it's
+// verified for anthropic/openai/bedrock/vertex/ollama at once.
+describe("scan — --diff composition (provider-agnostic orchestration)", () => {
+  function writeJsFiles(names: string[]) {
+    for (const n of names) writeFileSync(join(projectRoot, n), "const x = 1;\n", "utf8");
+  }
+
+  it("scopes candidates to the changed-file set", async () => {
+    suppressLogs();
+    writeJsFiles(["a.js", "b.js", "c.js"]);
+    diffMock.changedFiles = ["a.js", "c.js"];
+
+    await runScan(projectRoot, { template: [agentA], output: outputDir, diff: "HEAD" }, env);
+
+    // Only the changed files reach the detector; b.js and the beforeEach
+    // fixtures (server.js/util.js) are outside the diff and never scanned.
+    expect(ranFiles().sort()).toEqual(["a.js", "c.js"]);
+  });
+
+  it("applies --max-files-per-agent to the diff-scoped set", async () => {
+    suppressLogs();
+    writeJsFiles(["a.js", "b.js", "c.js"]);
+    diffMock.changedFiles = ["a.js", "b.js", "c.js"];
+
+    await runScan(
+      projectRoot,
+      {
+        template: [agentA],
+        output: outputDir,
+        diff: "HEAD",
+        maxFilesPerBatch: 1,
+        maxFilesPerAgent: 2,
+      },
+      env,
+    );
+
+    // 3 changed files; the per-agent cap applies AFTER the diff intersection,
+    // so exactly 2 are reviewed.
+    expect(ranFiles().length).toBe(2);
+  });
+
+  it("applies --max-batches to batches built from the diff-scoped set", async () => {
+    suppressLogs();
+    writeJsFiles(["a.js", "b.js", "c.js"]);
+    diffMock.changedFiles = ["a.js", "b.js", "c.js"];
+
+    await runScan(
+      projectRoot,
+      {
+        template: [agentA],
+        output: outputDir,
+        diff: "HEAD",
+        maxFilesPerBatch: 1,
+        maxBatches: 2,
+      },
+      env,
+    );
+
+    // 3 changed files @ 1 file/batch = 3 batches, capped to 2 → runAgent 2x.
+    expect(detectorMock.runAgent).toHaveBeenCalledTimes(2);
+  });
+});
+
+// --source-id decouples resume identity from the absolute scan root, so the
+// same codebase scanned from a different path still reuses its cache.
+describe("scan resume — --source-id", () => {
+  // Second copy of the fixture at a different absolute path, same content.
+  function cloneProject(): string {
+    const dir = mkdtempSync(join(tmpdir(), "agentgg-target2-"));
+    writeFileSync(
+      join(dir, "server.js"),
+      "const x = 'sk-test'; require('cp').exec(process.argv[2]);",
+      "utf8",
+    );
+    writeFileSync(join(dir, "util.js"), "module.exports = (a) => a + 1;", "utf8");
+    return dir;
+  }
+
+  it("without --source-id, a different root re-runs the agent (guard intact)", async () => {
+    suppressLogs();
+    const other = cloneProject();
+    try {
+      await runScan(projectRoot, { template: [agentA], output: outputDir }, env);
+      detectorMock.runAgent.mockClear();
+
+      await runScan(other, { template: [agentA], output: outputDir }, env);
+      expect(detectorMock.runAgent).toHaveBeenCalled();
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("with a matching --source-id, a different root reuses the cache", async () => {
+    suppressLogs();
+    const other = cloneProject();
+    try {
+      await runScan(
+        projectRoot,
+        { template: [agentA], output: outputDir, sourceId: "fixture-1" },
+        env,
+      );
+      detectorMock.runAgent.mockClear();
+
+      await runScan(other, { template: [agentA], output: outputDir, sourceId: "fixture-1" }, env);
+      expect(detectorMock.runAgent).not.toHaveBeenCalled();
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses the recon brief too, not just the agent sidecar", async () => {
+    suppressLogs();
+    const other = cloneProject();
+    try {
+      await runScan(
+        projectRoot,
+        { template: [agentA], output: outputDir, sourceId: "fixture-1" },
+        env,
+      );
+      expect(detectorMock.recon).toHaveBeenCalledTimes(1);
+
+      await runScan(other, { template: [agentA], output: outputDir, sourceId: "fixture-1" }, env);
+      // Still 1: reconHash is derived from the source id, so the cached brief
+      // survives the path change. Keyed on the root it would survey again.
+      expect(detectorMock.recon).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("a different --source-id at the same root invalidates the cache", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentA], output: outputDir, sourceId: "one" }, env);
+    detectorMock.runAgent.mockClear();
+
+    await runScan(projectRoot, { template: [agentA], output: outputDir, sourceId: "two" }, env);
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+  });
+
+  it("is recorded verbatim on the sidecar and the plan, not resolved to a path", async () => {
+    suppressLogs();
+    await runScan(
+      projectRoot,
+      { template: [agentA], output: outputDir, sourceId: "fixture-1" },
+      env,
+    );
+
+    const sidecar = readAgentRun(outputDir, "test-detector-a");
+    expect(sidecar?.scope.rootPath).toBe("fixture-1");
+    expect(readScanPlan(outputDir)?.rootPath).toBe("fixture-1");
+  });
+});

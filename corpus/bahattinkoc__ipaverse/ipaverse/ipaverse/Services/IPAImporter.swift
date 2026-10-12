@@ -1,0 +1,187 @@
+//
+//  IPAImporter.swift
+//  ipaverse
+//
+//  Created by BAHATTIN KOC on 20.06.2026.
+//
+
+import Foundation
+import SwiftData
+import AppKit
+import ImageIO
+
+// MARK: - IPAImportError
+
+enum IPAImportError: LocalizedError {
+    case notAnIPA(String)
+    case missingBundleIdentifier
+
+    var errorDescription: String? {
+        switch self {
+        case .notAnIPA(let name): "\"\(name)\" is not an .ipa file"
+        case .missingBundleIdentifier: "Could not read CFBundleIdentifier from the IPA's Info.plist"
+        }
+    }
+}
+
+// MARK: - IPAImporter
+
+/// Imports an arbitrary `.ipa` file from disk into the Downloaded list so it can be
+/// edited, re-signed, and installed exactly like a store-downloaded app.
+struct IPAImporter {
+
+    private struct PreparedImport: Sendable {
+        let app: AppStoreApp
+        let date: Date
+        let filePath: String
+        let iconURL: String?
+        let hash: String
+        let buildVersion: String?
+        let decrypted: Bool
+
+
+    }
+
+    /// Reads the IPA's Info.plist and builds an `AppStoreApp` describing it.
+    /// Imported IPAs are not tied to an App Store record, so `id`/`price` are 0 and
+    /// `iconURL` is nil.
+    static func metadata(for ipaURL: URL) throws -> AppStoreApp {
+        guard ipaURL.pathExtension.lowercased() == "ipa" else {
+            throw IPAImportError.notAnIPA(ipaURL.lastPathComponent)
+        }
+
+        let plist = try IPAResigner.loadInfoPlist(ipaPath: ipaURL.path)
+
+        guard let bundleID = plist["CFBundleIdentifier"] as? String, !bundleID.isEmpty else {
+            throw IPAImportError.missingBundleIdentifier
+        }
+
+        let name = (plist["CFBundleDisplayName"] as? String)
+            ?? (plist["CFBundleName"] as? String)
+            ?? ipaURL.deletingPathExtension().lastPathComponent
+        let version = (plist["CFBundleShortVersionString"] as? String)
+            ?? (plist["CFBundleVersion"] as? String)
+            ?? ""
+
+        return AppStoreApp(
+            id: 0,
+            bundleID: bundleID,
+            name: name,
+            version: version,
+            price: 0,
+            iconURL: nil,
+            platform: (plist["CFBundleSupportedPlatforms"] as? [String])?.contains("AppleTVOS") == true ? .tvos :
+                (plist["CFBundleSupportedPlatforms"] as? [String])?.contains("XROS") == true ? .visionos :
+                (plist["UIDeviceFamily"] as? [Int]) == [2] ? .ipados : .ios
+        )
+    }
+
+    /// Imports a physical file into SwiftData. Only reimporting the same file path
+    /// updates a record; another copy of the same app/version stays independent.
+    /// Returns the inserted/updated record so
+    /// callers can tag it (e.g. `sourceTag`) without a second fetch.
+    ///
+    /// The actual file work (unzip listing, Info.plist parsing, icon
+    /// extraction) runs off the main actor — those calls were previously made
+    /// directly from this `@MainActor` function and could visibly freeze the
+    /// UI for a couple of seconds on a large IPA. Only the SwiftData
+    /// fetch/insert/save at the end touches `context`, which needs to stay
+    /// on the main actor.
+    @discardableResult
+    @MainActor
+    static func importIPA(at ipaURL: URL, into context: ModelContext) async throws -> DownloadedApp {
+        let prepared = try await Task.detached(priority: .userInitiated) { () -> PreparedImport in
+            try IPASecurityScanner.validateArchiveLimits(ipaPath: ipaURL.path)
+            let app = try metadata(for: ipaURL)
+            // Prefer the app's build date (from the IPA) over "now" for imported apps.
+            let date = IPAResigner.appBuildDate(ipaPath: ipaURL.path) ?? Date()
+            // Extract the embedded app icon to a local cache so the row shows it.
+            // Best-effort: a missing icon must not fail the import.
+            let identity = UUID().uuidString
+            return PreparedImport(
+                app: app,
+                date: date,
+                filePath: ipaURL.path,
+                iconURL: cacheIcon(for: identity, ipaURL: ipaURL),
+                hash: try LibraryRepository.fileHash(ipaURL),
+                buildVersion: (try? IPAResigner.loadInfoPlist(ipaPath: ipaURL.path))?["CFBundleVersion"] as? String,
+                decrypted: isDecrypted(ipaURL: ipaURL)
+            )
+        }.value
+
+        let result = try LibraryRepository.upsertFile(app: prepared.app, filePath: prepared.filePath, context: context, hash: prepared.hash)
+        result.buildDate = prepared.date
+        result.buildVersion = prepared.buildVersion
+        result.sha256 = prepared.hash
+        if result.sourceTag != "Resigned" { result.sourceTag = prepared.decrypted ? "Decrypted" : nil }
+        if let icon = prepared.iconURL { result.iconURL = icon }
+        try context.save()
+        return result
+    }
+
+    /// Whether the IPA's main binary is *not* FairPlay-encrypted — i.e. it's
+    /// already a decrypted, re-signable copy rather than a raw App Store
+    /// download. Pulls just the main executable out of the zip (same
+    /// approach as `ResigningVM`'s entitlement check) instead of extracting
+    /// the whole IPA. Returns `false` (don't tag) if this can't be determined.
+    static func isDecrypted(ipaURL: URL) -> Bool {
+        guard (try? IPASecurityScanner.validateArchiveLimits(ipaPath: ipaURL.path)) != nil,
+              let entries = try? IPAResigner.listEntries(ipaPath: ipaURL.path),
+              let infoEntry = entries.first(where: {
+                  $0.hasPrefix("Payload/") && $0.hasSuffix(".app/Info.plist") &&
+                  $0.components(separatedBy: "/").count == 3
+              }),
+              let plistData = try? IPAResigner.readEntry(ipaPath: ipaURL.path, entryName: infoEntry),
+              let plist = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any],
+              let executable = plist["CFBundleExecutable"] as? String,
+              isSafeExecutableName(executable)
+        else { return false }
+
+        let binaryEntry = String(infoEntry.dropLast("Info.plist".count)) + executable
+        guard let data = try? IPAResigner.readEntry(ipaPath: ipaURL.path, entryName: binaryEntry),
+              let magic = data.safeUInt32(at: 0), [UInt32(0xFEEDFACF), 0xCFFAEDFE, 0xFEEDFACE, 0xCEFAEDFE, 0xCAFEBABE, 0xBEBAFECA].contains(magic) else {
+            return false
+        }
+
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        guard (try? data.write(to: tempURL)) != nil else { return false }
+        return !IPAResigner.isFairPlayEncrypted(binaryURL: tempURL)
+    }
+
+    private static func isSafeExecutableName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." &&
+        !name.contains("/") && !name.contains("\\")
+    }
+
+    // MARK: - Icon cache
+
+    /// Extracts the IPA's app icon, re-encodes it to a standard PNG (ImageIO
+    /// transparently handles Apple's CgBI format), writes it to the on-disk icon
+    /// cache, and returns a file-URL string for `DownloadedApp.iconURL`.
+    private static func cacheIcon(for identity: String, ipaURL: URL) -> String? {
+        guard let raw = try? IPAResigner.extractRawAppIcon(ipaPath: ipaURL.path),
+              let source = CGImageSourceCreateWithData(raw as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+
+        let rep = NSBitmapImageRep(cgImage: cgImage)
+        guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
+
+        let directory = iconCacheDirectory()
+        let safeName = identity.replacingOccurrences(of: "/", with: "_")
+        let fileURL = directory.appendingPathComponent("\(safeName).png")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try png.write(to: fileURL)
+            return fileURL.absoluteString
+        } catch {
+            return nil
+        }
+    }
+
+    private static func iconCacheDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("ipaverse/Icons", isDirectory: true)
+    }
+}

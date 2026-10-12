@@ -1,0 +1,388 @@
+# -*- coding: utf-8 -*-
+
+# =================================================================================
+# osintgpt
+#
+# Author: @estebanpdl
+#
+# File: loop.py
+# Description: The model drives retrieval. Which tool to call and when is its
+#   decision; this only runs what it asks for and records what happened.
+# =================================================================================
+
+# import modules
+import json
+import logging
+import time
+
+# import submodules
+from dataclasses import dataclass, field
+from datetime import date
+
+# type hints
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple
+)
+
+# import osintgpt llm
+from osintgpt.llm.base import EmbeddingProvider, GenerationProvider
+from osintgpt.llm.calling import (
+    Exchange,
+    ModelTurn,
+    ToolCallingUnsupported,
+    ToolSpec
+)
+
+# import osintgpt prompts
+from osintgpt.prompts import prompt
+
+from .registry import TOOL_SPECS, run_tool
+from .tools import ToolContext
+from .trace import TouchedDocument, Trace
+
+log = logging.getLogger('osintgpt.agentic')
+
+# Six rounds was enough in practice. A round may hold several parallel calls,
+# so this is not a step budget. The model is never told the number exists:
+# knowing a cap invites spending it rather than stopping when the answer is
+# ready.
+MAX_ROUNDS = 6
+
+
+# AgenticAnswer class
+@dataclass(frozen=True)
+class AgenticAnswer:
+    '''
+    An answer, and everything the model did to reach it.
+    '''
+    question: str
+    text: str
+    trace: Trace = field(default_factory=Trace)
+    # Refs the tools actually returned, in the order they were first seen.
+    # What a reader opens to check the answer.
+    sources: List[str] = field(default_factory=list)
+    # What to ask next, each self-contained so it can be sent as written.
+    followups: List[str] = field(default_factory=list)
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.trace.degraded)
+
+
+# let the model retrieve and answer
+def agentic_answer(
+    project,
+    question: str,
+    embedder: EmbeddingProvider,
+    generator: GenerationProvider,
+    max_rounds: int = MAX_ROUNDS,
+    store: Optional[Any] = None,
+    on_round: Optional[Callable[[int, ModelTurn], None]] = None,
+    conversation: Optional[Sequence[Tuple[str, str]]] = None
+) -> AgenticAnswer:
+    '''
+    Give the model the retrieval tools and let it decide what to call.
+
+    A backend that cannot call tools falls back to the static pipeline rather
+    than failing, and the trace says so. An empty answer is structurally
+    impossible: when the rounds run out the model is asked once more with no
+    tools offered, so it must reply from what it has.
+
+    Args:
+        project (Project): The project to answer from.
+        question (str): The question, as asked.
+        embedder (EmbeddingProvider): Must be the model the project was \
+            indexed with.
+        generator (GenerationProvider): Drives the tools and writes the answer.
+        max_rounds (int): Most rounds of tool calling before the final ask.
+        store (BaseVectorEngine, optional): Defaults to the project's own.
+        on_round (Callable, optional): Called with the round number and what \
+            the model produced, for progress.
+        conversation (Sequence[Tuple[str, str]], optional): Earlier questions \
+            and the answers they got, oldest first. Without it every question \
+            is answered as though it were the first, which is right for a \
+            one-shot call and wrong inside a thread — a follow-up naming \
+            "the second one" has nothing to resolve it against. Carries no \
+            passages: the tools retrieve those again.
+
+    Returns:
+        AgenticAnswer: The answer, its sources, and the trace.
+    '''
+    from osintgpt.projects.questions import record_question
+
+    record_question(project, question)
+
+    trace = Trace()
+    context = ToolContext(
+        project=project, embedder=embedder, generator=generator, store=store
+    )
+
+    if _nothing_indexed(project, store):
+        # No call is made, of any kind. A corpus with nothing in it cannot
+        # ground an answer, and a model given tools that can only return
+        # nothing would answer from its training instead.
+        from osintgpt.answering import NOTHING_RETRIEVED
+
+        trace.degraded = 'the project has nothing indexed'
+
+        return AgenticAnswer(
+            question=question, text=NOTHING_RETRIEVED, trace=trace
+        )
+
+    if not generator.supports_tools:
+        return _static(project, question, embedder, generator, trace, store,
+                       'the model does not support tool calling')
+
+    system = prompt(
+        'agentic',
+        today=date.today().isoformat(),
+        continuing=bool(conversation)
+    )
+    # Omitted when empty, so a provider whose `generate_with_tools` does not
+    # accept `conversation` still serves every caller not using a thread.
+    carried = {'conversation': list(conversation)} if conversation else {}
+    history: List[Exchange] = []
+    sources: List[str] = []
+    # Passages the tools actually returned, so a suggestion is grounded in
+    # what the model read rather than in what it might have read.
+    gathered: List[dict] = []
+
+    for round_number in range(1, max(int(max_rounds), 1) + 1):
+        try:
+            turn = generator.generate_with_tools(
+                system, question, TOOL_SPECS, history, **carried
+            )
+        except ToolCallingUnsupported as error:
+            return _static(project, question, embedder, generator, trace,
+                           store, str(error))
+        except Exception as error:  # noqa: BLE001 — degrade, do not fail
+            log.warning('tool round %d failed: %s', round_number, error)
+
+            return _static(project, question, embedder, generator, trace,
+                           store, f'tool calling failed: {error}')
+
+        if on_round:
+            on_round(round_number, turn)
+
+        if not turn.wants_tools:
+            # It answered. Nothing here decides it should have kept looking.
+            return _answered(
+                project, generator, question, turn.text.strip(), trace,
+                sources, gathered
+            )
+
+        # Recorded only once the turn is known to be working rather than
+        # answering: the answering turn's text *is* the answer, and narrating
+        # it would print the whole answer a second time inside the trace.
+        trace.say(round_number, turn.text)
+
+        results = _run_calls(
+            context, turn, trace, round_number, sources, gathered
+        )
+        history.append(Exchange(turn=turn, results=results))
+
+    # Rounds exhausted. One more request with no tools offered, so the model
+    # has no way to ask for more and must answer from what it gathered.
+    try:
+        final = generator.generate_with_tools(
+            system, question, [], history, **carried
+        )
+        text = final.text.strip()
+    except Exception as error:  # noqa: BLE001 — an answer is still owed
+        log.warning('final round failed: %s', error)
+        text = ''
+
+    if not text:
+        return _static(project, question, embedder, generator, trace, store,
+                       'the model gathered material but produced no answer')
+
+    return _answered(
+        project, generator, question, text, trace, sources, gathered
+    )
+
+
+def _answered(project, generator, question, text, trace, sources, gathered):
+    '''
+    Attach suggestions to an answer the model produced itself.
+    '''
+    from osintgpt.answering import followups_for
+
+    return AgenticAnswer(
+        question=question, text=text, trace=trace, sources=sources,
+        followups=followups_for(
+            project, generator, question, text, gathered
+        )
+    )
+
+
+def _nothing_indexed(project, store) -> bool:
+    '''
+    Whether the project holds any vectors at all.
+
+    Checked before the generator is touched, so an unindexed project costs
+    nothing rather than a model call that could only be answered ungrounded.
+    '''
+    from osintgpt.vector_store import store_for
+
+    owned = store is None
+    engine = store or store_for(project)
+    try:
+        return engine.count() == 0
+    except Exception:  # noqa: BLE001 — a guard, not the answer
+        return False
+    finally:
+        if owned and hasattr(engine, 'close'):
+            engine.close()
+
+
+def _run_calls(
+    context, turn, trace, round_number, sources, gathered
+) -> Dict[str, str]:
+    '''
+    Run everything the model asked for this round, recording each.
+    '''
+    results: Dict[str, str] = {}
+
+    for call in turn.calls:
+        started = time.perf_counter()
+        try:
+            result = run_tool(context, call.name, call.arguments)
+            error = result.error
+            count = result.count
+            unit = result.unit
+            payload = result.payload
+        except Exception as failure:  # noqa: BLE001 — one call, not the loop
+            error, count, unit, payload = str(failure), 0, 'result', {}
+
+        elapsed = time.perf_counter() - started
+        trace.record(
+            round_number, call.name, call.arguments,
+            count=count, seconds=elapsed, error=error, unit=unit,
+            documents=_touched(payload)
+        )
+
+        for ref in _refs_in(payload):
+            if ref not in sources:
+                sources.append(ref)
+
+        gathered.extend(payload.get('passages') or [])
+
+        results[call.id] = json.dumps(
+            {'error': error} if error else payload,
+            ensure_ascii=False, default=str
+        )
+
+    return results
+
+
+def _touched(payload: Dict[str, Any]) -> List[TouchedDocument]:
+    '''
+    Every document a call reported, gathered in the order it returned them.
+
+    Deliberately not `_refs_in`. That collects what an answer cites, and a
+    directory listing is not a citation — so it reads only the dict entries
+    that carry evidence. This records what a call *touched*, which is the
+    question an audit asks, so a listing of bare refs counts here and a
+    listing of bare refs is exactly what `list_documents` returns.
+
+    A document reached more than once is one entry: the first result sets what
+    is shown, because results arrive ranked and the first is the best, and the
+    rest are counted. Only the first sets `section` for the same reason — the
+    heading that earned the document its place.
+    '''
+    found: Dict[str, Dict[str, Any]] = {}
+
+    for key in ('passages', 'documents', 'hops', 'claims', 'path'):
+        for item in payload.get(key, []) or []:
+            _gather(found, item if isinstance(item, dict) else {'ref': item})
+
+    if payload.get('ref'):
+        _gather(found, {'ref': payload['ref']})
+
+    return [TouchedDocument(**fields) for fields in found.values()]
+
+
+def _gather(found: Dict[str, Dict[str, Any]], item: Dict[str, Any]) -> None:
+    '''
+    Fold one returned result into the document it came from.
+    '''
+    ref = item.get('ref')
+    if not isinstance(ref, str) or not ref:
+        return
+
+    score = item.get('score')
+    first = ref not in found
+    fields = found.setdefault(ref, {'ref': ref, 'passages': 0, 'terms': ()})
+
+    if score is not None:
+        fields['passages'] += 1
+        if first:
+            fields['best'] = score
+
+    if first:
+        # `citation` is `ref › section` where a section exists, and the ref on
+        # its own where none does; the second form carries no section to show.
+        citation = str(item.get('citation') or '')
+        _, _, section = citation.partition(' › ')
+        for key, value in (
+            ('section', section), ('timestamp', item.get('timestamp') or ''),
+            ('author', item.get('author') or '')
+        ):
+            if value:
+                fields[key] = str(value)
+
+    if item.get('matches'):
+        fields['matches'] = int(item['matches'])
+
+    for term in item.get('terms') or []:
+        if term not in fields['terms']:
+            fields['terms'] = fields['terms'] + (str(term),)
+
+
+def _refs_in(payload: Dict[str, Any]) -> List[str]:
+    '''
+    Every document a payload mentions, wherever the tool put it.
+    '''
+    found = []
+    for key in ('passages', 'documents', 'hops', 'claims', 'path'):
+        for item in payload.get(key, []) or []:
+            ref = item.get('ref') if isinstance(item, dict) else None
+            if ref:
+                found.append(ref)
+
+    if payload.get('ref'):
+        found.append(payload['ref'])
+
+    return found
+
+
+def _static(project, question, embedder, generator, trace, store, reason):
+    '''
+    The pipeline that answers when the loop cannot.
+
+    Retrieve once, answer from what came back. It is what a model without tool
+    calling gets, and what everything falls back to — an empty answer has to
+    be structurally impossible, not merely unlikely.
+    '''
+    from osintgpt.answering import answer_question
+
+    trace.degraded = reason
+    log.info('falling back to the static pipeline: %s', reason)
+
+    # record=False: the question was logged before the loop began, and
+    # degrading is not asking again.
+    answer = answer_question(
+        project, question, embedder, generator, store=store, record=False
+    )
+
+    return AgenticAnswer(
+        question=question, text=answer.text, trace=trace,
+        sources=[r.ref for r in answer.passages],
+        followups=answer.followups
+    )

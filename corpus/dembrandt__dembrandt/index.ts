@@ -1,0 +1,966 @@
+#!/usr/bin/env node
+
+/**
+ * Dembrandt - Design Token Extraction CLI
+ *
+ * Extracts design tokens, brand colors, typography, spacing, and component styles
+ * from any website using Playwright.
+ */
+
+import { program, Option, InvalidArgumentError } from "commander";
+import chalk from "chalk";
+import ora from "ora";
+import { loadBrowserEngines, PlaywrightMissingError, isMissingBrowserBinary } from "./lib/browser.js";
+import { extractBranding } from "./lib/extractors/index.js";
+import { displayResults, terminalLink } from "./lib/formatters/terminal.js";
+import { COLOR_FORMATS, isColorFormat } from "./lib/colors.js";
+import { color } from "./lib/formatters/theme.js";
+import { toDtcgTokens } from "./lib/formatters/dtcg.js";
+import { generatePDF } from "./lib/formatters/pdf.js";
+import { generateDesignMd } from "./lib/formatters/markdown.js";
+import { generateTailwindTheme } from "./lib/formatters/tailwind.js";
+import { generateShadcnTheme } from "./lib/formatters/shadcn.js";
+import { generateHtmlReport } from "./lib/formatters/html.js";
+import { resolveCompare } from "./lib/compare.js";
+import { emitDriftAnnotations, conformanceAnnotations, detectCiSystem } from "./lib/ci-annotations.js";
+import { checkConformance, commitFromEnv, parseTokenFile } from "./lib/token-conformance.js";
+import { generateConformanceMd } from "./lib/formatters/conformance-md.js";
+import { parseSitemap, computePagesRequested } from "./lib/discovery.js";
+import { mergeResults } from "./lib/merger.js";
+import { writeFileSync, mkdirSync, readFileSync } from "fs";
+import { join, dirname, resolve } from "path";
+import { fileURLToPath } from "url";
+import { checkAgainstRules, fetchRobotsRules, filterAllowedUrls, robotsAgentFor, robotsVerdict, type RobotsRules } from "./lib/robots.js";
+import { EXIT, classifyError } from "./lib/exit-codes.js";
+import { activeFlags, pathSummary } from "./lib/run-summary.js";
+import { consumeCloudHint } from "./lib/cli-state.js";
+import { installBrowsers, bundledPlaywrightVersion } from "./lib/install-browser.js";
+import { guardWarnings, loginNeedsTtyError, voiceNeedsOutputFile } from "./lib/cli-guards.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const { version } = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
+
+function sameOrigin(a: string, b: string): boolean {
+  try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
+}
+
+/** robots.txt Sitemap: directives, but only for the origin they were read from. */
+function sitemapsFrom(rules: RobotsRules, targetUrl: string): string[] {
+  if (rules.status !== "ok" || !sameOrigin(rules.robotsUrl, targetUrl)) return [];
+  return rules.sitemaps;
+}
+
+/**
+ * ora options for a spinner on the given stream. The spinner animates only on
+ * a real interactive terminal: a non-TTY (piped) or CI environment gets the
+ * final status lines without the frame churn that garbles logs. Some CI runners
+ * allocate a pseudo-TTY, so we check CI explicitly rather than rely on isTTY.
+ */
+function spinnerOptions(useStderr = false) {
+  const stream = useStderr ? process.stderr : process.stdout;
+  return { stream, isEnabled: Boolean(stream.isTTY) && !process.env.CI };
+}
+
+program
+  .name("dembrandt")
+  .description("Extract design tokens from any website.")
+  .version(version)
+  .enablePositionalOptions()
+  .argument("<url>")
+  .argument("[paths...]", "Additional paths on the same domain to extract and merge, e.g. /pricing /docs")
+  .option("--browser <type>", "Browser to use (chromium|firefox); set BROWSER_CDP_ENDPOINT env var to connect to an existing Chromium instance via CDP", "chromium")
+  .option("--json-only", "Output raw JSON")
+  .option("--save-output", "Save JSON file to output folder")
+  .option("--dtcg", "Export in W3C Design Tokens (DTCG) format")
+  .option("--dark-mode", "Extract colors from dark mode")
+  .option("--mobile", "Extract from mobile viewport")
+  .option("--slow", "3x longer timeouts for slow-loading sites")
+  .option("--brand-guide", "Export a brand guide PDF")
+  .option("--design-md", "Export a DESIGN.md file")
+  .option("--tailwind [path]", "Write a Tailwind v4 @theme CSS file with the observed values only (default: output/<domain>/theme.css)")
+  .option("--shadcn [path]", "Write a shadcn/ui theme block, observed slots only (default: output/<domain>/shadcn.css)")
+  .option("--html [path]", "Write a self-contained HTML report (default: output/<domain>/<timestamp>.html)")
+  .option("--compare <baseline>", "Drift-compare against a baseline JSON file. Exits 1 on drift, 2 if the baseline cannot be read.")
+  .option("--tokens <path>", "Check every rendered colour, radius and font size against a W3C Design Tokens file; repeat for several files (light and dark sets, several packages)", (v: string, all: string[] = []) => [...all, v])
+  .option("--max-off-token <n>", "With --tokens: exit 1 when more than N rendered values match no token", (v: string) => { const n = Number(v); if (!Number.isInteger(n) || n < 0) throw new InvalidArgumentError("--max-off-token takes a whole number"); return n; })
+  .option("--tokens-report <path>", "With --tokens: write the off-token summary as a Markdown page (plain tables, wiki-ready)")
+  .option("--annotations <system>", "Print CI annotations for off-token values and drift: github or azure (default: detected from the runner)", (v: string) => { if (v !== "github" && v !== "azure") throw new InvalidArgumentError("--annotations takes github or azure"); return v; })
+  .option("--approve", "With --compare <file>: accept the current extraction as the new baseline by overwriting that local file, and pass instead of failing.")
+  .option("--no-sandbox", "Disable browser sandbox (needed for Docker/CI)")
+  .option("--no-headed-fallback", "Fail instead of retrying a failed navigation in a visible browser (also DEMBRANDT_NO_HEADED_FALLBACK=1); for batch and unattended runs")
+  .option("--raw-colors", "Include pre-filter raw colors in JSON output")
+  .option(
+    "--color-format <format>",
+    `Notation for displayed colors: ${COLOR_FORMATS.join("|")} ('source' keeps declared tokens as authored). JSON keeps every notation regardless.`,
+    (v: string) => {
+      const value = String(v).toLowerCase();
+      if (!isColorFormat(value)) {
+        throw new InvalidArgumentError(`expected one of ${COLOR_FORMATS.join(", ")}`);
+      }
+      return value;
+    },
+    "hex",
+  )
+  .option("--screenshot <path>", "Save a viewport screenshot of the page (not full-page)")
+  // Internal, undocumented flag. Hidden from --help; not part of the product surface.
+  .addOption(new Option("--teach").hideHelp())
+  // Hidden until the role set is validated: an undocumented opt-in flag has no
+  // consumers, so roles can still be cut without a breaking contract change.
+  .addOption(new Option("--voice").hideHelp())
+  .option("--ai", "Use ML model to predict brand primary color (experimental)")
+  .option("--wcag", "Analyze WCAG contrast ratios between palette colors")
+  .option("--crawl [n]", "Auto-discover and extract up to N pages via DOM links (default: 5); combine with --sitemap to use sitemap discovery instead", (v: any) => {
+    if (v === undefined || v === true) return 5;
+    const n = parseInt(v, 10);
+    if (isNaN(n) || n < 1) throw new Error(`--crawl must be a positive integer, got: ${v}`);
+    return n;
+  })
+  .option("--sitemap", "Discover pages from sitemap.xml instead of DOM links; use alone or combine with --crawl to set page limit")
+  .option("--cookie <string>", "Cookie string for authenticated pages, e.g. \"session=abc; token=xyz\"")
+  .option("--cookie-file <path>", "Cookie export for authenticated pages: JSON array, Playwright storageState (cookies + localStorage), or Netscape cookies.txt")
+  .option("--basic-auth <user:password>", "HTTP Basic credentials for the browser context, e.g. \"staging:secret\"")
+  .option("--login", "Open a visible browser to sign in; press Enter when ready, then continue extraction (interactive terminal only)")
+  .option("--save-storage-state <path>", "With --login, save the signed-in session to a file for later runs via --cookie-file")
+  .option("--header <string>", "Extra HTTP header, e.g. \"Authorization: Bearer eyJ...\"; repeat the flag for several", (v: string, all: string[] = []) => [...all, v])
+  .option("--stealth", "Enable anti-detection: navigator spoofing, human mouse simulation, randomized fingerprint (use only when authorized)")
+  .option("--user-agent <string>", "Custom user agent string")
+  .option("--locale <string>", "Browser locale for fingerprint, e.g. en-GB, fi-FI; affects content only if the site reacts to Accept-Language (default: en-US)")
+  .option("--timezone <string>", "Browser timezone for fingerprint, e.g. Europe/Helsinki; affects content only if the site reacts to timezone (default: America/New_York)")
+  .option("--accept-language <string>", "Custom Accept-Language header value")
+  .option("--key <string>", "Dembrandt API key for syncing extractions to your account (falls back to DEMBRANDT_KEY env var)")
+  .option("--screen-size <WxH>", "Physical screen resolution to report, e.g. 1920x1080 (default: 1920x1080)")
+  .action(async (input, paths, opts) => {
+    let url = input;
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      url = "https://" + url;
+    }
+
+    // Resolve API key: --key flag takes precedence over env var
+    const apiKey: string | undefined = opts.key ?? process.env.DEMBRANDT_KEY;
+
+    const voiceWritesOutput: boolean = voiceNeedsOutputFile(opts, !!apiKey);
+
+    for (const warning of guardWarnings(opts, paths)) console.error(color.warning(warning));
+    const loginError = loginNeedsTtyError(opts, Boolean(process.stdin.isTTY));
+    if (loginError) {
+      console.error(color.error(`✖ ${loginError}`));
+      process.exit(EXIT.RUNTIME);
+    }
+
+    // In --json-only mode, redirect all status output to stderr so stdout is clean JSON
+    const originalConsoleLog = console.log;
+    if (opts.jsonOnly) {
+      console.log = (...args) => console.error(...args);
+    }
+
+    const spinner = ora({ text: "Starting extraction...", ...spinnerOptions(opts.jsonOnly) }).start();
+
+    // Unattended runs (scheduled CI, any hosted path) have no user deciding what
+    // they have the right to fetch, so there the robots decision has to bind.
+    const enforceRobots = process.env.DEMBRANDT_ENFORCE_ROBOTS === "1";
+    // Only the group matching the User-Agent we actually send applies to us.
+    const robotsAgent = robotsAgentFor(opts.userAgent);
+
+    // One fetch per origin for the whole run: the entry check, the sitemap
+    // directives and the crawl filter all read the same file.
+    const entryRobotsRules = await fetchRobotsRules(url, { agent: robotsAgent }).catch(
+      () => ({ status: "unavailable" }) as RobotsRules,
+    );
+
+    let entryRobotsWarning = null;
+    try {
+      const robots = checkAgainstRules(url, entryRobotsRules);
+      const verdict = robotsVerdict(robots, { enforce: enforceRobots });
+
+      if (verdict.action === "refuse") {
+        spinner.fail(`${verdict.reason}. Skipping ${url} (DEMBRANDT_ENFORCE_ROBOTS=1).`);
+        process.exit(EXIT.ROBOTS_DENIED);
+      }
+
+      if (verdict.action === "warn") {
+        entryRobotsWarning = `robots.txt disallows ${url} (rule: "${verdict.rule}")`;
+        spinner.warn(
+          chalk.hex("#FFB86C")(`${verdict.reason}. Proceeding anyway — respect the site's terms.`)
+        );
+        spinner.start("Starting extraction...");
+      }
+    } catch {
+      // robots check is advisory; never block extraction
+    }
+
+    let chromium, firefox;
+    try {
+      ({ chromium, firefox } = await loadBrowserEngines());
+    } catch (err) {
+      spinner.fail(err.message);
+      if (opts.jsonOnly) {
+        console.log = originalConsoleLog;
+        console.log(JSON.stringify({ url, error: { code: "BROWSER_UNAVAILABLE", message: err.message } }, null, 2));
+      }
+      process.exit(EXIT.RUNTIME);
+    }
+
+    let browser = null;
+
+    try {
+      let useHeaded = !!opts.login;
+      let result;
+      // The browser is installed at most once per run. Without this a install
+      // that succeeds but still cannot launch would loop on the same download.
+      let browserInstallTried = false;
+
+      while (true) {
+        // Select browser type based on --browser flag
+        const browserType = opts.browser === 'firefox' ? firefox : chromium;
+
+        spinner.text = `Launching browser (${useHeaded ? "visible" : "headless"
+          } mode)`;
+        // Firefox-specific launch args (Firefox doesn't support Chromium flags)
+        const launchArgs = opts.browser === 'firefox'
+          ? [] // Firefox has different flags
+          : ["--disable-blink-features=AutomationControlled"];
+
+        if (opts.noSandbox && opts.browser === 'chromium') {
+          launchArgs.push("--no-sandbox", "--disable-setuid-sandbox");
+        }
+        if (process.env.BROWSER_CDP_ENDPOINT) {
+          if (opts.browser !== 'chromium') {
+            throw new Error("BROWSER_CDP_ENDPOINT is only supported with --browser chromium.");
+          }
+          spinner.text = "Connecting over CDP...";
+          browser = await browserType.connectOverCDP(process.env.BROWSER_CDP_ENDPOINT);
+        } else {
+          try {
+            browser = await browserType.launch({
+              headless: !useHeaded,
+              args: launchArgs,
+            });
+          } catch (launchErr) {
+            // playwright-core is a hard dependency so the *module* always
+            // resolves — the guard in loadBrowserEngines can never fire on a
+            // real install. The condition that actually bites is a missing
+            // browser *binary*, which only surfaces here, as raw Playwright
+            // text. Translate it into our own instruction instead.
+            if (isMissingBrowserBinary(launchErr)) {
+              const engine = opts.browser === 'firefox' ? 'firefox' : 'chromium';
+              // Telling someone to run a second command is where first runs go
+              // to die: the extraction they asked for is abandoned, and the
+              // instruction is easy to mistype or to mistake for a dead end.
+              // The installer is the same one `dembrandt install-browser` runs
+              // and derives the revision from the bundled playwright-core, so
+              // it cannot install a browser this build will not find.
+              if (!browserInstallTried) {
+                browserInstallTried = true;
+                spinner.stop();
+                console.log(
+                  chalk.dim(`No ${engine} for playwright-core ${bundledPlaywrightVersion()} yet. Installing it once, then continuing.`)
+                );
+                if (installBrowsers([engine]) === 0) {
+                  spinner.start();
+                  continue;
+                }
+              }
+              throw new PlaywrightMissingError(engine);
+            }
+            throw launchErr;
+          }
+        }
+
+        try {
+          const crawlN = opts.crawl ?? null;
+          const isAutoCrawl = crawlN && !opts.sitemap && (!paths || paths.length === 0);
+          const hasExplicitPaths = paths && paths.length > 0;
+
+          result = await extractBranding(url, spinner, browser, {
+            navigationTimeout: 90000,
+            verbose: !opts.jsonOnly,
+            darkMode: opts.darkMode,
+            mobile: opts.mobile,
+            reveal: !process.env.DEMBRANDT_DISABLE_REVEAL,
+            slow: opts.slow,
+            screenshotPath: opts.screenshot,
+            discoverLinks: isAutoCrawl ? crawlN - 1 : null,
+            wcag: opts.wcag,
+            voice: opts.voice,
+            includeRawColors: opts.rawColors,
+            stealth: opts.stealth,
+            cookie: opts.cookie,
+            cookieFile: opts.cookieFile,
+            basicAuth: opts.basicAuth,
+            login: opts.login,
+            saveStorageState: opts.saveStorageState,
+            header: opts.header,
+            userAgent: opts.userAgent,
+            locale: opts.locale,
+            timezoneId: opts.timezone,
+            acceptLanguage: opts.acceptLanguage,
+            screenSize: opts.screenSize,
+            teach: opts.teach,
+            browser: opts.browser,
+            _version: version,
+          });
+
+          // A redirect can land on another origin, whose robots.txt is a
+          // different file and has not been consulted for this page yet.
+          const landedElsewhere = !sameOrigin(url, result.url);
+          const landingRobotsRules = landedElsewhere
+            ? await fetchRobotsRules(result.url, { agent: robotsAgent }).catch(
+                () => ({ status: "unavailable" }) as RobotsRules,
+              )
+            : entryRobotsRules;
+
+          let redirectRobotsWarning = null;
+          if (landedElsewhere) {
+            const verdict = robotsVerdict(checkAgainstRules(result.url, landingRobotsRules), {
+              enforce: enforceRobots,
+            });
+            if (verdict.action === "refuse") {
+              spinner.fail(
+                `${verdict.reason}. Skipping ${result.url}, redirected from ${url} (DEMBRANDT_ENFORCE_ROBOTS=1).`
+              );
+              // process.exit skips the finally that owns the browser.
+              if (browser) await browser.close();
+              process.exit(EXIT.ROBOTS_DENIED);
+            }
+            if (verdict.action === "warn") {
+              redirectRobotsWarning = `robots.txt disallows ${result.url} (rule: "${verdict.rule}")`;
+              if (!opts.jsonOnly) {
+                spinner.warn(
+                  chalk.hex("#FFB86C")(`${verdict.reason}. Proceeding anyway — respect the site's terms.`)
+                );
+                spinner.start("Continuing...");
+              }
+            }
+          }
+
+          const robotsWarnings = [entryRobotsWarning, redirectRobotsWarning].filter(Boolean);
+          if (robotsWarnings.length > 0 && result.meta) {
+            result.meta.robotsWarnings = robotsWarnings;
+          }
+
+          // Build list of additional URLs to extract
+          let additionalUrls = [];
+          let sitemapMax = null;
+
+          if (hasExplicitPaths) {
+            // Explicit paths: resolve against base URL
+            const base = new URL(result.url);
+            additionalUrls = paths.map(p => {
+              if (p.startsWith('http')) return p;
+              return `${base.protocol}//${base.host}${p.startsWith('/') ? p : '/' + p}`;
+            });
+          } else if (opts.sitemap) {
+            if (!opts.jsonOnly) spinner.start("Fetching sitemap...");
+            const max = crawlN ? crawlN - 1 : 20;
+            sitemapMax = max;
+            additionalUrls = await parseSitemap(result.url, max, sitemapsFrom(entryRobotsRules, result.url));
+            if (additionalUrls.length === 0 && result.url !== url) {
+              additionalUrls = await parseSitemap(url, max, sitemapsFrom(entryRobotsRules, url));
+            }
+          } else if (isAutoCrawl) {
+            additionalUrls = result._discoveredLinks || [];
+          }
+
+          delete result._discoveredLinks;
+
+          if (additionalUrls.length > 0) {
+            const { allowed, disallowed } = filterAllowedUrls(additionalUrls, landingRobotsRules, {
+              enforce: enforceRobots,
+            });
+            if (disallowed.length > 0) {
+              if (!opts.jsonOnly) {
+                spinner.warn(
+                  chalk.hex("#FFB86C")(
+                    `robots.txt disallows ${disallowed.length} discovered page(s), skipping: ${disallowed.map(d => d.url).join(', ')}`
+                  )
+                );
+                spinner.start("Continuing...");
+              }
+              additionalUrls = allowed;
+              if (result.meta) {
+                result.meta.robotsWarnings = [
+                  ...(result.meta.robotsWarnings || []),
+                  `robots.txt disallowed ${disallowed.length} discovered page(s): ${disallowed.map(d => d.url).join(', ')}`,
+                ];
+              }
+            }
+          }
+
+          const crawlTechnique = hasExplicitPaths ? 'explicit-paths' : opts.sitemap ? 'sitemap' : isAutoCrawl ? 'auto' : null;
+
+          if (additionalUrls.length === 0) {
+            if ((hasExplicitPaths || opts.sitemap || isAutoCrawl) && !opts.jsonOnly) {
+              spinner.warn("No additional pages discovered");
+            }
+            if (crawlTechnique && result.meta) {
+              result.meta.crawl = {
+                technique: crawlTechnique,
+                pagesRequested: computePagesRequested({ hasExplicitPaths, explicitPathCount: paths?.length || 0, isSitemap: !!opts.sitemap, sitemapMax, crawlN }),
+                pagesFound: 1,
+              };
+            }
+          } else {
+            spinner.stop();
+            if (!opts.jsonOnly) console.log(chalk.dim(`  Found ${additionalUrls.length} page(s) to analyze`));
+
+            const allResults = [result];
+            for (let i = 0; i < additionalUrls.length; i++) {
+              const pageUrl = additionalUrls[i];
+              const pageNum = i + 2;
+              const total = additionalUrls.length + 1;
+              if (!opts.jsonOnly) spinner.start(`Extracting page ${pageNum}/${total}: ${new URL(pageUrl).pathname}`);
+
+              await new Promise(r => setTimeout(r, 1500 + Math.random() * 1500));
+
+              try {
+                const pageResult = await extractBranding(pageUrl, spinner, browser, {
+                  navigationTimeout: 90000,
+                  verbose: !opts.jsonOnly,
+                  darkMode: opts.darkMode,
+                  mobile: opts.mobile,
+                  reveal: !process.env.DEMBRANDT_DISABLE_REVEAL,
+                  slow: opts.slow,
+                  stealth: opts.stealth,
+                  cookie: opts.cookie,
+                  cookieFile: opts.cookieFile,
+                  basicAuth: opts.basicAuth,
+                  header: opts.header,
+                  screenSize: opts.screenSize,
+                  wcag: opts.wcag,
+                  voice: opts.voice,
+                  includeRawColors: opts.rawColors,
+                  userAgent: opts.userAgent,
+                  locale: opts.locale,
+                  timezoneId: opts.timezone,
+                  acceptLanguage: opts.acceptLanguage,
+                  browser: opts.browser,
+                });
+                delete pageResult._discoveredLinks;
+                allResults.push(pageResult);
+              } catch (err) {
+                if (!opts.jsonOnly) spinner.warn(`Skipping ${pageUrl}: ${String(err?.message || err).slice(0, 80)}`);
+              }
+            }
+
+            spinner.stop();
+            const pagesFound = allResults.length;
+            result = mergeResults(allResults);
+            if (crawlTechnique && result.meta) {
+              result.meta.crawl = {
+                technique: crawlTechnique,
+                pagesRequested: computePagesRequested({ hasExplicitPaths, explicitPathCount: paths?.length || 0, isSitemap: !!opts.sitemap, sitemapMax, crawlN }),
+                pagesFound,
+                // Which pages, not just how many: a merged palette cannot be
+                // checked, reproduced or re-read from a count alone.
+                pages: allResults.map((r) => r?.url).filter((u): u is string => typeof u === 'string'),
+              };
+            }
+          }
+
+          if (!hasExplicitPaths && !opts.sitemap && !isAutoCrawl) {
+            delete result._discoveredLinks;
+          }
+
+          break;
+        } catch (err) {
+          await browser.close();
+          browser = null;
+
+          if (useHeaded || process.env.BROWSER_CDP_ENDPOINT) throw err;
+          if (opts.headedFallback === false || process.env.DEMBRANDT_NO_HEADED_FALLBACK === "1") throw err;
+
+          if (
+            err.message.includes("Timeout") ||
+            err.message.includes("net::ERR_")
+          ) {
+            spinner.warn(
+              "Navigation failed → retrying with visible browser"
+            );
+            console.error(chalk.dim(`  ↳ Error: ${err.message}`));
+            console.error(chalk.dim(`  ↳ URL: ${url}`));
+            console.error(chalk.dim(`  ↳ Mode: headless`));
+            useHeaded = true;
+            continue;
+          }
+          throw err;
+        }
+      }
+
+      console.log();
+
+      // ML primary prediction (--ai flag, experimental)
+      if (opts.ai && result.colors?.palette?.length) {
+        try {
+          const { predictPrimary, modelMeta } = await import('./lib/ml/runtime.js');
+          const meta = modelMeta();
+          const prediction = await predictPrimary(result as any);
+          if (prediction) {
+            result.colors.semantic = result.colors.semantic ?? {};
+            result.colors.semantic.primary = prediction.hex;
+            if (!opts.jsonOnly) {
+              const acc = meta?.metrics?.leave_one_site_out_top1;
+              const accStr = acc != null ? ` · ${(acc * 100).toFixed(0)}% acc` : '';
+              console.error(chalk.dim(`  ⚡ ML primary → ${prediction.hex} (score ${prediction.score.toFixed(2)}${accStr})`));
+            }
+          }
+        } catch (e: any) {
+          if (!opts.jsonOnly) console.error(chalk.dim(`  ⚡ ML skipped: ${e.message}`));
+        }
+      }
+
+      // Pull the internal payload off the result before it can reach stdout or
+      // the normal saved output, and write it to its own sidecar.
+      const teachData = (result as any)._teach;
+      delete (result as any)._teach;
+      if (opts.teach && teachData) {
+        try {
+          const tDomain = new URL(url).hostname.replace("www.", "");
+          const tStamp = new Date().toISOString().replace(/[:.]/g, "-").split(".")[0];
+          const tDir = join(process.cwd(), "output", tDomain);
+          mkdirSync(tDir, { recursive: true });
+          const tFile = `${tStamp}_v${version}.teach.json`;
+          writeFileSync(join(tDir, tFile), JSON.stringify({ url: result.url, extractedAt: new Date().toISOString(), ...teachData }, null, 2));
+          if (!opts.jsonOnly) console.error(chalk.dim(`  teach → output/${tDomain}/${tFile}`));
+        } catch { /* non-fatal */ }
+      }
+
+      // Convert to W3C format if requested
+      const outputData = opts.dtcg ? toDtcgTokens(result) : result;
+
+      // Collect "saved to" notices and print them after the results below
+      const savedNotices = [];
+      let syncFailed = false;
+
+      if (opts.saveOutput || opts.dtcg || voiceWritesOutput) {
+        try {
+          const domain = new URL(url).hostname.replace("www.", "");
+          const timestamp = new Date()
+            .toISOString()
+            .replace(/[:.]/g, "-")
+            .split(".")[0];
+          // Save to current working directory, not installation directory
+          const outputDir = join(process.cwd(), "output", domain);
+          mkdirSync(outputDir, { recursive: true });
+
+          // The two flags are orthogonal: --save-output writes the raw
+          // extraction, --dtcg writes the tokens file. Both flags = both files.
+          const saves = [];
+          if (opts.saveOutput) saves.push({ data: result, suffix: '', label: 'JSON saved (--save-output)' });
+          else if (voiceWritesOutput) saves.push({ data: result, suffix: '', label: 'JSON saved (--voice)' });
+          if (opts.dtcg) saves.push({ data: outputData, suffix: '.tokens', label: 'DTCG tokens saved (--dtcg)' });
+          for (const { data, suffix, label } of saves) {
+            const filename = `${timestamp}_v${version}${suffix}.json`;
+            writeFileSync(join(outputDir, filename), JSON.stringify(data, null, 2));
+            savedNotices.push(
+              chalk.dim(
+                `💾 ${label}: ${color.info(
+                  `output/${domain}/${filename}`
+                )}`
+              )
+            );
+          }
+        } catch (err) {
+          console.log(
+            color.warning(`! Could not save JSON file: ${err.message}`)
+          );
+        }
+      }
+
+      // Generate PDF brand guide
+      if (opts.brandGuide) {
+        try {
+          const pdfDomain = new URL(url).hostname.replace("www.", "");
+          const now = new Date();
+          const pdfDate = now.toISOString().slice(0, 10);
+          const pdfTime = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}`;
+          const pdfDir = join(process.cwd(), "output", pdfDomain);
+          mkdirSync(pdfDir, { recursive: true });
+          const pdfFilename = `${pdfDomain}-brand-guide-${pdfDate}-${pdfTime}.pdf`;
+          const pdfPath = join(pdfDir, pdfFilename);
+          spinner.start("Generating PDF brand guide...");
+          await generatePDF(result, pdfPath, browser, { version });
+          spinner.stop();
+          savedNotices.push(
+            chalk.dim(
+              `💾 Brand guide PDF saved (--brand-guide): ${color.info(
+                `output/${pdfDomain}/${pdfFilename}`
+              )}`
+            )
+          );
+        } catch (err) {
+          spinner.stop();
+          console.log(
+            color.warning(`Could not generate PDF: ${err.message}`)
+          );
+        }
+      }
+
+      // Generate DESIGN.md
+      if (opts.designMd) {
+        try {
+          const mdDomain = new URL(url).hostname.replace("www.", "");
+          const mdDir = join(process.cwd(), "output", mdDomain);
+          mkdirSync(mdDir, { recursive: true });
+          const mdPath = join(mdDir, "DESIGN.md");
+          writeFileSync(mdPath, generateDesignMd(result, { version }));
+          savedNotices.push(
+            chalk.dim(
+              `💾 DESIGN.md saved (--design-md): ${color.info(
+                `output/${mdDomain}/DESIGN.md`
+              )}`
+            )
+          );
+        } catch (err) {
+          console.log(
+            color.warning(`Could not generate DESIGN.md: ${err.message}`)
+          );
+        }
+      }
+
+      const writeEmitter = (
+        flag: string | boolean | undefined,
+        fileName: string,
+        label: string,
+        flagName: string,
+        build: () => string,
+      ) => {
+        if (flag === undefined) return;
+        try {
+          const domain = new URL(url).hostname.replace("www.", "");
+          let target: string;
+          if (typeof flag === "string") {
+            target = resolve(process.cwd(), flag);
+            mkdirSync(dirname(target), { recursive: true });
+          } else {
+            const dir = join(process.cwd(), "output", domain);
+            mkdirSync(dir, { recursive: true });
+            target = join(dir, fileName);
+          }
+          writeFileSync(target, build());
+          const shown = typeof flag === "string" ? flag : `output/${domain}/${fileName}`;
+          savedNotices.push(chalk.dim(`💾 ${label} saved (${flagName}): ${color.info(shown)}`));
+        } catch (err) {
+          console.log(color.warning(`! Could not write ${label}: ${err.message}`));
+        }
+      };
+
+      writeEmitter(opts.shadcn, "shadcn.css", "shadcn theme", "--shadcn", () =>
+        generateShadcnTheme(result, { version }));
+
+      writeEmitter(opts.tailwind, "theme.css", "Tailwind theme", "--tailwind", () =>
+        generateTailwindTheme(result, { version }));
+
+      // Compare against a baseline: a local file (free, offline) or an App
+      // baseline id (platform). resolveCompare dispatches on file-vs-id.
+      let driftReport;
+      if (opts.compare) {
+        try {
+          // The App endpoint for baseline-id compares comes from .dembrandtrc.
+          let apiBase;
+          try {
+            const rc = JSON.parse(readFileSync(join(process.cwd(), ".dembrandtrc"), "utf-8"));
+            if (typeof rc.endpoint === "string") apiBase = rc.endpoint;
+          } catch { /* no .dembrandtrc, or unreadable — use the default */ }
+          const { report, source, mode } = await resolveCompare(opts.compare, result, apiBase ? { api: apiBase } : {});
+          driftReport = report;
+          const verdict = report.status === "drift"
+            ? color.warning(`drift ${report.score} (threshold ${report.threshold})`)
+            : color.accent(`stable ${report.score}`);
+          savedNotices.push(
+            chalk.dim(
+              `⟂ Drift vs ${source} (${mode}): ${verdict} — ` +
+              `${report.summary.changed} changed, ${report.summary.added} added, ${report.summary.removed} removed`
+            )
+          );
+          for (const w of report.warnings ?? []) {
+            savedNotices.push(color.warning(`! ${w}`));
+          }
+          // --approve: accept the current extraction as the new baseline.
+          // Only local files can be overwritten; App baseline ids are read-only.
+          if (opts.approve) {
+            if (mode === "local") {
+              writeFileSync(resolve(process.cwd(), source), JSON.stringify(result, null, 2));
+              savedNotices.push(
+                chalk.dim(`✓ Baseline accepted (--approve): ${color.info(source)}`)
+              );
+              // Accepted — pass the run regardless of drift.
+            } else {
+              savedNotices.push(
+                color.warning("! --approve only updates local baseline files, not App baseline ids — drift stands.")
+              );
+              if (report.status === "drift") process.exitCode = EXIT.DRIFT;
+            }
+          } else if (report.status === "drift") {
+            // CI gate: drift fails the run, but the report still writes first.
+            process.exitCode = EXIT.DRIFT;
+          }
+          // A compare where every category was degraded proved nothing. Same
+          // rule as an unreadable baseline: "check broke, investigate" (exit
+          // RUNTIME), never a silent pass. An explicit --approve of a local
+          // baseline still wins: the user chose to accept this extraction.
+          if (report.inconclusive && !(opts.approve && mode === "local") && process.exitCode === undefined) {
+            process.exitCode = EXIT.RUNTIME;
+          }
+          // Under GitHub Actions, surface a failing drift gate inline on the PR
+          // via workflow-command annotations (DEM-83). No-op locally. Gated on
+          // the gate actually failing, so an --approve'd local baseline (which
+          // passes despite a drift report) emits nothing.
+          if (process.exitCode === EXIT.DRIFT && !opts.jsonOnly) emitDriftAnnotations(report, undefined, undefined, opts.annotations);
+        } catch (err) {
+          // A gate that cannot evaluate its baseline must not pass: exit RUNTIME
+          // ("check broke, investigate") so CI distinguishes this from stable (0)
+          // and from real drift (1). See lib/exit-codes.ts.
+          console.log(color.warning(`! Could not compare against baseline: ${err.message}`));
+          process.exitCode = EXIT.RUNTIME;
+        }
+      }
+
+      if (opts.tokens?.length) {
+        try {
+          const tokens = opts.tokens.flatMap((p: string) => parseTokenFile(readFileSync(resolve(process.cwd(), p), "utf-8"), p));
+          const report = checkConformance(result, tokens, { commit: commitFromEnv() });
+          result.tokenConformance = report;
+          const over = opts.maxOffToken !== undefined && report.offToken.length > opts.maxOffToken;
+          const verdict = over
+            ? color.warning(`${report.offToken.length} off-token values, limit ${opts.maxOffToken}`)
+            : color.accent(`${report.offToken.length} off-token values`);
+          savedNotices.push(chalk.dim(`⟂ Tokens: ${verdict} across ${report.categories.color.checked} colours, ${report.categories.radius.checked} radii, ${report.categories.fontSize.checked} font sizes`));
+          for (const row of report.offToken.slice(0, 5)) {
+            savedNotices.push(chalk.dim(`  ${row.category} ${row.value} ×${row.count}${row.nearest ? ` nearest ${row.nearest.name} (${row.nearest.value})` : ""}`));
+          }
+          if (opts.tokensReport) {
+            const mdPath = resolve(process.cwd(), opts.tokensReport);
+            mkdirSync(dirname(mdPath), { recursive: true });
+            writeFileSync(mdPath, generateConformanceMd(report, { version, maxOffToken: opts.maxOffToken }));
+            savedNotices.push(chalk.dim(`💾 Token report saved (--tokens-report): ${color.info(opts.tokensReport)}`));
+          }
+          if (over && Number(process.exitCode ?? 0) < EXIT.DRIFT) process.exitCode = EXIT.DRIFT;
+          const system = opts.annotations ?? detectCiSystem();
+          if (system && !opts.jsonOnly) for (const line of conformanceAnnotations(report, system, opts.maxOffToken)) process.stdout.write(`${line}\n`);
+        } catch (err) {
+          console.log(color.warning(`! Could not check tokens: ${err.message}`));
+          if (Number(process.exitCode ?? 0) < EXIT.RUNTIME) process.exitCode = EXIT.RUNTIME;
+        }
+      }
+
+      // Generate self-contained HTML report
+      if (opts.html !== undefined) {
+        try {
+          const htmlDomain = new URL(url).hostname.replace("www.", "");
+          let htmlPath;
+          if (typeof opts.html === "string") {
+            htmlPath = resolve(process.cwd(), opts.html);
+            mkdirSync(dirname(htmlPath), { recursive: true });
+          } else {
+            const htmlStamp = new Date().toISOString().replace(/[:.]/g, "-").split(".")[0];
+            const htmlDir = join(process.cwd(), "output", htmlDomain);
+            mkdirSync(htmlDir, { recursive: true });
+            htmlPath = join(htmlDir, `${htmlStamp}_v${version}.html`);
+          }
+          writeFileSync(
+            htmlPath,
+            generateHtmlReport(result, {
+              version,
+              drift: driftReport,
+              baselineLabel: opts.compare,
+            })
+          );
+          const htmlLabel = typeof opts.html === "string" ? opts.html : `output/${htmlDomain}/${htmlPath.split("/").pop()}`;
+          savedNotices.push(
+            chalk.dim(`💾 HTML report saved (--html): ${color.info(htmlLabel)}`)
+          );
+        } catch (err) {
+          console.log(color.warning(`! Could not write HTML report: ${err.message}`));
+        }
+      }
+
+      // Sync to cloud if --key / DEMBRANDT_KEY is set. A failed sync exits
+      // SYNC_FAILED; a rate limit does not, and only warns.
+      if (apiKey) {
+        const syncFailure = (reason: string, remedy: string): void => {
+          console.error(color.error(`✖ Cloud sync failed: ${reason}`));
+          console.error(chalk.dim(`  ${remedy}`));
+          console.error(chalk.dim(`  The extraction itself succeeded. Drift tracking did NOT record this run.`));
+          syncFailed = true;
+        };
+
+        try {
+          // No size check here. The cap belongs to the API, which already
+          // enforces it and reports the exact limit; duplicating the number in
+          // the CLI meant two sources of truth in two repos that could drift
+          // apart silently, and raising the cap would have needed a CLI release.
+          const apiBase = process.env.DEMBRANDT_API_URL ?? "https://www.dembrandt.com";
+          const syncRes = await fetch(`${apiBase}/api/extractions`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(result),
+          });
+
+          if (syncRes.ok) {
+            savedNotices.push(chalk.dim(`☁  Synced to your account (--key)`));
+          } else if (syncRes.status === 429) {
+            // Hitting the rate limit is the system working, not a fault, and
+            // the recipes have always promised it does not fail a pipeline.
+            const err = await syncRes.json().catch(() => ({ error: syncRes.statusText }));
+            console.error(color.warning(`! Cloud sync skipped: ${err.error ?? "rate limit reached"}`));
+            console.error(chalk.dim(`  This run was not recorded. Limits reset hourly.`));
+          } else {
+            const err = await syncRes.json().catch(() => ({ error: syncRes.statusText }));
+            const pageCount = result.pages?.length ?? 0;
+            syncFailure(
+              `${err.error ?? syncRes.statusText} (HTTP ${syncRes.status})`,
+              syncRes.status === 413
+                ? pageCount > 1
+                  ? `Extract fewer pages (--crawl ${Math.max(1, Math.floor(pageCount / 2))} or lower), or drop --raw-colors.`
+                  : `Drop --raw-colors, or open an issue if a single page really is this large.`
+                : syncRes.status === 401
+                  ? `Check the API key at dembrandt.com/app/api-keys.`
+                  : `Retry, or check dembrandt.com/app for service status.`,
+            );
+          }
+        } catch (syncErr) {
+          syncFailure(syncErr.message, `Check network access to the API host and retry.`);
+        }
+      }
+
+      // Output to terminal
+      const summaryLine =
+        color.accent('✨ Analysis summary: ') +
+        chalk.dim(
+          `${result.colors?.palette?.length ?? 0} colors, ` +
+          `${result.typography?.styles?.length ?? 0} text styles, ` +
+          `${result.breakpoints?.length ?? 0} breakpoints.`
+        );
+
+      // Surface what shaped this run (DEM-99) — active flags and merged paths —
+      // so the summary confirms what was asked for, not just what was extracted.
+      const flagBits = activeFlags(opts);
+      const flagsLine = flagBits.length ? chalk.dim(`   Flags: ${flagBits.join(' ')}`) : null;
+      const pathBits = pathSummary(paths, result.pages?.length ?? 0, result.pages?.map((p) => p.url) ?? []);
+      const pathsLine = pathBits.length ? chalk.dim(`   Paths: ${pathBits.join(' ')}`) : null;
+
+      if (opts.jsonOnly) {
+        console.log = originalConsoleLog;
+        // Attach the drift report to the JSON stream (only here, so --save-output
+        // and baseline files stay pure extractions). Lets consumers — e.g. a CI
+        // gate posting a PR comment — read the per-token changes machine-readably
+        // instead of scraping the HTML report.
+        const jsonOut = driftReport ? { ...outputData, drift: driftReport } : outputData;
+        console.log(JSON.stringify(jsonOut, null, 2));
+        console.error(summaryLine);
+        if (pathsLine) console.error(pathsLine);
+        if (flagsLine) console.error(flagsLine);
+        for (const notice of savedNotices) console.error(notice);
+      } else {
+        console.log();
+        displayResults(result, { colorFormat: opts.colorFormat });
+        console.log();
+        console.log(summaryLine);
+        if (pathsLine) console.log(pathsLine);
+        if (flagsLine) console.log(flagsLine);
+        for (const notice of savedNotices) console.log(notice);
+
+        // The CLI is the only surface most users ever see, so without a nudge
+        // the account side is undiscoverable. Restricted to a bare run — anyone
+        // passing flags already knows the tool and would just read this as
+        // noise — shown on the first few such runs only (see cli-state), and
+        // never once the user already syncs with --key. Points at the recipe
+        // rather than /app: the reader is still deciding, not signing up.
+        if (!apiKey && flagBits.length === 0 && consumeCloudHint()) {
+          console.log(chalk.dim("💡 --key <token> snapshots each run to your account and catches design drift over time: ") + chalk.dim(terminalLink("https://www.dembrandt.com/recipes/cloud-drift-ci", "dembrandt.com/recipes/cloud-drift-ci")));
+        }
+      }
+
+      // Drift (1) outranks this.
+      if (syncFailed && process.exitCode === undefined) process.exitCode = EXIT.SYNC_FAILED;
+    } catch (err) {
+      const { code, exit } = classifyError(err);
+      spinner.fail("Failed");
+      if (opts.jsonOnly) {
+        console.log = originalConsoleLog;
+        console.log(JSON.stringify({ url, error: { code, message: err.message } }, null, 2));
+      } else {
+        console.error(chalk.red("\n✗ Extraction failed"));
+        console.error(chalk.red(`  Error [${code}]: ${err.message}`));
+        console.error(chalk.dim(`  URL: ${url}`));
+        if (exit === EXIT.TIMEOUT) console.error(chalk.dim("  Hint: retry with --slow"));
+      }
+      process.exit(exit);
+    } finally {
+      if (browser) await browser.close();
+    }
+  });
+
+// Grouped --help for the root command. Commander 11 has no native option groups,
+// so render them via a custom formatHelp. Subcommands keep a single flat list.
+const OPTION_GROUPS = [
+  ["Extraction", ["--dark-mode", "--mobile", "--slow", "--crawl", "--sitemap", "--browser"]],
+  ["Output & export", ["--json-only", "--save-output", "--dtcg", "--brand-guide", "--design-md", "--tailwind", "--shadcn", "--html", "--screenshot", "--raw-colors"]],
+  ["Analysis", ["--wcag", "--compare", "--approve", "--tokens", "--max-off-token", "--tokens-report", "--annotations"]],
+  ["Network & auth", ["--cookie", "--cookie-file", "--basic-auth", "--login", "--save-storage-state", "--header", "--user-agent", "--locale", "--timezone", "--accept-language", "--screen-size"]],
+  ["Anti-detection", ["--stealth", "--no-sandbox", "--no-headed-fallback"]],
+];
+
+program.configureHelp({
+  formatHelp(cmd, helper) {
+    const termWidth = helper.padWidth(cmd, helper);
+    const indent = 2;
+
+    const item = (term, desc) => {
+      if (!desc) return term;
+      return helper.formatItem(term, termWidth, desc, helper).trimEnd().split("\n").map((l) => l.slice(2)).join("\n");
+    };
+    const block = (lines) => lines.map((l) => " ".repeat(indent) + l).join("\n");
+
+    const out = [`Usage: ${helper.commandUsage(cmd)}`, ""];
+    const description = helper.commandDescription(cmd);
+    if (description) out.push(description, "");
+
+    const args = helper.visibleArguments(cmd);
+    if (args.length) {
+      out.push("Arguments:", block(args.map((a) => item(helper.argumentTerm(a), helper.argumentDescription(a)))), "");
+    }
+
+    const options = helper.visibleOptions(cmd);
+    if (options.length) {
+      if (cmd.parent) {
+        out.push("Options:", block(options.map((o) => item(helper.optionTerm(o), helper.optionDescription(o)))), "");
+      } else {
+        const byLong = new Map(options.map((o) => [o.long ?? o.short, o]));
+        const used = new Set();
+        for (const [title, flags] of OPTION_GROUPS) {
+          const groupOpts = (flags as any[]).map((f: any) => byLong.get(f)).filter(Boolean);
+          if (!groupOpts.length) continue;
+          groupOpts.forEach((o) => used.add(o));
+          out.push(`${title}:`, block(groupOpts.map((o) => item(helper.optionTerm(o), helper.optionDescription(o)))), "");
+        }
+        const rest = options.filter((o) => !used.has(o));
+        if (rest.length) {
+          out.push("General:", block(rest.map((o) => item(helper.optionTerm(o), helper.optionDescription(o)))), "");
+        }
+      }
+    }
+
+    const commands = helper.visibleCommands(cmd);
+    if (commands.length) {
+      out.push("Commands:", block(commands.map((c) => item(helper.subcommandTerm(c), helper.subcommandDescription(c)))), "");
+    }
+
+    return out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+  },
+});
+
+// Handled before parse(): the root command takes a required <url> argument, so
+// a real Commander subcommand would collide with it. Intercepting the bare verb
+// keeps `dembrandt install-browser` working without restructuring the CLI.
+if (process.argv[2] === "mcp") {
+  await import("./mcp-server.js");
+} else {
+  if (process.argv[2] === "install-browser") {
+    process.exit(installBrowsers(process.argv.slice(3)));
+  }
+  program.parse();
+}

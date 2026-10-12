@@ -1,0 +1,357 @@
+use super::{GdbHandler, Register};
+use hex::ToHex;
+use std::io::Write;
+use std::num::NonZero;
+
+/// Contains states for a GDB remote session.
+pub struct SessionState {
+    current_thread: NonZero<usize>,
+    no_ack: Option<bool>,
+    thread_suffix_supported: bool,
+}
+
+impl SessionState {
+    pub fn no_ack(&self) -> Option<bool> {
+        self.no_ack
+    }
+
+    pub fn parse_start_no_ack_mode(&mut self) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        self.no_ack = Some(false);
+
+        Ok(PacketResult::Reply(b"OK".into()))
+    }
+
+    pub fn parse_ack_no_ack(&mut self) {
+        self.no_ack = Some(true);
+    }
+
+    pub fn parse_supported(
+        &mut self,
+        req: &[u8],
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        // Push features that we always supported.
+        let mut res = Vec::with_capacity(256);
+
+        res.extend_from_slice(b"QStartNoAckMode+;swbreak+");
+
+        // Parse GDB features.
+        let req = match req.strip_prefix(b":") {
+            Some(v) => v,
+            None => return Ok(PacketResult::Reply(res)),
+        };
+
+        for feat in req.split(|&b| b == b';') {
+            match_bytes! { feat,
+                // TODO: This maybe useful when we support debugging both kernel and userspace at
+                // the same time.
+                ["fork-events", _data] => {},
+                // TODO: Implement this.
+                ["hwbreak", _data] => {},
+                // TODO: Maybe we can use this feature to debug both kernel and userspace process at
+                // the same time?
+                ["multiprocess", _data] => {},
+                ["swbreak", _data] => {},
+                // TODO: Same here.
+                ["vfork-events", _data] => {},
+                ["xmlRegisters=", _data] => {
+                    res.extend_from_slice(b";xmlRegisters=");
+                    res.extend_from_slice(if cfg!(target_arch = "aarch64") {
+                        b"arm"
+                    } else if cfg!(target_arch = "x86_64") {
+                        b"i386"
+                    } else {
+                        todo!()
+                    });
+                },
+                _ => todo!("{}", String::from_utf8_lossy(feat)),
+            }
+        }
+
+        Ok(PacketResult::Reply(res))
+    }
+
+    pub fn parse_thread_suffix_supported(
+        &mut self,
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        self.thread_suffix_supported = true;
+
+        Ok(PacketResult::Reply(b"OK".into()))
+    }
+
+    pub fn parse_host_info(&mut self) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        let mut res = Vec::with_capacity(256);
+
+        // https://en.wikipedia.org/wiki/Mach-O
+        if cfg!(target_arch = "aarch64") {
+            res.extend_from_slice(b"cputype:16777228;cpusubtype:0"); // 0x100000C
+            res.extend_from_slice(b";triple:aarch64-unknown-none");
+        } else if cfg!(target_arch = "x86_64") {
+            res.extend_from_slice(b"cputype:16777223;cpusubtype:3"); // 0x1000007
+            res.extend_from_slice(b";triple:x86_64-unknown-none");
+        } else {
+            todo!()
+        }
+
+        // We don't have any plan for support big-endian.
+        res.extend_from_slice(b";endian:little");
+
+        if cfg!(target_pointer_width = "32") {
+            res.extend_from_slice(b";ptrsize:4");
+        } else if cfg!(target_pointer_width = "64") {
+            res.extend_from_slice(b";ptrsize:8");
+        } else {
+            unreachable!();
+        }
+
+        // It is unlikely for us to support page size other than 16K in a near future.
+        res.extend_from_slice(b";vm-page-size:16384");
+
+        Ok(PacketResult::Reply(res))
+    }
+
+    pub fn parse_vcont(&mut self) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        // Only Continue and Stop is supported at the moment.
+        Ok(PacketResult::Reply(b"vCont;c;t".into()))
+    }
+
+    pub fn parse_current_thread(&mut self) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        Ok(PacketResult::Reply(
+            format!("QC{:x}", self.current_thread).into(),
+        ))
+    }
+
+    pub fn parse_stop_reason(&mut self) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        // We need to use SIGTRAP here otherwise the GDB will resume the kernel without apply the
+        // breakpoints.
+        //
+        // See https://sourceware.org/git/?p=binutils-gdb.git;a=blob;f=include/gdb/signals.def for a
+        // list of signals.
+        Ok(PacketResult::Reply(b"S05".into())) // SIGTRAP
+    }
+
+    pub fn parse_continue<H: GdbHandler>(
+        &mut self,
+        req: &[u8],
+        h: &mut H,
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        // TODO: It is unclear if this resume current thread or all threads.
+        let addr = if req.is_empty() { None } else { todo!() };
+
+        h.resume_thread(self.current_thread, addr)?;
+
+        Ok(PacketResult::Break)
+    }
+
+    pub fn parse_first_thread_info<H: GdbHandler>(
+        &mut self,
+        h: &mut H,
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        // We don't need to do anything special because the hexadecimal already in a big-endian
+        // format.
+        let mut iter = h.active_threads().into_iter();
+        let mut res = Vec::with_capacity(128);
+
+        match iter.next() {
+            Some(v) => write!(res, "m{v:x}").unwrap(),
+            None => return Ok(PacketResult::Reply(res)),
+        }
+
+        for id in iter {
+            write!(res, ",{id:x}").unwrap();
+        }
+
+        Ok(PacketResult::Reply(res))
+    }
+
+    pub fn parse_subsequent_thread_info(
+        &mut self,
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        Ok(PacketResult::Reply(b"l".into())) // No more threads.
+    }
+
+    pub fn parse_register_info(
+        &mut self,
+        reg: &[u8],
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        // Parse register number.
+        let reg = Self::parse_hex(reg)
+            .ok_or_else(|| format!("unknown register '{}'", String::from_utf8_lossy(reg)))?;
+        let reg = match Register::try_from(reg) {
+            Ok(v) => v,
+            Err(_) => return Ok(PacketResult::Reply(Vec::new())), // No more registers.
+        };
+
+        // Build response.
+        let mut info = format!(
+            "name:{};bitsize:{};offset:{};encoding:{};format:{};set:{};dwarf:{};",
+            reg,
+            reg.size(),
+            reg.offset(),
+            reg.ty(),
+            reg.format(),
+            reg.category(),
+            reg.dwarf_number()
+        );
+
+        if let Some(v) = reg.alias() {
+            use std::fmt::Write;
+
+            write!(info, "generic:{v};").unwrap();
+        }
+
+        Ok(PacketResult::Reply(info.into()))
+    }
+
+    pub async fn parse_read_register<H: GdbHandler>(
+        &mut self,
+        req: &[u8],
+        h: &mut H,
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        // Get target register and thread.
+        let (reg, td) = if self.thread_suffix_supported {
+            // https://lldb.llvm.org/resources/lldbgdbremote.html#qthreadsuffixsupported
+            let mut iter = req.split(|&b| b == b';');
+            let reg = match iter.next() {
+                Some(v) => Self::parse_hex(v)
+                    .and_then(|v| v.try_into().ok())
+                    .ok_or_else(|| format!("unknown register '{}'", String::from_utf8_lossy(v)))?,
+                None => return Err("missing register number".into()),
+            };
+
+            // Parse target thread.
+            let td = match iter.next().and_then(|s| s.strip_prefix(b"thread:")) {
+                Some(v) => Self::parse_hex(v)
+                    .and_then(|v| v.try_into().ok())
+                    .ok_or_else(|| format!("invalid thread-id '{}'", String::from_utf8_lossy(v)))?,
+                None => return Err("missing thread-id".into()),
+            };
+
+            (reg, td)
+        } else {
+            todo!()
+        };
+
+        // Read register.
+        let val = Self::read_register(h, td, reg).await?;
+
+        Ok(PacketResult::Reply(val.into()))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    async fn read_register<H: GdbHandler>(
+        h: &mut H,
+        td: NonZero<usize>,
+        reg: Register,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        todo!()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn read_register<H: GdbHandler>(
+        h: &mut H,
+        td: NonZero<usize>,
+        reg: Register,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let value = match reg {
+            Register::Rax => h.read_rax(td).await?.to_ne_bytes().encode_hex(),
+            Register::Rbx => todo!(),
+            Register::Rcx => todo!(),
+            Register::Rdx => todo!(),
+            Register::Rsi => todo!(),
+            Register::Rdi => todo!(),
+            Register::Rbp => todo!(),
+            Register::Rsp => h.read_rsp(td).await?.to_ne_bytes().encode_hex(),
+            Register::R8 => todo!(),
+            Register::R9 => todo!(),
+            Register::R10 => todo!(),
+            Register::R11 => todo!(),
+            Register::R12 => todo!(),
+            Register::R13 => todo!(),
+            Register::R14 => todo!(),
+            Register::R15 => todo!(),
+            Register::Rip => h.read_rip(td).await?.to_ne_bytes().encode_hex(),
+            Register::Rflags => todo!(),
+        };
+
+        Ok(value)
+    }
+
+    pub async fn parse_read_memory<H: GdbHandler>(
+        &mut self,
+        req: &[u8],
+        h: &mut H,
+        bin: bool,
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        let mut iter = req.splitn(2, |&b| b == b',');
+        let addr = iter.next().unwrap(); // This should always success.
+        let len = iter.next().ok_or_else(|| "missing length")?;
+
+        // Parse target address and length. The docs does not say its format so I assume it is
+        // hexadecimal like other places.
+        let addr = Self::parse_hex(addr).ok_or_else(|| "invalid addr")?;
+        let len = Self::parse_hex(len).ok_or_else(|| "invalid length")?;
+
+        // Special case for zero length.
+        let len = match NonZero::new(len) {
+            Some(v) => v,
+            None => match bin {
+                true => return Ok(PacketResult::Reply(b"b".into())),
+                false => return Ok(PacketResult::Reply(Vec::new())),
+            },
+        };
+
+        // Read memory.
+        let data = h.read_memory(self.current_thread, addr, len).await?;
+
+        if bin {
+            let mut res = Vec::with_capacity(1 + data.len());
+
+            res.extend_from_slice(b"b");
+            res.extend_from_slice(&data);
+
+            Ok(PacketResult::Reply(res))
+        } else {
+            Ok(PacketResult::Reply(hex::encode(data).into()))
+        }
+    }
+
+    pub async fn parse_insert_software_breakpoint<H: GdbHandler>(
+        &mut self,
+        req: &[u8],
+        h: &mut H,
+    ) -> Result<PacketResult, Box<dyn std::error::Error>> {
+        let mut iter = req.splitn(3, |&b| b == b',').skip(1); // Skip trailing "," after Z0.
+        let addr = iter.next().ok_or_else(|| "missing addr")?;
+        let addr = Self::parse_hex(addr).ok_or_else(|| "invalid addr")?;
+        let kind = iter.next().ok_or_else(|| "missing kind")?;
+        let kind = Self::parse_hex(kind).ok_or_else(|| "invalid kind")?;
+
+        h.insert_software_breakpoint(self.current_thread, addr, kind)
+            .await?;
+
+        Ok(PacketResult::Reply("OK".into()))
+    }
+
+    fn parse_hex(v: &[u8]) -> Option<usize> {
+        std::str::from_utf8(v)
+            .ok()
+            .and_then(|v| usize::from_str_radix(v, 16).ok())
+    }
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            current_thread: NonZero::<usize>::MIN,
+            no_ack: None,
+            thread_suffix_supported: false,
+        }
+    }
+}
+
+/// Result of processing a GDB packet.
+pub enum PacketResult {
+    Reply(Vec<u8>),
+    Break,
+    Exit,
+}

@@ -1,0 +1,497 @@
+package mod
+
+import (
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"red-cloud/i18n"
+	"red-cloud/mod/gologger"
+	"reflect"
+	"sync"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+var commonCachePath = "./tf-plugin-cache" // Provider 插件缓存目录
+var RedcPath = ""
+var ProjectPath = "redc-taskresult"
+var ActiveConfigPath = ""
+var LoadedConfig *Config = nil           // 全局配置对象
+var LoadedGUISettings *GUISettings = nil // 全局 GUI 设置
+// LoadedGUISettings 是进程级共享状态，调用方会就地修改 CaseTags 等 map。
+// 所有读写都必须经 LoadGUISettings/SaveGUISettings，由 guiSettingsMu 串行化，
+// 否则并发写 map 会触发 runtime fatal error（recover 无法捕获）。
+var guiSettingsMu sync.Mutex
+
+const ProjectFile = "project.json"
+const RedcPlanPath = "case.tfplan"
+const MaxTfDepth = 2
+
+// GUISettings GUI 配置结构体
+type GUISettings struct {
+	DisableRightClick      bool   `json:"disableRightClick"`
+	NotificationEnabled    bool   `json:"notificationEnabled"`
+	SpotMonitorEnabled     bool   `json:"spotMonitorEnabled"`
+	SpotAutoRecoverEnabled bool   `json:"spotAutoRecoverEnabled"`
+	DebugEnabled           bool   `json:"debugEnabled"`
+	HttpProxy           string `json:"httpProxy"`
+	HttpsProxy          string `json:"httpsProxy"`
+	Socks5Proxy         string `json:"socks5Proxy"`
+	NoProxy             string `json:"noProxy"`
+	Language            string `json:"language"`
+	WelcomeDialogShown  string `json:"welcomeDialogShown"` // "true" means already shown, user chose to hide
+	OnboardingDismissed bool   `json:"onboardingDismissed"`
+	WebhookEnabled      bool   `json:"webhookEnabled"`
+	WebhookSlack        string `json:"webhookSlack"`
+	WebhookDingtalk     string `json:"webhookDingtalk"`
+	WebhookDingtalkSecret string `json:"webhookDingtalkSecret"`
+	WebhookFeishu       string `json:"webhookFeishu"`
+	WebhookFeishuSecret string `json:"webhookFeishuSecret"`
+	WebhookDiscord      string `json:"webhookDiscord"`
+	WebhookWecom        string `json:"webhookWecom"`
+	CaseTags            map[string][]string `json:"caseTags,omitempty"`
+	HTTPServerEnabled   bool       `json:"httpServerEnabled"`
+	HTTPServerPort      int        `json:"httpServerPort"`
+	HTTPServerToken     string     `json:"httpServerToken"`
+	HTTPServerHost      string     `json:"httpServerHost"`
+	HTTPServerUsers     []HTTPUser `json:"httpServerUsers,omitempty"`
+}
+
+// HTTPUser represents a user with role-based access for the HTTP server
+type HTTPUser struct {
+	Username string `json:"username"`
+	Token    string `json:"token"`
+	Role     string `json:"role"` // "admin", "operator", "viewer"
+}
+
+// Config 配置文件结构体，新增厂商配置也需要再这里添加
+// yaml 为配置文件，env为tf的环境变量参数
+type Config struct {
+	Providers struct {
+		Aws struct {
+			AccessKey string `yaml:"AWS_ACCESS_KEY_ID" env:"AWS_ACCESS_KEY_ID"`
+			SecretKey string `yaml:"AWS_SECRET_ACCESS_KEY" env:"AWS_SECRET_ACCESS_KEY" `
+			Region    string `yaml:"region"`
+		} `yaml:"aws"`
+		Alicloud struct {
+			AccessKey string `yaml:"ALICLOUD_ACCESS_KEY" env:"ALICLOUD_ACCESS_KEY" `
+			SecretKey string `yaml:"ALICLOUD_SECRET_KEY" env:"ALICLOUD_SECRET_KEY"`
+			Region    string `yaml:"region"`
+		} `yaml:"aliyun"`
+		Tencentcloud struct {
+			SecretId  string `yaml:"TENCENTCLOUD_SECRET_ID" env:"TENCENTCLOUD_SECRET_ID"`
+			SecretKey string `yaml:"TENCENTCLOUD_SECRET_KEY" env:"TENCENTCLOUD_SECRET_KEY"`
+			Region    string `yaml:"region"`
+		} `yaml:"tencentcloud"`
+		Volcengine struct {
+			AccessKey string `yaml:"VOLCENGINE_ACCESS_KEY" env:"VOLCENGINE_ACCESS_KEY"`
+			SecretKey string `yaml:"VOLCENGINE_SECRET_KEY" env:"VOLCENGINE_SECRET_KEY"`
+			Region    string `yaml:"region"`
+		} `yaml:"volcengine"`
+		UCloud struct {
+			PublicKey  string `yaml:"UCLOUD_PUBLIC_KEY" env:"UCLOUD_PUBLIC_KEY"`
+			PrivateKey string `yaml:"UCLOUD_PRIVATE_KEY" env:"UCLOUD_PRIVATE_KEY"`
+			Region     string `yaml:"region"`
+			ProjectId  string `yaml:"project_id" env:"UCLOUD_PROJECT_ID"`
+		} `yaml:"ucloud"`
+		Huaweicloud struct {
+			AccessKey string `yaml:"HUAWEICLOUD_ACCESS_KEY" env:"HUAWEICLOUD_ACCESS_KEY"`
+			SecretKey string `yaml:"HUAWEICLOUD_SECRET_KEY" env:"HUAWEICLOUD_SECRET_KEY"`
+			Region    string `yaml:"region"`
+		} `yaml:"huaweicloud"`
+		Vultr struct {
+			ApiKey string `yaml:"VULTR_API_KEY" env:"VULTR_API_KEY"`
+		} `yaml:"vultr"`
+		Ctyun struct {
+			AccessKey string `yaml:"CTYUN_AK" env:"CTYUN_AK"`
+			SecretKey string `yaml:"CTYUN_SK" env:"CTYUN_SK"`
+			Region    string `yaml:"region"`
+		} `yaml:"ctyun"`
+		Google struct {
+			Credentials string `yaml:"GOOGLE_APPLICATION_CREDENTIALS" env:"GOOGLE_APPLICATION_CREDENTIALS"`
+			Project     string `yaml:"project"`
+			Region      string `yaml:"region"`
+		} `yaml:"google"`
+		Azure struct {
+			ClientId       string `yaml:"ARM_CLIENT_ID" env:"ARM_CLIENT_ID"`
+			ClientSecret   string `yaml:"ARM_CLIENT_SECRET" env:"ARM_CLIENT_SECRET"`
+			SubscriptionId string `yaml:"ARM_SUBSCRIPTION_ID" env:"ARM_SUBSCRIPTION_ID"`
+			TenantId       string `yaml:"ARM_TENANT_ID" env:"ARM_TENANT_ID"`
+		} `yaml:"azure"`
+		Oracle struct {
+			User        string `yaml:"OCI_CLI_USER" env:"OCI_CLI_USER"`
+			Tenancy     string `yaml:"OCI_CLI_TENANCY" env:"OCI_CLI_TENANCY"`
+			Fingerprint string `yaml:"OCI_CLI_FINGERPRINT" env:"OCI_CLI_FINGERPRINT"`
+			KeyFile     string `yaml:"OCI_CLI_KEY_FILE" env:"OCI_CLI_KEY_FILE"`
+			Region      string `yaml:"OCI_CLI_REGION" env:"OCI_CLI_REGION"`
+		} `yaml:"oracle"`
+	} `yaml:"providers"`
+	Cloudflare struct {
+		Email  string `yaml:"CF_EMAIL" env:"CF_EMAIL"`
+		APIKey string `yaml:"CF_API_KEY" env:"CF_API_KEY"`
+	} `yaml:"cloudflare"`
+}
+
+func LoadConfig(path string) error {
+	home, err := os.UserHomeDir() // 忽略错误，home为空也没关系
+	if err != nil {
+		return fmt.Errorf("%s", i18n.Tf("config_no_user_home", err.Error()))
+	}
+
+	// 设置默认缓存路径
+	os.Setenv("TF_PLUGIN_CACHE_DIR", filepath.Join(home, ".terraform.d", "plugin-cache"))
+	// 设置 Terraform 插件缓存可能需要的环境变量
+	os.Setenv("TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE", "1")
+
+	if RedcPath == "" {
+		RedcPath = filepath.Join(home, "redc")
+	}
+	defaultConfigPath := filepath.Join(RedcPath, "config.yaml")
+	searchPaths := []string{path}
+	if path == "" {
+		exePath, _ := os.Executable() // 获取程序自身路径
+		searchPaths = []string{
+			filepath.Join(filepath.Dir(exePath), "config.yaml"),
+			defaultConfigPath,
+		}
+	}
+
+	TemplateDir = filepath.Join(RedcPath, "templates")
+	AITemplateDir = filepath.Join(TemplateDir, "ai-templates")
+	ProjectPath = filepath.Join(RedcPath, "task-result")
+
+	var data []byte
+	var conf Config
+	var loadedPath string
+	for _, p := range searchPaths {
+		if p == "" {
+			continue
+		}
+		if data, err = os.ReadFile(p); err == nil {
+			loadedPath = p
+			break // 读取成功，跳出循环
+		}
+	}
+
+	if data == nil {
+		gologger.Info().Msgf("%s", i18n.Tf("config_creating_empty", defaultConfigPath))
+		if err := os.MkdirAll(filepath.Dir(defaultConfigPath), 0755); err != nil {
+			return fmt.Errorf("%s", i18n.Tf("config_create_dir_failed", err))
+		}
+		defaultConf := Config{}
+		defaultData, err := yaml.Marshal(defaultConf)
+		if err != nil {
+			return fmt.Errorf("%s", i18n.Tf("config_gen_template_failed", err))
+		}
+		if err := os.WriteFile(defaultConfigPath, defaultData, 0644); err != nil {
+			return fmt.Errorf("%s", i18n.Tf("config_create_file_failed", err))
+		}
+		ActiveConfigPath = defaultConfigPath
+		return nil
+	}
+
+	if err := yaml.Unmarshal(data, &conf); err != nil {
+		return err
+	}
+
+	// 批量配置环境变量
+	bindEnv(conf)
+	if loadedPath != "" {
+		ActiveConfigPath = loadedPath
+	}
+
+	// 保存到全局变量
+	LoadedConfig = &conf
+
+	return nil
+}
+
+// ApplyConfig reads config from path and applies environment variables
+func ApplyConfig(customPath string) error {
+	conf, configPath, err := ReadConfig(customPath)
+	if err != nil {
+		return err
+	}
+	bindEnv(*conf)
+	if configPath != "" {
+		ActiveConfigPath = configPath
+	}
+	return nil
+}
+
+// bindEnv 递归遍历结构体，直接用 `yaml` 标签的值作为环境变量 Key
+func bindEnv(v interface{}) {
+	val := reflect.ValueOf(v)
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	} // 处理指针
+
+	for i := 0; i < val.NumField(); i++ {
+		fieldVal := val.Field(i)
+		fieldType := val.Type().Field(i)
+
+		// 如果是嵌套结构体 (如 Providers -> Aws)，递归处理
+		if fieldVal.Kind() == reflect.Struct {
+			bindEnv(fieldVal.Interface())
+			continue
+		}
+
+		// 如果是字符串且有值，读取 yaml 标签并 Setenv
+		if tag := fieldType.Tag.Get("env"); (tag != "" && tag != "-") && fieldVal.String() != "" {
+			os.Setenv(tag, fieldVal.String())
+		}
+	}
+}
+
+// GetConfigPath returns the current config file path (supports custom path)
+func GetConfigPath(customPath string) (string, error) {
+	if customPath != "" {
+		return customPath, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("%s", i18n.Tf("config_get_user_home_failed", err.Error()))
+	}
+	if RedcPath == "" {
+		RedcPath = filepath.Join(home, "redc")
+	}
+	return filepath.Join(RedcPath, "config.yaml"), nil
+}
+
+// ReadConfig reads config from a specific path or default path
+func ReadConfig(customPath string) (*Config, string, error) {
+	configPath, err := GetConfigPath(customPath)
+	if err != nil {
+		return nil, "", err
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Config{}, configPath, nil
+		}
+		return nil, configPath, fmt.Errorf("%s", i18n.Tf("config_load_file_failed", err))
+	}
+
+	var conf Config
+	if err := yaml.Unmarshal(data, &conf); err != nil {
+		return nil, configPath, fmt.Errorf("%s", i18n.Tf("config_parse_failed", err))
+	}
+	return &conf, configPath, nil
+}
+
+// SaveConfig writes config to a specific path or default path
+func SaveConfig(conf *Config, customPath string) error {
+	configPath, err := GetConfigPath(customPath)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		return fmt.Errorf("%s", i18n.Tf("config_create_dir_failed", err))
+	}
+
+	data, err := yaml.Marshal(conf)
+	if err != nil {
+		return fmt.Errorf("%s", i18n.Tf("config_serialize_failed", err))
+	}
+
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
+		return fmt.Errorf("%s", i18n.Tf("config_write_failed", err))
+	}
+
+	// Rebind environment variables after saving
+	bindEnv(*conf)
+
+	// 更新全局配置对象
+	LoadedConfig = conf
+
+	return nil
+}
+
+// GetProviderCredentials 从已加载的配置中获取云厂商凭据
+func GetProviderCredentials(provider string) (accessKey, secretKey string) {
+	if LoadedConfig == nil {
+		return "", ""
+	}
+
+	switch provider {
+	case "volcengine":
+		return LoadedConfig.Providers.Volcengine.AccessKey, LoadedConfig.Providers.Volcengine.SecretKey
+	case "alicloud":
+		return LoadedConfig.Providers.Alicloud.AccessKey, LoadedConfig.Providers.Alicloud.SecretKey
+	case "tencentcloud":
+		return LoadedConfig.Providers.Tencentcloud.SecretId, LoadedConfig.Providers.Tencentcloud.SecretKey
+	case "aws":
+		return LoadedConfig.Providers.Aws.AccessKey, LoadedConfig.Providers.Aws.SecretKey
+	case "huaweicloud":
+		return LoadedConfig.Providers.Huaweicloud.AccessKey, LoadedConfig.Providers.Huaweicloud.SecretKey
+	case "ucloud":
+		return LoadedConfig.Providers.UCloud.PublicKey, LoadedConfig.Providers.UCloud.PrivateKey
+	case "ctyun":
+		return LoadedConfig.Providers.Ctyun.AccessKey, LoadedConfig.Providers.Ctyun.SecretKey
+	}
+
+	return "", ""
+}
+
+func getGUISettingsPath() string {
+	if RedcPath == "" {
+		home, _ := os.UserHomeDir()
+		RedcPath = filepath.Join(home, "redc")
+	}
+	return filepath.Join(RedcPath, "gui_settings.json")
+}
+
+func LoadGUISettings() (*GUISettings, error) {
+	guiSettingsMu.Lock()
+	defer guiSettingsMu.Unlock()
+
+	if LoadedGUISettings != nil {
+		return LoadedGUISettings, nil
+	}
+
+	path := getGUISettingsPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			LoadedGUISettings = &GUISettings{
+				DisableRightClick:   true,
+				NotificationEnabled: false,
+				DebugEnabled:        false,
+				HttpProxy:           "",
+				HttpsProxy:          "",
+				Socks5Proxy:         "",
+				NoProxy:             "",
+				WelcomeDialogShown:  "",
+			}
+			return LoadedGUISettings, nil
+		}
+		return nil, err
+	}
+
+	var settings GUISettings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, err
+	}
+
+	// If WelcomeDialogShown is empty, it's the first time - show the dialog
+	LoadedGUISettings = &settings
+	return LoadedGUISettings, nil
+}
+
+func SaveGUISettings(settings *GUISettings) error {
+	guiSettingsMu.Lock()
+	defer guiSettingsMu.Unlock()
+
+	path := getGUISettingsPath()
+
+	if RedcPath == "" {
+		home, _ := os.UserHomeDir()
+		RedcPath = filepath.Join(home, "redc")
+	}
+
+	if err := os.MkdirAll(RedcPath, 0755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return err
+	}
+
+	LoadedGUISettings = settings
+	return nil
+}
+
+// GetProxySettings returns the current proxy settings from GUI settings or environment
+func GetProxySettings() (httpProxy, httpsProxy, socks5Proxy, noProxy string) {
+	// Try to load from GUI settings first
+	if settings, err := LoadGUISettings(); err == nil && settings != nil {
+		if settings.HttpProxy != "" {
+			httpProxy = settings.HttpProxy
+		}
+		if settings.HttpsProxy != "" {
+			httpsProxy = settings.HttpsProxy
+		}
+		if settings.Socks5Proxy != "" {
+			socks5Proxy = settings.Socks5Proxy
+		}
+		if settings.NoProxy != "" {
+			noProxy = settings.NoProxy
+		}
+	}
+
+	// Fallback to environment variables if not set in GUI settings
+	if httpProxy == "" {
+		httpProxy = os.Getenv("HTTP_PROXY")
+	}
+	if httpsProxy == "" {
+		httpsProxy = os.Getenv("HTTPS_PROXY")
+	}
+	if socks5Proxy == "" {
+		socks5Proxy = os.Getenv("ALL_PROXY")
+	}
+	if noProxy == "" {
+		noProxy = os.Getenv("NO_PROXY")
+	}
+
+	return httpProxy, httpsProxy, socks5Proxy, noProxy
+}
+
+// GetProxyURL returns a proxy URL for HTTP client based on the current proxy settings
+func GetProxyURL() string {
+	httpProxy, httpsProxy, socks5Proxy, _ := GetProxySettings()
+	if socks5Proxy != "" {
+		return socks5Proxy
+	}
+	if httpsProxy != "" {
+		return httpsProxy
+	}
+	if httpProxy != "" {
+		return httpProxy
+	}
+	return ""
+}
+
+// NewProxyHTTPClient returns an HTTP client that uses the configured proxy
+func NewProxyHTTPClient(timeout time.Duration) *http.Client {
+	proxyURL := GetProxyURL()
+
+	if proxyURL != "" {
+		if proxy, err := url.Parse(proxyURL); err == nil {
+			return &http.Client{
+				Timeout: timeout,
+				Transport: &http.Transport{
+					Proxy: http.ProxyURL(proxy),
+				},
+			}
+		}
+	}
+
+	return &http.Client{Timeout: timeout}
+}
+
+// newTLSSkipClient returns an HTTP client that skips TLS certificate verification.
+// Only use for trusted first-party domains (e.g., f8x.wgpsec.org).
+func newTLSSkipClient(timeout time.Duration) *http.Client {
+	proxyURL := GetProxyURL()
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	if proxyURL != "" {
+		if proxy, err := url.Parse(proxyURL); err == nil {
+			transport.Proxy = http.ProxyURL(proxy)
+		}
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}
+}

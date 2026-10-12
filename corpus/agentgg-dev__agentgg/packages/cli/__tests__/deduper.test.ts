@@ -1,0 +1,184 @@
+import type { Finding } from "@agentgg/core";
+import { describe, expect, it } from "vitest";
+import { buildDedupePrompt, dedupeCandidates, resolveDedup } from "../src/deduper.js";
+
+function makeFinding(id: string, overrides: Partial<Finding> = {}): Finding {
+  return {
+    id,
+    agentSlug: "sql-injection",
+    title: `Finding ${id}`,
+    vulnSlug: "sql-injection",
+    filePath: "src/db.ts",
+    lineRange: [10, 12],
+    summary: "SQL built via string concatenation.",
+    details: "details",
+    poc: "poc",
+    impact: "impact",
+    references: [],
+    confidence: 0.8,
+    notifications: [],
+    ...overrides,
+  };
+}
+
+function f(id: string, agentSlug: string): Finding {
+  return makeFinding(id, { agentSlug });
+}
+
+describe("resolveDedup", () => {
+  it("returns the duplicates of a well-formed cluster, keyed to the primary", () => {
+    const findings = [makeFinding("a"), makeFinding("b"), makeFinding("c")];
+    const out = resolveDedup(findings, [
+      { primaryId: "a", duplicateIds: ["b", "c"], reasoning: "same sink" },
+    ]);
+    expect(out).toEqual([
+      { id: "b", duplicateOf: "a", reasoning: "same sink" },
+      { id: "c", duplicateOf: "a", reasoning: "same sink" },
+    ]);
+  });
+
+  it("returns nothing when there are no clusters", () => {
+    const findings = [makeFinding("a"), makeFinding("b")];
+    expect(resolveDedup(findings, [])).toEqual([]);
+  });
+
+  it("drops unknown primary and unknown duplicate ids", () => {
+    const findings = [makeFinding("a"), makeFinding("b")];
+    expect(
+      resolveDedup(findings, [{ primaryId: "ghost", duplicateIds: ["b"], reasoning: "x" }]),
+    ).toEqual([]);
+    expect(
+      resolveDedup(findings, [{ primaryId: "a", duplicateIds: ["ghost"], reasoning: "x" }]),
+    ).toEqual([]);
+  });
+
+  it("ignores a self-referential duplicate id", () => {
+    const findings = [makeFinding("a"), makeFinding("b")];
+    const out = resolveDedup(findings, [
+      { primaryId: "a", duplicateIds: ["a", "b"], reasoning: "x" },
+    ]);
+    expect(out).toEqual([{ id: "b", duplicateOf: "a", reasoning: "x" }]);
+  });
+
+  it("rejects a cluster whose primary is itself a duplicate elsewhere (single-primary invariant)", () => {
+    const findings = [makeFinding("a"), makeFinding("b"), makeFinding("c")];
+    // b is a duplicate of a, but also claims to be the primary of c — contradictory.
+    const out = resolveDedup(findings, [
+      { primaryId: "a", duplicateIds: ["b"], reasoning: "ab" },
+      { primaryId: "b", duplicateIds: ["c"], reasoning: "bc" },
+    ]);
+    // a→b stands; the b→c cluster is dropped because b can't be both.
+    expect(out).toEqual([{ id: "b", duplicateOf: "a", reasoning: "ab" }]);
+  });
+
+  it("assigns a duplicate to only one primary (first cluster wins)", () => {
+    const findings = [makeFinding("a"), makeFinding("b"), makeFinding("c")];
+    const out = resolveDedup(findings, [
+      { primaryId: "a", duplicateIds: ["c"], reasoning: "ac" },
+      { primaryId: "b", duplicateIds: ["c"], reasoning: "bc" },
+    ]);
+    expect(out).toEqual([{ id: "c", duplicateOf: "a", reasoning: "ac" }]);
+  });
+
+  it("merges duplicates from repeated clusters that share a primary", () => {
+    const findings = [makeFinding("a"), makeFinding("b"), makeFinding("c")];
+    const out = resolveDedup(findings, [
+      { primaryId: "a", duplicateIds: ["b"], reasoning: "ab" },
+      { primaryId: "a", duplicateIds: ["c"], reasoning: "ac" },
+    ]);
+    expect(out).toEqual([
+      { id: "b", duplicateOf: "a", reasoning: "ab" },
+      { id: "c", duplicateOf: "a", reasoning: "ac" },
+    ]);
+  });
+
+  it("never marks a finding the run may not write", () => {
+    const findings = [f("a1", "alpha"), f("b1", "beta")];
+    const clusters = [{ primaryId: "a1", duplicateIds: ["b1"], reasoning: "same sink" }];
+    const kept = resolveDedup(findings, clusters, { canMark: (x) => x.agentSlug === "alpha" });
+    expect(kept).toEqual([]);
+  });
+
+  it("marks a finding the run owns", () => {
+    const findings = [f("a1", "alpha"), f("b1", "beta")];
+    const clusters = [{ primaryId: "b1", duplicateIds: ["a1"], reasoning: "same sink" }];
+    const kept = resolveDedup(findings, clusters, { canMark: (x) => x.agentSlug === "alpha" });
+    expect(kept.map((x) => x.id)).toEqual(["a1"]);
+  });
+});
+
+describe("buildDedupePrompt", () => {
+  it("lists every finding id and embeds the source when provided", () => {
+    const prompt = buildDedupePrompt({
+      filePath: "src/db.ts",
+      findings: [makeFinding("aaa"), makeFinding("bbb")],
+      fileContent: "const q = 'SELECT ' + a + b;",
+    });
+    expect(prompt).toContain("Finding id: aaa");
+    expect(prompt).toContain("Finding id: bbb");
+    expect(prompt).toContain("src/db.ts");
+    expect(prompt).toContain("const q = 'SELECT ' + a + b;");
+  });
+
+  it("omits the source block when no content is given", () => {
+    const prompt = buildDedupePrompt({
+      filePath: "src/db.ts",
+      findings: [makeFinding("aaa"), makeFinding("bbb")],
+    });
+    expect(prompt).not.toContain("## The source file");
+  });
+
+  it("ranks candidates without a verdict, using confidence only as a tiebreak", () => {
+    const prompt = buildDedupePrompt({
+      filePath: "src/db.ts",
+      findings: [makeFinding("aaa"), makeFinding("bbb")],
+    });
+    expect(prompt).not.toContain("verdict:");
+    expect(prompt).toContain("Confidence");
+  });
+});
+
+describe("buildDedupePrompt primary ranking", () => {
+  it("shows each finding's impact", () => {
+    const out = buildDedupePrompt({
+      filePath: "src/login.ts",
+      findings: [makeFinding("id1", { impact: "Attacker dumps the users table." })],
+    });
+    expect(out).toContain("**Impact:** Attacker dumps the users table.");
+  });
+
+  it("ranks the root-cause class first and the claimed impact second", () => {
+    const out = buildDedupePrompt({ filePath: "src/login.ts", findings: [makeFinding("id2")] });
+    const cls = out.indexOf("the vulnerability class that names the root");
+    const impact = out.indexOf("the most severe impact claimed");
+    const sink = out.indexOf("the most exact location");
+    expect(cls).toBeGreaterThan(-1);
+    expect(impact).toBeGreaterThan(cls);
+    expect(sink).toBeGreaterThan(impact);
+  });
+});
+
+describe("dedupeCandidates", () => {
+  it("drops findings that already carry a marker", () => {
+    const list = [
+      makeFinding("solo"),
+      makeFinding("d1", { dedup: { duplicateOf: "elsewhere", reasoning: "same" } }),
+    ];
+    expect(dedupeCandidates(list).map((x) => x.id)).toEqual(["solo"]);
+  });
+
+  it("drops a finding another one already points at", () => {
+    // p1 is somebody's primary; comparing it again could chain d1 → p1 → n1.
+    const list = [
+      makeFinding("p1"),
+      makeFinding("d1", { dedup: { duplicateOf: "p1", reasoning: "same" } }),
+      makeFinding("n1"),
+    ];
+    expect(dedupeCandidates(list).map((x) => x.id)).toEqual(["n1"]);
+  });
+
+  it("keeps every finding when nothing is deduped yet", () => {
+    const list = [makeFinding("a"), makeFinding("b")];
+    expect(dedupeCandidates(list).map((x) => x.id)).toEqual(["a", "b"]);
+  });
+});

@@ -1,0 +1,134 @@
+import { useState } from 'react'
+import classnames from 'classnames/bind'
+import { type UserOwnView, type SupportedAuthenticationScheme } from 'src/global_types'
+import { useWiredData } from 'src/helpers'
+import { getSupportedAuthentications } from 'src/services'
+import { format } from 'date-fns'
+
+import { DeleteAuthModal } from '../modals'
+import Modal from 'src/components/modal'
+import SettingsSection from 'src/components/settings_section'
+import Table from 'src/components/table'
+import { default as Button, ButtonGroup } from 'src/components/button'
+import { useAuthFrontendComponent } from 'src/authschemes'
+
+const cx = classnames.bind(require('./stylesheet'))
+
+export default function AuthMethods(props: {
+  profile: UserOwnView
+  allowLinking: boolean
+  requestReload?: () => void
+}) {
+  const [removeAuth, setRemovingAuth] = useState<null | string>(null)
+  const wiredSchemes = useWiredData<Array<SupportedAuthenticationScheme>>(
+    getSupportedAuthentications,
+  )
+
+  const columns = ['Method Name', 'Status', 'Last Login', 'Actions']
+
+  return (
+    <SettingsSection title="Authentication Methods" width="wide">
+      {wiredSchemes.render((supportedSchemes) => (
+        <Table className={cx('table')} columns={columns}>
+          {supportedSchemes.map((scheme) => (
+            <TableRow
+              allowLinking={props.allowLinking}
+              key={scheme.schemeCode}
+              supportedScheme={scheme}
+              profile={props.profile}
+              removeAuth={() => setRemovingAuth(scheme.schemeCode)}
+              requestReload={props.requestReload}
+            />
+          ))}
+        </Table>
+      ))}
+
+      {removeAuth && (
+        <DeleteAuthModal
+          userSlug={props.profile.slug}
+          schemeCode={removeAuth}
+          onRequestClose={() => {
+            setRemovingAuth(null)
+            props.requestReload && props.requestReload()
+          }}
+        />
+      )}
+    </SettingsSection>
+  )
+}
+
+const TableRow = (props: {
+  supportedScheme: SupportedAuthenticationScheme
+  profile: UserOwnView
+  removeAuth: () => void
+  allowLinking: boolean
+  requestReload?: () => void
+}) => {
+  const [linking, setLinking] = useState<boolean>(false)
+  const Linker = useAuthFrontendComponent(
+    props.supportedScheme.schemeType,
+    'Linker',
+    props.supportedScheme,
+  )
+
+  const userScheme = props.profile.authSchemes.find(
+    (x) => x.schemeCode === props.supportedScheme.schemeCode,
+  )
+  const canDeleteAuth = () => {
+    switch (true) {
+      case !userScheme:
+        return { disabled: true, title: 'Auth scheme has not been linked' }
+      default:
+        return {}
+    }
+  }
+  const canLink = () => {
+    if (userScheme != undefined) {
+      let title = 'Auth scheme has already been linked'
+      if (props.supportedScheme.schemeCode == 'webauthn') {
+        title += ', add new keys in the security tab'
+      }
+      return {
+        disabled: true,
+        title,
+      }
+    }
+    return {}
+  }
+
+  return (
+    <tr>
+      <td>{props.supportedScheme.schemeName}</td>
+      <td>{userScheme ? 'Linked' : 'Not Linked'}</td>
+      <td>
+        {userScheme && userScheme.lastLogin
+          ? format(userScheme.lastLogin, 'MMMM do, yyyy')
+          : 'Never'}{' '}
+      </td>
+      <td>
+        <ButtonGroup>
+          {props.allowLinking && (
+            <Button small {...canLink()} onClick={() => setLinking(true)}>
+              Link
+            </Button>
+          )}
+          <Button danger small {...canDeleteAuth()} onClick={() => props.removeAuth()}>
+            Delete
+          </Button>
+        </ButtonGroup>
+      </td>
+      {linking && (
+        <Modal onRequestClose={() => setLinking(false)} title={'Link Account'}>
+          <Linker
+            userData={props.profile}
+            onSuccess={() => {
+              setLinking(false)
+              props.requestReload?.()
+            }}
+            authFlags={props.supportedScheme.schemeFlags}
+          />
+        </Modal>
+      )}
+    </tr>
+  )
+}

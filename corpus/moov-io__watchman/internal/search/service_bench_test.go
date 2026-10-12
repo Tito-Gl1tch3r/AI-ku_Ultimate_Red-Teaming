@@ -1,0 +1,234 @@
+package search
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"testing"
+
+	"github.com/moov-io/watchman/internal/ofactest"
+	"github.com/moov-io/watchman/pkg/search"
+
+	"github.com/stretchr/testify/require"
+)
+
+func Benchmark_Search(b *testing.B) {
+	svc := testService(b)
+	ctx := context.Background()
+
+	query := search.Entity[search.Value]{
+		Name: "Xao Ling",
+		Type: search.EntityPerson,
+	}
+	query = query.Normalize()
+
+	opts := SearchOpts{
+		Limit:    20,
+		MinMatch: 0.1,
+	}
+
+	search := func(b *testing.B) {
+		b.Helper()
+
+		for i := 0; i < b.N; i++ {
+			results, err := svc.Search(ctx, query, opts)
+			require.NoError(b, err)
+			require.Greater(b, len(results), 0)
+		}
+	}
+
+	b.ResetTimer()
+
+	b.Run("fixed goroutine count", func(b *testing.B) {
+		counts := []int{1, 3, 5, 10, 20, 25, 50, 100, 150, 200, 250}
+		for _, g := range counts {
+			b.Run(fmt.Sprintf("%d", g), func(b *testing.B) {
+				b.Setenv("SEARCH_GOROUTINE_COUNT", strconv.Itoa(g))
+
+				search(b)
+			})
+		}
+	})
+
+	b.Run("dynamic goroutine count", func(b *testing.B) {
+		b.Setenv("SEARCH_GOROUTINE_COUNT", "") // clear
+
+		search(b)
+	})
+}
+
+// Benchmark_SearchDebug measures debug cost on a typed name search.
+// "off" is cheap Similarity only. "debug_all_returned" re-runs DebugSimilarity
+// for the returned top-K. "debug_threshold_0.80" re-runs it only for hits
+// with match >= 0.80.
+func Benchmark_SearchDebug(b *testing.B) {
+	svc := testService(b)
+	ctx := context.Background()
+	query := search.Entity[search.Value]{
+		Name: "Mohammad",
+		Type: search.EntityPerson,
+	}.Normalize()
+
+	b.Setenv("SEARCH_GOROUTINE_COUNT", "10")
+
+	run := func(b *testing.B, opts SearchOpts) {
+		b.Helper()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			results, err := svc.Search(ctx, query, opts)
+			require.NoError(b, err)
+			require.NotEmpty(b, results)
+		}
+	}
+
+	b.Run("off", func(b *testing.B) {
+		run(b, SearchOpts{Limit: 10, MinMatch: 0.01})
+	})
+	b.Run("debug_all_returned", func(b *testing.B) {
+		run(b, SearchOpts{Limit: 10, MinMatch: 0.01, Debug: true})
+	})
+	b.Run("debug_threshold_0.80", func(b *testing.B) {
+		run(b, SearchOpts{Limit: 10, MinMatch: 0.01, Debug: true, DebugMinMatch: 0.80})
+	})
+}
+
+func Benchmark_SearchVesselIMO(b *testing.B) {
+	svc := testService(b)
+	ctx := context.Background()
+	query := ofactest.EntityForBenchmark(b, "50972")
+	query.Name = ""
+	query.Source = ""
+	if query.Vessel != nil {
+		query.Vessel.Name = ""
+		query.Vessel.AltNames = nil
+		query.Vessel.CallSign = ""
+	}
+	query.PreparedFields = search.PreparedFields{}
+	query = query.Normalize()
+	opts := SearchOpts{
+		Limit:    5,
+		MinMatch: 0.80,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		results, err := svc.Search(ctx, query, opts)
+		require.NoError(b, err)
+		require.Greater(b, len(results), 0)
+	}
+}
+
+func Benchmark_SearchBusinessTokens(b *testing.B) {
+	svc := testService(b)
+	ctx := context.Background()
+	query := search.Entity[search.Value]{
+		Name: "Shipping Limited",
+		Type: search.EntityBusiness,
+	}.Normalize()
+	opts := SearchOpts{
+		Limit:    20,
+		MinMatch: 0.1,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		results, err := svc.Search(ctx, query, opts)
+		require.NoError(b, err)
+		require.Greater(b, len(results), 0)
+	}
+}
+
+func Benchmark_SearchUnknownTypeFanout(b *testing.B) {
+	svc := testService(b)
+	ctx := context.Background()
+	opts := SearchOpts{Limit: 10, MinMatch: 0.5}
+
+	named := search.Entity[search.Value]{
+		Name: "Khoroshev",
+		Type: search.EntityPerson,
+	}.Normalize()
+	unknown := named
+	unknown.Type = ""
+
+	b.ReportAllocs()
+	b.Run("type=person", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			results, err := svc.Search(ctx, named, opts)
+			require.NoError(b, err)
+			require.NotEmpty(b, results)
+		}
+	})
+	b.Run("type=empty-all-partitions", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			results, err := svc.Search(ctx, unknown, opts)
+			require.NoError(b, err)
+			_ = results
+		}
+	})
+}
+
+func Benchmark_SearchParallel(b *testing.B) {
+	svc := testService(b)
+	ctx := context.Background()
+
+	opts := SearchOpts{
+		Limit:    5,
+		MinMatch: 0.80,
+	}
+	b.ResetTimer()
+
+	b.Run("individual", func(b *testing.B) {
+		query := ofactest.EntityForBenchmark(b, "29702")
+		b.ResetTimer()
+
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				results, err := svc.Search(ctx, query, opts)
+				require.NoError(b, err)
+				require.Greater(b, len(results), 0)
+			}
+		})
+	})
+
+	b.Run("business", func(b *testing.B) {
+		query := ofactest.EntityForBenchmark(b, "44525")
+		b.ResetTimer()
+
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				results, err := svc.Search(ctx, query, opts)
+				require.NoError(b, err)
+				require.Greater(b, len(results), 0)
+			}
+		})
+	})
+
+	b.Run("vessel", func(b *testing.B) {
+		query := ofactest.EntityForBenchmark(b, "50972")
+		b.ResetTimer()
+
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				results, err := svc.Search(ctx, query, opts)
+				require.NoError(b, err)
+				require.Greater(b, len(results), 0)
+			}
+		})
+	})
+
+	b.Run("aircraft", func(b *testing.B) {
+		query := ofactest.EntityForBenchmark(b, "48727")
+		b.ResetTimer()
+
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				results, err := svc.Search(ctx, query, opts)
+				require.NoError(b, err)
+				require.Greater(b, len(results), 0)
+			}
+		})
+	})
+}

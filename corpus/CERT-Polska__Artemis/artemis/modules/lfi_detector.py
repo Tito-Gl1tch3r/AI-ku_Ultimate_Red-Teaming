@@ -1,0 +1,200 @@
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from karton.core import Task
+from requests import Session
+
+from artemis import load_risk_class
+from artemis.binds import Service, TaskStatus, TaskType
+from artemis.config import Config
+from artemis.crawling import get_injectable_parameters, get_links_to_scan
+from artemis.http_requests import HTTPResponse
+from artemis.module_base import ArtemisBase
+from artemis.modules.data.lfi_detector.lfi_detector_data import (
+    LFI_PAYLOADS,
+    RCE_PAYLOADS,
+)
+from artemis.modules.data.parameters import URL_PARAMS
+from artemis.task_utils import get_target_url
+
+
+class LFIFindings(Enum):
+    LFI_VULNERABILITY = "lfi_vulnerability"
+    RCE_VULNERABILITY = "rce_vulnerability"
+
+
+vulnerability_to_message = {
+    LFIFindings.LFI_VULNERABILITY: "It appears that this URL is vulnerable to LFI:",
+    LFIFindings.RCE_VULNERABILITY: "It appears that this URL is vulnerable to RCE:",
+}
+
+
+@load_risk_class.load_risk_class(load_risk_class.LoadRiskClass.HIGH)
+class LFIDetector(ArtemisBase):
+    """
+    Module for detecting Local File Inclusion (LFI) vulnerabilities.
+    """
+
+    num_retries = Config.Miscellaneous.SLOW_MODULE_NUM_RETRIES
+    identity = "lfi_detector"
+    filters = [
+        {"type": TaskType.SERVICE.value, "service": Service.HTTP.value},
+    ]
+
+    def create_url_with_batch_payload(self, url: str, param_batch: List[str], payload: str) -> str:
+        assignments = {key: payload for key in param_batch}
+        concatenation = "&" if self.is_url_with_parameters(url) else "?"
+        return f"{url}{concatenation}" + "&".join([f"{key}={value}" for key, value in assignments.items()])
+
+    def is_url_with_parameters(self, url: str) -> bool:
+        return "?" in url
+
+    def contains_lfi_indicator(self, original_response: HTTPResponse, response: HTTPResponse) -> Optional[str]:
+        """Check if the response contains indicators of LFI.
+
+        Each indicator is a file-content signature that proves actual file contents
+        were leaked, not just an error message. The differential check (indicator
+        present in response but NOT in original response) prevents false positives.
+
+        Indicators cover:
+        - Linux /etc/passwd: root:x:, daemon:x:, bin:x:, nobody:x:
+        - Windows win.ini: [fonts], [extensions]
+        - Windows boot.ini (legacy NT/2000/XP/2003): [boot loader], [operating systems]
+        - PHP php://filter base64 wrapper output: base64 substrings of root:x: and <?php
+        """
+        indicators = [
+            # Linux /etc/passwd - multiple lines for resilience
+            ("root:x:", "/etc/passwd"),
+            ("daemon:x:", "/etc/passwd"),
+            ("bin:x:", "/etc/passwd"),
+            ("nobody:x:", "/etc/passwd"),
+            # Windows win.ini - actual file content sections
+            ("[fonts]", "Windows win.ini"),
+            ("[extensions]", "Windows win.ini"),
+            # Windows boot.ini (legacy, pre-Vista)
+            ("[boot loader]", "Windows boot.ini"),
+            ("[operating systems]", "Windows boot.ini"),
+            # PHP php://filter base64 wrapper responses - base64 substrings
+            # searched directly in the raw response, no decoding needed.
+            # "cm9vdDp4" = base64 of "root:x" (first 8 chars of encoded /etc/passwd)
+            ("cm9vdDp4", "/etc/passwd via php://filter base64"),
+            # "PD9waHAg" = base64 of "<?php " (proves PHP source was leaked)
+            ("PD9waHAg", "PHP source code via php://filter base64"),
+        ]
+        for indicator, description in indicators:
+            if indicator in response.content and indicator not in original_response.content:
+                self.log.debug(f"Matched LFI indicator: {description}")
+                return description
+        return None
+
+    def minimize_parameters(
+        self, url: str, params: List[str], payload: str, original_response: HTTPResponse, session: Session
+    ) -> List[str]:
+        """
+        Try to find the minimal set of parameters that still triggers LFI. Currently minimizes to single parameters only.
+        Falls back to original params if none work individually.
+        """
+        minimal_params: List[str] = []
+
+        for param in params:
+            test_url = self.create_url_with_batch_payload(url, [param], payload)
+            response = self.session_clear_cookies_http_get(session, test_url)
+
+            if self.contains_lfi_indicator(original_response, response):
+                minimal_params.append(param)
+            if len(minimal_params) >= Config.Modules.LFIDetector.LFI_MINIMAL_PARAMS_MAX_LEN:
+                break
+
+        if minimal_params:
+            self.log.info(
+                "LFI parameter minimization: %s -> %s",
+                params,
+                minimal_params,
+            )
+            return minimal_params
+
+        # fallback if no single param triggers LFI
+        return params
+
+    def scan(self, urls: List[str], session: Session) -> List[Dict[str, Any]]:
+        """Scan URLs for LFI vulnerabilities."""
+        messages: List[Dict[str, Any]] = []
+
+        for current_url in urls:
+            original_response = self.session_clear_cookies_http_get(session, current_url)
+
+            parameters = get_injectable_parameters(current_url)
+            self.log.info("Obtained parameters: %s for url %s", parameters, current_url)
+
+            for vulnerability, payloads in [
+                (LFIFindings.LFI_VULNERABILITY, LFI_PAYLOADS),
+                (LFIFindings.RCE_VULNERABILITY, RCE_PAYLOADS),
+            ]:
+                for payload in payloads:
+                    param_batch = []
+                    total_params = parameters + URL_PARAMS
+                    for i, param in enumerate(total_params):
+                        param_batch.append(param)
+                        url_with_payload = self.create_url_with_batch_payload(current_url, param_batch, payload)
+
+                        # The idea of that check is to break down params into chunks that lead to a given maximum URL
+                        # length (as longer URLs may be unsupported by the servers).
+                        #
+                        # We can't have constant chunk size as the payloads have varied length.
+                        if len(url_with_payload) >= 1600 or i == len(total_params) - 1:
+                            response = self.session_clear_cookies_http_get(session, url_with_payload)
+
+                            if indicator := self.contains_lfi_indicator(original_response, response):
+
+                                minimal_params = self.minimize_parameters(
+                                    current_url,
+                                    param_batch,
+                                    payload,
+                                    original_response,
+                                    session,
+                                )
+
+                                minimal_url = self.create_url_with_batch_payload(
+                                    current_url,
+                                    minimal_params,
+                                    payload,
+                                )
+
+                                messages.append(
+                                    {
+                                        "url": minimal_url,
+                                        "headers": {},
+                                        "matched_indicator": indicator,
+                                        "statement": vulnerability_to_message[vulnerability] + " " + minimal_url,
+                                        "code": vulnerability.value,
+                                    }
+                                )
+                                if Config.Modules.LFIDetector.LFI_STOP_ON_FIRST_MATCH:
+                                    return messages
+                            param_batch = []
+
+        return messages
+
+    def run(self, current_task: Task) -> None:
+        """Run the LFI detection module."""
+        if self.check_connection_to_base_url_and_save_error(current_task):
+            url = get_target_url(current_task)
+            links = get_links_to_scan(url)
+
+            with Session() as session:
+                messages = self.scan(urls=links, session=session)
+
+            if messages:
+                status = TaskStatus.INTERESTING
+                status_reason = ", ".join([m["statement"] for m in messages])
+            else:
+                status = TaskStatus.OK
+                status_reason = None
+
+            data = {"result": messages, "statements": {e.value: e.name for e in LFIFindings}}
+
+            self.save_task_result(task=current_task, status=status, status_reason=status_reason, data=data)
+
+
+if __name__ == "__main__":
+    LFIDetector.parallel_loop()

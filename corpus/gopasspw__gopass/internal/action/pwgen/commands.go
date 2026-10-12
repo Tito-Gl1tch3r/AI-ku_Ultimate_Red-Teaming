@@ -1,0 +1,82 @@
+package pwgen
+
+import (
+	"github.com/urfave/cli/v3"
+)
+
+// GetCommands returns the pwgen subcommand.
+func GetCommands() []*cli.Command {
+	return []*cli.Command{
+		{
+			Name:        "pwgen",
+			Usage:       "Generate passwords",
+			Description: "Print any number of password to the console. The optional length parameter specifies the length of each password.",
+			ArgsUsage:   "[length] [count]",
+			Action:      Pwgen,
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:    "no-numerals",
+					Aliases: []string{"0"},
+					Usage:   "Do not include numerals in the generated passwords.",
+				},
+				&cli.BoolFlag{
+					Name:    "no-capitalize",
+					Aliases: []string{"A"},
+					Usage:   "Do not include capital letter in the generated passwords.",
+				},
+				&cli.BoolFlag{
+					Name:    "ambiguous",
+					Aliases: []string{"B"},
+					Usage:   "Do not include characters that could be easily confused with each other, like '1' and 'l' or '0' and 'O'",
+				},
+				&cli.BoolFlag{
+					Name:    "symbols",
+					Aliases: []string{"y"},
+					Usage:   "Include at least one symbol in the password.",
+				},
+				&cli.BoolFlag{
+					Name:    "one-per-line",
+					Aliases: []string{"1"},
+					Usage:   "Print one password per line",
+				},
+				&cli.BoolFlag{
+					Name:    "xkcd",
+					Aliases: []string{"x"},
+					Usage:   "Use multiple random english words combined to a password. By default, space is used as separator and all words are lowercase",
+				},
+				&cli.StringFlag{
+					Name:    "xkcd-sep",
+					Aliases: []string{"sep", "xkcdsep", "xs"},
+					Usage:   "Word separator for generated xkcd style password. If no separator is specified, the words are combined without spaces/separator and the first character of words is capitalised. This flag implies -xkcd",
+					Value:   " ",
+				},
+				&cli.StringFlag{
+					Name:    "xkcd-lang",
+					Aliases: []string{"lang", "xkcdlang", "xl"},
+					Usage:   "Language to generate password from, currently only en (english, default) or de are supported",
+					Value:   "en",
+				},
+				&cli.BoolFlag{
+					Name:    "xkcd-capitalize",
+					Aliases: []string{"xkcdcapitalize", "xc"},
+					Usage:   "Capitalize first letter of each word in generated xkcd style password. This flag implies -xkcd",
+				},
+				&cli.BoolFlag{
+					Name:    "xkcd-numbers",
+					Aliases: []string{"xkcdnumbers", "xn"},
+					Usage:   "Add a random number to the end of the generated xkcd style password. This flag implies -xkcd",
+				},
+				&cli.BoolFlag{
+					Name:    "memorable",
+					Aliases: []string{"m"},
+					Usage:   "Use the memorable (word-based) password generator. The requested length is a minimum (output may be longer). Incompatible with --no-numerals (memorable always includes digits).",
+				},
+				&cli.BoolFlag{
+					Name:    "memorable-capitalize",
+					Aliases: []string{"memorablecapitalize", "mc"},
+					Usage:   "Capitalize (some) words in the generated memorable password. This flag implies --memorable",
+				},
+			},
+		},
+	}
+}

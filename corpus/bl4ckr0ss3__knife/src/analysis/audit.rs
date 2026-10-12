@@ -1,0 +1,1407 @@
+//! The bug finder: which sink call sites look wrong, not just which exist.
+//!
+//! `sinks` answers "where is `memcpy` called". That still leaves a researcher
+//! reading every one. `audit` reads them first: for each catalogued call it
+//! recovers where the interesting argument came from and keeps only the sites
+//! whose provenance matches a bug pattern. A `memcpy` whose length was just
+//! computed by a subtraction, an allocation sized by a multiply, a `printf`
+//! whose format string is loaded from memory rather than pointed at a
+//! constant: those are where the bugs are, and those are what it prints.
+//!
+//! Provenance is a bounded backward data-flow walk over x86 registers. It stops
+//! at calls, follows copies and predecessor blocks, and joins origins from
+//! control-flow paths as a may-set. Findings say when a dangerous origin exists
+//! only on some incoming paths rather than silently dropping it or pretending
+//! every path is dangerous.
+
+use crate::analysis::engine::Analysis;
+use crate::analysis::thunks::bare_name;
+use crate::model::{Arch, Binary, Format};
+use iced_x86::{
+    Decoder, DecoderOptions, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind,
+    Register,
+};
+use serde::Serialize;
+use std::collections::{BTreeSet, VecDeque};
+
+/// What to inspect about a given sink, and the 1-based C argument index.
+#[derive(Clone, Copy)]
+enum Check {
+    /// A format-string argument that should be a fixed constant, not a value
+    /// loaded at runtime.
+    Format(u8),
+    /// An allocation size, suspicious when computed by multiplication.
+    AllocSize(u8),
+    /// A copy length, suspicious when computed by subtraction or multiplication.
+    CopySize(u8),
+    /// A copy with no length argument at all; only the reachability matters.
+    Unbounded,
+}
+
+/// The auditable subset of the sink surface, with what to check on each. An
+/// API may carry more than one check (`sprintf` is both a format sink and an
+/// unbounded copy).
+fn checks(api: &str) -> &'static [Check] {
+    use Check::*;
+    match api {
+        // format-string sinks: the format argument, by C position
+        "printf" | "vprintf" => &[Format(1)],
+        "fprintf" | "vfprintf" | "syslog" | "wsprintfA" | "wsprintfW" => &[Format(2)],
+        "sprintf" | "vsprintf" => &[Format(2), Unbounded],
+        "snprintf" | "_snprintf" => &[Format(3)],
+        // allocation size
+        "malloc" => &[AllocSize(1)],
+        "realloc" | "VirtualAlloc" => &[AllocSize(2)],
+        "HeapAlloc" => &[AllocSize(3)],
+        // sized copies: the length argument
+        "memcpy" | "memmove" | "memset" | "RtlCopyMemory" | "CopyMemory" | "bcopy" | "strncpy"
+        | "strncat" | "wcsncpy" => &[CopySize(3)],
+        // copies with no bound
+        "strcpy" | "strcat" | "gets" | "wcscpy" | "wcscat" | "lstrcpyA" | "lstrcpyW"
+        | "lstrcatA" | "lstrcatW" | "StrCpyA" | "StrCpyW" => &[Unbounded],
+        _ => &[],
+    }
+}
+
+/// The source argument of a two-operand string copy, so a constant source can
+/// be told from an attacker-controlled one. `gets` reads stdin (always
+/// attacker-controlled, no pointer argument) and the `sprintf` family expands a
+/// format rather than copying a single source, so both return `None` and keep
+/// their finding as-is.
+fn source_arg(api: &str) -> Option<u8> {
+    match api {
+        "strcpy" | "strcat" | "wcscpy" | "wcscat" | "lstrcpyA" | "lstrcpyW" | "lstrcatA"
+        | "lstrcatW" | "StrCpyA" | "StrCpyW" => Some(2),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Finding {
+    /// Address of the calling instruction.
+    pub addr: u64,
+    pub func: Option<String>,
+    pub api: String,
+    /// Kebab-case pattern id, stable for scripting.
+    pub pattern: &'static str,
+    /// 3 = looks exploitable, 2 = worth a close look, 1 = context worth knowing.
+    pub severity: u8,
+    pub detail: String,
+    /// The call sits in a function reachable from an entry point or export.
+    pub reachable: bool,
+    /// The instructions the provenance walk passed through deciding this: where
+    /// the dangerous argument was produced, every step that carried it, and the
+    /// clamp that bounded it if there was one. Ascending, and empty when the
+    /// walk found nothing to say — a reader can highlight the flow instead of
+    /// taking the explanation on faith.
+    pub trail: Vec<u64>,
+}
+
+/// What the backward walk concluded about where a register's value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Origin {
+    /// A fixed address: `lea reg, [rip+k]` or `mov reg, imm`. Not attacker
+    /// controlled, so a format pointer that is one of these is safe.
+    Fixed,
+    /// Loaded from memory or copied from another register: a runtime value.
+    Dynamic,
+    /// A value inherited from this function's calling convention arguments.
+    Argument,
+    /// A return value from an API that introduces process-external input.
+    External,
+    /// Produced by a multiply or a left shift.
+    Multiply,
+    /// Produced by a subtraction.
+    Subtract,
+    /// A small constant immediate (a length known at compile time).
+    Constant,
+    /// A pointer into the stack frame: `lea reg, [rsp+k]` / `[rbp-k]`. As a copy
+    /// destination this is a fixed-size stack buffer, so an unbounded write into
+    /// it is the classic stack overflow.
+    Stack,
+    /// No defining instruction was found in the block before the call.
+    Unknown,
+}
+
+/// APIs whose return register itself carries data or a size controlled by the
+/// process environment, a file, a socket, the command line, or user input.
+fn external_return(api: &str) -> bool {
+    matches!(
+        api,
+        "getenv"
+            | "secure_getenv"
+            | "fgets"
+            | "gets"
+            | "getline"
+            | "getdelim"
+            | "read"
+            | "recv"
+            | "recvfrom"
+            | "GetCommandLineA"
+            | "GetCommandLineW"
+            | "GetEnvironmentStringsA"
+            | "GetEnvironmentStringsW"
+    )
+}
+
+pub fn run(an: &Analysis, bin: &Binary, bytes: &[u8]) -> Vec<Finding> {
+    // The provenance walk is x86-only; other architectures get no findings
+    // rather than wrong ones. The caller tells the user why.
+    if !matches!(an.arch, Arch::X86 | Arch::X86_64) {
+        return Vec::new();
+    }
+    let win64 = bin.format == Format::Pe && an.bits == 64;
+    let reachable = reachable_functions(an, bin);
+
+    let mut out = Vec::new();
+    for f in &an.functions {
+        let from_entry = reachable.contains(&f.addr);
+        for block in &f.blocks {
+            for (i, ins) in block.insns.iter().enumerate() {
+                let Some(target) = ins.target else { continue };
+                // Resolve the call target to a bare API name.
+                let Some(full) = an.imports.get(&target).or_else(|| an.names.get(&target)) else {
+                    continue;
+                };
+                let api = bare_name(full);
+                let cs = checks(api);
+                if cs.is_empty() {
+                    continue;
+                }
+                for check in cs {
+                    if let Some(mut fnd) =
+                        classify(*check, api, an, bin, bytes, f, block, i, win64, from_entry)
+                    {
+                        fnd.func = Some(f.name.clone());
+                        out.push(fnd);
+                    }
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(b.reachable.cmp(&a.reachable))
+            .then(a.addr.cmp(&b.addr))
+    });
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify(
+    check: Check,
+    api: &str,
+    an: &Analysis,
+    bin: &Binary,
+    bytes: &[u8],
+    func: &crate::analysis::engine::Function,
+    block: &crate::analysis::engine::BasicBlock,
+    call_idx: usize,
+    win64: bool,
+    reachable: bool,
+) -> Option<Finding> {
+    let addr = block.insns[call_idx].addr + an.display_base;
+    // Every instruction the walks below touch, gathered as they run. `mk` reads
+    // it when it builds the finding, and each path has already resolved the
+    // provenance it cares about by then — so a finding carries the flow that
+    // justified it without every arm having to pass it along.
+    let seen: std::cell::RefCell<BTreeSet<u64>> = std::cell::RefCell::new(BTreeSet::new());
+    let prov = |arg: u8| {
+        let p = provenance(an, bin, bytes, func, block, call_idx, arg, win64);
+        seen.borrow_mut().extend(&p.trail);
+        p
+    };
+    let mk = |pattern, severity, detail: String| Finding {
+        addr,
+        func: None,
+        api: api.to_string(),
+        pattern,
+        severity,
+        detail,
+        reachable,
+        trail: seen.borrow().iter().map(|a| a + an.display_base).collect(),
+    };
+
+    // The copy destination is the first argument of every copy sink. A write
+    // into a fixed-size stack buffer is the classic overflow, so it is worth
+    // knowing whichever length pattern applies.
+    let dest_is_stack = prov(1).contains(Origin::Stack);
+
+    match check {
+        Check::Unbounded => {
+            // An unbounded copy into a stack buffer is the textbook stack
+            // overflow, but only if the source is attacker-controlled. Copying a
+            // constant string into a stack buffer is the compiler's own doing
+            // and cannot overflow it, so a fixed source drops the finding to the
+            // bottom band. This is exactly the false positive a run against real
+            // software surfaces: `strcpy(local, "some literal")`.
+            if dest_is_stack {
+                let source = source_arg(api).map(prov);
+                if source.as_ref().is_some_and(|p| p.is_only(Origin::Fixed)) {
+                    return Some(mk(
+                        "stack-overflow",
+                        1,
+                        "copy into a stack buffer, but from a constant string, likely safe"
+                            .to_string(),
+                    ));
+                }
+                let source_kind = match source.as_ref() {
+                    Some(p) if p.contains(Origin::External) => "external-input API data",
+                    Some(p) if p.contains(Origin::Argument) => "a function argument",
+                    Some(p) if p.contains(Origin::Dynamic) => "a runtime value",
+                    Some(_) => "a value of unknown provenance",
+                    None if api == "gets" => "input read directly by gets",
+                    None => "runtime-expanded data",
+                };
+                return Some(mk(
+                    "stack-overflow",
+                    3,
+                    format!(
+                        "unbounded copy of {source_kind} into a stack buffer (classic overflow)"
+                    ),
+                ));
+            }
+            // No length argument to inspect; the finding is the call plus reach.
+            let sev = if reachable { 3 } else { 2 };
+            let detail = if reachable {
+                "unbounded copy reachable from an entry point or export".to_string()
+            } else {
+                "unbounded copy; no length argument bounds the write".to_string()
+            };
+            Some(mk("unbounded-copy", sev, detail))
+        }
+        Check::Format(arg) => {
+            // A format pointer that is a fixed constant is the normal, safe
+            // case; a runtime pointer is the format-string bug. Anything we
+            // could not resolve is left alone rather than guessed at.
+            let p = prov(arg);
+            if p.contains(Origin::External)
+                || p.contains(Origin::Argument)
+                || p.contains(Origin::Dynamic)
+            {
+                let path = if p.mixed() {
+                    " on some incoming paths"
+                } else {
+                    ""
+                };
+                let source = if p.contains(Origin::External) {
+                    "originates from an external-input API"
+                } else if p.contains(Origin::Argument) {
+                    "comes from a function argument"
+                } else {
+                    "is loaded at runtime"
+                };
+                Some(mk(
+                    "format-string",
+                    3,
+                    format!("format argument {source}{path}, not a constant string"),
+                ))
+            } else {
+                None
+            }
+        }
+        // A size that is clamped or masked before the call cannot actually reach
+        // an extreme, so the finding is kept but ranked well below the raw ones:
+        // still worth a glance, no longer worth an afternoon.
+        Check::AllocSize(arg) => {
+            let p = prov(arg);
+            if p.contains(Origin::Multiply) {
+                let (sev, src) = arith_severity(&p);
+                Some(sized(
+                    &mk,
+                    "alloc-overflow",
+                    sev,
+                    &format!("allocation size computed by multiplication {src}"),
+                    p.bounded,
+                    p.mixed(),
+                ))
+            } else if p.contains(Origin::Subtract) {
+                let (sev, src) = arith_severity(&p);
+                Some(sized(
+                    &mk,
+                    "alloc-underflow",
+                    sev,
+                    &format!("allocation size computed by subtraction {src}"),
+                    p.bounded,
+                    p.mixed(),
+                ))
+            } else {
+                None
+            }
+        }
+        Check::CopySize(arg) => {
+            let p = prov(arg);
+            // A stack destination turns an attacker-influenced length into a
+            // stack-smash rather than a heap one, worth saying in the finding.
+            let dst = if dest_is_stack {
+                " into a stack buffer"
+            } else {
+                ""
+            };
+            if p.contains(Origin::Subtract) {
+                let (sev, src) = arith_severity(&p);
+                Some(sized(
+                    &mk,
+                    "copy-underflow",
+                    sev,
+                    &format!("copy length computed by subtraction {src}{dst}"),
+                    p.bounded,
+                    p.mixed(),
+                ))
+            } else if p.contains(Origin::Multiply) {
+                let (sev, src) = arith_severity(&p);
+                Some(sized(
+                    &mk,
+                    "copy-overflow",
+                    sev,
+                    &format!("copy length computed by multiplication {src}{dst}"),
+                    p.bounded,
+                    p.mixed(),
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Build a size-argument finding, downgrading it a band and annotating it when
+/// the value was clamped or masked before the call.
+/// Rank an arithmetic-size finding by whether the values feeding the arithmetic
+/// are attacker-influenced. A product or difference of caller-controlled input
+/// is the real integer bug; one of constants or internal values is the benign
+/// allocator pattern that used to be a false positive, and drops to the bottom.
+fn arith_severity(p: &Prov) -> (u8, &'static str) {
+    if p.contains(Origin::External) || p.contains(Origin::Argument) {
+        (3, "from caller-controlled input")
+    } else if p.contains(Origin::Dynamic) {
+        (2, "from a runtime value")
+    } else {
+        (1, "from constant or internal values, likely safe")
+    }
+}
+
+fn sized(
+    mk: &dyn Fn(&'static str, u8, String) -> Finding,
+    pattern: &'static str,
+    severity: u8,
+    detail: &str,
+    bounded: bool,
+    mixed: bool,
+) -> Finding {
+    let path = if mixed {
+        "; arithmetic origin occurs on some incoming paths"
+    } else {
+        ""
+    };
+    if bounded {
+        // A clamped or masked size is likely safe, so it sinks to the bottom
+        // band rather than merely one step down.
+        mk(
+            pattern,
+            1,
+            format!("{detail}{path}; but clamped or masked before the call, likely safe"),
+        )
+    } else {
+        mk(pattern, severity, format!("{detail}{path}"))
+    }
+}
+
+/// Which 64-bit register carries C argument `n` (1-based) under the ABI.
+fn arg_register(n: u8, win64: bool) -> Option<Register> {
+    let table: &[Register] = if win64 {
+        &[Register::RCX, Register::RDX, Register::R8, Register::R9]
+    } else {
+        &[
+            Register::RDI,
+            Register::RSI,
+            Register::RDX,
+            Register::RCX,
+            Register::R8,
+            Register::R9,
+        ]
+    };
+    table.get((n as usize).checked_sub(1)?).copied()
+}
+
+/// What the backward walk found about an argument: where its value came from,
+/// and whether it was bounded before the call.
+struct Prov {
+    origins: BTreeSet<Origin>,
+    /// A clamp (`cmp` + `cmov`) or a mask (`and reg, imm`) was applied to the
+    /// value between its computation and the call, so a raw subtraction or
+    /// multiply cannot actually reach an extreme.
+    bounded: bool,
+    /// The instructions the walk passed through on its way from the call back to
+    /// the origin: every one that writes the tracked register, the clamp that
+    /// bounds it, and the external call that produced it.
+    ///
+    /// A set, not a path. The walk unions its results in two places — the
+    /// operands of a multiply or subtract, and the predecessors of a block — so
+    /// no single line through the function exists to report. What is honest is
+    /// "these instructions participate in the value", which is also exactly what
+    /// a reader wants highlighted. Ordered, so the same image always reports the
+    /// same trail.
+    trail: BTreeSet<u64>,
+}
+
+impl Prov {
+    fn one(origin: Origin, bounded: bool) -> Self {
+        Self {
+            origins: BTreeSet::from([origin]),
+            bounded,
+            trail: BTreeSet::new(),
+        }
+    }
+
+    fn unknown(bounded: bool) -> Self {
+        Self::one(Origin::Unknown, bounded)
+    }
+
+    /// As `one`, but crediting the instruction the origin was read from.
+    fn at(origin: Origin, bounded: bool, addr: u64) -> Self {
+        let mut p = Self::one(origin, bounded);
+        p.trail.insert(addr);
+        p
+    }
+
+    /// Fold the instructions this walk already visited into a result built from
+    /// a deeper one, so a returned provenance carries the whole chain.
+    fn with(mut self, visited: &BTreeSet<u64>) -> Self {
+        self.trail.extend(visited);
+        self
+    }
+
+    fn contains(&self, origin: Origin) -> bool {
+        self.origins.contains(&origin)
+    }
+
+    fn is_only(&self, origin: Origin) -> bool {
+        self.origins.len() == 1 && self.contains(origin)
+    }
+
+    fn mixed(&self) -> bool {
+        self.origins.len() > 1
+    }
+}
+
+/// Where an argument's value came from, and whether it was bounded on the way.
+///
+/// The walk is backward from the call over the argument register. When it runs
+/// off the top of the call's own block without an answer, it continues into the
+/// predecessor blocks: the "a switch picks a value, a common tail makes the
+/// call" shape is everywhere, and without following it a value set one block
+/// earlier reads as unknown. Predecessor origins are unioned, and the depth is
+/// capped so a loop or a fan-in cannot run away.
+#[allow(clippy::too_many_arguments)]
+fn provenance(
+    an: &Analysis,
+    bin: &Binary,
+    bytes: &[u8],
+    func: &crate::analysis::engine::Function,
+    block: &crate::analysis::engine::BasicBlock,
+    call_idx: usize,
+    arg: u8,
+    win64: bool,
+) -> Prov {
+    // 32-bit x86 passes arguments on the stack, not in registers, so the
+    // register walk finds nothing and every legacy binary reads as unknown.
+    // There the Nth argument is the Nth `push` before the call.
+    if an.bits == 32 {
+        return provenance_32(an, bin, bytes, func, block, call_idx, arg);
+    }
+    let Some(target) = arg_register(arg, win64) else {
+        return Prov::unknown(false);
+    };
+    resolve_reg(
+        an,
+        bin,
+        bytes,
+        func,
+        block,
+        call_idx,
+        target.full_register(),
+        0,
+        win64,
+    )
+}
+
+/// Provenance for the 32-bit stack calling convention: find the `push` that
+/// supplies argument `arg` (they go right-to-left, so arg 1 is the last push
+/// before the call), then classify what it pushed. A pushed register is traced
+/// back like any other value.
+fn provenance_32(
+    an: &Analysis,
+    bin: &Binary,
+    bytes: &[u8],
+    func: &crate::analysis::engine::Function,
+    block: &crate::analysis::engine::BasicBlock,
+    call_idx: usize,
+    arg: u8,
+) -> Prov {
+    let unknown = Prov::unknown(false);
+    // Walk back counting pushes; the arg-th one is our argument.
+    let mut seen = 0u8;
+    for j in (0..call_idx).rev() {
+        let ins = &block.insns[j];
+        let Some(d) = decode_one(ins.bytes(), ins.addr, an.bits) else {
+            continue;
+        };
+        // Arguments are pushed after any earlier call returns, so an
+        // intervening call means the push we want is not in this run.
+        if matches!(d.mnemonic(), Mnemonic::Call) {
+            return unknown;
+        }
+        if d.mnemonic() != Mnemonic::Push {
+            continue;
+        }
+        seen += 1;
+        if seen != arg {
+            continue;
+        }
+        // This push supplies the argument, so it is the first step of the flow
+        // whatever it turns out to push. Classify what that is.
+        let pushed_at = ins.addr;
+        return match d.op0_kind() {
+            OpKind::Register => {
+                // `push eax` where eax was `lea eax,[ebp-0x28]` or a load: trace
+                // the register back from just before this push.
+                let mut p = resolve_reg(
+                    an,
+                    bin,
+                    bytes,
+                    func,
+                    block,
+                    j,
+                    d.op0_register().full_register(),
+                    0,
+                    false,
+                );
+                p.trail.insert(pushed_at);
+                p
+            }
+            OpKind::Memory => Prov::at(Origin::Dynamic, false, pushed_at),
+            _ => {
+                // A pushed immediate: a constant, or a fixed pointer if it lands
+                // on a string (`push offset "literal"`).
+                let imm = d.immediate(0);
+                Prov::at(
+                    if points_at_string(bin, an, bytes, imm) {
+                        Origin::Fixed
+                    } else {
+                        Origin::Constant
+                    },
+                    false,
+                    pushed_at,
+                )
+            }
+        };
+    }
+    unknown
+}
+
+/// Resolve register `want` by walking backward from index `upto` in `block`,
+/// descending into predecessor blocks up to a small depth.
+#[allow(clippy::too_many_arguments)]
+fn resolve_reg(
+    an: &Analysis,
+    bin: &Binary,
+    bytes: &[u8],
+    func: &crate::analysis::engine::Function,
+    block: &crate::analysis::engine::BasicBlock,
+    upto: usize,
+    want_in: Register,
+    depth: u32,
+    win64: bool,
+) -> Prov {
+    let mut want = want_in;
+    let mut bounded = false;
+    let mut info = InstructionInfoFactory::new();
+    // Every instruction this walk decides is part of the value, so the caller can
+    // show the flow rather than only name its origin.
+    let mut visited: BTreeSet<u64> = BTreeSet::new();
+
+    for j in (0..upto).rev() {
+        let ins = &block.insns[j];
+        let Some(d) = decode_one(ins.bytes(), ins.addr, an.bits) else {
+            continue;
+        };
+        // Argument registers do not survive an intervening call, so a value set
+        // before one is not the value passed here, and there is no point
+        // chasing it into predecessors either.
+        if matches!(d.mnemonic(), Mnemonic::Call) {
+            if want == Register::RAX
+                && ins
+                    .target_name
+                    .as_deref()
+                    .map(bare_name)
+                    .is_some_and(external_return)
+            {
+                return Prov::at(Origin::External, bounded, ins.addr).with(&visited);
+            }
+            return Prov::unknown(bounded).with(&visited);
+        }
+
+        // A conditional move into the tracked register is the min/max clamp
+        // idiom (`cmp size, limit; cmova size, limit`). It writes the register
+        // only conditionally, so the backward walk would otherwise step past it
+        // to the raw arithmetic and call a bounded value dangerous. Record the
+        // clamp and keep following the kept value.
+        if is_cmov(&d) && writes_reg(&mut info, &d, want) {
+            bounded = true;
+            visited.insert(ins.addr);
+            continue;
+        }
+
+        if !writes_reg(&mut info, &d, want) {
+            continue;
+        }
+        // Past this point the instruction writes the value being traced, so it
+        // belongs to the flow whichever way the walk goes from here.
+        visited.insert(ins.addr);
+        // A mask bounds the value to the immediate, which is the other way a
+        // subtraction or product is made safe.
+        if d.mnemonic() == Mnemonic::And && d.op1_kind() != OpKind::Register {
+            bounded = true;
+        }
+        // Follow a copy: `mov edi, eax` means the value's real origin is
+        // whatever last wrote eax, so keep walking with that register.
+        if d.mnemonic() == Mnemonic::Mov
+            && d.op0_kind() == OpKind::Register
+            && d.op1_kind() == OpKind::Register
+        {
+            want = d.op1_register().full_register();
+            continue;
+        }
+        let origin = origin_of(&d, bin, an, bytes);
+        // See through size arithmetic into its operands: a product or difference
+        // is only dangerous if a value feeding it is attacker-influenced. A
+        // `count * size` of constants is the benign allocator pattern, and
+        // stopping at the multiply cannot tell the two apart. Chase the read GPR
+        // operands (bounded by `depth`) and union what they resolve to. Chasing
+        // a memory-address base errs toward "attacker-influenced", i.e. toward
+        // keeping a real bug high.
+        if matches!(origin, Origin::Multiply | Origin::Subtract) && depth < 2 {
+            let reads: Vec<Register> = info
+                .info(&d)
+                .used_registers()
+                .iter()
+                .filter(|u| matches!(u.access(), OpAccess::Read | OpAccess::ReadWrite))
+                .map(|u| u.register())
+                .filter(|r| r.is_gpr())
+                .map(|r| r.full_register())
+                .collect();
+            let mut origins = BTreeSet::from([origin]);
+            let mut b = bounded;
+            let mut trail = visited;
+            for r in reads {
+                let sub = resolve_reg(an, bin, bytes, func, block, j, r, depth + 1, win64);
+                origins.extend(sub.origins);
+                b |= sub.bounded;
+                trail.extend(sub.trail);
+            }
+            return Prov {
+                origins,
+                bounded: b,
+                trail,
+            };
+        }
+        return Prov::at(origin, bounded, ins.addr).with(&visited);
+    }
+
+    // Not written in this block. Join every predecessor's possible origins.
+    if depth >= 2 {
+        return Prov::unknown(bounded).with(&visited);
+    }
+    let preds: Vec<&crate::analysis::engine::BasicBlock> = func
+        .blocks
+        .iter()
+        .filter(|b| b.start != block.start && b.succ.contains(&block.start))
+        .collect();
+    if preds.is_empty() {
+        if block.start == func.addr && an.bits == 64 && abi_arg_register(want, win64) {
+            return Prov::one(Origin::Argument, bounded).with(&visited);
+        }
+        return Prov::unknown(bounded).with(&visited);
+    }
+
+    let mut origins = BTreeSet::new();
+    let mut all_bounded = true;
+    let mut trail = visited;
+    for p in preds {
+        let r = resolve_reg(
+            an,
+            bin,
+            bytes,
+            func,
+            p,
+            p.insns.len(),
+            want,
+            depth + 1,
+            win64,
+        );
+        all_bounded &= r.bounded;
+        origins.extend(r.origins);
+        trail.extend(r.trail);
+    }
+    Prov {
+        origins,
+        bounded: bounded || all_bounded,
+        trail,
+    }
+}
+
+fn abi_arg_register(register: Register, win64: bool) -> bool {
+    let args: &[Register] = if win64 {
+        &[Register::RCX, Register::RDX, Register::R8, Register::R9]
+    } else {
+        &[
+            Register::RDI,
+            Register::RSI,
+            Register::RDX,
+            Register::RCX,
+            Register::R8,
+            Register::R9,
+        ]
+    };
+    args.contains(&register)
+}
+
+/// Does this instruction write (or conditionally write) the given 64-bit reg?
+fn writes_reg(info: &mut InstructionInfoFactory, d: &Instruction, want: Register) -> bool {
+    info.info(d)
+        .used_registers()
+        .iter()
+        .filter(|u| {
+            matches!(
+                u.access(),
+                OpAccess::Write | OpAccess::ReadWrite | OpAccess::CondWrite
+            )
+        })
+        .any(|u| u.register().is_gpr() && u.register().full_register() == want)
+}
+
+/// Every conditional-move variant, without listing all sixteen: their debug
+/// names all begin with `Cmov`.
+fn is_cmov(d: &Instruction) -> bool {
+    format!("{:?}", d.mnemonic()).starts_with("Cmov")
+}
+
+/// Classify the instruction that defined an argument register.
+fn origin_of(d: &Instruction, bin: &Binary, an: &Analysis, bytes: &[u8]) -> Origin {
+    match d.mnemonic() {
+        Mnemonic::Imul | Mnemonic::Mul => Origin::Multiply,
+        // A left shift is a multiply by a power of two; on a size it overflows
+        // the same way.
+        Mnemonic::Shl | Mnemonic::Sal => Origin::Multiply,
+        Mnemonic::Sub | Mnemonic::Sbb => Origin::Subtract,
+        // `lea reg, [base + index*scale]` with a real index is a multiply; a
+        // frame-relative lea is a stack buffer; a plain `lea reg, [rip+k]` is a
+        // fixed address.
+        Mnemonic::Lea => {
+            let base = d.memory_base();
+            if matches!(
+                base,
+                Register::RSP | Register::ESP | Register::RBP | Register::EBP
+            ) && d.memory_index() == Register::None
+            {
+                Origin::Stack
+            } else if d.memory_index() != Register::None {
+                Origin::Multiply
+            } else {
+                Origin::Fixed
+            }
+        }
+        Mnemonic::Mov => classify_mov(d, bin, an, bytes),
+        Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => Origin::Dynamic,
+        Mnemonic::Xor => {
+            // xor reg, reg is the idiom for zero.
+            if d.op0_register() == d.op1_register() {
+                Origin::Constant
+            } else {
+                Origin::Dynamic
+            }
+        }
+        _ => Origin::Dynamic,
+    }
+}
+
+fn classify_mov(d: &Instruction, bin: &Binary, an: &Analysis, bytes: &[u8]) -> Origin {
+    match d.op1_kind() {
+        // mov reg, imm: a compile-time constant. A pointer-sized immediate that
+        // lands on a mapped string is a fixed format pointer; otherwise it is a
+        // constant length.
+        OpKind::Immediate8
+        | OpKind::Immediate16
+        | OpKind::Immediate32
+        | OpKind::Immediate32to64
+        | OpKind::Immediate64 => {
+            let imm = d.immediate(1);
+            if points_at_string(bin, an, bytes, imm) {
+                Origin::Fixed
+            } else {
+                Origin::Constant
+            }
+        }
+        // mov reg, [mem]: a runtime load.
+        OpKind::Memory => Origin::Dynamic,
+        // mov reg, reg: value came from another register (often a call return).
+        OpKind::Register => Origin::Dynamic,
+        _ => Origin::Dynamic,
+    }
+}
+
+/// Does this address land within a string literal in a mapped section? Used to
+/// tell a fixed format-string pointer from a dangerous runtime one.
+fn points_at_string(bin: &Binary, an: &Analysis, bytes: &[u8], va: u64) -> bool {
+    let base = an.display_base;
+    let Some(off) = crate::analysis::engine::va_to_off(bin, base, va) else {
+        return false;
+    };
+    // A printable run of a few bytes at the target is a string constant.
+    bytes
+        .get(off..off + 4)
+        .is_some_and(|w| w.iter().all(|&b| (0x20..0x7f).contains(&b)))
+}
+
+/// Decode a single instruction from an engine block's stored bytes, so the
+/// audit can read operands the block model does not keep.
+fn decode_one(raw: &[u8], ip: u64, bits: u32) -> Option<Instruction> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut dec = Decoder::with_ip(bits, raw, ip, DecoderOptions::NONE);
+    if !dec.can_decode() {
+        return None;
+    }
+    let insn = dec.decode();
+    (!insn.is_invalid()).then_some(insn)
+}
+
+/// Functions reachable from the entry point or an export, by forward walk over
+/// the recovered call graph. A sink inside one of these is attacker-reachable.
+fn reachable_functions(an: &Analysis, bin: &Binary) -> BTreeSet<u64> {
+    let base = crate::analysis::engine::display_base(bin);
+    let is_func: BTreeSet<u64> = an.functions.iter().map(|f| f.addr).collect();
+
+    let mut roots: Vec<u64> = bin
+        .symbols
+        .iter()
+        .filter(|s| s.kind == crate::model::SymKind::Export)
+        .map(|s| s.addr + base)
+        .filter(|a| is_func.contains(a))
+        .collect();
+    let entry = bin.entry + base;
+    if is_func.contains(&entry) {
+        roots.push(entry);
+    }
+
+    let mut seen: BTreeSet<u64> = roots.iter().copied().collect();
+    let mut queue: VecDeque<u64> = roots.into_iter().collect();
+    while let Some(a) = queue.pop_front() {
+        let Some(f) = an.find_function(a) else {
+            continue;
+        };
+        for &callee in &f.calls {
+            if is_func.contains(&callee) && seen.insert(callee) {
+                queue.push_back(callee);
+            }
+        }
+    }
+    seen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::engine;
+    use crate::db::Db;
+    use crate::model::{Section, SymKind, Symbol};
+
+    /// Assemble a single function: a run of x86-64 bytes at `va` ending in the
+    /// caller's `ret`, plus an imported sink at `slot` that the code calls via
+    /// `call [rip]`. Returns the analysis so a test can audit it.
+    struct Harness {
+        bin: Binary,
+        bytes: Vec<u8>,
+    }
+
+    impl Harness {
+        /// `code` is placed at 0x1000; `sink` is imported at slot 0x4000 and is
+        /// the target of the final `call qword [rip+disp]` the caller appends.
+        fn new(sink: &str, mut code: Vec<u8>) -> Harness {
+            let va = 0x1000u64;
+            let slot = 0x4000u64;
+            // call qword ptr [rip+disp] -> slot. Instruction is 6 bytes.
+            let call_at = va + code.len() as u64;
+            let disp = (slot as i64 - (call_at as i64 + 6)) as i32;
+            code.push(0xff);
+            code.push(0x15);
+            code.extend_from_slice(&disp.to_le_bytes());
+            code.push(0xc3); // ret
+
+            let mut bin = Binary::stub(Format::Elf, Arch::X86_64);
+            bin.entry = va;
+            bin.sections = vec![Section {
+                name: ".text".into(),
+                vaddr: va,
+                vsize: code.len() as u64,
+                file_off: va,
+                file_size: code.len() as u64,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: true,
+            }];
+            bin.symbols = vec![Symbol {
+                addr: slot,
+                name: sink.into(),
+                kind: SymKind::Import,
+                size: None,
+            }];
+            let mut bytes = vec![0u8; va as usize];
+            bytes.extend_from_slice(&code);
+            Harness { bin, bytes }
+        }
+
+        /// A 32-bit variant: `sink` is imported at slot 0x4000 and called via
+        /// `call dword [0x4000]` (the absolute-indirect form 32-bit uses), so
+        /// arguments come from `push`es, not registers.
+        fn new_x86(sink: &str, mut code: Vec<u8>) -> Harness {
+            let va = 0x1000u64;
+            let slot = 0x4000u64;
+            code.push(0xff); // call dword ptr [slot]
+            code.push(0x15);
+            code.extend_from_slice(&(slot as u32).to_le_bytes());
+            code.push(0xc3); // ret
+
+            let mut bin = Binary::stub(Format::Pe, Arch::X86);
+            bin.entry = va;
+            bin.sections = vec![Section {
+                name: ".text".into(),
+                vaddr: va,
+                vsize: code.len() as u64,
+                file_off: va,
+                file_size: code.len() as u64,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: true,
+            }];
+            bin.symbols = vec![Symbol {
+                addr: slot,
+                name: sink.into(),
+                kind: SymKind::Import,
+                size: None,
+            }];
+            let mut bytes = vec![0u8; va as usize];
+            bytes.extend_from_slice(&code);
+            Harness { bin, bytes }
+        }
+
+        fn with_import(mut self, addr: u64, name: &str) -> Harness {
+            self.bin.symbols.push(Symbol {
+                addr,
+                name: name.into(),
+                kind: SymKind::Import,
+                size: None,
+            });
+            self
+        }
+
+        fn findings(&self) -> Vec<Finding> {
+            let an = engine::analyze(&self.bin, &self.bytes, 10_000, &Db::default());
+            run(&an, &self.bin, &self.bytes)
+        }
+    }
+
+    #[test]
+    fn memcpy_length_from_subtraction_is_flagged() {
+        // mov rdi, rsi ; mov edx, ecx ; sub edx, eax ; call memcpy
+        // The length (rdx, SysV arg3) is a subtraction: underflow candidate.
+        let code = vec![
+            0x48, 0x89, 0xf7, // mov rdi, rsi
+            0x89, 0xca, // mov edx, ecx
+            0x29, 0xc2, // sub edx, eax
+        ];
+        let f = Harness::new("memcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "copy-underflow")
+            .expect("expected copy-underflow");
+        assert_eq!(hit.severity, 3, "an unclamped subtraction is high severity");
+    }
+
+    #[test]
+    fn dangerous_origin_on_one_branch_survives_the_join() {
+        // cmp eax,0 ; je constant ; imul edx,ecx ; jmp join ;
+        // constant: mov edx,0x20 ; join: call memcpy
+        // The third argument is dangerous on one feasible path and fixed on
+        // the other. A may-analysis must keep the multiplication visible.
+        let h = Harness::new(
+            "memcpy",
+            vec![
+                0x83, 0xf8, 0x00, // cmp eax, 0
+                0x74, 0x05, // je +5 -> constant
+                0x0f, 0xaf, 0xd1, // imul edx, ecx
+                0xeb, 0x05, // jmp +5 -> join
+                0xba, 0x20, 0x00, 0x00, 0x00, // mov edx, 0x20
+            ],
+        );
+        let findings = h.findings();
+        let hit = findings
+            .iter()
+            .find(|finding| finding.pattern == "copy-overflow")
+            .expect("multiplication on one incoming path should remain visible");
+        assert!(
+            hit.detail.contains("some incoming paths"),
+            "mixed provenance should be explicit: {}",
+            hit.detail
+        );
+    }
+
+    #[test]
+    fn a_clamped_subtraction_is_downgraded_not_dropped() {
+        // sub edx, eax ; cmp edx, ecx ; cmova edx, ecx ; call memcpy
+        // The length (rdx, SysV arg3) is a subtraction, but the cmov clamps it,
+        // so it is the safe min()/max() idiom, not an underflow. The finding
+        // should survive but drop below the raw ones.
+        let code = vec![
+            0x29, 0xc2, // sub edx, eax
+            0x39, 0xca, // cmp edx, ecx
+            0x0f, 0x47, 0xd1, // cmova edx, ecx
+        ];
+        let f = Harness::new("memcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "copy-underflow")
+            .expect("still reported");
+        assert_eq!(hit.severity, 1, "a clamped subtraction is downgraded");
+        assert!(hit.detail.contains("clamped or masked"));
+    }
+
+    #[test]
+    fn a_clamp_through_a_move_hop_is_detected() {
+        // The exact shape seen in 7z.dll: the length is computed in one 64-bit
+        // register, clamped there with a cmov, then moved into the argument
+        // register. The walk must follow the move and still see the clamp.
+        //   sub r12, rax ; cmp r12, rcx ; cmova r12, rcx ; mov rdx, r12 ; call
+        let code = vec![
+            0x49, 0x29, 0xc4, // sub r12, rax
+            0x49, 0x39, 0xcc, // cmp r12, rcx
+            0x4c, 0x0f, 0x47, 0xe1, // cmova r12, rcx
+            0x4c, 0x89, 0xe2, // mov rdx, r12   (rdx = SysV arg3)
+        ];
+        let f = Harness::new("memcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "copy-underflow")
+            .expect("still reported");
+        assert_eq!(hit.severity, 1, "the clamp is seen through the move hop");
+    }
+
+    #[test]
+    fn strcpy_into_a_stack_buffer_is_a_stack_overflow() {
+        // lea rdi, [rsp+0x20] ; call strcpy
+        // The destination (rdi, SysV arg1) is a stack buffer, so an unbounded
+        // strcpy into it is the textbook stack overflow, not a generic one.
+        let code = vec![0x48, 0x8d, 0x7c, 0x24, 0x20]; // lea rdi, [rsp+0x20]
+        let f = Harness::new("strcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("expected stack-overflow");
+        assert_eq!(hit.severity, 3);
+        assert!(hit.detail.contains("stack buffer"));
+    }
+
+    #[test]
+    fn strcpy_of_a_constant_into_a_stack_buffer_is_downgraded() {
+        // lea rsi, [rip+0x10] ; lea rdi, [rsp+0x20] ; call strcpy
+        // The source (rsi, SysV arg2) is a constant string, so this cannot
+        // overflow the buffer: the exact false positive a real binary surfaces.
+        let code = vec![
+            0x48, 0x8d, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip+0x10]
+            0x48, 0x8d, 0x7c, 0x24, 0x20, // lea rdi, [rsp+0x20]
+        ];
+        let f = Harness::new("strcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("still reported");
+        assert_eq!(hit.severity, 1, "a constant source cannot overflow");
+        assert!(hit.detail.contains("constant string"));
+    }
+
+    #[test]
+    fn a_constant_source_set_in_a_predecessor_block_is_resolved() {
+        // The 7z shape: the source is a constant set in an earlier block, then a
+        // common tail does `lea dst,[rsp+..]; strcpy`. The walk must follow the
+        // predecessor to see the source is constant and downgrade the finding.
+        //   lea rsi,[rip+0] ; jmp +0 ; lea rdi,[rsp+0x20] ; call strcpy
+        // The jmp forces a block split so the source lands in a predecessor.
+        let code = vec![
+            0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00, // lea rsi, [rip+0]  (const src)
+            0xeb, 0x00, // jmp +0  (block boundary; target is the next insn)
+            0x48, 0x8d, 0x7c, 0x24, 0x20, // lea rdi, [rsp+0x20]  (stack dst)
+        ];
+        let f = Harness::new("strcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("still reported");
+        assert_eq!(
+            hit.severity, 1,
+            "a constant source one block back is resolved and downgraded"
+        );
+    }
+
+    #[test]
+    fn strcpy_of_a_runtime_value_into_a_stack_buffer_stays_high() {
+        // mov rsi, [rbx] ; lea rdi, [rsp+0x20] ; call strcpy
+        // The source is a loaded (runtime) pointer, so the overflow is real.
+        let code = vec![
+            0x48, 0x8b, 0x33, // mov rsi, [rbx]
+            0x48, 0x8d, 0x7c, 0x24, 0x20, // lea rdi, [rsp+0x20]
+        ];
+        let f = Harness::new("strcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("expected stack-overflow");
+        assert_eq!(hit.severity, 3, "a runtime source is the real overflow");
+    }
+
+    #[test]
+    fn strcpy_into_a_heap_pointer_is_a_plain_unbounded_copy() {
+        // mov rdi, [rbx] ; call strcpy: the destination is a loaded pointer,
+        // not a stack buffer, so it stays the generic unbounded-copy finding.
+        let code = vec![0x48, 0x8b, 0x3b]; // mov rdi, [rbx]
+        let f = Harness::new("strcpy", code).findings();
+        assert!(f.iter().any(|x| x.pattern == "unbounded-copy"));
+        assert!(!f.iter().any(|x| x.pattern == "stack-overflow"));
+    }
+
+    #[test]
+    fn a_32bit_stack_copy_reads_its_pushed_arguments() {
+        // The CVE-2017-11882 shape, 32-bit: an attacker field is copied into a
+        // fixed stack buffer via lstrcpyA, with both arguments on the stack.
+        //   mov eax,[ebp+8] ; add eax,0x1c ; push eax   (src: attacker record)
+        //   lea eax,[ebp-0x28] ; push eax               (dst: stack buffer)
+        //   call [lstrcpyA]
+        let code = vec![
+            0x8b, 0x45, 0x08, // mov eax, [ebp+8]
+            0x83, 0xc0, 0x1c, // add eax, 0x1c
+            0x50, // push eax          (arg2 = src)
+            0x8d, 0x45, 0xd8, // lea eax, [ebp-0x28]
+            0x50, // push eax          (arg1 = dst, stack buffer)
+        ];
+        let f = Harness::new_x86("lstrcpyA", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("expected stack-overflow from 32-bit pushed args");
+        assert_eq!(hit.severity, 3, "runtime source into a stack buffer");
+    }
+
+    #[test]
+    fn malloc_size_from_multiply_is_flagged() {
+        // mov eax, edi ; imul eax, esi ; mov edi, eax ; call malloc
+        // The size (rdi, SysV arg1) traces to an imul: overflow candidate.
+        let code = vec![
+            0x89, 0xf8, // mov eax, edi
+            0x0f, 0xaf, 0xc6, // imul eax, esi
+            0x89, 0xc7, // mov edi, eax
+        ];
+        let f = Harness::new("malloc", code).findings();
+        assert!(
+            f.iter().any(|x| x.pattern == "alloc-overflow"),
+            "expected alloc-overflow, got {:?}",
+            f.iter().map(|x| x.pattern).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn malloc_size_from_a_constant_multiply_is_not_high() {
+        // mov eax, 0x10 ; mov ecx, 0x20 ; imul eax, ecx ; mov edi, eax ; call malloc
+        // The size is a product of two constants — the benign `count * size`
+        // allocator pattern, not a caller-controlled overflow. Seeing through the
+        // imul to its constant operands must drop it to the bottom band; that is
+        // the false positive real software surfaces.
+        let code = vec![
+            0xb8, 0x10, 0x00, 0x00, 0x00, // mov eax, 0x10
+            0xb9, 0x20, 0x00, 0x00, 0x00, // mov ecx, 0x20
+            0x0f, 0xaf, 0xc1, // imul eax, ecx
+            0x89, 0xc7, // mov edi, eax
+        ];
+        let f = Harness::new("malloc", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "alloc-overflow")
+            .expect("still surfaced, just low");
+        assert_eq!(
+            hit.severity, 1,
+            "a constant-operand product is not exploitable"
+        );
+        assert!(hit.detail.contains("constant or internal"));
+    }
+
+    #[test]
+    fn memcpy_with_a_constant_length_is_not_flagged() {
+        // mov edx, 0x10 ; call memcpy: a fixed length is not a bug.
+        let code = vec![0xba, 0x10, 0x00, 0x00, 0x00]; // mov edx, 16
+        let f = Harness::new("memcpy", code).findings();
+        assert!(
+            !f.iter().any(|x| x.pattern.starts_with("copy-")),
+            "a constant length must not be flagged: {:?}",
+            f.iter().map(|x| x.pattern).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn printf_with_a_runtime_format_is_flagged() {
+        // mov rdi, [rsi] ; call printf: format loaded from memory.
+        let code = vec![0x48, 0x8b, 0x3e]; // mov rdi, [rsi]
+        let f = Harness::new("printf", code).findings();
+        assert!(
+            f.iter().any(|x| x.pattern == "format-string"),
+            "expected format-string, got {:?}",
+            f.iter().map(|x| x.pattern).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_finding_carries_the_instructions_its_argument_came_through() {
+        // `mov rdi, [rsi]` immediately before the call is what produced the
+        // format pointer, so it is what a reader should be shown — naming the
+        // origin is not the same as being able to point at it.
+        let code = vec![0x48, 0x8b, 0x3e]; // mov rdi, [rsi], 3 bytes
+        let findings = Harness::new("printf", code).findings();
+        let hit = findings
+            .iter()
+            .find(|f| f.pattern == "format-string")
+            .expect("a format string loaded from memory is dangerous");
+        assert!(
+            hit.trail.contains(&(hit.addr - 3)),
+            "the load that produced the format pointer should be on the trail: \
+             call at {:#x}, trail {:#x?}",
+            hit.addr,
+            hit.trail
+        );
+        // In this straight-line fixture every step precedes the call. That is
+        // not a general law: a loop's back edge makes the call's own block reach
+        // itself, so on real code a step can sit at a higher address than the
+        // call it feeds.
+        assert!(
+            hit.trail.iter().all(|a| *a < hit.addr),
+            "in one linear block the steps precede the call: call at {:#x}, trail {:#x?}",
+            hit.addr,
+            hit.trail
+        );
+        assert!(
+            hit.trail.windows(2).all(|w| w[0] < w[1]),
+            "the trail is ascending and free of repeats: {:#x?}",
+            hit.trail
+        );
+    }
+
+    #[test]
+    fn a_constant_argument_leaves_a_short_trail() {
+        // `mov edx, 16` then memcpy: the length is a compile-time constant, so
+        // the walk stops at that one instruction and has nothing further to say.
+        let code = vec![0xba, 0x10, 0x00, 0x00, 0x00]; // mov edx, 16
+        let findings = Harness::new("memcpy", code).findings();
+        for f in &findings {
+            assert!(
+                f.trail.len() <= 2,
+                "a constant length should not drag a long trail: {:#x?}",
+                f.trail
+            );
+        }
+    }
+
+    #[test]
+    fn printf_with_a_function_argument_is_flagged_as_tainted() {
+        // SysV arg1 arrives in rdi and is forwarded directly to printf.
+        let findings = Harness::new("printf", vec![]).findings();
+        let hit = findings
+            .iter()
+            .find(|finding| finding.pattern == "format-string")
+            .expect("a function argument used as a format string is dangerous");
+        assert!(hit.detail.contains("function argument"), "{}", hit.detail);
+    }
+
+    #[test]
+    fn printf_with_getenv_return_is_flagged_as_external_input() {
+        // call [getenv@0x5000] ; mov rdi,rax ; call printf
+        let getenv_disp = (0x5000i64 - (0x1000i64 + 6)) as i32;
+        let mut code = vec![0xff, 0x15];
+        code.extend_from_slice(&getenv_disp.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0xc7]); // mov rdi, rax
+        let findings = Harness::new("printf", code)
+            .with_import(0x5000, "getenv")
+            .findings();
+        let hit = findings
+            .iter()
+            .find(|finding| finding.pattern == "format-string")
+            .expect("getenv data used as a format string is dangerous");
+        assert!(hit.detail.contains("external-input API"), "{}", hit.detail);
+    }
+
+    #[test]
+    fn printf_with_a_fixed_format_pointer_is_not_flagged() {
+        // lea rdi, [rip+k] ; call printf: a constant format string is fine.
+        let code = vec![0x48, 0x8d, 0x3d, 0x10, 0x00, 0x00, 0x00]; // lea rdi,[rip+0x10]
+        let f = Harness::new("printf", code).findings();
+        assert!(
+            !f.iter().any(|x| x.pattern == "format-string"),
+            "a fixed format pointer must not be flagged: {:?}",
+            f.iter().map(|x| x.pattern).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn strcpy_reachable_from_entry_is_high_severity() {
+        // The harness places the code at the entry point, so the call is
+        // reachable; an unbounded copy there is the worst case.
+        let f = Harness::new("strcpy", Vec::new()).findings();
+        let u = f
+            .iter()
+            .find(|x| x.pattern == "unbounded-copy")
+            .expect("unbounded-copy expected");
+        assert!(u.reachable);
+        assert_eq!(u.severity, 3);
+    }
+
+    #[test]
+    fn a_value_set_before_an_intervening_call_is_not_attributed() {
+        // mov edx, eax (a subtraction would flag, but here it is a plain move
+        // BEFORE a call) ; call something ; call memcpy: rdx does not survive
+        // the first call, so the sub is not the memcpy length.
+        // Represented minimally: sub edx,eax ; call [rip] (other) ; then the
+        // harness appends call memcpy. The sub precedes an intervening call.
+        // other import at a different slot:
+        let va = 0x1000u64;
+        let other = 0x5000u64;
+        let mut code = vec![0x29, 0xc2]; // sub edx, eax
+        let call_at = va + code.len() as u64;
+        let disp = (other as i64 - (call_at as i64 + 6)) as i32;
+        code.push(0xff);
+        code.push(0x15);
+        code.extend_from_slice(&disp.to_le_bytes()); // call [rip] -> other
+        let mut h = Harness::new("memcpy", code);
+        h.bin.symbols.push(Symbol {
+            addr: other,
+            name: "getpid".into(),
+            kind: SymKind::Import,
+            size: None,
+        });
+        let f = h.findings();
+        assert!(
+            !f.iter().any(|x| x.pattern == "copy-underflow"),
+            "a value set before an intervening call must not be attributed"
+        );
+    }
+}

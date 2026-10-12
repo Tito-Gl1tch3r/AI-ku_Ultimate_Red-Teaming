@@ -1,0 +1,48 @@
+import { UpdateChallengeRoute } from '@rctf/types'
+import {
+  createDefaultFlag,
+  getFirstDefaultFlag,
+} from '../../../../providers/flags'
+import {
+  getPrivateChallenge,
+  upsertChallenge,
+} from '../../../../services/challenges'
+import {
+  applyChallengeConfigChange,
+  scoringConfigChanged,
+} from '../../../../services/solve-points'
+import { forceLeaderboardUpdate } from '../../../../workers'
+import adminGroup from '../group'
+
+adminGroup.route(UpdateChallengeRoute, async ({ res, ctx, params, body }) => {
+  const { flag, ...bodyData } = body.data
+
+  const before = await getPrivateChallenge(ctx.var.db, params.id)
+  const updated = await upsertChallenge(ctx.var.db, params.id, {
+    ...bodyData,
+    flags:
+      flag === undefined
+        ? undefined
+        : flag === ''
+          ? []
+          : [createDefaultFlag(flag)],
+    files: body.data.files?.map(file => ({
+      ...file,
+      size: -1,
+    })),
+  })
+  if (before && scoringConfigChanged(before.data, updated.data)) {
+    await applyChallengeConfigChange(
+      ctx.var.db,
+      ctx.var.redis,
+      ctx.var.logger,
+      params.id
+    )
+  }
+  forceLeaderboardUpdate(ctx.var.redis)
+  return res.goodChallengeUpdate({
+    id: updated.id,
+    ...updated.data,
+    flag: getFirstDefaultFlag(updated.data.flags),
+  })
+})

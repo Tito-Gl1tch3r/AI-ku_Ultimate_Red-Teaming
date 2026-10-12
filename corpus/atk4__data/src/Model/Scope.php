@@ -1,0 +1,214 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Atk4\Data\Model;
+
+use Atk4\Core\ContainerTrait;
+use Atk4\Data\Exception;
+use Atk4\Data\Field;
+use Atk4\Data\Model;
+use Atk4\Data\Model\Scope\AbstractScope;
+use Atk4\Data\Persistence\Sql\Expressionable;
+
+/**
+ * @property array<int|string, AbstractScope> $elements
+ */
+class Scope extends AbstractScope
+{
+    use ContainerTrait;
+
+    public const OR = 'OR';
+    public const AND = 'AND';
+
+    /** @var self::AND|self::OR Junction to use in case more than one element. */
+    protected string $junction = self::AND;
+
+    /**
+     * Create a Scope from array of condition objects or condition arrays.
+     *
+     * @param array<int, AbstractScope|Expressionable|array{string|Expressionable, 1?: mixed, 2?: mixed}> $conditions
+     */
+    public function __construct(array $conditions = [], string $junction = self::AND)
+    {
+        if (!in_array($junction, [self::OR, self::AND], true)) {
+            throw (new Exception('Unsupported compound condition junction'))
+                ->addMoreInfo('junction', $junction);
+        }
+
+        $this->junction = $junction;
+
+        foreach ($conditions as $condition) {
+            if (!$condition instanceof AbstractScope) {
+                if ($condition instanceof Expressionable && !$condition instanceof Field) {
+                    $condition = [$condition];
+                }
+                $condition = new Scope\Condition(...$condition);
+            }
+
+            $this->add($condition);
+        }
+    }
+
+    public function __clone()
+    {
+        foreach ($this->elements as $k => $nestedCondition) {
+            $this->elements[$k] = clone $nestedCondition;
+            if ($this->elements[$k]->issetOwner()) {
+                $this->elements[$k]->unsetOwner();
+            }
+            $this->elements[$k]->setOwner($this);
+            $this->elements[$k]->shortName = $nestedCondition->shortName;
+        }
+        if ($this->issetOwner()) {
+            $this->unsetOwner();
+        }
+        // $this->shortName = null; // uncomment once https://github.com/php/php-src/issues/9389 is resolved
+    }
+
+    /**
+     * @param AbstractScope|array<int, AbstractScope|Expressionable|array{string|Expressionable, 1?: mixed, 2?: mixed}>|string|Expressionable $field
+     * @param ($field is string|Expressionable ? ($value is null ? mixed : non-empty-string) : never)                                         $operator
+     * @param ($operator is string ? mixed : never)                                                                                           $value
+     *
+     * @return $this
+     */
+    public function addCondition($field, $operator = null, $value = null)
+    {
+        if ('func_num_args'() === 1 && $field instanceof AbstractScope) {
+            $condition = $field;
+        } elseif ('func_num_args'() === 1 && is_array($field)) {
+            $condition = static::createAnd(...$field);
+        } else {
+            $condition = new Scope\Condition(...'func_get_args'());
+        }
+
+        $this->add($condition);
+
+        return $this;
+    }
+
+    /**
+     * Return array of nested conditions.
+     *
+     * @return array<int|string, AbstractScope>
+     */
+    public function getNestedConditions(): array
+    {
+        return $this->elements;
+    }
+
+    #[\Override]
+    protected function onChangeModel(): void
+    {
+        foreach ($this->elements as $nestedCondition) {
+            $nestedCondition->onChangeModel();
+        }
+    }
+
+    #[\Override]
+    public function isEmpty(): bool
+    {
+        return count($this->elements) === 0;
+    }
+
+    #[\Override]
+    public function isCompound(): bool
+    {
+        return count($this->elements) > 1;
+    }
+
+    /**
+     * @return self::AND|self::OR
+     */
+    public function getJunction(): string
+    {
+        return $this->junction;
+    }
+
+    /**
+     * Checks if junction is OR.
+     */
+    public function isOr(): bool
+    {
+        return $this->junction === self::OR;
+    }
+
+    /**
+     * Checks if junction is AND.
+     */
+    public function isAnd(): bool
+    {
+        return $this->junction === self::AND;
+    }
+
+    #[\Override]
+    public function clear(): self
+    {
+        $this->elements = [];
+
+        return $this;
+    }
+
+    #[\Override]
+    public function simplify(): AbstractScope
+    {
+        if (count($this->elements) !== 1) {
+            return $this;
+        }
+
+        $component = array_first($this->elements);
+
+        return $component->simplify();
+    }
+
+    /**
+     * Use De Morgan's laws to negate.
+     */
+    #[\Override]
+    public function negate(): self
+    {
+        $this->junction = $this->junction === self::OR ? self::AND : self::OR;
+
+        foreach ($this->elements as $nestedCondition) {
+            $nestedCondition->negate();
+        }
+
+        return $this;
+    }
+
+    #[\Override]
+    public function toWords(?Model $model = null): string
+    {
+        $parts = [];
+        foreach ($this->elements as $nestedCondition) {
+            $words = $nestedCondition->toWords($model);
+
+            $parts[] = $this->isCompound() && $nestedCondition->isCompound() ? '(' . $words . ')' : $words;
+        }
+
+        $glue = ' ' . strtolower($this->junction) . ' ';
+
+        return implode($glue, $parts);
+    }
+
+    /**
+     * @param AbstractScope|Expressionable|array{string|Expressionable, 1?: mixed, 2?: mixed} ...$conditions
+     *
+     * @return static
+     */
+    public static function createAnd(...$conditions)
+    {
+        return new static($conditions, self::AND);
+    }
+
+    /**
+     * @param AbstractScope|Expressionable|array{string|Expressionable, 1?: mixed, 2?: mixed} ...$conditions
+     *
+     * @return static
+     */
+    public static function createOr(...$conditions)
+    {
+        return new static($conditions, self::OR);
+    }
+}

@@ -1,0 +1,633 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mergeResults } from '../lib/merger.js';
+
+/**
+ * mergeResults feeds both the terminal display and the DTCG formatter. It is a
+ * pure function, so it is tested directly with synthetic extraction results
+ * rather than live pages. These assertions pin the union invariants: perceptual
+ * dedup, pageCount, count summation, multi-page confidence boost, homepage-wins
+ * semantics, and the pages provenance array.
+ */
+
+function page(url, overrides: Record<string, unknown> = {}) {
+  return {
+    url,
+    extractedAt: `${url}-time`,
+    siteName: 'Test',
+    logo: { url: 'logo.svg' },
+    favicons: [],
+    colors: { palette: [], semantic: {}, cssVariables: {} },
+    typography: { styles: [], sources: {} },
+    spacing: { commonValues: [] },
+    borderRadius: { values: [] },
+    borders: { combinations: [] },
+    shadows: [],
+    gradients: [],
+    motion: { durations: [], easings: [], animations: [], contexts: {}, interactiveDeltas: [] },
+    components: { buttons: [], inputs: {}, links: [], badges: {} },
+    breakpoints: [],
+    iconSystem: [],
+    frameworks: [],
+    ...overrides,
+  };
+}
+
+const color = (hex, count, confidence) => ({ normalized: hex, color: hex, count, confidence });
+
+test('merged meta gets a fresh snapshotId and aggregates readiness across pages', () => {
+  const a = page('https://a.com/', {
+    meta: { schemaVersion: '1.3.0', snapshotId: 'id-a', viewport: { width: 1920, height: 1080 }, fontsReady: true },
+  });
+  const b = page('https://a.com/pricing', {
+    meta: { schemaVersion: '1.3.0', snapshotId: 'id-b', fontsReady: false, pendingFonts: ['Inter'], degraded: ['hover-focus'] },
+  });
+
+  const merged = mergeResults([a, b]);
+  assert.ok(merged.meta.snapshotId, 'merged snapshot must have an id');
+  assert.notEqual(merged.meta.snapshotId, 'id-a', 'merged artifact is a distinct snapshot');
+  assert.equal(merged.meta.fontsReady, false, 'one fallback-rendered page taints the merged snapshot');
+  assert.deepEqual(merged.meta.pendingFonts, ['Inter']);
+  assert.deepEqual(merged.meta.degraded, ['hover-focus']);
+  assert.deepEqual(merged.meta.viewport, { width: 1920, height: 1080 }, 'home meta fields survive');
+});
+
+test('mergeResults throws on empty input', () => {
+  assert.throws(() => mergeResults([]), /No results to merge/);
+});
+
+test('mergeResults returns a single result unchanged', () => {
+  const only = page('https://a.test');
+  assert.equal(mergeResults([only]), only);
+});
+
+test('mergeResults unions palette with perceptual dedup, pageCount and count', () => {
+  const home = page('https://a.test', {
+    colors: {
+      palette: [color('#0066cc', 10, 'high'), color('#777777', 2, 'low')],
+      semantic: { primary: '#0066cc' },
+      cssVariables: {},
+    },
+  });
+  const second = page('https://a.test/pricing', {
+    colors: {
+      // #0166cc is within deltaE 15 of #0066cc -> collapses.
+      // #777777 repeats -> low confidence boosted by multi-page presence.
+      // #cc0000 is page-only.
+      palette: [color('#0166cc', 6, 'high'), color('#777777', 3, 'low'), color('#cc0000', 4, 'low')],
+      semantic: { primary: '#cc0000', secondary: '#00aa00' },
+      cssVariables: {},
+    },
+  });
+
+  const merged = mergeResults([home, second]);
+  const pal = merged.colors.palette;
+
+  const blue = pal.find((c) => c.normalized === '#0066cc');
+  assert.ok(blue, 'near-duplicate blues collapse to the higher-count canonical');
+  assert.equal(blue.pageCount, 2);
+  assert.equal(blue.count, 16);
+  assert.equal(pal.some((c) => c.normalized === '#0166cc'), false);
+
+  const gray = pal.find((c) => c.normalized === '#777777');
+  assert.equal(gray.pageCount, 2);
+  assert.equal(gray.count, 5);
+  assert.equal(gray.confidence, 'medium'); // low -> medium because pageCount > 1
+
+  const red = pal.find((c) => c.normalized === '#cc0000');
+  assert.equal(red.pageCount, 1);
+  assert.equal(red.confidence, 'low');
+
+  // Homepage semantic wins; missing keys are filled from later pages.
+  assert.equal(merged.colors.semantic.primary, '#0066cc');
+  assert.equal(merged.colors.semantic.secondary, '#00aa00');
+});
+
+test('mergeResults dedupes typography by family/size/weight and sums spacing', () => {
+  const style = (family, size, weight) => ({ family, size, weight });
+  const home = page('https://a.test', {
+    typography: { styles: [style('Inter', '16px', '400')], sources: {} },
+    spacing: { commonValues: [{ px: '8px', count: 5 }] },
+  });
+  const second = page('https://a.test/x', {
+    typography: { styles: [style('Inter', '16px', '400'), style('Inter', '24px', '700')], sources: {} },
+    spacing: { commonValues: [{ px: '8px', count: 3 }, { px: '16px', count: 2 }] },
+  });
+
+  const merged = mergeResults([home, second]);
+
+  assert.equal(merged.typography.styles.length, 2);
+  const eight = merged.spacing.commonValues.find((v) => v.px === '8px');
+  assert.equal(eight.count, 8);
+  assert.ok(merged.spacing.commonValues.find((v) => v.px === '16px'));
+});
+
+test('mergeResults records per-page provenance in the pages array', () => {
+  const merged = mergeResults([page('https://a.test'), page('https://a.test/pricing')]);
+  assert.equal(merged.pages.length, 2);
+  assert.deepEqual(
+    merged.pages.map((p) => p.url),
+    ['https://a.test', 'https://a.test/pricing'],
+  );
+});
+
+test('mergeResults unions variable-font axes by axis, widening the range', () => {
+  const home = page('https://a.test', {
+    typography: { styles: [], sources: { variableAxes: [{ axis: 'wght', min: 400, max: 600, count: 2 }] } },
+  });
+  const second = page('https://a.test/pricing', {
+    typography: { styles: [], sources: { variableAxes: [
+      { axis: 'wght', min: 300, max: 700, count: 1 },
+      { axis: 'slnt', min: -4, max: 0, count: 1 },
+    ] } },
+  });
+
+  const merged = mergeResults([home, second]);
+  const axes = merged.typography.sources.variableAxes;
+  const wght = axes.find((a) => a.axis === 'wght');
+  assert.equal(wght.min, 300);
+  assert.equal(wght.max, 700);
+  assert.equal(wght.count, 3);
+  assert.ok(axes.find((a) => a.axis === 'slnt'));
+});
+
+test('mergeResults unions wcag pairs, deduping order-insensitive static pairs and summing counts', () => {
+  const pair = (fg, bg, count) => ({ fg, bg, ratio: 4.6, aa: true, aaLarge: true, aaa: false, count });
+  const home = page('https://a.test', {
+    wcag: [pair('#000000', '#ffffff', 5), { fg: '#888888', bg: '#999999', ratio: 1.2, aa: false, aaLarge: false, aaa: false, state: 'hover', tag: 'a', source: 'state' }],
+  });
+  const second = page('https://a.test/pricing', {
+    // Same static pair with fg/bg swapped -> same pair, counts sum.
+    wcag: [pair('#ffffff', '#000000', 3), pair('#cc0000', '#ffffff', 2)],
+  });
+
+  const merged = mergeResults([home, second]);
+
+  const statics = merged.wcag.filter((p) => !p.source);
+  assert.equal(statics.length, 2);
+  const bw = statics.find((p) => [p.fg, p.bg].sort().join('/') === '#000000/#ffffff');
+  assert.equal(bw.count, 8);
+
+  // State pairs survive the merge, appended after static pairs.
+  const states = merged.wcag.filter((p) => p.source === 'state');
+  assert.equal(states.length, 1);
+  assert.equal(states[0].state, 'hover');
+});
+
+test('mergeResults omits wcag when no page ran the analysis', () => {
+  const merged = mergeResults([page('https://a.test'), page('https://a.test/pricing')]);
+  assert.equal('wcag' in merged, false);
+});
+
+test('mergeResults keeps rawColors per page in the pages array', () => {
+  const raw = (hex) => [{ normalized: hex, color: hex, count: 1 }];
+  const home = page('https://a.test', {
+    colors: { palette: [], semantic: {}, cssVariables: {}, rawColors: raw('#111111') },
+  });
+  const second = page('https://a.test/pricing', {
+    colors: { palette: [], semantic: {}, cssVariables: {}, rawColors: raw('#222222') },
+  });
+
+  const merged = mergeResults([home, second]);
+
+  assert.equal(merged.pages[0].rawColors[0].normalized, '#111111');
+  assert.equal(merged.pages[1].rawColors[0].normalized, '#222222');
+  // Back-compat: colors.rawColors stays the first page's set.
+  assert.equal(merged.colors.rawColors[0].normalized, '#111111');
+  // No leak when the flag was off: plain pages entries carry no rawColors key.
+  const plain = mergeResults([page('https://a.test'), page('https://a.test/x')]);
+  assert.equal('rawColors' in plain.pages[0], false);
+});
+
+test('mergeResults sorts merged font urls so page order never reaches the output', () => {
+  const home = page('https://a.test', {
+    typography: { styles: [], sources: { urls: ['https://a.test/b.woff2', 'https://a.test/d.woff2'] } },
+  });
+  const second = page('https://a.test/pricing', {
+    typography: { styles: [], sources: { urls: ['https://a.test/a.woff2', 'https://a.test/b.woff2'] } },
+  });
+
+  const forward = mergeResults([home, second]).typography.sources.urls;
+  assert.deepEqual(forward, [
+    'https://a.test/a.woff2',
+    'https://a.test/b.woff2',
+    'https://a.test/d.woff2',
+  ]);
+});
+
+// ─── Per-category union rules ────────────────────────────────────────────────
+// Everything below was previously unexercised: the crawl merge is the least
+// visible code path in the CLI (one flag, no CI coverage) and the most trusted,
+// since its output is what --save-output writes and what drift compares.
+
+test('typography styles dedup on family|size|weight and count occurrences', () => {
+  const style = (family, size, weight) => ({ context: 'body', family, size, weight });
+  const a = page('https://a.com/', { typography: { styles: [style('Inter', '16px', '400')], sources: { googleFonts: ['Inter'] } } });
+  const b = page('https://a.com/x', {
+    typography: {
+      styles: [style('Inter', '16px', '400'), style('Inter', '48px', '700')],
+      sources: { googleFonts: ['Lora'], fontDisplay: 'swap' },
+    },
+  });
+
+  const merged = mergeResults([a, b]);
+  assert.equal(merged.typography.styles.length, 2, 'identical tuples collapse');
+  const body = merged.typography.styles.find(s => s.size === '16px');
+  assert.equal(body.count, 2, 'repeat across pages is counted');
+  assert.deepEqual(merged.typography.sources.googleFonts, ['Inter', 'Lora'], 'font source arrays union');
+  assert.equal(merged.typography.sources.fontDisplay, 'swap', 'a scalar the home page lacked is adopted');
+});
+
+test('spacing values union by px and sum counts', () => {
+  const a = page('https://a.com/', { spacing: { scaleType: '8px', commonValues: [{ px: '16px', count: 4 }] } });
+  const b = page('https://a.com/x', { spacing: { scaleType: '8px', commonValues: [{ px: '16px', count: 3 }, { px: '24px', count: 9 }] } });
+
+  const merged = mergeResults([a, b]);
+  assert.equal(merged.spacing.scaleType, '8px', 'home scale type wins');
+  const px16 = merged.spacing.commonValues.find(v => v.px === '16px');
+  assert.equal(px16.count, 7);
+  assert.equal(merged.spacing.commonValues[0].px, '24px', 'sorted by count desc');
+});
+
+test('border radius confidence is recomputed from the aggregated count', () => {
+  // A value that is low-confidence on every page can be high-confidence across
+  // the site. This promotion is the whole point of crawling.
+  const a = page('https://a.com/', { borderRadius: { values: [{ value: '8px', count: 6, confidence: 'low' }] } });
+  const b = page('https://a.com/x', { borderRadius: { values: [{ value: '8px', count: 6, confidence: 'low' }] } });
+
+  const merged = mergeResults([a, b]);
+  const r = merged.borderRadius.values[0];
+  assert.equal(r.count, 12);
+  assert.equal(r.confidence, 'high', 'count > 10 promotes to high');
+});
+
+test('borders union on width|style|color, cap elements at 5 and promote confidence', () => {
+  const combo = (count, elements) => ({ width: '1px', style: 'solid', color: '#242424', count, elements, confidence: 'low' });
+  const a = page('https://a.com/', { borders: { combinations: [combo(3, ['div', 'span', 'a'])] } });
+  const b = page('https://a.com/x', { borders: { combinations: [combo(9, ['section', 'footer', 'nav'])] } });
+
+  const merged = mergeResults([a, b]);
+  const c = merged.borders.combinations[0];
+  assert.equal(c.count, 12);
+  assert.equal(c.confidence, 'high');
+  assert.equal(c.elements.length, 5, 'element list is capped');
+});
+
+test('shadows union on the shadow string and recompute confidence', () => {
+  const a = page('https://a.com/', { shadows: [{ shadow: '0 1px 2px #000', count: 2, confidence: 'low' }] });
+  const b = page('https://a.com/x', { shadows: [{ shadow: '0 1px 2px #000', count: 3, confidence: 'low' }, { shadow: '0 0 0 red', count: 1 }] });
+
+  const merged = mergeResults([a, b]);
+  assert.equal(merged.shadows.length, 2);
+  assert.equal(merged.shadows[0].count, 5);
+  assert.equal(merged.shadows[0].confidence, 'medium', 'count > 3 but <= 10');
+});
+
+test('components dedup by fingerprint and sum counts', () => {
+  const btn = (bg) => ({ variant: 'primary', backgroundColor: bg, color: '#fff', borderRadius: '8px' });
+  const a = page('https://a.com/', { components: { buttons: [btn('#1a73e8')], inputs: {}, links: [], badges: {} } });
+  const b = page('https://a.com/x', { components: { buttons: [btn('#1a73e8'), btn('#ff0000')], inputs: {}, links: [], badges: {} } });
+
+  const merged = mergeResults([a, b]);
+  assert.equal(merged.components.buttons.length, 2, 'identical buttons collapse');
+  assert.equal(merged.components.buttons[0].count, 2, 'the repeated variant leads');
+});
+
+test('grouped components keep their grouping keys through the merge', () => {
+  const inputs = { text: [{ backgroundColor: '#fff', borderColor: '#ddd' }], checkbox: [{ backgroundColor: '#fff' }] };
+  const badges = { all: [{ backgroundColor: '#ffd230' }], byVariant: { error: [{ backgroundColor: '#ff0000' }] } };
+  const a = page('https://a.com/', { components: { buttons: [], links: [], inputs, badges } });
+  const b = page('https://a.com/x', { components: { buttons: [], links: [], inputs, badges } });
+
+  const merged = mergeResults([a, b]);
+  assert.ok(Array.isArray(merged.components.inputs.text), 'text group survives');
+  assert.ok(Array.isArray(merged.components.inputs.checkbox), 'checkbox group survives');
+  assert.equal(merged.components.inputs.text[0].count, 2);
+  assert.ok(Array.isArray(merged.components.badges.byVariant.error), 'nested byVariant group survives');
+});
+
+test('icon systems and frameworks dedup by name, first occurrence wins', () => {
+  const a = page('https://a.com/', { iconSystem: [{ name: 'Heroicons', type: 'svg' }], frameworks: [{ name: 'Tailwind', confidence: 'high' }] });
+  const b = page('https://a.com/x', { iconSystem: [{ name: 'Heroicons', type: 'font' }], frameworks: [{ name: 'Tailwind', confidence: 'low' }, { name: 'MUI' }] });
+
+  const merged = mergeResults([a, b]);
+  assert.equal(merged.iconSystem.length, 1);
+  assert.equal(merged.iconSystem[0].type, 'svg', 'home page detection is kept');
+  assert.deepEqual(merged.frameworks.map(f => f.name), ['Tailwind', 'MUI']);
+});
+
+test('a later page that states more about a framework replaces the earlier reading', () => {
+  const a = page('https://a.com/', { frameworks: [{ name: 'React', confidence: 'high', coverage: 0.2 }, { name: 'Bootstrap', confidence: 'medium', version: '5' }] });
+  const b = page('https://a.com/x', { frameworks: [{ name: 'React', confidence: 'high', version: '19.1.0', coverage: 0.9 }, { name: 'Bootstrap', confidence: 'high', version: '5.3.3' }] });
+
+  const merged = mergeResults([a, b]);
+  assert.deepEqual(merged.frameworks.map(f => [f.name, f.version, f.confidence, f.coverage]), [['React', '19.1.0', 'high', 0.9], ['Bootstrap', '5.3.3', 'high', undefined]]);
+});
+
+test('a confident reading is not replaced by a less confident one with a longer version', () => {
+  const a = page('https://a.com/', { frameworks: [{ name: 'Tailwind CSS', confidence: 'high', version: '4' }, { name: 'Vue', confidence: 'high' }] });
+  const b = page('https://a.com/x', { frameworks: [{ name: 'Tailwind CSS', confidence: 'medium', version: '3.4.1' }, { name: 'Vue', confidence: 'medium', version: '3.5.0' }] });
+
+  const merged = mergeResults([a, b]);
+  assert.deepEqual(merged.frameworks.map(f => [f.name, f.version, f.confidence]), [['Tailwind CSS', '4', 'high'], ['Vue', '3.5.0', 'high']]);
+});
+
+test('motion unions durations by value, easings and animations by count', () => {
+  const a = page('https://a.com/', {
+    motion: { durations: [{ value: '150ms', ms: 150, count: 1 }], easings: [{ value: 'ease-out', count: 1 }], animations: [{ name: 'fade', count: 1 }], contexts: {}, interactiveDeltas: [] },
+  });
+  const b = page('https://a.com/x', {
+    motion: { durations: [{ value: '150ms', ms: 150, count: 2 }, { value: '80ms', ms: 80, count: 1 }], easings: [{ value: 'ease-out', count: 4 }], animations: [{ name: 'fade', count: 2 }], contexts: {}, interactiveDeltas: [] },
+  });
+
+  const merged = mergeResults([a, b]);
+  assert.deepEqual(merged.motion.durations.map(d => d.value), ['80ms', '150ms'], 'durations sort fastest first');
+  assert.equal(merged.motion.durations.find(d => d.value === '150ms').count, 3);
+  assert.equal(merged.motion.easings[0].count, 5);
+  assert.equal(merged.motion.animations[0].count, 3);
+});
+
+test('wcag pairs dedup order-insensitively and state pairs stay separate', () => {
+  const a = page('https://a.com/', { wcag: [{ fg: '#fff', bg: '#000', ratio: 21, aa: true, count: 2 }] });
+  const b = page('https://a.com/x', {
+    wcag: [
+      { fg: '#000', bg: '#fff', ratio: 21, aa: true, count: 3 },
+      { fg: '#fff', bg: '#000', ratio: 21, aa: true, count: 1, source: 'state', state: 'hover', tag: 'a' },
+    ],
+  });
+
+  const merged = mergeResults([a, b]);
+  const statics = merged.wcag.filter(p => !p.source);
+  assert.equal(statics.length, 1, 'fg/bg swapped is the same pair');
+  assert.equal(statics[0].count, 5);
+  assert.equal(merged.wcag.filter(p => p.source === 'state').length, 1, 'state pair is not folded into the static one');
+  assert.equal(merged.wcag[merged.wcag.length - 1].source, 'state', 'state pairs are appended last');
+});
+
+test('a colour pair used as body text and as a heading stays two pairs across pages', () => {
+  const body = { fg: '#767676', bg: '#ffffff', ratio: 4.54, aa: true, count: 4, large: false, requiredAA: 4.5, passAA: true, fontSize: 16, fontWeight: 400 };
+  const head = { fg: '#767676', bg: '#ffffff', ratio: 4.54, aa: true, count: 1, large: true, requiredAA: 3, passAA: true, fontSize: 32, fontWeight: 700 };
+  const merged = mergeResults([
+    page('https://a.com/', { wcag: [{ ...body }, { ...head }] }),
+    page('https://a.com/x', { wcag: [{ ...body, count: 2, fontSize: 13 }] }),
+  ]);
+  const statics = merged.wcag.filter(p => !p.source);
+  assert.equal(statics.length, 2, 'body and large carry different thresholds');
+  const small = statics.find(p => !p.large);
+  assert.equal(small.count, 6);
+  assert.equal(small.fontSize, 13, 'the smallest occurrence across pages is the one at risk');
+  assert.equal(small.fontWeight, 400);
+});
+
+test('pairs from an extraction with no observed size still merge on colour alone', () => {
+  const merged = mergeResults([
+    page('https://a.com/', { wcag: [{ fg: '#fff', bg: '#000', ratio: 21, aa: true, count: 2 }] }),
+    page('https://a.com/x', { wcag: [{ fg: '#000', bg: '#fff', ratio: 21, aa: true, count: 3 }] }),
+  ]);
+  assert.equal(merged.wcag.filter(p => !p.source).length, 1);
+});
+
+test('gradients union on the gradient string', () => {
+  const g = { gradient: 'linear-gradient(#000, #fff)', type: 'linear-gradient', count: 1 };
+  const merged = mergeResults([
+    page('https://a.com/', { gradients: [{ ...g }] }),
+    page('https://a.com/x', { gradients: [{ ...g }] }),
+  ]);
+  assert.equal(merged.gradients.length, 1);
+  assert.equal(merged.gradients[0].count, 2);
+});
+
+test('a page missing whole sections does not break the merge', () => {
+  // Pages fail individually during a crawl and are pushed with whatever the
+  // guarded extractors returned, so absent sections are normal input here.
+  const merged = mergeResults([
+    page('https://a.com/'),
+    { url: 'https://a.com/x', extractedAt: 't' },
+  ] as never);
+  assert.equal(merged.pages.length, 2, 'both pages are recorded');
+  assert.ok(Array.isArray(merged.shadows));
+  assert.ok(Array.isArray(merged.colors.palette));
+  assert.ok(Array.isArray(merged.components.buttons));
+});
+
+
+test('voice is preserved per page and never merged across them', () => {
+  // Colours and type are tokens, so the same value on three pages is stronger
+  // evidence of one thing. Copy is not: averaging a marketing page's sentence
+  // length with a docs page's yields a number describing neither page.
+  const home = page('https://a.com/', { voice: {"fragments": [{"role": "hero-h1", "text": "Heading", "order": 0}], "metrics": {"structural": {"wordCount": 200, "sentenceCount": 4, "meanSentenceLength": 11, "sentenceLengthStdev": 2, "exclamationRatio": 0, "questionRatio": 0, "longWordRatio": 0, "avgSyllablesPerWord": 1.5, "lowSample": true}, "lexical": null, "lang": "en"}, "pageType": "landing"} });
+  const docs = page('https://a.com/docs', { voice: {"fragments": [{"role": "hero-h1", "text": "Heading", "order": 0}], "metrics": {"structural": {"wordCount": 400, "sentenceCount": 4, "meanSentenceLength": 24, "sentenceLengthStdev": 2, "exclamationRatio": 0, "questionRatio": 0, "longWordRatio": 0, "avgSyllablesPerWord": 1.5, "lowSample": true}, "lexical": null, "lang": "en"}, "pageType": "docs"} });
+
+  const merged = mergeResults([home, docs]);
+
+  // Root keeps the homepage's, as with logo and colors.rawColors.
+  assert.equal(merged.voice.pageType, 'landing');
+  assert.equal(merged.voice.metrics.structural.meanSentenceLength, 11);
+
+  // Both pages survive intact, so the variation between them stays readable.
+  assert.equal(merged.pages.length, 2);
+  assert.equal(merged.pages[0].voice.pageType, 'landing');
+  assert.equal(merged.pages[1].voice.pageType, 'docs');
+  assert.equal(merged.pages[1].voice.metrics.structural.meanSentenceLength, 24);
+});
+
+test('a page that yielded no voice carries its reason instead of a gap', () => {
+  const home = page('https://a.com/', { voice: {"fragments": [{"role": "hero-h1", "text": "Heading", "order": 0}], "metrics": {"structural": {"wordCount": 200, "sentenceCount": 4, "meanSentenceLength": 11, "sentenceLengthStdev": 2, "exclamationRatio": 0, "questionRatio": 0, "longWordRatio": 0, "avgSyllablesPerWord": 1.5, "lowSample": true}, "lexical": null, "lang": "en"}, "pageType": "landing"} });
+  const thin = page('https://a.com/contact', { voice: null, voiceSkipped: 'below-word-floor' });
+
+  const merged = mergeResults([home, thin]);
+
+  assert.equal(merged.pages[1].voice, null);
+  assert.equal(merged.pages[1].voiceSkipped, 'below-word-floor');
+  // The root still reports the homepage's voice rather than being dragged down.
+  assert.ok(merged.voice);
+});
+
+test('a run without --voice gains no voice keys', () => {
+  const merged = mergeResults([page('https://a.com/'), page('https://a.com/b')]);
+  assert.equal('voice' in merged, false);
+  assert.equal('voice' in merged.pages[0], false);
+  assert.equal('voiceAllPages' in merged, false);
+});
+
+// DEM-257 follow-up: a homepage carrying only nav chrome and one recycled
+// sentence starves a reader that classifies brand voice from `voice` alone
+// (see lib/merger.ts's mergeVoice doc comment). `voiceAllPages` is the fix:
+// every page's fragments, deduplicated, as one corpus -- while `voice` and
+// `pages[]` above stay exactly as the previous tests already pin them.
+test('voiceAllPages merges fragments across pages and dedupes repeats, without touching root voice', () => {
+  const home = page('https://a.com/', {
+    voice: {
+      fragments: [
+        { role: 'hero-h1', text: 'Hankkija - Kasvun osaaja', order: 0 },
+        { role: 'hero-body', text: 'Hankkija on Suomen johtava maatalouskauppa.', order: 0 },
+        { role: 'nav-label', text: 'Etusivu', order: 0 },
+        { role: 'nav-label', text: 'Piha ja puutarha', order: 1 },
+      ],
+      metrics: { structural: { wordCount: 10, sentenceCount: 1, meanSentenceLength: 7, sentenceLengthStdev: 0, exclamationRatio: 0, questionRatio: 0, longWordRatio: 0, avgSyllablesPerWord: 2, lowSample: true }, lexical: null, lang: 'fi' },
+      pageType: 'landing',
+    },
+  });
+  const category = page('https://a.com/piha-ja-puutarha', {
+    voice: {
+      fragments: [
+        // Same nav label as the homepage: identical role + text, must collapse to one.
+        { role: 'nav-label', text: 'Etusivu', order: 0 },
+        { role: 'section-h2', text: 'Kasvimaan perustaminen' },
+        { role: 'value-prop', text: 'Autamme sinua onnistumaan puutarhassa askel askeleelta.', order: 0 },
+      ],
+      metrics: { structural: { wordCount: 12, sentenceCount: 1, meanSentenceLength: 8, sentenceLengthStdev: 0, exclamationRatio: 0, questionRatio: 0, longWordRatio: 0, avgSyllablesPerWord: 2, lowSample: true }, lexical: null, lang: 'fi' },
+      pageType: 'other',
+    },
+  });
+
+  const merged = mergeResults([home, category]);
+
+  // Root voice is untouched: still exactly the homepage's four fragments.
+  assert.equal(merged.voice.fragments.length, 4);
+
+  const all = merged.voiceAllPages;
+  assert.ok(all);
+  // 4 + 3 fragments minus the one duplicate nav-label = 6.
+  assert.equal(all.fragments.length, 6);
+  assert.equal(all.fragments.filter((f) => f.role === 'nav-label' && f.text === 'Etusivu').length, 1);
+  // The category page's prose survives, which is the entire point.
+  assert.ok(all.fragments.some((f) => f.role === 'value-prop' && f.text.includes('puutarhassa')));
+  // Provenance: each fragment says which page it came from.
+  const valueProp = all.fragments.find((f) => f.role === 'value-prop');
+  assert.equal(valueProp.page, 'https://a.com/piha-ja-puutarha');
+  // Budget/classification decisions pick the homepage's, same as root voice.
+  assert.equal(all.pageType, 'landing');
+});
+
+test('voiceAllPages skips pages with no voice instead of throwing', () => {
+  const home = page('https://a.com/', {
+    voice: {
+      fragments: [{ role: 'hero-h1', text: 'Heading', order: 0 }],
+      metrics: { structural: { wordCount: 1, sentenceCount: 0, meanSentenceLength: 0, sentenceLengthStdev: 0, exclamationRatio: 0, questionRatio: 0, longWordRatio: 0, avgSyllablesPerWord: 1, lowSample: true }, lexical: null, lang: 'en' },
+      pageType: 'landing',
+    },
+  });
+  const thin = page('https://a.com/contact', { voice: null, voiceSkipped: 'below-word-floor' });
+
+  const merged = mergeResults([home, thin]);
+
+  assert.equal(merged.voiceAllPages.fragments.length, 1);
+});
+
+test('voiceAllPages is null when every page skipped voice, even though the run used --voice', () => {
+  const home = page('https://a.com/', { voice: null, voiceSkipped: 'no-text' });
+  const other = page('https://a.com/b', { voice: null, voiceSkipped: 'no-text' });
+
+  const merged = mergeResults([home, other]);
+
+  assert.equal(merged.voiceAllPages, null);
+});
+
+test('the homepage primary stays the canonical of its cluster after a merge', () => {
+  const home = page('https://m.com/', {
+    colors: { palette: [color('#3859ff', 3, 'high')], semantic: { primary: 'rgb(56, 89, 255)' }, cssVariables: {} },
+  });
+  const inner = page('https://m.com/inner', {
+    colors: { palette: [color('#314cd9', 9, 'high')], semantic: {}, cssVariables: {} },
+  });
+  const merged = mergeResults([home, inner]);
+  const hexes = merged.colors.palette.map((c) => c.normalized);
+  assert.ok(hexes.includes('#3859ff'), `primary survives the merge, got ${hexes.join(' ')}`);
+  assert.equal(merged.colors.semantic.primary, 'rgb(56, 89, 255)');
+  assert.equal(merged.colors.palette.find((c) => c.normalized === '#3859ff').count, 12);
+});
+
+test('coverage tags a token by how many pages carry it, not by how often it is used', () => {
+  const everywhere = { px: '8px', count: 40 };
+  const oneOff = { px: '11px', count: 400 };
+
+  const merged = mergeResults([
+    page('https://a.com/', { spacing: { commonValues: [everywhere, oneOff] } }),
+    page('https://a.com/pricing', { spacing: { commonValues: [everywhere] } }),
+    page('https://a.com/docs', { spacing: { commonValues: [everywhere] } }),
+  ]);
+
+  const spacing = merged.spacing.commonValues;
+  assert.equal(spacing.find((v) => v.px === '8px').pageCount, 3);
+  assert.equal(spacing.find((v) => v.px === '11px').pageCount, 1);
+
+  assert.deepEqual(merged.coverage.outliers.map((o) => o.token), ['11px']);
+  assert.equal(merged.coverage.totalPages, 3);
+});
+
+test('coverage is absent for a single-page extraction', () => {
+  const merged = mergeResults([page('https://a.com/', { shadows: [{ shadow: '0 1px 2px', count: 3 }] })]);
+  assert.equal(merged.coverage, undefined);
+});
+
+test('every merged family carries pageCount and scope', () => {
+  const merged = mergeResults([
+    page('https://a.com/', {
+      typography: { styles: [{ context: 'body', family: 'Inter', size: '16px', weight: '400' }], sources: {} },
+      borders: { combinations: [{ width: '1px', style: 'solid', color: '#000000', count: 2 }] },
+      shadows: [{ shadow: '0 1px 2px', count: 3 }],
+      borderRadius: { values: [{ value: '4px', count: 2 }] },
+    }),
+    page('https://a.com/x', {
+      typography: { styles: [{ context: 'body', family: 'Inter', size: '16px', weight: '400' }], sources: {} },
+      shadows: [{ shadow: '0 1px 2px', count: 1 }],
+    }),
+  ]);
+  assert.equal(merged.typography.styles[0].scope, 'site');
+  assert.equal(merged.shadows[0].scope, 'site');
+  assert.equal(merged.borders.combinations[0].scope, 'page');
+  assert.equal(merged.borderRadius.values[0].scope, 'page');
+  assert.equal(merged.coverage.byFamily.typography.meanCoverage, 1);
+});
+
+test('semantic evidence follows the page that supplied the role; occurrences sum across pages', () => {
+  const refused = { decision: 'refused', rule: null, reason: 'no candidate', tokens: [], alternates: [] };
+  const elected = { decision: 'elected', rule: 'cta', reason: 'painted on buttons', tokens: [], alternates: [] };
+  const merged = mergeResults([
+    page('https://a.test/', {
+      colors: {
+        palette: [], semantic: {}, cssVariables: {},
+        semanticEvidence: { primary: refused },
+        occurrences: [{ hex: '#111111', paints: 'fill', slot: null, count: 2, area: 100, cssVar: null, state: null }],
+      },
+    }),
+    page('https://a.test/pricing', {
+      colors: {
+        palette: [], semantic: { primary: '#0066cc' }, cssVariables: {},
+        semanticEvidence: { primary: elected },
+        occurrences: [
+          { hex: '#111111', paints: 'fill', slot: null, count: 3, area: 50, cssVar: '--ink', state: null },
+          { hex: '#0066cc', paints: 'text', slot: null, count: 1, area: 0, cssVar: null, state: null },
+        ],
+      },
+    }),
+  ]);
+  assert.equal(merged.colors.semantic.primary, '#0066cc');
+  assert.equal(merged.colors.semanticEvidence.primary, elected);
+  assert.deepEqual(
+    merged.colors.occurrences.map((o) => [o.hex, o.paints, o.count, o.area, o.cssVar]),
+    [['#111111', 'fill', 5, 150, null], ['#0066cc', 'text', 1, 0, null]],
+  );
+});
+
+test('homepage evidence is kept when a later page would overwrite it', () => {
+  const home = { decision: 'elected', rule: 'class', reason: 'home', tokens: [], alternates: [] };
+  const merged = mergeResults([
+    page('https://a.test/', { colors: { palette: [], semantic: { primary: '#0066cc' }, cssVariables: {}, semanticEvidence: { primary: home } } }),
+    page('https://a.test/x', { colors: { palette: [], semantic: { primary: '#cc0000' }, cssVariables: {}, semanticEvidence: { primary: { ...home, reason: 'other' } } } }),
+  ]);
+  assert.equal(merged.colors.semanticEvidence.primary, home);
+});
+
+test('a style seen in several contexts on one page counts that page once', () => {
+  const style = (context) => ({ family: 'Inter', size: '16px', weight: 400, context });
+  const merged = mergeResults([
+    page('https://a.test/', { typography: { styles: [style('body'), style('ui'), style('caption')], sources: {} } }),
+    page('https://a.test/x', { typography: { styles: [style('body')], sources: {} } }),
+  ]);
+  const s = merged.typography.styles.find((x) => x.size === '16px');
+  assert.equal(s.pageCount, 2);
+  assert.equal(s.count, 4);
+  assert.equal(s.scope, 'site');
+});

@@ -1,0 +1,1629 @@
+-module(observer_cli_capture).
+
+-ignore_xref({json, encode, 1}).
+
+-include_lib("kernel/include/file.hrl").
+
+-export([
+    parse/1,
+    command/1,
+    command_name/1,
+    schema/0,
+    target/1,
+    cookie_source/1,
+    duration/1,
+    trace_duration/1,
+    trace_limit/1,
+    timeout/1,
+    response/6,
+    error/2,
+    encode/2,
+    encode/3,
+    exit_code/1,
+    escape_text/1
+]).
+
+-ifdef(TEST).
+-export([
+    validate_list_values/2,
+    validate_scheduler_timeout/2,
+    finish_target/3,
+    valid_env_name/1,
+    safe_cookie_file_mode/1,
+    strip_cookie_lf/1,
+    valid_application_name/1,
+    valid_mfa_text/1,
+    duration_ms/1,
+    multiply_duration/2,
+    reason_code/1,
+    read_cookie_bytes/1,
+    read_cookie_file/1
+]).
+-endif.
+
+-define(MAX_RESPONSE_BYTES, 1024 * 1024).
+-define(MAX_NODE_LENGTH, 255).
+-define(MAX_COOKIE_LENGTH, 255).
+-define(SCHEMA, <<"observer_cli.capture/v1">>).
+-define(TRACE_TIMEOUT_MARGIN_MS, 7000).
+-define(TRACE_STOP_TIMEOUT_MS, 5000).
+
+-type route() ::
+    #{
+        route := tui,
+        target := string(),
+        cookie := undefined | string(),
+        interval := integer()
+    }
+    | #{
+        route := command,
+        command := atom(),
+        arguments := [string()],
+        options := map()
+    }.
+-type parse_error() ::
+    #{category := argument, exit_code := 2, reason := term()}.
+
+-spec parse([string()]) -> {ok, route()} | {error, parse_error()}.
+parse([]) ->
+    argument_error(invalid_arguments);
+parse([[$- | _] | _]) ->
+    argument_error(global_option_before_command);
+parse(["tui" | Arguments]) ->
+    parse_tui(Arguments);
+parse([First | _] = Arguments) ->
+    case command(First) of
+        undefined -> argument_error({unknown_command, First});
+        Command -> parse_command(Command, tl(Arguments))
+    end.
+
+parse_tui([Target]) ->
+    {ok, #{route => tui, target => Target, cookie => undefined, interval => 1500}};
+parse_tui([Target, Cookie, IntervalText]) ->
+    try list_to_integer(IntervalText) of
+        Interval when Interval >= 1000 ->
+            {ok, #{
+                route => tui,
+                target => Target,
+                cookie => Cookie,
+                interval => Interval
+            }};
+        _ ->
+            argument_error(invalid_refresh_interval)
+    catch
+        error:badarg -> argument_error(invalid_refresh_interval)
+    end;
+parse_tui(_Arguments) ->
+    argument_error(invalid_arguments).
+
+parse_command(Command, Arguments) ->
+    parse_command(Command, Arguments, [], #{}).
+
+parse_command(Command, [], Positionals, Options) ->
+    Arguments = lists:reverse(Positionals),
+    case validate_command(Command, Arguments, Options) of
+        ok ->
+            {ok, #{
+                route => command,
+                command => Command,
+                arguments => Arguments,
+                options => Options
+            }};
+        {error, Reason} ->
+            argument_error(Reason, Command, Options)
+    end;
+parse_command(Command, [Argument | Rest], Positionals, Options) ->
+    case option(Argument) of
+        positional ->
+            parse_command(Command, Rest, [Argument | Positionals], Options);
+        unknown ->
+            argument_error({unknown_option, Argument});
+        {flag, Key} ->
+            add_option(Command, Rest, Positionals, Options, Key, true);
+        {value, Key} when is_map_key(Key, Options) ->
+            argument_error({duplicate_option, Key});
+        {value, Key} ->
+            parse_option_value(Command, Rest, Positionals, Options, Key, Argument)
+    end.
+
+parse_option_value(_Command, [], _Positionals, _Options, _Key, Option) ->
+    argument_error({missing_option_value, Option});
+parse_option_value(_Command, [[$-, $- | _] | _], _Positionals, _Options, _Key, Option) ->
+    argument_error({missing_option_value, Option});
+parse_option_value(Command, [Value | Rest], Positionals, Options, Key, _Option) ->
+    add_option(Command, Rest, Positionals, Options, Key, Value).
+
+add_option(_Command, _Rest, _Positionals, Options, Key, _Value) when is_map_key(Key, Options) ->
+    argument_error({duplicate_option, Key});
+add_option(Command, Rest, Positionals, Options, Key, Value) ->
+    parse_command(Command, Rest, Positionals, Options#{Key => Value}).
+
+validate_command(describe, Arguments, Options) ->
+    case validate_options(describe, Options) of
+        ok ->
+            case {maps:get(schema, Options, false), Arguments} of
+                {true, []} -> ok;
+                {true, _} -> {error, schema_export_no_command};
+                {false, _} -> validate_arguments(describe, Arguments)
+            end;
+        Error ->
+            Error
+    end;
+validate_command(trace, Arguments, Options) ->
+    case validate_options(trace, Options) of
+        ok -> validate_trace_command(Arguments, Options);
+        Error -> Error
+    end;
+validate_command(Command, Arguments, Options) ->
+    case validate_options(Command, Options) of
+        ok -> validate_arguments(Command, Arguments);
+        Error -> Error
+    end.
+
+validate_trace_command(["call", _MFA] = Arguments, Options) ->
+    case
+        {
+            validate_arguments(trace, Arguments),
+            maps:get(replace_existing_trace, Options, false),
+            maps:is_key(pid, Options),
+            lists:all(
+                fun(Key) ->
+                    lists:member(Key, [pid, replace_existing_trace, limit, rate, duration])
+                end,
+                trace_mode_keys(Options)
+            )
+        }
+    of
+        {ok, true, true, true} -> ok;
+        {{error, Reason}, _, _, _} -> {error, Reason};
+        {ok, false, _, _} -> {error, replace_existing_trace_required};
+        {ok, _, false, _} -> {error, trace_pid_required};
+        {ok, _, _, false} -> {error, unsupported_command_option}
+    end;
+validate_trace_command(["stop"] = Arguments, Options) ->
+    case
+        {
+            validate_arguments(trace, Arguments),
+            maps:get(all, Options, false),
+            trace_mode_keys(Options)
+        }
+    of
+        {ok, true, [all]} -> validate_trace_stop_timeout(Options);
+        {ok, false, _} -> {error, trace_all_required};
+        {ok, true, _} -> {error, unsupported_command_option}
+    end;
+validate_trace_command(Arguments, _Options) ->
+    validate_arguments(trace, Arguments).
+
+trace_mode_keys(Options) ->
+    Global = [
+        node,
+        cookie_env,
+        cookie_file,
+        name_mode,
+        format,
+        json,
+        timeout,
+        redact,
+        include_identifiers,
+        verbose
+    ],
+    lists:sort(maps:keys(maps:without(Global, Options))).
+
+validate_options(Command, Options) ->
+    validate_exclusive_options(
+        Command,
+        Options,
+        [
+            {cookie_env, cookie_file},
+            {redact, include_identifiers},
+            {limit, rate}
+        ]
+    ).
+
+validate_exclusive_options(Command, Options, [{Left, Right} | Rest]) ->
+    case maps:is_key(Left, Options) andalso maps:is_key(Right, Options) of
+        true ->
+            {error, {mutually_exclusive_options, Left, Right}};
+        false ->
+            validate_exclusive_options(Command, Options, Rest)
+    end;
+validate_exclusive_options(Command, Options, []) ->
+    validate_format_options(Command, Options).
+
+validate_format_options(_Command, #{json := true, format := Format}) when Format =/= "json" ->
+    {error, {mutually_exclusive_options, json, format}};
+validate_format_options(_Command, #{format := Format}) when
+    Format =/= "text", Format =/= "json", Format =/= "term"
+->
+    {error, {unsupported_format, Format}};
+validate_format_options(_Command, #{verbose := true, json := true}) ->
+    {error, verbose_text_only};
+validate_format_options(_Command, #{verbose := true, format := Format}) when Format =/= "text" ->
+    {error, verbose_text_only};
+validate_format_options(Command, Options) ->
+    validate_runtime_options(Command, Options).
+
+validate_runtime_options(describe, Options) ->
+    case only_options(describe, Options, [schema]) of
+        false ->
+            {error, unsupported_command_option};
+        true ->
+            case
+                maps:get(schema, Options, false) andalso
+                    not (maps:get(json, Options, false) orelse
+                        maps:get(format, Options, "text") =:= "json")
+            of
+                true -> {error, schema_export_requires_json};
+                false -> ok
+            end
+    end;
+validate_runtime_options(schedulers, Options) ->
+    case only_options(schedulers, Options, [duration]) of
+        true ->
+            case duration(Options) of
+                {ok, Duration} -> validate_scheduler_timeout(Options, Duration);
+                {error, Reason} -> {error, Reason}
+            end;
+        false ->
+            {error, unsupported_command_option}
+    end;
+validate_runtime_options(snapshot, Options) ->
+    validate_target_options(snapshot, Options, [deep]);
+validate_runtime_options(diagnose, Options) ->
+    case only_options(diagnose, Options, [observe, deep, app]) of
+        true -> validate_diagnose_options(Options);
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(distribution, #{limit := Text} = Options) ->
+    case only_options(distribution, Options, [limit]) of
+        true ->
+            case positive_integer(Text) of
+                Limit when is_integer(Limit), Limit =< 200 -> validate_target_options(Options);
+                _ -> {error, invalid_limit}
+            end;
+        false ->
+            {error, unsupported_command_option}
+    end;
+validate_runtime_options(distribution, Options) ->
+    case only_options(distribution, Options, [limit]) of
+        true -> validate_target_options(Options);
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(processes, Options) ->
+    case only_options(processes, Options, [sort, limit, duration]) of
+        true -> validate_processes_options(Options);
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(applications, Options) ->
+    case only_options(applications, Options, [sort, limit]) of
+        true ->
+            validate_list_options(Options, sort_keys(applications));
+        false ->
+            {error, unsupported_command_option}
+    end;
+validate_runtime_options(Command, Options) when Command =:= ets; Command =:= mnesia ->
+    case only_options(Command, Options, [sort, limit]) of
+        true -> validate_list_options(Options, sort_keys(Command));
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(network, Options) ->
+    validate_counter_list_options(network, Options, sort_keys(network));
+validate_runtime_options(ports, Options) ->
+    case only_options(ports, Options, [sort, limit]) of
+        true -> validate_list_options(Options, sort_keys(ports));
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(sockets, Options) ->
+    validate_counter_list_options(sockets, Options, sort_keys(sockets));
+validate_runtime_options(process, Options) ->
+    validate_target_options(process, Options, [info]);
+validate_runtime_options(port, Options) ->
+    validate_target_options(port, Options, []);
+validate_runtime_options(otp_state, #{behavior := "gen_event"} = Options) ->
+    case only_options(otp_state, Options, [behavior, limit]) of
+        true ->
+            case validate_limit_value(Options) of
+                ok -> validate_otp_state_timeout(Options);
+                Error -> Error
+            end;
+        false ->
+            {error, unsupported_command_option}
+    end;
+validate_runtime_options(otp_state, #{behavior := Behavior} = Options) when
+    Behavior =:= "gen_server"; Behavior =:= "gen_statem"
+->
+    case only_options(otp_state, Options, [behavior]) of
+        true -> validate_otp_state_timeout(Options);
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(otp_state, #{behavior := _Behavior}) ->
+    {error, invalid_behavior};
+validate_runtime_options(otp_state, _Options) ->
+    {error, behavior_required};
+validate_runtime_options(supervision_tree, #{app := App} = Options) ->
+    case valid_application_name(App) of
+        true -> validate_target_options(supervision_tree, Options, [app]);
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(supervision_tree, _Options) ->
+    {error, application_required};
+validate_runtime_options(logs, Options) ->
+    case only_options(logs, Options, [handler, tail]) of
+        true -> validate_logs_options(Options);
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(trace, #{all := true} = Options) ->
+    case only_options(trace, Options, [all]) of
+        true -> validate_target_options(Options);
+        false -> {error, unsupported_command_option}
+    end;
+validate_runtime_options(trace, Options) ->
+    validate_trace_options(Options);
+validate_runtime_options(Command, Options) ->
+    validate_target_options(Command, Options, []).
+
+validate_target_options(Command, Options, CommandOptions) ->
+    case only_options(Command, Options, CommandOptions) of
+        true -> validate_target_options(Options);
+        false -> {error, unsupported_command_option}
+    end.
+
+validate_logs_options(Options) ->
+    case maps:find(handler, Options) of
+        {ok, Handler} ->
+            case observer_cli_log:addressable_handler_id(Handler) of
+                true -> validate_logs_tail(Options);
+                false -> {error, unaddressable_handler_id}
+            end;
+        error ->
+            validate_logs_tail(Options)
+    end.
+
+validate_logs_tail(#{tail := Text} = Options) ->
+    case positive_integer(Text) of
+        Tail when is_integer(Tail), Tail =< 2000 -> validate_target_options(Options);
+        _ -> {error, invalid_tail}
+    end;
+validate_logs_tail(Options) ->
+    validate_target_options(Options).
+
+validate_trace_options(Options) ->
+    case only_options(trace, Options, [pid, limit, rate, duration, replace_existing_trace, all]) of
+        true ->
+            case {trace_duration(Options), trace_limit(Options)} of
+                {{ok, Duration}, {ok, _Max}} -> validate_trace_timeout(Options, Duration);
+                {{error, Reason}, _} -> {error, Reason};
+                {_, {error, Reason}} -> {error, Reason}
+            end;
+        false ->
+            {error, unsupported_command_option}
+    end.
+
+validate_trace_timeout(#{timeout := _} = Options, Duration) ->
+    case timeout_value(Options) of
+        {ok, Timeout} when Timeout >= Duration + ?TRACE_TIMEOUT_MARGIN_MS ->
+            validate_target_options(Options);
+        {ok, _} ->
+            {error, trace_timeout_too_short};
+        Error ->
+            Error
+    end;
+validate_trace_timeout(Options, _Duration) ->
+    validate_target_options(Options).
+
+validate_trace_stop_timeout(#{timeout := _} = Options) ->
+    case timeout_value(Options) of
+        {ok, Timeout} when Timeout >= ?TRACE_STOP_TIMEOUT_MS -> ok;
+        {ok, _} -> {error, trace_stop_timeout_too_short};
+        Error -> Error
+    end;
+validate_trace_stop_timeout(_Options) ->
+    ok.
+
+validate_counter_list_options(Command, Options, Sorts) ->
+    case only_options(Command, Options, [sort, limit, duration]) of
+        true -> validate_counter_list_values(Options, Sorts);
+        false -> {error, unsupported_command_option}
+    end.
+
+validate_counter_list_values(Options, Sorts) ->
+    case validate_list_values(Options, Sorts) of
+        ok -> validate_optional_duration(Options);
+        Error -> Error
+    end.
+
+validate_optional_duration(#{duration := _} = Options) ->
+    case duration(Options) of
+        {ok, Duration} -> validate_scheduler_timeout(Options, Duration);
+        {error, Reason} -> {error, Reason}
+    end;
+validate_optional_duration(Options) ->
+    validate_target_options(Options).
+
+only_options(Command, Options, CommandOptions) ->
+    lists:all(
+        fun(Key) -> lists:member(Key, global_options(Command) ++ CommandOptions) end,
+        maps:keys(Options)
+    ).
+
+global_options(Command) -> observer_cli_capture_catalog:common_options(Command).
+
+validate_diagnose_options(Options) ->
+    Observe = maps:find(observe, Options),
+    Deep = maps:is_key(deep, Options),
+    App = maps:find(app, Options),
+    case {Observe, Deep, App} of
+        {error, false, error} ->
+            validate_target_options(Options);
+        {error, true, _} ->
+            {error, observe_required};
+        {error, _, {ok, _}} ->
+            {error, observe_required};
+        {{ok, _}, true, {ok, _}} ->
+            {error, {mutually_exclusive_options, deep, app}};
+        {{ok, Text}, _, _} ->
+            case duration_ms(Text) of
+                Duration when is_integer(Duration), Duration >= 5000, Duration =< 60000 ->
+                    case App of
+                        {ok, Name} -> validate_observation_app(Name, Options, Duration);
+                        error -> validate_observation_timeout(Options, Duration)
+                    end;
+                _ ->
+                    {error, invalid_observation_duration}
+            end
+    end.
+
+validate_observation_app(Name, Options, Duration) ->
+    case valid_application_name(Name) of
+        true -> validate_observation_timeout(Options, Duration);
+        false -> {error, invalid_application}
+    end.
+
+validate_observation_timeout(#{timeout := _} = Options, Duration) ->
+    case timeout_value(Options) of
+        {ok, Timeout} when Timeout >= Duration + 5000 -> validate_target_options(Options);
+        {ok, _} -> {error, timeout_too_short};
+        Error -> Error
+    end;
+validate_observation_timeout(Options, _Duration) ->
+    validate_target_options(Options).
+
+validate_processes_options(Options) ->
+    case validate_list_values(Options, sort_keys(processes)) of
+        ok ->
+            case maps:find(duration, Options) of
+                {ok, _} ->
+                    case duration(Options) of
+                        {ok, Duration} -> validate_scheduler_timeout(Options, Duration);
+                        {error, Reason} -> {error, Reason}
+                    end;
+                error ->
+                    validate_target_options(Options)
+            end;
+        Error ->
+            Error
+    end.
+
+validate_list_options(Options, Sorts) ->
+    case validate_list_values(Options, Sorts) of
+        ok -> validate_target_options(Options);
+        Error -> Error
+    end.
+
+validate_list_values(Options, Sorts) ->
+    case maps:get(sort, Options, hd(Sorts)) of
+        Sort when is_list(Sort) ->
+            case lists:member(Sort, Sorts) of
+                true -> validate_limit_value(Options);
+                false -> {error, invalid_sort}
+            end;
+        _ ->
+            {error, invalid_sort}
+    end.
+
+validate_limit_value(#{limit := Text}) ->
+    case positive_integer(Text) of
+        Limit when is_integer(Limit), Limit =< 200 -> ok;
+        _ -> {error, invalid_limit}
+    end;
+validate_limit_value(_Options) ->
+    ok.
+
+validate_otp_state_timeout(#{timeout := _} = Options) ->
+    case timeout_value(Options) of
+        {ok, Timeout} when Timeout >= 10000 -> validate_target_options(Options);
+        {ok, _} -> {error, otp_state_timeout_too_short};
+        Error -> Error
+    end;
+validate_otp_state_timeout(Options) ->
+    validate_target_options(Options).
+
+validate_arguments(describe, Arguments) ->
+    case observer_cli_capture_catalog:describe(Arguments) of
+        {ok, _} -> ok;
+        {error, _} -> {error, unknown_describe_command}
+    end;
+validate_arguments(process, [_Target]) ->
+    ok;
+validate_arguments(process, _Arguments) ->
+    {error, process_target_required};
+validate_arguments(port, [_Target]) ->
+    ok;
+validate_arguments(port, _Arguments) ->
+    {error, port_target_required};
+validate_arguments(otp_state, [_Target]) ->
+    ok;
+validate_arguments(otp_state, _Arguments) ->
+    {error, otp_state_target_required};
+validate_arguments(supervision_tree, []) ->
+    ok;
+validate_arguments(supervision_tree, _Arguments) ->
+    {error, invalid_arguments};
+validate_arguments(trace, ["call", MFA]) ->
+    case valid_mfa_text(MFA) of
+        true -> ok;
+        false -> {error, invalid_mfa}
+    end;
+validate_arguments(trace, ["stop"]) ->
+    ok;
+validate_arguments(trace, _Arguments) ->
+    {error, invalid_trace_command};
+validate_arguments(Command, []) when
+    Command =:= snapshot;
+    Command =:= diagnose;
+    Command =:= processes;
+    Command =:= applications;
+    Command =:= ets;
+    Command =:= mnesia;
+    Command =:= network;
+    Command =:= ports;
+    Command =:= sockets
+->
+    ok;
+validate_arguments(Command, _Arguments) when
+    Command =:= snapshot;
+    Command =:= diagnose;
+    Command =:= processes;
+    Command =:= applications;
+    Command =:= ets;
+    Command =:= mnesia;
+    Command =:= network;
+    Command =:= ports;
+    Command =:= sockets
+->
+    {error, invalid_arguments};
+validate_arguments(_Command, []) ->
+    ok;
+validate_arguments(_Command, _Arguments) ->
+    {error, invalid_arguments}.
+
+validate_scheduler_timeout(#{timeout := _} = Options, Duration) ->
+    case timeout_value(Options) of
+        {ok, Timeout} when Timeout >= Duration + 5000 -> validate_target_options(Options);
+        {ok, _Timeout} -> {error, timeout_too_short};
+        {error, Reason} -> {error, Reason}
+    end;
+validate_scheduler_timeout(Options, _Duration) ->
+    validate_target_options(Options).
+
+validate_target_options(#{name_mode := Mode}) when Mode =/= "short", Mode =/= "long" ->
+    {error, {unsupported_name_mode, Mode}};
+validate_target_options(#{timeout := _Timeout} = Options) ->
+    case timeout(Options) of
+        {ok, _Milliseconds} -> validate_target_without_timeout(maps:remove(timeout, Options));
+        {error, Reason} -> {error, Reason}
+    end;
+validate_target_options(Options) ->
+    validate_target_without_timeout(Options).
+
+validate_target_without_timeout(#{node := _Node} = Options) when
+    not is_map_key(cookie_env, Options), not is_map_key(cookie_file, Options)
+->
+    {error, missing_cookie_source};
+validate_target_without_timeout(#{node := _Node} = Options) ->
+    case target(Options) of
+        {ok, {_Target, _Mode}} -> ok;
+        {error, Reason} -> {error, Reason}
+    end;
+validate_target_without_timeout(Options) when
+    is_map_key(cookie_env, Options);
+    is_map_key(cookie_file, Options);
+    is_map_key(name_mode, Options)
+->
+    {error, target_option_requires_node};
+validate_target_without_timeout(_Options) ->
+    ok.
+
+-spec target(map()) ->
+    {ok, {string(), shortnames | longnames}} | {error, atom()}.
+target(#{node := Text} = Options) ->
+    case node_parts(Text) of
+        {ok, [Name]} ->
+            case erlang:apply(inet, gethostname, []) of
+                {ok, Host} -> finish_target(Name, Host, Options);
+                {error, _Reason} -> {error, invalid_node}
+            end;
+        {ok, [Name, Host]} ->
+            finish_target(Name, Host, Options);
+        error ->
+            {error, invalid_node}
+    end;
+target(_Options) ->
+    {error, no_active_context}.
+
+-spec cookie_source(map()) -> {ok, binary()} | {error, atom()}.
+cookie_source(#{cookie_env := Name}) ->
+    case valid_env_name(Name) of
+        true ->
+            case os:getenv(Name) of
+                false -> {error, cookie_source_unavailable};
+                Value -> valid_cookie(unicode:characters_to_binary(Value))
+            end;
+        false ->
+            {error, invalid_cookie_source}
+    end;
+cookie_source(#{cookie_file := Path}) ->
+    read_cookie_file(Path);
+cookie_source(_Options) ->
+    {error, missing_cookie_source}.
+
+-spec duration(map()) -> {ok, pos_integer()} | {error, atom()}.
+duration(#{duration := Text}) ->
+    case duration_ms(Text) of
+        Milliseconds when is_integer(Milliseconds), Milliseconds >= 250, Milliseconds =< 10000 ->
+            {ok, Milliseconds};
+        _ ->
+            {error, invalid_duration}
+    end;
+duration(_Options) ->
+    {ok, 1500}.
+
+-spec trace_duration(map()) -> {ok, pos_integer()} | {error, atom()}.
+trace_duration(#{duration := Text}) ->
+    case duration_ms(Text) of
+        Milliseconds when is_integer(Milliseconds), Milliseconds >= 100, Milliseconds =< 60000 ->
+            {ok, Milliseconds};
+        _ ->
+            {error, invalid_duration}
+    end;
+trace_duration(_Options) ->
+    {ok, 10000}.
+
+-spec trace_limit(map()) -> {ok, pos_integer() | {pos_integer(), 1000}} | {error, atom()}.
+trace_limit(#{rate := Text}) ->
+    case string:split(Text, "/", all) of
+        [CountText, "s"] ->
+            case positive_integer(CountText) of
+                Count when is_integer(Count), Count =< 200 -> {ok, {Count, 1000}};
+                _ -> {error, invalid_rate}
+            end;
+        _ ->
+            {error, invalid_rate}
+    end;
+trace_limit(#{limit := Text}) ->
+    case positive_integer(Text) of
+        Count when is_integer(Count), Count =< 1000 -> {ok, Count};
+        _ -> {error, invalid_limit}
+    end;
+trace_limit(_Options) ->
+    {ok, 100}.
+
+-spec timeout(map()) -> {ok, pos_integer()} | {error, atom()}.
+timeout(#{timeout := _Text} = Options) ->
+    timeout_value(Options);
+timeout(#{replace_existing_trace := true} = Options) ->
+    case trace_duration(Options) of
+        {ok, Duration} -> {ok, max(10000, Duration + ?TRACE_TIMEOUT_MARGIN_MS)};
+        {error, _Reason} -> {error, invalid_duration}
+    end;
+timeout(#{duration := _Text} = Options) ->
+    case duration(Options) of
+        {ok, Duration} -> {ok, max(10000, Duration + 5000)};
+        {error, _Reason} -> {error, invalid_duration}
+    end;
+timeout(#{observe := Text}) ->
+    case duration_ms(Text) of
+        Duration when is_integer(Duration), Duration >= 5000, Duration =< 60000 ->
+            {ok, Duration + 5000};
+        _ ->
+            {error, invalid_observation_duration}
+    end;
+timeout(_Options) ->
+    {ok, 10000}.
+
+timeout_value(#{timeout := Text}) ->
+    case duration_ms(Text) of
+        Milliseconds when is_integer(Milliseconds), Milliseconds > 0, Milliseconds =< 120000 ->
+            {ok, Milliseconds};
+        _ ->
+            {error, invalid_timeout}
+    end.
+
+node_parts(Text) when is_list(Text), length(Text) =< ?MAX_NODE_LENGTH ->
+    case valid_text(Text) of
+        true ->
+            case string:split(Text, "@", all) of
+                [Name] when Name =/= [] -> {ok, [Name]};
+                [Name, Host] when Name =/= [], Host =/= [] -> {ok, [Name, Host]};
+                _ -> error
+            end;
+        false ->
+            error
+    end;
+node_parts(_Text) ->
+    error.
+
+finish_target(Name, Host, Options) ->
+    Target = Name ++ "@" ++ Host,
+    case length(Target) =< ?MAX_NODE_LENGTH of
+        true -> {ok, {Target, name_mode(Options, Host)}};
+        false -> {error, invalid_node}
+    end.
+
+name_mode(#{name_mode := "short"}, _Host) ->
+    shortnames;
+name_mode(#{name_mode := "long"}, _Host) ->
+    longnames;
+name_mode(_Options, Host) ->
+    case lists:member($., Host) orelse lists:member($:, Host) of
+        true -> longnames;
+        false -> shortnames
+    end.
+
+valid_env_name(Name) when is_list(Name), Name =/= [], length(Name) =< 255 ->
+    valid_text(Name) andalso not lists:member($=, Name);
+valid_env_name(_Name) ->
+    false.
+
+read_cookie_file(Path) when is_list(Path), Path =/= [] ->
+    case file:read_file_info(Path) of
+        {ok, #file_info{type = regular, mode = Mode, size = Size}} when Size =< 257 ->
+            case safe_cookie_file_mode(Mode) of
+                true ->
+                    case read_cookie_bytes(Path) of
+                        {ok, Binary} -> valid_cookie(strip_cookie_newline(Binary));
+                        {error, invalid_cookie} -> {error, invalid_cookie};
+                        {error, _Reason} -> {error, cookie_source_unavailable}
+                    end;
+                false ->
+                    {error, cookie_file_permissions}
+            end;
+        {ok, #file_info{type = regular}} ->
+            {error, invalid_cookie};
+        {ok, _Info} ->
+            {error, cookie_source_unavailable};
+        {error, _Reason} ->
+            {error, cookie_source_unavailable}
+    end;
+read_cookie_file(_Path) ->
+    {error, invalid_cookie_source}.
+
+read_cookie_bytes(Path) ->
+    case file:open(Path, [raw, binary, read]) of
+        {ok, File} ->
+            Result =
+                case file:read(File, 258) of
+                    {ok, Binary} when byte_size(Binary) =< 257 -> {ok, Binary};
+                    _ -> {error, invalid_cookie}
+                end,
+            ok = file:close(File),
+            Result;
+        {error, _Reason} ->
+            {error, unavailable}
+    end.
+
+safe_cookie_file_mode(Mode) ->
+    case os:type() of
+        {unix, _} -> (Mode band 8#077) =:= 0;
+        _ -> true
+    end.
+
+strip_cookie_newline(Binary) when byte_size(Binary) >= 2 ->
+    case binary:part(Binary, byte_size(Binary) - 2, 2) of
+        <<"\r\n">> -> binary:part(Binary, 0, byte_size(Binary) - 2);
+        _ -> strip_cookie_lf(Binary)
+    end;
+strip_cookie_newline(Binary) ->
+    strip_cookie_lf(Binary).
+
+strip_cookie_lf(Binary) when byte_size(Binary) >= 1 ->
+    case binary:last(Binary) of
+        $\n -> binary:part(Binary, 0, byte_size(Binary) - 1);
+        _ -> Binary
+    end;
+strip_cookie_lf(Binary) ->
+    Binary.
+
+valid_cookie(Binary) when
+    is_binary(Binary), byte_size(Binary) > 0, byte_size(Binary) =< ?MAX_COOKIE_LENGTH
+->
+    case lists:all(fun(Byte) -> Byte >= 32 andalso Byte =< 126 end, binary_to_list(Binary)) of
+        true -> {ok, Binary};
+        false -> {error, invalid_cookie}
+    end;
+valid_cookie(_Binary) ->
+    {error, invalid_cookie}.
+
+valid_text(Text) ->
+    lists:all(
+        fun(Character) ->
+            Character >= 32 andalso not (Character >= 127 andalso Character =< 159)
+        end,
+        Text
+    ).
+
+valid_application_name(Name) when is_list(Name), Name =/= [], length(Name) =< 255 ->
+    valid_text(Name);
+valid_application_name(_Name) ->
+    false.
+
+valid_mfa_text(Text) when is_list(Text), Text =/= [], length(Text) =< 768 ->
+    case string:split(Text, ":", all) of
+        [Module, FunctionArity] when Module =/= [] ->
+            case string:split(FunctionArity, "/", all) of
+                [Function, ArityText] when Function =/= [] ->
+                    exact_mfa_name(Module) andalso exact_mfa_name(Function) andalso
+                        case positive_integer_or_zero(ArityText) of
+                            Arity when is_integer(Arity), Arity =< 255 -> true;
+                            _ -> false
+                        end;
+                _ ->
+                    false
+            end;
+        _ ->
+            false
+    end;
+valid_mfa_text(_Text) ->
+    false.
+
+exact_mfa_name(Name) ->
+    Name =/= "_" andalso Name =/= "*" andalso valid_text(Name).
+
+duration_ms(Text) when is_list(Text) ->
+    case lists:reverse(Text) of
+        [$s, $m | Reversed] -> positive_integer(lists:reverse(Reversed));
+        [$s | Reversed] -> multiply_duration(positive_integer(lists:reverse(Reversed)), 1000);
+        _ -> positive_integer(Text)
+    end;
+duration_ms(_Text) ->
+    error.
+
+positive_integer(Text) ->
+    integer_at_least(Text, 1).
+
+positive_integer_or_zero(Text) ->
+    integer_at_least(Text, 0).
+
+integer_at_least(Text, Minimum) ->
+    try list_to_integer(Text) of
+        Value when Value >= Minimum -> Value;
+        _ -> error
+    catch
+        error:badarg -> error
+    end.
+
+multiply_duration(Value, Multiplier) when is_integer(Value) -> Value * Multiplier;
+multiply_duration(error, _Multiplier) -> error.
+
+option(Argument) -> observer_cli_capture_catalog:option(Argument).
+
+-spec command(string()) -> atom() | undefined.
+command(Argument) -> observer_cli_capture_catalog:command(Argument).
+
+-spec schema() -> binary().
+schema() -> ?SCHEMA.
+
+argument_error(Reason) ->
+    {error, #{category => argument, exit_code => 2, reason => Reason}}.
+
+%% Keep recovery hints on the same sort definitions used by validation.
+sort_keys(Command) -> observer_cli_capture_catalog:sort_keys(Command).
+
+argument_error(Reason, Command, Options) ->
+    {error, Error} = argument_error(Reason),
+    case invalid_option_constraint(Command, Reason) of
+        {Key, Constraint} when is_map_key(Key, Options) ->
+            {error, Error#{
+                message_reason =>
+                    {invalid_option_value, Reason, Key, maps:get(Key, Options), Constraint}
+            }};
+        _ ->
+            {error, Error}
+    end.
+
+invalid_option_constraint(Command, invalid_sort) ->
+    {sort, unicode:characters_to_binary(lists:join(", ", sort_keys(Command)))};
+invalid_option_constraint(trace, invalid_limit) ->
+    {limit, <<"an integer from 1 to 1000">>};
+invalid_option_constraint(_, invalid_limit) ->
+    {limit, <<"an integer from 1 to 200">>};
+invalid_option_constraint(trace, invalid_duration) ->
+    {duration, <<"100ms..60s (integer milliseconds, Nms, or Ns)">>};
+invalid_option_constraint(_, invalid_duration) ->
+    {duration, <<"250ms..10s (integer milliseconds, Nms, or Ns)">>};
+invalid_option_constraint(_, invalid_timeout) ->
+    {timeout, <<"1ms..120s (integer milliseconds, Nms, or Ns)">>};
+invalid_option_constraint(_, invalid_observation_duration) ->
+    {observe, <<"5s..60s (integer milliseconds, Nms, or Ns)">>};
+invalid_option_constraint(_, invalid_rate) ->
+    {rate, <<"N/s where N is an integer from 1 to 200">>};
+invalid_option_constraint(_, invalid_behavior) ->
+    {behavior, <<"gen_server, gen_statem, or gen_event">>};
+invalid_option_constraint(_, invalid_tail) ->
+    {tail, <<"an integer from 1 to 2000">>};
+invalid_option_constraint(_, timeout_too_short) ->
+    {timeout, <<"at least the sampling duration plus 5s">>};
+invalid_option_constraint(_, trace_timeout_too_short) ->
+    {timeout, <<"at least the trace duration plus 7s">>};
+invalid_option_constraint(_, trace_stop_timeout_too_short) ->
+    {timeout, <<"at least 5s">>};
+invalid_option_constraint(_, otp_state_timeout_too_short) ->
+    {timeout, <<"at least 10s">>};
+invalid_option_constraint(_, _) ->
+    none.
+
+-spec response(
+    atom() | binary(),
+    complete | partial | error | binary(),
+    null | map(),
+    null | map(),
+    null | map(),
+    [term()]
+) ->
+    map().
+response(Command, Outcome, Target, Capture, Data, Issues) ->
+    #{
+        <<"schema">> => ?SCHEMA,
+        <<"command">> => command_binary(Command),
+        <<"outcome">> => outcome_binary(Outcome),
+        <<"data">> => Data,
+        <<"meta">> => #{<<"target">> => Target, <<"capture">> => Capture},
+        <<"issues">> => Issues
+    }.
+
+-spec error(atom(), term()) -> map().
+error(Category, Reason) ->
+    #{
+        <<"severity">> => <<"error">>,
+        <<"class">> => atom_to_binary(Category),
+        <<"reason_code">> => reason_code(Reason),
+        <<"message">> => reason_message(Reason)
+    }.
+
+-spec encode(text | term | json, map(), map()) -> {ok, binary()} | {error, map()}.
+encode(text, Response, #{verbose := true}) -> encode(verbose, Response);
+encode(Format, Response, _Options) -> encode(Format, Response).
+
+-spec encode(text | verbose | term | json, map()) -> {ok, binary()} | {error, map()}.
+encode(text, #{<<"schema">> := <<"observer_cli.cli/v2">>} = Response) ->
+    capped(observer_cli_present:render(Response, report_width()));
+encode(text, #{<<"command">> := <<"logs">>, <<"data">> := Data} = Response) when
+    is_map(Data)
+->
+    capped(iolist_to_binary(logs_text(Response, Data)));
+encode(text, #{<<"command">> := <<"describe">>, <<"data">> := #{<<"name">> := _}} = Response) ->
+    encode(verbose, Response);
+encode(text, Response) ->
+    capped(observer_cli_report:render(Response, report_width()));
+encode(verbose, #{<<"command">> := <<"inspect logs">>} = Response) ->
+    encode(text, Response);
+encode(verbose, #{<<"command">> := Command} = Response) when
+    Command =:= <<"logs">>
+->
+    encode(text, Response);
+encode(verbose, #{<<"command">> := Command} = Response) ->
+    capped(
+        iolist_to_binary([
+            <<"observer_cli ">>,
+            text_command(Command),
+            <<"\n">>,
+            render_text_map(text_response(Response), 0, root)
+        ])
+    );
+encode(term, Response) ->
+    Body = iolist_to_binary(io_lib:format("~0tp.", [Response])),
+    capped(iolist_to_binary([harden_term(Body), <<"\n">>]));
+encode(json, Response) ->
+    case code:ensure_loaded(json) of
+        {module, json} ->
+            try
+                Body = iolist_to_binary(erlang:apply(json, encode, [Response])),
+                capped(iolist_to_binary([harden_json(Body), <<"\n">>]))
+            of
+                Result -> Result
+            catch
+                _:_ -> encoder_error(json_encoding_failed)
+            end;
+        {error, _Reason} ->
+            {error, controller_error(capability, json_unavailable)}
+    end;
+encode(_Format, _Response) ->
+    {error, controller_error(format, unsupported_format)}.
+
+report_width() ->
+    case io:columns() of
+        {ok, Width} when is_integer(Width), Width > 0 -> Width;
+        _ -> 80
+    end.
+
+-spec command_name(atom() | binary()) -> binary().
+command_name(Command) when is_atom(Command) -> observer_cli_capture_catalog:public_name(Command);
+command_name(Command) when is_binary(Command) ->
+    try
+        observer_cli_capture_catalog:public_name(binary_to_existing_atom(Command, utf8))
+    catch
+        error:badarg -> Command
+    end.
+
+text_command(Command) -> escape_text(command_name(Command)).
+
+logs_text(Response, Data) ->
+    Meta = maps:get(<<"meta">>, Response),
+    Target = maps:get(<<"target">>, Meta),
+    Sources = maps:get(<<"sources">>, Data),
+    Selected = maps:get(<<"selected_source">>, Data),
+    Tail = maps:get(<<"tail">>, Data),
+    [
+        <<"observer_cli logs\n">>,
+        logs_failure_text(Response, Tail),
+        logs_target_text(Target),
+        logs_source_text(Selected, Sources),
+        logs_tail_text(Tail)
+    ].
+
+logs_target_text(#{<<"node">> := Node, <<"otp_release">> := Otp}) ->
+    [<<"target=">>, escape_text(Node), <<" otp=">>, escape_text(Otp), <<"\n">>];
+logs_target_text(_Target) ->
+    [].
+
+logs_source_text(null, Sources) ->
+    [logs_summary_text(Source) || Source <- Sources];
+logs_source_text(
+    #{
+        <<"id">> := Id,
+        <<"handler_kind">> := Kind,
+        <<"configured_path">> := Path
+    },
+    _Sources
+) ->
+    [
+        <<"handler=">>,
+        escape_text(Id),
+        <<" handler_kind=">>,
+        escape_text(Kind),
+        <<"\nconfigured_path=">>,
+        escape_text(Path),
+        <<"\n">>
+    ].
+
+logs_summary_text(#{
+    <<"id">> := Id,
+    <<"addressable">> := Addressable,
+    <<"supported">> := Supported,
+    <<"reason_code">> := Reason
+}) ->
+    [
+        <<"source=">>,
+        escape_text(Id),
+        <<" addressable=">>,
+        text_scalar(Addressable),
+        <<" supported=">>,
+        text_scalar(Supported),
+        <<" reason=">>,
+        text_scalar(Reason),
+        <<"\n">>
+    ].
+
+logs_tail_text(null) ->
+    [];
+logs_tail_text(Tail) ->
+    Lines = maps:get(<<"lines">>, Tail),
+    Truncated = maps:get(<<"truncated_line_indexes">>, Tail),
+    [
+        <<"scope=">>,
+        escape_text(maps:get(<<"scope">>, Tail)),
+        <<" active_handler_fd_match=">>,
+        escape_text(maps:get(<<"active_handler_fd_match">>, Tail)),
+        <<"\nvisibility=">>,
+        escape_text(maps:get(<<"visibility">>, Tail)),
+        <<" command_filesync_requested=">>,
+        text_scalar(maps:get(<<"command_filesync_requested">>, Tail)),
+        <<" consistency=">>,
+        escape_text(maps:get(<<"consistency">>, Tail)),
+        <<"\nrequested_lines=">>,
+        text_scalar(maps:get(<<"requested_lines">>, Tail)),
+        <<" returned_lines=">>,
+        text_scalar(maps:get(<<"returned_lines">>, Tail)),
+        <<" bytes_read=">>,
+        text_scalar(maps:get(<<"bytes_read">>, Tail)),
+        <<" has_more=">>,
+        text_scalar(maps:get(<<"has_more">>, Tail)),
+        <<"\n--- UNTRUSTED LOG CONTENT ---\n">>,
+        logs_lines_text(Lines, Truncated, 0)
+    ].
+
+logs_lines_text([], _Truncated, _Index) ->
+    [];
+logs_lines_text([Line | Rest], Truncated, Index) ->
+    Omitted =
+        case lists:member(Index, Truncated) of
+            true -> <<"[earlier bytes omitted] ">>;
+            false -> <<>>
+        end,
+    [
+        <<"| ">>,
+        Omitted,
+        logs_line_text(Line),
+        <<"\n">>,
+        logs_lines_text(Rest, Truncated, Index + 1)
+    ].
+
+logs_line_text(Line) when is_binary(Line) ->
+    escape_text(Line);
+logs_line_text(#{<<"encoding">> := <<"base64">>, <<"data">> := Data}) ->
+    <<"base64:", Data/binary>>.
+
+logs_failure_text(Response, Tail) ->
+    Capture = maps:get(<<"capture">>, maps:get(<<"meta">>, Response)),
+    Reason =
+        case Capture of
+            #{<<"probes">> := [#{<<"reason_code">> := ProbeReason}]} -> ProbeReason;
+            _ -> null
+        end,
+    [
+        <<"outcome=">>,
+        escape_text(maps:get(<<"outcome">>, Response)),
+        <<" reason=">>,
+        text_scalar(Reason),
+        <<"\n">>,
+        case Tail of
+            null ->
+                [];
+            _ ->
+                [
+                    <<"content_truncated=">>,
+                    text_scalar(maps:get(<<"content_truncated">>, Tail)),
+                    <<" truncation_reasons=">>,
+                    lists:join(<<",">>, [
+                        escape_text(R)
+                     || R <- maps:get(<<"truncation_reasons">>, Tail)
+                    ]),
+                    <<"\n">>
+                ]
+        end
+    ].
+
+cookie_source_text(#{<<"type">> := <<"env">>, <<"name">> := Name}) ->
+    [<<"env:">>, escape_text(Name)];
+cookie_source_text(#{<<"type">> := <<"file">>, <<"path">> := Path}) ->
+    [<<"file:">>, escape_text(Path)].
+
+render_text_map(Map, Indent, Order) ->
+    [render_text_field(Key, maps:get(Key, Map), Indent) || Key <- text_map_keys(Map, Order)].
+
+render_text_field(Key, Value, Indent) when is_map(Value), map_size(Value) =:= 0 ->
+    [text_indent(Indent), text_scalar(Key), <<": {}\n">>];
+render_text_field(Key, Value, Indent) when is_map(Value) ->
+    [
+        text_indent(Indent),
+        text_scalar(Key),
+        <<":\n">>,
+        render_text_map(Value, Indent + 2, nested)
+    ];
+render_text_field(Key, [], Indent) ->
+    [text_indent(Indent), text_scalar(Key), <<": []\n">>];
+render_text_field(Key, Value, Indent) when is_list(Value) ->
+    [text_indent(Indent), text_scalar(Key), <<":\n">>, render_text_list(Value, Indent + 2, 0)];
+render_text_field(Key, Value, Indent) ->
+    [text_indent(Indent), text_scalar(Key), <<": ">>, text_scalar(Value), <<"\n">>].
+
+render_text_list([], _Indent, _Index) ->
+    [];
+render_text_list([Value | Rest], Indent, Index) ->
+    [
+        render_text_item(Value, Indent, Index),
+        render_text_list(Rest, Indent, Index + 1)
+    ].
+
+render_text_item(Value, Indent, Index) when is_map(Value), map_size(Value) =:= 0 ->
+    [text_indent(Indent), <<"[">>, integer_to_binary(Index), <<"]: {}\n">>];
+render_text_item(Value, Indent, Index) when is_map(Value) ->
+    [
+        text_indent(Indent),
+        <<"[">>,
+        integer_to_binary(Index),
+        <<"]:\n">>,
+        render_text_map(Value, Indent + 2, nested)
+    ];
+render_text_item([], Indent, Index) ->
+    [text_indent(Indent), <<"[">>, integer_to_binary(Index), <<"]: []\n">>];
+render_text_item(Value, Indent, Index) when is_list(Value) ->
+    [
+        text_indent(Indent),
+        <<"[">>,
+        integer_to_binary(Index),
+        <<"]:\n">>,
+        render_text_list(Value, Indent + 2, 0)
+    ];
+render_text_item(Value, Indent, Index) ->
+    [
+        text_indent(Indent),
+        <<"[">>,
+        integer_to_binary(Index),
+        <<"]: ">>,
+        text_scalar(Value),
+        <<"\n">>
+    ].
+
+text_map_keys(Map, root) ->
+    ordered_text_keys(
+        Map,
+        [
+            <<"target">>,
+            <<"data">>,
+            <<"capture">>,
+            <<"issues">>,
+            <<"outcome">>
+        ]
+    );
+text_map_keys(Map, nested) ->
+    ordered_text_keys(
+        Map,
+        [
+            <<"summary">>,
+            <<"id">>,
+            <<"severity">>,
+            <<"class">>,
+            <<"status">>,
+            <<"reason_code">>,
+            <<"message">>,
+            <<"required">>
+        ]
+    ).
+
+ordered_text_keys(Map, Priority) ->
+    Present = [Key || Key <- Priority, maps:is_key(Key, Map)],
+    Present ++ lists:sort(maps:keys(maps:without(Priority, Map))).
+
+text_response(Response) ->
+    Data = maps:get(<<"data">>, Response, null),
+    Meta = maps:get(<<"meta">>, Response, #{}),
+    Target = maps:get(<<"target">>, Meta, null),
+    Capture = text_capture(maps:get(<<"capture">>, Meta, null)),
+    Issues = maps:get(<<"issues">>, Response, []),
+    Outcome = maps:get(<<"outcome">>, Response, <<"error">>),
+    maps:filter(
+        fun
+            (_Key, null) -> false;
+            (<<"issues">>, []) -> false;
+            (<<"outcome">>, <<"complete">>) -> false;
+            (_Key, _Value) -> true
+        end,
+        #{
+            <<"target">> => Target,
+            <<"data">> => Data,
+            <<"capture">> => Capture,
+            <<"issues">> => Issues,
+            <<"outcome">> => Outcome
+        }
+    ).
+
+text_capture(null) ->
+    null;
+text_capture(Capture) ->
+    Probes = [
+        Probe
+     || #{<<"status">> := Status} = Probe <- maps:get(<<"probes">>, Capture), Status =/= <<"ok">>
+    ],
+    maps:filter(
+        fun
+            (_Key, []) -> false;
+            (_Key, _Value) -> true
+        end,
+        #{
+            <<"duration_ms">> => maps:get(<<"duration_ms">>, Capture),
+            <<"probes">> => Probes,
+            <<"observer_effects">> => maps:get(<<"observer_effects">>, Capture)
+        }
+    ).
+
+text_indent(Width) ->
+    binary:copy(<<" ">>, Width).
+
+text_scalar(<<>>) ->
+    <<"\"\"">>;
+text_scalar(Value) when is_binary(Value) ->
+    escape_text(Value);
+text_scalar(Value) when is_atom(Value) ->
+    atom_to_binary(Value);
+text_scalar(Value) when is_integer(Value) ->
+    integer_to_binary(Value);
+text_scalar(Value) when is_float(Value) ->
+    float_to_binary(Value, [short]);
+text_scalar(Value) ->
+    iolist_to_binary(io_lib:format("~tp", [Value])).
+
+-spec exit_code(atom() | map()) -> 0..4.
+exit_code(#{category := Category}) ->
+    exit_code(Category);
+exit_code(argument) ->
+    2;
+exit_code(format) ->
+    2;
+exit_code(capability) ->
+    2;
+exit_code(safety_refusal) ->
+    3;
+exit_code(scan_budget_exceeded) ->
+    3;
+exit_code(controller) ->
+    3;
+exit_code(distribution) ->
+    3;
+exit_code(connection) ->
+    3;
+exit_code(required_probe) ->
+    3;
+exit_code(partial) ->
+    3;
+exit_code(internal) ->
+    4;
+exit_code(cleanup) ->
+    4;
+exit_code(schema) ->
+    4;
+exit_code(_Unknown) ->
+    4.
+
+-spec escape_text(unicode:chardata()) -> binary().
+escape_text(Text) ->
+    case unicode:characters_to_list(Text) of
+        Codepoints when is_list(Codepoints) ->
+            iolist_to_binary([escape_codepoint(Codepoint) || Codepoint <- Codepoints]);
+        _Invalid ->
+            Raw = raw_text(Text),
+            <<"base64:", (base64:encode(Raw))/binary>>
+    end.
+
+raw_text(Text) when is_binary(Text) ->
+    Text;
+raw_text(Text) ->
+    try iolist_to_binary(Text) of
+        Binary -> Binary
+    catch
+        _:_ -> term_to_binary(Text)
+    end.
+
+escape_codepoint(Codepoint) when
+    Codepoint < 16#20;
+    Codepoint >= 16#7F, Codepoint =< 16#9F
+->
+    io_lib:format("\\x~2.16.0B", [Codepoint]);
+escape_codepoint(Codepoint) ->
+    case bidi_or_separator(Codepoint) of
+        true -> io_lib:format("\\u{~.16B}", [Codepoint]);
+        false -> unicode:characters_to_binary([Codepoint])
+    end.
+
+harden_term(Binary) ->
+    harden_unicode(Binary, fun term_codepoint/1).
+
+term_codepoint(Codepoint) when
+    Codepoint < 16#20;
+    Codepoint >= 16#7F, Codepoint =< 16#9F
+->
+    io_lib:format("\\x~2.16.0B", [Codepoint]);
+term_codepoint(Codepoint) ->
+    case bidi_or_separator(Codepoint) of
+        true -> io_lib:format("\\x{~.16B}", [Codepoint]);
+        false -> unicode:characters_to_binary([Codepoint])
+    end.
+
+harden_json(Binary) ->
+    harden_unicode(Binary, fun json_codepoint/1).
+
+json_codepoint(Codepoint) when Codepoint < 16#20 ->
+    json_unicode_escape(Codepoint);
+json_codepoint(Codepoint) when Codepoint >= 16#7F, Codepoint =< 16#9F ->
+    json_unicode_escape(Codepoint);
+json_codepoint(Codepoint) ->
+    case bidi_or_separator(Codepoint) of
+        true -> json_unicode_escape(Codepoint);
+        false -> unicode:characters_to_binary([Codepoint])
+    end.
+
+json_unicode_escape(Codepoint) ->
+    io_lib:format("\\u~4.16.0B", [Codepoint]).
+
+harden_unicode(Binary, Fun) ->
+    case unicode:characters_to_list(Binary) of
+        Codepoints when is_list(Codepoints) ->
+            iolist_to_binary([Fun(Codepoint) || Codepoint <- Codepoints]);
+        _Invalid ->
+            Binary
+    end.
+
+bidi_or_separator(16#061C) -> true;
+bidi_or_separator(16#200E) -> true;
+bidi_or_separator(16#200F) -> true;
+bidi_or_separator(16#2028) -> true;
+bidi_or_separator(16#2029) -> true;
+bidi_or_separator(Codepoint) when Codepoint >= 16#202A, Codepoint =< 16#202E -> true;
+bidi_or_separator(Codepoint) when Codepoint >= 16#2066, Codepoint =< 16#2069 -> true;
+bidi_or_separator(_Codepoint) -> false.
+
+command_binary(null) ->
+    null;
+command_binary(Command) when is_atom(Command) ->
+    atom_to_binary(Command);
+command_binary(Command) when is_binary(Command) ->
+    Command.
+
+outcome_binary(Outcome) when is_atom(Outcome) ->
+    atom_to_binary(Outcome);
+outcome_binary(Outcome) when is_binary(Outcome) ->
+    Outcome.
+
+reason_code({invalid_option_value, Reason, _Key, _Value, _Constraint}) ->
+    reason_code(Reason);
+reason_code({contextual_error, Reason, _Context}) ->
+    reason_code(Reason);
+reason_code({Code, _Detail}) when is_atom(Code) ->
+    atom_to_binary(Code);
+reason_code({Code, _Left, _Right}) when is_atom(Code) ->
+    atom_to_binary(Code);
+reason_code(Code) when is_atom(Code) ->
+    atom_to_binary(Code);
+reason_code(Code) when is_binary(Code) ->
+    Code;
+reason_code(_Reason) ->
+    <<"unknown_error">>.
+
+reason_message({invalid_option_value, _Reason, Key, Value, Constraint}) ->
+    iolist_to_binary([
+        <<"invalid ">>,
+        option_text(Key),
+        <<" value \"">>,
+        escape_text(Value),
+        <<"\"; expected ">>,
+        Constraint
+    ]);
+reason_message({contextual_error, Reason, #{redacted := true}}) ->
+    iolist_to_binary([
+        reason_message(Reason),
+        <<"; configured target and cookie source withheld by identifier policy">>
+    ]);
+reason_message({contextual_error, Reason, Context}) ->
+    iolist_to_binary([
+        reason_message(Reason),
+        <<"; configured target: ">>,
+        <<"node=">>,
+        escape_text(maps:get(node, Context)),
+        <<", name_mode=">>,
+        escape_text(maps:get(name_mode, Context)),
+        <<", cookie_source=">>,
+        cookie_source_text(maps:get(cookie_source, Context))
+    ]);
+reason_message({unknown_option, Option}) ->
+    iolist_to_binary([<<"unknown option: ">>, escape_text(Option)]);
+reason_message({unknown_command, Command}) ->
+    iolist_to_binary([<<"unknown command: ">>, escape_text(Command)]);
+reason_message({duplicate_option, Option}) ->
+    iolist_to_binary([<<"option may only be specified once: ">>, option_text(Option)]);
+reason_message({missing_option_value, Option}) ->
+    iolist_to_binary([<<"missing value for option: ">>, escape_text(Option)]);
+reason_message({mutually_exclusive_options, Left, Right}) ->
+    iolist_to_binary([
+        option_text(Left), <<" and ">>, option_text(Right), <<" cannot be used together">>
+    ]);
+reason_message({unsupported_format, Format}) ->
+    iolist_to_binary([<<"unsupported format: ">>, escape_text(Format)]);
+reason_message({unsupported_name_mode, Mode}) ->
+    iolist_to_binary([<<"unsupported name mode: ">>, escape_text(Mode)]);
+reason_message(schema_export_requires_json) ->
+    <<"describe --schema requires --json or --format json">>;
+reason_message(schema_export_no_command) ->
+    <<"describe --schema exports the complete schema; omit command arguments">>;
+reason_message(unknown_describe_command) ->
+    <<"unknown command description; use describe or describe trace">>;
+reason_message(verbose_text_only) ->
+    <<"--verbose is only supported with --format text; JSON and term already contain complete evidence">>;
+reason_message(json_unavailable) ->
+    <<"JSON output requires OTP 27 or newer">>;
+reason_message(command_unavailable) ->
+    <<"command capability is not available yet">>;
+reason_message(capability_unavailable) ->
+    <<"install a matching observer_cli diagnostics bundle on the target">>;
+reason_message(diagnostics_missing) ->
+    <<"observer_cli diagnostics are not installed on the target">>;
+reason_message(diagnostics_incompatible) ->
+    <<"the target observer_cli diagnostics bundle is incompatible">>;
+reason_message(no_active_context) ->
+    <<"no target configured; supply --node with one cookie source or set OBSERVER_CLI_NODE">>;
+reason_message(global_option_before_command) ->
+    <<"options must appear after the command name">>;
+reason_message(missing_cookie_source) ->
+    <<"--node requires exactly one of --cookie-env or --cookie-file">>;
+reason_message(target_option_requires_node) ->
+    <<"--cookie-env, --cookie-file, and --name-mode require an explicit --node">>;
+reason_message(process_target_required) ->
+    <<"process requires one PID_OR_NAME">>;
+reason_message(port_target_required) ->
+    <<"port requires one PORT_ID">>;
+reason_message(otp_state_target_required) ->
+    <<"otp-state requires one PID_OR_NAME">>;
+reason_message(behavior_required) ->
+    <<"otp-state requires --behavior gen_server|gen_statem|gen_event">>;
+reason_message(invalid_behavior) ->
+    <<"--behavior must be gen_server, gen_statem, or gen_event">>;
+reason_message(application_required) ->
+    <<"supervision-tree requires --app APP">>;
+reason_message(observe_required) ->
+    <<"--deep and --app require --observe DURATION">>;
+reason_message(replace_existing_trace_required) ->
+    <<"trace call requires --replace-existing-trace">>;
+reason_message(trace_pid_required) ->
+    <<"trace call requires --pid PID">>;
+reason_message(trace_all_required) ->
+    <<"trace stop requires --all">>;
+reason_message(timeout_too_short) ->
+    <<"--timeout must cover the sampling duration plus five seconds">>;
+reason_message(trace_timeout_too_short) ->
+    <<"trace call --timeout must cover the trace duration plus seven seconds">>;
+reason_message(trace_stop_timeout_too_short) ->
+    <<"trace stop --timeout must be at least five seconds">>;
+reason_message(otp_state_timeout_too_short) ->
+    <<"--timeout must be at least 10s for otp-state">>;
+reason_message(unaddressable_handler_id) ->
+    <<"--handler must be 1..255 safe Unicode characters and must not start with --">>;
+reason_message(invalid_tail) ->
+    <<"--tail must be an integer from 1 to 2000">>;
+reason_message(invalid_refresh_interval) ->
+    <<"REFRESH_MS must be an integer of at least 1000">>;
+reason_message(cookie_source_unavailable) ->
+    <<"cookie source unavailable; set the configured environment variable or make the configured file readable before retrying">>;
+reason_message(cookie_file_permissions) ->
+    <<"cookie file permissions are unsafe; remove all group and other permission bits (normally chmod 600)">>;
+reason_message(invalid_cookie) ->
+    <<"cookie source must contain 1..255 printable ASCII bytes; verify its contents without putting the value in command arguments">>;
+reason_message(connection_failed) ->
+    <<"target connection failed; check node name, name mode, EPMD, network, and cookie">>;
+reason_message(tui_start_failed) ->
+    <<"interactive TUI startup failed; check target reachability, cookie, and bundle compatibility">>;
+reason_message({remote_otp_mismatch, ControllerOtp, TargetOtp}) ->
+    iolist_to_binary([
+        <<"TUI auto-load requires the same OTP major release; controller OTP ">>,
+        escape_text(ControllerOtp),
+        <<", target OTP ">>,
+        escape_text(TargetOtp)
+    ]);
+reason_message(Reason) when
+    Reason =:= invalid_command_response;
+    Reason =:= invalid_snapshot_response;
+    Reason =:= invalid_diagnose_response;
+    Reason =:= invalid_schema
+->
+    <<"target response schema is incompatible; install the same observer_cli build on the controller and target">>;
+reason_message(response_too_large) ->
+    <<"encoded response exceeds one MiB">>;
+reason_message(Reason) when is_binary(Reason) ->
+    escape_text(Reason);
+reason_message(Reason) when is_atom(Reason) ->
+    list_to_binary(string:replace(atom_to_list(Reason), "_", " ", all));
+reason_message(Reason) ->
+    iolist_to_binary(io_lib:format("~tp", [Reason])).
+
+option_text(Option) when is_atom(Option) ->
+    list_to_binary(["--", string:replace(atom_to_list(Option), "_", "-", all)]).
+
+capped(Binary) when byte_size(Binary) =< ?MAX_RESPONSE_BYTES ->
+    {ok, Binary};
+capped(_Binary) ->
+    {error, controller_error(schema, response_too_large)}.
+
+encoder_error(Reason) ->
+    {error, controller_error(internal, Reason)}.
+
+controller_error(Category, Reason) ->
+    #{category => Category, exit_code => exit_code(Category), reason => Reason}.

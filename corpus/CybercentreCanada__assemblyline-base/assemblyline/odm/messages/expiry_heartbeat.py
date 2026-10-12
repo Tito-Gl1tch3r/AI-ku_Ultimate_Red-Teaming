@@ -1,0 +1,38 @@
+from assemblyline import odm
+
+MSG_TYPES = {"ExpiryHeartbeat"}
+LOADER_CLASS = "assemblyline.odm.messages.expiry_heartbeat.ExpiryMessage"
+
+
+@odm.model(description="Expiry Stats")
+class Metrics(odm.Model):
+    alert = odm.Integer(description="Number of alerts", default=0)
+    apikey = odm.Integer(description="Number of apikeys", default=0)
+    badlist = odm.Integer(description="Number of badlisted items", default=0)
+    cached_file = odm.Integer(description="Number of cached files", default=0)
+    emptyresult = odm.Integer(description="Number of empty results", default=0)
+    error = odm.Integer(description="Number of errors", default=0)
+    file = odm.Integer(description="Number of files", default=0)
+    filescore = odm.Integer(description="Number of filscores", default=0)
+    result = odm.Integer(description="Number of results", default=0)
+    retrohunt = odm.Integer(description="Number of retrohunt searches", default=0)
+    retrohunt_hit = odm.Integer(description="Number of retrohunt hits", default=0)
+    safelist = odm.Integer(description="Number of safelisted items", default=0)
+    submission = odm.Integer(description="Number of submissions", default=0)
+    submission_tree = odm.Integer(description="Number of submission trees", default=0)
+    submission_summary = odm.Integer(description="Number of submission summaries", default=0)
+
+
+@odm.model(description="Heartbeat Model")
+class Heartbeat(odm.Model):
+    instances = odm.Integer(description="Number of instances")
+    metrics = odm.Compound(Metrics, description="Expiry metrics")
+    queues = odm.Compound(Metrics, description="Expiry queues")
+
+
+@odm.model(description="Model of Expiry Heartbeat Message")
+class ExpiryMessage(odm.Model):
+    msg = odm.Compound(Heartbeat, description="Hearbeat message")
+    msg_loader = odm.Enum(values={LOADER_CLASS}, default=LOADER_CLASS, description="Loader class for message")
+    msg_type = odm.Enum(values=MSG_TYPES, default="ExpiryHeartbeat", description="Type of message")
+    sender = odm.Keyword(description="Sender of message")

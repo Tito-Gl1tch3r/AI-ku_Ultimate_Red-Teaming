@@ -1,0 +1,397 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { computeDrift } from '../lib/drift.js';
+import { deltaE } from '../lib/colors.js';
+
+/**
+ * Low-confidence tokens are single-use, margin-of-detection elements the
+ * extractor is unsure about; they surface inconsistently between two
+ * extractions of the same design. computeDrift must ignore them so they never
+ * produce phantom drift.
+ */
+
+function fixture(overrides: Record<string, unknown> = {}): any {
+  return {
+    url: 'https://example.com/',
+    extractedAt: 't',
+    colors: { palette: [{ normalized: '#133174', count: 40, confidence: 'high' }], semantic: { primary: '#133174' }, cssVariables: {} },
+    typography: { styles: [], sources: {} },
+    // Representative extract: spacing and radius present, so overall-score
+    // assertions run against a realistic category denominator.
+    spacing: { scaleType: 'base-8', commonValues: [{ px: 8 }, { px: 16 }, { px: 24 }] },
+    borderRadius: { values: [{ value: '4px', count: 20, confidence: 'high' }] },
+    borders: {}, shadows: [],
+    components: { buttons: [], inputs: [], links: [], badges: [] },
+    breakpoints: [], iconSystem: [], frameworks: [],
+    ...overrides,
+  };
+}
+
+test('a low-confidence shadow present in one extraction but not the other is not drift', () => {
+  const withShadow = fixture({
+    shadows: [{ shadow: 'rgb(128, 128, 128) 0px 0px 5px 0px', count: 1, confidence: 'low' }],
+  });
+  const without = fixture({ shadows: [] });
+
+  const report = computeDrift(withShadow, without);
+  assert.equal(report.status, 'stable');
+  assert.equal(report.summary.removed, 0);
+  assert.equal(report.changes.filter((c) => c.category === 'shadow').length, 0);
+});
+
+test('a low-confidence radius present in one extraction but not the other is not drift', () => {
+  const withRadius = fixture({
+    borderRadius: { values: [{ value: '2px', count: 1, confidence: 'low' }] },
+  });
+  const without = fixture({ borderRadius: { values: [] } });
+
+  const report = computeDrift(withRadius, without);
+  assert.equal(report.status, 'stable');
+  assert.equal(report.changes.filter((c) => c.category === 'radius').length, 0);
+});
+
+test('baseline and candidate extracted at different viewport widths produce a warning', () => {
+  const base = fixture({ meta: { schemaVersion: '1', viewport: { width: 1920, height: 1080 } } });
+  const cand = fixture({ meta: { schemaVersion: '1', viewport: { width: 390, height: 844 } } });
+
+  const report = computeDrift(base, cand);
+  assert.equal(report.warnings?.length, 1);
+  assert.match(report.warnings![0], /1920x1080/);
+  assert.match(report.warnings![0], /390x844/);
+});
+
+const context = (over: Record<string, unknown> = {}) => ({
+  viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 1, isMobile: false, hasTouch: false,
+  colorScheme: 'light', reducedMotion: 'no-preference', forcedColors: 'none',
+  locale: 'en-US', timezoneId: 'America/New_York', userAgent: 'ua', ...over,
+});
+
+test('snapshots measured under different rendering dials produce one context warning naming each dial', () => {
+  const base = fixture({ meta: { schemaVersion: '1', context: context() } });
+  const cand = fixture({ meta: { schemaVersion: '1', context: context({ colorScheme: 'dark', deviceScaleFactor: 2 }) } });
+
+  const report = computeDrift(base, cand);
+  assert.equal(report.warnings?.length, 1);
+  assert.match(report.warnings![0], /deviceScaleFactor 1 -> 2/);
+  assert.match(report.warnings![0], /colorScheme light -> dark/);
+  assert.doesNotMatch(report.warnings![0], /locale/);
+});
+
+test('a context that differs only in the user agent or timezone is the same measurement', () => {
+  const base = fixture({ meta: { schemaVersion: '1', context: context() } });
+  const cand = fixture({ meta: { schemaVersion: '1', context: context({ userAgent: 'other', timezoneId: 'Europe/Helsinki' }) } });
+  assert.equal(computeDrift(base, cand).warnings, undefined);
+});
+
+test('a snapshot without meta.context is not warned against', () => {
+  const base = fixture({ meta: { schemaVersion: '1' } });
+  const cand = fixture({ meta: { schemaVersion: '1', context: context({ colorScheme: 'dark' }) } });
+  assert.equal(computeDrift(base, cand).warnings, undefined);
+});
+
+test('same viewport width produces no warning', () => {
+  const base = fixture({ meta: { schemaVersion: '1', viewport: { width: 1920, height: 1080 } } });
+  const cand = fixture({ meta: { schemaVersion: '1', viewport: { width: 1920, height: 900 } } });
+
+  const report = computeDrift(base, cand);
+  assert.equal(report.warnings, undefined);
+});
+
+test('malformed viewport meta produces no warning instead of garbage', () => {
+  const cand = fixture({ meta: { schemaVersion: '1', viewport: { width: 390, height: 844 } } });
+  for (const viewport of [{}, { width: null, height: null }, { width: '', height: 844 }, { width: [], height: 1080 }]) {
+    const base = fixture({ meta: { schemaVersion: '1', viewport } });
+    assert.equal(computeDrift(base, cand).warnings, undefined, JSON.stringify(viewport));
+  }
+});
+
+test('a real width mismatch with a garbage height renders ? instead of NaN', () => {
+  const base = fixture({ meta: { schemaVersion: '1', viewport: { width: 1920, height: null } } });
+  const cand = fixture({ meta: { schemaVersion: '1', viewport: { width: 390, height: 844 } } });
+
+  const w = computeDrift(base, cand).warnings![0];
+  assert.match(w, /1920x\?/);
+  assert.doesNotMatch(w, /NaN/);
+});
+
+test('same width as string vs number is not a mismatch', () => {
+  const base = fixture({ meta: { schemaVersion: '1', viewport: { width: '1920', height: '1080' } } });
+  const cand = fixture({ meta: { schemaVersion: '1', viewport: { width: 1920, height: 1080 } } });
+  assert.equal(computeDrift(base, cand).warnings, undefined);
+});
+
+test('missing viewport meta on either side produces no warning (pre-viewport snapshots)', () => {
+  const base = fixture(); // no meta at all
+  const cand = fixture({ meta: { schemaVersion: '1', viewport: { width: 390, height: 844 } } });
+
+  const report = computeDrift(base, cand);
+  assert.equal(report.warnings, undefined);
+});
+
+interface TestStyle { context: string; family: string; size: string; weight: string }
+
+function typoStyles(n: number, family = 'Inter'): TestStyle[] {
+  return Array.from({ length: n }, (_, i) => ({
+    context: `style-${i}`, family, size: '16px', weight: '400',
+  }));
+}
+
+test('one removed typography style among many does not max the category', () => {
+  const styles = typoStyles(10);
+  const base = fixture({ typography: { styles, sources: {} } });
+  const cand = fixture({ typography: { styles: styles.slice(0, 9), sources: {} } });
+
+  const report = computeDrift(base, cand);
+  const typo = report.categories.find((c) => c.category === 'typography')!;
+  assert.ok(typo.score < 0.5, `one removal must not dominate the category, got ${typo.score}`);
+  assert.equal(report.status, 'stable');
+});
+
+test('one font-family change flags drift without maxing the category', () => {
+  const styles = typoStyles(10);
+  const changed = styles.map((s, i) => (i === 0 ? { ...s, family: 'Comic Sans MS' } : s));
+  const base = fixture({ typography: { styles, sources: {} } });
+  const cand = fixture({ typography: { styles: changed, sources: {} } });
+
+  const report = computeDrift(base, cand);
+  const typo = report.categories.find((c) => c.category === 'typography')!;
+  assert.ok(typo.score <= 0.5, `one family change must not read as full replacement, got ${typo.score}`);
+  assert.equal(report.status, 'drift', 'a confirmed in-place family change is real drift and must flag');
+});
+
+test('mass deletion of typography styles flags drift even though one removal does not', () => {
+  const styles = typoStyles(10);
+  const base = fixture({ typography: { styles, sources: {} } });
+  const cand = fixture({ typography: { styles: styles.slice(0, 4), sources: {} } });
+
+  const report = computeDrift(base, cand);
+  const typo = report.categories.find((c) => c.category === 'typography')!;
+  assert.ok(typo.score >= 0.6, `deleting 6/10 styles must scale, got ${typo.score}`);
+  assert.equal(report.status, 'drift');
+});
+
+test('replacing the font family across all styles still drifts', () => {
+  const base = fixture({ typography: { styles: typoStyles(10, 'Inter'), sources: {} } });
+  const cand = fixture({ typography: { styles: typoStyles(10, 'Georgia'), sources: {} } });
+
+  const report = computeDrift(base, cand);
+  const typo = report.categories.find((c) => c.category === 'typography')!;
+  assert.ok(typo.score >= 0.7, `full family swap must score high, got ${typo.score}`);
+  assert.equal(report.status, 'drift');
+});
+
+test('a removed style scores below an in-place family change', () => {
+  const styles = typoStyles(10);
+  const base = fixture({ typography: { styles, sources: {} } });
+
+  const removedReport = computeDrift(base, fixture({ typography: { styles: styles.slice(0, 9), sources: {} } }));
+  const changedReport = computeDrift(base, fixture({
+    typography: { styles: styles.map((s, i) => (i === 0 ? { ...s, family: 'Georgia' } : s)), sources: {} },
+  }));
+
+  const score = (r: ReturnType<typeof computeDrift>) =>
+    r.categories.find((c) => c.category === 'typography')!.score;
+  assert.ok(score(removedReport) < score(changedReport),
+    `removal (${score(removedReport)}) must score below family change (${score(changedReport)})`);
+});
+
+test('extracts from different final URLs produce a page-mismatch warning', () => {
+  const base = fixture({ url: 'https://example.com/' });
+  const cand = fixture({ url: 'https://www.example.com/fi/' });
+
+  const report = computeDrift(base, cand);
+  assert.ok(report.warnings?.some((w) => w.includes('different pages')), JSON.stringify(report.warnings));
+});
+
+test('www and trailing slash are not a page mismatch', () => {
+  const base = fixture({ url: 'https://example.com/pricing' });
+  const cand = fixture({ url: 'https://www.example.com/pricing/' });
+
+  assert.equal(computeDrift(base, cand).warnings, undefined);
+});
+
+test('--dark-mode on one side only produces a warning', () => {
+  const base = fixture({ meta: { schemaVersion: '1', flags: { darkMode: true } } });
+  const cand = fixture({ meta: { schemaVersion: '1', flags: {} } });
+
+  const report = computeDrift(base, cand);
+  assert.ok(report.warnings?.some((w) => w.includes('--dark-mode')), JSON.stringify(report.warnings));
+});
+
+test('unloaded web fonts on either side produce a warning naming the pending families', () => {
+  const base = fixture({ meta: { schemaVersion: '1', fontsReady: true } });
+  const cand = fixture({ meta: { schemaVersion: '1', fontsReady: false, pendingFonts: ['Inter'] } });
+
+  const report = computeDrift(base, cand);
+  const w = report.warnings?.find((x) => x.includes('web fonts'));
+  assert.ok(w, JSON.stringify(report.warnings));
+  assert.match(w!, /candidate/);
+  assert.match(w!, /Inter/);
+});
+
+test('a degraded category is excluded from the score instead of read as removals', () => {
+  const styles = typoStyles(16);
+  const base = fixture({ typography: { styles, sources: {} } });
+  // Candidate's typography extractor failed: empty styles + a scoped error.
+  const cand = fixture({
+    typography: { styles: [], sources: {} },
+    meta: { schemaVersion: '1', errors: [{ stage: 'typography', reason: 'timeout' }] },
+  });
+
+  const report = computeDrift(base, cand);
+  assert.equal(report.status, 'stable', `16 missing styles from a failed extractor must not read as drift, got ${report.score}`);
+  assert.ok(report.warnings?.some((w) => w.includes('typography extraction was degraded')), JSON.stringify(report.warnings));
+  // Phantom tokens must not leak into changes/summary either: CI annotations
+  // render report.changes unfiltered.
+  assert.equal(report.changes.filter((c) => c.category === 'typography').length, 0);
+  assert.equal(report.summary.removed, 0);
+});
+
+test('a failed manifest injection degrades color: its palette entries must not read as removed brand colors', () => {
+  // Manifest injection pushes theme_color/background_color into the palette
+  // (count 10, high confidence). If the candidate's injection fails, those
+  // colors vanish — without the manifest→color mapping they scored as drift.
+  const palette = [
+    { color: '#ff6600', normalized: '#ff6600', count: 10, confidence: 'high' },
+    { color: '#123456', normalized: '#123456', count: 40, confidence: 'high' },
+  ];
+  const base = fixture({ colors: { palette, semantic: {}, cssVariables: {} } });
+  const cand = fixture({
+    colors: { palette: [palette[1]], semantic: {}, cssVariables: {} },
+    meta: { schemaVersion: '1', degraded: ['manifest'] },
+  });
+
+  const report = computeDrift(base, cand);
+  assert.equal(report.status, 'stable', `a failed manifest stage must not read as color drift, got ${report.score}`);
+  assert.equal(report.changes.filter((c) => c.category === 'color').length, 0);
+});
+
+test('a compare where every comparable category is degraded warns that it is inconclusive', () => {
+  const sparse = {
+    typography: { styles: typoStyles(3), sources: {} },
+    colors: { palette: [], semantic: {}, cssVariables: {} },
+    spacing: { scaleType: 'base-8', commonValues: [] },
+    borderRadius: { values: [] },
+    shadows: [],
+  };
+  const base = fixture(sparse);
+  const cand = fixture({
+    ...sparse,
+    typography: { styles: [], sources: {} },
+    meta: { schemaVersion: '1', errors: [{ stage: 'typography', reason: 'timeout' }] },
+  });
+
+  const report = computeDrift(base, cand);
+  assert.equal(report.score, 0);
+  assert.ok(report.warnings?.some((w) => w.includes('inconclusive')), JSON.stringify(report.warnings));
+});
+
+test('categories empty on both sides do not dilute the score', () => {
+  const styles = typoStyles(2);
+  const sparse = {
+    typography: { styles, sources: {} },
+    spacing: { scaleType: 'base-8', commonValues: [] },
+    borderRadius: { values: [] },
+    shadows: [],
+  };
+  const base = fixture(sparse);
+  const cand = fixture({ ...sparse, typography: { styles: typoStyles(2, 'Georgia'), sources: {} } });
+
+  const report = computeDrift(base, cand);
+  // Comparable categories: color (w 1) + typography (w 1). A full family swap
+  // (category 1.0) must average against those alone, not the empty three.
+  assert.equal(report.score, 50);
+});
+
+test('a high-confidence radius change is still real drift', () => {
+  const base = fixture({
+    borderRadius: { values: [{ value: '4px', count: 20, confidence: 'high' }] },
+  });
+  const changed = fixture({
+    borderRadius: { values: [{ value: '12px', count: 20, confidence: 'high' }] },
+  });
+
+  const report = computeDrift(base, changed);
+  assert.ok(report.changes.some((c) => c.category === 'radius'), 'high-confidence radius change must be reported');
+});
+
+/**
+ * DEM-211. drift.ts used to carry its own Lab conversion with truncated matrix
+ * coefficients, so the same CIE76 metric disagreed with lib/colors.ts by up to
+ * 0.03. Both now share one conversion. These pin the property that made the
+ * duplicate dangerous: the shared deltaE decides drift's colour classification,
+ * so a pair colors.ts calls closer than the just-noticeable difference must be
+ * stable here, and a pair it calls further must not be.
+ */
+test('drift classification agrees with the shared deltaE across the colorSame boundary', () => {
+  const base = '#133174';
+  // Below JND (colorSame 2.3) and above it, measured with the shared metric.
+  const imperceptible = '#143276';
+  const perceptible = '#1a3a80';
+
+  assert.ok(deltaE(base, imperceptible) < 2.3, 'fixture drifted: expected a sub-JND pair');
+  assert.ok(deltaE(base, perceptible) > 2.3, 'fixture drifted: expected a supra-JND pair');
+
+  const paletteOf = (hex: string) => ({
+    colors: { palette: [{ normalized: hex, count: 40, confidence: 'high' }], semantic: {}, cssVariables: {} },
+  });
+
+  const same = computeDrift(fixture(paletteOf(base)), fixture(paletteOf(imperceptible)));
+  const moved = computeDrift(fixture(paletteOf(base)), fixture(paletteOf(perceptible)));
+
+  const colorOf = (r: ReturnType<typeof computeDrift>) =>
+    r.categories.find((c) => c.category === 'color');
+
+  assert.equal(colorOf(same)?.changed, 0, 'a sub-JND colour was reported as changed');
+  assert.equal(colorOf(moved)?.changed, 1, 'a supra-JND colour was not reported as changed');
+});
+
+/**
+ * A single changed brand colour must fail the gate. The semantic map used to
+ * share the palette's denominator, so one magenta primary in a real palette
+ * scored stable 0 and exited 0 — the exact case the gate exists for (DEM-376).
+ *
+ * The palette keeps its own denominator, so the churn tolerance below still
+ * holds: scoring the two together in either direction breaks one of them.
+ */
+test('one changed semantic colour is not diluted by a stable palette', () => {
+  const palette = Array.from({ length: 24 }, (_, i) => ({
+    normalized: `#${(0x0a0a0a * (i + 1)).toString(16).padStart(6, '0').slice(-6)}`,
+    count: 40,
+    confidence: 'high',
+  }));
+  const at = (primary: string) =>
+    fixture({ colors: { palette, semantic: { primary }, cssVariables: {} } });
+
+  const before = computeDrift(at('#635bff'), at('#635bff'));
+  assert.equal(before.status, 'stable');
+  assert.equal(before.score, 0);
+
+  const after = computeDrift(at('#635bff'), at('#ff00ff'));
+  assert.equal(after.status, 'drift');
+  assert.ok(after.score > after.threshold, `score ${after.score} must exceed ${after.threshold}`);
+});
+
+test('a single added or removed palette entry stays under the gate', () => {
+  const palette = (n: number, extra: string[] = []) => [
+    ...Array.from({ length: n }, (_, i) => ({
+      normalized: `#${(0x0a0a0a * (i + 1)).toString(16).padStart(6, '0').slice(-6)}`,
+      count: 40,
+      confidence: 'high',
+    })),
+    ...extra.map((normalized) => ({ normalized, count: 40, confidence: 'high' })),
+  ];
+  const at = (pal: unknown[]) =>
+    fixture({ colors: { palette: pal, semantic: { primary: '#635bff' }, cssVariables: {} } });
+
+  // A site varies between runs: an A/B variant, a CDN edge, a lazy image's
+  // sampled colour. One palette entry appearing or vanishing must not fail a
+  // gate on a site nobody touched.
+  for (const [label, cand] of [
+    ['added', at(palette(30, ['#ff00ff']))],
+    ['removed', at(palette(29))],
+  ] as const) {
+    const report = computeDrift(at(palette(30)), cand);
+    assert.equal(report.status, 'stable', `one ${label} entry scored ${report.score}`);
+  }
+});

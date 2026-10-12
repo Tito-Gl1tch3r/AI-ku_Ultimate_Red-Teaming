@@ -1,0 +1,502 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import type { Agent, FileRecord, Finding, Provider } from "@agentgg/core";
+import {
+  completeRun,
+  createRunMeta,
+  loadAllFileRecords,
+  readScanMeta,
+  writeFileRecord,
+  writeRunMeta,
+} from "@agentgg/core";
+import type { Command } from "commander";
+import { loadAllAgents } from "../agent-catalog.js";
+import { runConcurrent } from "../concurrent.js";
+import { loadDefaultScope } from "../default-scope.js";
+import { handleDetectorError } from "../diagnostics.js";
+import { loadOrSynthesizeConfig, resolveDetector } from "../llm.js";
+import { logError } from "../log.js";
+import { applyGroupVerdict, duplicatesOfRejected, membersOf, promote } from "../promote.js";
+import {
+  buildCredentialsFromOpts,
+  REGION_FLAG_HELP,
+  validateProviderFlags,
+} from "../providers/index.js";
+import { writeMarkdownReport } from "../reporters/md.js";
+import { createUsageMeter } from "../usage-meter.js";
+import { fitMembers } from "../validator.js";
+import { buildInvocation } from "./invocation.js";
+
+interface RevalidateOpts {
+  /**
+   * Scope document control, matching `scan`:
+   *   - a string: path to a SECURITY.md-style scope doc (`--scope <path>`).
+   *   - `undefined`: flag omitted → the bundled default scope is used.
+   *   - `false`: `--no-scope` → opt out of scope entirely.
+   *
+   * A resolved scope doc has two meanings:
+   *   - with --validate: threaded into full validation; `out-of-scope`
+   *     joins the usual confirmed/false-positive/uncertain verdicts.
+   *   - WITHOUT --validate: an EXPLICIT `--scope <path>` triggers
+   *     scope-only validation — the model never re-reads source; only
+   *     `out-of-scope` is persisted. The bundled default never triggers
+   *     this on its own.
+   */
+  scope?: string | boolean;
+  /**
+   * Force full validation (re-reads source). Without this, `--scope`
+   * alone runs scope-only; absence of both runs full validation with
+   * no scope context (revalidate's default).
+   */
+  validate?: boolean;
+  provider?: string;
+  apiKey?: string;
+  oauthToken?: string;
+  baseUrl?: string;
+  region?: string;
+  project?: string;
+  model?: string;
+  /** `--openrouter-routing`: see the twin option on `scan`. */
+  openrouterRouting?: string;
+  force?: boolean;
+  verbose?: boolean;
+  /** Override the scanned root recorded in scan.json — rare. */
+  root?: string;
+  /** Max tool-use turns per validator call. */
+  validateMaxTurns?: number;
+  /** Drop false-positive findings from the markdown report instead of keeping them (kept by default). */
+  excludeFalsePositives?: boolean;
+  /**
+   * `--no-summary` → `summary: false`. Skip re-rendering the markdown report
+   * (`summary.md` + `findings/*.md`) after validation. Verdicts are still
+   * persisted to `state/files/*`; render later with `agentgg summary`.
+   * Commander defaults this to `true`; the bare flag sets it `false`.
+   */
+  summary?: boolean;
+  /** Findings validated in parallel (in-flight LLM calls). Default 5. */
+  concurrency?: number;
+}
+
+/**
+ * Re-run the validation phase against findings already on disk in
+ * one `--output` directory. By default skips findings that already
+ * have a verdict; pass `--force` to re-classify everything.
+ *
+ * Operates entirely off the persisted `FileRecord`s — no walker,
+ * no detection phase. The source root comes from the scan-meta
+ * sidecar so the user doesn't have to retype it (override with
+ * `--root` if the working copy moved).
+ */
+export async function runRevalidate(
+  outputArg: string,
+  opts: RevalidateOpts,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const outputDir = resolve(outputArg);
+  const scanMeta = readScanMeta(outputDir);
+  if (!scanMeta) {
+    throw new Error(
+      `No scan state at ${outputDir}. Run \`agentgg scan <path> -o ${outputArg}\` first.`,
+    );
+  }
+  const rootPath = opts.root ? resolve(opts.root) : scanMeta.root;
+
+  const config = loadOrSynthesizeConfig(env, opts.provider);
+  const activeProvider = (opts.provider ?? config.provider) as Provider;
+  validateProviderFlags(activeProvider, opts);
+  const credentials = buildCredentialsFromOpts(opts);
+  const detector = resolveDetector(config, {
+    provider: opts.provider,
+    model: opts.model,
+    credentials,
+    verbose: opts.verbose,
+    validateMaxTurns: opts.validateMaxTurns,
+    openrouterRouting: opts.openrouterRouting,
+  });
+
+  // Same abort-on-fatal-diagnostic pattern as scan — see scan.ts for the
+  // full design note. `handleDetectorError` aborts this controller on a
+  // fatal quota/auth diagnostic; sibling in-flight validator calls then
+  // cancel at the SDK layer instead of churning through a dead credential.
+  // Resume safety: validation only writes verdicts on the happy path of
+  // each task, so cancelled findings retain their prior state.
+  const revalidateAbortController = new AbortController();
+
+  // Resolve --scope at revalidate time, matching scan: an explicit path
+  // is re-read (missing path is fatal — same fail-fast contract); the
+  // flag omitted falls back to the bundled default scope; `--no-scope`
+  // (opts.scope === false) opts out entirely.
+  let scopeContent: string | undefined;
+  if (typeof opts.scope === "string") {
+    const scopePath = resolve(opts.scope);
+    try {
+      scopeContent = readFileSync(scopePath, "utf8");
+    } catch (err) {
+      throw new Error(`--scope: cannot read ${scopePath}: ${(err as Error).message}`);
+    }
+  } else if (opts.scope !== false) {
+    scopeContent = loadDefaultScope();
+  }
+
+  // Scope-only validation is selected ONLY by an explicit `--scope <path>`
+  // without `--validate`; the bundled default never triggers it. So
+  // absence of both flags stays revalidate's full-validation default —
+  // now with default scope context threaded in. `--validate` (with or
+  // without `--scope`) always runs full re-reading validation.
+  const scopeOnlyValidate = !opts.validate && typeof opts.scope === "string";
+
+  const records = loadAllFileRecords(outputDir);
+  if (records.length === 0) {
+    console.log(`No FileRecords in ${outputDir}/state/files/.`);
+    console.log("  Run `agentgg scan` first to populate findings.");
+    return;
+  }
+
+  // (record, finding) pairs we'll actually re-validate.
+  type Task = { record: FileRecord; finding: Finding };
+  const tasks: Task[] = [];
+  let skippedDupes = 0;
+  for (const record of records) {
+    for (const finding of record.findings) {
+      if (!opts.force && finding.validation) continue;
+      // A duplicate is represented by its primary, so it is not classified
+      // on its own. `agentgg dedup --force` clears the marker first.
+      if (finding.dedup) {
+        skippedDupes++;
+        continue;
+      }
+      tasks.push({ record, finding });
+    }
+  }
+
+  if (tasks.length === 0) {
+    console.log(
+      `Nothing to revalidate. ${records.length} file(s) on disk; every finding already has a verdict${
+        skippedDupes > 0 ? ` or is a duplicate (${skippedDupes} skipped)` : ""
+      }.`,
+    );
+    console.log("  Pass --force to re-classify every finding.");
+    return;
+  }
+
+  console.log(`Revalidating ${tasks.length} finding(s) in ${outputDir}`);
+  console.log(`  Root:        ${rootPath}`);
+  console.log(`  Provider:    ${detector.name}`);
+  if (scopeContent)
+    console.log(`  Scope:       ${typeof opts.scope === "string" ? opts.scope : "default"}`);
+  if (scopeOnlyValidate) {
+    console.log(
+      `  Mode:        scope-only (file content not read; only out-of-scope verdicts persisted)`,
+    );
+  } else {
+    console.log(`  Mode:        full${scopeContent ? " (with scope context)" : ""}`);
+  }
+  if (opts.force) console.log(`  Force:       re-classifying everything`);
+  console.log("");
+
+  const runMeta = createRunMeta({
+    type: "validate",
+    invocation: buildInvocation({ command: "revalidate" }),
+  });
+  writeRunMeta(outputDir, runMeta);
+
+  // Token-usage metering — revalidate is an LLM validation pass, so it's
+  // recorded too. Checkpoints to state/usage.json incrementally and is flushed
+  // at finalize. (No SIGTERM handler here, matching this command's existing
+  // shape; a cancel relies on the last incremental checkpoint.)
+  const usageMeter = createUsageMeter(outputDir, detector.name);
+  detector.attachUsageMeter?.(usageMeter);
+
+  const startedAt = new Date();
+  const verdicts: Record<string, number> = {};
+  const fileCache = new Map<string, string | null>();
+  // A finding only carries `agentSlug`, so resolve its reporting agent from
+  // the catalog. This makes an agent-authored `validationPrompt` apply here
+  // exactly as it does under `scan --validate`. A catalog that fails to load,
+  // or an agent renamed or removed since the scan, leaves the map empty for
+  // that slug and the validator keeps its default rules.
+  const agentBySlug = new Map<string, Agent>();
+  if (!scopeOnlyValidate) {
+    try {
+      for (const agent of loadAllAgents().agents) agentBySlug.set(agent.slug, agent);
+    } catch (err) {
+      if (opts.verbose) logError(`Could not load agents: ${(err as Error).message}`);
+    }
+    const withCustom = tasks.filter(
+      ({ finding }) => agentBySlug.get(finding.agentSlug)?.validationPrompt,
+    ).length;
+    if (withCustom > 0) {
+      console.log(`  ${withCustom} finding(s) use their agent's own validation prompt
+`);
+    }
+  }
+  // Track which records actually changed so we don't rewrite every
+  // FileRecord on disk for no reason.
+  const dirtyRecords = new Set<FileRecord>();
+
+  // One bounded pool over findings. Each finding is a distinct object;
+  // verdicts, fileCache, and dirtyRecords are only touched in await-free
+  // regions, so concurrent workers can't race. Dirtied records are written
+  // below once the pool drains.
+  const concurrency = Math.max(1, opts.concurrency ?? 5);
+  const recordOf = new Map<string, FileRecord>();
+  for (const record of records) {
+    for (const finding of record.findings) recordOf.set(finding.id, record);
+  }
+  const allFindings = records.flatMap((r) => r.findings);
+  // Built once, before any swap. Safe: a swapped group is confirmed and never
+  // enters the second wave below, which is the only later reader.
+  const groups = membersOf(allFindings);
+  let moved = 0;
+  const validateOne = async ({ record, finding }: Task): Promise<void> => {
+    // Scope-only branch: never read the file, only ask the LLM to
+    // classify against the scope document, and only persist when the
+    // verdict is `out-of-scope`. In-scope/uncertain results are logged
+    // but the finding's validation field is left untouched so a
+    // follow-up full `revalidate` can still assess technical merit.
+    if (scopeOnlyValidate && scopeContent !== undefined) {
+      try {
+        const result = await detector.validateFindingByScope({
+          finding,
+          scope: scopeContent,
+          signal: revalidateAbortController.signal,
+        });
+        verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
+        if (result.verdict === "out-of-scope") {
+          finding.validation = {
+            verdict: result.verdict,
+            reasoning: result.reasoning,
+          };
+          finding.suggestedFix = undefined;
+          dirtyRecords.add(record);
+        }
+        if (opts.verbose) {
+          const note =
+            result.verdict === "out-of-scope"
+              ? "marked out-of-scope"
+              : "kept (scope did not disqualify)";
+          console.log(`  ${finding.filePath} (${finding.id}): ${result.verdict} — ${note}`);
+        }
+      } catch (err) {
+        handleDetectorError(opts, `scope-validate:${finding.id}`, err, revalidateAbortController);
+      }
+      return;
+    }
+
+    const absPath = resolve(rootPath, finding.filePath);
+    let content = fileCache.get(finding.filePath);
+    if (content === undefined) {
+      try {
+        content = readFileSync(absPath, "utf8");
+      } catch {
+        content = null;
+      }
+      fileCache.set(finding.filePath, content);
+    }
+    if (content === null) {
+      if (opts.verbose) {
+        console.log(`  skip ${finding.filePath}: file not readable`);
+      }
+      return;
+    }
+    try {
+      const result = await detector.validateFinding({
+        finding,
+        fileContent: content,
+        scope: scopeContent,
+        root: rootPath,
+        validationPrompt: agentBySlug.get(finding.agentSlug)?.validationPrompt,
+        members: groups.get(finding.id),
+        signal: revalidateAbortController.signal,
+      });
+      // This command owns every shard in the directory.
+      const changed = applyGroupVerdict(allFindings, finding, result, () => true);
+      if (changed.length > 1) moved++;
+      for (const f of changed) {
+        const r = recordOf.get(f.id);
+        if (r) dirtyRecords.add(r);
+      }
+      verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
+      if (opts.verbose) {
+        console.log(`  ${finding.filePath} (${finding.id}): ${result.verdict}`);
+      }
+    } catch (err) {
+      handleDetectorError(opts, `validate:${finding.id}`, err, revalidateAbortController);
+    }
+  };
+  await runConcurrent(tasks, concurrency, validateOne);
+
+  // A rejected group covers only the members its prompt showed. Members the
+  // cap left out get their own verdict, and the first survivor takes over.
+  const unseen = new Set<string>();
+  for (const members of groups.values()) {
+    for (const m of fitMembers(members).left) unseen.add(m.id);
+  }
+  const secondWave = duplicatesOfRejected(allFindings, unseen);
+  if (secondWave.length > 0) {
+    console.log(`  Validating ${secondWave.length} duplicate(s) a rejected group did not show`);
+    await runConcurrent(secondWave, concurrency, async (finding) => {
+      const record = recordOf.get(finding.id);
+      if (record) await validateOne({ record, finding });
+    });
+  }
+  const promoted = promote(allFindings, () => true, unseen);
+  if (promoted.length > 0) {
+    const heirs = promoted.filter((f) => !f.dedup).length;
+    moved += heirs;
+    console.log(`  Promoted ${heirs} finding(s) whose primary was rejected.`);
+    for (const finding of promoted) {
+      const record = recordOf.get(finding.id);
+      if (record) dirtyRecords.add(record);
+    }
+  }
+  if (moved > 0) {
+    console.log(
+      `  ${moved} group(s) have a new primary with no score. Run \`agentgg score ${outputDir}\` to score them.`,
+    );
+  }
+
+  // Write dirtied records back. Append a validate-phase AnalysisRun
+  // entry so the history reflects this revalidate pass.
+  for (const record of dirtyRecords) {
+    const validatedHere = record.findings.filter((f) => f.validation);
+    record.analysisHistory.push({
+      runId: runMeta.runId,
+      phase: "validate",
+      ranAt: new Date().toISOString(),
+      durationMs: 0,
+      provider: detector.name,
+      agentSlugs: Array.from(new Set(validatedHere.map((f) => f.agentSlug))),
+      findingCount: validatedHere.length,
+    });
+    record.status = "validated";
+    try {
+      writeFileRecord(outputDir, record);
+    } catch (err) {
+      logError(`persist failed for ${record.filePath}: ${(err as Error).message}`);
+    }
+  }
+
+  const completedAt = new Date();
+  completeRun(outputDir, runMeta.runId, "done", {
+    findingsCount: tasks.length,
+    totalDurationMs: completedAt.getTime() - startedAt.getTime(),
+  });
+  usageMeter.flush();
+
+  // Re-render the per-finding markdown + summary so the on-disk
+  // reports reflect the new verdicts. Without this, `findings/*.md`
+  // keeps showing "Validation: _not run_" even though the underlying
+  // FileRecord has the verdict. `--no-summary` skips this render — the
+  // verdicts are already persisted to state/files/*, so `agentgg summary`
+  // can produce the report later.
+  if (opts.summary !== false) {
+    const allFindings = records.flatMap((r) => r.findings);
+    const byAgent: Record<string, number> = {};
+    for (const f of allFindings) {
+      byAgent[f.agentSlug] = (byAgent[f.agentSlug] ?? 0) + 1;
+    }
+    writeMarkdownReport({
+      outDir: outputDir,
+      root: rootPath,
+      startedAt,
+      completedAt,
+      findings: allFindings,
+      filesScanned: records.length,
+      byAgent,
+      excludeFalsePositives: opts.excludeFalsePositives,
+    });
+  }
+
+  const summary = Object.entries(verdicts)
+    .sort()
+    .map(([v, n]) => `${v}=${n}`)
+    .join(", ");
+  console.log(`Done. Verdicts: ${summary || "(none)"}`);
+  console.log(`  Rewrote ${dirtyRecords.size} FileRecord(s).`);
+  if (opts.summary === false) {
+    console.log("  Summary: skipped (--no-summary). Run `agentgg summary` to render it.");
+  }
+}
+
+export function registerRevalidateCommand(program: Command): void {
+  program
+    .command("revalidate")
+    .description("re-run the validation phase against persisted findings in an --output directory")
+    .argument(
+      "[output-dir]",
+      "path to the scan's --output directory (defaults to ./scan-results)",
+      "./scan-results",
+    )
+    .option(
+      "--scope <path>",
+      "path to a SECURITY.md-style scope file. With --validate, scope rules are threaded into the full classifier (verdicts include `out-of-scope`). WITHOUT --validate, triggers scope-only validation: the model never re-reads the source and only persists `out-of-scope` verdicts (cheap pre-filter). When omitted, a bundled default scope (trust-boundary rules) is used; pass --no-scope to disable it.",
+    )
+    .option(
+      "--no-scope",
+      "disable the bundled default scope (skip trust-boundary filtering during validation)",
+    )
+    .option(
+      "--validate",
+      "force full validation (re-reads source) even when --scope is set. Without this, an explicit `--scope <path>` selects the cheap scope-only path; absence of both runs full validation with the default scope context.",
+    )
+    .option(
+      "--root <path>",
+      "override the scanned root recorded in scan.json (only needed if the working copy moved)",
+    )
+    .option(
+      "--provider <name>",
+      "LLM provider for this run: anthropic | openai | ollama | bedrock (overrides saved default)",
+    )
+    .option(
+      "--api-key <key>",
+      "One-shot API key (not persisted). Valid for: anthropic, openai, openrouter.",
+    )
+    .option(
+      "--oauth-token <token>",
+      "One-shot Anthropic OAuth token (sk-ant-oat…). Not persisted. Anthropic only.",
+    )
+    .option("--base-url <url>", "One-shot Ollama base URL (not persisted). Ollama only.")
+    .option("--region <name>", REGION_FLAG_HELP)
+    .option(
+      "--project <id>",
+      "GCP project ID for Vertex AI. Falls back to $GOOGLE_CLOUD_PROJECT / $GCLOUD_PROJECT. Vertex only.",
+    )
+    .option("--model <name>", "One-shot model override for the selected provider (not persisted)")
+    .option(
+      "--openrouter-routing <json|file>",
+      "OpenRouter provider-routing block, overriding OPENROUTER_* env for this run: inline JSON (must start with {) or a path to a .json file (avoids shell-quoting JSON on Windows). Invalid JSON aborts before any LLM call. OpenRouter only.",
+    )
+    .option(
+      "--validate-max-turns <n>",
+      "Max tool-use turns per validator call (default: 50). Bump if the validator hits the turn cap.",
+      (v) => parseInt(v, 10),
+      50,
+    )
+    .option(
+      "--exclude-false-positives",
+      "Drop false-positive findings from the markdown report (default: keep them). FP findings always stay in state/files/* regardless.",
+    )
+    .option(
+      "--no-summary",
+      "Skip re-rendering the markdown report (summary.md + findings/*.md) after validation. Verdicts still persist to state/files/*; render later with `agentgg summary`.",
+    )
+    .option("--force", "re-validate findings that already have a verdict (default: skip them)")
+    .option(
+      "--concurrency <n>",
+      "findings validated in parallel (in-flight LLM calls)",
+      (v) => parseInt(v, 10),
+      5,
+    )
+    .option("-v, --verbose", "verbose output")
+    .action(async (outputDir: string, opts: RevalidateOpts) => {
+      try {
+        await runRevalidate(outputDir, opts);
+      } catch (err) {
+        logError(`revalidate failed: ${err instanceof Error ? err.message : String(err)}`);
+        // See scan.ts comment — let the event loop drain so libuv can
+        // close in-flight subprocess handles cleanly on Windows.
+        process.exitCode = 1;
+      }
+    });
+}

@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+pub use self::handler::*;
+
+pub(self) use self::state::*;
+
+use self::arch::*;
+use self::client::ClientDispatcher;
+use arrayvec::ArrayVec;
+use std::fmt::{Display, Formatter};
+use thiserror::Error;
+
+/// Match byte slices against patterns, similar to a match statement.
+///
+/// Supports:
+/// - Exact matches: `"qProcessInfo" => { ... }`
+/// - Prefix matches with capture: `["qSupported", rest] => { ... }`
+/// - Default case: `_ => { ... }`
+macro_rules! match_bytes {
+    ($data:expr, $($pattern:tt => $body:expr),+ $(,)?) => {{
+        let __data = $data;
+        match_bytes!(@arms __data, $($pattern => $body),+)
+    }};
+
+    // Terminal case with default
+    (@arms $data:ident, _ => $body:expr) => {
+        $body
+    };
+
+    // Exact match followed by more patterns
+    (@arms $data:ident, $lit:literal => $body:expr, $($rest:tt)+) => {
+        if $data == $lit.as_bytes() {
+            $body
+        } else {
+            match_bytes!(@arms $data, $($rest)+)
+        }
+    };
+
+    // Prefix match followed by more patterns
+    (@arms $data:ident, [$prefix:literal, $capture:ident] => $body:expr, $($rest:tt)+) => {
+        if let Some($capture) = $data.strip_prefix($prefix.as_bytes()) {
+            $body
+        } else {
+            match_bytes!(@arms $data, $($rest)+)
+        }
+    };
+
+    // Final exact match (no default)
+    (@arms $data:ident, $lit:literal => $body:expr) => {
+        if $data == $lit.as_bytes() {
+            $body
+        } else {
+            todo!("{}", String::from_utf8_lossy($data))
+        }
+    };
+
+    // Final prefix match (no default)
+    (@arms $data:ident, [$prefix:literal, $capture:ident] => $body:expr) => {
+        if let Some($capture) = $data.strip_prefix($prefix.as_bytes()) {
+            $body
+        } else {
+            todo!("{}", String::from_utf8_lossy($data))
+        }
+    };
+}
+
+#[cfg_attr(target_arch = "aarch64", path = "aarch64.rs")]
+#[cfg_attr(target_arch = "x86_64", path = "x86_64.rs")]
+mod arch;
+mod client;
+mod handler;
+mod state;
+
+/// Represents a GDB remote session.
+///
+/// This type requires the client to be compatible with GDB >= 5.0.
+#[derive(Default)]
+pub struct GdbSession {
+    req: Vec<u8>,
+    state: SessionState,
+}
+
+impl GdbSession {
+    #[must_use]
+    pub fn dispatch_client<'a, H: GdbHandler>(
+        &'a mut self,
+        data: &[u8],
+        h: &'a mut H,
+    ) -> ClientDispatcher<'a, H> {
+        self.req.extend_from_slice(data);
+
+        ClientDispatcher::new(self, h)
+    }
+}
+
+/// Type of [Register].
+#[derive(Clone, Copy)]
+enum RegisterType {
+    Unsigned,
+}
+
+impl Display for RegisterType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unsigned => "uint",
+        })
+    }
+}
+
+/// Category of [Register].
+#[derive(Clone, Copy)]
+enum RegisterCategory {
+    General,
+}
+
+impl Display for RegisterCategory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::General => "General Purpose Registers",
+        })
+    }
+}
+
+/// Alias of [Register].
+#[derive(Clone, Copy)]
+enum RegisterAlias {
+    ProgramCounter,
+    StackPointer,
+    FramePointer,
+}
+
+impl Display for RegisterAlias {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ProgramCounter => "pc",
+            Self::StackPointer => "sp",
+            Self::FramePointer => "fp",
+        })
+    }
+}
+
+/// Display format of [Register].
+#[derive(Clone, Copy)]
+enum RegisterFormat {
+    Hex,
+}
+
+impl Display for RegisterFormat {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Hex => "hex",
+        })
+    }
+}
+
+/// Contains information for a success call to [ClientDispatcher::pump()].
+pub enum GdbResult {
+    Reply(GdbReply),
+    Break(ArrayVec<u8, 2>),
+    Exit,
+}
+
+/// Contains reply for a GDB packet.
+#[derive(Default)]
+pub struct GdbReply {
+    pub head: ArrayVec<u8, 2>,
+    pub body: Vec<u8>,
+    pub tail: ArrayVec<u8, 3>,
+}
+
+/// Represents an error when [ClientDispatcher::pump()] fails.
+#[derive(Debug, Error)]
+pub enum GdbError {
+    #[error("unknown packet prefix {0:#x}")]
+    UnknownPacketPrefix(u8),
+
+    #[error("unexpected acknowledgment packet from GDB")]
+    UnexpectedAck,
+
+    #[error("missing acknowledgment packet from GDB")]
+    MissingAck,
+
+    #[error("couldn't decode checksum {0:?}")]
+    DecodeChecksum([u8; 2], #[source] hex::FromHexError),
+
+    #[error("invalid checksum (expect {1}, got {0})")]
+    InvalidChecksum(u8, u8),
+
+    #[error("couldn't parse '{0}'")]
+    Parse(&'static str, #[source] Box<dyn std::error::Error>),
+}

@@ -1,0 +1,687 @@
+import asyncio
+import glob
+import json
+import os
+import urllib
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from zipfile import ZipFile
+
+import aiohttp
+from fastapi import (
+    APIRouter,
+    Depends,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+)
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi_csrf_protect import CsrfProtect
+from karton.core.backend import KartonBackend
+from karton.core.config import Config as KartonConfig
+from karton.core.inspect import KartonState
+from karton.core.task import TaskPriority, TaskState
+from redis import Redis
+from starlette.datastructures import Headers
+
+from artemis import auth, csrf
+from artemis.binds import TaskType
+from artemis.config import Config
+from artemis.db import DB, ColumnOrdering, ReportGenerationTaskStatus, TaskFilter
+from artemis.json_utils import JSONEncoderAdditionalTypes
+from artemis.karton_utils import (
+    get_binds_that_can_be_disabled,
+    get_num_pending_tasks,
+    restart_crashed_tasks,
+)
+from artemis.modules.classifier import Classifier
+from artemis.producer import create_tasks
+from artemis.reporting.base.language import Language
+from artemis.task_utils import (
+    get_analysis_num_finished_tasks,
+    get_analysis_num_in_progress_tasks,
+    get_task_target,
+)
+from artemis.templating import (
+    render_analyses_table_row,
+    render_task_table_row,
+    templates,
+)
+
+router = APIRouter()
+db = DB()
+redis = Redis.from_url(Config.Data.REDIS_CONN_STR)
+
+
+def whitelist_proxy_request_headers(headers: Headers) -> Dict[str, str]:
+    result = {}
+    for header in headers:
+        if header.lower() in ["referer", "referrer"]:
+            result[header] = headers[header]
+    return result
+
+
+def whitelist_proxy_response_headers(headers: Any) -> Dict[str, str]:
+    result = {}
+    for header in headers:
+        if header.lower() in [
+            "content-type",
+            "content-length",
+            "last-modified",
+            "cache-control",
+            "etag",
+            "content-encoding",
+            "location",
+        ]:
+            result[header] = headers[header]
+    return result
+
+
+def error_content_not_found(request: Request, exc: HTTPException) -> Response:
+    if request.url.path.startswith("/api"):
+        return JSONResponse({"error": 404}, status_code=404)
+    else:
+        return templates.TemplateResponse("not_found.jinja2", {"request": request}, status_code=404)
+
+
+if not Config.Miscellaneous.API_TOKEN:
+
+    @router.get("/docs", include_in_schema=False)
+    def api_docs_information(request: Request) -> Response:
+        return templates.TemplateResponse(
+            "no_api_token.jinja2",
+            {
+                "request": request,
+            },
+        )
+
+
+@router.get("/login", include_in_schema=False)
+def get_login(request: Request) -> Response:
+    if request.session.get(auth.SESSION_KEY_AUTHENTICATED):
+        return RedirectResponse(request.app.url_path_for("get_root"), status_code=303)
+
+    return templates.TemplateResponse(
+        "login.jinja2",
+        {
+            "request": request,
+            "error": None,
+        },
+    )
+
+
+# CSRF is intentionally not enforced on /login - the session cookie is SameSite=Strict,
+# which blocks the cross-site form submissions CSRF would defend against.
+@router.post("/login", include_in_schema=False)
+async def post_login(
+    request: Request,
+    username: str = Form(),
+    password: str = Form(),
+) -> Response:
+    if not auth.check_credentials(username, password):
+        return templates.TemplateResponse(
+            "login.jinja2",
+            {
+                "request": request,
+                "error": "Invalid username or password.",
+            },
+            status_code=401,
+        )
+
+    request.session[auth.SESSION_KEY_AUTHENTICATED] = True
+    return RedirectResponse(request.app.url_path_for("get_root"), status_code=303)
+
+
+@router.post("/logout", include_in_schema=False)
+async def post_logout(request: Request) -> Response:
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
+
+
+@router.get("/", include_in_schema=False)
+def get_root(request: Request, csrf_protect: CsrfProtect = Depends()) -> Response:
+    has_analyses = len(list(db.get_paginated_analyses(0, 1, [ColumnOrdering("target", True)]).data)) > 0
+    has_finished_analyses = False
+
+    num_pending_tasks = get_num_pending_tasks(KartonBackend(config=KartonConfig()))
+
+    for analysis in db.list_analysis():
+        if analysis["id"] not in num_pending_tasks or num_pending_tasks[analysis["id"]] == 0:
+            has_finished_analyses = True
+
+    return csrf.csrf_form_template_response(
+        "index.jinja2",
+        {
+            "request": request,
+            "has_analyses": has_analyses,
+            "has_finished_analyses": has_finished_analyses,
+            "api_url": str(request.app.url_path_for("get_analyses_table")),
+            "num_active_tasks": sum(num_pending_tasks.values()),
+        },
+        csrf_protect,
+    )
+
+
+@router.get("/add", include_in_schema=False)
+def get_add_form(request: Request, csrf_protect: CsrfProtect = Depends()) -> Response:
+    binds = sorted(get_binds_that_can_be_disabled(), key=lambda bind: bind.identity.lower())
+
+    return csrf.csrf_form_template_response(
+        "add.jinja2",
+        {
+            "request": request,
+            "binds": binds,
+            "priority": TaskPriority.NORMAL.value,
+            "priorities": list(TaskPriority),
+            "modules_disabled_by_default": Config.Miscellaneous.MODULES_DISABLED_BY_DEFAULT,
+        },
+        csrf_protect,
+    )
+
+
+@router.post("/add", include_in_schema=False)
+@csrf.validate_csrf
+async def post_add(
+    request: Request,
+    targets: str = Form(),
+    tag: Optional[str] = Form(None),
+    priority: Optional[str] = Form(None),
+    choose_modules_to_enable: Optional[bool] = Form(None),
+    redirect: bool = Form(True),
+    csrf_protect: CsrfProtect = Depends(),
+) -> Response:
+    disabled_modules = []
+
+    if choose_modules_to_enable:
+        async with request.form() as form:
+            for bind in get_binds_that_can_be_disabled():
+                if f"module_enabled_{bind.identity}" not in form:
+                    disabled_modules.append(bind.identity)
+
+    total_list: List[str] = []
+    if targets:
+        targets = targets.strip()
+        total_list += (x.strip() for x in targets.split("\n"))
+
+    validation_messages = []
+    for task in total_list:
+        if not Classifier.is_supported(task):
+            validation_messages.append(
+                f"{task} is not supported - Artemis supports domains, IPs, IPv4 ranges or root URLs such as https://example.com/ or ssh://example.com:22/. Domains and IPs may also optionally be followed by port number. A URL must be a root URL (scheme://host[:port]/) without a path."
+            )
+
+    # The port scanner isn't needed when every target already names its service - a root
+    # URL or a host:port - so the classifier can emit a SERVICE task without it.
+    port_scan_not_needed = bool(total_list) and all(Classifier.is_service_target(task) for task in total_list)
+
+    for dependency, task_types in [
+        ("port_scanner", [TaskType.SERVICE.value, TaskType.WEBAPP.value]),
+        ("device_identifier", [TaskType.DEVICE.value]),
+    ]:
+        if dependency == "port_scanner" and port_scan_not_needed:
+            continue
+        if dependency in disabled_modules:
+            for bind in get_binds_that_can_be_disabled():
+                if bind.identity not in disabled_modules:
+                    for item in bind.filters:
+                        if "type" in item and item["type"] in task_types:
+                            validation_messages.append(f"Module {bind.identity} requires {dependency} to be enabled")
+
+    if validation_messages:
+        binds = sorted(get_binds_that_can_be_disabled(), key=lambda bind: bind.identity.lower())
+        return csrf.csrf_form_template_response(
+            "add.jinja2",
+            {
+                "validation_message": ", ".join(validation_messages),
+                "request": request,
+                "binds": binds,
+                "priority": priority,
+                "priorities": list(TaskPriority),
+                "tasks": total_list,
+                "tag": tag or "",
+                "disabled_modules": disabled_modules,
+                "modules_disabled_by_default": Config.Miscellaneous.MODULES_DISABLED_BY_DEFAULT,
+            },
+            csrf_protect,
+        )
+
+    await asyncio.to_thread(create_tasks, total_list, tag, disabled_modules, TaskPriority(priority))
+    if redirect:
+        return RedirectResponse(request.app.url_path_for("get_root"), status_code=303)
+    else:
+        return Response(
+            content="OK",
+            status_code=200,
+        )
+
+
+@router.get("/exports", include_in_schema=False)
+def get_exports(request: Request, csrf_protect: CsrfProtect = Depends()) -> Response:
+    return csrf.csrf_form_template_response(
+        "exports.jinja2",
+        {
+            "request": request,
+            "report_generation_tasks": db.list_report_generation_tasks(),
+        },
+        csrf_protect,
+    )
+
+
+@router.get("/export", include_in_schema=False)
+def get_export_form(request: Request, csrf_protect: CsrfProtect = Depends()) -> Response:
+    return csrf.csrf_form_template_response(
+        "export.jinja2",
+        {
+            "request": request,
+            "languages": list(Language),
+        },
+        csrf_protect,
+    )
+
+
+@router.get("/export/view/{id}", include_in_schema=False)
+def view_export(request: Request, id: int) -> Response:
+    task = db.get_report_generation_task(id)
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Report generation task not found")
+
+    vulnerabilities = []
+
+    num_high_severity = 0
+    num_medium_severity = 0
+    num_low_severity = 0
+
+    if task.status == "done":
+        domain_messages = {}
+        messages_path = os.path.join(task.output_location, "messages")
+        for item in os.listdir(messages_path):
+            with open(os.path.join(messages_path, item)) as f:
+                domain_messages[item.removesuffix(".html")] = f.read()
+
+        with open(os.path.join(task.output_location, "advanced", "output.json")) as f:
+            data = json.load(f)
+
+            for message in data["messages"].values():
+                for report in message["reports"]:
+                    vulnerabilities.append(report)
+                    if report["severity"] == "high":
+                        num_high_severity += 1
+                    elif report["severity"] == "medium":
+                        num_medium_severity += 1
+                    elif report["severity"] == "low":
+                        num_low_severity += 1
+                    else:
+                        assert False
+
+    else:
+        domain_messages = {}
+
+    return templates.TemplateResponse(
+        "view_export.jinja2",
+        {
+            "domain_messages": domain_messages,
+            "request": request,
+            "num_high_severity": num_high_severity,
+            "num_medium_severity": num_medium_severity,
+            "num_low_severity": num_low_severity,
+            "vulnerabilities": vulnerabilities,
+            "task": task,
+        },
+    )
+
+
+@router.post("/export/confirm-delete/{id}", include_in_schema=False)
+@csrf.validate_csrf
+async def post_export_delete(request: Request, id: int, csrf_protect: CsrfProtect = Depends()) -> Response:
+    await asyncio.to_thread(db.delete_report_generation_task, id)
+    return RedirectResponse(request.app.url_path_for("get_exports"), status_code=303)
+
+
+def build_export_zip_response(id: int) -> Response:
+    task = db.get_report_generation_task(id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Report generation task not found")
+    if task.status != ReportGenerationTaskStatus.DONE.value:
+        raise HTTPException(status_code=404, detail="Report generation task not yet finished")
+
+    byte_stream = BytesIO()
+    zipfile = ZipFile(byte_stream, "w")
+
+    for path in glob.glob(str(Path(task.output_location) / "**" / "*"), recursive=True):
+        zipfile.write(path, os.path.relpath(path, task.output_location))
+    zipfile.close()
+
+    return Response(
+        byte_stream.getvalue(), headers={"Content-Disposition": f"attachment; filename=artemis-export-{id}.zip"}
+    )
+
+
+@router.get("/export/download-zip/{id}", include_in_schema=False)
+def export_download_zip(request: Request, id: int) -> Response:
+    return build_export_zip_response(id)
+
+
+@router.post("/export", include_in_schema=False)
+@csrf.validate_csrf
+async def post_export(
+    request: Request,
+    csrf_protect: CsrfProtect = Depends(),
+    tag: Optional[str] = Form(None),
+    comment: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    skip_previously_exported: Optional[str] = Form(None),
+) -> Response:
+    await asyncio.to_thread(
+        db.create_report_generation_task,
+        skip_previously_exported=skip_previously_exported == "yes",
+        tag=tag,
+        comment=comment,
+        language=Language(language),
+    )
+    return RedirectResponse(request.app.url_path_for("get_exports"), status_code=303)
+
+
+@router.post("/remove-finished-analyses", include_in_schema=False)
+@csrf.validate_csrf
+async def post_remove_finished_analyses(request: Request, csrf_protect: CsrfProtect = Depends()) -> Response:
+    def _remove_finished_analyses() -> None:
+        karton_state = KartonState(backend=KartonBackend(config=KartonConfig()))
+        for analysis in db.list_analysis():
+            if (
+                analysis["id"] not in karton_state.analyses
+                or len(karton_state.analyses[analysis["id"]].pending_tasks) == 0
+            ):
+                db.delete_analysis(analysis["id"])
+
+    await asyncio.to_thread(_remove_finished_analyses)
+    return RedirectResponse(request.app.url_path_for("get_root"), status_code=303)
+
+
+@router.post("/analysis/remove-pending-tasks/{analysis_id}", include_in_schema=False)
+@csrf.validate_csrf
+async def post_remove_pending_tasks(
+    request: Request, analysis_id: str, csrf_protect: CsrfProtect = Depends()
+) -> Response:
+    def _remove_pending_tasks() -> None:
+        db.mark_analysis_as_stopped(analysis_id)
+        backend = KartonBackend(config=KartonConfig())
+        for task in backend.get_all_tasks():
+            if task.root_uid == analysis_id:
+                backend.delete_task(task)
+
+    await asyncio.to_thread(_remove_pending_tasks)
+    return RedirectResponse(request.app.url_path_for("get_root"), status_code=303)
+
+
+@router.get("/analysis/get-pending-tasks/{analysis_id}", include_in_schema=False)
+def get_pending_tasks(request: Request, analysis_id: str) -> Response:
+    analysis = db.get_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    backend = KartonBackend(config=KartonConfig())
+
+    tasks = []
+    for task in backend.get_all_tasks():
+        if task.root_uid == analysis_id:
+            if task.status in [TaskState.SPAWNED, TaskState.STARTED]:
+                tasks.append((task, get_task_target(task)))
+
+    return templates.TemplateResponse(
+        "pending_tasks.jinja2",
+        {
+            "title": analysis["target"],
+            "request": request,
+            "tasks": tasks,
+            "num_tasks": len(tasks),
+        },
+    )
+
+
+@router.get("/restart-crashed-tasks", include_in_schema=False)
+def get_restart_crashed_tasks(request: Request, csrf_protect: CsrfProtect = Depends()) -> Response:
+    return csrf.csrf_form_template_response(
+        "restart_crashed_tasks.jinja2",
+        {
+            "request": request,
+        },
+        csrf_protect,
+    )
+
+
+@router.post("/restart-crashed-tasks", include_in_schema=False)
+@csrf.validate_csrf
+async def post_restart_crashed_tasks(request: Request, csrf_protect: CsrfProtect = Depends()) -> Response:
+    await asyncio.to_thread(restart_crashed_tasks)
+    return RedirectResponse(request.app.url_path_for("get_root"), status_code=303)
+
+
+@router.get("/queue", include_in_schema=False)
+def get_queue(request: Request) -> Response:
+    return templates.TemplateResponse(
+        "queue.jinja2",
+        {
+            "request": request,
+        },
+    )
+
+
+@router.api_route("/karton-dashboard/{path:path}", methods=["GET", "POST"], include_in_schema=False)
+async def karton_dashboard(request: Request, path: str) -> Response:
+    async with aiohttp.ClientSession() as session:
+        async with session.request(
+            method=request.method,
+            url="http://karton-dashboard:5000/karton-dashboard/" + path,
+            allow_redirects=False,
+            headers={"connection": "close", **whitelist_proxy_request_headers(request.headers)},
+            timeout=aiohttp.ClientTimeout(total=600),
+        ) as response:
+            content = await response.read()
+            return Response(
+                content=content,
+                status_code=response.status,
+                headers=whitelist_proxy_response_headers(response.headers),
+            )
+
+
+@router.api_route("/metrics", methods=["GET"], include_in_schema=False)
+async def prometheus(request: Request) -> Response:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url="http://metrics:9000/",
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as response:
+            content = await response.read()
+            return Response(
+                content=content,
+                status_code=response.status,
+            )
+
+
+@router.get("/analysis/{root_id}", include_in_schema=False)
+def get_analysis(request: Request, root_id: str, task_filter: Optional[TaskFilter] = None) -> Response:
+    analysis = db.get_analysis_by_id(root_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    api_url_parameters = {"analysis_id": root_id}
+
+    if task_filter:
+        api_url_parameters["task_filter"] = task_filter.value
+
+    return templates.TemplateResponse(
+        "task_list.jinja2",
+        {
+            "request": request,
+            "title": f"Analysis of {analysis['target']}",
+            "api_url": str(request.app.url_path_for("get_task_results_table"))
+            + "?"
+            + urllib.parse.urlencode(api_url_parameters),
+            "task_filter": task_filter,
+        },
+    )
+
+
+@router.get("/results", include_in_schema=False)
+def get_results(request: Request, task_filter: Optional[TaskFilter] = None) -> Response:
+    if task_filter:
+        api_url_parameters = {"task_filter": task_filter.value}
+    else:
+        api_url_parameters = {}
+    return templates.TemplateResponse(
+        "task_list.jinja2",
+        {
+            "request": request,
+            "title": "Results",
+            "api_url": str(request.app.url_path_for("get_task_results_table"))
+            + "?"
+            + urllib.parse.urlencode(api_url_parameters),
+            "task_filter": task_filter,
+        },
+    )
+
+
+@router.get("/task/{task_id}", include_in_schema=False)
+def get_task(task_id: str, request: Request, referer: str = Header(default="/")) -> Response:
+    task = db.get_task_by_id(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return templates.TemplateResponse(
+        "task.jinja2",
+        {
+            "request": request,
+            "task": task,
+            "referer": referer,
+            "pretty_printed": json.dumps(task, indent=4, cls=JSONEncoderAdditionalTypes),
+        },
+    )
+
+
+def _get_ordering(request: Request, column_names: list[Optional[str]]) -> list[ColumnOrdering]:
+    ordering = []
+
+    # Unfortunately, I was not able to find a less ugly way of extracting order[0][column]
+    # parameters from FastAPI query string. Feel free to refactor these lines.
+    i = 0
+    while True:
+        column_key = f"order[{i}][column]"
+        dir_key = f"order[{i}][dir]"
+        if column_key not in request.query_params or dir_key not in request.query_params:
+            break
+        column_name = column_names[int(request.query_params[column_key])]
+        if column_name:
+            ordering.append(ColumnOrdering(column_name=column_name, ascending=request.query_params[dir_key] == "asc"))
+        i += 1
+    return ordering
+
+
+def _get_search_query(request: Request) -> Optional[str]:
+    i = 0
+    while True:
+        search_value_key = f"columns[{i}][search][value]"
+        search_regex_key = f"columns[{i}][search][regex]"
+        if search_value_key not in request.query_params:
+            break
+        if request.query_params[search_value_key].strip() != "":
+            raise NotImplementedError("Per-column search is not yet implemented")
+        if request.query_params[search_regex_key] != "false":
+            raise NotImplementedError("Regex search is not yet implemented")
+        i += 1
+
+    if request.query_params["search[regex]"] != "false":
+        raise NotImplementedError("Regex search is not yet implemented")
+
+    return request.query_params["search[value]"]
+
+
+@router.get("/frontend-api/analyses-table", include_in_schema=False)
+def get_analyses_table(
+    request: Request,
+    draw: int = Query(),
+    start: int = Query(),
+    length: int = Query(),
+) -> Dict[str, Any]:
+    ordering = _get_ordering(request, column_names=["created_at", "target", "tag", None, None])
+    search_query = _get_search_query(request)
+
+    result = db.get_paginated_analyses(start, length, ordering, search_query=search_query)
+    backend = KartonBackend(config=KartonConfig())
+    num_pending_tasks = get_num_pending_tasks(backend)
+    all_bind_identities = {bind.identity for bind in backend.get_binds()}
+    disableable_bind_identities = {bind.identity for bind in get_binds_that_can_be_disabled()}
+
+    entries = []
+    for entry in result.data:
+        num_finished_tasks = get_analysis_num_finished_tasks(redis, entry["id"])
+        num_in_progress_tasks = get_analysis_num_in_progress_tasks(redis, entry["id"])
+        num_all_tasks = num_finished_tasks + num_in_progress_tasks + num_pending_tasks.get(entry["id"], 0)
+
+        entries.append(
+            {
+                "id": entry["id"],
+                "tag": entry["tag"],
+                "target": entry["target"],
+                "created_at": entry["created_at"],
+                "disabled_modules": entry["disabled_modules"],
+                "num_pending_tasks": num_pending_tasks.get(entry["id"], 0),
+                "num_all_tasks": num_all_tasks,
+                "num_finished_tasks": num_finished_tasks,
+                "percentage_finished_tasks": 100.0 * num_finished_tasks / num_all_tasks if num_all_tasks else "N/A",
+                "stopped": entry.get("stopped", None),
+            }
+        )
+
+    return {
+        "draw": draw,
+        "recordsTotal": result.records_count_total,
+        "recordsFiltered": result.records_count_filtered,
+        "data": [
+            render_analyses_table_row(request, entry, all_bind_identities, disableable_bind_identities)
+            for entry in entries
+        ],
+    }
+
+
+@router.get("/frontend-api/task-results-table", include_in_schema=False)
+def get_task_results_table(
+    request: Request,
+    analysis_id: Optional[str] = Query(default=None),
+    task_filter: Optional[TaskFilter] = Query(default=None),
+    draw: int = Query(),
+    start: int = Query(),
+    length: int = Query(),
+) -> Dict[str, Any]:
+    ordering = _get_ordering(
+        request,
+        column_names=["created_at", "tag", "receiver", "target_string", None, "status_reason"],
+    )
+    search_query = _get_search_query(request)
+
+    if analysis_id:
+        if not db.get_analysis_by_id(analysis_id):
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        result = db.get_paginated_task_results(
+            start,
+            length,
+            ordering,
+            search_query=search_query,
+            analysis_id=analysis_id,
+            task_filter=task_filter,
+        )
+    else:
+        result = db.get_paginated_task_results(
+            start, length, ordering, search_query=search_query, task_filter=task_filter
+        )
+
+    return {
+        "draw": draw,
+        "recordsTotal": result.records_count_total,
+        "recordsFiltered": result.records_count_filtered,
+        "data": [render_task_table_row(request, task) for task in result.data],
+    }

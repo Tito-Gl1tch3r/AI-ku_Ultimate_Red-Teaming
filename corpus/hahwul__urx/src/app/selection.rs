@@ -1,0 +1,864 @@
+//! Deciding which providers run, and building them.
+//!
+//! Selection is deliberately split from construction: [`effective_provider_ids`]
+//! is pure and cheap, so the cache key can ask "which providers would this run
+//! use?" without instantiating a single HTTP client.
+
+use std::collections::HashSet;
+
+use anyhow::Result;
+
+use crate::app::catalog::{
+    cdx_endpoint_ids, cdx_endpoints, is_cdx_endpoint_id, missing_api_key_message, provider_catalog,
+    provider_display_name, valid_provider_ids, validate_provider_ids,
+    validate_rate_limit_override_ids,
+};
+use crate::app::keys::{ApiKeys, KEYED_PROVIDER_IDS};
+use crate::cli::Args;
+use crate::filters::{compile_url_regexes, validate_presets};
+use crate::network::NetworkSettings;
+use crate::providers::{
+    self, ArquivoProvider, BeVigilProvider, CdxDialect, CdxProvider, CommonCrawlProvider,
+    GitHubProvider, OTXProvider, Provider, RobotsProvider, SitemapProvider, UrlscanProvider,
+    VirusTotalProvider, WaybackMachineProvider, ZoomEyeProvider,
+};
+use crate::runner::add_provider;
+
+/// The built providers alongside their display names, positionally aligned.
+pub type ProviderList = (Vec<Box<dyn Provider>>, Vec<String>);
+
+/// Providers that speak a CDX API and can therefore honour `--from/--to` and
+/// the `--archive-*` predicates. Everything else silently ignores them, so we
+/// warn when the user asked for filters no selected provider can apply.
+/// `--cdx-endpoint` providers (`cdx:<host>`) belong here too; see [`is_cdx_provider`].
+const CDX_PROVIDERS: [&str; 3] = ["wayback", "cc", "arquivo"];
+
+/// Providers whose index server is pywb-derived, and therefore cannot express
+/// a multi-value positive filter (see [`providers::ArchiveFilters`]).
+const PYWB_PROVIDERS: [&str; 2] = ["cc", "arquivo"];
+
+/// Whether `id` honours the archive-side filters.
+fn is_cdx_provider(id: &str) -> bool {
+    CDX_PROVIDERS.contains(&id) || is_cdx_endpoint_id(id)
+}
+
+/// Whether `id` matches filter values exactly (pywb semantics). A
+/// `--cdx-endpoint` provider counts unless the user named the classic dialect:
+/// undeclared, it is probed at fetch time and defaults to pywb, so the warning
+/// errs toward telling the user their positive list may be skipped.
+fn is_pywb_provider(id: &str, requested_dialect: Option<CdxDialect>) -> bool {
+    PYWB_PROVIDERS.contains(&id)
+        || (is_cdx_endpoint_id(id) && requested_dialect != Some(CdxDialect::Classic))
+}
+
+/// Trim the ids named by a provider-selecting flag.
+///
+/// clap splits `--providers` on commas but keeps the surrounding spaces, so the
+/// entirely natural `--providers "wayback, cc"` used to fail with
+/// `Unknown provider id(s) in --providers:  cc. Allowed values: ..., cc, ...`
+/// — an error that names the value it is simultaneously rejecting. An entry
+/// that is empty *after* trimming is left in place so it is still reported,
+/// rather than turning `--providers ""` into a silently different selection.
+fn trimmed_ids(raw: &[String]) -> Vec<String> {
+    raw.iter().map(|id| id.trim().to_string()).collect()
+}
+
+/// Which providers this run would use, given the flags and available API keys.
+///
+/// Pure and side-effect free — [`crate::app::caching::create_cache_key`] relies
+/// on that to fingerprint a run without building anything.
+pub fn effective_provider_ids(args: &Args) -> Vec<String> {
+    let keys = ApiKeys::resolve(args);
+
+    let mut providers_list: Vec<String> = if args.all_providers {
+        provider_catalog()
+            .iter()
+            // A keyed provider only joins `--all-providers` once its key exists;
+            // robots/sitemap are per-target probes, opted into separately.
+            .filter(|p| !p.requires_key || !keys.for_provider(p.id).is_empty())
+            .filter(|p| p.id != "robots" && p.id != "sitemap")
+            .map(|p| p.id.to_string())
+            .collect()
+    } else {
+        trimmed_ids(&args.providers)
+    };
+
+    if !args.all_providers {
+        // Supplying a key is taken as intent to use that provider. Silent here:
+        // this function also runs for cache-key construction, where announcing
+        // the same thing a second time would be noise.
+        for id in KEYED_PROVIDER_IDS {
+            if !keys.for_provider(id).is_empty() && !providers_list.iter().any(|p| p == id) {
+                providers_list.push(id.to_string());
+            }
+        }
+    }
+
+    // Naming an endpoint is the whole of the intent to use it — there is no
+    // catalog id to put on --providers. Malformed URLs are reported by
+    // `validate_selection_flags`; here they simply contribute no id.
+    for id in cdx_endpoint_ids(args).unwrap_or_default() {
+        if !providers_list.contains(&id) {
+            providers_list.push(id);
+        }
+    }
+
+    let excluded_ids = trimmed_ids(&args.exclude_providers);
+    let excluded: HashSet<&str> = excluded_ids.iter().map(String::as_str).collect();
+    providers_list.retain(|p| !excluded.contains(p.as_str()));
+
+    for (id, requested) in [
+        ("robots", args.should_use_robots()),
+        ("sitemap", args.should_use_sitemap()),
+    ] {
+        if requested && !excluded.contains(id) && !providers_list.iter().any(|p| p == id) {
+            providers_list.push(id.to_string());
+        }
+    }
+
+    providers_list
+}
+
+/// Display label for one Common Crawl index instance. A raw `CC-MAIN-…` id is
+/// already self-identifying, but aliases like `latest` are not — prefix those
+/// so the progress line and verbose log say which provider they belong to.
+pub fn cc_provider_label(index: &str) -> String {
+    if index.to_ascii_uppercase().starts_with("CC-") {
+        index.to_string()
+    } else {
+        format!("CC ({index})")
+    }
+}
+
+/// Translate the `--from/--to/--archive-*` flags into [`providers::ArchiveFilters`],
+/// warning once about any date we could not parse rather than failing the run.
+pub fn build_archive_filters(args: &Args) -> providers::ArchiveFilters {
+    let parse_date = |raw: &str, flag: &str, end_of_range: bool| {
+        let parsed = providers::normalize_cdx_timestamp(raw, end_of_range);
+        if parsed.is_none() && !args.silent {
+            eprintln!(
+                "Ignoring {flag}={raw:?}: expected YYYY, YYYYMM, YYYYMMDD, or YYYYMMDDhhmmss"
+            );
+        }
+        parsed
+    };
+
+    providers::ArchiveFilters::from_cli_lists(
+        args.from
+            .as_deref()
+            .and_then(|s| parse_date(s, "--from", false)),
+        args.to.as_deref().and_then(|s| parse_date(s, "--to", true)),
+        &args.archive_status,
+        &args.archive_exclude_status,
+        &args.archive_mime,
+        &args.archive_exclude_mime,
+    )
+}
+
+/// Warn about `--from/--to/--archive-*` flags that will not take effect, rather
+/// than letting them be silently inert.
+fn warn_about_inert_archive_filters(
+    args: &Args,
+    providers_list: &[String],
+    filters: &providers::ArchiveFilters,
+) {
+    if filters.is_empty() || args.silent {
+        return;
+    }
+
+    if !providers_list.iter().any(|p| is_cdx_provider(p)) {
+        eprintln!(
+            "Warning: --from/--to/--archive-* apply only to CDX-backed providers ({}, --cdx-endpoint); none are enabled, so they will have no effect.",
+            CDX_PROVIDERS.join(", ")
+        );
+        return;
+    }
+
+    // Common Crawl, Arquivo.pt and pywb endpoints match filter values exactly
+    // and AND repeated filters together, so "200 or 301" is unsatisfiable
+    // there. urx drops such a filter for those providers instead of sending a
+    // query that would come back empty and read as "the archive has nothing".
+    let affected: Vec<&str> = providers_list
+        .iter()
+        .map(String::as_str)
+        .filter(|p| is_pywb_provider(p, args.cdx_dialect))
+        .collect();
+    if affected.is_empty() {
+        return;
+    }
+    let unsupported = filters.unsupported_positives(providers::CdxDialect::Pywb);
+    if unsupported.is_empty() {
+        return;
+    }
+    eprintln!(
+        "Warning: {} accept only a single value for {} (their index matches exactly, with no OR); \
+         that filter is skipped for them and applied on wayback and classic-dialect endpoints only.",
+        affected.join(" and "),
+        unsupported.join(" / ")
+    );
+}
+
+/// Validate every selection flag before any network client is built, so a typo
+/// fails immediately instead of after minutes of fetching.
+///
+/// Public because `--files` runs never reach [`initialize_providers`], and
+/// `--preset` is applied on that path too: `main` calls this up front so the
+/// checks cover every input mode. Running it twice on the provider path is
+/// harmless — it only reads `args`.
+pub fn validate_selection_flags(args: &Args) -> Result<()> {
+    // A malformed --cdx-endpoint URL is reported here, once, before anything
+    // else — and the well-formed ones become ids the other flags may name.
+    let dynamic_ids = cdx_endpoint_ids(args)?;
+    validate_provider_ids(&trimmed_ids(&args.providers), "--providers", &dynamic_ids)?;
+    // A misspelled preset used to be dropped in silence, producing an
+    // unfiltered run that looked like the filter had matched everything.
+    validate_presets(&args.preset)?;
+    // Compiled here and thrown away: the point is to fail on a malformed
+    // pattern now, at startup, rather than after minutes of fetching — or, on
+    // the batch path, to not fail at all and just match nothing.
+    compile_url_regexes(&args.match_regex, "--match-regex")?;
+    compile_url_regexes(&args.filter_regex, "--filter-regex")?;
+    validate_provider_ids(
+        &trimmed_ids(&args.exclude_providers),
+        "--exclude-providers",
+        &dynamic_ids,
+    )?;
+    validate_rate_limit_override_ids(args, &dynamic_ids)
+}
+
+/// Build every provider this run selected, in catalog order.
+pub fn initialize_providers(
+    args: &Args,
+    network_settings: &NetworkSettings,
+) -> Result<ProviderList> {
+    validate_selection_flags(args)?;
+
+    let keys = ApiKeys::resolve(args);
+    let selected = effective_provider_ids(args);
+    let enabled: HashSet<&str> = selected.iter().map(String::as_str).collect();
+
+    // Predicates the archives evaluate for us. Built once so a malformed date
+    // warns a single time rather than once per provider per domain.
+    let archive_filters = build_archive_filters(args);
+    warn_about_inert_archive_filters(args, &selected, &archive_filters);
+
+    let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+
+    // Every provider is registered the same way; the macro keeps the shared
+    // `args`/`network_settings`/accumulator arguments out of ten call sites.
+    // Labels come from the catalog, the same names `--list-providers` shows.
+    let label = |id: &str| provider_display_name(id).to_string();
+    let archived_label = |id: &str| format!("{} (archived)", provider_display_name(id));
+    macro_rules! register {
+        ($id:expr, $label:expr, $builder:expr) => {
+            add_provider(
+                args,
+                network_settings,
+                &mut providers,
+                &mut names,
+                $id,
+                $label,
+                $builder,
+            )
+        };
+    }
+
+    if enabled.contains("wayback") {
+        let filters = archive_filters.clone();
+        register!("wayback", label("wayback"), move || {
+            let mut p = WaybackMachineProvider::new();
+            p.with_filters(filters);
+            p
+        });
+    }
+
+    if enabled.contains("cc") {
+        // Each --cc-index entry becomes its own provider instance so they
+        // run in parallel and the per-provider stats stay distinct.
+        for index in &args.cc_index {
+            let index = index.clone();
+            let label = cc_provider_label(&index);
+            let filters = archive_filters.clone();
+            register!("cc", label, move || {
+                let mut p = CommonCrawlProvider::with_index(index);
+                p.with_filters(filters);
+                p
+            });
+        }
+    }
+
+    // The archived variants are registered under the same ids as their live
+    // counterparts, the way each `--cc-index` becomes its own `cc` instance:
+    // they are the same provider reading a different copy of the file, so
+    // `--exclude-robots` and `--rate-limit-by robots=N` govern both, while
+    // separate instances give them their own stats row and `--show-sources`
+    // label. Only `--from`/`--to` carry over from the archive filters: status
+    // and MIME predicates are meaningful for a URL listing, not for the
+    // version history of one document.
+    let archived = args.archived_discovery.then(|| {
+        providers::archived::ArchivedDiscovery::new(args.archived_discovery_limit)
+            .with_window(archive_filters.from.clone(), archive_filters.to.clone())
+    });
+
+    if enabled.contains("robots") {
+        register!("robots", label("robots"), RobotsProvider::new);
+        if let Some(settings) = archived.clone() {
+            register!("robots", archived_label("robots"), || {
+                RobotsProvider::archived(settings)
+            });
+        }
+    }
+
+    if enabled.contains("sitemap") {
+        register!("sitemap", label("sitemap"), SitemapProvider::new);
+        if let Some(settings) = archived.clone() {
+            register!("sitemap", archived_label("sitemap"), || {
+                SitemapProvider::archived(settings)
+            });
+        }
+    }
+
+    if enabled.contains("otx") {
+        register!("otx", label("otx"), OTXProvider::new);
+    }
+
+    if enabled.contains("arquivo") {
+        let filters = archive_filters.clone();
+        register!("arquivo", label("arquivo"), move || {
+            let mut p = ArquivoProvider::new();
+            p.with_filters(filters);
+            p
+        });
+    }
+
+    // User-supplied CDX servers run right after the built-in archives. Each
+    // endpoint is its own instance (its own stats row, rate limit and dialect
+    // probe), labelled by the `cdx:<host>` id it answers to on the flags.
+    let cdx_dialect = args.cdx_dialect;
+    for (id, endpoint) in cdx_endpoints(args)? {
+        if !enabled.contains(id.as_str()) {
+            continue;
+        }
+        let filters = archive_filters.clone();
+        let label = id.clone();
+        register!(id.as_str(), label, move || {
+            let mut p = CdxProvider::new(endpoint, cdx_dialect);
+            p.with_filters(filters);
+            p
+        });
+    }
+
+    // From here on the order matches the catalog's keyed section, which is also
+    // the order provider rows appear in `--stats` and the progress region.
+    //
+    // A key-gated provider cannot run at all without a key. `--all-providers`
+    // users don't want a noisy error for every key they happen not to have, so
+    // the complaint is suppressed in that mode. urlscan.io's public search
+    // works without a key (rate-limited to ~30 req/min per IP); a key only
+    // raises those limits and enables rotation.
+    for info in provider_catalog() {
+        let id = info.id;
+        if !KEYED_PROVIDER_IDS.contains(&id) || !enabled.contains(id) {
+            continue;
+        }
+        let keys = keys.for_provider(id).to_vec();
+        if info.requires_key && keys.is_empty() {
+            if !args.silent && !args.all_providers {
+                eprintln!("{}", missing_api_key_message(id));
+            }
+            continue;
+        }
+        let name = label(id);
+        match id {
+            "vt" => register!(id, name, || VirusTotalProvider::new_with_keys(keys)),
+            "urlscan" => register!(id, name, || UrlscanProvider::new_with_keys(keys)),
+            "zoomeye" => register!(id, name, || ZoomEyeProvider::new_with_keys(keys)),
+            "github" => register!(id, name, || GitHubProvider::new_with_keys(keys)),
+            "bevigil" => register!(id, name, || BeVigilProvider::new_with_keys(keys)),
+            _ => unreachable!("{id} is not a keyed provider"),
+        }
+    }
+
+    if providers.is_empty() {
+        // Returned, not printed-and-returned: `main` reports the error too, so
+        // the old eprintln made every no-provider run emit the message twice —
+        // and the copy `--silent` suppressed was the one carrying the guidance.
+        return Err(anyhow::anyhow!(
+            "No valid providers specified. Please use --providers with valid provider names ({})",
+            valid_provider_ids().join(", ")
+        ));
+    }
+
+    Ok((providers, names))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{build_test_args, EnvGuard, ENV};
+    use clap::Parser;
+
+    /// The keyed providers' environment variables, cleared so a developer's
+    /// real keys can't change what a selection test observes.
+    const KEYED_ENV: [&str; 5] = [
+        "URX_VT_API_KEY",
+        "URX_URLSCAN_API_KEY",
+        "URX_ZOOMEYE_API_KEY",
+        "URX_GITHUB_API_KEY",
+        "URX_BEVIGIL_API_KEY",
+    ];
+
+    /// Run `initialize_providers` expecting rejection, and return the message.
+    /// `Result::unwrap_err` is unavailable here — `dyn Provider` isn't `Debug`.
+    fn selection_error(args: &Args) -> String {
+        match initialize_providers(args, &NetworkSettings::default()) {
+            Ok(_) => panic!("expected provider initialization to fail"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_cc_provider_label() {
+        // Aliases carry no provider hint on their own, so they get one.
+        assert_eq!(cc_provider_label("latest"), "CC (latest)");
+        assert_eq!(cc_provider_label("LATEST"), "CC (LATEST)");
+        // A real index id already reads as Common Crawl; don't double up.
+        assert_eq!(cc_provider_label("CC-MAIN-2026-17"), "CC-MAIN-2026-17");
+        assert_eq!(cc_provider_label("cc-main-2023-06"), "cc-main-2023-06");
+    }
+
+    #[test]
+    fn test_build_archive_filters_maps_every_flag() {
+        let args = Args::parse_from([
+            "urx",
+            "--from",
+            "2020",
+            "--to",
+            "2021",
+            "--archive-status",
+            "200",
+            "--archive-exclude-status",
+            "404,500",
+            "--archive-mime",
+            "application/json",
+            "--archive-exclude-mime",
+            "text/html",
+            "example.com",
+        ]);
+        let f = build_archive_filters(&args);
+
+        // Partial dates pad toward opposite ends of the range.
+        assert_eq!(f.from.as_deref(), Some("20200101000000"));
+        assert_eq!(f.to.as_deref(), Some("20211231235959"));
+        assert_eq!(f.status, vec!["200"]);
+        assert_eq!(f.exclude_status, vec!["404", "500"]);
+        assert_eq!(f.mime, vec!["application/json"]);
+        assert_eq!(f.exclude_mime, vec!["text/html"]);
+    }
+
+    #[test]
+    fn test_build_archive_filters_ignores_unparseable_date() {
+        // A bad date warns and is dropped rather than aborting the whole run.
+        let args = Args::parse_from(["urx", "--silent", "--from", "not-a-date", "example.com"]);
+        let f = build_archive_filters(&args);
+        assert!(f.from.is_none());
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn test_archive_filters_reach_both_cdx_dialects() {
+        // Ties the CLI flags to the wire format each archive actually accepts,
+        // which was verified against the live servers: web.archive.org wants
+        // `statuscode`/`mimetype`, Common Crawl and Arquivo.pt want
+        // `status`/`mime`.
+        let args = Args::parse_from([
+            "urx",
+            "--archive-status",
+            "200",
+            "--archive-exclude-mime",
+            "text/html",
+            "example.com",
+        ]);
+        let f = build_archive_filters(&args);
+
+        let classic = f.query_params(providers::CdxDialect::Classic);
+        assert!(classic.contains("&filter=statuscode:200"), "{classic}");
+        assert!(
+            classic.contains("&filter=!mimetype:text%2Fhtml"),
+            "{classic}"
+        );
+
+        let pywb = f.query_params(providers::CdxDialect::Pywb);
+        assert!(pywb.contains("&filter=status:200"), "{pywb}");
+        assert!(pywb.contains("&filter=!mime:text%2Fhtml"), "{pywb}");
+    }
+
+    #[test]
+    fn test_legacy_wayback_date_flags_still_feed_archive_filters() {
+        let args = Args::parse_from(["urx", "--wayback-from", "2020", "example.com"]);
+        assert_eq!(
+            build_archive_filters(&args).from.as_deref(),
+            Some("20200101000000")
+        );
+    }
+
+    #[test]
+    fn test_initialize_providers_rejects_unknown_provider_ids() {
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string(), "bogus".to_string()];
+
+        let err = selection_error(&args);
+        assert!(
+            err.contains("Unknown provider id(s) in --providers"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_initialize_providers_rejects_unknown_excluded_provider_ids() {
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string()];
+        args.exclude_providers = vec!["bogus".to_string()];
+
+        let err = selection_error(&args);
+        assert!(
+            err.contains("Unknown provider id(s) in --exclude-providers"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_initialize_providers_rejects_unknown_rate_limit_override_ids() {
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string()];
+        args.rate_limit_by = vec!["bogus=1".to_string()];
+
+        let err = selection_error(&args);
+        assert!(
+            err.contains("Unknown provider id(s) in --rate-limit-by"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_initialize_providers_errors_when_nothing_was_selected() {
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let mut args = build_test_args();
+        args.providers = vec![];
+
+        let err = selection_error(&args);
+        assert!(err.contains("No valid providers specified"), "{err}");
+    }
+
+    #[test]
+    fn test_initialize_providers_enables_urlscan_without_api_key() {
+        // urlscan is keyless: requesting it with no API key must still
+        // instantiate the provider (regression guard for the removed key gate).
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&["URX_URLSCAN_API_KEY"]);
+
+        let mut args = build_test_args();
+        args.providers = vec!["urlscan".to_string()];
+
+        let (providers, names) = initialize_providers(&args, &NetworkSettings::default())
+            .expect("urlscan should initialize without an API key");
+        assert!(
+            !providers.is_empty(),
+            "urlscan must be instantiated even without a key"
+        );
+        assert!(names.iter().any(|n| n == "Urlscan"));
+    }
+
+    #[test]
+    fn test_initialize_providers_skips_keyed_provider_without_a_key() {
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string(), "vt".to_string()];
+
+        let (providers, names) = initialize_providers(&args, &NetworkSettings::default()).unwrap();
+        assert_eq!(providers.len(), 1, "vt has no key and must be skipped");
+        assert_eq!(names, vec!["Wayback Machine"]);
+    }
+
+    #[test]
+    fn test_initialize_providers_builds_one_instance_per_cc_index() {
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let mut args = build_test_args();
+        args.providers = vec!["cc".to_string()];
+        args.cc_index = vec!["CC-MAIN-2026-17".to_string(), "latest".to_string()];
+
+        let (providers, names) = initialize_providers(&args, &NetworkSettings::default()).unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(names, vec!["CC-MAIN-2026-17", "CC (latest)"]);
+    }
+
+    #[test]
+    fn test_effective_provider_ids_all_providers_keyless() {
+        // --all-providers with no keys must enable every keyless provider
+        // (including arquivo and the now-keyless urlscan) while keeping the
+        // keyed providers disabled.
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let mut args = build_test_args();
+        args.all_providers = true;
+        args.providers = vec![]; // ignored when --all-providers is set
+
+        let ids = effective_provider_ids(&args);
+
+        for id in ["wayback", "cc", "otx", "arquivo", "urlscan"] {
+            assert!(
+                ids.iter().any(|p| p == id),
+                "--all-providers (keyless) must enable {id}; got {ids:?}"
+            );
+        }
+        for id in ["vt", "zoomeye", "github", "bevigil"] {
+            assert!(
+                !ids.iter().any(|p| p == id),
+                "keyed provider {id} must not activate without a key; got {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bevigil_is_keyed_like_the_other_keyed_providers() {
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        // Requested without a key: skipped (the message goes to stderr).
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string(), "bevigil".to_string()];
+        let (providers, names) = initialize_providers(&args, &NetworkSettings::default()).unwrap();
+        assert_eq!(providers.len(), 1, "bevigil has no key and must be skipped");
+        assert_eq!(names, vec!["Wayback Machine"]);
+
+        // A key on the flag both enables and builds it.
+        args.providers = vec!["wayback".to_string()];
+        args.bevigil_api_key = vec!["k".to_string()];
+        assert_eq!(effective_provider_ids(&args), vec!["wayback", "bevigil"]);
+        let (providers, names) = initialize_providers(&args, &NetworkSettings::default()).unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(names, vec!["Wayback Machine", "BeVigil"]);
+
+        // ...and so does the environment variable, on --all-providers too.
+        drop(_guard);
+        let _guard = EnvGuard::set(&[("URX_BEVIGIL_API_KEY", "env-key")]);
+        let mut args = build_test_args();
+        args.all_providers = true;
+        assert!(effective_provider_ids(&args).iter().any(|p| p == "bevigil"));
+    }
+
+    #[test]
+    fn test_exclude_providers_wins_over_auto_enable() {
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::set(&[("URX_VT_API_KEY", "some-key")]);
+
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string()];
+        args.exclude_providers = vec!["vt".to_string()];
+
+        let ids = effective_provider_ids(&args);
+        assert!(
+            !ids.iter().any(|p| p == "vt"),
+            "--exclude-providers must beat key-driven auto-enable; got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_provider_flags_tolerate_whitespace_around_commas() {
+        // Regression: clap splits on ',' but keeps the spaces, so
+        // `--providers "wayback, cc"` failed with
+        // "Unknown provider id(s) in --providers:  cc. Allowed values: ..., cc, ..."
+        // — an error naming the very value it rejected.
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let args = Args::parse_from([
+            "urx",
+            "--providers",
+            " wayback , cc ",
+            "--exclude-providers",
+            " cc ",
+            "--exclude-robots",
+            "--exclude-sitemap",
+            "example.com",
+        ]);
+
+        assert_eq!(effective_provider_ids(&args), vec!["wayback"]);
+        let (providers, names) = initialize_providers(&args, &NetworkSettings::default())
+            .expect("whitespace around ids must not be an error");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(names, vec!["Wayback Machine"]);
+    }
+
+    #[test]
+    fn test_empty_provider_id_is_still_rejected() {
+        // Trimming must not quietly reinterpret an explicitly empty selection.
+        let mut args = build_test_args();
+        args.providers = vec![String::new()];
+        assert!(
+            selection_error(&args).contains("Unknown provider id(s) in --providers"),
+            "an empty id must still be reported"
+        );
+    }
+
+    #[test]
+    fn test_no_provider_error_carries_the_guidance_exactly_once() {
+        // The message used to be printed by this function *and* reported again
+        // by `main`, so a failing run showed it twice — and `--silent`
+        // suppressed the copy that carried the list of valid ids, leaving only
+        // the bare "No valid providers specified".
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let mut args = build_test_args();
+        args.silent = true;
+        args.providers = vec![];
+
+        let err = selection_error(&args);
+        assert!(err.contains("No valid providers specified"), "{err}");
+        assert!(
+            err.contains("wayback"),
+            "the allowed ids must travel with the error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cdx_endpoints_join_the_selection_by_being_named() {
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string()];
+        args.cdx_endpoint = vec![
+            "https://vefsafn.is/cdx".to_string(),
+            "http://localhost:8080/cdx".to_string(),
+        ];
+        assert_eq!(
+            effective_provider_ids(&args),
+            vec!["wayback", "cdx:vefsafn.is", "cdx:localhost:8080"]
+        );
+
+        // The id works on the other flags like any catalog id.
+        args.exclude_providers = vec!["cdx:localhost:8080".to_string()];
+        args.rate_limit_by = vec!["cdx:vefsafn.is=2".to_string()];
+        assert_eq!(
+            effective_provider_ids(&args),
+            vec!["wayback", "cdx:vefsafn.is"]
+        );
+
+        let (providers, names) = initialize_providers(&args, &NetworkSettings::default()).unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(names, vec!["Wayback Machine", "cdx:vefsafn.is"]);
+
+        // --all-providers includes them as well.
+        args.all_providers = true;
+        assert!(effective_provider_ids(&args)
+            .iter()
+            .any(|p| p == "cdx:vefsafn.is"));
+    }
+
+    #[test]
+    fn test_a_malformed_cdx_endpoint_fails_at_startup() {
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string()];
+        args.cdx_endpoint = vec!["vefsafn.is/cdx".to_string()];
+
+        let err = selection_error(&args);
+        assert!(err.contains("Invalid --cdx-endpoint"), "{err}");
+        assert!(err.contains("vefsafn.is/cdx"), "{err}");
+    }
+
+    #[test]
+    fn test_cdx_dialect_flag_is_parsed_for_endpoints() {
+        let args = Args::parse_from([
+            "urx",
+            "--cdx-endpoint",
+            "https://vefsafn.is/cdx",
+            "--cdx-dialect",
+            "classic",
+            "example.com",
+        ]);
+        assert_eq!(args.cdx_dialect, Some(CdxDialect::Classic));
+        // Classic endpoints take a regex OR list; only pywb ones are warned
+        // about.
+        assert!(!is_pywb_provider(
+            "cdx:vefsafn.is",
+            Some(CdxDialect::Classic)
+        ));
+        assert!(is_pywb_provider("cdx:vefsafn.is", Some(CdxDialect::Pywb)));
+        assert!(is_pywb_provider("cdx:vefsafn.is", None));
+        assert!(is_cdx_provider("cdx:vefsafn.is"));
+        assert!(is_cdx_provider("wayback"));
+        assert!(!is_cdx_provider("otx"));
+    }
+
+    #[test]
+    fn test_archived_discovery_adds_an_archived_instance_beside_each_live_one() {
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string()];
+        args.include_robots = true;
+        args.exclude_robots = false;
+        args.include_sitemap = true;
+        args.exclude_sitemap = false;
+        args.archived_discovery = true;
+
+        let (providers, names) = initialize_providers(&args, &NetworkSettings::default()).unwrap();
+        assert_eq!(providers.len(), 5);
+        assert_eq!(
+            names,
+            vec![
+                "Wayback Machine",
+                "Robots.txt",
+                "Robots.txt (archived)",
+                "Sitemap",
+                "Sitemap (archived)",
+            ]
+        );
+
+        // No new provider id: the selection is still the three ids...
+        assert_eq!(
+            effective_provider_ids(&args),
+            vec!["wayback", "robots", "sitemap"]
+        );
+        // ...and excluding a discovery source excludes its archived twin.
+        args.exclude_sitemap = true;
+        let (_, names) = initialize_providers(&args, &NetworkSettings::default()).unwrap();
+        assert_eq!(
+            names,
+            vec!["Wayback Machine", "Robots.txt", "Robots.txt (archived)"]
+        );
+        // ...and the flag off means no archived instances at all.
+        args.archived_discovery = false;
+        let (_, names) = initialize_providers(&args, &NetworkSettings::default()).unwrap();
+        assert_eq!(names, vec!["Wayback Machine", "Robots.txt"]);
+    }
+
+    #[test]
+    fn test_robots_and_sitemap_join_only_when_requested() {
+        let _env_lock = ENV.lock().unwrap();
+        let _guard = EnvGuard::unset(&KEYED_ENV);
+
+        let mut args = build_test_args();
+        args.providers = vec!["wayback".to_string()];
+        assert_eq!(effective_provider_ids(&args), vec!["wayback"]);
+
+        args.include_robots = true;
+        args.exclude_robots = false;
+        assert_eq!(effective_provider_ids(&args), vec!["wayback", "robots"]);
+
+        // ...and an explicit exclusion still wins.
+        args.exclude_robots = true;
+        assert_eq!(effective_provider_ids(&args), vec!["wayback"]);
+    }
+}

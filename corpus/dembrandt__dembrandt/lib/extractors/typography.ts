@@ -1,0 +1,526 @@
+import type { VariableFontAxis } from '../types.js';
+
+/**
+ * Pick the canonical body font family from two signals: the font computed on
+ * `document.body` (the inherited base) and per-family body-text coverage.
+ *
+ * Trust the inherited base only when page text actually renders in it. That
+ * makes apple.com resolve to SF Pro Text even though large lead paragraphs
+ * override to SF Pro Display and out-volume it. But a site that sets no
+ * font-family on <body> inherits the UA default (e.g. "Times"), which no
+ * visible text uses — there the most-used body family is the real answer (e.g.
+ * nyt-franklin on nytimes.com, not the UA "Times"). Coverage ties keep the
+ * first-seen family for determinism. Returns null when neither signal yields a
+ * family. Pure and exported so the disambiguation is unit-testable without a
+ * browser.
+ */
+// UA-default serif names a page inherits when <body> sets no font-family. They
+// appear even on sites whose real text is a custom font, so they must never be
+// trusted as the body font over actual coverage.
+const UA_DEFAULT_FAMILIES = new Set(['times', 'times new roman', 'serif']);
+
+/**
+ * A page's type system is the families it actually sets text in. Third-party
+ * embeds (a widget, a badge, an embedded gallery) drag their own faces onto the
+ * page for a handful of elements, and those arrived in the output looking exactly
+ * like a brand token: dembrandt.com reported six families, four of which covered
+ * under 1% of counted text between them.
+ *
+ * So a family must carry real usage to stay: at least MIN_FAMILY_SHARE of counted
+ * elements, and at least MIN_FAMILY_COUNT of them. The share is what does the
+ * work — an absolute floor alone would either strip a small page bare or let a
+ * widget through on a large one. Nothing is deleted silently: the dropped
+ * families are reported so a caller can see what the floor removed.
+ *
+ * Pure and exported so the floor is unit-testable without a browser.
+ */
+const MIN_FAMILY_SHARE = 0.02;
+const MIN_FAMILY_COUNT = 3;
+
+export function applyFamilyUsageFloor<T extends { family: string; count?: number }>(
+  styles: T[],
+): { styles: T[]; filteredFamilies: string[] } {
+  const totals: Record<string, number> = {};
+  for (const s of styles) totals[s.family] = (totals[s.family] || 0) + (s.count || 1);
+  const counted = Object.values(totals).reduce((a, b) => a + b, 0);
+  if (!counted) return { styles, filteredFamilies: [] };
+
+  const keep = new Set(
+    Object.keys(totals).filter(
+      (f) => totals[f] >= MIN_FAMILY_COUNT && totals[f] / counted >= MIN_FAMILY_SHARE,
+    ),
+  );
+  // Never strip the page down to nothing: if no family clears the floor, the
+  // page is small enough that every family it uses is part of its type system.
+  if (keep.size === 0) return { styles, filteredFamilies: [] };
+
+  return {
+    styles: styles.filter((s) => keep.has(s.family)),
+    filteredFamilies: Object.keys(totals).filter((f) => !keep.has(f)).sort(),
+  };
+}
+
+export function resolveCustomFonts(
+  declared: string[],
+  loadedFamilies: string[],
+  usedFamilies: string[],
+  hostedFamilies: string[],
+): string[] {
+  if (declared.length) return [...new Set(declared)].sort();
+  const loaded = new Set(loadedFamilies.map((f) => f.trim().toLowerCase()));
+  const hosted = new Set(hostedFamilies.map((f) => f.trim().toLowerCase()));
+  const own = usedFamilies.filter((f) => {
+    const key = f.trim().toLowerCase();
+    return loaded.has(key) && !hosted.has(key);
+  });
+  return [...new Set(own)].sort();
+}
+
+export function pickBodyFamily(bodyComputedFamily: string | null, weights: Record<string, number>): string | null {
+  const base = (bodyComputedFamily || '').trim();
+  const w = weights || {};
+  if (base && !UA_DEFAULT_FAMILIES.has(base.toLowerCase()) && (w[base] || 0) > 0) return base;
+  let best: string | null = null;
+  let max = 0;
+  for (const [family, weight] of Object.entries(w)) {
+    if (weight > max) { max = weight; best = family; }
+  }
+  if (best) return best;
+  return base || null;
+}
+
+/**
+ * Parse `font-variation-settings` strings (e.g. `"wght" 600, "slnt" -4`) into
+ * per-axis ranges across the page. Pure and exported so it is unit-testable
+ * without a browser. Only explicit variation settings count — we do not infer
+ * an axis from font-weight, which would conflate static and variable fonts.
+ */
+export function parseVariableAxes(settings: string[]): VariableFontAxis[] {
+  const map = new Map<string, VariableFontAxis>();
+  for (const setting of settings) {
+    for (const m of String(setting).matchAll(/"([^"]+)"\s+(-?\d+(?:\.\d+)?)/g)) {
+      const axis = m[1];
+      const val = parseFloat(m[2]);
+      const a = map.get(axis) || { axis, min: val, max: val, count: 0 };
+      a.min = Math.min(a.min, val);
+      a.max = Math.max(a.max, val);
+      a.count++;
+      map.set(axis, a);
+    }
+  }
+  return [...map.values()].sort((a, b) => b.count - a.count);
+}
+
+/**
+ * Parse `font-feature-settings` strings (e.g. `"ss01" on, "tnum" off`) into a
+ * deduped, sorted list of *enabled* OpenType feature tags. Features explicitly
+ * turned off (`off` or `0`) are excluded — a brand's letterforms are defined by
+ * what is on, not what was switched off.
+ */
+export function parseOpenTypeFeatures(settings: string[]): string[] {
+  const set = new Set<string>();
+  for (const setting of settings) {
+    for (const m of String(setting).matchAll(/"([^"]+)"(?:\s+(on|off|\d+))?/g)) {
+      const state = m[2];
+      if (state === 'off' || state === '0') continue;
+      set.add(m[1]);
+    }
+  }
+  return [...set].sort();
+}
+
+const FONT_FILE_EXTENSIONS = /\.(woff2?|ttf|otf|eot)(?:[?#].*)?$/i;
+const WEBFONT_PROVIDER_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com', 'use.typekit.net', 'fonts.bunny.net'];
+
+/**
+ * Filter raw, already-absolute candidate URLs down to real font asset/
+ * stylesheet URLs: font files by extension, or known webfont provider hosts
+ * (whose stylesheet URLs carry no file extension). Pure and unit-testable,
+ * same convention as parseVariableAxes / parseOpenTypeFeatures.
+ */
+export function filterFontUrls(urls: string[]): string[] {
+  const set = new Set<string>();
+  for (const url of urls) {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      continue; // not a parseable absolute URL — skip
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+    if (FONT_FILE_EXTENSIONS.test(parsed.pathname)) {
+      set.add(parsed.href);
+      continue;
+    }
+    if (WEBFONT_PROVIDER_HOSTS.includes(parsed.hostname)) set.add(parsed.href);
+  }
+  return [...set].sort();
+}
+
+export async function extractTypography(page) {
+  const data = await page.evaluate(() => {
+    // A family is split across faces by subset (latin, cyrillic, greek), so it
+    // renders letters if ANY of its faces covers A-Z, not if every one does.
+    const rangedFamilies = new Set<string>();
+    const latinFamilies = new Set<string>();
+    const coversLatinLetters = (range: string) =>
+      range.split(',').some((part) => {
+        const m = /^\s*u\+([0-9a-f]+)(?:-([0-9a-f]+))?/i.exec(part.trim());
+        if (!m) return true; // wildcards and unparseable ranges: assume coverage
+        const start = parseInt(m[1], 16);
+        const end = m[2] ? parseInt(m[2], 16) : start;
+        return start <= 0x41 && end >= 0x5a; // A-Z
+      });
+
+    const seen = new Map();
+    const variationSettings: string[] = [];
+    const featureSettings: string[] = [];
+    // family -> total directly-contained visible body text length. Drives the
+    // dominant-body-font pick: among everything the heuristic labels "body", the
+    // family carrying the most reading text is the real body font.
+    const familyBodyWeight: Record<string, number> = {};
+    const sources = {
+      googleFonts: [],
+      adobeFonts: false,
+      customFonts: [],
+      variableFonts: new Set(),
+    };
+    const fontUrlCandidates: string[] = [];
+    const webfontProviderHosts = ['fonts.googleapis.com', 'fonts.gstatic.com', 'use.typekit.net', 'fonts.bunny.net'];
+
+    document
+      .querySelectorAll('link[rel*="stylesheet"]')
+      .forEach((l: any) => {
+        if (webfontProviderHosts.some(h => l.href.includes(h))) {
+          fontUrlCandidates.push(new URL(l.href, location.href).href);
+        }
+      });
+    document
+      .querySelectorAll('link[rel*="preload"][as="font"]')
+      .forEach((l: any) => {
+        if (l.href) fontUrlCandidates.push(new URL(l.href, location.href).href);
+      });
+
+    document
+      .querySelectorAll(
+        'link[href*="fonts.googleapis.com"], link[href*="fonts.gstatic.com"]'
+      )
+      .forEach((l: any) => {
+        const matches = l.href.match(/family=([^&:%]+)/g) || [];
+        matches.forEach((m) => {
+          const name = decodeURIComponent(
+            m.replace("family=", "").split(":")[0]
+          ).replace(/\+/g, " ");
+          if (!sources.googleFonts.includes(name))
+            sources.googleFonts.push(name);
+          if (l.href.includes("wght") || l.href.includes("ital"))
+            sources.variableFonts.add(name);
+        });
+      });
+    if (
+      document.querySelector(
+        'link[href*="typekit.net"], script[src*="use.typekit.net"]'
+      )
+    ) {
+      sources.adobeFonts = true;
+    }
+
+    // Detect truly custom fonts: @font-face rules loading from own domain
+    const thirdPartyHosts = ['googleapis.com', 'gstatic.com', 'typekit.net', 'adobe.com',
+      'fonts.com', 'cloud.typography.com', 'fast.fonts.net', 'use.fontawesome.com'];
+    const pageHost = window.location.hostname;
+    try {
+      for (const sheet of document.styleSheets) {
+        try {
+          for (const rule of sheet.cssRules || []) {
+            if (rule instanceof CSSFontFaceRule) {
+              const src = rule.style.getPropertyValue('src') || '';
+              for (const m of src.matchAll(/url\(\s*['"]?([^'")]+)['"]?\s*\)/g)) {
+                try {
+                  fontUrlCandidates.push(new URL(m[1], location.href).href);
+                } catch {}
+              }
+              const family = (rule.style.getPropertyValue('font-family') || '').replace(/['"]/g, '').trim();
+              if (!family) continue;
+              const familyKey = family.toLowerCase();
+              const isThirdParty = thirdPartyHosts.some(h => src.includes(h));
+              const isSameOrigin = src.includes(pageHost) || src.startsWith('/') || src.startsWith('./') || (!src.includes('http') && src.includes('url('));
+              if (!isThirdParty && (isSameOrigin || src.includes('url(')) && !sources.customFonts.includes(family)) {
+                sources.customFonts.push(family);
+              }
+              // A face restricted to digits (tabular-numeral fonts are declared this
+              // way) renders no letters, so the browser falls through to the next
+              // family for text. Such a family must not be reported as the family.
+              const range = rule.style.getPropertyValue('unicode-range');
+              if (range) {
+                rangedFamilies.add(familyKey);
+                if (coversLatinLetters(range)) latinFamilies.add(familyKey);
+              } else {
+                latinFamilies.add(familyKey);
+              }
+
+              const familyLower = familyKey;
+              if (
+                familyLower.includes('variable') ||
+                familyLower.includes(' vf') ||
+                familyLower.endsWith('-var') ||
+                (src.includes('woff2') && rule.style.getPropertyValue('font-variation-settings'))
+              ) {
+                sources.variableFonts.add(family);
+              }
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+
+    let fontDisplay = null;
+    try {
+      for (const sheet of document.styleSheets) {
+        try {
+          for (const rule of sheet.cssRules || []) {
+            if (rule instanceof CSSFontFaceRule) {
+              const display = rule.style.getPropertyValue('font-display');
+              if (display && display !== 'auto') {
+                fontDisplay = display;
+                break;
+              }
+            }
+          }
+        } catch (e) {}
+        if (fontDisplay) break;
+      }
+    } catch (e) {}
+
+    // Computed font-size is resolved to px at the capture viewport, so a fluid
+    // ramp is invisible there. Collect the selectors that author one instead.
+    const fluidSelectors: string[] = [];
+    const staticSelectors: string[] = [];
+    // A fluid scale is normally declared once as a custom property and used as
+    // `font-size: var(--text-lg)`, so the literal ramp never appears in the rule
+    // that sets the size. Resolve one level of indirection off :root.
+    const rootStyle = getComputedStyle(document.documentElement);
+    const resolveVars = (value: string) => {
+      let out = value;
+      for (let pass = 0; pass < 2 && out.includes('var('); pass++) {
+        out = out.replace(/var\(\s*(--[^,)\s]+)[^)]*\)/g, (_, name) => rootStyle.getPropertyValue(name) || '');
+      }
+      return out;
+    };
+    const isFluidValue = (v: string) => {
+      const resolved = v.includes('var(') ? resolveVars(v) : v;
+      return /clamp\(/i.test(resolved) || /\d(vw|vh|vmin|vmax)\b/i.test(resolved);
+    };
+    const collectSizeRules = (rules: CSSRuleList | undefined) => {
+      for (const rule of rules || []) {
+        if (rule instanceof CSSStyleRule) {
+          const size = rule.style.fontSize;
+          if (rule.selectorText && size) {
+            (isFluidValue(size) ? fluidSelectors : staticSelectors).push(rule.selectorText);
+          }
+        }
+        // Style rules carry an empty cssRules list under CSS nesting, so recurse
+        // on length rather than presence or every rule looks like a group.
+        const nested = (rule as CSSGroupingRule).cssRules;
+        if (nested?.length) collectSizeRules(nested);
+      }
+    };
+    for (const sheet of document.styleSheets) {
+      try { collectSizeRules(sheet.cssRules); } catch (e) {}
+    }
+    const matchesAny = (el, selectors: string[]) => selectors.some((sel) => {
+      try { return el.matches(sel); } catch (e) { return false; }
+    });
+    // Selector evidence cannot say which declaration wins the cascade, so the
+    // claim is only made when every font-size reaching the element is fluid.
+    // Resolving a contested element needs measurement across two viewports.
+    const matchesFluid = (el) => matchesAny(el, fluidSelectors) && !matchesAny(el, staticSelectors);
+
+    const els = document.querySelectorAll(`
+      h1,h2,h3,h4,h5,h6,p,span,a,button,[role="button"],.btn,.button,
+      .hero,[class*="title"],[class*="heading"],[class*="text"],nav a,
+      code,pre,kbd,samp
+    `);
+
+    els.forEach((el) => {
+      const s = getComputedStyle(el);
+      if (s.display === "none" || s.visibility === "hidden") return;
+
+      const size = parseFloat(s.fontSize);
+      const weight = parseInt(s.fontWeight) || 400;
+      const fontFamilies = s.fontFamily.split(",").map(f => f.replace(/['"]/g, "").trim());
+      const glyphless = (f: string) => {
+        const key = f.toLowerCase();
+        return rangedFamilies.has(key) && !latinFamilies.has(key);
+      };
+      const rendered = fontFamilies.findIndex(f => !glyphless(f));
+      const familyIndex = rendered === -1 ? 0 : rendered;
+      const family = fontFamilies[familyIndex];
+      const fallbacks = fontFamilies.filter((_, i) => i !== familyIndex)
+        .filter(f => f && f !== 'sans-serif' && f !== 'serif' && f !== 'monospace');
+      const letterSpacing = s.letterSpacing;
+      const textTransform = s.textTransform;
+      const lineHeight = s.lineHeight;
+
+      const isFluid = matchesFluid(el);
+      const fontFeatures = s.fontFeatureSettings !== 'normal' ? s.fontFeatureSettings : null;
+      if (fontFeatures) featureSettings.push(fontFeatures);
+      if (s.fontVariationSettings && s.fontVariationSettings !== 'normal') {
+        variationSettings.push(s.fontVariationSettings);
+      }
+
+      let context = "body";
+      const className = typeof el.className === 'string' ? el.className : ((el as any).className.baseVal || '');
+      const headingMatch = el.tagName.match(/^H([1-6])$/);
+      if (["CODE", "PRE", "KBD", "SAMP"].includes(el.tagName)) {
+        // Its own role: a mono face is part of the system but is not body copy,
+        // and letting it compete for "body" moves the body token.
+        context = "mono";
+      } else if (
+        el.tagName === "BUTTON" ||
+        el.getAttribute("role") === "button" ||
+        className.includes("btn")
+      ) {
+        context = "ui";
+      } else if (el.tagName === "A" && (el as any).href) {
+        context = "link";
+      } else if (headingMatch) {
+        const level = parseInt(headingMatch[1]);
+        // h1 at very large size = display, otherwise heading
+        context = (level === 1 && size >= 56) ? "display" : `heading-${level}`;
+      } else if (size >= 56) {
+        context = "display";  // non-heading super-sized text (hero, marketing)
+      } else if (size <= 12) {
+        context = "caption";
+      } else if (size > 24) {
+        // Body means reading copy. Non-heading text between the caption ceiling
+        // and the display floor is marketing or sub-hero copy: still text, but
+        // labelling it "body" put 48px on dembrandt.com's body token. Demote to
+        // the generic text role rather than inventing a level it does not have.
+        context = "text";
+      } else if (el.tagName === "LABEL" || el.tagName === "SMALL" ||
+                 className.includes("label") || className.includes("caption") || className.includes("badge")) {
+        context = "ui";
+      }
+
+      // Vote for the dominant body font only with normal-size running text. Large
+      // non-heading marketing text (hero copy <56px) also lands in "body" via the
+      // size heuristic; counting it lets a display face out-vote the real body
+      // font on heading-heavy pages (e.g. SF Pro Display beating SF Pro Text on
+      // apple.com). Restrict the vote to the typical reading-copy range.
+      if (context === "body" && size >= 11 && size <= 24) {
+        let directTextLen = 0;
+        el.childNodes.forEach((node: ChildNode) => {
+          if (node.nodeType === 3) directTextLen += (node.textContent || "").trim().length;
+        });
+        if (directTextLen > 0) familyBodyWeight[family] = (familyBodyWeight[family] || 0) + directTextLen;
+      }
+
+      const key = `${family}|${size}|${weight}|${context}|${letterSpacing}|${textTransform}`;
+      if (seen.has(key)) {
+        // First occurrence still defines the style, but how often it recurs is
+        // the only evidence that separates a real type token from one element
+        // that a third-party embed dropped on the page.
+        seen.get(key).count++;
+        return;
+      }
+
+      let lineHeightValue = null;
+      if (lineHeight !== 'normal') {
+        const lhNum = parseFloat(lineHeight);
+        if (lineHeight.includes('px')) {
+          lineHeightValue = (lhNum / size).toFixed(2);
+        } else {
+          lineHeightValue = lhNum.toFixed(2);
+        }
+      }
+
+      seen.set(key, {
+        context,
+        count: 1,
+        family,
+        fallbacks: fallbacks.length > 0 ? fallbacks.join(', ') : null,
+        size: `${size}px (${(size / 16).toFixed(2)}rem)`,
+        weight,
+        lineHeight: lineHeightValue,
+        spacing: letterSpacing !== "normal" ? letterSpacing : null,
+        transform: textTransform !== "none" ? textTransform : null,
+        isFluid: isFluid || undefined,
+        fontFeatures: fontFeatures || undefined,
+      });
+    });
+
+    const result = Array.from(seen.values()).sort((a, b) => {
+      const aSize = parseFloat(a.size);
+      const bSize = parseFloat(b.size);
+      return bSize - aSize;
+    });
+
+    // The font inherited by document.body is the canonical base body font.
+    let bodyComputedFamily: string | null = null;
+    if (document.body) {
+      const fam = getComputedStyle(document.body).fontFamily.split(",")[0].replace(/['"]/g, "").trim();
+      if (fam) bodyComputedFamily = fam;
+    }
+
+    return {
+      styles: result,
+      sources: {
+        googleFonts: sources.googleFonts,
+        adobeFonts: sources.adobeFonts,
+        variableFonts: [...sources.variableFonts].length > 0,
+        customFonts: sources.customFonts,
+        ...(fontDisplay ? { fontDisplay } : {}),
+      },
+      loadedFamilies: [...document.fonts]
+        .filter((f) => f.status === 'loaded')
+        .map((f) => f.family.replace(/['"]/g, '').trim()),
+      variationSettings,
+      featureSettings,
+      familyBodyWeight,
+      bodyComputedFamily,
+      fontUrlCandidates,
+    };
+  });
+
+  // Aggregate the raw variation/feature strings in Node so the parsing stays
+  // unit-testable. Attach to sources only when present — no empty arrays.
+  const variableAxes = parseVariableAxes(data.variationSettings);
+  const openTypeFeatures = parseOpenTypeFeatures(data.featureSettings);
+  const urls = filterFontUrls(data.fontUrlCandidates);
+
+  // Disambiguate the body font. The size/tag heuristic labels every non-special
+  // element "body", so a decorative face on one stray element can masquerade as
+  // the body font. Keep the "body" label only on the dominant reading-text
+  // family; demote the rest to the generic "text" role (still text, not the
+  // canonical body font). This makes the body token reflect the dominant
+  // computed font rather than whichever element fell through the heuristic first.
+  const bodyFamily = pickBodyFamily(data.bodyComputedFamily, data.familyBodyWeight);
+  if (bodyFamily) {
+    for (const style of data.styles) {
+      if (style.context === "body" && style.family !== bodyFamily) style.context = "text";
+    }
+  }
+
+  const { styles, filteredFamilies } = applyFamilyUsageFloor(data.styles);
+
+  const hosted = [
+    ...data.sources.googleFonts,
+    ...(Array.isArray(data.sources.adobeFonts) ? data.sources.adobeFonts : []),
+  ];
+  const customFonts = resolveCustomFonts(
+    data.sources.customFonts, data.loadedFamilies, styles.map((s) => s.family), hosted,
+  );
+
+  return {
+    styles,
+    sources: {
+      ...data.sources,
+      customFonts,
+      ...(variableAxes.length ? { variableAxes } : {}),
+      ...(openTypeFeatures.length ? { openTypeFeatures } : {}),
+      urls,
+      ...(filteredFamilies.length ? { filteredFamilies } : {}),
+    },
+  };
+}

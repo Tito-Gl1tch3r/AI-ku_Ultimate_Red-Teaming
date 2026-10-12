@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+import binascii
+import json
+import os
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set
+
+import yaml
+from karton.core import Consumer, Task
+from karton.core.config import Config as KartonConfig
+from publicsuffixlist import PublicSuffixList
+
+from artemis import load_risk_class
+from artemis.binds import TaskStatus, TaskType
+from artemis.config import Config
+from artemis.db import DB
+from artemis.domains import is_domain, is_subdomain
+from artemis.module_base import ArtemisBase
+from artemis.resolvers import ResolutionException, lookup
+from artemis.task_utils import get_ip_range, has_ip_range
+from artemis.utils import check_output_log_on_error
+
+PUBLIC_SUFFIX_LIST = PublicSuffixList()
+
+
+class UnableToObtainSubdomainsException(Exception):
+    pass
+
+
+@load_risk_class.load_risk_class(load_risk_class.LoadRiskClass.LOW)
+class SubdomainEnumeration(ArtemisBase):
+    """
+    Enumerates subdomains using `gau`, `subfinder` and DNS brute-forcing.
+    """
+
+    num_retries = Config.Miscellaneous.SLOW_MODULE_NUM_RETRIES
+    identity = "subdomain_enumeration"
+    filters = [
+        {"type": TaskType.DOMAIN.value},
+    ]
+    lock_target = False
+
+    def __init__(self, db: Optional[DB] = None, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(db, *args, **kwargs)
+
+        # before we migrate the tasks, let's create binds to make sure the new tasks will hit the queue of this module
+        self.backend.register_bind(self._bind)
+
+        self._ensure_subfinder_provider_config()
+
+        subdomains_to_brute_force_set = set()
+        base_subdomain_lists_path = os.path.join(os.path.dirname(__file__), "data", "subdomains")
+        for file_name in os.listdir(base_subdomain_lists_path):
+            with open(os.path.join(base_subdomain_lists_path, file_name), encoding="utf-8") as f:
+                for line in f:
+                    if not line.startswith("#"):
+                        subdomains_to_brute_force_set.add(line.strip())
+        self._subdomains_to_brute_force = list(subdomains_to_brute_force_set)
+
+        with self.lock:
+            old_modules = ["crtsh", "gau"]
+
+            if len({bind.identity for bind in self.backend.get_binds()} & set(old_modules)) > 0:
+                for old_task in self.backend.iter_all_tasks(parse_resources=False):
+                    if old_task.receiver in old_modules and old_task.payload.get("source", None) != "migration":
+                        self.log.info(f"Moving task from {old_task.receiver} to {self.identity}")
+                        new_task = Task(
+                            {"type": TaskType.DOMAIN.value},
+                            payload={
+                                "domain": old_task.payload["domain"],
+                                "source": "migration",
+                            },
+                        )
+
+                        self.add_task(old_task, new_task)
+                        self.backend.delete_task(old_task)
+
+                for old_module in old_modules:
+
+                    class KartonDummy(Consumer):
+                        """
+                        This karton has been replaced with subdomain_enumeration.
+                        """
+
+                        identity = old_module
+                        persistent = False
+                        filters: List[Dict[str, Any]] = []
+
+                        def process(self, task: Task) -> None:
+                            pass
+
+                    karton = KartonDummy(config=KartonConfig())
+                    karton._shutdown = True
+                    karton.loop()
+
+    def _should_filter_subdomain(self, domain: str) -> bool:
+        """Some subdomain sources return domains in the form of somethingwww.example.com - some text
+        (or even other domains) concatenated with the initial domains. We filter such domains."""
+        items = domain.split(".")
+        for item in items:
+            if item != "www" and item.endswith("www"):
+                return True
+        return False
+
+    def _ensure_subfinder_provider_config(self) -> None:
+        """
+        Subfinder requires provider configuration to be stored in a file. If configuration is provided via
+        environment variable, generate provider-config.yaml before running subfinder.
+        """
+
+        config = Config.Modules.SubdomainEnumeration.SUBFINDER_PROVIDER_CONFIG
+
+        if not config:
+            return
+
+        try:
+            config_data = json.loads(config)
+        except json.JSONDecodeError:
+            self.log.error("Invalid JSON in SUBFINDER_API_KEYS. Expected JSON format.")
+            return
+
+        config_dir = Path("/root/.config/subfinder")
+
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.log.error("Failed to create subfinder config directory: %s", e)
+            return
+
+        provider_config = config_dir / "provider-config.yaml"
+
+        try:
+            with open(provider_config, "w") as f:
+                yaml.safe_dump(config_data, f)
+
+            self.log.info("Generated Subfinder provider-config.yaml from Artemis configuration")
+
+        except Exception as e:
+            self.log.error("Failed to write Subfinder provider config: %s", e)
+
+    def get_subdomains_with_retry(
+        self,
+        func: Callable[[str], Optional[Set[str]]],
+        domain: str,
+        retries: int = Config.Modules.SubdomainEnumeration.RETRIES,
+        sleep_time_seconds: int = Config.Modules.SubdomainEnumeration.SLEEP_TIME_SECONDS,
+    ) -> Set[str]:
+        for retry_id in range(retries):
+            subdomains = func(domain)
+            if subdomains is not None:
+                return subdomains
+
+            self.log.info("Retrying for domain %s", domain)
+            if retry_id < retries - 1:
+                time.sleep(sleep_time_seconds)
+            else:
+                raise UnableToObtainSubdomainsException(
+                    f"Unable to obtain subdomains for {domain} after {retries} retries"
+                )
+
+        return set()  # this is an unreachable statement but the linter doesn't see that
+
+    def get_subdomains_from_tool(
+        self, tool: str, args: List[str], domain: str, input: Optional[bytes] = None
+    ) -> Optional[Set[str]]:
+        subdomains: Set[str] = set()
+        try:
+            result = check_output_log_on_error([tool] + args, self.log, input=input)
+            for item in result.decode().splitlines():
+                if "://" in item:
+                    url_parsed = urllib.parse.urlparse(item)
+                    if not url_parsed.hostname:
+                        continue
+                    item = url_parsed.hostname
+
+                subdomains.add(item)
+
+            return subdomains
+        except Exception:
+            self.log.exception(f"Unable to obtain information from {tool} for domain {domain}")
+            return None
+
+    def get_subdomains_from_subfinder(self, domain: str) -> Optional[Set[str]]:
+        """
+        In practice, the -all and -all -recursive flags can return slightly different outputs depending on timing and provider rate limits.
+        Running subfinder twice and merging the results helps reduce the chance of missing subdomains.
+        """
+        # Run with -all
+        all_result = self.get_subdomains_from_tool(
+            "subfinder",
+            ["-d", domain, "-silent", "-all"],
+            domain,
+        )
+
+        # Run with -all -recursive
+        recursive_result = self.get_subdomains_from_tool(
+            "subfinder",
+            ["-d", domain, "-silent", "-all", "-recursive"],
+            domain,
+        )
+
+        # If neither run produced anything, report the failure instead of an empty set,
+        # which the caller would read as "subfinder found no subdomains" and not retry.
+        if all_result is None and recursive_result is None:
+            return None
+
+        # Merge both results
+        return (all_result or set()).union(recursive_result or set())
+
+    def get_subdomains_from_gau(self, domain: str) -> Optional[Set[str]]:
+        return self.get_subdomains_from_tool(
+            "gau",
+            ["--subs"] + Config.Modules.SubdomainEnumeration.GAU_ADDITIONAL_OPTIONS,
+            domain,
+            input=domain.encode("idna"),
+        )
+
+    def _collect_wildcard_ips(self, domain: str, num_samples: int) -> Set[str]:
+        wildcard_ips: Set[str] = set()
+        for _ in range(num_samples):
+            try:
+                wildcard_ips.update(lookup(binascii.hexlify(os.urandom(5)).decode("ascii") + "." + domain))
+            except ResolutionException:
+                pass
+        return wildcard_ips
+
+    def get_subdomains_by_dns_brute_force(self, wildcard_ips: Set[str], domain: str) -> Optional[Set[str]]:
+        time_start = time.time()
+        self.log.info("Brute-forcing %s possible subdomains", len(self._subdomains_to_brute_force))
+        qps = Config.Modules.SubdomainEnumeration.DNS_QUERIES_PER_SECOND
+        time_limit = Config.Modules.SubdomainEnumeration.DNS_BRUTE_FORCE_TIME_LIMIT_SECONDS
+        deadline = time_start + time_limit
+
+        def _resolve(subdomain: str) -> str | None:
+            try:
+                result = lookup(subdomain + "." + domain)
+            except ResolutionException:
+                return None
+            if result and set(result) - wildcard_ips:
+                return subdomain + "." + domain
+            return None
+
+        subdomains: Set[str] = set()
+
+        with ThreadPoolExecutor(max_workers=qps) as executor:
+            futures = []
+            for subdomain in self._subdomains_to_brute_force:
+                if time.time() > deadline:
+                    self.log.error(
+                        "Brute-force time limit of %s exceeded, finishing",
+                        time_limit,
+                    )
+                    break
+                futures.append(executor.submit(_resolve, subdomain))
+                time.sleep(1.0 / qps)
+
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    subdomains.add(result)
+
+        return subdomains
+
+    def _filter_wildcard_subdomains(self, wildcard_ips: Set[str], subdomains: Set[str], parent_domain: str) -> Set[str]:
+        kept: set[str] = set()
+        for subdomain in subdomains:
+            try:
+                candidate_ips = set(lookup(subdomain))
+            except ResolutionException:
+                self.log.info("Subdomain %s no longer resolves, filtering out", subdomain)
+                continue
+            if candidate_ips - wildcard_ips:
+                kept.add(subdomain)
+            else:
+                self.log.info("Subdomain %s resolves only to wildcard IPs, filtering out", subdomain)
+
+        self.log.info(
+            "Wildcard filter: kept %d/%d subdomains (%d wildcard IPs)",
+            len(kept),
+            len(subdomains),
+            len(wildcard_ips),
+        )
+        return kept
+
+    def run(self, current_task: Task) -> None:
+        if current_task.headers.get("origin", "") == self.identity:
+            return
+
+        if has_ip_range(current_task):
+            # In practice, there are too many subdomains such as 1.2.3.4.hosting-provider.net.
+            # returned via reverse DNS to perform subdomain enumeration on all of them.
+            return
+
+        domain = current_task.get_payload("domain").lower()
+
+        # The rationale here is to filter wildcard DNS configurations. If someone has configured their
+        # DNS server to return something for all subdomains, we don't want to produce a large list of subdomains.
+        #
+        # We perform queries for multiple random domains as there might be multiple possible results
+        # for wildcard DNS query.
+        #
+        # The number here (100) is not a mistake - we observed that there might be a large number of possible results.
+        wildcard_ips = self._collect_wildcard_ips(domain, 100)
+
+        if (
+            PUBLIC_SUFFIX_LIST.publicsuffix(domain) == domain
+            or domain in Config.PublicSuffixes.ADDITIONAL_PUBLIC_SUFFIXES
+        ):
+            if not Config.PublicSuffixes.ALLOW_SUBDOMAIN_ENUMERATION_IN_PUBLIC_SUFFIXES:
+                message = (
+                    f"{domain} is a public suffix - adding subdomains to the list of "
+                    "scanned targets may result in scanning too much. Quitting."
+                )
+                self.log.warning(message)
+                self.save_task_result(task=current_task, status=TaskStatus.ERROR, status_reason=message)
+                return
+
+        encoded_domain = domain.encode("idna").decode("utf-8")
+
+        if self.redis.get(f"subdomain-enumeration-done-{encoded_domain}-{current_task.root_uid}"):
+            self.log.info(
+                "SubdomainEnumeration has already been performed for %s. Skipping further enumeration.", domain
+            )
+            self.save_task_result(task=current_task, status=TaskStatus.OK)
+            return
+
+        valid_subdomains: set[str] = set()
+        existing_subdomains: set[str] = set()
+
+        subdomain_tools = [
+            self.get_subdomains_from_subfinder,
+            self.get_subdomains_from_gau,
+            lambda domain: self.get_subdomains_by_dns_brute_force(wildcard_ips, domain),
+        ]
+
+        for tool_func in subdomain_tools:
+            try:
+                subdomains_from_tool = self.get_subdomains_with_retry(tool_func, domain)
+                self.log.info(f"Subdomains from {tool_func.__name__}: {subdomains_from_tool}")
+            except UnableToObtainSubdomainsException as e:
+                self.log.error(f"Failed to obtain subdomains from {tool_func.__name__} for domain {domain}: {e}")
+                continue
+
+            for subdomain in subdomains_from_tool:
+                subdomain = subdomain.strip(".")
+                if not is_domain(subdomain):
+                    self.log.info("Non-domain returned: %s from %s", subdomain, domain)
+                    continue
+                if not is_subdomain(subdomain, domain):
+                    self.log.info("Non-subdomain returned: %s from %s", subdomain, domain)
+                    continue
+                if self._should_filter_subdomain(subdomain):
+                    self.log.info("Subdomain returned that we should filter: %s", subdomain)
+                    continue
+                valid_subdomains.add(subdomain)
+
+        threshold = Config.Modules.SubdomainEnumeration.LARGE_SUBDOMAIN_COUNT_VERIFICATION_THRESHOLD
+        if threshold > 0 and len(valid_subdomains) >= threshold:
+            self.log.info(
+                "Found %d subdomains, exceeding threshold of %d. Running wildcard DNS filter.",
+                len(valid_subdomains),
+                threshold,
+            )
+            valid_subdomains = self._filter_wildcard_subdomains(wildcard_ips, valid_subdomains, domain)
+
+        with self.redis.pipeline() as pipe:
+            for subdomain in valid_subdomains:
+                encoded_subdomain = subdomain.encode("idna").decode("utf-8")
+                pipe.setex(
+                    f"subdomain-enumeration-done-{encoded_subdomain}-{current_task.root_uid}",
+                    Config.Miscellaneous.SUBDOMAIN_ENUMERATION_TTL_DAYS * 24 * 60 * 60,
+                    1,
+                )
+            pipe.execute()
+
+        for subdomain in valid_subdomains:
+            if subdomain != domain:  # ensure we are not adding the parent domain again
+                # If the initial source of the scanning was an IP or an IP range, only scan the subdomains
+                # that point to the original IP.
+                if has_ip_range(current_task):
+                    ip_range = get_ip_range(current_task)
+                    matches = [ip in ip_range for ip in lookup(subdomain)]
+                    if not (len(matches) and all(matches)):
+                        continue
+
+                task = Task(
+                    {"type": TaskType.DOMAIN},
+                    payload={
+                        "domain": subdomain,
+                    },
+                )
+                if self.add_task_if_domain_exists(current_task, task):
+                    existing_subdomains.add(subdomain)
+
+                task = Task(
+                    {"type": TaskType.DOMAIN_THAT_MAY_NOT_EXIST},
+                    payload={
+                        "domain": subdomain,
+                    },
+                )
+                self.add_task(current_task, task)
+
+        if valid_subdomains:
+            self.save_task_result(
+                task=current_task,
+                status=TaskStatus.OK,
+                data={
+                    "valid_subdomains": list(sorted(valid_subdomains)),
+                    "existing_subdomains": list(sorted(existing_subdomains)),
+                },
+            )
+        else:
+            self.log.error(f"Failed to obtain any subdomains for domain {domain}")
+            self.save_task_result(task=current_task, status=TaskStatus.ERROR)
+            return
+
+
+if __name__ == "__main__":
+    SubdomainEnumeration.parallel_loop()

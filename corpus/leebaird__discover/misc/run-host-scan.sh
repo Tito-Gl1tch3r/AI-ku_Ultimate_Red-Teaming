@@ -1,0 +1,2373 @@
+#!/usr/bin/env bash
+
+# Planning by Lee Baird (@discoverscripts)
+# Coded by Grok (xAI)
+#
+# Operator host scan launcher (Red Team quiet defaults).
+# Invoked via discover-scan: scheme or CLI:
+#   run-host-scan.sh <tool> <url> [software] [report_root] [ports]
+#
+# Tools: robots | nmap | nuclei | droopescan | wpscan | nikto | feroxbuster | ffuf
+# - nmap: TCP-only: -Pn -n --open -sTV -p <ports> <host> (no sudo)
+#         UDP (Shodan transport, or UDP= fallback; port 53 always TCP+UDP):
+#         sudo nmap --privileged -Pn -n --open -sTV -sUV -p T:...,U:... <host>
+#         (no HTTP pre-check; sudo only when UDP; sudo -v in this terminal)
+# - Visible terminal (desktop entry uses Terminal=true)
+# - One scan at a time (engagement lock)
+# - Software-aware nuclei/ffuf/droopescan/wpscan profiles
+# - Nuclei is two-pass auto: (1) software tags recon, (2) CVE/KEV IDs
+# - droopescan only when software is a supported CMS (Drupal, Joomla, ...) - not WordPress
+# - wpscan only when software is WordPress
+# - robots: fetch /robots.txt, parse Disallow paths (multiTabs option 3)
+
+set -euo pipefail
+
+# Prefer user pipx (Python 3.14-patched) over a broken system install.
+export PATH="${HOME}/.local/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
+
+# Load ~/.discover/api-keys (and legacy .env) without overriding shell exports.
+# Picks up WPSCAN_API_TOKEN, SHODAN_API_KEY, NVD_API_KEY for host-scan tools.
+f_host_scan_load_api_keys(){
+    local env_file line key value discover_root
+    discover_root="${DISCOVER:-}"
+
+    if [ -z "$discover_root" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/../discover.sh" ]; then
+        discover_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    fi
+
+    for env_file in \
+        "${HOME}/.discover/api-keys" \
+        ${discover_root:+"$discover_root/.env"} \
+        "${HOME}/.discover/.env"
+    do
+        [ -n "$env_file" ] && [ -f "$env_file" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [ -z "$line" ] && continue
+            case "$line" in
+                \#*) continue ;;
+                export\ *) line="${line#export }"
+                    line="${line#"${line%%[![:space:]]*}"}"
+                    ;;
+            esac
+            case "$line" in
+                *=*) ;;
+                *) continue ;;
+            esac
+            key="${line%%=*}"
+            value="${line#*=}"
+            key="${key%"${key##*[![:space:]]}"}"
+            key="${key#"${key%%[![:space:]]*}"}"
+            case "$key" in
+                ''|*[!A-Za-z0-9_]*|[0-9]*) continue ;;
+            esac
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+
+            if [ "${#value}" -ge 2 ]; then
+                if [ "${value:0:1}" = '"' ] && [ "${value: -1}" = '"' ]; then
+                    value="${value:1:${#value}-2}"
+                elif [ "${value:0:1}" = "'" ] && [ "${value: -1}" = "'" ]; then
+                    value="${value:1:${#value}-2}"
+                fi
+            fi
+
+            if [ -n "${!key:-}" ]; then
+                continue
+            fi
+
+            export "$key=$value"
+        done < "$env_file"
+    done
+}
+f_host_scan_load_api_keys
+unset -f f_host_scan_load_api_keys
+
+TOOL="${1:-}"
+URL="${2:-}"
+SOFTWARE="${3:-}"
+REPORT_ROOT="${4:-}"
+PORTS="${5:-}"
+
+f_die(){
+    echo
+    echo "[!] $*"
+    echo
+    sleep 2
+    exit 1
+}
+
+[[ "$TOOL" =~ ^(nikto|nuclei|ffuf|feroxbuster|droopescan|wpscan|robots|nmap)$ ]] || f_die "Tool must be nuclei, droopescan, wpscan, robots, nmap, nikto, ffuf, or feroxbuster."
+[ -n "$URL" ] || f_die "URL is required."
+
+# Resolve report root
+if [ -z "$REPORT_ROOT" ] && [ -f "${HOME}/.discover/current-report" ]; then
+    REPORT_ROOT=$(head -n 1 "${HOME}/.discover/current-report" 2>/dev/null || true)
+fi
+
+REPORT_ROOT="${REPORT_ROOT//$'\r'/}"
+REPORT_ROOT="${REPORT_ROOT#"${REPORT_ROOT%%[![:space:]]*}"}"
+REPORT_ROOT="${REPORT_ROOT%"${REPORT_ROOT##*[![:space:]]}"}"
+REPORT_ROOT="${REPORT_ROOT/#\~/$HOME}"
+[ -n "$REPORT_ROOT" ] || f_die "No engagement report (use Domain → Open report first)."
+[ -d "$REPORT_ROOT" ] || f_die "Report not found: $REPORT_ROOT"
+REPORT_ROOT="$(cd "$REPORT_ROOT" && pwd)"
+
+MODE_FILE="$REPORT_ROOT/assets/report-mode.json"
+
+if [ -f "$MODE_FILE" ]; then
+    if python3 - "$MODE_FILE" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+if m.get("launches") is False or (m.get("mode") or "").lower() in {"client", "defender"}:
+    sys.exit(1)
+sys.exit(0)
+PY
+    then
+        :
+    else
+        f_die "This report is not in operator mode (launches disabled)."
+    fi
+fi
+
+# Validate URL
+if [[ ! "$URL" =~ ^https?:// ]]; then
+    f_die "URL must start with http:// or https://"
+fi
+
+HOST=$(python3 - "$URL" <<'PY'
+from urllib.parse import urlparse
+import sys
+print((urlparse(sys.argv[1]).hostname or "").lower())
+PY
+)
+[ -n "$HOST" ] || f_die "Could not parse host from URL."
+
+# Host must appear in engagement httpx data when available
+HTTPX_JSONL="$REPORT_ROOT/tools/httpx.jsonl"
+
+if [ -f "$HTTPX_JSONL" ]; then
+    if ! python3 - "$HTTPX_JSONL" "$HOST" <<'PY'
+import json, sys
+from urllib.parse import urlparse
+path, want = sys.argv[1], sys.argv[2].lower()
+with open(path, encoding="utf-8", errors="replace") as handle:
+    for raw in handle:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            o = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for key in ("host", "input"):
+            h = (o.get(key) or "").lower().split(":")[0]
+            if h == want:
+                sys.exit(0)
+        for key in ("url",):
+            u = o.get(key) or ""
+            h = (urlparse(u).hostname or "").lower()
+            if h == want:
+                sys.exit(0)
+sys.exit(1)
+PY
+    then
+        f_die "Host $HOST is not in this engagement's httpx results."
+    fi
+fi
+
+# Discover root for UA / wordlists
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DISCOVER_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+UA_FILE="$DISCOVER_ROOT/resource/user-agent.txt"
+UA=""
+
+if [ -f "$UA_FILE" ]; then
+    UA=$(grep -v '^[[:space:]]*#' "$UA_FILE" | sed '/^[[:space:]]*$/d' | head -n 1)
+fi
+
+if [ -z "$UA" ]; then
+    UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
+fi
+
+SCANS_DIR="$REPORT_ROOT/tools/host-scans"
+LOCK="$SCANS_DIR/.lock"
+mkdir -p "$SCANS_DIR"
+
+if [ -f "$LOCK" ]; then
+    LOCK_PID=$(cut -d' ' -f1 "$LOCK" 2>/dev/null || true)
+
+    if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+        f_die "Another host scan is already running (PID $LOCK_PID). One tool at a time."
+    fi
+
+    rm -f "$LOCK"
+fi
+
+STAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+STAMP_DISPLAY=$(date -u +"%m/%d/%Y - %H:%M Z")
+RUN_DIR="$SCANS_DIR/$HOST/$TOOL/$STAMP"
+mkdir -p "$RUN_DIR"
+OUT_FILE="$RUN_DIR/output.txt"
+META_FILE="$RUN_DIR/meta.json"
+OUT_REL="tools/host-scans/$HOST/$TOOL/$STAMP/output.txt"
+
+printf '%s %s\n' "$$" "$TOOL $HOST" > "$LOCK"
+
+# Status helpers
+f_write_status(){
+    local running_flag="$1"
+    # Pass meta path so skip_reason (e.g. host_unreachable) surfaces in status.json / expand UI.
+    python3 - "$SCANS_DIR" "$HOST" "$TOOL" "$running_flag" "$STAMP_DISPLAY" "$OUT_REL" "$SOFTWARE" "$URL" "$META_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+host, tool, running, finished, out_rel, software, url = sys.argv[2:9]
+meta_path = Path(sys.argv[9]) if len(sys.argv) > 9 else None
+status_path = base / "status.json"
+try:
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+except Exception:
+    status = {}
+hosts = status.setdefault("hosts", {})
+h = hosts.setdefault(host, {})
+skip_reason = ""
+exit_code = None
+disallow_count = None
+url_count = None
+if meta_path and meta_path.is_file():
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        skip_reason = str(meta.get("skip_reason") or "").strip()
+        if meta.get("exit_code") is not None:
+            exit_code = meta.get("exit_code")
+        if meta.get("disallow_count") is not None:
+            disallow_count = meta.get("disallow_count")
+        if meta.get("url_count") is not None:
+            url_count = meta.get("url_count")
+    except Exception:
+        pass
+if running == "1":
+    st = "running"
+elif skip_reason == "host_unreachable":
+    st = "failed"
+elif exit_code not in (None, 0, "0"):
+    st = "failed"
+else:
+    st = "done"
+entry = {
+    "status": st,
+    "finished": None if running == "1" else finished,
+    "finished_display": None if running == "1" else finished,
+    "output": out_rel,
+    "output_rel": out_rel,
+    "software": software or "",
+    "url": url,
+}
+if skip_reason:
+    entry["skip_reason"] = skip_reason
+if disallow_count is not None:
+    entry["disallow_count"] = disallow_count
+if url_count is not None:
+    entry["url_count"] = url_count
+h[tool] = entry
+status["running"] = running == "1"
+if running == "1":
+    status["current"] = {"host": host, "tool": tool, "url": url}
+else:
+    status["current"] = None
+status_path.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+latest = base / host / tool / "latest.json"
+latest.parent.mkdir(parents=True, exist_ok=True)
+latest.write_text(json.dumps(entry, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+f_audit(){
+    local action="$1"
+    local audit_dir="$REPORT_ROOT/tools/audit"
+    local audit_log="$audit_dir/log.txt"
+    mkdir -p "$audit_dir"
+    local ts ip op
+    ts=$(date -u +"%m/%d/%Y - %H:%M Z")
+
+    # Started uses the run stamp so audit-build can match output.txt Command.
+    case "$action" in
+        Started\ *) ts="$STAMP_DISPLAY" ;;
+    esac
+
+    if declare -F f_audit_operator_name >/dev/null 2>&1; then
+        op=$(f_audit_operator_name)
+    else
+        op=$(head -n 1 "${HOME}/.discover/operator-name" 2>/dev/null | tr -d '\r' | tr -cd "A-Za-z" | cut -c1-10)
+        [ -n "$op" ] || op=unknown
+    fi
+
+    if declare -F f_audit_egress_ip >/dev/null 2>&1; then
+        ip=$(f_audit_egress_ip)
+    else
+        ip=$(curl -4 -fsS --connect-timeout 5 --max-time 10 http://ifconfig.me 2>/dev/null | tr -d '[:space:]')
+        [ -n "$ip" ] || ip=unknown
+    fi
+
+    case "$action" in *.) ;; *) action="${action}." ;; esac
+    # mm/dd/yyyy - hh:mm Z | operator | egress IP | action
+    printf '%s | %s | %s | %s\n' "$ts" "$op" "$ip" "$action" >> "$audit_log"
+}
+
+# Append one Google Sheet row when this engagement has a sheet URL (Audit Config).
+# Never opens a browser; never fails the scan. Background + 40s cap.
+# uv stdout is discarded; stderr (skip/fail lines) still prints.
+f_op_notes(){
+    local target="$1"
+    local command="$2"
+    local result="${3:-}"
+    local url_file="$REPORT_ROOT/tools/op-notes-url"
+    local sheets_url=""
+    local op ip script uv_bin
+
+    [ -n "$command" ] || return 0
+    [ -f "$url_file" ] || return 0
+
+    sheets_url=$(head -n 1 "$url_file" 2>/dev/null | tr -d '\r')
+    sheets_url="${sheets_url#"${sheets_url%%[![:space:]]*}"}"
+    sheets_url="${sheets_url%"${sheets_url##*[![:space:]]}"}"
+    sheets_url="${sheets_url#\"}"
+    sheets_url="${sheets_url%\"}"
+    sheets_url="${sheets_url#\'}"
+    sheets_url="${sheets_url%\'}"
+
+    [ -n "$sheets_url" ] || return 0
+
+    if [ ! -f "${HOME}/.discover/google-token.json" ]; then
+        printf '\033[0;31m[!] Google Sheet skipped: not authorized (Audit Config → Google Sheet).\033[0m\n' >&2
+        return 0
+    fi
+
+    script="$DISCOVER_ROOT/misc/op_notes.py"
+    [ -f "$script" ] || return 0
+
+    uv_bin=""
+
+    if command -v uv >/dev/null 2>&1; then
+        uv_bin=$(command -v uv)
+    elif [ -x "${HOME}/.local/bin/uv" ]; then
+        uv_bin="${HOME}/.local/bin/uv"
+    fi
+
+    if [ -z "$uv_bin" ]; then
+        printf '\033[0;31m[!] Google Sheet skipped: uv is not installed.\033[0m\n' >&2
+        return 0
+    fi
+
+    if declare -F f_audit_operator_name >/dev/null 2>&1; then
+        op=$(f_audit_operator_name)
+    else
+        op=$(head -n 1 "${HOME}/.discover/operator-name" 2>/dev/null | tr -d '\r' | tr -cd "A-Za-z" | cut -c1-10)
+        [ -n "$op" ] || op=unknown
+    fi
+
+    if declare -F f_audit_egress_ip >/dev/null 2>&1; then
+        ip=$(f_audit_egress_ip)
+    else
+        ip=$(curl -4 -fsS --connect-timeout 5 --max-time 10 http://ifconfig.me 2>/dev/null | tr -d '[:space:]')
+        [ -n "$ip" ] || ip=unknown
+    fi
+
+    (
+        if command -v timeout >/dev/null 2>&1; then
+            timeout --signal=TERM --kill-after=5s 40s \
+                "$uv_bin" run "$script" append "$sheets_url" "$STAMP_DISPLAY" "$op" "$ip" "$target" "$command" "$result" \
+                || printf '\033[0;31m[!] Google Sheet entry failed: check token/URL.\033[0m\n' >&2
+        else
+            "$uv_bin" run "$script" append "$sheets_url" "$STAMP_DISPLAY" "$op" "$ip" "$target" "$command" "$result" \
+                || printf '\033[0;31m[!] Google Sheet entry failed: check token/URL.\033[0m\n' >&2
+        fi
+    ) >/dev/null &
+}
+
+# Software-aware nuclei tags (pass-1 recon / fingerprint).
+# Expand UI only offers nuclei when SOFTWARE is set (filter or row fingerprint).
+f_nuclei_args(){
+    local soft_lc
+    soft_lc=$(printf '%s' "$SOFTWARE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    NUCLEI_EXTRA=()
+
+    if [[ "$soft_lc" == drupal* ]]; then
+        NUCLEI_EXTRA=(-tags drupal -c 5 -rl 25)
+    elif [[ "$soft_lc" == wordpress* || "$soft_lc" == wp* || "$soft_lc" == jquery* && "$soft_lc" == *wordpress* ]]; then
+        NUCLEI_EXTRA=(-tags wordpress -c 5 -rl 25)
+    elif [[ "$soft_lc" == joomla* ]]; then
+        NUCLEI_EXTRA=(-tags joomla -c 5 -rl 25)
+    elif [[ "$soft_lc" == moodle* ]]; then
+        NUCLEI_EXTRA=(-tags moodle -c 5 -rl 25)
+    elif [[ "$soft_lc" == kibana* ]]; then
+        NUCLEI_EXTRA=(-tags kibana -c 5 -rl 25)
+    elif [[ "$soft_lc" == grafana* ]]; then
+        NUCLEI_EXTRA=(-tags grafana -c 5 -rl 25)
+    elif [[ "$soft_lc" == prometheus* ]]; then
+        NUCLEI_EXTRA=(-tags prometheus -c 5 -rl 25)
+    elif [[ "$soft_lc" == elasticsearch* ]]; then
+        NUCLEI_EXTRA=(-tags elasticsearch -c 5 -rl 25)
+    elif [[ "$soft_lc" == jenkins* ]]; then
+        NUCLEI_EXTRA=(-tags jenkins -c 5 -rl 25)
+    elif [[ "$soft_lc" == kafka* || "$soft_lc" == kafbat* || "$soft_lc" == akhq* ]]; then
+        # shellcheck disable=SC2054
+        NUCLEI_EXTRA=(-tags kafka,akhq -c 5 -rl 25)
+    elif [[ "$soft_lc" == sonarqube* ]]; then
+        NUCLEI_EXTRA=(-tags sonarqube -c 5 -rl 25)
+    elif [[ "$soft_lc" == rabbitmq* ]]; then
+        NUCLEI_EXTRA=(-tags rabbitmq -c 5 -rl 25)
+    elif [[ "$soft_lc" == redis* ]]; then
+        NUCLEI_EXTRA=(-tags redis -c 5 -rl 25)
+    elif [[ "$soft_lc" == kiali* ]]; then
+        NUCLEI_EXTRA=(-tags kiali -c 5 -rl 25)
+    elif [[ "$soft_lc" == kubecost* ]]; then
+        NUCLEI_EXTRA=(-tags kubecost -c 5 -rl 25)
+    elif [[ "$soft_lc" == superset* ]]; then
+        NUCLEI_EXTRA=(-tags superset -c 5 -rl 25)
+    elif [[ "$soft_lc" == filebrowser* ]]; then
+        NUCLEI_EXTRA=(-tags filebrowser -c 5 -rl 25)
+    elif [[ "$soft_lc" == gitlab* ]]; then
+        NUCLEI_EXTRA=(-tags gitlab -c 5 -rl 25)
+    elif [[ "$soft_lc" == gitea* ]]; then
+        NUCLEI_EXTRA=(-tags gitea -c 5 -rl 25)
+    elif [[ "$soft_lc" == gogs* ]]; then
+        NUCLEI_EXTRA=(-tags gogs -c 5 -rl 25)
+    elif [[ "$soft_lc" == keycloak* ]]; then
+        NUCLEI_EXTRA=(-tags keycloak -c 5 -rl 25)
+    elif [[ "$soft_lc" == citrix* || "$soft_lc" == netscaler* ]]; then
+        # shellcheck disable=SC2054
+        NUCLEI_EXTRA=(-tags citrix,netscaler -c 5 -rl 25)
+    elif [[ "$soft_lc" == rancher* ]]; then
+        NUCLEI_EXTRA=(-tags rancher -c 5 -rl 25)
+    elif [[ "$soft_lc" == argocd* || "$soft_lc" == argo ]]; then
+        NUCLEI_EXTRA=(-tags argocd -c 5 -rl 25)
+    elif [[ "$soft_lc" == eureka* ]]; then
+        NUCLEI_EXTRA=(-tags eureka -c 5 -rl 25)
+    elif [[ "$soft_lc" == harbor* ]]; then
+        NUCLEI_EXTRA=(-tags harbor -c 5 -rl 25)
+    elif [[ "$soft_lc" == minio* ]]; then
+        NUCLEI_EXTRA=(-tags minio -c 5 -rl 25)
+    elif [[ "$soft_lc" == nexus* || "$soft_lc" == sonatype* ]]; then
+        NUCLEI_EXTRA=(-tags nexus -c 5 -rl 25)
+    elif [[ "$soft_lc" == jfrog* || "$soft_lc" == artifactory* ]]; then
+        # shellcheck disable=SC2054
+        NUCLEI_EXTRA=(-tags jfrog,artifactory -c 5 -rl 25)
+    elif [[ "$soft_lc" == strapi* ]]; then
+        NUCLEI_EXTRA=(-tags strapi -c 5 -rl 25)
+    elif [[ "$soft_lc" == pgadmin* ]]; then
+        NUCLEI_EXTRA=(-tags pgadmin -c 5 -rl 25)
+    elif [[ "$soft_lc" == uipath* ]]; then
+        NUCLEI_EXTRA=(-tags uipath -c 5 -rl 25)
+    elif [[ "$soft_lc" == dbeaver* ]]; then
+        NUCLEI_EXTRA=(-tags dbeaver -c 5 -rl 25)
+    elif [[ "$soft_lc" == oracle* ]]; then
+        NUCLEI_EXTRA=(-tags oracle -c 5 -rl 25)
+    elif [[ "$soft_lc" == tomcat* ]]; then
+        NUCLEI_EXTRA=(-tags tomcat -c 5 -rl 25)
+    elif [[ "$soft_lc" == wildfly* || "$soft_lc" == jboss* ]]; then
+        # shellcheck disable=SC2054
+        NUCLEI_EXTRA=(-tags wildfly,jboss -c 5 -rl 25)
+    elif [[ "$soft_lc" == sharepoint* ]]; then
+        NUCLEI_EXTRA=(-tags sharepoint -c 5 -rl 25)
+    elif [[ "$soft_lc" == iis* || "$soft_lc" == microsoft-iis* ]]; then
+        NUCLEI_EXTRA=(-tags iis -c 5 -rl 25)
+    elif [[ "$soft_lc" == *asp.net* || "$soft_lc" == aspnet* ]]; then
+        NUCLEI_EXTRA=(-tags aspnet -c 5 -rl 25)
+    elif [[ "$soft_lc" == apache* ]]; then
+        NUCLEI_EXTRA=(-tags apache -c 5 -rl 25)
+    elif [[ "$soft_lc" == nginx* ]]; then
+        NUCLEI_EXTRA=(-tags nginx -c 5 -rl 25)
+    elif [[ "$soft_lc" == php* ]]; then
+        NUCLEI_EXTRA=(-tags php -c 5 -rl 25)
+    elif [[ "$soft_lc" == node* ]]; then
+        NUCLEI_EXTRA=(-tags nodejs -c 5 -rl 25)
+    elif [[ "$soft_lc" == crafter* ]]; then
+        NUCLEI_EXTRA=(-tags craftercms -c 5 -rl 25)
+    elif [[ "$soft_lc" == java || "$soft_lc" == java:* ]]; then
+        NUCLEI_EXTRA=(-tags java -c 5 -rl 25)
+    else
+        # Product known but no dedicated tag map: quiet tech recon + Pass 2 when cache allows
+        NUCLEI_EXTRA=(-tags tech -c 5 -rl 20)
+    fi
+
+}
+
+# Pass-2: CVE/KEV template IDs that nuclei can actually run.
+# Sources (priority):
+#   1) Engagement software-cves-cache (KEV first, then high CVSS) ∩ local templates
+#   2) Local nuclei-templates CVE YAML tagged/named for this product (fills NVD gaps)
+# Prints: "ID1,ID2,...|kev_count|total|note" or empty if nothing runnable.
+f_nuclei_pass2_ids(){
+    python3 - "$REPORT_ROOT" "$SOFTWARE" "$DISCOVER_ROOT" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+report_root = Path(sys.argv[1])
+software = (sys.argv[2] or "").strip()
+discover_root = Path(sys.argv[3])
+max_ids = 30
+min_score = 7.0
+
+if not software:
+    sys.exit(0)
+
+label = software
+product, version = "", ""
+m = re.match(r"^([^:\[]+)\[(.+)\]$", label)
+if m:
+    product, version = m.group(1).strip(), m.group(2).strip()
+elif ":" in label:
+    product, version = [p.strip() for p in label.split(":", 1)]
+else:
+    product, version = label, ""
+
+prod_key = re.sub(r"[-_\s]+", " ", product.lower()).strip()
+if not prod_key:
+    sys.exit(0)
+cache_key = f"{prod_key}|{version}" if version else prod_key
+
+# --- local nuclei templates (only IDs that can actually run) ---
+def find_templates_root() -> Path | None:
+    env = (Path.home() / "nuclei-templates")
+    candidates = [
+        Path.home() / "nuclei-templates",
+        Path.home() / ".local" / "nuclei-templates",
+        Path.home() / ".local" / "share" / "nuclei" / "templates",
+        Path("/opt/nuclei-templates"),
+        Path("/usr/share/nuclei-templates"),
+    ]
+    # config may point at custom dir
+    cfg = Path.home() / ".config" / "nuclei" / "config.yaml"
+    if cfg.is_file():
+        try:
+            text = cfg.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("templates-directory:") or line.startswith("#templates-directory:"):
+                    # skip comments unless value present after
+                    if line.startswith("#"):
+                        continue
+                    val = line.split(":", 1)[1].strip().strip("'\"")
+                    if val:
+                        candidates.insert(0, Path(val).expanduser())
+        except OSError:
+            pass
+    for c in candidates:
+        if c.is_dir() and any(c.rglob("CVE-*.yaml")):
+            return c
+    return None
+
+
+templates_root = find_templates_root()
+template_ids: set[str] = set()
+product_template_ids: list[str] = []
+if templates_root is not None:
+    for p in templates_root.rglob("CVE-*.yaml"):
+        cid = p.stem.upper()
+        if not cid.startswith("CVE-"):
+            continue
+        template_ids.add(cid)
+        # Product-linked CVE templates (tags/body mention product)
+        try:
+            head = p.read_text(encoding="utf-8", errors="replace")[:4000].lower()
+        except OSError:
+            continue
+        # require product token in tags line or metadata vendor/product
+        if (
+            f" {prod_key}" in f" {head.replace(',', ' ').replace(':', ' ')}"
+            or f"tags:" in head
+            and prod_key in head
+        ):
+            # tighter: tags/vendor/product fields
+            if re.search(
+                rf"(?m)^\s*(tags:|vendor:|product:).*{re.escape(prod_key)}",
+                head,
+            ) or re.search(
+                rf"(?m)^\s*tags:.*\b{re.escape(prod_key)}\b",
+                head,
+            ):
+                product_template_ids.append(cid)
+
+    product_template_ids = sorted(set(product_template_ids))
+
+# --- KEV catalog ---
+kev_ids: set[str] = set()
+kev_path = discover_root / "resource" / "kevs.json"
+if not kev_path.is_file():
+    legacy = discover_root / "resource" / "known_exploited_vulnerabilities.json"
+    if legacy.is_file():
+        kev_path = legacy
+if kev_path.is_file():
+    try:
+        payload = json.loads(kev_path.read_text(encoding="utf-8"))
+        for row in payload.get("vulnerabilities") or []:
+            if not isinstance(row, dict):
+                continue
+            cid = (row.get("cveID") or row.get("cve_id") or "").strip().upper()
+            if cid.startswith("CVE-"):
+                kev_ids.add(cid)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+# --- engagement NVD cache ---
+entry = None
+cache_path = report_root / "tools" / "software-cves-cache.json"
+if cache_path.is_file():
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        entries = cache.get("entries") or {}
+        entry = entries.get(cache_key)
+        if not isinstance(entry, dict):
+            for k, v in entries.items():
+                if isinstance(v, dict) and (k == prod_key or k.startswith(prod_key + "|")):
+                    entry = v
+                    break
+    except (OSError, json.JSONDecodeError):
+        entry = None
+
+def sort_key(item: dict) -> tuple:
+    return (item.get("score") is None, -(item.get("score") or 0), item.get("id") or "")
+
+normalized: list[dict] = []
+if isinstance(entry, dict):
+    for row in entry.get("cves") or []:
+        if not isinstance(row, dict):
+            continue
+        cid = (row.get("id") or "").strip().upper()
+        if not cid.startswith("CVE-"):
+            continue
+        normalized.append(
+            {"id": cid, "score": row.get("score"), "is_kev": cid in kev_ids}
+        )
+
+picked: list[str] = []
+seen: set[str] = set()
+
+def add(cid: str) -> None:
+    cid = (cid or "").strip().upper()
+    if not cid.startswith("CVE-") or cid in seen or len(picked) >= max_ids:
+        return
+    # Only IDs nuclei can load (when we know the catalog)
+    if template_ids and cid not in template_ids:
+        return
+    seen.add(cid)
+    picked.append(cid)
+
+# 1) Cache KEV with templates
+for c in sorted([c for c in normalized if c["is_kev"]], key=sort_key):
+    add(c["id"])
+# 2) Cache top_cve
+if isinstance(entry, dict):
+    add((entry.get("top_cve") or "").strip().upper())
+# 3) Cache high CVSS with templates
+for c in sorted(
+    [
+        c
+        for c in normalized
+        if not c["is_kev"]
+        and c.get("score") is not None
+        and float(c["score"]) >= min_score
+    ],
+    key=sort_key,
+):
+    add(c["id"])
+# 4) Product CVE templates from local nuclei catalog (covers NVD gaps
+#    e.g. CVE-2014-3704 for Drupal even when CPE cache is incomplete)
+for cid in product_template_ids:
+    # KEV product templates first
+    if cid in kev_ids:
+        add(cid)
+for cid in product_template_ids:
+    add(cid)
+
+# 5) Fallback: any remaining cache IDs that have templates
+if not picked:
+    for c in sorted(normalized, key=sort_key):
+        add(c["id"])
+
+if not picked:
+    sys.exit(0)
+
+kev_n = sum(1 for cid in picked if cid in kev_ids)
+# note for logs: how many cache IDs lacked templates
+cache_ids = {c["id"] for c in normalized}
+cache_with_tpl = sum(1 for cid in cache_ids if cid in template_ids) if template_ids else 0
+note = f"templates={len(picked)};cache_cves={len(cache_ids)};cache_with_template={cache_with_tpl};product_tpl={len(product_template_ids)}"
+print(f"{','.join(picked)}|{kev_n}|{len(picked)}|{note}")
+PY
+}
+
+# If nuclei wrote no findings, leave a clear operator-facing message (not a blank file).
+f_nuclei_ensure_findings_message(){
+    local path="$1"
+
+    if [ ! -f "$path" ] || [ ! -s "$path" ]; then
+        printf '%s\n' "No vulnerabilities discovered." > "$path"
+    fi
+
+}
+
+# Append Findings: to output.txt. Prefix real nuclei match lines with [*].
+f_nuclei_append_findings(){
+    local src="$1"
+    python3 - "$src" <<'PY'
+from pathlib import Path
+import sys
+
+src = Path(sys.argv[1])
+placeholder = "No vulnerabilities discovered."
+print("Findings:")
+if not src.is_file():
+    print(placeholder)
+    print()
+    raise SystemExit(0)
+text = src.read_text(encoding="utf-8", errors="replace")
+if not text.strip():
+    print(placeholder)
+    print()
+    raise SystemExit(0)
+for line in text.splitlines():
+    s = line.rstrip()
+    if not s.strip():
+        print()
+        continue
+    if s.strip() == placeholder:
+        print(s.strip())
+        continue
+    if s.lstrip().startswith("[*]"):
+        print(s)
+        continue
+    print(f"[*] {s}")
+print()
+PY
+}
+
+# Strip ANSI / progress junk (ffuf draws progress with ESC sequences that show as
+# little boxes with stacked numbers in plain text viewers).
+# Also drop droopescan-style percent bars (modules [ === ] 1/4000 (0%)).
+f_clean_scan_text(){
+    python3 -c '
+import re, sys
+raw = sys.stdin.read()
+# CSI / OSC / charset ANSI
+raw = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", raw)
+raw = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", raw)
+raw = re.sub(r"\x1b[()][0-9A-B]", "", raw)
+raw = re.sub(r"\x1b.", "", raw)
+raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+out = []
+prev_empty = False
+for ln in raw.splitlines():
+    s = ln.strip()
+    # Drop live progress lines
+    if re.match(r"^::\s*Progress:", s, re.I) or re.match(r"^Progress:", s, re.I):
+        continue
+
+    if re.search(r"\bReq/sec\b", s) and re.search(r"\bErrors\b", s, re.I):
+        continue
+    # droopescan progressbar: "modules [ === ] 12/4000 (0%)"
+    if re.search(r"\(\s*\d+%\s*\)", s):
+        continue
+
+    if re.search(r"\[\s*=+", s) and re.search(r"\d+\s*/\s*\d+", s):
+        continue
+    empty = not s
+
+    if empty and prev_empty:
+        continue
+    # Drop per-hit timing only (keep Status, Size, Words, Lines)
+    ln = re.sub(r",\s*Duration:\s*\d+ms", "", ln, flags=re.I)
+    # droopescan headings: "[+] Plugins found:" → "Plugins found:"
+    ln = re.sub(r"^(\s*)\[\+\]\s+", r"\1", ln)
+    ln = re.sub(r"\burls found\b", "URLs found", ln, flags=re.I)
+    out.append(ln.rstrip())
+    prev_empty = empty
+sys.stdout.write("\n".join(out))
+
+if out:
+    sys.stdout.write("\n")
+'
+}
+
+# Map Discover software label → droopescan CMS plugin (empty if unsupported).
+f_droopescan_cms(){
+    local soft_lc base
+    soft_lc=$(printf '%s' "${SOFTWARE:-}" | tr '[:upper:]' '[:lower:]')
+    soft_lc="${soft_lc%%[*}"
+    base="${soft_lc%%:*}"
+    base="${base// /}"
+    case "$base" in
+        drupal) printf '%s' "drupal" ;;
+        # WordPress: use wpscan only (droopescan WP results were poor in testing).
+        joomla) printf '%s' "joomla" ;;
+        moodle) printf '%s' "moodle" ;;
+        silverstripe|ss) printf '%s' "silverstripe" ;;
+        *) printf '%s' "" ;;
+    esac
+}
+
+# True when software filter is WordPress (for wpscan gating).
+f_is_wordpress(){
+    local soft_lc base
+    soft_lc=$(printf '%s' "${SOFTWARE:-}" | tr '[:upper:]' '[:lower:]')
+    soft_lc="${soft_lc%%[*}"
+    base="${soft_lc%%:*}"
+    base="${base// /}"
+    case "$base" in
+        wordpress|wp) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Quiet ffuf wordlist under SecLists Discovery/Web-Content (software-aware).
+# Prefer focused product lists when SOFTWARE is known; otherwise small general lists.
+# Skip huge CMS dumps (e.g. Drupal.txt ~58k) that break quiet expand timing.
+f_ffuf_seclists_web_root(){
+    local d
+    for d in \
+        /usr/share/wordlists/seclists/Discovery/Web-Content \
+        /usr/share/seclists/Discovery/Web-Content
+    do
+        if [ -d "$d" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+f_ffuf_wordlist(){
+    local soft_lc seclists_web rel candidate
+    # Product token only (Apache:2.4.37 → apache).
+    soft_lc=$(printf '%s' "${SOFTWARE:-}" | tr '[:upper:]' '[:lower:]')
+    soft_lc=${soft_lc%%:*}
+    soft_lc=${soft_lc%%\[*}
+    soft_lc=$(printf '%s' "$soft_lc" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    seclists_web=""
+    seclists_web=$(f_ffuf_seclists_web_root) || seclists_web=""
+
+    FFUF_WL=""
+    rel=""
+
+    if [ -n "$seclists_web" ] && [ -n "$soft_lc" ]; then
+        case "$soft_lc" in
+            wordpress|wp)
+                rel="CMS/wordpress.fuzz.txt"
+                ;;
+            # Drupal.txt is ~58k entries — too large for quiet expand; use general fallback.
+            drupal) rel="" ;;
+            # Joomla only has large plugin/theme lists in SecLists.
+            joomla) rel="" ;;
+            kibana|elasticsearch|elastic)
+                rel="Service-Specific/Elasticsearch-Kibana.txt"
+                ;;
+            grafana)
+                rel="Service-Specific/Grafana.txt"
+                ;;
+            jenkins)
+                rel="Service-Specific/Jenkins-Hudson.txt"
+                ;;
+            gitlab|gitea|gogs)
+                rel="Service-Specific/GitLab.txt"
+                ;;
+            keycloak)
+                rel="Service-Specific/Keycloak-Identity-Access-Management.txt"
+                ;;
+            tomcat)
+                rel="Web-Servers/Apache-Tomcat.txt"
+                ;;
+            wildfly|jboss)
+                rel="Web-Servers/JBoss.txt"
+                ;;
+            iis|aspnet|asp.net|"microsoft asp.net")
+                rel="Web-Servers/IIS.txt"
+                ;;
+            nginx)
+                rel="Web-Servers/nginx.txt"
+                ;;
+            apache)
+                rel="Web-Servers/Apache.txt"
+                ;;
+            php)
+                rel="Programming-Language-Specific/PHP.fuzz.txt"
+                ;;
+            spring|springboot|spring-boot|java)
+                rel="Programming-Language-Specific/Java-Spring-Boot.txt"
+                ;;
+            sharepoint)
+                rel="CMS/Sharepoint.txt"
+                ;;
+            confluence)
+                rel="Service-Specific/confluence-administration.txt"
+                ;;
+            weblogic)
+                rel="Service-Specific/Oracle-WebLogic.txt"
+                ;;
+            *)
+                rel=""
+                ;;
+        esac
+
+        if [ -n "$rel" ] && [ -f "$seclists_web/$rel" ]; then
+            FFUF_WL="$seclists_web/$rel"
+        fi
+    fi
+
+    # Quiet general fallbacks (first existing wins).
+    if [ -z "$FFUF_WL" ]; then
+        for candidate in \
+            ${seclists_web:+"$seclists_web/common.txt"} \
+            ${seclists_web:+"$seclists_web/quickhits.txt"} \
+            ${seclists_web:+"$seclists_web/raft-small-directories.txt"} \
+            /usr/share/wordlists/dirb/common.txt
+        do
+            [ -n "$candidate" ] || continue
+
+            if [ -f "$candidate" ]; then
+                FFUF_WL="$candidate"
+                break
+            fi
+        done
+    fi
+
+    [ -n "$FFUF_WL" ] || f_die "No ffuf wordlist found under SecLists Discovery/Web-Content (or dirb common.txt). Run Discover Update."
+}
+
+# shellcheck disable=SC2329
+cleanup(){
+    local code=$?
+    rm -f "$LOCK" 2>/dev/null || true
+
+    if [ "${SCAN_STARTED:-0}" -eq 1 ]; then
+        f_write_status 0
+        # rebuild audit page if possible
+        if [ -f "$DISCOVER_ROOT/recon/audit-build.py" ]; then
+            python3 "$DISCOVER_ROOT/recon/audit-build.py" "$REPORT_ROOT" \
+                "$DISCOVER_ROOT/report/pages/audit.htm" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    exit "$code"
+}
+trap cleanup EXIT INT TERM
+
+if [ "$TOOL" = "nikto" ]; then
+    # GitHub install: wrapper and/or /opt/nikto/program/nikto.pl (see update.sh)
+    if [ ! -x /usr/local/bin/nikto ] && [ ! -f /opt/nikto/program/nikto.pl ] \
+        && ! command -v nikto >/dev/null 2>&1; then
+        f_die "Nikto is not installed. Run Discover Update (GitHub sullo/nikto → /opt/nikto)."
+    fi
+elif [ "$TOOL" = "robots" ]; then
+    command -v curl >/dev/null 2>&1 || f_die "curl is not installed (required for robots)."
+elif [ "$TOOL" = "feroxbuster" ]; then
+    command -v feroxbuster >/dev/null 2>&1 || f_die "feroxbuster is not installed. Run Discover Update."
+else
+    command -v "$TOOL" >/dev/null 2>&1 || f_die "$TOOL is not installed. Run Discover Update."
+fi
+
+SOFT_NOTE=""
+[ -n "$SOFTWARE" ] && SOFT_NOTE=" (software: $SOFTWARE)"
+
+f_write_status 1
+SCAN_STARTED=1
+f_audit "Started $TOOL on $URL$SOFT_NOTE"
+
+cat > "$META_FILE" <<EOF
+{
+  "tool": "$TOOL",
+  "host": "$HOST",
+  "url": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$URL"),
+  "software": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$SOFTWARE"),
+  "started_display": "$STAMP_DISPLAY",
+  "started_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "output": "$OUT_REL",
+  "status": "running"
+}
+EOF
+
+# Clean up a command for logging without running Python or specifying the
+# command in multiple places (the specifications could "drift" and what's
+# logged could be something other than what was actually run)
+f_clean_cmd() {
+    local -n cmd_ref="$1"
+    local arg skip_next=0
+
+    echo -n "$(basename "${cmd_ref[0]}")"
+    for arg in "${cmd_ref[@]:1}"; do
+        if [ "$skip_next" -eq 1 ]; then
+            skip_next=0
+            echo -n " REDACTED"
+            continue
+        fi
+
+        if [[ "$arg" == --api-token ]]; then
+            echo -n " --api-token"
+            skip_next=1
+            continue
+        fi
+
+        if [[ "$arg" == --api-token=* ]]; then
+            echo -n " --api-token=REDACTED"
+            continue
+        fi
+
+        # Trim REPORT_ROOT from absolute paths
+        arg="${arg#"${REPORT_ROOT}"/}"
+
+        # Quote if appropriate
+        if [[ "$arg" =~ [^-[:alnum:]://\.,] ]]; then
+            arg="${arg@Q}"
+        fi
+
+        echo -n " ${arg}"
+    done
+    echo
+}
+
+# Write Started timestamp + exact Command: header (tools append after this).
+f_write_run_header(){
+    local cmd="$1"
+    {
+        echo "Started: $STAMP_DISPLAY"
+        echo
+        echo "Command:"
+        echo "$cmd"
+        echo
+        echo
+    } > "$OUT_FILE"
+}
+
+# Resolve Nikto binary (GitHub install via update.sh → /usr/local/bin/nikto).
+f_nikto_bin(){
+
+    if [ -x /usr/local/bin/nikto ]; then
+        echo /usr/local/bin/nikto
+        return 0
+    fi
+
+    if [ -f /opt/nikto/program/nikto.pl ]; then
+        echo /opt/nikto/program/nikto.pl
+        return 0
+    fi
+
+    command -v nikto 2>/dev/null || true
+}
+
+# Per-run config: non-interactive, no telemetry/RFI, HTTP/1.1 + GET discovery.
+# Base from GitHub install; UA is also passed as -useragent (Nikto 2.5+).
+f_nikto_write_config(){
+    local conf_path="$1"
+    local ua="$2"
+    python3 - "$conf_path" "$ua" <<'PY'
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+ua = sys.argv[2]
+base = ""
+for candidate in (
+    Path("/opt/nikto/program/nikto.conf"),
+    Path("/opt/nikto/program/nikto.conf.default"),
+    Path("/etc/nikto/config.txt"),
+    Path("/etc/nikto.conf"),
+):
+    if candidate.is_file():
+        base = candidate.read_text(encoding="utf-8", errors="replace")
+        break
+
+force = {
+    "USERAGENT": ua,
+    "PROMPTS": "no",
+    "UPDATES": "no",
+    "DEFAULTHTTPVER": "1.1",
+    "CHECKMETHODS": "GET",
+    # Bail sooner on unresponsive / slow hosts (expand quiet profile).
+    "FAILURES": "8",
+}
+comment_keys = {"RFIURL"}
+
+seen: set[str] = set()
+new_lines: list[str] = []
+for raw in base.splitlines() if base else []:
+    stripped = raw.strip()
+    if stripped and not stripped.startswith("#") and "=" in stripped:
+        key = stripped.split("=", 1)[0].strip()
+        if key in comment_keys:
+            new_lines.append("#" + raw if not raw.lstrip().startswith("#") else raw)
+            continue
+        if key in force:
+            if key not in seen:
+                new_lines.append(f"{key}={force[key]}")
+                seen.add(key)
+            continue
+        new_lines.append(raw)
+        continue
+    new_lines.append(raw)
+
+for key, value in force.items():
+    if key not in seen:
+        new_lines.append(f"{key}={value}")
+
+out.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+PY
+}
+
+# Origin only (scheme://host[:port]) — robots.txt lives at the host root.
+f_url_origin(){
+    python3 - "$1" <<'PY'
+from urllib.parse import urlparse
+import sys
+raw = sys.argv[1]
+p = urlparse(raw if "://" in raw else "https://" + raw)
+scheme = (p.scheme or "https").lower()
+if scheme not in ("http", "https"):
+    scheme = "https"
+netloc = p.netloc or (p.path.split("/")[0] if p.path else "")
+print(f"{scheme}://{netloc}".rstrip("/"))
+PY
+}
+
+f_url_host(){
+    python3 - "$1" <<'PY'
+from urllib.parse import urlparse
+import sys
+raw = sys.argv[1]
+p = urlparse(raw if "://" in raw else "https://" + raw)
+host = (p.hostname or "").strip()
+print(host)
+PY
+}
+
+# Split Shodan ports into TCP / UDP for nmap -p T:...,U:...
+# Prefer tools/shodan/hosts/<ip>.json data[].transport; else UDP= from scan/nmap.sh.
+# Port 53 is always both TCP and UDP when it is in the set.
+# Prints three lines: tcp list, udp list, nmap -p spec.
+f_nmap_split_ports(){
+    python3 - "$1" "$2" "$3" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+# Keep in lockstep with scan/nmap.sh UDP=.
+UDP_FALLBACK = {
+    53, 67, 69, 123, 137, 161, 407, 500, 523, 623, 1434, 1604,
+    1900, 2302, 2362, 3478, 3671, 4800, 5353, 5683, 6481, 17185,
+    31337, 34964, 44818, 47808,
+}
+IPV4 = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+raw = (sys.argv[1] or "").replace(" ", "")
+report = Path(sys.argv[2] or "")
+host = (sys.argv[3] or "").strip().lower().rstrip(".")
+
+seen = set()
+ports = []
+for part in raw.split(","):
+    if not part.isdigit():
+        continue
+    n = int(part)
+    if n < 1 or n > 65535 or n in seen:
+        continue
+    seen.add(n)
+    ports.append(n)
+ports.sort()
+
+
+def resolve_ip(report_dir: Path, hostname: str) -> str:
+    if not hostname:
+        return ""
+    if IPV4.fullmatch(hostname):
+        return hostname
+    for name in ("subdomains", "private-subs"):
+        path = report_dir / "tools" / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            if parts[0].strip().lower().rstrip(".") != hostname:
+                continue
+            ip = parts[1].strip()
+            if IPV4.fullmatch(ip):
+                return ip
+    idx_path = report_dir / "tools" / "shodan" / "index.json"
+    if not idx_path.is_file():
+        return ""
+    try:
+        idx = json.loads(idx_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(idx, dict):
+        return ""
+    for ip, rec in idx.items():
+        if not IPV4.fullmatch(str(ip)) or not isinstance(rec, dict):
+            continue
+        names = rec.get("hostnames") or ""
+        if isinstance(names, str):
+            names = [n.strip() for n in names.split(",")]
+        elif not isinstance(names, list):
+            continue
+        for n in names:
+            if str(n).strip().lower().rstrip(".") == hostname:
+                return str(ip)
+    return ""
+
+
+def shodan_transports(report_dir, ip):
+    out = {}
+    if not ip:
+        return out
+    path = report_dir / "tools" / "shodan" / "hosts" / f"{ip}.json"
+    if not path.is_file():
+        return out
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return out
+    if not isinstance(rec, dict):
+        return out
+    payload = rec.get("shodan") if isinstance(rec.get("shodan"), dict) else rec
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return out
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        port = item.get("port")
+        try:
+            port_n = int(port)
+        except (TypeError, ValueError):
+            continue
+        if port_n < 1 or port_n > 65535:
+            continue
+        t = str(item.get("transport") or "").strip().lower()
+        if t not in ("tcp", "udp"):
+            continue
+        out.setdefault(port_n, set()).add(t)
+    return out
+
+
+ip = resolve_ip(report, host)
+trans_map = shodan_transports(report, ip)
+tcp = []
+udp = []
+for n in ports:
+    trans = trans_map.get(n, set())
+    want_tcp = "tcp" in trans
+    want_udp = "udp" in trans
+    if n == 53:
+        want_tcp = True
+        want_udp = True
+    elif not want_tcp and not want_udp:
+        if n in UDP_FALLBACK:
+            want_udp = True
+        else:
+            want_tcp = True
+    if want_tcp:
+        tcp.append(n)
+    if want_udp:
+        udp.append(n)
+
+tcp_s = ",".join(str(n) for n in tcp)
+udp_s = ",".join(str(n) for n in udp)
+if tcp and udp:
+    spec = f"T:{tcp_s},U:{udp_s}"
+elif udp:
+    spec = f"U:{udp_s}"
+else:
+    spec = tcp_s
+print(tcp_s)
+print(udp_s)
+print(spec)
+PY
+}
+
+# Cached sudo ticket, or prompt in this terminal. No-op when already root.
+# Return 1 if the operator cancels / sudo fails (caller aborts; no TCP-only fallback).
+f_nmap_acquire_sudo(){
+    if [ "$(id -u)" -eq 0 ]; then
+        return 0
+    fi
+
+    if sudo -n true 2>/dev/null; then
+        return 0
+    fi
+
+    echo "[*] UDP nmap needs root. Enter your sudo password."
+    echo
+
+    if sudo -v; then
+        echo
+        return 0
+    fi
+
+    echo
+    echo "[!] UDP nmap needs sudo. Scan aborted."
+    return 1
+}
+
+# TXT body: Starting Nmap <ver>, aligned PORT table, Service Info, Nmap done.
+# When raw UDP sendto is blocked (VPN/TUN), warn and do not keep tcpwrapped as a fingerprint.
+f_nmap_format_body(){
+    python3 - "$1" "${2:-txt}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+raw_path = Path(sys.argv[1])
+mode = sys.argv[2] if len(sys.argv) > 2 else "txt"
+if not raw_path.is_file():
+    raise SystemExit(0)
+text = raw_path.read_text(encoding="utf-8", errors="replace")
+ver = ""
+elapsed = ""
+service_info = ""
+ports = []
+in_table = False
+port_re = re.compile(
+    r"^(\d+/(?:tcp|udp|sctp))\s+(\S+)\s+(\S+)(?:\s+(.*))?$"
+)
+udp_blocked = bool(
+    re.search(r"sendto.*Operation not permitted", text)
+    or "Couldn't open a raw socket" in text
+)
+for line in text.splitlines():
+    if line.startswith("Starting Nmap"):
+        m = re.match(r"Starting Nmap ([0-9][0-9.]*)", line)
+        if m:
+            ver = m.group(1)
+        continue
+    if line.startswith("Nmap done:"):
+        m = re.search(r"scanned in ([0-9.]+ seconds)", line)
+        if m:
+            elapsed = m.group(1)
+        continue
+    if line.startswith("Service Info:"):
+        service_info = line.rstrip()
+        in_table = False
+        continue
+    if re.match(r"^PORT\s+STATE\s+SERVICE", line):
+        in_table = True
+        continue
+    if in_table:
+        m = port_re.match(line)
+        if m:
+            ports.append(
+                (
+                    m.group(1),
+                    m.group(2),
+                    m.group(3),
+                    (m.group(4) or "").rstrip(),
+                )
+            )
+            continue
+        if not line.strip():
+            in_table = False
+
+fixed = []
+for port, state, svc, version in ports:
+    proto = port.rsplit("/", 1)[-1]
+    if udp_blocked and proto == "udp":
+        if svc.lower() == "tcpwrapped":
+            svc = "unknown"
+        version = "UDP probe blocked locally"
+    fixed.append((port, state, svc, version))
+ports = fixed
+
+if mode == "sheet" and not ports:
+    print("No open ports.")
+    raise SystemExit(0)
+if mode != "sheet":
+    if udp_blocked:
+        print("[!] UDP probes blocked: sendto Operation not permitted.")
+        print("    Raw UDP cannot be sent on this interface (often a VPN/TUN). TCP results are valid. UDP rows are not a real service fingerprint.")
+        print()
+    if ver:
+        print(f"Starting Nmap {ver}")
+w_port = max([10] + [len(p[0]) for p in ports]) + 1
+w_state = max([7] + [len(p[1]) for p in ports]) + 1
+w_svc = max([10] + [len(p[2]) for p in ports]) + 1
+print(f"{'PORT':<{w_port}}{'STATE':<{w_state}}{'SERVICE':<{w_svc}}VERSION")
+for port, state, svc, version in ports:
+    if version:
+        print(f"{port:<{w_port}}{state:<{w_state}}{svc:<{w_svc}}{version}")
+    else:
+        print(f"{port:<{w_port}}{state:<{w_state}}{svc}")
+if mode == "sheet" and udp_blocked:
+    print()
+    print("UDP probes blocked locally (VPN/TUN sendto).")
+if mode != "sheet" and service_info:
+    print()
+    print(service_info)
+if mode != "sheet":
+    print()
+    if elapsed:
+        print(f"Nmap done: scanned in {elapsed}")
+    else:
+        print("Nmap done.")
+PY
+}
+
+# HTTP(S) URLs from nmap open ports whose SERVICE is http/https (incl. ssl/http).
+f_nmap_write_web_urls(){
+    python3 - "$1" "$2" "$3" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+raw_path = Path(sys.argv[1])
+host = (sys.argv[2] or "").strip().lower()
+out_path = Path(sys.argv[3])
+if not host or not raw_path.is_file():
+    print("0")
+    raise SystemExit(0)
+text = raw_path.read_text(encoding="utf-8", errors="replace")
+port_re = re.compile(
+    r"^(\d+)/(?:tcp|udp|sctp)\s+(\S+)\s+(\S+)(?:\s+(.*))?$"
+)
+in_table = False
+urls = []
+seen = set()
+for line in text.splitlines():
+    if re.match(r"^PORT\s+STATE\s+SERVICE", line):
+        in_table = True
+        continue
+    if not in_table:
+        continue
+    m = port_re.match(line)
+    if not m:
+        if not line.strip() or line.startswith("Service Info:"):
+            in_table = False
+        continue
+    port, _state, svc = m.group(1), m.group(2), m.group(3)
+    svc_l = svc.lower()
+    if "https" in svc_l or "ssl/http" in svc_l:
+        scheme = "https"
+    elif svc_l in ("ssl", "ssl/unknown") or svc_l.startswith("ssl/unknown"):
+        scheme = "https"
+    elif "http" in svc_l:
+        scheme = "http"
+    else:
+        continue
+    url = f"{scheme}://{host}:{port}"
+    if url in seen:
+        continue
+    seen.add(url)
+    urls.append(url)
+out_path.write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
+print(str(len(urls)))
+PY
+}
+
+# Pre-flight: can curl reach the URL with HTTP/1.1?
+# Returns 0 = run the tool, 1 = skip (unreachable / no HTTP response).
+# Used for HTTP expand tools so operators get a clear skip note in output.txt.
+# nmap does not use this (Shodan TCP and/or UDP ports).
+# robots probes {origin}/robots.txt (site root can 403/timeout while robots.txt is 200).
+f_host_reachable_precheck(){
+    local url="$1"
+    local probe="$url"
+    local line code time_total http10 attempt
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "[*] curl not available - skipping reachability pre-check."
+        return 0
+    fi
+
+    if [ "${TOOL:-}" = "robots" ]; then
+        probe="$(f_url_origin "$url")/robots.txt"
+    fi
+
+    echo "[*] Reachability pre-check (curl HTTP/1.1 GET, 15s)."
+
+    code="000"
+    time_total="?"
+    for attempt in 1 2; do
+        line=$(curl -sS -k -o /dev/null -w "%{http_code} %{time_total}" \
+            --http1.1 --connect-timeout 8 --max-time 15 \
+            -A "$UA" \
+            "$probe" 2>/dev/null) || true
+        code="${line%% *}"
+        time_total="${line#* }"
+        [ -n "$code" ] || code="000"
+
+        if [ "$code" != "000" ]; then
+            break
+        fi
+
+        if [ "$attempt" -eq 1 ]; then
+            echo "[*] Pre-check received no HTTP response, retrying once."
+            sleep 2
+        fi
+    done
+
+    if [ "$code" = "000" ]; then
+        echo "[!] Pre-check failed. No HTTP response from the target within 15s."
+        echo "[!] The target is not reachable or not answering HTTP."
+        return 1
+    fi
+
+    echo "[*] Pre-check OK: HTTP $code in ${time_total}s (HTTP/1.1)."
+
+    http10=$(curl -sS -k -o /dev/null -w "%{http_code}" \
+        --http1.0 --connect-timeout 5 --max-time 10 \
+        -A "$UA" \
+        "$probe" 2>/dev/null) || http10="000"
+
+    if [ "$http10" = "426" ]; then
+        echo "[*] Note: HTTP/1.0 returns 426 Upgrade Required (common on Azure ALB)."
+        echo "    Discover uses HTTP/1.1 + GET for this probe."
+    fi
+
+    return 0
+}
+
+# Resolve wordlist before the live banner so ffuf/ferox show it under Software.
+FFUF_WL=""
+case "$TOOL" in
+    ffuf|feroxbuster)
+        f_ffuf_wordlist
+        ;;
+esac
+
+NMAP_TCP=""
+NMAP_UDP=""
+NMAP_SPEC=""
+
+if [ "$TOOL" = "nmap" ]; then
+    mapfile -t NMAP_SPLIT_LINES < <(f_nmap_split_ports "$PORTS" "$REPORT_ROOT" "$HOST")
+    NMAP_TCP="${NMAP_SPLIT_LINES[0]:-}"
+    NMAP_UDP="${NMAP_SPLIT_LINES[1]:-}"
+    NMAP_SPEC="${NMAP_SPLIT_LINES[2]:-}"
+fi
+
+echo
+echo "============================================================"
+echo " Discover host scan (quiet / Red Team defaults)"
+if [ "$TOOL" = "robots" ]; then
+    echo " Tool:     curl"
+else
+    echo " Tool:     $TOOL"
+fi
+
+echo " Target:   $URL"
+
+if [ "$TOOL" = "nmap" ]; then
+    if [ -n "$NMAP_UDP" ] && [ -n "$NMAP_TCP" ]; then
+        echo " Ports:    T:$NMAP_TCP U:$NMAP_UDP"
+    elif [ -n "$NMAP_UDP" ]; then
+        echo " Ports:    U:$NMAP_UDP"
+    else
+        echo " Ports:    ${NMAP_TCP:-${PORTS:--}}"
+    fi
+elif [ "$TOOL" != "robots" ] && [ "$TOOL" != "nikto" ]; then
+    echo " Software: ${SOFTWARE:--}"
+fi
+
+if [ -n "$FFUF_WL" ]; then
+    echo " Wordlist: $FFUF_WL"
+fi
+
+echo " Report:   $REPORT_ROOT"
+echo " Output:   $OUT_FILE"
+echo " UA:       $UA"
+echo "============================================================"
+echo
+echo "[*] ctrl+c to abort."
+echo
+
+EXIT_CODE=0
+HOST_SKIPPED=0
+
+# Reachability first for HTTP tools. nmap uses Shodan ports; skip curl GET.
+PRECHECK_RC=0
+PRECHECK_OUT=""
+
+if [ "$TOOL" != "nmap" ]; then
+    set +e
+    PRECHECK_OUT=$(f_host_reachable_precheck "$URL" 2>&1)
+    PRECHECK_RC=$?
+    set -e
+    printf '%s\n' "$PRECHECK_OUT"
+    echo
+fi
+
+if [ "$PRECHECK_RC" -ne 0 ]; then
+    HOST_SKIPPED=1
+    EXIT_CODE=1
+    {
+        echo "Started: $STAMP_DISPLAY"
+        echo
+
+        if [ "$TOOL" = "robots" ]; then
+            echo "Tool:    curl"
+        else
+            echo "Tool:    $TOOL"
+        fi
+
+        echo "Target:  $URL"
+
+        if [ "$TOOL" != "robots" ] && [ "$TOOL" != "nikto" ]; then
+            echo "Software: ${SOFTWARE:--}"
+        fi
+
+        echo
+        printf '%s\n' "$PRECHECK_OUT"
+        echo
+
+        if [ "$TOOL" = "robots" ]; then
+            echo "[!] curl skipped - host not reachable from this network."
+        else
+            echo "[!] $TOOL skipped - host not reachable from this network."
+        fi
+
+        echo "    Result: no scan (reachability pre-check failed)."
+        echo "    Re-run this tool when the host answers HTTP from your network."
+        echo
+    } > "$OUT_FILE"
+    # Record skip reason on meta for UI / later rebuilds
+    python3 - "$META_FILE" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    meta = json.load(open(path, encoding="utf-8"))
+except Exception:
+    meta = {}
+meta["status"] = "failed"
+meta["skip_reason"] = "host_unreachable"
+meta["exit_code"] = 1
+json.dump(meta, open(path, "w", encoding="utf-8"), indent=2)
+open(path, "a", encoding="utf-8").write("\n")
+PY
+else
+case "$TOOL" in
+    nikto)
+        # GitHub Nikto 2.5+/2.6 (update.sh → /opt/nikto): TLS SNI in bundled LW2,
+        # -useragent / -nointeractive / -nocheck; per-request -timeout 5s; maxtime 10m;
+        # hard wall via timeout 11m; FAILURES=8 in run nikto.conf.
+        NIKTO_BIN=$(f_nikto_bin)
+
+        if [ -z "$NIKTO_BIN" ]; then
+            {
+                echo "[!] Nikto not found. Run Discover Update (installs sullo/nikto to /opt/nikto)."
+            } | tee -a "$OUT_FILE"
+            EXIT_CODE=1
+        else
+            NIKTO_HTM="$RUN_DIR/nikto.htm"
+            NIKTO_CONF="$RUN_DIR/nikto.conf"
+            NIKTO_REQ_TIMEOUT="5"
+            NIKTO_MAXTIME="10m"
+            NIKTO_HARD_TIMEOUT="11m"
+
+            f_nikto_write_config "$NIKTO_CONF" "$UA"
+            NIKTO_CMD=(
+                "$NIKTO_BIN" -config "$NIKTO_CONF"
+                -host "$URL"
+                -useragent "$UA"
+                -nointeractive -nocheck
+                -timeout "$NIKTO_REQ_TIMEOUT"
+                -maxtime "$NIKTO_MAXTIME"
+                -Format htm
+                -output "$NIKTO_HTM"
+            )
+
+            if [[ "$URL" =~ ^https:// ]]; then
+                # -ssl skips plain-HTTP probe on :443.
+                NIKTO_CMD+=( -ssl )
+            fi
+
+            f_write_run_header "$(f_clean_cmd NIKTO_CMD)"
+            f_op_notes "$URL" "$(f_clean_cmd NIKTO_CMD)"
+            {
+                echo "[*] Non-interactive (PROMPTS=no, UPDATES=no, -nointeractive -nocheck);"
+                echo "    HTTP/1.1 + GET; request timeout ${NIKTO_REQ_TIMEOUT}s; FAILURES=8;"
+                echo "    maxtime ${NIKTO_MAXTIME}; hard stop ${NIKTO_HARD_TIMEOUT}."
+                echo
+            } | tee -a "$OUT_FILE"
+
+            # Reachability already verified above (shared pre-check for all tools).
+            set +e
+            if command -v timeout >/dev/null 2>&1; then
+                timeout --foreground --signal=TERM --kill-after=45s "$NIKTO_HARD_TIMEOUT" \
+                    "${NIKTO_CMD[@]}" \
+                    2>&1 | tee -a "$OUT_FILE"
+                EXIT_CODE=${PIPESTATUS[0]}
+            else
+                "${NIKTO_CMD[@]}" \
+                    2>&1 | tee -a "$OUT_FILE"
+                EXIT_CODE=${PIPESTATUS[0]}
+            fi
+
+            set -e
+
+            if [ "${EXIT_CODE:-0}" -eq 124 ]; then
+                {
+                    echo
+                    echo "[*] Discover hard stop: Nikto exceeded ${NIKTO_HARD_TIMEOUT} wall clock (maxtime ${NIKTO_MAXTIME} + grace)."
+                    echo "    Scan stopped automatically - no operator input required."
+                } | tee -a "$OUT_FILE"
+                EXIT_CODE=0
+            fi
+
+            if grep -q 'No web server found on' "$OUT_FILE" 2>/dev/null; then
+                {
+                    echo
+                    echo "[!] Nikto host discovery failed: no web server found (0 hosts tested)."
+                    echo "    Pre-check may still have seen HTTP. Treat as inconclusive;"
+                    echo "    use nuclei/ffuf/manual review instead."
+                    echo "    (Maxtime ERROR lines can appear even on short runs when discovery fails.)"
+                } | tee -a "$OUT_FILE"
+                EXIT_CODE=1
+            fi
+
+            if [ -f "$NIKTO_HTM" ]; then
+                echo "" >> "$OUT_FILE"
+                echo "HTML report: $NIKTO_HTM" >> "$OUT_FILE"
+            fi
+        fi
+
+        ;;
+    nuclei)
+        # Pass 1: software-tagged recon. Pass 2: auto CVE/KEV from cache.
+        # Expand UI only offers nuclei when a product is known; refuse empty here.
+        if [ -z "${SOFTWARE// }" ]; then
+            f_die "nuclei requires a software product (Active ?software= filter or row tech fingerprint). Got: empty"
+        fi
+
+        # output.txt layout is Command → Findings. Do not tee live nuclei
+        # lines into the report file, and do not print an Output: filesystem path.
+        f_nuclei_args
+        NUCLEI_OUT="$RUN_DIR/nuclei.txt"
+        NUCLEI_CMD=(
+            nuclei -u "$URL"
+            -H "User-Agent: $UA"
+            "${NUCLEI_EXTRA[@]}"
+            -silent -nc -duc -o "$NUCLEI_OUT"
+        )
+
+        f_op_notes "$URL" "$(f_clean_cmd NUCLEI_CMD)"
+        {
+            echo "Started: $STAMP_DISPLAY"
+            echo
+            echo "=== Pass 1: software recon tags ==="
+            echo
+            echo "Command:"
+            f_clean_cmd NUCLEI_CMD
+            echo
+        } > "$OUT_FILE"
+
+        echo "[*] Pass 1: software recon (${NUCLEI_EXTRA[*]:-tags tech})"
+        set +e
+        # Findings go to -o only; keep terminal visible but keep output.txt structured.
+        "${NUCLEI_CMD[@]}"
+        PASS1_CODE=$?
+        set -e
+        EXIT_CODE=$PASS1_CODE
+        f_nuclei_ensure_findings_message "$NUCLEI_OUT"
+        f_nuclei_append_findings "$NUCLEI_OUT" >> "$OUT_FILE"
+
+        # Pass 2: CVE/KEV IDs that exist as local nuclei templates (+ product CVE YAMLs).
+        PASS2_META=$(f_nuclei_pass2_ids || true)
+        PASS2_IDS=""
+        PASS2_KEV_N=0
+        PASS2_TOTAL=0
+        PASS2_NOTE=""
+
+        if [ -n "$PASS2_META" ]; then
+            PASS2_IDS=$(printf '%s' "$PASS2_META" | cut -d'|' -f1)
+            PASS2_KEV_N=$(printf '%s' "$PASS2_META" | cut -d'|' -f2)
+            PASS2_TOTAL=$(printf '%s' "$PASS2_META" | cut -d'|' -f3)
+            PASS2_NOTE=$(printf '%s' "$PASS2_META" | cut -d'|' -f4-)
+        fi
+
+        if [ -n "$PASS2_IDS" ]; then
+            NUCLEI_PASS2_OUT="$RUN_DIR/nuclei-pass2.txt"
+            NUCLEI_PASS2_CMD=(
+                nuclei -u "$URL"
+                -H "User-Agent: $UA"
+                -id "$PASS2_IDS"
+                -c 5 -rl 25 -timeout 15 -retries 1
+                -silent -nc -duc -o "$NUCLEI_PASS2_OUT"
+            )
+            # Comma-space list for readability in the report
+            PASS2_IDS_DISPLAY=$(printf '%s' "$PASS2_IDS" | sed 's/,/, /g')
+            {
+                echo
+                echo "=== Pass 2: CVE and KEV templates ==="
+                echo
+                echo "Software:"
+                echo "${SOFTWARE:--}"
+                echo
+                echo "Templates (${PASS2_TOTAL:-?}, KEV ${PASS2_KEV_N:-?}):"
+                echo "$PASS2_IDS_DISPLAY"
+                echo
+                echo "Selection:"
+                echo "${PASS2_NOTE:-(none)}"
+                echo
+                echo "Command:"
+                f_clean_cmd NUCLEI_PASS2_CMD
+                echo
+            } >> "$OUT_FILE"
+            echo
+            echo "[*] Pass 2: CVE and KEV templates (${PASS2_TOTAL:-?} runnable, ${PASS2_KEV_N:-?} KEV)"
+            # Do not audit pass-2 start/finish - covered by parent nuclei Started/Finished + Output.
+            set +e
+            "${NUCLEI_PASS2_CMD[@]}"
+            PASS2_CODE=$?
+            set -e
+
+            if [ "$PASS2_CODE" -ne 0 ] && [ "$EXIT_CODE" -eq 0 ]; then
+                EXIT_CODE=$PASS2_CODE
+            fi
+
+            f_nuclei_ensure_findings_message "$NUCLEI_PASS2_OUT"
+            f_nuclei_append_findings "$NUCLEI_PASS2_OUT" >> "$OUT_FILE"
+            # Do not audit "Finished nuclei pass-2 ..." - redundant with parent Finished + Output.
+            python3 - "$META_FILE" "$PASS2_IDS" "${PASS2_KEV_N:-0}" "${PASS2_TOTAL:-0}" "${PASS2_CODE:-1}" "${PASS2_NOTE:-}" <<'PY'
+import json, sys
+path, ids, kev_n, total, code, note = sys.argv[1:7]
+try:
+    meta = json.load(open(path, encoding="utf-8"))
+except Exception:
+    meta = {}
+meta["pass2"] = {
+    "ids": [x for x in ids.split(",") if x],
+    "kev_count": int(kev_n) if str(kev_n).isdigit() else kev_n,
+    "id_count": int(total) if str(total).isdigit() else total,
+    "exit_code": int(code) if str(code).lstrip("-").isdigit() else code,
+    "selection": note,
+    "output": "nuclei-pass2.txt",
+}
+json.dump(meta, open(path, "w", encoding="utf-8"), indent=2)
+open(path, "a", encoding="utf-8").write("\n")
+PY
+        else
+            {
+                echo
+                echo "=== Pass 2: skipped ==="
+                echo
+                echo "No runnable CVE templates for software '${SOFTWARE:--}'."
+                echo "Need Active CVE cache and/or local nuclei-templates CVE YAML for this product."
+                echo
+            } >> "$OUT_FILE"
+            echo "[*] Pass 2: skipped (no runnable CVE templates for this software)"
+        fi
+
+        ;;
+    droopescan)
+        CMS=$(f_droopescan_cms)
+        [ -n "$CMS" ] || f_die "droopescan requires CMS software (Drupal, Joomla, Moodle, Silverstripe - not WordPress; use wpscan). Got: ${SOFTWARE:-none}"
+        command -v droopescan >/dev/null 2>&1 || f_die "droopescan is not installed (or not on PATH). Run Discover Update; prefer ~/.local/bin after Python 3.14 patch."
+        DROOP_OUT="$RUN_DIR/droopescan.txt"
+        DROOP_RAW="$RUN_DIR/droopescan.raw"
+        # Quiet-ish: all enums, modest threads, no live percent bar in the TXT.
+        DROOP_CMD=(droopescan scan "$CMS" -u "$URL" -e a -t 4 -o standard --hide-progressbar)
+
+        f_write_run_header "$(f_clean_cmd DROOP_CMD)"
+        f_op_notes "$URL" "$(f_clean_cmd DROOP_CMD)"
+        {
+            echo "CMS: $CMS"
+            echo "Software: ${SOFTWARE:--}"
+            echo
+        } >> "$OUT_FILE"
+        echo "[*] droopescan scan $CMS on $URL"
+        set +e
+        "${DROOP_CMD[@]}" 2>&1 | tee "$DROOP_RAW"
+        EXIT_CODE=${PIPESTATUS[0]}
+        set -e
+
+        if [ -f "$DROOP_RAW" ]; then
+            f_clean_scan_text < "$DROOP_RAW" > "$DROOP_OUT"
+            f_clean_scan_text < "$DROOP_RAW" >> "$OUT_FILE"
+            rm -f "$DROOP_RAW"
+        fi
+
+        if [ ! -s "$DROOP_OUT" ]; then
+            printf '%s\n' "No droopescan output captured." > "$DROOP_OUT"
+        fi
+
+        ;;
+    wpscan)
+        f_is_wordpress || f_die "wpscan requires WordPress software filter. Got: ${SOFTWARE:-none}"
+        command -v wpscan >/dev/null 2>&1 || f_die "wpscan is not installed. Run Discover Update (gem install wpscan)."
+        WPSCAN_OUT="$RUN_DIR/wpscan.txt"
+        # Quiet-ish Red Team defaults: passive plugin detection + moderate enum.
+        # Optional free API token: export WPSCAN_API_TOKEN=... (vuln DB lookups).
+        # shellcheck disable=SC2054
+        WPSCAN_CMD=(wpscan --url "$URL" --random-user-agent --user-agent "$UA" --disable-tls-checks --plugins-detection passive --enumerate vp,vt,tt,cb,dbe,u --format cli-no-colour --no-banner)
+
+        if [ -n "${WPSCAN_API_TOKEN:-}" ]; then
+            WPSCAN_CMD+=( --api-token "$WPSCAN_API_TOKEN" )
+        fi
+
+        f_write_run_header "$(f_clean_cmd WPSCAN_CMD)"
+        f_op_notes "$URL" "$(f_clean_cmd WPSCAN_CMD)"
+        {
+            echo "Software: ${SOFTWARE:--}"
+
+            if [ -n "${WPSCAN_API_TOKEN:-}" ]; then
+                echo "API token: set (WPSCAN_API_TOKEN)"
+            else
+                echo "API token: not set (optional - free token improves vuln matching)"
+            fi
+
+            echo
+        } >> "$OUT_FILE"
+        echo "[*] wpscan on $URL"
+        set +e
+        "${WPSCAN_CMD[@]}" 2>&1 | tee "$WPSCAN_OUT" | tee -a "$OUT_FILE"
+
+        EXIT_CODE=${PIPESTATUS[0]}
+        set -e
+
+        if [ ! -s "$WPSCAN_OUT" ]; then
+            printf '%s\n' "No wpscan output captured." > "$WPSCAN_OUT"
+        fi
+
+        {
+            echo
+            echo "Output: $WPSCAN_OUT"
+            echo
+        } >> "$OUT_FILE"
+        ;;
+    robots)
+        # multiTabs.sh option 3: fetch robots.txt, parse Disallow paths.
+        # Run only fetches + parses; Firefox tabs open via discover-robots: (htm button).
+        ROBOTS_FILE="$RUN_DIR/robots.txt"
+        DISALLOW_FILE="$RUN_DIR/disallow-urls.txt"
+        BASE_URL=$(f_url_origin "$URL")
+        ROBOTS_URL="${BASE_URL}/robots.txt"
+        ROBOTS_CMD=(curl -kLsS --http1.1 --connect-timeout 8 --max-time 15 -A "$UA" -w "%{http_code}" -o "$ROBOTS_FILE" "$ROBOTS_URL")
+
+        f_write_run_header "$(f_clean_cmd ROBOTS_CMD)"
+        f_op_notes "$URL" "$(f_clean_cmd ROBOTS_CMD)"
+        {
+            echo "Robots URL: $ROBOTS_URL"
+            echo "Base:       $BASE_URL"
+            echo
+        } >> "$OUT_FILE"
+        echo "[*] Fetching $ROBOTS_URL"
+        set +e
+        HTTP_CODE=$("${ROBOTS_CMD[@]}" 2>/dev/null)
+        CURL_RC=$?
+        set -e
+        [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
+
+        if [ ! -f "$ROBOTS_FILE" ]; then
+            : > "$ROBOTS_FILE"
+        fi
+
+        # Parse Disallow paths → absolute URLs (same idea as multiTabs.sh).
+        DISALLOW_COUNT=$(python3 - "$ROBOTS_FILE" "$DISALLOW_FILE" "$BASE_URL" <<'PY'
+import re
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+robots_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+base = sys.argv[3].rstrip("/")
+text = robots_path.read_text(encoding="utf-8", errors="replace") if robots_path.is_file() else ""
+seen = set()
+urls = []
+for raw in text.splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    # Strip trailing comment
+    if "#" in line:
+        line = line.split("#", 1)[0].strip()
+    m = re.match(r"(?i)^disallow\s*:\s*(.*)$", line)
+    if not m:
+        continue
+    path = (m.group(1) or "").strip()
+    if not path or path == "*" or path == "/":
+        continue
+    if path.lower() == "disallow":
+        continue
+    if path.startswith(("http://", "https://")):
+        full = path
+    else:
+        if not path.startswith("/"):
+            path = "/" + path
+        if path == "/":
+            continue
+        full = base + path
+    parsed = urlparse(full) if full.startswith(("http://", "https://")) else None
+    parsed_path = (parsed.path or "/") if parsed else path
+    # Skip Disallow: / (site root). Keep /?q=... (Drupal aliases).
+    if parsed_path.rstrip("/") in ("",) or parsed_path == "/":
+        if not (parsed and (parsed.query or parsed.fragment)):
+            continue
+    if full in seen:
+        continue
+    seen.add(full)
+    urls.append(full)
+out_path.write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
+print(len(urls))
+PY
+)
+        DISALLOW_COUNT="${DISALLOW_COUNT:-0}"
+        {
+            echo "[*] robots.txt HTTP $HTTP_CODE"
+
+            if [ "$CURL_RC" -ne 0 ]; then
+                echo "curl exit:   $CURL_RC"
+            fi
+
+            if [ "$DISALLOW_COUNT" -eq 1 ] 2>/dev/null; then
+                echo "[*] $DISALLOW_COUNT Disallow path"
+            else
+                echo "[*] $DISALLOW_COUNT Disallow paths"
+            fi
+
+            echo
+
+            if [ "$DISALLOW_COUNT" -gt 0 ] 2>/dev/null; then
+                echo "Disallow URLs:"
+                cat "$DISALLOW_FILE"
+                echo
+            else
+                echo "No Disallow directories found (empty robots, missing file, Disallow: / only, or only Allow/*)."
+                echo
+            fi
+
+        } >> "$OUT_FILE"
+        # Soft success: fetch attempted; non-2xx still useful (body may be empty).
+        if [ "$CURL_RC" -ne 0 ] && [ "$HTTP_CODE" = "000" ]; then
+            EXIT_CODE=1
+            {
+                echo "[!] Failed to fetch robots.txt from $ROBOTS_URL."
+                echo
+            } >> "$OUT_FILE"
+        else
+            EXIT_CODE=0
+        fi
+
+        python3 - "$META_FILE" "$DISALLOW_COUNT" "$HTTP_CODE" <<'PY'
+import json, sys
+path, count, code = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    meta = json.load(open(path, encoding="utf-8"))
+except Exception:
+    meta = {}
+try:
+    meta["disallow_count"] = int(count)
+except ValueError:
+    meta["disallow_count"] = 0
+meta["url_count"] = meta["disallow_count"]
+meta["robots_http_status"] = code
+json.dump(meta, open(path, "w", encoding="utf-8"), indent=2)
+open(path, "a", encoding="utf-8").write("\n")
+PY
+        echo "[*] robots.txt HTTP $HTTP_CODE"
+
+        if [ "$DISALLOW_COUNT" -eq 1 ] 2>/dev/null; then
+            echo "[*] $DISALLOW_COUNT Disallow path"
+        else
+            echo "[*] $DISALLOW_COUNT Disallow paths"
+        fi
+
+        ;;
+    nmap)
+        NMAP_HOST=$(f_url_host "$URL")
+
+        if [ -z "$NMAP_HOST" ]; then
+            echo "[!] Could not parse host from URL." | tee -a "$OUT_FILE"
+            EXIT_CODE=1
+        elif [ -z "$NMAP_SPEC" ]; then
+            echo "[!] No Shodan ports for this host. Run Active Enrich → Shodan first." | tee -a "$OUT_FILE"
+            EXIT_CODE=1
+        elif [ -n "$NMAP_UDP" ] && ! f_nmap_acquire_sudo; then
+            {
+                echo "Started: $STAMP_DISPLAY"
+                echo
+                echo "[!] UDP nmap needs sudo. Scan aborted."
+                echo
+            } > "$OUT_FILE"
+            EXIT_CODE=1
+        else
+            NMAP_CMD=()
+
+            if [ -n "$NMAP_UDP" ]; then
+                if [ "$(id -u)" -eq 0 ]; then
+                    NMAP_CMD+=(nmap --privileged)
+                else
+                    NMAP_CMD+=(sudo nmap --privileged)
+                fi
+
+                NMAP_CMD+=(-Pn -n --open)
+
+                if [ -n "$NMAP_TCP" ]; then
+                    NMAP_CMD+=(-sTV -sUV)
+                else
+                    NMAP_CMD+=(-sUV)
+                fi
+
+                NMAP_CMD+=(-p "$NMAP_SPEC" "$NMAP_HOST")
+            else
+                NMAP_CMD=(nmap -Pn -n --open -sTV -p "$NMAP_SPEC" "$NMAP_HOST")
+            fi
+
+            {
+                echo "Started: $STAMP_DISPLAY"
+                echo
+                echo "Command:"
+                echo "$(f_clean_cmd NMAP_CMD)"
+                echo
+            } > "$OUT_FILE"
+            set +e
+            "${NMAP_CMD[@]}" 2>&1 | tee "$RUN_DIR/nmap.raw"
+            EXIT_CODE=${PIPESTATUS[0]}
+            set -e
+
+            if grep -qE 'sendto.*Operation not permitted|Couldn.t open a raw socket' "$RUN_DIR/nmap.raw" 2>/dev/null; then
+                echo
+                echo "[!] UDP probes blocked: sendto Operation not permitted (often VPN/TUN). TCP results are valid."
+                echo
+            fi
+
+            f_nmap_format_body "$RUN_DIR/nmap.raw" >> "$OUT_FILE"
+            NMAP_WEB_COUNT=$(f_nmap_write_web_urls "$RUN_DIR/nmap.raw" "$NMAP_HOST" "$RUN_DIR/web-urls.txt")
+            python3 - "$META_FILE" "${NMAP_WEB_COUNT:-0}" <<'PY'
+import json, sys
+path, count = sys.argv[1], sys.argv[2]
+try:
+    meta = json.load(open(path, encoding="utf-8"))
+except Exception:
+    meta = {}
+try:
+    meta["url_count"] = int(count)
+except ValueError:
+    meta["url_count"] = 0
+json.dump(meta, open(path, "w", encoding="utf-8"), indent=2)
+open(path, "a", encoding="utf-8").write("\n")
+PY
+            f_op_notes "$URL" "$(f_clean_cmd NMAP_CMD)" "$(f_nmap_format_body "$RUN_DIR/nmap.raw" sheet)"
+        fi
+
+        ;;
+    ffuf)
+        [ -n "$FFUF_WL" ] || f_ffuf_wordlist
+        # Ensure URL has FUZZ path
+        FFUF_URL="$URL"
+
+        if [[ "$FFUF_URL" != *FUZZ* ]]; then
+            FFUF_URL="${FFUF_URL%/}/FUZZ"
+        fi
+
+        FFUF_JSON="$RUN_DIR/ffuf.json"
+        # Quiet default: no custom -mc (use ffuf defaults: 2xx,301,302,307,500,...)
+        # Filter noise with -fc. Keep 2xx, 401, and 500s (version banners). Drop
+        # forbid, empty, rate-limit, and redirects (301/302/307 are often real
+        # paths that still aren't useful to open anonymously - clutter).
+        # Fail-fast on dead/slow hosts: 5s per request, 10m wall, stop on
+        # spurious errors (timeouts / connection errors) so expand does not
+        # sit on 600+ hanging requests. Hard stop 11m matches Nikto style.
+        FFUF_FC="301,302,307,400,403,404,405,429"
+        FFUF_TIMEOUT="5"
+        FFUF_MAXTIME="600"
+        FFUF_HARD_TIMEOUT="11m"
+        FFUF_CMD=(ffuf -u "$FFUF_URL" -w "$FFUF_WL" -t 10 -rate 20 -timeout "$FFUF_TIMEOUT" -maxtime "$FFUF_MAXTIME" -se -H "User-Agent: $UA" -of json -o "$FFUF_JSON" -fc "$FFUF_FC" -noninteractive)
+
+        f_write_run_header "$(f_clean_cmd FFUF_CMD)"
+        f_op_notes "$URL" "$(f_clean_cmd FFUF_CMD)"
+        {
+            echo "[*] Request timeout ${FFUF_TIMEOUT}s; maxtime ${FFUF_MAXTIME}s; stop on spurious errors;"
+            echo "    hard stop ${FFUF_HARD_TIMEOUT}."
+            echo
+        } | tee -a "$OUT_FILE"
+        FFUF_RAW="$RUN_DIR/ffuf.raw.txt"
+        set +e
+
+        if command -v timeout >/dev/null 2>&1; then
+            timeout --foreground --signal=TERM --kill-after=15s "$FFUF_HARD_TIMEOUT" \
+                "${FFUF_CMD[@]}" 2>&1 | tee "$FFUF_RAW"
+            EXIT_CODE=${PIPESTATUS[0]}
+        else
+            "${FFUF_CMD[@]}" 2>&1 | tee "$FFUF_RAW"
+            EXIT_CODE=${PIPESTATUS[0]}
+        fi
+
+        set -e
+
+        if [ "${EXIT_CODE:-0}" -eq 124 ]; then
+            {
+                echo
+                echo "[*] Discover hard stop: ffuf exceeded ${FFUF_HARD_TIMEOUT} wall clock (maxtime ${FFUF_MAXTIME}s + grace)."
+                echo "    Scan stopped automatically - no operator input required."
+            } | tee -a "$OUT_FILE"
+            EXIT_CODE=0
+        fi
+
+        # Append cleaned text to operator report (no ESC boxes / progress spam).
+        if [ -f "$FFUF_RAW" ]; then
+            f_clean_scan_text < "$FFUF_RAW" >> "$OUT_FILE"
+            rm -f "$FFUF_RAW"
+        fi
+
+        if [ -f "$FFUF_JSON" ]; then
+            echo "" >> "$OUT_FILE"
+            echo "JSON results: $FFUF_JSON" >> "$OUT_FILE"
+        fi
+
+        ;;
+    feroxbuster)
+        # Same software-aware SecLists pick as ffuf (quiet expand).
+        [ -n "$FFUF_WL" ] || f_ffuf_wordlist
+        FEROX_JSON="$RUN_DIR/ferox.json"
+        FEROX_TIMEOUT="5"
+        FEROX_TIME_LIMIT="10m"
+        FEROX_HARD_TIMEOUT="11m"
+        FEROX_FC="301,302,307,400,403,404,405,429"
+        FEROX_CMD=(feroxbuster -u "$URL" -w "$FFUF_WL" -a "$UA" -t 10 --rate-limit 20 -T "$FEROX_TIMEOUT" --time-limit "$FEROX_TIME_LIMIT" --auto-bail -n --dont-extract-links -k -C "$FEROX_FC" -q --json -o "$FEROX_JSON" --no-state)
+
+        f_write_run_header "$(f_clean_cmd FEROX_CMD)"
+        f_op_notes "$URL" "$(f_clean_cmd FEROX_CMD)"
+        FEROX_RAW="$RUN_DIR/ferox.raw.txt"
+        set +e
+
+        if command -v timeout >/dev/null 2>&1; then
+            timeout --foreground --signal=TERM --kill-after=15s "$FEROX_HARD_TIMEOUT" \
+                "${FEROX_CMD[@]}" \
+                2>&1 | tee "$FEROX_RAW"
+            EXIT_CODE=${PIPESTATUS[0]}
+        else
+            "${FEROX_CMD[@]}" \
+                2>&1 | tee "$FEROX_RAW"
+            EXIT_CODE=${PIPESTATUS[0]}
+        fi
+
+        set -e
+
+        if [ "${EXIT_CODE:-0}" -eq 124 ]; then
+            {
+                echo
+                echo "[*] Discover hard stop: feroxbuster exceeded ${FEROX_HARD_TIMEOUT} wall clock (time-limit ${FEROX_TIME_LIMIT} + grace)."
+                echo "    Scan stopped automatically - no operator input required."
+            } | tee -a "$OUT_FILE"
+            EXIT_CODE=0
+        fi
+
+        if [ -f "$FEROX_RAW" ]; then
+            f_clean_scan_text < "$FEROX_RAW" >> "$OUT_FILE"
+            rm -f "$FEROX_RAW"
+        fi
+
+        if [ -f "$FEROX_JSON" ]; then
+            echo "" >> "$OUT_FILE"
+            echo "JSON results: $FEROX_JSON" >> "$OUT_FILE"
+        fi
+
+        ;;
+esac
+fi  # HOST_SKIPPED reachability gate
+
+FINISHED=$(date -u +"%m/%d/%Y - %H:%M Z")
+COUNT_JSON=""
+case "$TOOL" in
+    ffuf) COUNT_JSON="$RUN_DIR/ffuf.json" ;;
+    feroxbuster) COUNT_JSON="$RUN_DIR/ferox.json" ;;
+esac
+python3 - "$META_FILE" "$FINISHED" "$EXIT_CODE" "$COUNT_JSON" <<'PY'
+import json, sys
+from pathlib import Path
+path, finished, code = sys.argv[1], sys.argv[2], int(sys.argv[3])
+json_path = Path(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
+try:
+    meta = json.load(open(path, encoding="utf-8"))
+except Exception:
+    meta = {}
+# Keep skip_reason if pre-check already set it
+if meta.get("skip_reason") == "host_unreachable":
+    meta["status"] = "failed"
+else:
+    meta["status"] = "done" if code == 0 else "failed"
+meta["finished_display"] = finished
+from datetime import datetime, timezone
+meta["finished_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+meta["exit_code"] = code
+if json_path is not None:
+    seen = set()
+    text = ""
+    if json_path.is_file():
+        try:
+            text = json_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+    data = None
+    try:
+        data = json.loads(text) if text else None
+    except Exception:
+        data = None
+
+    def add(url):
+        u = str(url or "").strip()
+        if u.startswith(("http://", "https://")):
+            seen.add(u)
+
+    if isinstance(data, dict):
+        for row in data.get("results") or []:
+            if isinstance(row, dict):
+                add(row.get("url"))
+    elif isinstance(data, list):
+        for row in data:
+            if isinstance(row, dict) and row.get("type") in (None, "response"):
+                add(row.get("url") or row.get("original_url"))
+    if not seen or data is None:
+        for raw in text.splitlines():
+            raw = raw.strip()
+            if not raw or raw[0] not in "{[":
+                continue
+            try:
+                row = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("type") and row.get("type") != "response":
+                continue
+            add(row.get("url") or row.get("original_url"))
+    meta["url_count"] = len(seen)
+json.dump(meta, open(path, "w", encoding="utf-8"), indent=2)
+open(path, "a", encoding="utf-8").write("\n")
+PY
+
+f_write_status 0
+# Omit "(exit 0)" - success is the default; keep non-zero exits visible.
+if [ "${EXIT_CODE:-1}" -eq 0 ]; then
+    f_audit "Finished $TOOL on $URL$SOFT_NOTE"
+else
+    f_audit "Finished $TOOL on $URL (exit $EXIT_CODE)$SOFT_NOTE"
+fi
+
+# Rebuild audit page
+if [ -f "$DISCOVER_ROOT/recon/audit-build.py" ]; then
+    python3 "$DISCOVER_ROOT/recon/audit-build.py" "$REPORT_ROOT" \
+        "$DISCOVER_ROOT/report/pages/audit.htm" >/dev/null 2>&1 || true
+fi
+
+if [ -f "$DISCOVER_ROOT/recon/touch-report-date.py" ]; then
+    python3 "$DISCOVER_ROOT/recon/touch-report-date.py" "$REPORT_ROOT" >/dev/null 2>&1 || true
+fi
+
+echo
+echo "============================================================"
+echo "[*] Done. Exit code: $EXIT_CODE"
+echo "============================================================"
+echo
+echo "Press Enter to close this terminal."
+read -r _
+exit "$EXIT_CODE"

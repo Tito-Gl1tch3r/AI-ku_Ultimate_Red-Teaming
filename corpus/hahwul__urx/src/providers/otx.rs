@@ -1,0 +1,839 @@
+use anyhow::Result;
+
+use serde::de::Deserializer;
+use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
+
+use super::{Provider, UrlRecord};
+use crate::network::client::send_with_retry;
+use crate::network::NetConfig;
+use crate::progress::ProgressReporter;
+
+// Helper function to deserialize null as default value for i32
+fn deserialize_null_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+#[derive(Clone)]
+pub struct OTXProvider {
+    include_subdomains: bool,
+    net: NetConfig,
+    base_url: String,
+    page_limit: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OTXResult {
+    #[serde(default)]
+    has_next: bool,
+    #[serde(default)]
+    actual_size: i32,
+    #[serde(default = "Vec::new")]
+    url_list: Vec<OTXUrlEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OTXUrlEntry {
+    #[serde(default = "String::new")]
+    domain: String,
+    #[serde(default = "String::new")]
+    url: String,
+    #[serde(default = "String::new")]
+    hostname: String,
+    #[serde(default, deserialize_with = "deserialize_null_i32")]
+    httpcode: i32,
+    #[serde(default, deserialize_with = "deserialize_null_i32")]
+    page_num: i32,
+    #[serde(default, deserialize_with = "deserialize_null_i32")]
+    full_size: i32,
+    #[serde(default)]
+    paged: bool,
+}
+
+const OTX_RESULTS_LIMIT: u32 = 200;
+
+/// Hard ceiling on OTX pages walked for one domain. OTX paginates `has_next`,
+/// but a stuck cursor or a server that keeps reporting `has_next: true` would
+/// otherwise loop forever issuing requests. At `OTX_RESULTS_LIMIT` rows/page
+/// this still covers far more URLs than any domain has in OTX.
+const OTX_MAX_PAGES: u32 = 1_000;
+
+impl OTXProvider {
+    /// Creates a new OTXProvider with default settings
+    pub fn new() -> Self {
+        OTXProvider {
+            include_subdomains: false,
+            net: NetConfig::default(),
+            base_url: "https://otx.alienvault.com".to_string(),
+            page_limit: OTX_MAX_PAGES,
+        }
+    }
+
+    /// Formats the OTX API URL based on the domain and page number.
+    ///
+    /// OTX exposes two indicator endpoints, and the choice between them is what
+    /// `--subs` means here:
+    ///
+    /// * `indicators/domain/<d>` — `d` and everything under it.
+    /// * `indicators/hostname/<h>` — that exact host only.
+    ///
+    /// The query is always sent for the domain **as the user typed it**. It used
+    /// to be truncated to its last two labels when `--subs` was set, on the
+    /// assumption that "the last two labels" is the registrable domain. That is
+    /// only true under single-label suffixes: `shop.example.co.uk` was reduced to
+    /// `co.uk`, so urx asked OTX for every URL under an entire public suffix and
+    /// then threw essentially all of it away in host validation. Even where the
+    /// assumption held it was wasteful — `sub.example.com` fetched all of
+    /// `example.com` to keep one subdomain's worth. Deciding registrability needs
+    /// a public-suffix list; not truncating needs none, and is what `--subs` on a
+    /// given host actually asks for.
+    fn format_url(&self, domain: &str, page: u32) -> String {
+        // AlienVault OTX API pages start at 1, not 0
+        let page_number = page + 1;
+
+        // An apex-looking name is queried through the domain endpoint even
+        // without --subs: the hostname endpoint would exclude `www.<domain>`,
+        // which host validation treats as the apex itself.
+        let endpoint = if self.include_subdomains || domain.split('.').count() <= 2 {
+            "domain"
+        } else {
+            "hostname"
+        };
+
+        format!(
+            "{}/api/v1/indicators/{endpoint}/{domain}/url_list?limit={OTX_RESULTS_LIMIT}&page={page_number}",
+            self.base_url
+        )
+    }
+}
+
+/// Truncate response text for error previews. Cutting at a fixed byte index
+/// would panic when byte 100 falls inside a multi-byte UTF-8 character, so
+/// back off to the nearest character boundary.
+fn preview_text(text: &str) -> String {
+    const MAX_PREVIEW_BYTES: usize = 100;
+    if text.len() <= MAX_PREVIEW_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_PREVIEW_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &text[..end])
+}
+
+/// Parse an OTX page, falling back to just its `url_list` (and the paging
+/// fields beside it) when the full shape does not match.
+fn parse_otx(text: &str) -> Result<OTXResult> {
+    if let Ok(otx_result) = serde_json::from_str::<OTXResult>(text) {
+        return Ok(otx_result);
+    }
+    let preview = preview_text(text);
+    let json_value = serde_json::from_str::<serde_json::Value>(text).map_err(|e| {
+        anyhow::anyhow!("Failed to parse OTX response as JSON: {e}. Response preview: {preview}")
+    })?;
+    let url_list = json_value.get("url_list").ok_or_else(|| {
+        anyhow::anyhow!("Response is missing url_list field. Response preview: {preview}")
+    })?;
+    let entries = serde_json::from_value::<Vec<OTXUrlEntry>>(url_list.clone()).map_err(|e| {
+        anyhow::anyhow!("Failed to parse url_list entries: {e}. Response preview: {preview}")
+    })?;
+    Ok(OTXResult {
+        has_next: json_value
+            .get("has_next")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        actual_size: json_value
+            .get("actual_size")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or(0),
+        url_list: entries,
+    })
+}
+
+impl Provider for OTXProvider {
+    fn clone_box(&self) -> Box<dyn Provider> {
+        Box::new(self.clone())
+    }
+
+    fn fetch_urls<'a>(
+        &'a self,
+        domain: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UrlRecord>>> + Send + 'a>> {
+        self.fetch_urls_with_progress(domain, None)
+    }
+
+    fn fetch_urls_with_progress<'a>(
+        &'a self,
+        domain: &'a str,
+        reporter: Option<ProgressReporter>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UrlRecord>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut all_urls = Vec::new();
+            let mut page = 0;
+            let client = self.net.http.build_client()?;
+
+            if let Some(r) = &reporter {
+                r.detail("fetching…");
+            }
+
+            loop {
+                let url = self.format_url(domain, page);
+
+                let result = send_with_retry(
+                    self.net.retries,
+                    self.net.rate_limit.as_ref(),
+                    |_| true,
+                    || client.get(&url),
+                    |_, text| parse_otx(&text),
+                )
+                .await;
+
+                match result {
+                    Ok(otx_result) => {
+                        let has_next = otx_result.has_next;
+                        let page_len = otx_result.url_list.len();
+
+                        // Keep only entries with a usable URL — OTX occasionally
+                        // returns rows with an empty `url`, which would otherwise be
+                        // emitted as blank lines.
+                        all_urls.extend(
+                            otx_result
+                                .url_list
+                                .into_iter()
+                                .map(|entry| entry.url)
+                                .filter(|url| !url.is_empty()),
+                        );
+
+                        if let Some(r) = &reporter {
+                            r.detail(format!("{} URLs…", all_urls.len()));
+                        }
+
+                        // Stop when this page returned nothing (there is no more
+                        // data, even if the server still claims `has_next`), or when
+                        // the API reports no further pages. A full page with
+                        // `has_next` absent (some responses omit it) is treated as
+                        // "maybe more", so a single trailing empty fetch confirms the
+                        // end rather than truncating at page one.
+                        let page_full = page_len as u32 >= OTX_RESULTS_LIMIT;
+                        if page_len == 0 || (!has_next && !page_full) {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // Best effort: a page that failed after all its retries must
+                        // not discard the pages already collected. Only a failure on
+                        // the very first request — where there is nothing to keep —
+                        // is fatal, matching every other paginating provider.
+                        if all_urls.is_empty() {
+                            return Err(e);
+                        }
+                        // We're returning a truncated result. Flag it so the runner
+                        // marks the line partial and warns, rather than presenting an
+                        // incomplete crawl as a clean success.
+                        if let Some(r) = &reporter {
+                            r.mark_partial();
+                        }
+                        break;
+                    }
+                }
+
+                // The run asked us to stop (--max-time elapsed, or Ctrl-C).
+                // Hand back the pages already walked instead of losing them to
+                // the hard cancel after the runner's grace window.
+                if let Some(r) = &reporter {
+                    if r.stop_requested() {
+                        r.mark_partial();
+                        break;
+                    }
+                }
+
+                page += 1;
+                if page >= self.page_limit {
+                    // Reaching the safety ceiling means another page may
+                    // remain; do not present the capped result as complete.
+                    if let Some(r) = &reporter {
+                        r.mark_partial();
+                    }
+                    break;
+                }
+            }
+
+            Ok(all_urls.into_iter().map(UrlRecord::bare).collect())
+        })
+    }
+
+    fn with_subdomains(&mut self, include: bool) {
+        self.include_subdomains = include;
+    }
+
+    fn with_network(&mut self, net: NetConfig) {
+        self.net = net;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::progress::StopSignal;
+    use crate::providers::urls_of;
+
+    #[test]
+    fn test_preview_text_multibyte_boundary() {
+        // 50 two-byte characters: byte 100 falls right past the string, and a
+        // 51-character string puts the cut point inside a character. Neither
+        // case may panic.
+        let short = "é".repeat(50);
+        assert_eq!(preview_text(&short), short);
+
+        let long = "é".repeat(51); // 102 bytes; byte 100 is mid-character
+        let preview = preview_text(&long);
+        assert!(preview.ends_with("... (truncated)"));
+        assert!(preview.starts_with(&"é".repeat(49)));
+    }
+
+    #[test]
+    fn test_preview_text_ascii() {
+        assert_eq!(preview_text("short"), "short");
+        let long = "a".repeat(150);
+        assert_eq!(
+            preview_text(&long),
+            format!("{}... (truncated)", "a".repeat(100))
+        );
+    }
+
+    #[test]
+    fn test_new_provider() {
+        let provider = OTXProvider::new();
+        assert!(!provider.include_subdomains);
+    }
+
+    #[test]
+    fn test_with_subdomains() {
+        let mut provider = OTXProvider::new();
+        provider.with_subdomains(true);
+        assert!(provider.include_subdomains);
+    }
+
+    #[test]
+    fn test_clone_box() {
+        let provider = OTXProvider::new();
+        let _cloned = provider.clone_box();
+        // Just testing that cloning works without error
+    }
+
+    #[test]
+    fn test_format_url_second_level_domain() {
+        let provider = OTXProvider::new();
+        let url = provider.format_url("example.com", 0);
+        assert_eq!(
+            url,
+            format!(
+                "https://otx.alienvault.com/api/v1/indicators/domain/example.com/url_list?limit={OTX_RESULTS_LIMIT}&page=1"
+            )
+        );
+    }
+
+    #[test]
+    fn test_format_url_subdomain_without_include_subdomains() {
+        let provider = OTXProvider::new();
+        let url = provider.format_url("sub.example.com", 0);
+        assert_eq!(
+            url,
+            format!(
+                "https://otx.alienvault.com/api/v1/indicators/hostname/sub.example.com/url_list?limit={OTX_RESULTS_LIMIT}&page=1"
+            )
+        );
+    }
+
+    #[test]
+    fn test_format_url_subdomain_with_include_subdomains() {
+        let mut provider = OTXProvider::new();
+        provider.with_subdomains(true);
+        let url = provider.format_url("sub.example.com", 0);
+        assert_eq!(
+            url,
+            format!(
+                "https://otx.alienvault.com/api/v1/indicators/domain/sub.example.com/url_list?limit={OTX_RESULTS_LIMIT}&page=1"
+            )
+        );
+    }
+
+    #[test]
+    fn test_format_url_does_not_truncate_multi_label_suffix() {
+        // Regression: --subs used to keep only the last two labels, so a domain
+        // under a multi-label public suffix was reduced to the suffix itself and
+        // urx asked OTX for every URL in `.co.uk`.
+        let mut provider = OTXProvider::new();
+        provider.with_subdomains(true);
+        assert!(
+            provider
+                .format_url("example.co.uk", 0)
+                .contains("/indicators/domain/example.co.uk/"),
+            "{}",
+            provider.format_url("example.co.uk", 0)
+        );
+        assert!(
+            provider
+                .format_url("shop.example.co.uk", 0)
+                .contains("/indicators/domain/shop.example.co.uk/"),
+            "{}",
+            provider.format_url("shop.example.co.uk", 0)
+        );
+    }
+
+    #[test]
+    fn test_format_url_multi_label_suffix_without_subs_uses_hostname() {
+        let provider = OTXProvider::new();
+        assert!(
+            provider
+                .format_url("example.co.uk", 0)
+                .contains("/indicators/hostname/example.co.uk/"),
+            "{}",
+            provider.format_url("example.co.uk", 0)
+        );
+    }
+
+    #[test]
+    fn test_format_url_with_pagination() {
+        let provider = OTXProvider::new();
+        let url = provider.format_url("example.com", 2);
+        assert_eq!(
+            url,
+            format!(
+                "https://otx.alienvault.com/api/v1/indicators/domain/example.com/url_list?limit={OTX_RESULTS_LIMIT}&page=3"
+            )
+        );
+    }
+
+    #[test]
+    fn test_otx_result_deserialize() {
+        let json = r#"{
+            "has_next": true,
+            "actual_size": 200,
+            "url_list": [
+                {
+                    "domain": "example.com",
+                    "url": "https://example.com/page1",
+                    "hostname": "example.com",
+                    "httpcode": 200,
+                    "page_num": 1,
+                    "full_size": 500,
+                    "paged": true
+                },
+                {
+                    "domain": "example.com",
+                    "url": "https://example.com/page2",
+                    "hostname": "example.com"
+                }
+            ]
+        }"#;
+
+        let result: OTXResult = serde_json::from_str(json).unwrap();
+        assert!(result.has_next);
+        assert_eq!(result.actual_size, 200);
+        assert_eq!(result.url_list.len(), 2);
+        assert_eq!(result.url_list[0].url, "https://example.com/page1");
+        assert_eq!(result.url_list[0].httpcode, 200);
+        assert_eq!(result.url_list[1].url, "https://example.com/page2");
+        assert_eq!(result.url_list[1].httpcode, 0); // default value for missing field
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_with_nonexistent_domain() {
+        let provider = OTXProvider::new();
+        let domain = "test-domain-that-does-not-exist-xyz.example";
+
+        let result = provider.fetch_urls(domain).await;
+        assert!(
+            result.is_err(),
+            "Expected an error when fetching from non-existent domain"
+        );
+
+        // Error message should contain domain or connection-related error
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to fetch OTX data")
+                || err.contains("timed out")
+                || err.contains("HTTP error")
+                || err.contains("connection")
+                || err.contains("network"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_pagination() {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+
+        // Mock page 1 response
+        let _m1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "has_next": true,
+                "url_list": [
+                    { "url": "http://example.com/1" }
+                ]
+            }"#,
+            )
+            .create();
+
+        // Mock page 2 response
+        let _m2 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=2",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "has_next": false,
+                "url_list": [
+                    { "url": "http://example.com/2" }
+                ]
+            }"#,
+            )
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+
+        let result = provider.fetch_urls("example.com").await;
+        assert!(result.is_ok(), "Failed to fetch URLs: {:?}", result.err());
+        let urls = urls_of(result.unwrap());
+
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains(&"http://example.com/1".to_string()));
+        assert!(urls.contains(&"http://example.com/2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_page_limit_marks_results_partial_when_otx_has_more() {
+        let mut server = mockito::Server::new_async().await;
+        let page1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"has_next":true,"url_list":[{"url":"http://example.com/a"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=2",
+            )
+            .with_status(200)
+            .with_body(r#"{"has_next":false,"url_list":[]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = server.url();
+        provider.page_limit = 1;
+        provider.net.retries = 0;
+
+        let reporter = ProgressReporter::new(indicatif::ProgressBar::hidden(), "test · ");
+        let urls = urls_of(
+            provider
+                .fetch_urls_with_progress("example.com", Some(reporter.clone()))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(urls, vec!["http://example.com/a"]);
+        assert!(
+            reporter.is_partial(),
+            "the page ceiling truncates this crawl"
+        );
+        page1.assert();
+        page2.assert();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+
+        let _m1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "has_next": false,
+                "url_list": []
+            }"#,
+            )
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+
+        let result = provider.fetch_urls("example.com").await;
+        assert!(result.is_ok());
+        let urls = urls_of(result.unwrap());
+
+        assert!(urls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_terminates_on_empty_page_despite_has_next() {
+        // A misbehaving API that keeps claiming has_next:true but returns no
+        // rows must not loop forever — an empty page ends the walk.
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+
+        let _m1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{ "has_next": true, "url_list": [] }"#)
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+
+        let result = provider.fetch_urls("example.com").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_request_keeps_the_pages_already_walked() {
+        // The runner raises a stop at the --max-time deadline; without the walk
+        // consulting it, the hard cancel that follows the grace window dropped
+        // every page already collected. The stop is raised from page one's own
+        // handler, so it lands exactly when that page has been served.
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let stop = StopSignal::default();
+
+        // A full page, so `has_next` aside the walk would ask for page 2.
+        let rows: Vec<String> = (0..OTX_RESULTS_LIMIT)
+            .map(|i| format!(r#"{{"url":"http://example.com/{i}"}}"#))
+            .collect();
+        let flip = stop.clone();
+        let body = format!(
+            r#"{{ "has_next": true, "url_list": [{}] }}"#,
+            rows.join(",")
+        );
+        let _page1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                flip.request_stop();
+                body.clone().into_bytes()
+            })
+            .create();
+        // Page two must never be requested once the stop is pending.
+        let page2 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=2",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{ "has_next": false, "url_list": [{"url":"http://example.com/late"}] }"#)
+            .expect(0)
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+        provider.net.retries = 0;
+
+        let reporter = ProgressReporter::new(indicatif::ProgressBar::hidden(), "test · ")
+            .with_stop_signal(stop.clone());
+        let urls = urls_of(
+            provider
+                .fetch_urls_with_progress("example.com", Some(reporter.clone()))
+                .await
+                .expect("page one must survive the deadline"),
+        );
+
+        assert_eq!(urls.len(), OTX_RESULTS_LIMIT as usize);
+        assert!(!urls.contains(&"http://example.com/late".to_string()));
+        // Stopping early leaves the crawl incomplete, not cleanly finished.
+        assert!(reporter.is_partial());
+        page2.assert();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_keeps_earlier_pages_when_a_later_page_fails() {
+        // Regression: a page that failed after its retries used to `return Err`,
+        // throwing away every page already collected. A domain with 50 good pages
+        // and one flaky page reported the whole provider as failed and yielded
+        // nothing.
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+
+        // A full page (200 rows) so the walk continues to page 2.
+        let rows: Vec<String> = (0..OTX_RESULTS_LIMIT)
+            .map(|i| format!(r#"{{"url":"http://example.com/{i}"}}"#))
+            .collect();
+        let _page1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{ "has_next": true, "url_list": [{}] }}"#,
+                rows.join(",")
+            ))
+            .create();
+        // ...and page 2 is permanently broken.
+        let _page2 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=2",
+            )
+            .with_status(503)
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+        provider.net.retries = 0; // fail fast, don't sleep through back-off
+
+        let reporter = ProgressReporter::new(indicatif::ProgressBar::hidden(), "test · ");
+        let urls = urls_of(
+            provider
+                .fetch_urls_with_progress("example.com", Some(reporter.clone()))
+                .await
+                .expect("page one must survive a later page's failure"),
+        );
+
+        assert_eq!(urls.len(), OTX_RESULTS_LIMIT as usize);
+        assert!(urls.contains(&"http://example.com/0".to_string()));
+        // The lost page is surfaced as a partial result, not a clean success.
+        assert!(reporter.is_partial());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_errors_when_the_first_page_fails() {
+        // With nothing collected there is nothing to salvage, so the failure
+        // must still propagate.
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let _m = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(503)
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+        provider.net.retries = 0;
+
+        assert!(provider.fetch_urls("example.com").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_skips_empty_url_entries() {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+
+        let _m1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{ "has_next": false, "url_list": [ { "url": "" }, { "url": "http://example.com/real" } ] }"#,
+            )
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+
+        let urls = urls_of(provider.fetch_urls("example.com").await.unwrap());
+        assert_eq!(urls, vec!["http://example.com/real".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_json_error() {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+
+        // Respond with malformed JSON
+        let _m1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{ "invalid_json": true "#)
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+        // Reduce retries to speed up test
+        provider.net.retries = 0;
+
+        let result = provider.fetch_urls("example.com").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // The implementation wraps the error, check for "Failed to parse"
+        assert!(err.contains("Failed to parse") || err.contains("Failed to fetch OTX data"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_urls_http_error() {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+
+        let _m1 = server
+            .mock(
+                "GET",
+                "/api/v1/indicators/domain/example.com/url_list?limit=200&page=1",
+            )
+            .with_status(500)
+            .create();
+
+        let mut provider = OTXProvider::new();
+        provider.base_url = url;
+        provider.net.retries = 0;
+
+        let result = provider.fetch_urls("example.com").await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // Check for HTTP error message
+        assert!(err.contains("HTTP error") || err.contains("Failed to fetch OTX data"));
+    }
+}

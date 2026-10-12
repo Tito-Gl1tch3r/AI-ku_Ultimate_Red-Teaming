@@ -1,0 +1,258 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { generateHtmlReport } from '../lib/formatters/html.js';
+import { computeDrift } from '../lib/drift.js';
+
+/**
+ * generateHtmlReport is a pure result -> string formatter. These assertions pin
+ * the contract that makes it usable as a CI artifact: self-contained (no external
+ * resources), correct escaping of untrusted extracted strings, and the drift
+ * banner in Mode B. The report is the rendered HTML only — no embedded JSON
+ * (dropped for size; the machine-readable form is --json-only).
+ */
+
+function fixture(overrides: Record<string, unknown> = {}): any {
+  return {
+    url: 'https://example.com/',
+    extractedAt: '2026-06-13T00:00:00.000Z',
+    meta: { schemaVersion: '1.1.0', dembrandtVersion: '0.18.0' },
+    colors: {
+      palette: [
+        { color: '#133174', normalized: '#133174', count: 40, confidence: 'high' },
+        { color: '#ff8800', normalized: '#ff8800', count: 8, confidence: 'medium' },
+      ],
+      semantic: { primary: '#133174' },
+      cssVariables: {},
+    },
+    typography: { styles: [{ context: 'body', family: 'Inter, sans-serif', size: '16px', weight: 400 }], sources: {} },
+    spacing: { scaleType: 'base-8', commonValues: [{ px: 16, display: '16px', count: 12 }] },
+    borderRadius: { values: [{ value: '8px', count: 5, confidence: 'high' }] },
+    borders: {},
+    shadows: [{ shadow: '0 1px 2px rgba(0,0,0,.1)', count: 3, confidence: 'high' }],
+    components: { buttons: [{ states: { default: { backgroundColor: '#133174', color: '#fff' } }, text: 'Go' }], inputs: [], links: [], badges: [] },
+    breakpoints: [{ px: 768 }],
+    iconSystem: [],
+    frameworks: [{ name: 'Tailwind', confidence: 'high' }],
+    ...overrides,
+  };
+}
+
+test('renders a self-contained document with no external resources', () => {
+  const html = generateHtmlReport(fixture());
+  assert.match(html, /^<!doctype html>/);
+  assert.match(html, /example\.com/);
+  assert.doesNotMatch(html, /<script\s+src=/i);
+  assert.doesNotMatch(html, /<link\s/i);
+  assert.doesNotMatch(html, /src="https?:/i);
+  assert.doesNotMatch(html, /@import/i);
+});
+
+test('a logo and favicons never become external resources either', () => {
+  const html = generateHtmlReport(fixture({
+    logo: { source: 'img', url: 'https://example.com/logo.png' },
+    favicons: [{ type: 'icon', url: 'https://example.com/favicon.png', sizes: null }],
+  }));
+  assert.doesNotMatch(html, /src="https?:/i);
+});
+
+test('frameworks and icon sets are listed with the version the page stated', () => {
+  const html = generateHtmlReport(fixture({
+    frameworks: [{ name: 'Next.js', confidence: 'high', version: '16.2.9' }, { name: 'React', confidence: 'high' }],
+    iconSystem: [{ name: 'Heroicons', type: 'svg', version: '2' }],
+  }) as never);
+  assert.ok(html.includes('Next.js 16.2.9, React'), 'framework versions missing');
+  assert.ok(html.includes('Heroicons 2'), 'icon set version missing');
+});
+
+test('a framework is listed with the share of the page it renders', () => {
+  const html = generateHtmlReport(fixture({
+    frameworks: [
+      { name: 'React', confidence: 'high', version: '19.2.0', coverage: 0.4 },
+      { name: 'Next.js', confidence: 'high', version: '16.2.9' },
+      { name: 'Vue', confidence: 'high', coverage: 0 },
+    ],
+  }) as never);
+  assert.ok(html.includes('React 19.2.0 (40% of page), Next.js 16.2.9, Vue (0% of page)'), 'page share missing');
+});
+
+test('escapes untrusted extracted strings (no breakout into the document)', () => {
+  const evil = '</style><img src=x onerror=alert(1)>';
+  const html = generateHtmlReport(fixture({
+    siteName: evil,
+    colors: { palette: [{ color: evil, normalized: evil, count: 1, confidence: 'low' }], semantic: {}, cssVariables: {} },
+  }));
+  // The raw breakout sequence must never appear unescaped; the injected string
+  // must render in its escaped form (the only legit </style> is the real one).
+  assert.doesNotMatch(html, /<img src=x onerror=/);
+  assert.match(html, /&lt;\/style&gt;&lt;img src=x onerror=alert\(1\)&gt;/);
+});
+
+test('the summary header always shows a Consistency gauge + a counts caption', () => {
+  // Consistency is always computable, so the header is always present; the
+  // counts caption replaces the dropped (useless) Token-coverage gauge.
+  const baseHtml = generateHtmlReport(fixture());
+  assert.match(baseHtml, /class="gauges"/);
+  assert.match(baseHtml, />Consistency</);
+  assert.match(baseHtml, />Contrast</); // always-on, self-computed from colours
+  assert.match(baseHtml, /class="counts"/);
+  assert.match(baseHtml, /text style/); // honest count, not a score
+  // Without WCAG data the Contrast gauge links to the findings, not a WCAG card.
+  assert.doesNotMatch(baseHtml, /href="#wcag"/);
+  // WCAG present → the Contrast gauge uses real pairs and links to the WCAG card.
+  const wcag = generateHtmlReport(fixture({ wcag: [{ fg: '#000', bg: '#fff', ratio: 21, aa: true, aaLarge: true, aaa: true }] }));
+  assert.match(wcag, /href="#wcag"/);
+});
+
+test('a CSS-only theme toggle is present (dark default, light when checked)', () => {
+  const html = generateHtmlReport(fixture());
+  assert.match(html, /id="theme"/);
+  assert.match(html, /:root:has\(#theme:checked\)/);
+  assert.match(html, /color-scheme:dark/); // default
+});
+
+test('findings drive the report: a contrast smell surfaces in the Findings card', () => {
+  // A light primary fails AA on white → a Findings card with a warn badge.
+  const html = generateHtmlReport(fixture({
+    colors: { palette: [{ color: '#9aa0ff', normalized: '#9aa0ff', count: 5, confidence: 'high' }], semantic: { primary: '#9aa0ff' }, cssVariables: {} },
+  }));
+  assert.match(html, /id="findings"/);
+  assert.match(html, /low contrast on white/);
+});
+
+test('Mode B renders a drift banner and a Drift gauge', () => {
+  const base = fixture();
+  const cand = fixture({ colors: { palette: [{ color: '#0a0a0a', normalized: '#0a0a0a', count: 40, confidence: 'high' }], semantic: {}, cssVariables: {} } });
+  const drift = computeDrift(base, cand);
+  const html = generateHtmlReport(cand, { drift });
+  assert.match(html, /class="drift is-(drift|stable)"/);
+  assert.match(html, />(DRIFT|STABLE)</);
+  assert.match(html, />Drift</);
+});
+
+test('the logo section renders the mark, its dimensions and its svg colours', () => {
+  const html = generateHtmlReport(fixture({
+    logo: {
+      source: 'svg',
+      url: 'https://example.com/logo.svg',
+      dataUri: 'data:image/svg+xml;base64,PHN2Zy8+',
+      width: 120,
+      height: 32,
+      alt: 'Example',
+      svgColors: ['#133174'],
+      safeZone: { top: 8, right: 8, bottom: 8, left: 8 },
+      background: '#ffffff',
+    },
+  }));
+  assert.match(html, /id="logo"/);
+  assert.match(html, /src="data:image\/svg\+xml;base64,PHN2Zy8/);
+  assert.match(html, /120×32/);
+  assert.match(html, /safe zone 8\/8\/8\/8/);
+  assert.match(html, /background:#ffffff/);
+});
+
+test('a logo with no usable image or metadata drops the section instead of rendering an empty card', () => {
+  const html = generateHtmlReport(fixture({ logo: { source: 'img', url: '' } }));
+  assert.doesNotMatch(html, /id="logo"/);
+});
+
+test('non-http logo and favicon sources are refused as image srcs', () => {
+  const html = generateHtmlReport(fixture({
+    logo: { source: 'img', url: 'javascript:alert(1)', width: 10, height: 10 },
+    favicons: [
+      { type: 'icon', url: 'file:///etc/passwd', sizes: null },
+      { type: 'apple-touch-icon', url: 'https://example.com/apple.png', sizes: '180x180', dataUri: 'data:image/png;base64,iVBORw0KGgo=' },
+    ],
+  }));
+  assert.doesNotMatch(html, /javascript:alert/);
+  assert.doesNotMatch(html, /file:\/\/\//);
+  assert.match(html, /src="data:image\/png;base64,iVBORw0KGgo="/);
+});
+
+test('inputs render from either the array or the { text } shape', () => {
+  const style = { type: 'email', border: '1px solid #ccc', borderRadius: '6px', states: { default: { backgroundColor: '#fff', color: '#111' } } };
+  for (const inputs of [[style], { text: [style] }]) {
+    const html = generateHtmlReport(fixture({ components: { buttons: [], inputs, links: [], badges: [] } }));
+    assert.match(html, /Inputs/);
+    assert.match(html, /placeholder="email"/);
+    assert.match(html, /border-radius:6px/);
+  }
+});
+
+test('a link shows its hover colour only when hover actually differs', () => {
+  const link = (hover: string) => ({ states: { default: { color: '#0055ff', textDecoration: 'underline' }, hover: { color: hover } } });
+  const changed = generateHtmlReport(fixture({ components: { buttons: [], inputs: [], links: [link('#003399')], badges: [] } }));
+  assert.match(changed, /hover #003399/);
+  const same = generateHtmlReport(fixture({ components: { buttons: [], inputs: [], links: [link('#0055ff')], badges: [] } }));
+  assert.match(same, /Links/);
+  assert.doesNotMatch(same, /hover #0055ff/);
+});
+
+test('component sections carry a Copy all payload built from every entry, not just the previewed ones', () => {
+  const links = Array.from({ length: 15 }, (_, i) => ({ states: { default: { color: `#0000${String(i).padStart(2, '0')}` } } }));
+  const html = generateHtmlReport(fixture({ components: { buttons: [], inputs: [], links, badges: [] } }));
+  const chips = (html.match(/class="badgepv"/g) ?? []).length;
+  assert.equal(chips, 12);
+  const copy: string[] = html.match(/data-copy="([^"]*)"/g) ?? [];
+  assert.ok(copy.some((c) => c.includes('#000000') && c.includes('#000014')), 'copy payload must span past the 12 rendered chips');
+});
+
+test('the report stamps the extracting version, falling back to the renderer', () => {
+  const extracted = generateHtmlReport(
+    fixture({ meta: { dembrandtVersion: '0.0.1' } }),
+    { version: '1.2.3' },
+  );
+  assert.match(extracted, /<meta name="generator" content="dembrandt 0\.0\.1">/);
+  assert.doesNotMatch(extracted, /1\.2\.3/);
+
+  const rendered = generateHtmlReport(fixture({ meta: {} }), { version: '1.2.3' });
+  assert.match(rendered, /<meta name="generator" content="dembrandt 1\.2\.3">/);
+
+  // MCP renders stored extractions with no version option at all.
+  assert.match(
+    generateHtmlReport(fixture({ meta: { dembrandtVersion: '0.0.1' } })),
+    /<meta name="generator" content="dembrandt 0\.0\.1">/,
+  );
+  assert.match(generateHtmlReport(fixture({ meta: {} })), /content="dembrandt">/);
+});
+
+test('the report grades a pair at the threshold its text size earns', () => {
+  const large = { fg: '#767676', bg: '#ffffff', ratio: 3.5, aa: false, aaLarge: true, aaa: false, large: true, requiredAA: 3, passAA: true, passAAA: false, fontSize: 32, fontWeight: 700 };
+  const body = { ...large, fg: '#8a8a8a', large: false, requiredAA: 4.5, passAA: false, fontSize: 16, fontWeight: 400 };
+  const html = generateHtmlReport(fixture({ wcag: [large, body] }));
+  assert.match(html, /b-good">AA Large/);
+  assert.match(html, /b-bad">Fail/);
+  assert.match(html, /WCAG contrast \(1 pass · 1 fail\)/);
+});
+
+test('a pair predating the size fields keeps the AA-Large middle tier', () => {
+  const legacy = { fg: '#767676', bg: '#ffffff', ratio: 3.5, aa: false, aaLarge: true, aaa: false };
+  const html = generateHtmlReport(fixture({ wcag: [legacy] }));
+  assert.match(html, /b-warn">AA Large/);
+  assert.match(html, /· 1 AA Large/);
+});
+
+test('role labels resolve when the semantic map is in rgb() and the palette in hex', () => {
+  const html = generateHtmlReport(fixture({ colors: { palette: [{ color: '#133174', normalized: '#133174', count: 40, confidence: 'high' }], semantic: { primary: 'rgb(19, 49, 116)' } } }));
+  assert.match(html, /<div class="role">primary<\/div>/);
+});
+
+test('the contrast gauge counts size-aware passes, not the fixed 4.5 flag', () => {
+  const large = { fg: '#767676', bg: '#ffffff', ratio: 3.6, aa: false, aaLarge: true, aaa: false, passAA: true, large: true };
+  const html = generateHtmlReport(fixture({ wcag: [large] }));
+  assert.match(html, /1\/1 pairs AA/);
+});
+
+test('input previews read the default state the extractor emits', () => {
+  const html = generateHtmlReport(fixture({ components: { inputs: [{ specificType: 'email', states: { default: { backgroundColor: '#ffffff', color: '#111111', border: '2px solid #ff0000', borderRadius: '6px', padding: '4px 8px' } } }] } }));
+  assert.match(html, /border:2px solid #ff0000/);
+  assert.match(html, /placeholder="email"/);
+});
+
+test('crawl agreement score and page-local outliers appear in the report', () => {
+  const html = generateHtmlReport(fixture({
+    coverage: { totalPages: 4, score: 72, byFamily: {}, outliers: [{ family: 'colors', token: '#ff0000', pages: 1, scope: 'page' }] },
+  }));
+  assert.match(html, /72\/100 consistent across 4 pages/);
+  assert.match(html, /page-local: colors #ff0000/);
+  assert.doesNotMatch(generateHtmlReport(fixture()), /consistent across/);
+});

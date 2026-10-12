@@ -1,0 +1,595 @@
+/**
+ * Multi-Page Result Merger
+ *
+ * Merges extraction results from multiple pages into a single
+ * unified result that is a superset of the single-page result: all single-page
+ * fields are preserved, with additional multi-page metadata (pages array,
+ * pageCount on palette entries) added.
+ */
+
+import { randomUUID } from 'node:crypto';
+import { coverageEntry, scopeOf, summarizeCoverage, type TokenScope } from './coverage.js';
+import { deltaE } from './colors.js';
+import type { ColorOccurrence } from './types.js';
+import { applyBudget, computeMetrics, totalWords, WORD_FLOOR } from './voice/metrics.js';
+
+/**
+ * Meta for a merged snapshot. The merged artifact is a distinct snapshot, so it
+ * gets its own snapshotId; readiness aggregates across pages (one page that
+ * rendered fallback fonts taints the merged typography).
+ */
+function mergeMeta(results) {
+  const home = results[0];
+  if (!home.meta) return {};
+  const metas = results.map((r) => r.meta).filter(Boolean);
+  const fontsReady = metas.every((m) => m.fontsReady !== false);
+  const pendingFonts = [...new Set(metas.flatMap((m) => m.pendingFonts ?? []))].sort();
+  const degraded = [...new Set(metas.flatMap((m) => m.degraded ?? []))];
+  const errors = metas.flatMap((m) => m.errors ?? []);
+  return {
+    meta: {
+      ...home.meta,
+      snapshotId: randomUUID(),
+      fontsReady,
+      ...(pendingFonts.length ? { pendingFonts } : {}),
+      ...(degraded.length ? { degraded } : {}),
+      ...(errors.length ? { errors } : {}),
+    },
+  };
+}
+
+const DELTA_E_THRESHOLD = 15;
+
+// rgb(56, 89, 255) and #3859ff are one colour; the palette stores the latter.
+function normalizeHex(c: string): string | null {
+  const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(c);
+  if (m) return '#' + [m[1], m[2], m[3]].map((n) => Number(n).toString(16).padStart(2, '0')).join('');
+  return /^#[0-9a-f]{6}$/i.test(c) ? c.toLowerCase() : null;
+}
+
+function mergeColors(results) {
+  const base = results[0].colors;
+
+  // Pool all palette entries with their source page index
+  const allColors = [];
+  results.forEach((r, pageIdx) => {
+    (r.colors?.palette || []).forEach(c => {
+      allColors.push({ ...c, _pageIdx: pageIdx });
+    });
+  });
+
+  // Perceptual dedup across all pages
+  const merged = [];
+  const used = new Set();
+
+  for (let i = 0; i < allColors.length; i++) {
+    if (used.has(i)) continue;
+
+    const c = allColors[i];
+    const similar = [c];
+    const pagesSeen = new Set([c._pageIdx]);
+
+    for (let j = i + 1; j < allColors.length; j++) {
+      if (used.has(j)) continue;
+      try {
+        if (deltaE(c.normalized, allColors[j].normalized) < DELTA_E_THRESHOLD) {
+          similar.push(allColors[j]);
+          pagesSeen.add(allColors[j]._pageIdx);
+          used.add(j);
+        }
+      } catch { /* skip unparseable colors */ }
+    }
+    used.add(i);
+
+    // The elected primary stays canonical for its cluster even when a shade counts higher.
+    const primaryNorm = base.semantic?.primary ? normalizeHex(base.semantic.primary) : null;
+    const best = similar.find((x) => primaryNorm && x.normalized === primaryNorm)
+      ?? similar.sort((a, b) => b.count - a.count)[0];
+    const totalCount = similar.reduce((s, x) => s + (x.count || 0), 0);
+    const pageCount = pagesSeen.size;
+
+    // Boost confidence when color appears on multiple pages
+    let confidence = best.confidence;
+    if (pageCount > 1 && confidence === 'low') confidence = 'medium';
+    if (pageCount > 2 && confidence === 'medium') confidence = 'high';
+
+    const { _pageIdx, ...clean } = best;
+    merged.push({ ...clean, count: totalCount, confidence, pageCount });
+  }
+
+  // Semantic: homepage wins, fill missing from other pages; evidence follows the page that supplied the value
+  const semantic = { ...base.semantic };
+  const semanticEvidence = { ...base.semanticEvidence };
+  for (let i = 1; i < results.length; i++) {
+    const s = results[i].colors?.semantic || {};
+    for (const [k, v] of Object.entries(s)) {
+      if (semantic[k] || !v) continue;
+      semantic[k] = v;
+      const ev = results[i].colors?.semanticEvidence?.[k];
+      if (ev) semanticEvidence[k] = ev;
+    }
+  }
+
+  const occurrenceMap = new Map<string, ColorOccurrence>();
+  results.forEach((r) => {
+    (r.colors?.occurrences || []).forEach((o) => {
+      const key = `${o.hex}|${o.paints}`;
+      const row = occurrenceMap.get(key);
+      if (row) { row.count += o.count; row.area += o.area; }
+      else occurrenceMap.set(key, { ...o });
+    });
+  });
+  const occurrences = Array.from(occurrenceMap.values())
+    .sort((a, b) => b.count - a.count || a.hex.localeCompare(b.hex) || a.paints.localeCompare(b.paints));
+
+  // CSS variables: union, first occurrence wins
+  const cssVariables: Record<string, any> = {};
+  results.forEach(r => {
+    const vars = r.colors?.cssVariables || {};
+    for (const [k, v] of Object.entries(vars)) {
+      if (!(k in cssVariables)) cssVariables[k] = v;
+    }
+  });
+
+  return {
+    ...base,
+    semantic,
+    ...(Object.keys(semanticEvidence).length ? { semanticEvidence } : {}),
+    ...(occurrences.length ? { occurrences } : {}),
+    palette: merged,
+    cssVariables,
+  };
+}
+
+function mergeTypography(results) {
+  const base = results[0].typography || {};
+
+  // Dedup styles by (family, size, weight) tuple, sum counts
+  const styleMap = new Map();
+  const stylePages = new Map<string, Set<number>>();
+  results.forEach((r, pageIdx) => {
+    (r.typography?.styles || []).forEach(s => {
+      const key = `${s.family}|${s.size}|${s.weight}`;
+      if (!styleMap.has(key)) {
+        styleMap.set(key, { ...s, count: 1, pageCount: 1 });
+        stylePages.set(key, new Set([pageIdx]));
+      } else {
+        styleMap.get(key).count++;
+        stylePages.get(key).add(pageIdx);
+        styleMap.get(key).pageCount = stylePages.get(key).size;
+      }
+    });
+  });
+
+  // Merge sources. variableAxes is an array of objects, so the generic Set
+  // union below would not dedupe it by axis — handle it explicitly afterwards.
+  const sources = { ...(base.sources || {}) };
+  results.slice(1).forEach(r => {
+    const s = r.typography?.sources || {};
+    for (const [k, v] of Object.entries(s)) {
+      if (k === 'variableAxes') continue; // merged separately, by axis
+      if (Array.isArray(v)) {
+        const union = [...new Set([...(sources[k] || []), ...v])];
+        // Font URLs are sorted per page. Sorting the union too keeps a merged
+        // multi-page run byte-identical regardless of which page contributed
+        // which asset; page order must not show up in the output.
+        sources[k] = k === 'urls' ? union.sort() : union;
+      } else if (v && !sources[k]) {
+        sources[k] = v;
+      }
+    }
+  });
+
+  // Variable-font axes: union by axis across all pages, widening each range.
+  const axisMap = new Map();
+  results.forEach(r => {
+    (r.typography?.sources?.variableAxes || []).forEach(a => {
+      const existing = axisMap.get(a.axis);
+      if (!existing) {
+        axisMap.set(a.axis, { ...a });
+      } else {
+        existing.min = Math.min(existing.min, a.min);
+        existing.max = Math.max(existing.max, a.max);
+        existing.count += a.count;
+      }
+    });
+  });
+  if (axisMap.size > 0) {
+    sources.variableAxes = [...axisMap.values()].sort((a, b) => b.count - a.count);
+  }
+
+  const styles = [...styleMap.values()].sort((a, b) => parseFloat(b.size) - parseFloat(a.size));
+  return { ...base, styles, sources };
+}
+
+/**
+ * Fingerprint a component by its visual properties.
+ * Buttons and links have states.default; badges have top-level props.
+ */
+function fingerprintComponent(c) {
+  const base = c.states?.default || c;
+  return [
+    base.backgroundColor || '', base.color || '', base.borderRadius || '',
+    base.fontSize || '', base.fontWeight || '', base.border || ''
+  ].join('|');
+}
+
+function mergeComponentArray(arrays) {
+  const map = new Map();
+  arrays.flat().forEach(item => {
+    const key = fingerprintComponent(item);
+    if (!map.has(key)) {
+      map.set(key, { ...item, count: item.count || 1 });
+    } else {
+      map.get(key).count += (item.count || 1);
+    }
+  });
+  return [...map.values()].sort((a, b) => b.count - a.count);
+}
+
+/**
+ * Merge grouped component objects (inputs: {text,checkbox,...}, badges: {all,byVariant}).
+ * Preserves the grouping keys and merges each sub-array independently.
+ */
+function mergeComponentGroups(groupObjects) {
+  const grouped: Record<string, any> = {};
+  groupObjects.forEach(obj => {
+    if (!obj) return;
+    for (const [key, val] of Object.entries(obj)) {
+      if (Array.isArray(val)) {
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(val);
+      } else if (typeof val === 'object' && val !== null) {
+        // Nested groups like byVariant: { error: [], warning: [], ... }
+        if (!grouped[key]) grouped[key] = {};
+        for (const [subKey, subArr] of Object.entries(val)) {
+          if (Array.isArray(subArr)) {
+            if (!grouped[key][subKey]) grouped[key][subKey] = [];
+            grouped[key][subKey].push(subArr);
+          }
+        }
+      }
+    }
+  });
+
+  const merged: Record<string, any> = {};
+  for (const [key, val] of Object.entries(grouped)) {
+    if (Array.isArray(val)) {
+      merged[key] = mergeComponentArray(val);
+    } else {
+      // Nested groups
+      merged[key] = {};
+      for (const [subKey, subArrays] of Object.entries(val)) {
+        merged[key][subKey] = mergeComponentArray(subArrays);
+      }
+    }
+  }
+  return merged;
+}
+
+function mergeComponents(results) {
+  return {
+    buttons: mergeComponentArray(results.map(r => r.components?.buttons || [])),
+    inputs:  mergeComponentGroups(results.map(r => r.components?.inputs).filter(Boolean)),
+    links:   mergeComponentArray(results.map(r => r.components?.links || [])),
+    badges:  mergeComponentGroups(results.map(r => r.components?.badges).filter(Boolean)),
+  };
+}
+
+function mergeValueArrays(results, getter, valueKey = 'value') {
+  const map = new Map();
+  results.forEach(r => {
+    (getter(r) || []).forEach(item => {
+      const key = item[valueKey];
+      if (!map.has(key)) {
+        map.set(key, { ...item, pageCount: 1 });
+      } else {
+        const e = map.get(key);
+        e.count = (e.count || 0) + (item.count || 1);
+        e.frequency = (e.frequency || 0) + (item.frequency || 0);
+        e.pageCount++;
+      }
+    });
+  });
+  return [...map.values()].sort((a, b) => (b.count || b.frequency || 0) - (a.count || a.frequency || 0));
+}
+
+function mergeSpacing(results) {
+  const base = results[0].spacing || {};
+  const values = mergeValueArrays(results, r => r.spacing?.commonValues, 'px');
+  return { ...base, commonValues: values };
+}
+
+function mergeBorderRadius(results) {
+  const base = results[0].borderRadius || {};
+  const values = mergeValueArrays(results, r => r.borderRadius?.values);
+  // Recompute confidence from aggregated count
+  for (const v of values) {
+    if (v.count > 10) v.confidence = 'high';
+    else if (v.count > 3) v.confidence = 'medium';
+  }
+  return { ...base, values };
+}
+
+function mergeBorders(results) {
+  const map = new Map();
+  results.forEach(r => {
+    (r.borders?.combinations || []).forEach(item => {
+      const key = `${item.width}|${item.style}|${item.color}`;
+      if (!map.has(key)) {
+        map.set(key, { ...item, elements: [...(item.elements || [])], pageCount: 1 });
+      } else {
+        const e = map.get(key);
+        e.count += (item.count || 1);
+        e.pageCount++;
+        const elementSet = new Set([...(e.elements || []), ...(item.elements || [])]);
+        e.elements = [...elementSet].slice(0, 5);
+        if (e.count > 10) e.confidence = 'high';
+        else if (e.count > 3) e.confidence = 'medium';
+      }
+    });
+  });
+  return {
+    combinations: [...map.values()].sort((a, b) => b.count - a.count),
+  };
+}
+
+function mergeShadows(results) {
+  const map = new Map();
+  results.forEach(r => {
+    (r.shadows || []).forEach(s => {
+      const key = s.shadow || s.value || JSON.stringify(s);
+      if (!map.has(key)) {
+        map.set(key, { ...s, count: s.count || 1, pageCount: 1 });
+      } else {
+        map.get(key).count += (s.count || 1);
+        map.get(key).pageCount++;
+      }
+    });
+  });
+  // Recompute confidence from aggregated count
+  for (const s of map.values()) {
+    if (s.count > 10) s.confidence = 'high';
+    else if (s.count > 3) s.confidence = 'medium';
+  }
+  return [...map.values()].sort((a, b) => b.count - a.count);
+}
+
+function mergeByName(results, getter) {
+  const byKey = new Map();
+  const trust = (item) => (item.confidence === 'high' ? 2 : item.confidence === 'medium' ? 1 : 0);
+  const detail = (item) => (item.version ? String(item.version).split('.').length : 0);
+  results.forEach(r => {
+    (getter(r) || []).forEach(item => {
+      const key = item.name || item.library || JSON.stringify(item);
+      const held = byKey.get(key);
+      if (!held) { byKey.set(key, item); return; }
+      const better = trust(item) > trust(held) || (trust(item) === trust(held) && detail(item) > detail(held));
+      const [best, other] = better ? [item, held] : [held, item];
+      const version = best.version ?? other.version;
+      const coverage = Math.max(held.coverage ?? -1, item.coverage ?? -1);
+      byKey.set(key, { ...best, ...(version ? { version } : {}), ...(coverage >= 0 ? { coverage } : {}) });
+    });
+  });
+  return [...byKey.values()];
+}
+
+function mergeGradients(results) {
+  const map = new Map();
+  results.forEach(r => {
+    (r.gradients || []).forEach(g => {
+      const key = g.gradient;
+      if (!map.has(key)) {
+        map.set(key, { ...g });
+      } else {
+        map.get(key).count += (g.count || 1);
+      }
+    });
+  });
+  return [...map.values()].sort((a, b) => b.count - a.count);
+}
+
+function mergeMotion(results) {
+  const base = results[0].motion || { durations: [], easings: [], animations: [], contexts: {}, interactiveDeltas: [] };
+
+  const durationMap = new Map();
+  results.forEach(r => {
+    (r.motion?.durations || []).forEach(d => {
+      if (!durationMap.has(d.value)) durationMap.set(d.value, { ...d });
+      else durationMap.get(d.value).count += (d.count || 1);
+    });
+  });
+
+  const easingMap = new Map();
+  results.forEach(r => {
+    (r.motion?.easings || []).forEach(e => {
+      if (!easingMap.has(e.value)) easingMap.set(e.value, { ...e });
+      else easingMap.get(e.value).count += (e.count || 1);
+    });
+  });
+
+  const animMap = new Map();
+  results.forEach(r => {
+    (r.motion?.animations || []).forEach(a => {
+      if (!animMap.has(a.name || a.value)) animMap.set(a.name || a.value, { ...a });
+      else animMap.get(a.name || a.value).count += (a.count || 1);
+    });
+  });
+
+  return {
+    ...base,
+    durations: [...durationMap.values()].sort((a, b) => a.ms - b.ms),
+    easings: [...easingMap.values()].sort((a, b) => b.count - a.count).slice(0, 8),
+    animations: [...animMap.values()].sort((a, b) => b.count - a.count).slice(0, 8),
+  };
+}
+
+/**
+ * Union of WCAG pairs across pages. Identical pairs produce identical grades,
+ * so dedupe is by pair identity (order-insensitive fg/bg for static pairs,
+ * plus state/tag for interactive state pairs) with counts summed. Static pairs
+ * keep the single-page contract: sorted by count desc, capped at 50, state
+ * pairs appended after.
+ */
+function mergeWcag(results) {
+  const map = new Map();
+  for (const r of results) {
+    for (const p of r.wcag || []) {
+      // Size class is part of the identity: the same colour pair carries a
+      // different threshold as body text and as a heading.
+      const size = p.large === undefined ? '' : `|${p.large ? 'lg' : 'sm'}`;
+      const key = p.source === 'state'
+        ? `state|${p.state}|${p.tag}|${p.fg}|${p.bg}${size}`
+        : `static|${[p.fg, p.bg].sort().join('/')}${size}`;
+      const entry = map.get(key);
+      if (!entry) {
+        map.set(key, { ...p });
+      } else {
+        if (p.count != null) entry.count = (entry.count ?? 0) + p.count;
+        // Report the smallest occurrence across pages: it is closest to failing.
+        if (p.fontSize != null && (entry.fontSize == null || p.fontSize < entry.fontSize)) {
+          entry.fontSize = p.fontSize;
+          entry.fontWeight = p.fontWeight;
+        }
+      }
+    }
+  }
+  const all = [...map.values()];
+  const statics = all
+    .filter(p => !p.source)
+    .sort((a, b) => (b.count ?? 0) - (a.count ?? 0))
+    .slice(0, 50);
+  return [...statics, ...all.filter(p => p.source === 'state')];
+}
+
+/**
+ * All pages' voice fragments, deduplicated and rebudgeted as one corpus.
+ *
+ * Root `voice` deliberately stays the homepage's own further down: a metric
+ * like mean sentence length genuinely should not be averaged across a
+ * marketing page and a docs page, it would describe neither. Fragments are a
+ * different kind of thing. A quote is evidence regardless of which page
+ * carried it, and a homepage that is mostly nav chrome starves any reader
+ * that classifies brand voice from a handful of fragments -- exactly what a
+ * category-heavy site like an e-commerce homepage does to a one-page voice
+ * sample. Recomputing metrics from the merged corpus (not averaging two
+ * numbers) keeps every structural stat internally consistent.
+ *
+ * Returns null rather than a hollow object when nothing survives: a caller
+ * checking `voiceAllPages` should not have to also check `fragments.length`.
+ */
+function mergeVoice(results) {
+  const withVoice = results.filter((r) => r.voice && r.voice.fragments && r.voice.fragments.length);
+  if (withVoice.length === 0) return null;
+
+  const seen = new Set();
+  const fragments = [];
+  for (const r of withVoice) {
+    for (const f of r.voice.fragments) {
+      const key = `${f.role}|${f.text.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      fragments.push({ ...f, page: r.url });
+    }
+  }
+  if (fragments.length === 0) return null;
+
+  // The homepage's classification stands for the merged budget too: it is
+  // usually the most representative single page, and a budget has to pick one
+  // cap rather than average several.
+  const pageType = withVoice[0].voice.pageType;
+  const lang = withVoice[0].voice.metrics.lang;
+  const budgeted = applyBudget(fragments, pageType);
+  const belowWordFloor = totalWords(fragments) < WORD_FLOOR;
+
+  return {
+    fragments: budgeted,
+    metrics: computeMetrics(budgeted, lang),
+    pageType,
+    ...(belowWordFloor ? { belowWordFloor: true } : {}),
+  };
+}
+
+/**
+ * Merge an array of per-page result objects into a single unified result.
+ * @param {Object[]} results - Array of extractBranding() result objects
+ * @returns {Object} Merged result with same shape as single-page result
+ */
+const COVERAGE_FAMILIES: [string, (m) => { pageCount?: number; scope?: TokenScope }[] | undefined, (v) => string][] = [
+  ['color', (m) => m.colors?.palette, (v) => v.normalized || v.color],
+  ['typography', (m) => m.typography?.styles, (v) => `${v.family} ${v.size}/${v.weight}`],
+  ['spacing', (m) => m.spacing?.commonValues, (v) => String(v.px)],
+  ['radius', (m) => m.borderRadius?.values, (v) => String(v.value)],
+  ['border', (m) => m.borders?.combinations, (v) => `${v.width} ${v.style} ${v.color}`],
+  ['shadow', (m) => m.shadows, (v) => v.shadow || v.value],
+];
+
+/** Tags every merged value with its scope and sums the crawl's agreement. */
+function attachCoverage(merged, totalPages: number) {
+  const entries = [];
+  for (const [family, getter, nameOf] of COVERAGE_FAMILIES) {
+    for (const value of getter(merged) || []) {
+      if (!value.pageCount) continue;
+      value.scope = scopeOf(value.pageCount, totalPages);
+      entries.push(coverageEntry(family, nameOf(value), value.pageCount, totalPages));
+    }
+  }
+  const coverage = summarizeCoverage(entries, totalPages);
+  return coverage ? { coverage } : {};
+}
+
+export function mergeResults(results) {
+  if (results.length === 0) throw new Error('No results to merge');
+  if (results.length === 1) return results[0];
+
+  const home = results[0];
+
+  const merged = {
+    colors: mergeColors(results),
+    typography: mergeTypography(results),
+    spacing: mergeSpacing(results),
+    borderRadius: mergeBorderRadius(results),
+    borders: mergeBorders(results),
+    shadows: mergeShadows(results),
+  };
+
+  return {
+    url: home.url,
+    extractedAt: home.extractedAt,
+    ...mergeMeta(results),
+    siteName: home.siteName,
+    logo: home.logo,
+    favicons: home.favicons,
+    ...merged,
+    ...attachCoverage(merged, results.length),
+    gradients: mergeGradients(results),
+    motion: mergeMotion(results),
+    components: mergeComponents(results),
+    breakpoints: [
+      ...new Map(
+        results.flatMap(r => r.breakpoints || []).map(b => [b.px, b])
+      ).values()
+    ].sort((a: any, b: any) => parseInt(b.px) - parseInt(a.px)),
+    iconSystem: mergeByName(results, r => r.iconSystem),
+    frameworks: mergeByName(results, r => r.frameworks),
+    ...(results.some(r => r.wcag) ? { wcag: mergeWcag(results) } : {}),
+    // Metrics are not merged: the variation between pages is the signal. Root
+    // keeps the homepage's own, each page keeps its own, as with rawColors.
+    ...(home.voice !== undefined ? { voice: home.voice } : {}),
+    ...(home.voiceSkipped ? { voiceSkipped: home.voiceSkipped } : {}),
+    // Fragments are merged, deduplicated and rebudgeted across every page that
+    // yielded voice: see mergeVoice above for why this is a separate field
+    // from `voice` rather than a replacement for it.
+    ...(results.some((r) => r.voice !== undefined) ? { voiceAllPages: mergeVoice(results) } : {}),
+    // rawColors are per-page filter diagnostics: merging them would destroy the
+    // page provenance they exist for, so each page keeps its own set here.
+    // colors.rawColors stays the first page's (via mergeColors) for back-compat.
+    pages: results.map(r => ({
+      url: r.url,
+      extractedAt: r.extractedAt,
+      ...(r.colors?.rawColors ? { rawColors: r.colors.rawColors } : {}),
+      ...(r.voice !== undefined ? { voice: r.voice } : {}),
+      ...(r.voiceSkipped ? { voiceSkipped: r.voiceSkipped } : {}),
+    })),
+  };
+}

@@ -1,0 +1,606 @@
+use super::{Alloc, BucketHdr, Slab, Uma, UmaBucket, UmaFlags, UmaKeg};
+use crate::context::{CpuLocal, config, current_thread};
+use crate::lock::Mutex;
+use crate::mem::Strong;
+use crate::vm::Vm;
+use alloc::collections::VecDeque;
+use alloc::collections::linked_list::LinkedList;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+use core::cmp::min;
+use core::num::NonZero;
+use core::ops::DerefMut;
+use core::pin::Pin;
+use core::ptr::{NonNull, null_mut};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Implementation of `uma_zone` structure.
+pub struct UmaZone {
+    bucket_enable: Arc<AtomicBool>,
+    bucket_keys: Arc<Vec<usize>>,
+    bucket_zones: Arc<Vec<UmaZone>>,
+    ty: ZoneType,
+    size: NonZero<usize>,                                              // uz_size
+    slab: unsafe fn(&Arc<UmaKeg>, Alloc) -> Option<Pin<Strong<Slab>>>, // uz_slab
+    init: Option<fn(*mut u8, NonZero<usize>, Alloc) -> bool>,          // uz_init
+    ctor: Option<fn(*mut u8, NonZero<usize>, Alloc) -> bool>,          // uz_ctor
+    dtor: Option<fn()>,                                                // uz_dtor
+    caches: CpuLocal<RefCell<UmaCache>>,                               // uz_cpu
+    state: Mutex<ZoneState>,
+}
+
+impl UmaZone {
+    const ALIGN_CACHE: usize = 63; // uma_align_cache
+
+    /// See `zone_ctor` on Orbis for a reference.
+    ///
+    /// # Reference offsets
+    /// | Version | Offset |
+    /// |---------|--------|
+    /// |PS4 11.00|0x13D490|
+    pub(super) fn new(
+        vm: &'static Vm,
+        bucket_enable: Arc<AtomicBool>,
+        bucket_keys: Arc<Vec<usize>>,
+        bucket_zones: Arc<Vec<UmaZone>>,
+        args: ZoneArgs,
+    ) -> Self {
+        let name = args.name;
+        let flags = args.flags;
+        let (keg, mut flags) = if flags.has_any(UmaFlags::Secondary) {
+            todo!()
+        } else {
+            // We use a different approach here to make it idiomatic to Rust. On Orbis it will
+            // construct a keg here if it is passed from the caller. If not it will allocate a new
+            // keg from masterzone_k.
+            let keg = match args.keg {
+                Some(v) => v,
+                None => UmaKeg::new(
+                    vm,
+                    args.size,
+                    args.align.unwrap_or(Self::ALIGN_CACHE),
+                    args.init,
+                    flags,
+                ),
+            };
+
+            (keg, UmaFlags::zeroed())
+        };
+
+        // Get type and uz_count.
+        let mut ty = ZoneType::Other;
+        let mut count = 0;
+
+        if !keg.flags().has_any(UmaFlags::Internal) {
+            count = if !keg.flags().has_any(UmaFlags::MaxBucket) {
+                min(keg.item_per_slab(), Uma::BUCKET_MAX)
+            } else {
+                Uma::BUCKET_MAX
+            };
+
+            match name.as_str() {
+                "mbuf_packet" => {
+                    ty = ZoneType::MbufPacket;
+                    count = 4;
+                }
+                "mbuf_cluster_pack" => {
+                    ty = ZoneType::MbufClusterPack;
+                    count = Uma::BUCKET_MAX;
+                }
+                "mbuf_jumbo_page" => {
+                    ty = ZoneType::MbufJumboPage;
+                    count = 1;
+                }
+                "mbuf" => {
+                    ty = ZoneType::Mbuf;
+                    count = 16;
+                }
+                "mbuf_cluster" => {
+                    ty = ZoneType::MbufCluster;
+                    count = 1;
+                }
+                _ => (),
+            }
+        }
+
+        // Construct uma_zone.
+        let inherit = UmaFlags::Offpage
+            | UmaFlags::Malloc
+            | UmaFlags::Hash
+            | UmaFlags::VToSlab
+            | UmaFlags::Bucket
+            | UmaFlags::Internal
+            | UmaFlags::CacheOnly;
+
+        flags |= keg.flags() & inherit;
+
+        Self {
+            bucket_enable,
+            bucket_keys,
+            bucket_zones,
+            ty,
+            size: keg.size(),
+            slab: Self::fetch_slab,
+            init: None,
+            ctor: args.ctor,
+            dtor: args.dtor,
+            caches: CpuLocal::new(|_| RefCell::default()),
+            state: Mutex::new(ZoneState {
+                kegs: LinkedList::from([keg]),
+                full_buckets: VecDeque::default(),
+                free_buckets: VecDeque::default(),
+                alloc_count: 0,
+                free_count: 0,
+                count,
+                fills: 0,
+                flags,
+            }),
+        }
+    }
+
+    pub fn size(&self) -> NonZero<usize> {
+        self.size
+    }
+
+    /// See `uma_zalloc_arg` on the Orbis for a reference.
+    ///
+    /// # Reference offsets
+    /// | Version | Offset |
+    /// |---------|--------|
+    /// |PS4 11.00|0x13E750|
+    pub fn alloc(&self, flags: Alloc) -> *mut u8 {
+        if flags.has_any(Alloc::Wait) {
+            // TODO: The Orbis also modify td_pflags on a certain condition.
+            let td = current_thread();
+
+            if !td.can_sleep() {
+                panic!("attempt to do waitable heap allocation in a non-sleeping context");
+            }
+        }
+
+        let m = loop {
+            // Try allocate from per-CPU cache first so we don't need to acquire a mutex lock.
+            let caches = self.caches.lock();
+            let mem = Self::alloc_from_cache(caches.borrow_mut().deref_mut());
+
+            if !mem.is_null() {
+                break mem;
+            }
+
+            drop(caches); // Exit from non-sleeping context before acquire the mutex.
+
+            // Cache not found, allocate from the zone. We need to re-check the cache again because
+            // we may on a different CPU since we drop the CPU pinning on the above.
+            let mut state = self.state.lock();
+            let caches = self.caches.lock();
+            let mut cache = caches.borrow_mut();
+            let mem = Self::alloc_from_cache(&mut cache);
+
+            if !mem.is_null() {
+                break mem;
+            }
+
+            // TODO: What actually we are doing here?
+            state.alloc_count += core::mem::take(&mut cache.allocs);
+            state.free_count += core::mem::take(&mut cache.frees);
+
+            if let Some(b) = cache.alloc.take() {
+                state.free_buckets.push_front(b);
+            }
+
+            if let Some(b) = state.full_buckets.pop_front() {
+                cache.alloc = Some(b);
+
+                // Seems like this should never fail.
+                let m = Self::alloc_from_cache(&mut cache);
+
+                debug_assert!(!m.is_null());
+
+                break m;
+            }
+
+            drop(cache);
+            drop(caches);
+
+            // TODO: What is this?
+            if matches!(
+                self.ty,
+                ZoneType::MbufPacket
+                    | ZoneType::MbufJumboPage
+                    | ZoneType::Mbuf
+                    | ZoneType::MbufCluster
+            ) {
+                if flags.has_any(Alloc::Wait) {
+                    todo!()
+                }
+
+                todo!()
+            }
+
+            // TODO: What is this?
+            if !matches!(
+                self.ty,
+                ZoneType::MbufCluster
+                    | ZoneType::Mbuf
+                    | ZoneType::MbufJumboPage
+                    | ZoneType::MbufPacket
+                    | ZoneType::MbufClusterPack
+            ) && state.count < Uma::BUCKET_MAX
+            {
+                state.count += 1;
+            }
+
+            if self.alloc_bucket(&mut state, flags) {
+                return self.alloc_item(&mut state, flags);
+            }
+        };
+
+        // The Orbis apply M_ZERO after calling uz_ctor, which seems like a bug.
+        if flags.has_any(Alloc::Zero) {
+            unsafe { m.write_bytes(0, self.size.get()) };
+        }
+
+        if self.ctor.is_none_or(move |f| f(m, self.size, flags)) {
+            m
+        } else {
+            todo!()
+        }
+    }
+
+    /// See `uma_zfree_arg` on the Orbis for a reference.
+    ///
+    /// # Safety
+    /// `item` either allocated from [Self::alloc()] or null.
+    ///
+    /// # Reference offsets
+    /// | Version | Offset |
+    /// |---------|--------|
+    /// |PS4 11.00|0x13EFC0|
+    pub unsafe fn free(&self, item: *mut u8) {
+        if item.is_null() {
+            return;
+        } else if self.dtor.is_some() {
+            todo!()
+        }
+
+        // Check zone type.
+        let mut state = self.state.lock();
+
+        if self.ty != ZoneType::MbufPacket
+            && self.ty != ZoneType::MbufClusterPack
+            && self.ty != ZoneType::MbufJumboPage
+            && self.ty != ZoneType::Mbuf
+            && self.ty != ZoneType::MbufCluster
+            && state.flags.has_any(UmaFlags::Full)
+        {
+            todo!()
+        }
+
+        // TODO: The uz_flags check on above defeat below optimization. On Orbis they did not put
+        // uz_flags behind a uz_lock.
+        let mut caches = self.caches.lock();
+        let mut cache = caches.borrow_mut();
+
+        loop {
+            while let Some(b) = cache.free.map(|mut v| unsafe { v.as_mut() }) {
+                loop {
+                    // Check if bucket has available space.
+                    let n = if matches!(
+                        self.ty,
+                        ZoneType::MbufCluster
+                            | ZoneType::Mbuf
+                            | ZoneType::MbufJumboPage
+                            | ZoneType::MbufClusterPack
+                            | ZoneType::MbufPacket
+                    ) {
+                        todo!()
+                    } else {
+                        b.items.len()
+                    };
+
+                    if let i = b.hdr.len
+                        && i < n
+                    {
+                        b.items[i] = item;
+                        b.hdr.len = i + 1;
+
+                        cache.frees += 1;
+
+                        if self.ty != ZoneType::MbufPacket
+                            && self.ty != ZoneType::MbufJumboPage
+                            && self.ty != ZoneType::Mbuf
+                            && self.ty != ZoneType::MbufCluster
+                        {
+                            return;
+                        }
+
+                        todo!()
+                    }
+
+                    todo!()
+                }
+            }
+
+            state.alloc_count += core::mem::take(&mut cache.allocs);
+            state.free_count += core::mem::take(&mut cache.frees);
+
+            if cache.free.take().is_some() {
+                todo!()
+            }
+
+            if let Some(b) = state.free_buckets.pop_front() {
+                cache.free = Some(b);
+                continue;
+            }
+
+            drop(cache);
+            drop(caches);
+
+            if !self.bucket_enable.load(Ordering::Relaxed) {
+                todo!()
+            }
+
+            // Get bucket zone.
+            let i = (state.count + 15) >> Uma::BUCKET_SHIFT;
+            let k = self.bucket_keys[i];
+            let b = &self.bucket_zones[k];
+            let f = Alloc::from((u32::from(state.flags) >> 31) << 9); // TODO: Refactor this.
+
+            drop(state);
+
+            // Alloc a bucket. The Orbis does not force M_ZERO here but we do the opposite to
+            // eliminate the chance of dangling pointer in bucket items.
+            let b = b.alloc_item(&mut b.state.lock(), f | Alloc::Zero | Alloc::NoWait);
+
+            if b.is_null() {
+                todo!()
+            }
+
+            // Initialize bucket.
+            let h = BucketHdr { len: 0 };
+            let b = unsafe {
+                core::ptr::write(b.cast(), h);
+                core::ptr::slice_from_raw_parts_mut(b, Uma::BUCKET_SIZES[k]) as *mut UmaBucket
+            };
+
+            // Add to free list.
+            state = self.state.lock();
+            state
+                .free_buckets
+                .push_front(unsafe { NonNull::new_unchecked(b) });
+
+            caches = self.caches.lock();
+            cache = caches.borrow_mut();
+        }
+    }
+
+    fn alloc_from_cache(c: &mut UmaCache) -> *mut u8 {
+        while let Some(b) = c.alloc.map(|v| v.as_ptr()) {
+            if let Some(v) = unsafe { (*b).hdr.len.checked_sub(1) } {
+                unsafe { (*b).hdr.len = v };
+
+                c.allocs += 1;
+
+                return unsafe { (*b).items[v] };
+            }
+
+            if c.free
+                .map(|v| v.as_ptr())
+                .is_some_and(|b| unsafe { (*b).hdr.len != 0 })
+            {
+                core::mem::swap(&mut c.alloc, &mut c.free);
+                continue;
+            }
+
+            break;
+        }
+
+        null_mut()
+    }
+
+    /// See `zone_alloc_bucket` on the Orbis for a reference.
+    ///
+    /// # Reference offsets
+    /// | Version | Offset |
+    /// |---------|--------|
+    /// |PS4 11.00|0x13EBA0|
+    fn alloc_bucket(&self, state: &mut ZoneState, flags: Alloc) -> bool {
+        // Get bucket.
+        let b = match state.free_buckets.front() {
+            Some(_) => todo!(),
+            None => {
+                if self.bucket_enable.load(Ordering::Relaxed) {
+                    // Get allocation flags. On Orbis it will remove M_ZERO from the flags but we do
+                    // the opposite to eliminate the chance of dangling pointer in bucket items.
+                    let mut flags = flags | Alloc::Zero;
+
+                    if state.flags.has_any(UmaFlags::CacheOnly) {
+                        flags |= Alloc::NoVm;
+                    }
+
+                    // Alloc a bucket.
+                    let i = (state.count + 15) >> Uma::BUCKET_SHIFT;
+                    let k = self.bucket_keys[i];
+                    let b = &self.bucket_zones[k];
+                    let b = b.alloc_item(&mut b.state.lock(), flags);
+
+                    if b.is_null() {
+                        todo!()
+                    }
+
+                    // Initialize bucket.
+                    let h = BucketHdr { len: 0 };
+                    let s = Uma::BUCKET_SIZES[k];
+
+                    unsafe {
+                        core::ptr::write(b.cast(), h);
+                        core::ptr::slice_from_raw_parts_mut(b, s) as *mut UmaBucket
+                    }
+                } else {
+                    todo!()
+                }
+            }
+        };
+
+        // SAFETY: We have exclusive access to the bucket.
+        let b = unsafe { &mut *b };
+
+        if state.fills < config().cpu_count().get().into() {
+            let n = min(b.items.len(), state.count);
+            let k = state.kegs.front().unwrap();
+            let mut f = flags;
+
+            state.fills += 1;
+
+            while b.hdr.len < n {
+                let s = match unsafe { (self.slab)(k, f) } {
+                    Some(v) => v,
+                    None => todo!(),
+                };
+
+                while b.hdr.len < n {
+                    let i = s.alloc_item();
+
+                    if i.is_null() {
+                        break;
+                    }
+
+                    b.items[b.hdr.len] = i;
+                    b.hdr.len += 1;
+                }
+
+                f |= Alloc::NoWait;
+            }
+
+            if self.init.is_some() {
+                todo!()
+            }
+
+            state.fills -= 1;
+
+            if b.hdr.len != 0 {
+                state
+                    .full_buckets
+                    .push_front(unsafe { NonNull::new_unchecked(b) });
+
+                return true;
+            }
+
+            todo!()
+        }
+
+        todo!()
+    }
+
+    /// See `zone_alloc_item` on the Orbis for a reference.
+    ///
+    /// # Reference offsets
+    /// | Version | Offset |
+    /// |---------|--------|
+    /// |PS4 11.00|0x13DD50|
+    fn alloc_item(&self, state: &mut ZoneState, flags: Alloc) -> *mut u8 {
+        // Get a slab.
+        let keg = state.kegs.front().unwrap();
+        let slab = unsafe { (self.slab)(keg, flags) };
+
+        if let Some(slab) = slab {
+            let item = slab.alloc_item();
+
+            state.alloc_count += 1;
+
+            if self.init.is_none_or(|f| f(item, self.size, flags)) {
+                if self.ctor.is_none_or(|f| f(item, self.size, flags)) {
+                    if flags.has_any(Alloc::Zero) {
+                        unsafe { item.write_bytes(0, self.size.get()) };
+                    }
+
+                    return item;
+                } else {
+                    todo!()
+                }
+            } else {
+                todo!()
+            }
+        }
+
+        todo!()
+    }
+
+    /// See `zone_fetch_slab` on the Orbis for a reference.
+    ///
+    /// # Reference offsets
+    /// | Version | Offset |
+    /// |---------|--------|
+    /// |PS4 11.00|0x141DB0|
+    unsafe fn fetch_slab(keg: &Arc<UmaKeg>, flags: Alloc) -> Option<Pin<Strong<Slab>>> {
+        if !keg.flags().has_any(UmaFlags::Bucket) || keg.recurse() == 0 {
+            loop {
+                if let Some(v) = unsafe { keg.fetch_slab(flags) } {
+                    return Some(v);
+                }
+
+                if flags.has_any(Alloc::NoWait | Alloc::NoVm) {
+                    break;
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// Contains mutable data for [UmaZone].
+struct ZoneState {
+    kegs: LinkedList<Arc<UmaKeg>>,              // uz_kegs + uz_klink
+    full_buckets: VecDeque<NonNull<UmaBucket>>, // uz_full_bucket
+    free_buckets: VecDeque<NonNull<UmaBucket>>, // uz_free_bucket
+    alloc_count: u64,                           // uz_allocs
+    free_count: u64,                            // uz_frees
+    count: usize,                               // uz_count
+    fills: u16,                                 // uz_fills
+    flags: UmaFlags,                            // uz_flags
+}
+
+unsafe impl Send for ZoneState {}
+
+/// Type of [UmaZone].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZoneType {
+    Other,
+    /// `zone_pack`.
+    MbufPacket,
+    /// `zone_jumbop`.
+    MbufJumboPage,
+    /// `zone_mbuf`.
+    Mbuf,
+    /// `zone_clust`.
+    MbufCluster,
+    /// `zone_clust_pack`.
+    MbufClusterPack,
+}
+
+/// Implementation of `uma_cache` structure.
+#[derive(Default)]
+struct UmaCache {
+    alloc: Option<NonNull<UmaBucket>>, // uc_allocbucket
+    /// The pointer must be unique.
+    free: Option<NonNull<UmaBucket>>, // uc_freebucket
+    allocs: u64,                       // uc_allocs
+    frees: u64,                        // uc_frees
+}
+
+unsafe impl Send for UmaCache {}
+
+/// Implementation of `uma_zctor_args` structure.
+pub struct ZoneArgs {
+    pub name: String,                                             // name
+    pub keg: Option<Arc<UmaKeg>>,                                 // keg
+    pub size: NonZero<usize>,                                     // size
+    pub align: Option<usize>,                                     // align
+    pub init: Option<fn()>,                                       // uminit
+    pub ctor: Option<fn(*mut u8, NonZero<usize>, Alloc) -> bool>, // ctor
+    pub dtor: Option<fn()>,                                       // dtor
+    pub flags: UmaFlags,                                          // flags
+}

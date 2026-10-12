@@ -1,0 +1,652 @@
+#!/usr/bin/env bash
+
+# Planning by Lee Baird (@discoverscripts)
+# Coded by Grok (xAI)
+#
+# Open an existing Discover report for additional testing.
+# Sets the current engagement so future host-scan launches know the report root.
+# Client ZIPs are separate exports; this path is always operator mode on the live tree.
+
+# Colors / separators: inherit from Discover when launched from the menu.
+BLUE=${BLUE:-'\033[1;34m'}
+YELLOW=${YELLOW:-'\033[1;33m'}
+RED=${RED:-'\033[1;31m'}
+NC=${NC:-'\033[0m'}
+SMALL=${SMALL:-'========================================'}
+MEDIUM=${MEDIUM:-'=================================================================='}
+
+if ! declare -F f_banner >/dev/null 2>&1; then
+    f_banner(){ echo; }
+fi
+
+f_import_report_die(){
+    echo
+    echo -e "${RED}$SMALL${NC}"
+    echo
+    echo -e "${RED}[!] $1${NC}"
+    echo
+    echo -e "${RED}$SMALL${NC}"
+    echo
+    sleep 2
+    exit 1
+}
+
+f_import_report_warn(){
+    echo -e "${YELLOW}[!] $1${NC}"
+}
+
+# True if dir looks like a Discover engagement report root.
+f_import_report_is_report_dir(){
+    local dir="$1"
+
+    [ -n "$dir" ] || return 1
+    [ -d "$dir" ] || return 1
+    [ -r "$dir" ] || return 1
+    [ -x "$dir" ] || return 1
+    [ -d "$dir/pages" ] || return 1
+    [ -f "$dir/index.htm" ] || [ -f "$dir/pages/active.htm" ] || [ -f "$dir/pages/subdomains.htm" ] || [ -f "$dir/pages/passive.htm" ]
+}
+
+# Resolve Discover install root (for assets / helpers).
+f_import_report_discover_root(){
+
+    if [ -n "${DISCOVER:-}" ] && [ -d "$DISCOVER" ]; then
+        printf '%s' "$DISCOVER"
+        return 0
+    fi
+
+    if [ -f "$(dirname "$0")/../discover.sh" ]; then
+        (cd "$(dirname "$0")/.." && pwd)
+        return 0
+    fi
+
+    return 1
+}
+
+f_import_report_open_browser(){
+    local page="$1"
+
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$page" >/dev/null 2>&1 &
+        return 0
+    fi
+
+    if command -v sensible-browser >/dev/null 2>&1; then
+        sensible-browser "$page" >/dev/null 2>&1 &
+        return 0
+    fi
+
+    return 1
+}
+
+# Copy operator UI assets into an older engagement tree when missing/outdated.
+f_import_report_sync_assets(){
+    local report="$1"
+    local src_root="$2"
+    local src js
+
+    [ -n "$src_root" ] || return 0
+    src="$src_root/report/assets"
+    [ -d "$src" ] || return 0
+
+    mkdir -p "$report/assets/javascript" "$report/assets/css" 2>/dev/null || {
+        f_import_report_warn "Could not create report assets dirs (host-scan UI may be incomplete)."
+        return 1
+    }
+
+    for js in \
+        inc-host-scan.js \
+        inc-shodan.js \
+        inc-subdomains-filter.js \
+        inc-subdomains-ports.js \
+        inc-data-table.js \
+        inc-audit-status.js \
+        inc-active-cve-tabs.js \
+        inc-active-cve-search.js \
+        inc-active-status-codes.js \
+        inc-active-refresh.js \
+        inc-report-export.js \
+        inc-audit-import.js \
+        inc-audit-config.js \
+        inc-audit-line-delete.js \
+        inc-audit-log-filter.js \
+        inc-audit-metrics-range.js
+    do
+        if [ -f "$src/javascript/$js" ]; then
+            cp -f "$src/javascript/$js" "$report/assets/javascript/$js" 2>/dev/null || \
+                f_import_report_warn "Could not copy $js into report assets."
+        fi
+    done
+
+    # Column layout for filtered host-scan toggle + Shodan lives in modern.css
+    if [ -f "$src/css/modern.css" ]; then
+        cp -f "$src/css/modern.css" "$report/assets/css/modern.css" 2>/dev/null || \
+            f_import_report_warn "Could not copy modern.css into report assets."
+        # Bust browser cache on Subdomains after layout / host-scan / Shodan fixes.
+        if [ -f "$report/pages/names.htm" ]; then
+            sed -i \
+                -e 's|modern\.css?v=[^"]*|modern.css?v=names-phone4|g' \
+                -e 's|modern\.css"|modern.css?v=names-phone4"|g' \
+                "$report/pages/names.htm" 2>/dev/null || true
+        fi
+
+        if [ -f "$report/pages/subdomains.htm" ]; then
+            sed -i \
+                -e 's|modern\.css?v=[^"]*|modern.css?v=ws-ports13|g' \
+                -e 's|inc-host-scan\.js?v=[0-9]*|inc-host-scan.js?v=75|g' \
+                -e 's|inc-subdomains-filter\.js?v=[0-9]*|inc-subdomains-filter.js?v=22|g' \
+                -e 's|inc-shodan\.js?v=[0-9]*|inc-shodan.js?v=19|g' \
+                -e 's|inc-subdomains-ports\.js?v=[0-9]*|inc-subdomains-ports.js?v=12|g' \
+                "$report/pages/subdomains.htm" 2>/dev/null || true
+            if ! grep -q 'inc-subdomains-ports.js' "$report/pages/subdomains.htm" 2>/dev/null; then
+                sed -i 's|</body>|<script src="../assets/javascript/inc-subdomains-ports.js?v=12"></script>\n</body>|' \
+                    "$report/pages/subdomains.htm" 2>/dev/null || true
+            fi
+        fi
+
+        # Report section pages: Export UI + CSS bust
+        for page in passive.htm active.htm audit.htm; do
+            if [ -f "$report/pages/$page" ]; then
+                sed -i \
+                    -e 's|modern\.css?v=[^"]*|modern.css?v=active-login-view3|g' \
+                    -e 's|inc-report-export\.js?v=[0-9]*|inc-report-export.js?v=5|g' \
+                    -e 's|inc-audit-import\.js?v=[0-9]*|inc-audit-import.js?v=12|g' \
+                    "$report/pages/$page" 2>/dev/null || true
+
+                if [ "$page" = "active.htm" ] && ! grep -q 'inc-active-status-codes.js' "$report/pages/$page" 2>/dev/null; then
+                    sed -i 's|</body>|<script src="../assets/javascript/inc-active-status-codes.js?v=2"></script>\n</body>|' \
+                        "$report/pages/$page" 2>/dev/null || true
+                fi
+
+                if [ "$page" = "active.htm" ] && ! grep -q 'inc-active-refresh.js' "$report/pages/$page" 2>/dev/null; then
+                    sed -i 's|</body>|<script src="../assets/javascript/inc-active-refresh.js?v=26"></script>\n</body>|' \
+                        "$report/pages/$page" 2>/dev/null || true
+                fi
+
+                if [ "$page" = "active.htm" ]; then
+                    sed -i \
+                        -e 's|inc-active-refresh\.js?v=[0-9]*|inc-active-refresh.js?v=26|g' \
+                        -e 's|inc-active-cve-search\.js?v=[0-9]*|inc-active-cve-search.js?v=2|g' \
+                        -e 's|inc-active-align\.js?v=[0-9]*|inc-active-align.js?v=10|g' \
+                        -e 's|modern\.css?v=[^"]*|modern.css?v=active-shodan-sum4|g' \
+                        "$report/pages/$page" 2>/dev/null || true
+
+                    if ! grep -q 'inc-active-login-view.js' "$report/pages/$page" 2>/dev/null; then
+                        sed -i 's|</body>|<script src="../assets/javascript/inc-active-login-view.js?v=6"></script>\n</body>|' \
+                            "$report/pages/$page" 2>/dev/null || true
+                    fi
+                fi
+
+                if ! grep -q 'inc-report-export.js' "$report/pages/$page" 2>/dev/null; then
+                    sed -i 's|</body>|<script src="../assets/javascript/inc-report-export.js?v=5"></script>\n</body>|' \
+                        "$report/pages/$page" 2>/dev/null || true
+                fi
+
+                if [ "$page" = "audit.htm" ]; then
+                    sed -i \
+                        -e 's|modern\.css?v=[^"]*|modern.css?v=audit-opnotes2|g' \
+                        -e 's|inc-audit-import\.js?v=[0-9]*|inc-audit-import.js?v=12|g' \
+                        -e 's|inc-audit-config\.js?v=[0-9]*|inc-audit-config.js?v=23|g' \
+                        -e 's|inc-audit-line-delete\.js?v=[0-9]*|inc-audit-line-delete.js?v=3|g' \
+                        -e 's|inc-audit-log-filter\.js?v=[0-9]*|inc-audit-log-filter.js?v=1|g' \
+                        -e 's|inc-audit-metrics-range\.js?v=[0-9]*|inc-audit-metrics-range.js?v=2|g' \
+                        "$report/pages/$page" 2>/dev/null || true
+
+                    if ! grep -q 'inc-audit-import.js' "$report/pages/$page" 2>/dev/null; then
+                        sed -i 's|</body>|<script src="../assets/javascript/inc-audit-import.js?v=12"></script>\n</body>|' \
+                            "$report/pages/$page" 2>/dev/null || true
+                    fi
+
+                    if ! grep -q 'inc-audit-config.js' "$report/pages/$page" 2>/dev/null; then
+                        sed -i 's|</body>|<script src="../assets/javascript/inc-audit-config.js?v=23"></script>\n</body>|' \
+                            "$report/pages/$page" 2>/dev/null || true
+                    fi
+
+                    if ! grep -q 'inc-audit-line-delete.js' "$report/pages/$page" 2>/dev/null; then
+                        sed -i 's|</body>|<script src="../assets/javascript/inc-audit-line-delete.js?v=3"></script>\n</body>|' \
+                            "$report/pages/$page" 2>/dev/null || true
+                    fi
+
+                    if ! grep -q 'inc-audit-log-filter.js' "$report/pages/$page" 2>/dev/null; then
+                        sed -i 's|</body>|<script src="../assets/javascript/inc-audit-log-filter.js?v=1"></script>\n</body>|' \
+                            "$report/pages/$page" 2>/dev/null || true
+                    fi
+
+                    if ! grep -q 'inc-audit-metrics-range.js' "$report/pages/$page" 2>/dev/null; then
+                        sed -i 's|</body>|<script src="../assets/javascript/inc-audit-metrics-range.js?v=2"></script>\n</body>|' \
+                            "$report/pages/$page" 2>/dev/null || true
+                    fi
+                fi
+            fi
+        done
+    fi
+
+}
+
+# Add Audit under Reports → after Active (pages/*.htm and root index.htm).
+f_import_report_ensure_audit_nav(){
+    local report="$1"
+
+    [ -d "$report" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    python3 - "$report" <<'PY'
+import sys
+from pathlib import Path
+
+report = Path(sys.argv[1])
+# (already-has markers, patterns to insert after Active)
+variants = [
+    # pages/*.htm — relative Active/Audit
+    {
+        "has": ('href="audit.htm"',),
+        "need": 'href="active.htm"',
+        "patterns": [
+            (
+                '<li class="active"><a href="active.htm">Active</a></li>',
+                '<li class="active"><a href="active.htm">Active</a></li>\n'
+                '                        <li><a href="audit.htm">Audit</a></li>',
+            ),
+            (
+                '<li><a href="active.htm">Active</a></li>',
+                '<li><a href="active.htm">Active</a></li>\n'
+                '                        <li><a href="audit.htm">Audit</a></li>',
+            ),
+        ],
+    },
+    # root index.htm — pages/ prefix
+    {
+        "has": ('href="pages/audit.htm"', 'href="audit.htm"'),
+        "need": 'href="pages/active.htm"',
+        "patterns": [
+            (
+                '<li class="active"><a href="pages/active.htm">Active</a></li>',
+                '<li class="active"><a href="pages/active.htm">Active</a></li>\n'
+                '                        <li><a href="pages/audit.htm">Audit</a></li>',
+            ),
+            (
+                '<li><a href="pages/active.htm">Active</a></li>',
+                '<li><a href="pages/active.htm">Active</a></li>\n'
+                '                        <li><a href="pages/audit.htm">Audit</a></li>',
+            ),
+        ],
+    },
+]
+
+files = []
+pages_dir = report / "pages"
+if pages_dir.is_dir():
+    files.extend(sorted(pages_dir.glob("*.htm")))
+for name in ("index.htm", "index.html"):
+    p = report / name
+    if p.is_file():
+        files.append(p)
+
+for page in files:
+    try:
+        text = page.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    for variant in variants:
+        if not any(h in text for h in variant["has"]) and variant["need"] in text:
+            for old, new in variant["patterns"]:
+                if old in text:
+                    text = text.replace(old, new, 1)
+                    try:
+                        page.write_text(text, encoding="utf-8")
+                    except OSError:
+                        pass
+                    break
+            break
+PY
+}
+
+# Ensure Subdomains page has filter + host-scan scripts (no fragile sed).
+f_import_report_ensure_subdomains_ui(){
+    local page="$1"
+
+    [ -f "$page" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    python3 - "$page" <<'PY'
+import sys
+from pathlib import Path
+
+page = Path(sys.argv[1])
+try:
+    text = page.read_text(encoding="utf-8", errors="replace")
+except OSError:
+    sys.exit(0)
+
+changed = False
+
+# Required scripts (idempotent: only insert when key filename is absent).
+need = [
+    ("inc-subdomains-filter.js", '<script src="../assets/javascript/inc-subdomains-filter.js?v=22"></script>'),
+    ("tools/cve-software-index.js", '<script src="../tools/cve-software-index.js"></script>'),
+    ("tools/shodan/index.js", '<script src="../tools/shodan/index.js"></script>'),
+    ("tools/shodan/kev-ids.js", '<script src="../tools/shodan/kev-ids.js"></script>'),
+    ("inc-shodan.js", '<script src="../assets/javascript/inc-shodan.js?v=19"></script>'),
+    ("inc-subdomains-ports.js", '<script src="../assets/javascript/inc-subdomains-ports.js?v=12"></script>'),
+    ("inc-host-scan.js", '<script src="../assets/javascript/inc-host-scan.js?v=75"></script>'),
+]
+insert = [tag for key, tag in need if key not in text]
+if insert:
+    block = "\n".join(insert) + "\n"
+    lower = text.lower()
+    idx = lower.rfind("</body>")
+    if idx != -1:
+        text = text[:idx] + block + text[idx:]
+    else:
+        text = text.rstrip() + "\n" + block
+    changed = True
+
+# Always pin host-scan script to current cache-bust (robots tool, etc.).
+import re
+new_text, n = re.subn(
+    r'inc-host-scan\.js\?v=[0-9]+',
+    'inc-host-scan.js?v=75',
+    text,
+)
+if n:
+    text = new_text
+    changed = True
+
+if changed:
+    try:
+        page.write_text(text, encoding="utf-8")
+    except OSError:
+        sys.exit(0)
+PY
+}
+
+# Ensure Active page has CVE search bar + script (older engagements).
+f_import_report_ensure_active_cve_search(){
+    local page="$1"
+
+    [ -f "$page" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    python3 - "$page" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+page = Path(sys.argv[1])
+try:
+    text = page.read_text(encoding="utf-8", errors="replace")
+except OSError:
+    sys.exit(0)
+
+changed = False
+
+if "inc-active-cve-search-form" not in text and "inc-page-header--active" in text:
+    new_text, n = re.subn(
+        r'(<div class="inc-page-header inc-page-header--active">\s*<h1>.*?</h1>\s*)'
+        r'(<span class="inc-active-scan-date">)',
+        r'''\1<form id="inc-active-cve-search-form" class="inc-active-cve-search" action="subdomains.htm" method="get" role="search">
+            <label class="sr-only" for="inc-active-cve-search-input">Search CVE</label>
+            <input type="search" name="cve" id="inc-active-cve-search-input" class="inc-active-cve-search-input" placeholder="CVE-YYYY-NNNNN" autocomplete="off" spellcheck="false" title="CVE-YYYY-NNNNN, YYYY-NNNNN, or a 4+ digit number for this year" />
+            <button type="submit" class="inc-active-cve-search-btn">Search</button>
+        </form>
+        \2''',
+        text,
+        count=1,
+        flags=re.S,
+    )
+    if n:
+        text = new_text
+        changed = True
+
+if "inc-active-cve-search.js" not in text:
+    lower = text.lower()
+    idx = lower.rfind("</body>")
+    tag = '<script src="../assets/javascript/inc-active-cve-search.js?v=2"></script>\n'
+    if idx != -1:
+        text = text[:idx] + tag + text[idx:]
+    else:
+        text = text.rstrip() + "\n" + tag
+    changed = True
+
+if changed:
+    try:
+        page.write_text(text, encoding="utf-8")
+    except OSError:
+        sys.exit(0)
+PY
+}
+
+# Restart localhost statusd so it pins this engagement (not a previous one).
+f_import_report_restart_statusd(){
+    local statusd="$1"
+    local report="$2"
+    local port="${3:-17322}"
+    local pid
+
+    [ -f "$statusd" ] || return 0
+
+    # Free the port if something already answers on it.
+    if curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+        if command -v fuser >/dev/null 2>&1; then
+            fuser -k "${port}/tcp" >/dev/null 2>&1 || true
+        elif command -v lsof >/dev/null 2>&1; then
+            pid=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
+
+            if [ -n "$pid" ]; then
+                # shellcheck disable=SC2086
+                kill $pid >/dev/null 2>&1 || true
+            fi
+        else
+            # Narrow pattern: script path + space (avoids matching this shell / pkill itself).
+            pkill -f "host-scan-statusd\\.py " >/dev/null 2>&1 || true
+        fi
+
+        sleep 0.2
+    fi
+
+    nohup python3 "$statusd" "$report" "$port" >/dev/null 2>&1 &
+    sleep 0.3
+}
+
+clear
+f_banner
+
+echo -e "${BLUE}Open report.${NC}"
+echo
+echo "Open an existing Discover report for additional testing."
+echo
+echo -n "Enter the location of your report: "
+read -r DISCOVER_REPORT
+
+# Normalize input (CR, whitespace, leading ~).
+DISCOVER_REPORT="${DISCOVER_REPORT//$'\r'/}"
+DISCOVER_REPORT="${DISCOVER_REPORT#"${DISCOVER_REPORT%%[![:space:]]*}"}"
+DISCOVER_REPORT="${DISCOVER_REPORT%"${DISCOVER_REPORT##*[![:space:]]}"}"
+DISCOVER_REPORT="${DISCOVER_REPORT/#\~/$HOME}"
+
+# Empty enter — same pattern as Active / Import names.
+if [ -z "$DISCOVER_REPORT" ]; then
+    f_import_report_die "No report location provided."
+fi
+
+# If the user pointed at a page file, resolve to the report root.
+#   pages/*  → two levels up (…/pages/active.htm → report root)
+#   index.htm / other files → one level up (…/index.htm → report root)
+if [ -f "$DISCOVER_REPORT" ]; then
+    case "$DISCOVER_REPORT" in
+        */pages/*)
+
+            if ! DISCOVER_REPORT="$(cd "$(dirname "$DISCOVER_REPORT")/.." && pwd)"; then
+                f_import_report_die "Report not found."
+            fi
+
+            ;;
+        *)
+
+            if ! DISCOVER_REPORT="$(cd "$(dirname "$DISCOVER_REPORT")" && pwd)"; then
+                f_import_report_die "Report not found."
+            fi
+
+            ;;
+    esac
+fi
+
+# Wrong path / not a Discover report — exit like other options.
+if ! f_import_report_is_report_dir "$DISCOVER_REPORT"; then
+    f_import_report_die "Report not found."
+fi
+
+DISCOVER_REPORT="$(cd "$DISCOVER_REPORT" && pwd)" || f_import_report_die "Report not found."
+export DISCOVER_REPORT
+
+DISCOVER_ROOT=""
+
+if DISCOVER_ROOT="$(f_import_report_discover_root)"; then
+    :
+else
+    DISCOVER_ROOT=""
+fi
+
+# Persist current engagement for helpers / future discover-scan bridge.
+SESSION_DIR="${HOME}/.discover"
+mkdir -p "$SESSION_DIR" || f_import_report_die "Could not create $SESSION_DIR."
+
+if ! printf '%s\n' "$DISCOVER_REPORT" > "$SESSION_DIR/current-report"; then
+    f_import_report_die "Could not write $SESSION_DIR/current-report."
+fi
+
+chmod 600 "$SESSION_DIR/current-report" 2>/dev/null || true
+
+# Operator mode on the live tree (client exports stamp client mode only on copies).
+MODE_DIR="$DISCOVER_REPORT/assets"
+MODE_FILE="$MODE_DIR/report-mode.json"
+
+if mkdir -p "$MODE_DIR" 2>/dev/null \
+    && cat > "$MODE_FILE" <<'EOF'
+{
+  "mode": "operator",
+  "launches": true
+}
+EOF
+then
+    chmod 644 "$MODE_FILE" 2>/dev/null || true
+else
+    f_import_report_warn "Could not write operator mode stamp (scan launches may be disabled)."
+fi
+
+# Ensure audit + host-scan directories exist.
+mkdir -p "$DISCOVER_REPORT/tools/audit" "$DISCOVER_REPORT/tools/host-scans" 2>/dev/null || true
+
+# Sync host-scan / filter JS into older report trees.
+if [ -n "$DISCOVER_ROOT" ]; then
+    f_import_report_sync_assets "$DISCOVER_REPORT" "$DISCOVER_ROOT"
+fi
+
+# Refresh Shodan KEV badges from Discover's CISA catalog for *this* report
+# wherever it lives (Desktop, $HOME/data, external disk). No Shodan API calls.
+# Import is the reliable path for reports outside $HOME/data — Update only
+# downloads the catalog and cannot find every copy of a report tree.
+if [ -n "$DISCOVER_ROOT" ] \
+    && [ -f "$DISCOVER_ROOT/recon/shodan-enrich.py" ] \
+    && { [ -f "$DISCOVER_REPORT/tools/shodan/index.js" ] \
+        || [ -f "$DISCOVER_REPORT/tools/shodan/index.json" ] \
+        || [ -d "$DISCOVER_REPORT/tools/shodan/hosts" ]; }; then
+    echo
+
+    if DISCOVER="$DISCOVER_ROOT" python3 "$DISCOVER_ROOT/recon/shodan-enrich.py" \
+        --refresh-kev "$DISCOVER_REPORT"; then
+        :
+    else
+        f_import_report_warn "Could not refresh tools/shodan/kev-ids.js (catalog missing? Run Discover Update)."
+    fi
+fi
+
+# Seed audit log if missing (format locked for Audit page).
+AUDIT_LOG="$DISCOVER_REPORT/tools/audit/log.txt"
+
+if [ ! -f "$AUDIT_LOG" ]; then
+    touch "$AUDIT_LOG" 2>/dev/null || true
+fi
+
+# Build/refresh Audit page
+if [ -n "$DISCOVER_ROOT" ] && [ -f "$DISCOVER_ROOT/recon/audit-build.py" ]; then
+    python3 "$DISCOVER_ROOT/recon/audit-build.py" "$DISCOVER_REPORT" "$DISCOVER_ROOT/report/pages/audit.htm" >/dev/null 2>&1 || true
+elif [ -f "$(dirname "$0")/audit-build.py" ]; then
+    python3 "$(dirname "$0")/audit-build.py" "$DISCOVER_REPORT" >/dev/null 2>&1 || true
+fi
+
+# Audit under Reports on every page; host-scan UI on Subdomains when filtered
+f_import_report_ensure_audit_nav "$DISCOVER_REPORT"
+f_import_report_ensure_subdomains_ui "$DISCOVER_REPORT/pages/subdomains.htm"
+f_import_report_ensure_active_cve_search "$DISCOVER_REPORT/pages/active.htm"
+
+# Build CVE → software index for Subdomains ?cve= when NVD cache exists
+if [ -n "$DISCOVER_ROOT" ] \
+    && [ -f "$DISCOVER_ROOT/recon/software-cve.py" ] \
+    && [ -f "$DISCOVER_REPORT/tools/software-cves-cache.json" ]; then
+    DISCOVER="$DISCOVER_ROOT" python3 -c "
+import importlib.util
+from pathlib import Path
+mod_path = Path(r'''$DISCOVER_ROOT''') / 'recon' / 'software-cve.py'
+cache_path = Path(r'''$DISCOVER_REPORT''') / 'tools' / 'software-cves-cache.json'
+spec = importlib.util.spec_from_file_location('software_cve', mod_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.write_cve_software_index_js(str(cache_path))
+" 2>/dev/null || true
+fi
+
+# Localhost status helper for live host-scan UI (rebind to this engagement)
+STATUSD=""
+
+if [ -n "$DISCOVER_ROOT" ] && [ -f "$DISCOVER_ROOT/misc/host-scan-statusd.py" ]; then
+    STATUSD="$DISCOVER_ROOT/misc/host-scan-statusd.py"
+elif [ -f "$(dirname "$0")/../misc/host-scan-statusd.py" ]; then
+    STATUSD="$(cd "$(dirname "$0")/../misc" && pwd)/host-scan-statusd.py"
+fi
+
+if [ -n "$STATUSD" ]; then
+    f_import_report_restart_statusd "$STATUSD" "$DISCOVER_REPORT" 17322
+fi
+
+OPEN_PAGE=""
+
+if [ -f "$DISCOVER_REPORT/index.htm" ]; then
+    OPEN_PAGE="$DISCOVER_REPORT/index.htm"
+elif [ -f "$DISCOVER_REPORT/pages/active.htm" ]; then
+    OPEN_PAGE="$DISCOVER_REPORT/pages/active.htm"
+elif [ -f "$DISCOVER_REPORT/pages/subdomains.htm" ]; then
+    OPEN_PAGE="$DISCOVER_REPORT/pages/subdomains.htm"
+elif [ -f "$DISCOVER_REPORT/pages/passive.htm" ]; then
+    OPEN_PAGE="$DISCOVER_REPORT/pages/passive.htm"
+fi
+
+echo -e "[*] Report:  ${YELLOW}$DISCOVER_REPORT${NC}"
+echo -e "[*] Session: ${YELLOW}$SESSION_DIR/current-report${NC}"
+
+if [ -n "$OPEN_PAGE" ]; then
+    # Prefer statusd HTTP so host-scan chevrons only appear for Discover-opened
+    # reports (manual file:// open never gets the expand UI).
+    OPEN_URL="$OPEN_PAGE"
+    STATUSD_PORT=17322
+
+    if [ -n "$STATUSD" ] && curl -fsS --connect-timeout 1 --max-time 2 \
+        "http://127.0.0.1:${STATUSD_PORT}/health" >/dev/null 2>&1; then
+        REL_PAGE="${OPEN_PAGE#"$DISCOVER_REPORT"/}"
+
+        if [ "$REL_PAGE" != "$OPEN_PAGE" ] && [ -n "$REL_PAGE" ]; then
+            OPEN_URL="http://127.0.0.1:${STATUSD_PORT}/${REL_PAGE}"
+        fi
+    fi
+
+    if f_import_report_open_browser "$OPEN_URL"; then
+        echo -e "[*] Browser: ${YELLOW}$OPEN_URL${NC}"
+    else
+        echo -e "[*] Browser: ${YELLOW}$OPEN_PAGE${NC}"
+    fi
+else
+    f_import_report_warn "No index/active/subdomains/passive page found to open."
+fi
+
+echo
+exit 0

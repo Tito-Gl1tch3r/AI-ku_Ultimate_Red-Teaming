@@ -1,0 +1,251 @@
+use anyhow::{Context, Result};
+use flate2::read::MultiGzDecoder;
+use std::fs::File;
+use std::path::Path;
+
+/// Pull a URL out of one WARC line, if it carries one.
+///
+/// A WARC mixes headers with raw response bodies, so both the
+/// `WARC-Target-URI:` header and bare URLs in the payload are collected. Header
+/// names are case-insensitive per the WARC spec.
+fn extract_url_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    let after_header = trimmed
+        .split_once(':')
+        .filter(|(name, _)| name.eq_ignore_ascii_case("WARC-Target-URI"))
+        // WARC/1.0 writers (wget before 1.21 among them) bracket the value:
+        // `WARC-Target-URI: <http://example.com/>`.
+        .map(|(_, value)| {
+            let value = value.trim();
+            value
+                .strip_prefix('<')
+                .and_then(|v| v.strip_suffix('>'))
+                .unwrap_or(value)
+        });
+
+    let candidate = match after_header {
+        Some(value) => value,
+        None => trimmed,
+    };
+
+    if (candidate.starts_with("http://") || candidate.starts_with("https://"))
+        && !candidate.contains(' ')
+    {
+        return Some(candidate.to_string());
+    }
+    None
+}
+
+/// Read URLs from a WARC (Web ARChive) file: `WARC-Target-URI` headers plus
+/// bare URLs in the payload.
+pub fn read_urls(file_path: &Path) -> Result<Vec<String>> {
+    let mut file = File::open(file_path)
+        .with_context(|| format!("Failed to open WARC file: {}", file_path.display()))?;
+    let magic = super::magic(&mut file)?;
+    if &magic == b"BZh" {
+        anyhow::bail!(
+            "{}: bzip2 WARC input is not supported. Decompress it first \
+                 (`bunzip2 -k <file>`) and pass the result to --files.",
+            file_path.display()
+        );
+    }
+
+    // WARCs are routinely gigabytes, and this reader used to collect every
+    // matching line with no bound at all — unlike the URLTeam and sitemap
+    // readers, which have capped their input from the start. Lines are read
+    // lossily because a WARC embeds raw response bodies: binary content must
+    // not abort the read.
+    let (urls, url_capped, byte_capped, _, line_capped) =
+            if magic.starts_with(super::GZIP_MAGIC) {
+            // WARC files are often distributed as gzip streams. MultiGzDecoder
+            // also handles record-oriented archives with one member per WARC
+            // record; the decompressed byte cap still applies to the whole file.
+            let mut src = super::StopOnDecodeError::new(MultiGzDecoder::new(file));
+            let collected = super::collect_capped(
+                &mut src,
+                super::MAX_FILE_URLS,
+                super::MAX_FILE_BYTES,
+                extract_url_from_line,
+            );
+            let decode_error = src.error;
+            collected.map(
+                |(mut urls, url_capped, byte_capped, final_fragment_url, line_capped)| {
+                if let Some(error) = decode_error {
+                    eprintln!(
+                        "[urx] {}: gzip stream ended early ({error}); keeping the URLs decoded so far",
+                        file_path.display()
+                    );
+                    if final_fragment_url {
+                        urls.pop();
+                    }
+                }
+                    (urls, url_capped, byte_capped, false, line_capped)
+                },
+            )
+        } else {
+            super::collect_capped(
+                file,
+                super::MAX_FILE_URLS,
+                super::MAX_FILE_BYTES,
+                extract_url_from_line,
+            )
+        }
+        .with_context(|| format!("Failed to read WARC file: {}", file_path.display()))?;
+
+    super::warn_if_truncated(
+        file_path,
+        url_capped,
+        byte_capped,
+        line_capped,
+        super::MAX_FILE_URLS,
+        super::MAX_FILE_BYTES,
+    );
+
+    Ok(urls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_read_warc_headers() -> Result<()> {
+        let mut temp_file = NamedTempFile::new()?;
+        writeln!(temp_file, "WARC/1.0")?;
+        writeln!(temp_file, "WARC-Type: response")?;
+        writeln!(temp_file, "WARC-Target-URI: https://example.com/page1")?;
+        writeln!(temp_file, "Content-Length: 100")?;
+        writeln!(temp_file)?;
+        writeln!(temp_file, "HTTP response content here")?;
+        writeln!(temp_file, "WARC-Target-URI: http://example.org/page2")?;
+        // WARC/1.0-style bracketed value (wget < 1.21).
+        writeln!(temp_file, "WARC-Target-URI: <http://example.net/page3>")?;
+        temp_file.flush()?;
+
+        let urls = read_urls(temp_file.path())?;
+
+        assert_eq!(urls.len(), 3);
+        assert!(urls.contains(&"https://example.com/page1".to_string()));
+        assert!(urls.contains(&"http://example.org/page2".to_string()));
+        assert!(urls.contains(&"http://example.net/page3".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_url_collection_is_bounded() -> Result<()> {
+        // Regression: this reader had no cap of any kind, while the URLTeam and
+        // sitemap readers have bounded their input from the start. WARCs are
+        // routinely gigabytes, so an unbounded collect grows with the file.
+        let mut temp_file = NamedTempFile::new()?;
+        for i in 0..500 {
+            writeln!(temp_file, "WARC-Target-URI: https://example.com/{i}")?;
+        }
+        temp_file.flush()?;
+
+        let (urls, url_capped, _, _, _) = super::super::collect_capped(
+            File::open(temp_file.path())?,
+            10,
+            super::super::MAX_FILE_BYTES,
+            extract_url_from_line,
+        )?;
+
+        assert_eq!(urls.len(), 10, "collection must stop at the URL cap");
+        assert!(url_capped, "the cap being hit must be reported");
+        Ok(())
+    }
+
+    #[test]
+    fn test_byte_cap_bounds_the_read() -> Result<()> {
+        let mut temp_file = NamedTempFile::new()?;
+        for i in 0..2000 {
+            writeln!(temp_file, "WARC-Target-URI: https://example.com/{i}")?;
+        }
+        temp_file.flush()?;
+
+        let (urls, _, byte_capped, _, _) = super::super::collect_capped(
+            File::open(temp_file.path())?,
+            super::super::MAX_FILE_URLS,
+            200,
+            extract_url_from_line,
+        )?;
+
+        assert!(byte_capped, "the byte cap must be reported");
+        assert!(
+            urls.len() < 2000,
+            "read should stop early, got {}",
+            urls.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_truncated_gzip_discards_a_partial_final_target_uri() -> Result<()> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut bytes = Vec::new();
+        let mut complete = GzEncoder::new(Vec::new(), Compression::default());
+        complete.write_all(b"WARC/1.0\nWARC-Target-URI: https://example.com/complete\n")?;
+        bytes.extend_from_slice(&complete.finish()?);
+
+        let mut partial = GzEncoder::new(Vec::new(), Compression::default());
+        partial.write_all(b"WARC/1.0\nWARC-Target-URI: https://example.net/partial")?;
+        let partial_member = partial.finish()?;
+        bytes.extend_from_slice(&partial_member[..partial_member.len() - 4]);
+
+        let compressed = tempfile::Builder::new().suffix(".warc.gz").tempfile()?;
+        std::fs::write(compressed.path(), bytes)?;
+
+        assert_eq!(
+            super::super::read_urls_from_file(compressed.path())?,
+            vec!["https://example.com/complete"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_target_uri_header_is_case_insensitive() {
+        // WARC field names are case-insensitive per the spec; only the exact
+        // "WARC-Target-URI:" spelling used to be recognised.
+        assert_eq!(
+            extract_url_from_line("warc-target-uri: https://example.com/a").as_deref(),
+            Some("https://example.com/a")
+        );
+        assert_eq!(
+            extract_url_from_line("WARC-Target-URI: https://example.com/b").as_deref(),
+            Some("https://example.com/b")
+        );
+        // A non-URL value is still rejected.
+        assert!(extract_url_from_line("WARC-Type: response").is_none());
+    }
+
+    #[test]
+    fn test_read_warc_content_urls() -> Result<()> {
+        let mut temp_file = NamedTempFile::new()?;
+        writeln!(temp_file, "WARC/1.0")?;
+        writeln!(temp_file, "WARC-Type: response")?;
+        writeln!(temp_file, "WARC-Target-URI: https://example.com/header")?;
+        writeln!(temp_file, "Content-Length: 100")?;
+        writeln!(temp_file)?;
+        writeln!(temp_file, "Some text content here")?;
+        writeln!(temp_file, "http://example.org/content1")?;
+        writeln!(temp_file, "  https://example.net/content2  ")?;
+        writeln!(temp_file, "http://invalid-url-with space")?;
+        temp_file.flush()?;
+
+        let urls = read_urls(temp_file.path())?;
+
+        assert_eq!(urls.len(), 3);
+        assert!(urls.contains(&"https://example.com/header".to_string()));
+        assert!(urls.contains(&"http://example.org/content1".to_string()));
+        assert!(urls.contains(&"https://example.net/content2".to_string()));
+        assert!(!urls.contains(&"http://invalid-url-with space".to_string()));
+
+        Ok(())
+    }
+}

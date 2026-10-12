@@ -1,0 +1,70 @@
+#ifndef _SERVER_API_H_
+#define _SERVER_API_H_
+
+#include <esp_err.h>
+#include <esp_http_server.h>
+#include "server.h"
+
+typedef enum {
+    API_GET_STATUS = 0,
+    API_SET_AP_SETTINGS,
+    API_GET_AP_SETTINGS,
+    API_WIFI_SCAN,
+    API_START_EVILTWIN,
+    API_STOP_EVILTWIN,
+    API_GET_EVILTWIN_TARGET,
+    API_CHECK_INPUT_PASSWORD,
+    API_GET_PASSWORDS,
+    API_KARMA_ATTACK_SCAN,
+    API_GET_KARMA_PROBES,
+    API_KARMA_ATTACK_START,
+    API_DEAUTHER_START,
+    API_DEAUTHER_STOP,
+    API_START_RAW_SNIFFER,
+    API_STOP_RAW_SNIFFER,
+    API_GET_RECON_AP_LIST,
+    API_GET_RECON_CLIENT_LIST,
+    API_WIFI_CONNECT,
+    API_WIFI_DISCONNECT,
+    API_DOWNLOAD_HANDSHAKE,
+    API_START_PACKET_ANALYZER,
+    API_STOP_PACKET_ANALYZER,
+    API_GET_LAST_WIFI_CREDENTIALS,
+    API_HOST_DISCOVERY,
+    API_PORT_SCAN,
+    API_START_BLE_SNIFFER,
+    API_STOP_BLE_SNIFFER,
+    API_GET_BLE_DEVICES,
+    API_BLE_DEVICES_CLEAR,
+    API_START_BLE_SPAM,
+    API_STOP_BLE_SPAM,
+    API_GET_SCANNED_AP,
+    API_MAX_COMMAND
+} api_command_t;
+
+
+/**
+ * @brief Get MIME type from file path
+ */
+const char* mime_from_path(const char* path);
+
+
+/**
+ * @brief Parse incoming websocket API request
+ * 
+ * @param req Websocket frame request
+ */
+void http_api_parse(ws_frame_req_t *req);
+
+
+/**
+ * @brief Send formatted log message via websocket
+ * 
+ * @param level Log level (e.g., "INFO", "WARNING", "ERROR")
+ * @param format Printf-style format string
+ * @param ... Variable arguments matching format string
+ */
+void ws_log(const char *level, const char *format, ...);
+
+
+#endif /* _SERVER_API_H_ */

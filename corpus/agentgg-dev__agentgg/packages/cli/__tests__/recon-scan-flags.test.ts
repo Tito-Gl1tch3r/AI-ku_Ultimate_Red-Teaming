@@ -1,0 +1,522 @@
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Finding, UserConfig } from "@agentgg/core";
+import {
+  getOfficialAgentsDir,
+  loadAllFileRecords,
+  readReconReport,
+  readScanPlan,
+  saveUserConfig,
+} from "@agentgg/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// A unified agent .md. `gated: true` adds a prompt precondition so the
+// precondition for-loop actually calls the detector's checkPrecondition —
+// which is what lets these tests observe whether the loop ran or was
+// skipped/reused.
+function writeTestAgent(dir: string, slug: string, gated = false): string {
+  const pre = gated
+    ? `precondition:
+  prompt: "Only run if relevant to this repo."
+`
+    : "";
+  const body = `---
+slug: ${slug}
+name: ${slug}
+description: Synthetic agent for recon/scan-flag tests.
+${pre}where:
+  extensions:
+    - js
+---
+Stub agent body. Detector is mocked.
+`;
+  const path = join(dir, `${slug}.md`);
+  writeFileSync(path, body, "utf8");
+  return path;
+}
+
+function mockFinding(slug: string, filePath: string): Finding {
+  return {
+    id: `${slug}-${filePath}`,
+    agentSlug: slug,
+    title: "mock finding",
+    vulnSlug: slug,
+    filePath,
+    summary: "s",
+    details: "d",
+    poc: "p",
+    impact: "i",
+    references: [],
+    confidence: 0.9,
+    notifications: [],
+  };
+}
+
+const detectorMock = vi.hoisted(() => ({
+  recon: vi.fn(async () => ({
+    purpose: "test fixture",
+    languages: ["javascript"] as string[],
+    frameworks: [] as string[],
+    authModel: null as string | null,
+    integrations: [] as string[],
+    notableDirs: [] as string[],
+    summary: "A small JS test fixture.",
+  })),
+  checkPrecondition: vi.fn(async () => ({ relevant: true, reason: "stub" })),
+  runAgent: vi.fn(
+    async (_args: { agent: { slug: string }; candidates: { filePath: string }[] }) =>
+      [] as Finding[],
+  ),
+  suggestExcludes: vi.fn(async () => ({ excludes: [] as { glob: string; reason: string }[] })),
+}));
+
+vi.mock("../src/llm.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/llm.js")>("../src/llm.js");
+  return {
+    ...actual,
+    resolveDetector: () => ({
+      name: "test-mock",
+      recon: detectorMock.recon,
+      checkPrecondition: detectorMock.checkPrecondition,
+      runAgent: detectorMock.runAgent,
+      suggestExcludes: detectorMock.suggestExcludes,
+    }),
+  };
+});
+
+import { runReconCommand } from "../src/commands/recon.js";
+import { cappedSlugsFromQueue, runScan } from "../src/commands/scan.js";
+
+let agentggHome: string;
+let projectRoot: string;
+let outputDir: string;
+let agentsDir: string;
+let agentPlain: string;
+let agentGated: string;
+let env: NodeJS.ProcessEnv;
+
+beforeEach(() => {
+  agentggHome = mkdtempSync(join(tmpdir(), "agentgg-home-"));
+  projectRoot = mkdtempSync(join(tmpdir(), "agentgg-target-"));
+  outputDir = mkdtempSync(join(tmpdir(), "agentgg-out-"));
+  agentsDir = mkdtempSync(join(tmpdir(), "agentgg-agents-"));
+  agentPlain = writeTestAgent(agentsDir, "plain-agent", false);
+  agentGated = writeTestAgent(agentsDir, "gated-agent", true);
+  env = { AGENTGG_HOME: agentggHome };
+
+  // Create an (empty) official agents dir so scan/recon skip the
+  // network auto-install path entirely. Agents come from -t instead.
+  mkdirSync(getOfficialAgentsDir(env), { recursive: true });
+
+  writeFileSync(join(projectRoot, "server.js"), "const x = 1;", "utf8");
+
+  const cfg: UserConfig = {
+    provider: "anthropic",
+    anthropic: { apiKey: "sk-ant-test", model: "claude-sonnet-4-6" },
+    schemaVersion: 1,
+  };
+  saveUserConfig(cfg, env);
+
+  detectorMock.recon.mockImplementation(async () => ({
+    purpose: "test fixture",
+    languages: ["javascript"],
+    frameworks: [],
+    authModel: null,
+    integrations: [],
+    notableDirs: [],
+    summary: "A small JS test fixture.",
+  }));
+  detectorMock.checkPrecondition.mockImplementation(async () => ({
+    relevant: true,
+    reason: "stub",
+  }));
+  detectorMock.runAgent.mockImplementation(async ({ agent, candidates }) =>
+    candidates.map((c) => mockFinding(agent.slug, c.filePath)),
+  );
+  detectorMock.suggestExcludes.mockImplementation(async () => ({ excludes: [] }));
+});
+
+afterEach(() => {
+  rmSync(agentggHome, { recursive: true, force: true });
+  rmSync(projectRoot, { recursive: true, force: true });
+  rmSync(outputDir, { recursive: true, force: true });
+  rmSync(agentsDir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+  detectorMock.recon.mockReset();
+  detectorMock.checkPrecondition.mockReset();
+  detectorMock.runAgent.mockReset();
+  detectorMock.suggestExcludes.mockReset();
+  for (const h of process.listeners("SIGINT")) {
+    process.removeListener("SIGINT", h);
+  }
+});
+
+function suppressLogs() {
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+}
+
+describe("runReconCommand", () => {
+  it("writes recon.json + plan.json and runs no detection", async () => {
+    suppressLogs();
+    await runReconCommand(projectRoot, { template: [agentPlain], output: outputDir }, env);
+
+    const recon = readReconReport(outputDir);
+    expect(recon).not.toBeNull();
+    expect(recon?.languages).toContain("javascript");
+
+    const plan = readScanPlan(outputDir);
+    expect(plan).not.toBeNull();
+    expect(plan?.decisions.find((d) => d.slug === "plain-agent")?.queued).toBe(true);
+
+    // recon does not run any agents.
+    expect(detectorMock.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("records a skipped agent when its prompt gate says no", async () => {
+    suppressLogs();
+    detectorMock.checkPrecondition.mockImplementation(async () => ({
+      relevant: false,
+      reason: "not relevant",
+    }));
+    await runReconCommand(projectRoot, { template: [agentGated], output: outputDir }, env);
+
+    const plan = readScanPlan(outputDir);
+    expect(plan?.decisions.find((d) => d.slug === "gated-agent")?.queued).toBe(false);
+  });
+
+  it("reuses the cached recon brief on a second run; --re-recon forces a re-survey", async () => {
+    suppressLogs();
+    await runReconCommand(projectRoot, { template: [agentPlain], output: outputDir }, env);
+    expect(detectorMock.recon).toHaveBeenCalledTimes(1);
+
+    await runReconCommand(projectRoot, { template: [agentPlain], output: outputDir }, env);
+    expect(detectorMock.recon).toHaveBeenCalledTimes(1); // cached, not re-run
+
+    await runReconCommand(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, reRecon: true },
+      env,
+    );
+    expect(detectorMock.recon).toHaveBeenCalledTimes(2); // forced re-survey
+  });
+});
+
+describe("recon --auto-exclude", () => {
+  it("runs the smart-exclude pass once and records the chosen globs in plan.json", async () => {
+    suppressLogs();
+    detectorMock.suggestExcludes.mockImplementation(async () => ({
+      excludes: [{ glob: "tests/**", reason: "test fixtures" }],
+    }));
+
+    await runReconCommand(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true },
+      env,
+    );
+
+    expect(detectorMock.suggestExcludes).toHaveBeenCalledTimes(1);
+    expect(readScanPlan(outputDir)?.autoExcludes).toEqual(["tests/**"]);
+  });
+
+  it("writes autoExcludes: [] when the pass runs but chooses nothing", async () => {
+    suppressLogs();
+    // Default mock returns { excludes: [] }.
+    await runReconCommand(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true },
+      env,
+    );
+
+    expect(detectorMock.suggestExcludes).toHaveBeenCalledTimes(1);
+    // [] (ran, found nothing) is distinct from undefined (didn't run).
+    expect(readScanPlan(outputDir)?.autoExcludes).toEqual([]);
+  });
+
+  it("omits autoExcludes and skips the pass entirely when the flag is off", async () => {
+    suppressLogs();
+    await runReconCommand(projectRoot, { template: [agentPlain], output: outputDir }, env);
+
+    expect(detectorMock.suggestExcludes).not.toHaveBeenCalled();
+    expect(readScanPlan(outputDir)?.autoExcludes).toBeUndefined();
+  });
+});
+
+describe("scan --no-recon", () => {
+  it("skips the recon survey and the precondition loop, running every -t agent", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentGated], output: outputDir, recon: false }, env);
+
+    expect(detectorMock.recon).not.toHaveBeenCalled();
+    expect(detectorMock.checkPrecondition).not.toHaveBeenCalled();
+    // The gated agent runs anyway — gating was bypassed.
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+    // No recon brief is persisted under --no-recon.
+    expect(readReconReport(outputDir)).toBeNull();
+    // A plan is still written, with the agent queued unconditionally.
+    expect(readScanPlan(outputDir)?.decisions.find((d) => d.slug === "gated-agent")?.queued).toBe(
+      true,
+    );
+  });
+});
+
+describe("scan --no-summary", () => {
+  it("does not write summary.md but still persists findings to state", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentPlain], output: outputDir, summary: false }, env);
+
+    expect(existsSync(join(outputDir, "summary.md"))).toBe(false);
+    expect(loadAllFileRecords(outputDir).length).toBeGreaterThan(0);
+  });
+
+  it("writes summary.md by default (no flag)", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentPlain], output: outputDir }, env);
+    expect(existsSync(join(outputDir, "summary.md"))).toBe(true);
+  });
+});
+
+describe("scan --semgrep-rules", () => {
+  it("rejects a path that is not a directory, before any LLM call", async () => {
+    suppressLogs();
+    const notADir = join(projectRoot, "server.js");
+    await expect(
+      runScan(
+        projectRoot,
+        { template: [agentPlain], output: outputDir, semgrepRules: [notADir] },
+        env,
+      ),
+    ).rejects.toThrow(/--semgrep-rules: not a directory/);
+    expect(detectorMock.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("accepts a real directory and still scans", async () => {
+    suppressLogs();
+    const rulesDir = join(projectRoot, "my-rules");
+    mkdirSync(rulesDir, { recursive: true });
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, semgrepRules: [rulesDir] },
+      env,
+    );
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+  });
+});
+
+describe("scan --max-files-per-agent", () => {
+  it("caps the agent to N candidate files, reviewing only N and dropping the rest", async () => {
+    suppressLogs();
+    // server.js (from beforeEach) + two more → 3 .js candidates for plain-agent.
+    writeFileSync(join(projectRoot, "a.js"), "const a = 1;", "utf8");
+    writeFileSync(join(projectRoot, "b.js"), "const b = 2;", "utf8");
+
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, maxFilesPerAgent: 2 },
+      env,
+    );
+
+    // The agent still runs, but over at most 2 distinct candidate files.
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+    const reviewed = new Set(
+      detectorMock.runAgent.mock.calls.flatMap((call) => call[0].candidates.map((c) => c.filePath)),
+    );
+    expect(reviewed.size).toBe(2);
+    // Only the 2 reviewed files get persisted records — the 3rd was dropped.
+    expect(loadAllFileRecords(outputDir).length).toBe(2);
+  });
+
+  it("reviews every candidate when the cap is at or above the candidate count", async () => {
+    suppressLogs();
+    writeFileSync(join(projectRoot, "a.js"), "const a = 1;", "utf8");
+    writeFileSync(join(projectRoot, "b.js"), "const b = 2;", "utf8");
+
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, maxFilesPerAgent: 5 },
+      env,
+    );
+
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+    expect(loadAllFileRecords(outputDir).length).toBe(3);
+  });
+
+  it("treats maxFilesPerAgent false (--no-max-files-per-agent) as no cap", async () => {
+    suppressLogs();
+    writeFileSync(join(projectRoot, "a.js"), "const a = 1;", "utf8");
+    writeFileSync(join(projectRoot, "b.js"), "const b = 2;", "utf8");
+
+    // `--no-max-files-per-agent` sets the opt to false → no cap, every file reviewed.
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, maxFilesPerAgent: false },
+      env,
+    );
+
+    expect(detectorMock.runAgent).toHaveBeenCalled();
+    expect(loadAllFileRecords(outputDir).length).toBe(3);
+  });
+});
+
+describe("scan plan reuse", () => {
+  it("reuses a prior plan, skipping the precondition for-loop on the next scan", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentGated], output: outputDir }, env);
+    expect(detectorMock.checkPrecondition).toHaveBeenCalled();
+
+    detectorMock.recon.mockClear();
+    detectorMock.checkPrecondition.mockClear();
+    await runScan(projectRoot, { template: [agentGated], output: outputDir }, env);
+
+    // Recon brief reused (no survey) and plan reused (no re-evaluation).
+    expect(detectorMock.recon).not.toHaveBeenCalled();
+    expect(detectorMock.checkPrecondition).not.toHaveBeenCalled();
+  });
+
+  it("--re-recon forces both a re-survey and a precondition re-evaluation", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentGated], output: outputDir }, env);
+
+    detectorMock.recon.mockClear();
+    detectorMock.checkPrecondition.mockClear();
+    await runScan(projectRoot, { template: [agentGated], output: outputDir, reRecon: true }, env);
+
+    expect(detectorMock.recon).toHaveBeenCalled();
+    expect(detectorMock.checkPrecondition).toHaveBeenCalled();
+  });
+});
+
+describe("scan --auto-exclude reuse", () => {
+  beforeEach(() => {
+    detectorMock.suggestExcludes.mockImplementation(async () => ({
+      excludes: [{ glob: "tests/**", reason: "test fixtures" }],
+    }));
+  });
+
+  it("reuses the auto-excludes a prior recon chose, without a second LLM pass", async () => {
+    suppressLogs();
+    // recon derives + records the auto-excludes in plan.json.
+    await runReconCommand(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true },
+      env,
+    );
+    expect(detectorMock.suggestExcludes).toHaveBeenCalledTimes(1);
+
+    // scan reuses them from plan.json — no second smart-exclude pass.
+    detectorMock.suggestExcludes.mockClear();
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true },
+      env,
+    );
+    expect(detectorMock.suggestExcludes).not.toHaveBeenCalled();
+    // The globs survive the scan's own plan.json rewrite so later scans reuse too.
+    expect(readScanPlan(outputDir)?.autoExcludes).toEqual(["tests/**"]);
+  });
+
+  it("reuses across repeated scans (first derives, second reuses)", async () => {
+    suppressLogs();
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true },
+      env,
+    );
+    expect(detectorMock.suggestExcludes).toHaveBeenCalledTimes(1);
+    expect(readScanPlan(outputDir)?.autoExcludes).toEqual(["tests/**"]);
+
+    detectorMock.suggestExcludes.mockClear();
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true },
+      env,
+    );
+    expect(detectorMock.suggestExcludes).not.toHaveBeenCalled();
+    expect(readScanPlan(outputDir)?.autoExcludes).toEqual(["tests/**"]);
+  });
+
+  it("--re-recon forces scan to re-derive the auto-excludes", async () => {
+    suppressLogs();
+    await runReconCommand(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true },
+      env,
+    );
+    expect(detectorMock.suggestExcludes).toHaveBeenCalledTimes(1);
+
+    detectorMock.suggestExcludes.mockClear();
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true, reRecon: true },
+      env,
+    );
+    expect(detectorMock.suggestExcludes).toHaveBeenCalledTimes(1); // re-derived, not reused
+  });
+
+  it("derives fresh when the prior recon ran without --auto-exclude", async () => {
+    suppressLogs();
+    // recon without auto-exclude → plan.json carries no autoExcludes field.
+    await runReconCommand(projectRoot, { template: [agentPlain], output: outputDir }, env);
+    expect(readScanPlan(outputDir)?.autoExcludes).toBeUndefined();
+    expect(detectorMock.suggestExcludes).not.toHaveBeenCalled();
+
+    // Nothing to reuse → scan runs the pass itself and records the result.
+    await runScan(
+      projectRoot,
+      { template: [agentPlain], output: outputDir, autoExclude: true },
+      env,
+    );
+    expect(detectorMock.suggestExcludes).toHaveBeenCalledTimes(1);
+    expect(readScanPlan(outputDir)?.autoExcludes).toEqual(["tests/**"]);
+  });
+});
+
+describe("cappedSlugsFromQueue", () => {
+  const q = (slugs: string[]) => slugs.map((slug) => ({ agent: { slug } }));
+
+  it("returns [] when the queue fits under the cap", () => {
+    expect(cappedSlugsFromQueue(q(["a", "a", "b"]), 5)).toEqual([]);
+  });
+
+  it("returns unique slugs beyond the cap in first-seen order", () => {
+    // cap=2 keeps [a,a]; drops [b,c,c] → capped = [b, c]
+    expect(cappedSlugsFromQueue(q(["a", "a", "b", "c", "c"]), 2)).toEqual(["b", "c"]);
+  });
+
+  it("counts a straddling agent (some batches kept, some dropped) as capped", () => {
+    // cap=1 keeps [a]; drops [a,b] → both a and b are capped
+    expect(cappedSlugsFromQueue(q(["a", "a", "b"]), 1)).toEqual(["a", "b"]);
+  });
+
+  it("returns [] for a non-finite cap (--no-max-batches)", () => {
+    expect(cappedSlugsFromQueue(q(["a", "b"]), Number.POSITIVE_INFINITY)).toEqual([]);
+  });
+});
+
+describe("scan --max-batches", () => {
+  it("writes state/capped.json listing agents dropped by the cap", async () => {
+    suppressLogs();
+    // Two agents, each yields one batch over the shared server.js candidate →
+    // 2 batches total. maxBatches:1 keeps the first, drops the second.
+    await runScan(
+      projectRoot,
+      { template: [agentPlain, agentGated], output: outputDir, maxBatches: 1 },
+      env,
+    );
+    const cappedPath = join(outputDir, "state", "capped.json");
+    expect(existsSync(cappedPath)).toBe(true);
+    const capped = JSON.parse(readFileSync(cappedPath, "utf8")) as { slugs: string[] };
+    expect(capped.slugs).toHaveLength(1);
+    expect(["plain-agent", "gated-agent"]).toContain(capped.slugs[0]);
+  });
+
+  it("does not write capped.json when nothing is dropped", async () => {
+    suppressLogs();
+    await runScan(projectRoot, { template: [agentPlain], output: outputDir, maxBatches: 250 }, env);
+    expect(existsSync(join(outputDir, "state", "capped.json"))).toBe(false);
+  });
+});

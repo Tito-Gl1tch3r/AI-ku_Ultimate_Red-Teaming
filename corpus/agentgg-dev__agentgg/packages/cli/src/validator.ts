@@ -1,0 +1,440 @@
+import type { Finding, ValidationVerdict } from "@agentgg/core";
+import { z } from "zod";
+import { languageFromPath } from "./detect.js";
+
+/**
+ * Shape the LLM is asked to produce for a single finding. Maps onto a
+ * subset of `ValidationResult` from @agentgg/core — fields like
+ * `scopeRef` (SECURITY.md driven) and `adjustedSeverity` (scoring
+ * agent driven) are intentionally NOT delegated to the validator.
+ *
+ * The detector wraps this in its provider-specific schema enforcement
+ * (Vercel SDK uses `generateObject`; Claude Agent SDK relies on a
+ * JSON-only prompt and defensive parsing).
+ */
+/**
+ * Reasoning recorded when the validator returns nothing at all: it spent its
+ * whole turn budget on tool calls, or the completion came back empty. The
+ * verdict stays `uncertain` because that is the truth (we do not know), but the
+ * prose has to say the run was cut short.
+ *
+ * Previously an empty response went through the structured reformat, whose
+ * prompt carries only the model's own output and never the finding. Asked to
+ * extract a verdict from a blank page, the model complied: it picked
+ * `uncertain` and wrote "No validation content or finding was provided to
+ * analyze", which landed on the finding looking like a real judgement.
+ *
+ * Exported so both detectors emit the same string, tests assert on it, and a
+ * cleanup pass can find affected findings. User-facing: the dashboard renders
+ * it verbatim.
+ */
+export const VALIDATION_CUT_SHORT =
+  "Validation was cut short. The model stopped before it returned a verdict, so this finding was not assessed.";
+
+export const LlmValidation = z.object({
+  verdict: z
+    .enum(["confirmed", "false-positive", "out-of-scope", "uncertain"])
+    .describe(
+      "Your classification of the finding. " +
+        "'confirmed' = real bug, exploitation plausible. " +
+        "'false-positive' = code is not vulnerable as described. " +
+        "'out-of-scope' = applies only when scope hints disqualify it. " +
+        "'uncertain' = you don't have enough information to decide.",
+    ),
+  reasoning: z
+    .string()
+    .describe(
+      "Short prose (max 4 sentences) explaining your verdict. Cite the specific code element that made you decide.",
+    ),
+  // Optional: `asValidationField` drops it, so a missing value costs nothing —
+  // but a required field threw away whole verdicts when the model closed the
+  // object early (unescaped quote inside `reasoning`).
+  confidence: z
+    .preprocess((v) => (typeof v === "number" && v > 1 ? v / 100 : v), z.number().min(0).max(1))
+    .default(0.5)
+    .describe(
+      "Decimal 0.0–1.0. NOT a percentage. Write 0.3 not 30. 0.0 = guess, 1.0 = certain. Uncertain verdicts should have low confidence.",
+    ),
+  confirmedImpact: z
+    .string()
+    .optional()
+    .describe(
+      "One or two sentences: the impact you confirmed in the code, from the worst claim that holds. Omit when nothing is confirmed.",
+    ),
+  unconfirmedImpact: z
+    .string()
+    .optional()
+    .describe(
+      "One sentence: a worse impact a report claimed that you could not confirm. Omit when every claimed impact was confirmed or refuted.",
+    ),
+  leadId: z
+    .string()
+    .optional()
+    .describe(
+      "The id of the report whose claim gives confirmedImpact. Omit for a single report or when nothing is confirmed.",
+    ),
+  primaryClaimHolds: z
+    .boolean()
+    .optional()
+    .describe(
+      "True when you confirmed the claim of the finding under review itself, false when you could not. Omit for a single report.",
+    ),
+});
+export type LlmValidation = z.infer<typeof LlmValidation>;
+
+export const GROUP_MEMBER_CHAR_CAP = 6000;
+
+function memberBlock(m: Finding): string {
+  return `### Report ${m.id}
+**Reported by agent:** ${m.agentSlug}
+**Vuln class:** ${m.vulnSlug}
+
+**Summary:** ${clip(m.summary, 400)}
+
+**Impact:** ${clip(m.impact, 600)}
+
+**PoC:** ${clip(m.poc, 800)}`;
+}
+
+/** Split members into those the prompt shows and those the cap leaves out.
+ *  The caller validates the left-out ones itself if the group is rejected. */
+export function fitMembers(members: Finding[]): { shown: Finding[]; left: Finding[] } {
+  const shown: Finding[] = [];
+  let used = 0;
+  for (const m of members) {
+    const size = memberBlock(m).length;
+    if (used + size > GROUP_MEMBER_CHAR_CAP) break;
+    shown.push(m);
+    used += size;
+  }
+  return { shown, left: members.slice(shown.length) };
+}
+
+function memberBlocks(members: Finding[]): string {
+  const { shown, left } = fitMembers(members);
+  const blocks = shown.map(memberBlock);
+  if (left.length > 0) blocks.push(`_${left.length} more report(s) left out to fit the prompt._`);
+  return blocks.join("\n\n");
+}
+
+function clip(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/**
+ * Build the prompt the validator sees for one finding. Includes the
+ * finding's narrative fields and the full file content (so the
+ * validator re-grounds its judgement in the actual code, not the
+ * detector's prose).
+ *
+ * Returns the prompt as a string; the calling detector wraps it with
+ * provider-specific output enforcement.
+ */
+export function buildValidatePrompt(args: {
+  finding: Finding;
+  fileContent: string;
+  /**
+   * Optional scope document (typically SECURITY.md contents). When
+   * present, the validator is told to also classify the finding against
+   * the documented scope and may return `out-of-scope`. When absent,
+   * the model is told that the `out-of-scope` verdict is NOT available
+   * — without scope context, that verdict would be guesswork.
+   */
+  scope?: string;
+  /**
+   * When set, the validator is running tool-enabled (Read/Glob/Grep
+   * rooted at the repo). The prompt then tells the model to trace the
+   * exploit chain across files rather than judging the embedded file in
+   * isolation. When omitted, the model only has the embedded file.
+   */
+  root?: string;
+  /**
+   * The reporting agent's own validation rules, from its frontmatter
+   * `validationPrompt`. When set, it REPLACES the default judgement rules
+   * at the top and the default confirm criteria at the bottom, and is
+   * placed last so it is the final instruction the model reads. The
+   * finding, the source, the tracing block, the scope block and the
+   * verdict contract are always injected either way, so the answer
+   * schema can not break.
+   */
+  validationPrompt?: string;
+  /** The group's duplicates. The verdict then covers the whole group. */
+  members?: Finding[];
+}): string {
+  const { finding, fileContent, scope, root, validationPrompt, members } = args;
+  const custom = validationPrompt?.trim();
+  const lang = languageFromPath(finding.filePath);
+  const lineHint = finding.lineRange
+    ? `lines ${finding.lineRange[0]}–${finding.lineRange[1]}`
+    : "unspecified lines";
+
+  const scopeBlock = scope
+    ? `
+## Scope rules
+
+The document below describes what's in-scope for this engagement
+(usually a SECURITY.md). If the finding describes a real bug but its
+file path, vulnerability class, or affected component is explicitly
+excluded by this scope, return \`out-of-scope\`. Also return
+\`out-of-scope\` when the scope's trust boundary rules exclude it:
+only an actor already on the trusted side (an administrator, a database
+owner, or someone who controls the data source) can supply the unsafe
+value. Quote the matching scope rule in your reasoning. If nothing in
+the scope disqualifies it, ignore the scope and judge the finding on
+technical merit.
+
+\`\`\`
+${scope}
+\`\`\`
+`
+    : "";
+
+  const verdictOptions = scope
+    ? '"confirmed" | "false-positive" | "out-of-scope" | "uncertain"'
+    : '"confirmed" | "false-positive" | "uncertain"';
+
+  const scopeVerdictNote = scope
+    ? ""
+    : "\nNo scope document was supplied for this run, so `out-of-scope` is not a valid verdict — use `uncertain` if you would otherwise have picked it.\n";
+
+  // Tool-enabled runs (root set) get an explicit instruction to trace the
+  // exploit chain across files. The embedded file below is only the
+  // finding's OWN file — for a cross-file chain (endpoint → service →
+  // sink) the mitigating guard often lives in a DIFFERENT file the model
+  // must open itself.
+  const tracingBlock = root
+    ? `
+## Trace the chain across files — do not judge this file in isolation
+
+You have Read/Glob/Grep tools rooted at the repository. The source
+below is only the finding's own file (\`${finding.filePath}\`). Many
+findings are cross-file: an entry point in one file reaches the sink in
+another through a service or repository layer, and a validation/filter
+step in between can neutralize the reported bug (or, conversely, a
+missing guard upstream can confirm it).
+
+Before deciding, actually investigate:
+- Grep for the sink method / endpoint named in the finding to locate its
+  callers and the request handler that reaches it.
+- If the sink is reached through type dispatch (an instanceof check, a
+  visitor, or a class registered by type), also Grep for the class name: a
+  search for the method name does not find those call sites.
+- Read those intermediate files. Confirm whether the untrusted input
+  really flows to the sink UNCHANGED, or whether an intermediate step
+  filters, allowlists, or otherwise constrains it (e.g. the input is used
+  only to look up / select an already-trusted value, not as the sink
+  argument itself).
+- Check the actual auth/authorization gating on the real entry point.
+
+Only after tracing the reachable path end to end should you classify. If
+the reported mechanism is broken by an intermediate guard (for example
+the input only selects an already-trusted value rather than being the
+sink argument), return 'false-positive'. A guard that lets
+only trusted values reach the sink leaves no real vulnerability, even
+though the unsafe code is still there. This comes before the scope
+rules: if the reported untrusted input cannot carry an unsafe value to
+the sink, return 'false-positive' even when a trusted actor could reach
+the same sink another way. Return 'uncertain' only when a different
+real path from untrusted input remains, such as a different entry
+point, and you could not verify it. Do NOT confirm the original writeup
+in that case.
+`
+    : "";
+
+  const rulesBlock = custom
+    ? ""
+    : `
+Be skeptical. Detection agents over-report. Reserve 'confirmed' for
+findings you are certain are a genuine, exploitable security
+vulnerability: the kind you would stake a CVE, a security advisory, or a
+published proof-of-concept on. That means you traced the exact unsafe
+code element AND a concrete, working exploit path from an
+attacker-reachable entry point, AND the reported sink, flow and PoC
+match that path. If you are not that certain, do not confirm.
+
+Use 'uncertain' whenever a real issue that untrusted input can reach is
+plausible but you cannot stand behind the report as written: the
+reported entry point turns out to be a filter or guard, the PoC as
+written would not work, the true exploit path runs through a different
+endpoint than the title claims, or you could not fully verify
+reachability. When only a trusted actor can
+supply the unsafe value, that is not 'uncertain': it is 'out-of-scope'
+under the scope rules, or 'false-positive' when a guard lets only
+trusted values reach the sink. 'uncertain' is the correct
+home for "there is probably something here, but not the clean, certain,
+report-it-upstream finding that was described." Confirming a shaky or
+mischaracterized finding is worse than an honest 'uncertain'.
+
+When the PoC as written would not work but you can see a payload that
+would, return 'uncertain' and give that payload in your reasoning. You
+cannot run code, so a payload you wrote yourself is a suggestion, not
+proof. A different host, port, or encoding of the same payload is not a
+fix and does not count against the PoC.
+`;
+
+  // Last thing the model reads before it answers: either the agent's own
+  // rules or the default confirm criteria. Never both.
+  const tailBlock = custom
+    ? `
+${custom}`
+    : `
+'confirmed' requires ALL of: you traced a working exploit path end to
+end, it is reachable by the relevant attacker, the reported sink and
+flow match the code, and the PoC as written would work. If the PoC needs
+a fix, return 'uncertain' and give the corrected payload in your
+reasoning. If there is no real vulnerability at all, return
+'false-positive'.`;
+
+  const groupBlock =
+    members && members.length > 0
+      ? `
+## Other reports of the same bug
+
+De-duplication grouped the reports below with the finding above: the same
+vulnerability at the same sink. They can claim different impacts or give
+different PoCs. Your verdict applies to the whole group.
+
+Judge the worst claim in this group that you can confirm, not only the claim
+of the finding above. If the finding above claims more than you can confirm
+but another report's claim holds, the verdict is 'confirmed' for that claim.
+
+${memberBlocks(members)}
+`
+      : "";
+
+  const leadNote =
+    members && members.length > 0
+      ? " Set `leadId` to the id of the report whose claim gives `confirmedImpact` (the finding above is `" +
+        finding.id +
+        "`), set `primaryClaimHolds` to true if you confirmed the claim of the finding above and false if you did not, and put any worse claim you could not confirm in `unconfirmedImpact`."
+      : "";
+
+  return `You are reviewing a security finding produced by another agent.
+Your job is to classify it by re-examining the source code yourself.
+${rulesBlock}
+## The finding
+
+**Title:** ${finding.title}
+**Vuln class:** ${finding.vulnSlug}
+**Reported by agent:** ${finding.agentSlug}
+**File:** ${finding.filePath} (${lineHint})
+**Detector confidence:** ${finding.confidence.toFixed(2)} (0.0–1.0 scale)
+
+### Summary
+${finding.summary}
+
+### Details
+${finding.details}
+
+### PoC
+${finding.poc}
+
+### Impact
+${finding.impact}
+${groupBlock}
+## The source code
+
+\`\`\`${lang}
+${fileContent}
+\`\`\`
+${tracingBlock}${scopeBlock}
+## Your task
+
+Return a verdict (${verdictOptions}), a short reasoning (max 4
+sentences, cite a specific code element), your confidence, and, only
+when the verdict is confirmed, in \`confirmedImpact\` the impact you
+confirmed in one or two sentences.${leadNote}
+${scopeVerdictNote}${tailBlock}`;
+}
+
+/**
+ * Convenience: map an LLM-produced classification onto the slot on the
+ * Finding. Kept here so both detectors hydrate identically.
+ */
+export function asValidationField(v: LlmValidation): {
+  verdict: ValidationVerdict;
+  reasoning: string;
+  confirmedImpact?: string;
+  unconfirmedImpact?: string;
+  leadId?: string;
+  primaryClaimHolds?: boolean;
+} {
+  return {
+    verdict: v.verdict,
+    reasoning: v.reasoning,
+    ...(v.confirmedImpact?.trim() ? { confirmedImpact: v.confirmedImpact.trim() } : {}),
+    ...(v.unconfirmedImpact?.trim() ? { unconfirmedImpact: v.unconfirmedImpact.trim() } : {}),
+    ...(v.leadId?.trim() ? { leadId: v.leadId.trim() } : {}),
+    ...(typeof v.primaryClaimHolds === "boolean" ? { primaryClaimHolds: v.primaryClaimHolds } : {}),
+  };
+}
+
+/**
+ * Build the prompt for `--scope-validate`. Same schema (`LlmValidation`)
+ * as the full validator so detectors can reuse their structured-output
+ * path, but the prompt:
+ *
+ *   - withholds file content entirely
+ *   - requires a scope document
+ *   - constrains the model to `out-of-scope` or `uncertain`
+ *     (`confirmed` / `false-positive` need the code, which scope-only
+ *     mode deliberately skips)
+ *
+ * Used as a cheap pre-filter to knock out scope-disqualified findings
+ * before paying the full validator cost.
+ */
+export function buildScopeValidatePrompt(args: { finding: Finding; scope: string }): string {
+  const { finding, scope } = args;
+  const lineHint = finding.lineRange
+    ? `lines ${finding.lineRange[0]}–${finding.lineRange[1]}`
+    : "unspecified lines";
+
+  return `You are classifying a security finding against a scope document.
+You will NOT see the source code — your only job is to decide whether
+the documented scope explicitly excludes this finding.
+
+## The finding
+
+**Title:** ${finding.title}
+**Vuln class:** ${finding.vulnSlug}
+**Reported by agent:** ${finding.agentSlug}
+**File:** ${finding.filePath} (${lineHint})
+
+### Summary
+${finding.summary}
+
+### Details
+${finding.details}
+
+### Impact
+${finding.impact}
+
+## Scope rules
+
+The document below describes what's in-scope for this engagement
+(usually a SECURITY.md). If the finding's file path, vulnerability
+class, or affected component is explicitly excluded by this scope, or
+the scope's trust boundary rules exclude it because only an actor
+already on the trusted side can supply the unsafe value, return
+\`out-of-scope\` and quote the matching rule. Otherwise return
+\`uncertain\` — that signals the scope did not disqualify the finding
+(full validation against the source is still needed to confirm or
+dismiss it).
+
+\`\`\`
+${scope}
+\`\`\`
+
+## Your task
+
+Return one of:
+- \`out-of-scope\` — scope explicitly excludes this finding's path,
+  vulnerability class, or affected component. Quote the matching rule.
+- \`uncertain\` — scope does not clearly exclude this finding.
+
+You MUST NOT return \`confirmed\` or \`false-positive\` — those
+verdicts require reading the source code, which has not been provided.
+
+Reasoning: at most 4 sentences. Quote the specific scope rule that
+drove your decision.`;
+}

@@ -1,0 +1,559 @@
+"""E2E for the Report 2.0 two-view master-detail page.
+
+Drives the browser with a synthetic completed scan (no archive.org), then asserts
+the Categories master-detail and the composable Activity view actually render and
+respond to clicks. Opt-in: WT_E2E=1.
+"""
+import json
+
+# A realistic synthetic result set: several categories, one disappeared
+# subdomain, a favicon with an archived source, an analytics tracker.
+FINDINGS = [
+    {"id": 1, "category": "emails", "value": "contact@oteria.fr", "first_seen": "2016-03", "last_seen": "2025-06", "occurrences": 214, "metadata": {"source_url": "https://web.archive.org/web/20200101000000/http://oteria.fr/"}},
+    {"id": 2, "category": "emails", "value": "rh@oteria.fr", "first_seen": "2019-01", "last_seen": "2023-11", "occurrences": 31, "metadata": {"source_url": "https://web.archive.org/web/20231101000000/http://oteria.fr/contact"}},
+    {"id": 3, "category": "emails", "value": "admissions@oteria.fr", "first_seen": "2018-09", "last_seen": "2025-06", "occurrences": 96, "metadata": {}},
+    {"id": 4, "category": "subdomains", "value": "www.oteria.fr", "first_seen": "2016-03", "last_seen": "2025-06", "occurrences": 388, "metadata": {}},
+    {"id": 5, "category": "subdomains", "value": "staging.oteria.fr", "first_seen": "2021-06", "last_seen": "2021-08", "occurrences": 3, "metadata": {"source_url": "https://web.archive.org/web/20210801000000/http://staging.oteria.fr/"}},
+    {"id": 6, "category": "technologies", "value": "nginx", "first_seen": "2016-03", "last_seen": "2025-06", "occurrences": 388, "metadata": {"version": "1.24"}},
+    {"id": 7, "category": "analytics_trackers", "value": "UA-38xxxx", "first_seen": "2016-03", "last_seen": "2023-04", "occurrences": 276, "metadata": {"type": "Google Analytics"}},
+    {"id": 8, "category": "favicons", "value": "https://oteria.fr/favicon.ico", "first_seen": "2022-05", "last_seen": "2025-06", "occurrences": 40, "metadata": {"md5": "91af7c00", "source_url": "https://web.archive.org/web/20230101000000/http://oteria.fr/favicon.ico"}},
+]
+
+INFO = {"name": "oteria.fr", "findings_summary": {}, "scanMeta": {}}
+
+
+def _open_report(page, live_server):
+    page.goto(live_server + "/", wait_until="networkidle")
+    page.evaluate(
+        """([findings, info]) => {
+            if (window.setLang) window.setLang('en');   // stable labels for assertions
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+            document.getElementById('view-results').classList.add('active');
+            window.renderReport2(info, findings, {url_id: 'e2etest', domain: 'oteria.fr'});
+        }""",
+        [FINDINGS, INFO],
+    )
+
+
+def test_categories_view_renders_rail_and_detail(live_server, page):
+    _open_report(page, live_server)
+    rail = page.locator("#r2-rail")
+    assert rail.is_visible()
+    # Found categories are listed with counts.
+    assert page.locator(".r2-rlink", has_text="Emails").count() >= 1
+    assert page.locator(".r2-rlink", has_text="Subdomains").count() >= 1
+    # The default-open category (emails, most findings) shows rows.
+    main = page.locator("#r2-main")
+    assert "contact@oteria.fr" in main.inner_text()
+    # Provenance columns present.
+    assert "occ." in main.inner_text().lower()
+    # Neutral: no severity UI anywhere (stats bar, filter dropdown, per-row dot).
+    assert page.locator(".sev-stat").count() == 0
+    assert page.locator("#r2-main .col-sev").count() == 0
+    assert page.locator("#filter-severity:visible").count() == 0
+
+
+def test_clicking_a_category_opens_it(live_server, page):
+    _open_report(page, live_server)
+    page.locator(".r2-rlink", has_text="Tech stack").first.click()
+    main = page.locator("#r2-main")
+    assert "nginx" in main.inner_text()
+    # Its per-category activity block renders.
+    assert page.locator(".r2-act").count() >= 1
+
+
+def test_empty_categories_toggle(live_server, page):
+    _open_report(page, live_server)
+    # Empty categories are collapsed by default, revealed on toggle.
+    assert page.locator(".r2-emptylist").count() == 0
+    page.locator(".r2-emptytoggle").click()
+    assert page.locator(".r2-emptylist").count() == 1
+    assert page.locator(".r2-emptylist .r2-rlink.zero").count() > 10
+
+
+def test_activity_view_composes_lanes(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    # Composer with lanes and checkboxes.
+    assert page.locator(".r2-composer").count() == 1
+    assert page.locator(".r2-composer .r2-lane").count() >= 1
+    # Category + pivot checkboxes in the rail.
+    assert page.locator(".r2-chk").count() >= 2
+    # Favicon gallery present (we supplied one favicon with an archive source).
+    assert page.locator(".r2-favstrip").count() == 1
+
+
+def test_pivot_checkbox_adds_a_lane(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    before = page.locator(".r2-composer .r2-lane").count()
+    # Tick a pivot that isn't checked yet (find an unchecked pivot row).
+    unchecked = page.locator(".r2-chk.pv:not(.on)").first
+    if unchecked.count() > 0:
+        unchecked.click()
+        after = page.locator(".r2-composer .r2-lane").count()
+        assert after >= before
+
+
+def test_filter_narrows_the_open_category(live_server, page):
+    _open_report(page, live_server)
+    # Open emails, filter to "rh". The findings ROWS narrow (the per-category
+    # activity below deliberately still shows the full history).
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    page.fill("#r2-filter", "rh")
+    assert page.locator("#r2-main .r2-row", has_text="rh@oteria.fr").count() >= 1
+    assert page.locator("#r2-main .r2-row", has_text="contact@oteria.fr").count() == 0
+
+
+# --- regression tests for reported UI bugs (fixed) ---
+
+LONG_VAL = "https://cdn.oteria.fr/assets/js/vendor/analytics.bundle.min.js?v=8f3a9c2e1b7d4f60a1c2e3b4d5f6a7b8&ts=1699999999"
+
+# Two categories with DISJOINT date ranges, to prove the timeline axis adapts.
+DATED = [
+    {"id": 1, "category": "emails", "value": "old@x.com", "first_seen": "2005-01", "last_seen": "2008-06", "occurrences": 5, "metadata": {}},
+    {"id": 2, "category": "subdomains", "value": "new.x.com", "first_seen": "2021-01", "last_seen": "2024-06", "occurrences": 9, "metadata": {}},
+    {"id": 3, "category": "js_urls", "value": LONG_VAL, "first_seen": "2019-05", "last_seen": "2020-02", "occurrences": 3, "metadata": {}},
+]
+
+
+def _open_with(page, live_server, findings):
+    page.goto(live_server + "/", wait_until="networkidle")
+    page.evaluate(
+        """([findings]) => {
+            if (window.setLang) window.setLang('en');
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+            document.getElementById('view-results').classList.add('active');
+            window.renderReport2({name: 'x.com'}, findings, {url_id: 't', domain: 'x.com'});
+        }""",
+        [findings],
+    )
+
+
+def test_long_value_shown_in_full_not_truncated(live_server, page):
+    _open_with(page, live_server, DATED)
+    page.locator(".r2-rlink", has_text="JavaScript URLs").first.click()
+    # The full long URL is present in the DOM (no ellipsis truncation of content).
+    txt = page.locator("#r2-main .r2-val-text").first.inner_text()
+    assert LONG_VAL in txt
+
+
+def test_copy_button_is_reachable_on_a_long_row(live_server, page):
+    _open_with(page, live_server, DATED)
+    page.locator(".r2-rlink", has_text="JavaScript URLs").first.click()
+    btn = page.locator("#r2-main .r2-row", has_text="analytics.bundle").locator(".r2-copy")
+    assert btn.count() == 1
+    box = btn.first.bounding_box()
+    main_box = page.locator("#r2-main").bounding_box()
+    # The copy button sits within the visible main column (not clipped off-row).
+    assert box is not None and box["x"] >= main_box["x"] - 1
+    btn.first.click()   # must not throw
+
+
+def test_per_category_timeline_axis_adapts_to_that_category(live_server, page):
+    _open_with(page, live_server, DATED)
+    # Open the 2005-2008 emails category: its axis years should be around 2005-2008,
+    # NOT the global 2005-2024 span.
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    years = page.locator("#r2-main .r2-act .r2-years").first.inner_text()
+    assert "2005" in years
+    assert "2021" not in years and "2024" not in years
+
+
+def test_activity_checkbox_state_updates_in_the_rail(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    first = page.locator("#r2-rail .r2-chk").first
+    was_on = "on" in (first.get_attribute("class") or "")
+    first.click()
+    now_on = "on" in (page.locator("#r2-rail .r2-chk").first.get_attribute("class") or "")
+    assert now_on != was_on, "rail checkbox visual did not update on toggle"
+
+
+def test_activity_offers_many_pivots(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    # Rich pivot list (subdomains, persons, trackers, emails, tech, favicons…).
+    assert page.locator("#r2-rail .r2-chk.pv").count() >= 4
+
+
+def test_composed_feed_has_no_duplicate_events(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    # staging.oteria.fr is both a subdomain (checked category) and a pivot; its
+    # events must appear once, not twice.
+    rows = page.locator(".r2-composer .r2-ev", has_text="staging.oteria.fr")
+    texts = rows.all_inner_texts()
+    assert len(texts) == len(set(texts)), f"duplicate change-feed events: {texts}"
+
+
+def test_unticking_everything_shows_a_compose_hint(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    # Untick every checked category and pivot.
+    for _ in range(40):
+        on = page.locator("#r2-rail .r2-chk.on")
+        if on.count() == 0:
+            break
+        on.first.click()
+    assert page.locator(".r2-empty-compose").count() == 1
+
+
+def test_show_all_lists_every_found_category(live_server, page):
+    _open_report(page, live_server)
+    page.locator(".r2-rall", has_text="Show all").click()
+    # Every found category's detail block is rendered at once.
+    assert page.locator("#r2-main .r2-catblock").count() >= 4
+
+
+def test_copy_column_button_present_per_category(live_server, page):
+    _open_report(page, live_server)
+    assert page.locator("#r2-main .r2-copycol").count() >= 1
+
+
+def test_copy_click_shows_a_confirmation_animation(live_server, page):
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    _open_report(page, live_server)
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    btn = page.locator("#r2-main .r2-row .r2-copy").first
+    btn.click()
+    # In-place confirmation: the button gets the .copied class and shows a check.
+    page.wait_for_selector("#r2-main .r2-copy.copied", timeout=2000)
+    assert "✓" in btn.inner_text()
+    # And the value actually reached the clipboard.
+    clip = page.evaluate("() => navigator.clipboard.readText()")
+    assert "@oteria.fr" in clip
+
+
+def test_pivots_derive_from_ticked_categories(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    # Subdomains is checked by default (a top category) -> its values are pivots.
+    assert page.locator("#r2-rail .r2-chk.pv", has_text="www.oteria.fr").count() == 1
+    # Untick Subdomains -> its pivots disappear from the list.
+    page.locator("#r2-rail .r2-chk", has_text="Subdomains").first.click()
+    assert page.locator("#r2-rail .r2-chk.pv", has_text="www.oteria.fr").count() == 0
+
+
+def test_pivot_search_filters_the_list(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    before = page.locator("#r2-rail .r2-chk.pv").count()
+    assert before >= 2
+    page.fill("#r2-pivfilter", "www")
+    after = page.locator("#r2-rail .r2-chk.pv").count()
+    assert after < before
+    assert page.locator("#r2-rail .r2-chk.pv", has_text="www.oteria.fr").count() == 1
+
+
+def test_no_pivots_hint_when_no_category_ticked(live_server, page):
+    _open_report(page, live_server)
+    page.locator("#r2-vbtn-activity").click()
+    # Untick every category -> the pivot section shows the guidance note.
+    for _ in range(40):
+        on = page.locator("#r2-rail .r2-chk:not(.pv).on")
+        if on.count() == 0:
+            break
+        on.first.click()
+    assert page.locator("#r2-rail .r2-pivnote").count() >= 1
+
+
+def test_value_with_a_quote_does_not_break_the_row(live_server, page):
+    # Regression: a finding value containing a double quote used to break the
+    # inline onclick attribute (esc() didn't escape quotes). The row must render
+    # intact and copy the exact value.
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    tricky = 'title="Accueil" & <b>x</b>'
+    findings = [{"id": 1, "category": "html_titles", "value": tricky,
+                 "first_seen": "2020-01", "last_seen": "2020-06", "occurrences": 2, "metadata": {}}]
+    _open_with(page, live_server, findings)
+    row = page.locator("#r2-main .r2-row")
+    assert row.count() == 1
+    # The full value is shown verbatim (not truncated/broken by the quote).
+    assert page.locator("#r2-main .r2-val-text").inner_text() == tricky
+    # Copy still works and yields the exact value.
+    row.locator(".r2-copy").click()
+    assert page.evaluate("() => navigator.clipboard.readText()") == tricky
+
+
+def test_applyfilters_is_null_safe_without_the_old_table(live_server, page):
+    # Regression 4A: the old findings-table filter controls are gone; a leftover
+    # caller (timeline drawer) must not crash on null.value.
+    _open_report(page, live_server)
+    err = page.evaluate("""() => {
+        try { if (typeof applyFilters === 'function') applyFilters(); return null; }
+        catch (e) { return String(e); }
+    }""")
+    assert err is None, f"applyFilters threw: {err}"
+
+
+def test_empty_scan_shows_a_no_findings_state(live_server, page):
+    _open_with(page, live_server, [])   # a scan that found nothing
+    assert page.locator("#r2-main .r2-noresults").count() == 1
+    # The count comes from the category list, so the test reads it the same way
+    # rather than pinning a number: a hardcoded 43 is what let the UI drift.
+    total = page.evaluate("REPORT2_SCOPE.length")
+    assert str(total) in page.locator("#r2-main .r2-noresults").inner_text()
+
+
+def test_rail_keyboard_navigation(live_server, page):
+    _open_report(page, live_server)
+    links = page.locator("#r2-rail .r2-rlink")
+    links.first.focus()
+    page.keyboard.press("ArrowDown")
+    # Focus moved to the 2nd rail link.
+    idx = page.evaluate("() => Array.from(document.querySelectorAll('#r2-rail .r2-rlink')).indexOf(document.activeElement)")
+    assert idx == 1
+    page.keyboard.press("Enter")   # opens the focused category
+    # The opened category's detail is now shown (its name is the 2nd found cat).
+    assert page.locator("#r2-main .r2-dhead .r2-name").count() == 1
+
+
+def test_copy_column_shows_confirmation(live_server, page):
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    _open_report(page, live_server)
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    btn = page.locator("#r2-main .r2-copycol").first
+    btn.click()
+    page.wait_for_selector("#r2-main .r2-copycol.copied", timeout=2000)
+    clip = page.evaluate("() => navigator.clipboard.readText()")
+    assert "@oteria.fr" in clip
+
+
+# --- summary header, presence filter, co-occurrence ---
+
+PRES = [
+    {"id": 1, "category": "emails", "value": "live@x.com", "first_seen": "2016-01", "last_seen": "2025-06", "occurrences": 9, "metadata": {"source_page_id": 1, "source_url": "https://web.archive.org/web/20200101/http://x.com/"}},
+    {"id": 2, "category": "emails", "value": "gone@x.com", "first_seen": "2017-01", "last_seen": "2019-06", "occurrences": 4, "metadata": {"source_page_id": 2}},
+    {"id": 3, "category": "persons", "value": "Jane Doe", "first_seen": "2018-01", "last_seen": "2025-06", "occurrences": 3, "metadata": {"source_page_id": 1}},
+]
+
+
+def test_summary_strip_shows_stats(live_server, page):
+    _open_with(page, live_server, PRES)
+    txt = page.locator("#r2-summary").inner_text()
+    assert "3" in txt          # 3 findings
+    assert str(page.evaluate("REPORT2_SCOPE.length")) in txt   # X/N categories
+    # Presence segmented control present with live/gone counts.
+    assert page.locator("#r2-summary .wt-tab").count() == 3
+
+
+def test_presence_filter_narrows_to_still_present(live_server, page):
+    _open_with(page, live_server, PRES)
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    # Default: both emails shown.
+    assert page.locator("#r2-main .r2-row", has_text="live@x.com").count() == 1
+    assert page.locator("#r2-main .r2-row", has_text="gone@x.com").count() == 1
+    # Click "Still present" -> only the live one remains.
+    page.locator(".wt-tab", has_text="Still present").click()
+    assert page.locator("#r2-main .r2-row", has_text="live@x.com").count() == 1
+    assert page.locator("#r2-main .r2-row", has_text="gone@x.com").count() == 0
+    # "Disappeared" -> only the gone one.
+    page.locator(".wt-tab", has_text="Disappeared").click()
+    assert page.locator("#r2-main .r2-row", has_text="gone@x.com").count() == 1
+    assert page.locator("#r2-main .r2-row", has_text="live@x.com").count() == 0
+
+
+def test_cooccurrence_chip_expands_same_page_findings(live_server, page):
+    _open_with(page, live_server, PRES)
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    # live@x.com shares source_page_id 1 with "Jane Doe" -> a "⋯ 1" chip.
+    chip = page.locator("#r2-main .r2-row", has_text="live@x.com").locator(".r2-cooc-chip")
+    assert chip.count() == 1
+    assert page.locator("#r2-main .r2-cooc-panel").count() == 0
+    chip.click()
+    panel = page.locator("#r2-main .r2-cooc-panel")
+    assert panel.count() == 1
+    assert "Jane Doe" in panel.inner_text()
+    # gone@x.com is alone on its page -> no chip.
+    assert page.locator("#r2-main .r2-row", has_text="gone@x.com").locator(".r2-cooc-chip").count() == 0
+
+
+# --- code-audit regressions ---
+
+# Category "emails" all disappeared by 2018; "subdomains" reaches the archive end
+# (2025). The global "still present" bound must stay 2025 even after opening the
+# 2018-only emails category (which locally mutates the timeline bound).
+GLOBALHI = [
+    {"id": 1, "category": "emails", "value": "old1@x.com", "first_seen": "2012-01", "last_seen": "2018-03", "occurrences": 4, "metadata": {}},
+    {"id": 2, "category": "emails", "value": "old2@x.com", "first_seen": "2013-01", "last_seen": "2017-06", "occurrences": 2, "metadata": {}},
+    {"id": 3, "category": "subdomains", "value": "www.x.com", "first_seen": "2012-01", "last_seen": "2025-06", "occurrences": 99, "metadata": {}},
+]
+
+
+def test_presence_bound_stable_after_opening_an_old_category(live_server, page):
+    _open_with(page, live_server, GLOBALHI)
+    # Open the emails category (its newest last_seen is 2018) — this used to shrink
+    # the global bound and misclassify presence on the next render.
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    # Now filter to "Still present": ONLY www.x.com (2025) should qualify; the 2018
+    # emails must NOT be counted live.
+    page.locator(".wt-tab", has_text="Still present").click()
+    page.locator(".r2-rlink", has_text="Subdomains").first.click()
+    assert page.locator("#r2-main .r2-row", has_text="www.x.com").count() == 1
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    # Emails category under "Still present" must be empty (all disappeared in 2018).
+    assert page.locator("#r2-main .r2-row", has_text="@x.com").count() == 0
+    assert page.locator("#r2-main .r2-emptystate").count() == 1
+
+
+def test_pivot_value_with_quote_does_not_inject(live_server, page):
+    tricky = 'x" onmouseover="window.__hacked=1'
+    findings = [
+        {"id": 1, "category": "subdomains", "value": tricky, "first_seen": "2020-01", "last_seen": "2025-06", "occurrences": 3, "metadata": {}},
+        {"id": 2, "category": "emails", "value": "a@x.com", "first_seen": "2020-01", "last_seen": "2025-06", "occurrences": 5, "metadata": {}},
+    ]
+    _open_with(page, live_server, findings)
+    page.locator("#r2-vbtn-activity").click()
+    # The pivot renders (its category is checked by default) and toggling it works
+    # via a data attribute — no injected handler fires.
+    pv = page.locator("#r2-rail .r2-chk.pv", has_text='onmouseover')
+    assert pv.count() == 1
+    pv.first.hover()
+    pv.first.click()
+    assert page.evaluate("() => window.__hacked") in (None, 0)
+    assert "on" in (pv.first.get_attribute("class") or "")
+
+
+def test_copy_column_respects_presence_filter(live_server, page):
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    _open_with(page, live_server, GLOBALHI)
+    page.locator(".r2-rlink", has_text="Subdomains").first.click()
+    page.locator(".wt-tab", has_text="Disappeared").click()
+    # Subdomains has only the live www.x.com -> under "Disappeared" nothing shows,
+    # so copy column copies nothing (not the full category).
+    page.locator(".r2-rlink", has_text="Emails").first.click()
+    page.locator("#r2-main .r2-copycol").first.click()
+    clip = page.evaluate("() => navigator.clipboard.readText()")
+    assert "old1@x.com" in clip and "www.x.com" not in clip
+
+
+def test_favicon_source_url_with_quote_does_not_inject(live_server, page):
+    # A favicon whose archived source_url carries an attribute-breakout payload
+    # (planted on a site, then archived) must not execute when the favicon
+    # gallery renders it — it is attribute-escaped, not injected.
+    payload = 'https://web.archive.org/web/20230101000000/http://x/f"onerror="window.__xss=1"'
+    findings = [
+        {"id": 1, "category": "favicons", "value": "https://x/favicon.ico",
+         "first_seen": "2023-01", "last_seen": "2025-06", "occurrences": 10,
+         "metadata": {"md5": "deadbeef", "source_url": payload}},
+        {"id": 2, "category": "emails", "value": "a@x.com", "first_seen": "2023-01",
+         "last_seen": "2025-06", "occurrences": 5, "metadata": {}},
+    ]
+    _open_with(page, live_server, findings)
+    page.locator("#r2-vbtn-activity").click()
+    img = page.locator("#r2-main img.r2-favimg")
+    assert img.count() == 1
+    # The onerror handler must be the benign built-in, not the injected one.
+    assert "window.__xss" not in (img.first.get_attribute("onerror") or "")
+    # And nothing executed.
+    assert page.evaluate("() => window.__xss") in (None, 0)
+
+
+def test_switching_language_relabels_the_report_without_losing_the_place(live_server, page, tmp_path):
+    """applyI18n only repaints data-i18n elements, so the report, which builds
+    every label in JS, kept whatever language it first rendered in. Switching
+    to English on a French report changed nothing at all."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    # A scan with two categories, so there is a place to be in.
+    import sqlite3
+    import urllib.request
+    now = datetime.now(timezone.utc)
+    payload = {
+        "url_id": "langswitch0000000000000", "domain": "lang-demo.com",
+        "status": "completed",
+        "results": {
+            "emails": [{"value": "a@lang-demo.com", "first_seen": "2019-01",
+                        "last_seen": "2021-01", "occurrences": 3}],
+            "subdomains": [{"value": "api.lang-demo.com", "first_seen": "2018-01",
+                            "last_seen": "2022-01", "occurrences": 9}],
+        },
+    }
+    page.goto(live_server + "/", wait_until="networkidle")
+    page.evaluate("(p) => { window.__T = p; }", payload)
+    page.evaluate("""() => {
+      document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+      renderPublicScan(window.__T);
+    }""")
+    page.evaluate("() => setLang('fr')")
+    page.wait_for_timeout(500)
+    page.evaluate("() => report2OpenCat('subdomains')")
+    page.wait_for_timeout(300)
+    before = page.evaluate("() => report2State.openCat")
+    fr = page.evaluate("() => [...document.querySelectorAll('.wt-tab')].map(e => e.innerText.trim())")
+
+    page.evaluate("() => setLang('en')")
+    page.wait_for_timeout(600)
+    en = page.evaluate("() => [...document.querySelectorAll('.wt-tab')].map(e => e.innerText.trim())")
+    assert fr != en, "the report ignored the language switch"
+    assert any("All" in t for t in en)
+    # and the reader is still where they were
+    assert page.evaluate("() => report2State.openCat") == before
+
+
+def test_the_report_prints_legibly_under_every_palette(live_server, page):
+    """The print block repaints the design tokens, but the themes page applies
+    a palette as inline styles on documentElement, and inline beats any
+    stylesheet rule. Ten of the twenty presets retint the text ramp, and those
+    printed near-white on white paper: the exact bug the print block exists to
+    prevent, still live for half the palettes."""
+    page.goto(live_server + "/", wait_until="networkidle")
+    page.emulate_media(media="print")
+    worst = []
+    for preset in ("truffe", "fjord", "retro", "vampire", "tokyo", "pastel",
+                   "mousse", "estampe", "solaire", "horizon", "terminal"):
+        page.evaluate("(p) => setThemePref({preset: p, mode: 'dark'})", preset)
+        page.wait_for_timeout(120)
+        ratio = page.evaluate("""() => {
+          const cs = getComputedStyle(document.body);
+          const lum = (c) => {
+            const [r, g, b] = c.match(/\\d+/g).slice(0, 3).map(Number).map(v => v / 255);
+            const f = (v) => v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+            return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+          };
+          const a = lum(cs.backgroundColor), b = lum(cs.color);
+          return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+        }""")
+        if ratio < 4.5:
+            worst.append((preset, round(ratio, 2)))
+    assert worst == [], f"unreadable on paper: {worst}"
+
+
+def _header_text(page, meta):
+    page.evaluate("""(m) => {
+      renderResultsHeader({name: 'x.test', scanMeta: m, total_findings: 12});
+    }""", meta)
+    page.wait_for_timeout(120)
+    return page.inner_text("#res-meta")
+
+
+def test_the_coverage_sentence_never_invents_a_zero(live_server, page):
+    """A written 0 is a fact; a missing key is not zero. The sentence ran the
+    page count through Number(v || 0), so a scan whose meta had no
+    pages_scraped announced "0 pages were retrieved and analysed" directly
+    under a headline saying thousands of snapshots were analysed, with the
+    findings from those pages listed below it."""
+    page.goto(live_server + "/", wait_until="networkidle")
+    page.evaluate("() => setLang('en')")
+
+    # A real zero, written by the no-HTML-snapshots path, must still be said.
+    real_zero = _header_text(page, {"snapshots_analyzed": 0, "pages_scraped": 0,
+                                    "total_snapshots_found": 40})
+    assert "0" in real_zero
+
+    # An absent count must not become one. Match on a standalone zero: the
+    # fallback value 4,800 ends in "0 pages" as a substring.
+    import re
+    bare_zero = re.compile(r"(?<![\d,])0 pages")
+    unknown = _header_text(page, {"snapshots_analyzed": 4800,
+                                  "total_snapshots_found": 5200})
+    assert not bare_zero.search(unknown), unknown
+    # Name the count in the sentence, not merely somewhere in the block: the
+    # headline above says "4,800 snapshots analysed" too, so a looser check
+    # passes even when the fallback is gone. Mutation testing caught that.
+    assert "4,800 pages" in unknown or "4800 pages" in unknown, unknown
+
+    # Nothing known at all: no number claimed.
+    silent = _header_text(page, {"total_findings": 12})
+    assert not bare_zero.search(silent), silent

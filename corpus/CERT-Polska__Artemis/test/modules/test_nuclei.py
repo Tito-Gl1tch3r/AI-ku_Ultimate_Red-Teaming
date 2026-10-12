@@ -1,0 +1,212 @@
+import re
+import urllib.parse
+from test.base import ArtemisModuleTestCase
+from unittest.mock import patch
+
+from karton.core import Task
+
+from artemis.binds import TaskStatus, TaskType
+from artemis.modules.nuclei import Nuclei
+
+
+def _param_names(url: str) -> list[str]:
+    return list(urllib.parse.parse_qs(urllib.parse.urlparse(url).query, keep_blank_values=True).keys())
+
+
+def _reflected_xss_urls(status_reason: str) -> list[str]:
+    """The PoC URLs reported for the reflected XSS DAST template."""
+    return re.findall(r"\[medium\]\s+(\S+): Reflected Cross-Site Scripting", status_reason)
+
+
+class NucleiTest(ArtemisModuleTestCase):
+    # The reason for ignoring mypy error is https://github.com/CERT-Polska/karton/issues/201
+    karton_class = Nuclei  # type: ignore
+
+    def test_dast_template(self) -> None:
+        task = Task(
+            {"type": TaskType.NUCLEI_TARGET},
+            payload={
+                "host": "test-dast-vuln-app.local",
+                "port": 5000,
+            },
+        )
+        self.run_task(task)
+        (call,) = self.mock_db.save_task_result.call_args_list
+        self.assertEqual(call.kwargs["status"], TaskStatus.INTERESTING)
+        self.assertIn(
+            "Local File Inclusion Directory traversal vulnerability in the Helpdesk Pro plugin before 1.4.0 for Joomla! allows remote attackers to read arbitrary files via a .. ",
+            call.kwargs["status_reason"],
+        )
+        self.assertIn(
+            "Local File Inclusion - Linux",
+            call.kwargs["status_reason"],
+        )
+        self.assertIn(
+            "LFI Detection - Keyed",
+            call.kwargs["status_reason"],
+        )
+        self.assertIn(
+            "Reflected SSTI Arithmetic Based",
+            call.kwargs["status_reason"],
+        )
+
+
+class NucleiShortTemplateListTest(ArtemisModuleTestCase):
+    # Tests with template list shortened to speed up test runtime
+
+    # The reason for ignoring mypy error is https://github.com/CERT-Polska/karton/issues/201
+    karton_class = Nuclei  # type: ignore
+
+    def setUp(self) -> None:
+        # list of templates used in tests
+        self.patcher = patch(
+            "artemis.config.Config.Modules.Nuclei.OVERRIDE_STANDARD_NUCLEI_TEMPLATES_TO_RUN",
+            [
+                "http/cves/2020/CVE-2020-28976.yaml",
+                "http/vulnerabilities/generic/top-xss-params.yaml",
+                "http/vulnerabilities/generic/xss-fuzz.yaml",
+                "dast/vulnerabilities/xss/reflected-xss.yaml",
+                "http/exposures/configs/apache-config.yaml",
+            ],
+        )
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+        return super().setUp()
+
+    def test_severity_threshold(self) -> None:
+        task = Task(
+            {"type": TaskType.NUCLEI_TARGET},
+            payload={
+                "host": "test-service-with-exposed-apache-config.local",
+                "port": 80,
+            },
+            payload_persistent={
+                "module_runtime_configurations": {"nuclei-module": {"severity_threshold": "critical_only"}}
+            },
+        )
+        self.run_task(task)
+        (call,) = self.mock_db.save_task_result.call_args_list
+        # Should find nothing if the severity threshold is set to critical, as the template is not critical-severity
+        self.assertEqual(call.kwargs["status"], TaskStatus.OK)
+
+        self.mock_db.reset_mock()
+
+        # Using previous identity for backwardcompatibilty testing during migration
+        task = Task(
+            {"type": TaskType.NUCLEI_TARGET},
+            payload={
+                "host": "test-service-with-exposed-apache-config.local",
+                "port": 80,
+            },
+            payload_persistent={
+                "module_runtime_configurations": {"nuclei": {"severity_threshold": "medium_and_above"}}
+            },
+        )
+        self.run_task(task)
+        (call,) = self.mock_db.save_task_result.call_args_list
+        self.assertEqual(call.kwargs["status"], TaskStatus.INTERESTING)
+
+    def test_403_bypass_workflow(self) -> None:
+        # workflows use additional list of templates
+        task = Task(
+            {"type": TaskType.NUCLEI_TARGET},
+            payload={
+                "host": "test-php-403-bypass.local",
+                "port": 80,
+            },
+        )
+        self.run_task(task)
+        (call,) = self.mock_db.save_task_result.call_args_list
+        self.assertEqual(call.kwargs["status"], TaskStatus.INTERESTING)
+        self.assertEqual(
+            call.kwargs["status_reason"],
+            "[medium] http://test-php-403-bypass.local:80: 403 Forbidden Bypass Detection with Headers Detects potential 403 Forbidden bypass vulnerabilities by adding headers (e.g., X-Forwarded-For, X-Original-URL).\n",
+        )
+
+    def test_interactsh(self) -> None:
+        task = Task(
+            {"type": TaskType.NUCLEI_TARGET},
+            payload={
+                "host": "test-php-mock-CVE-2020-28976.local",
+                "port": 80,
+            },
+            payload_persistent={
+                "module_runtime_configurations": {"nuclei-module": {"severity_threshold": "medium_and_above"}}
+            },
+        )
+        self.run_task(task)
+        (call,) = self.mock_db.save_task_result.call_args_list
+        self.assertEqual(call.kwargs["status"], TaskStatus.INTERESTING)
+        self.assertRegex(
+            call.kwargs["status_reason"],
+            r"\[medium\] http://test-php-mock-CVE-2020-28976\.local:80/wp-content/plugins/canto/includes/lib/get\.php\?subdomain=[a-z0-9\.]+: WordPress Canto 1\.3\.0 - Blind Server-Side Request Forgery WordPress Canto plugin 1\.3\.0 is susceptible to blind server-side request forgery\. An attacker can make a request to any internal and external server via /includes/lib/detail\.php\?subdomain and thereby possibly obtain sensitive information, modify data, and/or execute unauthorized administrative operations in the context of the affected site\.",
+        )
+
+    def test_poc_url_shortened_when_one_param_is_enough(self) -> None:
+        """/xss.php reflects `search` on its own, so the PoC URL - built from
+        the whole DAST wordlist - is shortened to that single parameter."""
+        task = Task(
+            {"type": TaskType.NUCLEI_TARGET},
+            payload={
+                "host": "test-php-xss-but-not-on-homepage.local",
+                "port": 80,
+            },
+        )
+        self.run_task(task)
+        (call,) = self.mock_db.save_task_result.call_args_list
+        self.assertEqual(call.kwargs["status"], TaskStatus.INTERESTING)
+        urls = _reflected_xss_urls(call.kwargs["status_reason"])
+        self.assertTrue(urls)
+        for url in urls:
+            self.assertEqual(_param_names(url), ["search"])
+
+    def test_poc_url_kept_whole_when_the_finding_needs_a_second_param(self) -> None:
+        """The app reflects `search` only if `login` is present. Nuclei's
+        single-mode re-fuzz reports `search` alone, because it keeps sending
+        `login` alongside it - so shortening the PoC to `?search=...` would
+        produce a URL that no longer reproduces the vulnerability. Artemis
+        must notice that and report the full URL instead."""
+        task = Task(
+            {"type": TaskType.NUCLEI_TARGET},
+            payload={
+                "host": "test-php-xss-requiring-second-param.local",
+                "port": 80,
+            },
+        )
+        self.run_task(task)
+        (call,) = self.mock_db.save_task_result.call_args_list
+        self.assertEqual(call.kwargs["status"], TaskStatus.INTERESTING)
+        urls = _reflected_xss_urls(call.kwargs["status_reason"])
+        self.assertTrue(urls)
+        for url in urls:
+            param_names = _param_names(url)
+            self.assertIn("search", param_names)
+            self.assertIn("login", param_names)
+
+    def test_links(self) -> None:
+        task = Task(
+            {"type": TaskType.NUCLEI_TARGET},
+            payload={
+                "host": "test-php-xss-but-not-on-homepage.local",
+                "port": 80,
+            },
+        )
+        self.run_task(task)
+        (call,) = self.mock_db.save_task_result.call_args_list
+        self.assertEqual(call.kwargs["status"], TaskStatus.INTERESTING)
+        self.assertRegex(
+            call.kwargs["status_reason"],
+            r"(?s)\[high\]\s+http://test-php-xss-but-not-on-homepage\.local/xss\.php/\?.*?"
+            r"Top 38 Parameters - Cross-Site Scripting",
+        )
+        self.assertRegex(
+            call.kwargs["status_reason"],
+            r"(?s)\[medium\]\s+http://test-php-xss-but-not-on-homepage\.local/xss\.php/\?.*?"
+            r"Fuzzing Parameters - Cross-Site Scripting",
+        )
+        self.assertRegex(
+            call.kwargs["status_reason"],
+            r"(?s)\[medium\]\s+http://test-php-xss-but-not-on-homepage\.local/xss\.php\?.*?"
+            r"Reflected Cross-Site Scripting",
+        )

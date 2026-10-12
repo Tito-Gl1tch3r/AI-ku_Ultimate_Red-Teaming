@@ -1,0 +1,681 @@
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { assertDirEffect, snapshotDir } from "../helpers/dir_effect";
+import {
+	OutputTransaction,
+	type OutputTransactionDependencies,
+} from "../../src/main/output_transaction";
+
+const originalPath = "/tmp/original.mp4";
+const generatedPath = "/tmp/.original.exifcleaner-stage.mp4";
+
+type TransactionTestOptions = {
+	writeResult?: Awaited<
+		ReturnType<OutputTransactionDependencies["stripMetadata"]["execute"]>
+	>;
+	verifyResult?: Awaited<
+		ReturnType<
+			OutputTransactionDependencies["verifyGeneratedOutput"]["execute"]
+		>
+	>;
+	unlink?: OutputTransactionDependencies["unlink"];
+	rename?: OutputTransactionDependencies["rename"];
+};
+
+function createTransaction({
+	writeResult = { ok: true, value: { tagsRemoved: 0 } },
+	verifyResult = { ok: true, value: undefined },
+	unlink = async () => undefined,
+	rename = async () => undefined,
+}: TransactionTestOptions = {}): {
+	transaction: OutputTransaction;
+	events: string[];
+} {
+	const events: string[] = [];
+	const transaction = new OutputTransaction({
+		stripMetadata: {
+			execute: async () => {
+				events.push("write");
+				return writeResult;
+			},
+		},
+		verifyGeneratedOutput: {
+			execute: async ({ generatedPath: path }) => {
+				events.push(`verify:${path}`);
+				return verifyResult;
+			},
+		},
+		unlink: async (path) => {
+			events.push(`unlink:${path}`);
+			return unlink(path);
+		},
+		rename: async (from, to) => {
+			events.push(`rename:${from}:${to}`);
+			return rename(from, to);
+		},
+		delay: async (milliseconds) => {
+			events.push(`delay:${milliseconds}`);
+		},
+	});
+
+	return { transaction, events };
+}
+
+describe("OutputTransaction", () => {
+	it("proves its temporary test workspace has no unaccounted mutations", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "output-transaction-"));
+		const before = snapshotDir(directory);
+		const after = snapshotDir(directory);
+		assertDirEffect(before, after, {});
+		await rm(directory, { recursive: true, force: true });
+	});
+
+	it("writes, verifies the exact output, then returns one publishable success", async () => {
+		const { transaction, events } = createTransaction();
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: true,
+			preserveColorProfile: true,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({ ok: true, value: { outputPath: generatedPath } });
+		expect(events).toEqual(["write", `verify:${generatedPath}`]);
+	});
+
+	it("returns write-failed before verification", async () => {
+		const { transaction, events } = createTransaction({
+			writeResult: {
+				ok: false,
+				error: { code: "exiftool-error", detail: "write failed" },
+			},
+		});
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({ ok: false, error: { code: "write-failed" } });
+		expect(events).toEqual(["write"]);
+	});
+
+	it("a confirmed-dead write timeout removes the exact generated path and reports a timed-out write failure (D-63)", async () => {
+		const { transaction, events } = createTransaction({
+			writeResult: {
+				ok: false,
+				error: {
+					code: "engine-error",
+					detail: "exceeded the write time limit",
+					backend: "exiftool",
+					confirmedDeadTimeout: true,
+				},
+			},
+		});
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			error: { code: "write-failed", timedOut: true },
+		});
+		expect(events).toEqual(["write", `unlink:${generatedPath}`]);
+	});
+
+	it("a confirmed-dead write timeout whose leftover cannot be removed stays a write failure with the exact residual path (D-66)", async () => {
+		const eperm = Object.assign(new Error("locked"), { code: "EPERM" });
+		const { transaction, events } = createTransaction({
+			writeResult: {
+				ok: false,
+				error: {
+					code: "engine-error",
+					detail: "exceeded the write time limit",
+					backend: "exiftool",
+					confirmedDeadTimeout: true,
+				},
+			},
+			unlink: async () => Promise.reject(eperm),
+		});
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			error: {
+				code: "write-failed",
+				timedOut: true,
+				residualPath: generatedPath,
+			},
+		});
+		expect(events).toEqual([
+			"write",
+			`unlink:${generatedPath}`,
+			"delay:20",
+			`unlink:${generatedPath}`,
+			"delay:50",
+			`unlink:${generatedPath}`,
+		]);
+	});
+
+	it("an engine error without the confirmed-dead flag never triggers cleanup (D-53, D-63)", async () => {
+		const { transaction, events } = createTransaction({
+			writeResult: {
+				ok: false,
+				error: {
+					code: "engine-error",
+					detail: "exceeded the write time limit",
+					backend: "exiftool",
+				},
+			},
+		});
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({ ok: false, error: { code: "write-failed" } });
+		expect(events).toEqual(["write"]);
+	});
+
+	it("cleans the exact generated path before reporting verification-failed", async () => {
+		const { transaction, events } = createTransaction({
+			verifyResult: {
+				ok: false,
+				error: { code: "output-verification-failed", detail: "not reopenable" },
+			},
+		});
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			error: {
+				code: "verification-failed",
+				verificationCode: "output-verification-failed",
+			},
+		});
+		expect(result).not.toHaveProperty("outputPath");
+		expect(events).toEqual([
+			"write",
+			`verify:${generatedPath}`,
+			`unlink:${generatedPath}`,
+		]);
+	});
+
+	it("materializes a generated output, verifies only it, then discards it before publishing failure", async () => {
+		const fixtureDir = await mkdtemp(join(tmpdir(), "exifcleaner-output-"));
+		const sourcePath = join(fixtureDir, "original.mp4");
+		const outputPath = join(fixtureDir, "generated.mp4");
+		const originalBytes = Buffer.from("preserved original bytes");
+		const events: string[] = [];
+		await writeFile(sourcePath, originalBytes);
+
+		try {
+			const transaction = new OutputTransaction({
+				stripMetadata: {
+					execute: async ({ outputPath: writtenPath }) => {
+						await writeFile(writtenPath, "generated but unreadable bytes");
+						events.push(`write:${writtenPath}`);
+						return { ok: true, value: { tagsRemoved: 1 } };
+					},
+				},
+				verifyGeneratedOutput: {
+					execute: async ({ generatedPath: verifiedPath }) => {
+						expect(verifiedPath).toBe(outputPath);
+						expect(await readFile(verifiedPath, "utf8")).toContain(
+							"unreadable",
+						);
+						events.push(`verify:${verifiedPath}`);
+						return {
+							ok: false,
+							error: {
+								code: "output-verification-failed",
+								detail: "re-open failed",
+							},
+						};
+					},
+				},
+				unlink: async (path) => {
+					events.push(`unlink:${path}`);
+					await rm(path);
+				},
+				rename: async () => undefined,
+				delay: async () => undefined,
+			});
+
+			const result = await transaction.execute({
+				filePath: sourcePath,
+				generatedPath: outputPath,
+				preserveOrientation: false,
+				preserveColorProfile: false,
+				preserveResolution: false,
+				preserveTimestamps: false,
+			});
+			events.push("result-published");
+
+			expect(result).toEqual({
+				ok: false,
+				error: {
+					code: "verification-failed",
+					verificationCode: "output-verification-failed",
+				},
+			});
+			expect(events).toEqual([
+				`write:${outputPath}`,
+				`verify:${outputPath}`,
+				`unlink:${outputPath}`,
+				"result-published",
+			]);
+			await expect(readFile(outputPath)).rejects.toMatchObject({
+				code: "ENOENT",
+			});
+			expect(
+				createHash("sha256")
+					.update(await readFile(sourcePath))
+					.digest("hex"),
+			).toBe(createHash("sha256").update(originalBytes).digest("hex"));
+		} finally {
+			await rm(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	it("treats ENOENT cleanup as a successful discard", async () => {
+		const enoent = Object.assign(new Error("already removed"), {
+			code: "ENOENT",
+		});
+		const { transaction, events } = createTransaction({
+			verifyResult: {
+				ok: false,
+				error: { code: "output-verification-failed", detail: "not reopenable" },
+			},
+			unlink: async () => Promise.reject(enoent),
+		});
+
+		await expect(
+			transaction.execute({
+				filePath: originalPath,
+				generatedPath,
+				preserveOrientation: false,
+				preserveColorProfile: false,
+				preserveResolution: false,
+				preserveTimestamps: false,
+			}),
+		).resolves.toEqual({
+			ok: false,
+			error: {
+				code: "verification-failed",
+				verificationCode: "output-verification-failed",
+			},
+		});
+		expect(events).toEqual([
+			"write",
+			`verify:${generatedPath}`,
+			`unlink:${generatedPath}`,
+		]);
+	});
+
+	it("reports the exact residual path after three transient cleanup failures", async () => {
+		const eacces = Object.assign(new Error("locked"), { code: "EACCES" });
+		const { transaction, events } = createTransaction({
+			verifyResult: {
+				ok: false,
+				error: { code: "output-verification-failed", detail: "not reopenable" },
+			},
+			unlink: async () => Promise.reject(eacces),
+		});
+
+		await expect(
+			transaction.execute({
+				filePath: originalPath,
+				generatedPath,
+				preserveOrientation: false,
+				preserveColorProfile: false,
+				preserveResolution: false,
+				preserveTimestamps: false,
+			}),
+		).resolves.toEqual({
+			ok: false,
+			error: { code: "cleanup-failed", residualPath: generatedPath },
+		});
+		expect(events).toEqual([
+			"write",
+			`verify:${generatedPath}`,
+			`unlink:${generatedPath}`,
+			"delay:20",
+			`unlink:${generatedPath}`,
+			"delay:50",
+			`unlink:${generatedPath}`,
+		]);
+	});
+
+	it("commits a verified stage only after verification", async () => {
+		const { transaction, events } = createTransaction();
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			commitPath: originalPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({ ok: true, value: { outputPath: originalPath } });
+		expect(events).toEqual([
+			"write",
+			`verify:${generatedPath}`,
+			`rename:${generatedPath}:${originalPath}`,
+		]);
+	});
+
+	it("cleans a failed commit stage before publishing a terminal failure", async () => {
+		const { transaction, events } = createTransaction({
+			rename: async () => Promise.reject(new Error("rename failed")),
+		});
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			commitPath: originalPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({ ok: false, error: { code: "commit-failed" } });
+		expect(result).not.toHaveProperty("outputPath");
+		expect(events).toEqual([
+			"write",
+			`verify:${generatedPath}`,
+			`rename:${generatedPath}:${originalPath}`,
+			`unlink:${generatedPath}`,
+		]);
+	});
+
+	// D-27 NC-8: a webp save-as-copy whose generated output fails ExifTool
+	// reopen verification is unlinked, reported as a failure, and leaves the
+	// source untouched (T-47-31, T-47-32). Driven against a real temp
+	// directory with real bytes so the whole-directory delta and the source's
+	// content hash are both asserted against real filesystem effects, not a
+	// fake's bookkeeping. Placed here (not exif_handlers.test.ts) because the
+	// verification dependency can be made to decline directly, with fewer
+	// fakes than driving the handler-level wiring would require.
+	it("NC-8: a failed reopen verification unlinks the generated output, reports failure, and leaves the source byte-identical", async () => {
+		const fixtureDir = await mkdtemp(join(tmpdir(), "exifcleaner-nc8-"));
+		const sourcePath = join(fixtureDir, "sample.webp");
+		const outputPath = join(fixtureDir, "sample-cleaned.webp");
+		const originalBytes = Buffer.from("original webp bytes, untouched");
+		await writeFile(sourcePath, originalBytes);
+		const sourceDigestBefore = createHash("sha256")
+			.update(originalBytes)
+			.digest("hex");
+
+		try {
+			const transaction = new OutputTransaction({
+				stripMetadata: {
+					execute: async ({ outputPath: writtenPath }) => {
+						await writeFile(writtenPath, "generated but unverifiable bytes");
+						return { ok: true, value: { tagsRemoved: 1 } };
+					},
+				},
+				verifyGeneratedOutput: {
+					execute: async ({ generatedPath: verifiedPath }) => {
+						expect(verifiedPath).toBe(outputPath);
+						return {
+							ok: false,
+							error: {
+								code: "output-verification-failed",
+								detail: "reopen failed",
+							},
+						};
+					},
+				},
+				unlink: async (path) => {
+					await rm(path);
+				},
+				rename: async () => undefined,
+				delay: async () => undefined,
+			});
+
+			const beforeDir = snapshotDir(fixtureDir);
+			const result = await transaction.execute({
+				filePath: sourcePath,
+				generatedPath: outputPath,
+				preserveOrientation: false,
+				preserveColorProfile: false,
+				preserveResolution: false,
+				preserveTimestamps: false,
+			});
+
+			expect(result).toEqual({
+				ok: false,
+				error: {
+					code: "verification-failed",
+					verificationCode: "output-verification-failed",
+				},
+			});
+			assertDirEffect(beforeDir, snapshotDir(fixtureDir), {
+				added: [],
+				modified: [],
+				removed: [],
+				unchanged: ["sample.webp"],
+			});
+			const sourceDigestAfter = createHash("sha256")
+				.update(await readFile(sourcePath))
+				.digest("hex");
+			expect(sourceDigestAfter).toBe(sourceDigestBefore);
+		} finally {
+			await rm(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	// Paired positive control (D-27): without this, NC-8's empty-delta
+	// assertion above would pass vacuously against any transaction that never
+	// writes anything at all. A successful webp copy must add exactly the
+	// generated path and modify nothing.
+	it("NC-8: a successful webp copy adds exactly one path and modifies none, with the source unchanged", async () => {
+		const fixtureDir = await mkdtemp(join(tmpdir(), "exifcleaner-nc8-ok-"));
+		const sourcePath = join(fixtureDir, "sample.webp");
+		const outputPath = join(fixtureDir, "sample-cleaned.webp");
+		await writeFile(sourcePath, Buffer.from("original webp bytes, untouched"));
+
+		try {
+			const transaction = new OutputTransaction({
+				stripMetadata: {
+					execute: async ({ outputPath: writtenPath }) => {
+						await writeFile(writtenPath, "generated and verified bytes");
+						return { ok: true, value: { tagsRemoved: 1 } };
+					},
+				},
+				verifyGeneratedOutput: {
+					execute: async () => ({ ok: true, value: undefined }),
+				},
+				unlink: async (path) => {
+					await rm(path);
+				},
+				rename: async () => undefined,
+				delay: async () => undefined,
+			});
+
+			const beforeDir = snapshotDir(fixtureDir);
+			const result = await transaction.execute({
+				filePath: sourcePath,
+				generatedPath: outputPath,
+				preserveOrientation: false,
+				preserveColorProfile: false,
+				preserveResolution: false,
+				preserveTimestamps: false,
+			});
+
+			expect(result).toEqual({ ok: true, value: { outputPath } });
+			assertDirEffect(beforeDir, snapshotDir(fixtureDir), {
+				added: ["sample-cleaned.webp"],
+				modified: [],
+				removed: [],
+				unchanged: ["sample.webp"],
+			});
+		} finally {
+			await rm(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([true, false])(
+		"forwards preserveResolution %s to stripMetadata.execute unchanged (FID-01, D-40)",
+		async (preserveResolution) => {
+			const requests: Array<{ preserveResolution: boolean }> = [];
+			const transaction = new OutputTransaction({
+				stripMetadata: {
+					execute: async (request) => {
+						requests.push({ preserveResolution: request.preserveResolution });
+						return { ok: true, value: { tagsRemoved: 0 } };
+					},
+				},
+				verifyGeneratedOutput: {
+					execute: async () => ({ ok: true, value: undefined }),
+				},
+				unlink: async () => undefined,
+				rename: async () => undefined,
+				delay: async () => undefined,
+			});
+
+			await transaction.execute({
+				filePath: originalPath,
+				generatedPath,
+				preserveOrientation: false,
+				preserveColorProfile: false,
+				preserveResolution,
+				preserveTimestamps: false,
+			});
+
+			expect(requests).toEqual([{ preserveResolution }]);
+		},
+	);
+
+	it("forwards copyModeLeakCheck to verifyGeneratedOutput.execute exactly as given, undefined when omitted", async () => {
+		const leakCheck = {
+			preserveOrientation: true,
+			preserveColorProfile: false,
+			preserveResolution: true,
+		};
+		const requests: Array<{
+			copyModeLeakCheck:
+				| {
+						preserveOrientation: boolean;
+						preserveColorProfile: boolean;
+						preserveResolution: boolean;
+				  }
+				| undefined;
+		}> = [];
+		const transaction = new OutputTransaction({
+			stripMetadata: {
+				execute: async () => ({ ok: true, value: { tagsRemoved: 0 } }),
+			},
+			verifyGeneratedOutput: {
+				execute: async (request) => {
+					requests.push({ copyModeLeakCheck: request.copyModeLeakCheck });
+					return { ok: true, value: undefined };
+				},
+			},
+			unlink: async () => undefined,
+			rename: async () => undefined,
+			delay: async () => undefined,
+		});
+
+		await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+			copyModeLeakCheck: leakCheck,
+		});
+		await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(requests).toEqual([
+			{ copyModeLeakCheck: leakCheck },
+			{ copyModeLeakCheck: undefined },
+		]);
+	});
+
+	it("a leak verdict unlinks the staged output and reports verification-failed with verificationCode output-metadata-leak", async () => {
+		const { transaction, events } = createTransaction({
+			verifyResult: {
+				ok: false,
+				error: {
+					code: "output-metadata-leak",
+					detail:
+						"Generated output kept 1 metadata tag(s) outside the permitted set: XMP-dc:Creator",
+					leakedTags: ["XMP-dc:Creator"],
+				},
+			},
+		});
+
+		const result = await transaction.execute({
+			filePath: originalPath,
+			generatedPath,
+			preserveOrientation: false,
+			preserveColorProfile: false,
+			preserveResolution: false,
+			preserveTimestamps: false,
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			error: {
+				code: "verification-failed",
+				verificationCode: "output-metadata-leak",
+			},
+		});
+		expect(events).toEqual([
+			"write",
+			`verify:${generatedPath}`,
+			`unlink:${generatedPath}`,
+		]);
+	});
+});

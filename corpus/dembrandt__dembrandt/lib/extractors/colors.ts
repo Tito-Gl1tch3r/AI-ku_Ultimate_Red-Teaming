@@ -1,0 +1,1098 @@
+import { convertColor } from '../colors.js';
+import type { CssVariable } from '../types.js';
+
+export async function extractColors(page) {
+  const result = await page.evaluate(() => {
+    const _canvas = document.createElement('canvas');
+    _canvas.width = _canvas.height = 1;
+    const _ctx = _canvas.getContext('2d');
+    const _colorMemo = new Map();
+
+    // Chromium serialises computed styles that pass through modern colour
+    // functions (Tailwind v4 opacity modifiers compile to color-mix in oklab)
+    // as oklab()/oklch()/color() strings. Rewrite them to legacy rgb()/rgba()
+    // once, at the read boundary, so every downstream consumer sees one
+    // grammar and alpha survives (GitHub #149). The alpha is parsed textually
+    // and the opaque remainder resolved through canvas, because getImageData
+    // on a semi-transparent fill round-trips through premultiplication and
+    // corrupts the channels.
+    const _modernColorRe = /^(?:oklab|oklch|lab|lch|hwb|color|color-mix)\(/i;
+    const _legacyMemo = new Map();
+    function toLegacy(color) {
+      if (!color || typeof color !== 'string') return color;
+      const str = color.trim();
+      if (!_modernColorRe.test(str)) return color;
+      if (_legacyMemo.has(str)) return _legacyMemo.get(str);
+      let result = color;
+      if (_ctx) {
+        let alpha = 1;
+        let opaque = str;
+        const am = str.match(/\/\s*([\d.]+%?)\s*\)$/);
+        if (am) {
+          alpha = am[1].endsWith('%') ? parseFloat(am[1]) / 100 : parseFloat(am[1]);
+          opaque = str.slice(0, str.lastIndexOf('/')).trimEnd() + ')';
+        }
+        try {
+          // Sentinel detects parse failure: an invalid assignment leaves
+          // fillStyle untouched.
+          _ctx.fillStyle = '#010203';
+          _ctx.fillStyle = opaque;
+          if (_ctx.fillStyle !== '#010203') {
+            _ctx.clearRect(0, 0, 1, 1);
+            _ctx.fillRect(0, 0, 1, 1);
+            const [r, g, b] = _ctx.getImageData(0, 0, 1, 1).data;
+            result = alpha >= 1
+              ? `rgb(${r}, ${g}, ${b})`
+              : `rgba(${r}, ${g}, ${b}, ${Math.round(alpha * 1000) / 1000})`;
+          }
+        } catch (e) {
+          result = color;
+        }
+      }
+      _legacyMemo.set(str, result);
+      return result;
+    }
+
+    function normalizeColor(color) {
+      color = toLegacy(color);
+      if (_colorMemo.has(color)) return _colorMemo.get(color);
+      let result;
+      const rgbaMatch = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+      if (rgbaMatch) {
+        const alpha = rgbaMatch[4] !== undefined ? parseFloat(rgbaMatch[4]) : 1;
+        if (alpha < 0.05) { result = color.toLowerCase(); _colorMemo.set(color, result); return result; }
+        const r = parseInt(rgbaMatch[1]).toString(16).padStart(2, "0");
+        const g = parseInt(rgbaMatch[2]).toString(16).padStart(2, "0");
+        const b = parseInt(rgbaMatch[3]).toString(16).padStart(2, "0");
+        result = `#${r}${g}${b}`;
+      } else {
+        const shortHex = color.match(/^#([0-9a-f]{3})$/i);
+        if (shortHex) {
+          const [, h] = shortHex;
+          result = `#${h[0]}${h[0]}${h[1]}${h[1]}${h[2]}${h[2]}`.toLowerCase();
+        } else if (/^#[0-9a-f]{6}$/i.test(color)) {
+          result = color.toLowerCase();
+        } else if (/^#[0-9a-f]{8}$/i.test(color)) {
+          result = color.toLowerCase().slice(0, 7);
+        } else if (_ctx) {
+          try {
+            _ctx.clearRect(0, 0, 1, 1);
+            _ctx.fillStyle = 'rgba(0,0,0,0)';
+            _ctx.fillStyle = color;
+            _ctx.fillRect(0, 0, 1, 1);
+            const [r, g, b, a] = _ctx.getImageData(0, 0, 1, 1).data;
+            result = a === 0 ? color.toLowerCase() : `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`;
+          } catch (e) {
+            result = color.toLowerCase();
+          }
+        } else {
+          result = color.toLowerCase();
+        }
+      }
+      _colorMemo.set(color, result);
+      return result;
+    }
+
+    function colorAlpha(color) {
+      if (!color) return 1;
+      const m = color.match(/rgba?\(\d+,\s*\d+,\s*\d+,\s*([\d.]+)\)/);
+      return m ? parseFloat(m[1]) : 1;
+    }
+
+    function colorLightness(color) {
+      if (!color) return 0;
+      const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      if (!m) return 0;
+      const r = parseInt(m[1]) / 255, g = parseInt(m[2]) / 255, b = parseInt(m[3]) / 255;
+      return (Math.max(r, g, b) + Math.min(r, g, b)) / 2;
+    }
+
+    // HSL saturation of an opaque hex, with near-black/near-white forced to 0.
+    // Used both for the primary fallback and the near-neutral primary override.
+    function chroma(hex) {
+      if (!hex || !hex.startsWith('#')) return 0;
+      const r = parseInt(hex.slice(1, 3), 16) / 255;
+      const g = parseInt(hex.slice(3, 5), 16) / 255;
+      const b = parseInt(hex.slice(5, 7), 16) / 255;
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const l = (max + min) / 2;
+      if (max === min) return 0;
+      const s = l > 0.5 ? (max - min) / (2 - max - min) : (max - min) / (max + min);
+      if (l < 0.08 || l > 0.92) return 0;
+      return s;
+    }
+
+    // HSL hue in degrees [0,360) from an opaque hex; -1 for achromatic colours.
+    // Used to keep the accent token on a genuinely different hue from primary.
+    function hueOf(hex) {
+      if (!hex || !hex.startsWith('#')) return -1;
+      const r = parseInt(hex.slice(1, 3), 16) / 255;
+      const g = parseInt(hex.slice(3, 5), 16) / 255;
+      const b = parseInt(hex.slice(5, 7), 16) / 255;
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const d = max - min;
+      if (d === 0) return -1;
+      let h;
+      if (max === r) h = (((g - b) / d) % 6 + 6) % 6;
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h *= 60;
+      return h < 0 ? h + 360 : h;
+    }
+    function hueDistance(a, b) {
+      const diff = Math.abs(a - b) % 360;
+      return diff > 180 ? 360 - diff : diff;
+    }
+
+    // "primary" qualified by a rendering role names a slot on a surface — the
+    // text on the primary button, a border — not the brand primary itself.
+    const ROLE_QUALIFIED_PRIMARY =
+      /(?:foreground|fg|text|ink|label|caption|border|outline|ring|divider|icon|placeholder|muted|hover|active|disabled)[-_ ]?primary|primary[-_ ]?(?:foreground|fg|text|ink|label|border|outline|ring|icon|content|hover|active|disabled)/;
+
+    function isRoleQualified(context) {
+      return ROLE_QUALIFIED_PRIMARY.test(context);
+    }
+
+    function isValidColorValue(value) {
+      if (!value) return false;
+      if (value.includes("calc(") || value.includes("clamp(") || value.includes("var(")) {
+        return /#[0-9a-f]{3,6}|rgba?\(|hsla?\(/i.test(value);
+      }
+      // Modern colour functions are valid iff they resolve; toLegacy returns
+      // the input unchanged when parsing fails.
+      if (_modernColorRe.test(value.trim())) return toLegacy(value) !== value;
+      return /^(#[0-9a-f]{3,8}|rgba?\(|hsla?\(|[a-z]+)/i.test(value);
+    }
+
+    const colorMap = new Map();
+    const occurrenceMap = new Map<string, { hex: string; paints: string; count: number; area: number }>();
+    const semanticColors: Record<string, string> = {};
+    let primaryRule: string | null = null;
+    const cssVariables: Record<string, { value: string; scope: 'root' | 'body' }> = {};
+
+    const domain = window.location.hostname;
+    const declared = new Map<string, { value: string; scope: 'root' | 'body' }>();
+    for (const scope of ['root', 'body'] as const) {
+      const el = scope === 'root' ? document.documentElement : document.body;
+      if (!el) continue;
+      const cs = getComputedStyle(el);
+      for (let i = 0; i < cs.length; i++) {
+        if (!cs[i].startsWith("--")) continue;
+        const value = cs.getPropertyValue(cs[i]).trim();
+        if (declared.get(cs[i])?.value === value) continue;
+        declared.set(cs[i], { value, scope });
+      }
+    }
+
+    for (const [prop, { value, scope }] of declared) {
+      if (prop.startsWith("--wp--preset")) continue;
+      if (
+        prop.startsWith("--el-") || prop.startsWith("--p-") ||
+        prop.startsWith("--chakra-") || prop.startsWith("--mantine-") ||
+        prop.startsWith("--ant-") || prop.startsWith("--bs-") ||
+        prop.startsWith("--swiper-") || prop.startsWith("--rsbs-") ||
+        prop.startsWith("--toastify-")
+      ) continue;
+      if (prop.includes("--system-") || prop.includes("--default-")) continue;
+      if (prop.includes("--cc-") && !domain.includes("cookie") && !domain.includes("consent")) continue;
+
+      const nonColorUtilities = [
+        '--tw-ring-offset-width', '--tw-ring-offset', '--tw-shadow', '--tw-blur',
+        '--tw-brightness', '--tw-contrast', '--tw-grayscale', '--tw-hue-rotate',
+        '--tw-invert', '--tw-saturate', '--tw-sepia', '--tw-drop-shadow',
+        '--tw-translate-x', '--tw-translate-y', '--tw-translate-z',
+        '--tw-rotate', '--tw-skew-x', '--tw-skew-y',
+        '--tw-scale-x', '--tw-scale-y', '--tw-scale-z',
+        '--tw-gradient-from-position', '--tw-gradient-via-position', '--tw-gradient-to-position',
+        '--tw-divide-', '--tw-space-', '--bs-gutter', '--bs-border-spacing'
+      ];
+      if (nonColorUtilities.some(pattern => prop.includes(pattern))) continue;
+
+      // Non-brand semantic/status/noise custom properties. A marketing brand
+      // book is visual identity, not a status system, so errors/warnings,
+      // competitor colours and incidental UI noise are excluded.
+      const nonBrandNames = /(competitor|fuel|error|danger|destructive|invalid|warning|success|info|alert|notice|disabled|placeholder|skeleton|shimmer|scrim|overlay|backdrop|tooltip)/;
+      if (nonBrandNames.test(prop)) continue;
+
+      // Framework default-theme dumps: sites ship the entire Tailwind/Panda
+      // default palette as --colors-<hue>-<shade> custom properties (e.g.
+      // --colors-red-500). These are framework defaults, not brand tokens, so
+      // they never belong in a brand book. Brand-named tokens (--accent-color-*,
+      // --green-scale-*, --hero-background-*) do not match and are kept.
+      const frameworkPalette = /^--(?:tw-)?colors?-(?:slate|gray|grey|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|\d00|950)$/;
+      if (frameworkPalette.test(prop)) continue;
+      if (/^--(?:tw-)?colors?-(?:transparent|current|black|white|inherit)$/.test(prop)) continue;
+
+      if (!value.match(/^(#|rgb|hsl|hwb|color\(|color-mix\(|oklab\(|oklch\(|lab\(|lch\()/i)) continue;
+      if (
+        value.includes("color.adjust(") || value.includes("rgba(0, 0, 0, 0)") ||
+        value.includes("rgba(0,0,0,0)") || value.includes("lighten(") ||
+        value.includes("darken(") || value.includes("saturate(")
+      ) continue;
+
+      if (isValidColorValue(value)) cssVariables[prop] = { value, scope };
+    }
+
+    // Declared custom properties carry brand-token provenance: the author
+    // named these colours deliberately. They outweigh ad-hoc computed colours in
+    // ranking, are never treated as structural, and are preferred as primary.
+    const tokenNames = new Map<string, string[]>();
+    for (const [name, v] of Object.entries(cssVariables)) {
+      const n = normalizeColor(v.value);
+      if (typeof n === 'string' && /^#[0-9a-f]{6}$/.test(n)) tokenNames.set(n, [...(tokenNames.get(n) || []), name]);
+    }
+    const tokenHexes = new Set(tokenNames.keys());
+
+    const elements = document.querySelectorAll("*");
+    const totalElements = elements.length;
+    const ctaPrimaryMap = new Map(); // normalized hex → original color for CTA backgrounds
+    // Black and white CTA fills never compete with a chromatic candidate.
+    const ctaNeutralMap = new Map();
+
+    // Mirror of CONTEXT_SCORES (lib/extractors/color-heuristics.ts) — kept inline
+    // because page.evaluate runs in an isolated realm and cannot import. Card /
+    // section / input / badge families lift colours on repeated content surfaces
+    // above the structural-noise threshold.
+    const contextScores = {
+      logo: 5, brand: 5, primary: 4, cta: 4, hero: 3, button: 3,
+      card: 2, section: 2, feature: 2, panel: 2, input: 2, badge: 2, chip: 2,
+      footer: 2, link: 2, header: 2, nav: 1,
+    };
+    // Mirror of ANCESTOR_LIFT_MAX (color-heuristics.ts): only keywords at or
+    // below this weight may lift a colour via an ANCESTOR's context.
+    const ancestorLiftMax = 2;
+
+    // Colours that appear only via status/feedback or warm-utility classes are
+    // not brand identity unless declared as a token or used as a CTA background.
+    // The semantic words cover Bootstrap (text-danger), MUI (Mui-error),
+    // Bulma (is-danger) and similar conventions; the second branch covers
+    // Tailwind's numbered warm utilities (text-red-600) that carry no word.
+    // Mirror of STATUS_CONTEXT_SOURCE (lib/extractors/color-heuristics.ts).
+    // "badge" intentionally removed: brand badges/pills are real brand colour;
+    // genuine status badges are warm-hued and caught by the numbered branch.
+    const statusContext = /\b(error|danger|destructive|invalid|warning|success|alert|notice|sale|discount|toast|notification)\b|(?:text|bg|border|ring|fill|stroke|from|to|via|divide|outline|decoration|accent|caret)-(?:red|rose|orange|amber|yellow)-\d/;
+
+    const colorLiteralRe = /^(#[0-9a-f]{3,8}|rgba?\([^)]*\)|hsla?\([^)]*\)|(?:oklch|oklab|lch|lab|hwb)\([^)]*\))$/i;
+
+    // A palette being documented is not a palette being used. Swatch strips,
+    // colour labels and code samples paint real pixels that carry no brand
+    // intent, and any docs or style-guide page renders them.
+    function isColorSample(el: Element, rect: DOMRect) {
+      if (el.closest('code, pre, samp, kbd')) return true;
+      // Leaves only: textContent on every node of a deep page is quadratic, and
+      // a swatch label is never a wrapper.
+      if (el.children.length === 0 && colorLiteralRe.test((el.textContent || '').trim())) return true;
+
+      if (rect.width > 200 || rect.height > 200 || !el.parentElement) return false;
+
+      // A small solid block beside text that is nothing but a colour value is a
+      // swatch wherever the two sit in the tree. The sibling run below only sees
+      // a strip under one parent, and documentation far more often lists one
+      // swatch per row next to the hex it names (DEM-253).
+      if (rect.width <= 64 && rect.height <= 64 && colorAlpha(toLegacy(getComputedStyle(el).backgroundColor)) >= 0.9) {
+        for (const sib of Array.from(el.parentElement.children)) {
+          if (sib === el) continue;
+          if (sib.children.length === 0 && colorLiteralRe.test((sib.textContent || '').trim())) return true;
+        }
+      }
+
+      const siblings: Element[] = Array.from(el.parentElement.children);
+      if (siblings.length < 4) return false;
+      const fills = new Set();
+      for (const sib of siblings) {
+        const sibRect = sib.getBoundingClientRect();
+        if (Math.abs(sibRect.width - rect.width) > 1 || Math.abs(sibRect.height - rect.height) > 1) return false;
+        const fill = toLegacy(getComputedStyle(sib).backgroundColor);
+        if (colorAlpha(fill) < 0.9) return false;
+        fills.add(normalizeColor(fill));
+      }
+      // Every block a different opaque fill is a swatch strip; a row of cards
+      // shares one.
+      return fills.size === siblings.length;
+    }
+
+    elements.forEach((el) => {
+      const computed = getComputedStyle(el);
+      if (computed.display === "none" || computed.visibility === "hidden" || computed.opacity === "0") return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      if (isColorSample(el, rect)) return;
+
+      const bgColor = toLegacy(computed.backgroundColor);
+      // `color` inherits, so a wrapper that paints no text still reports one —
+      // and for an unstyled <a> that is the browser's default link blue, which
+      // then outranks the brand. Read the text colour only off elements that
+      // actually render text.
+      const paintsText = Array.from(el.childNodes).some(
+        (n) => n.nodeType === 3 && (n.textContent || "").trim() !== ""
+      );
+      const textColor = paintsText ? toLegacy(computed.color) : "";
+      // Same trap on the border: an unset border-color resolves to currentColor,
+      // so every element reports one whether or not a border is drawn.
+      const hasBorder = [computed.borderTopWidth, computed.borderRightWidth,
+        computed.borderBottomWidth, computed.borderLeftWidth]
+        .some((w) => parseFloat(w) > 0);
+      const borderColor = hasBorder ? toLegacy(computed.borderColor) : "";
+
+      const context = (
+        (el.getAttribute('class') || '') + " " + el.id + " " +
+        (el.getAttribute('data-tracking-linkid') || '') + " " +
+        (el.getAttribute('data-cta') || '') + " " +
+        (el.getAttribute('data-component') || '') + " " +
+        el.tagName
+      ).toLowerCase();
+
+      let score = 1;
+      for (const [keyword, weight] of Object.entries(contextScores)) {
+        if (context.includes(keyword)) score = Math.max(score, weight);
+      }
+      // Real anchors and buttons carry brand intent even when their class names
+      // don't contain "link"/"button". Score by tag so chromatic link/CTA text
+      // colours aren't later discarded as structural noise (e.g. a plain styled
+      // <a> link colour the heuristic would otherwise drop).
+      if (el.tagName === 'A') score = Math.max(score, contextScores.link);
+      if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score = Math.max(score, contextScores.button);
+
+      // Deep-nested brand colours: lift via ANCESTOR context (card/section/
+      // footer/nav/...) at a capped weight when the element's own context is
+      // silent. Median labelled brand-colour xpath depth is ~10, so own-class
+      // scoring alone misses content buried inside a labelled wrapper. Mirror of
+      // ancestorLiftScore (color-heuristics.ts): bounded to 4 hops, only weights
+      // <= ancestorLiftMax, and only when own score is still baseline — so cost
+      // stays low and already-branded elements are never altered.
+      if (score <= ancestorLiftMax) {
+        let lift = 0;
+        let node = el.parentElement;
+        for (let hop = 0; hop < 4 && node && lift < ancestorLiftMax; hop++) {
+          const actx = (String(node.className || "") + " " + (node.id || "")).toLowerCase();
+          for (const [keyword, weight] of Object.entries(contextScores)) {
+            if (weight > ancestorLiftMax) continue;
+            if (actx.includes(keyword)) lift = Math.max(lift, Math.min(weight, ancestorLiftMax));
+          }
+          node = node.parentElement;
+        }
+        if (lift > score) score = lift;
+      }
+
+      const isStatus = statusContext.test(context);
+
+      const ctaShaped = (context.includes('button') || context.includes('btn') || context.includes('cta')) &&
+        bgColor && bgColor !== 'rgba(0, 0, 0, 0)' && bgColor !== 'transparent' && colorAlpha(bgColor) >= 0.7;
+      const isCta = ctaShaped &&
+        bgColor !== 'rgb(255, 255, 255)' && bgColor !== 'rgb(0, 0, 0)' && bgColor !== 'rgb(239, 239, 239)';
+      if (ctaShaped && (bgColor === 'rgb(0, 0, 0)' || bgColor === 'rgb(255, 255, 255)')) {
+        const n = normalizeColor(bgColor);
+        if (n) { const e = ctaNeutralMap.get(n) || { original: bgColor, count: 0 }; e.count++; ctaNeutralMap.set(n, e); }
+      }
+
+      if (isCta) {
+        score = Math.max(score, 25);
+        // CTA background is a strong primary signal — count occurrences
+        const ctaNorm = normalizeColor(bgColor);
+        if (ctaNorm) {
+          const existing = ctaPrimaryMap.get(ctaNorm) || { original: bgColor, count: 0 };
+          existing.count++;
+          ctaPrimaryMap.set(ctaNorm, existing);
+        }
+      }
+
+      function extractColorsFromValue(colorValue) {
+        if (!colorValue) return [];
+        // Functional notations are matched whole (so color(srgb ...) cannot
+        // leak a bare `srgb` token) and rewritten to legacy form; anything
+        // that fails to resolve is dropped by the modern-form filter below.
+        const colorRegex = /((?:oklab|oklch|lab|lch|hwb|color)\([^)]+\)|#[0-9a-f]{3,8}|rgba?\([^)]+\)|hsla?\([^)]+\)|[a-z]+)/gi;
+        const matches = (colorValue.match(colorRegex) || []).map(toLegacy);
+        const cssColorFunctions = new Set(['oklab','oklch','lch','lab','color','display','hsl','rgb','rgba','hsla','hwb','srgb','inherit','initial','unset','none','auto','normal']);
+        return matches.filter(c =>
+          c !== 'transparent' && c !== 'rgba(0, 0, 0, 0)' && c !== 'rgba(0,0,0,0)' &&
+          c.length > 2 && !cssColorFunctions.has(c.toLowerCase()) && !_modernColorRe.test(c)
+        );
+      }
+
+      const paints: [string, string][] = [[bgColor, 'fill'], [textColor, 'text'], [borderColor, 'border']];
+      for (const [value, paint] of paints) {
+        for (const color of extractColorsFromValue(value)) {
+          if (colorAlpha(color) < 0.3) continue;
+          const hex = normalizeColor(color);
+          if (typeof hex !== 'string') continue;
+          const key = hex + '|' + paint;
+          const row = occurrenceMap.get(key) || { hex, paints: paint, count: 0, area: 0 };
+          row.count++;
+          if (paint === 'fill') row.area += rect.width * rect.height;
+          occurrenceMap.set(key, row);
+        }
+      }
+      const allColors = paints.flatMap(([value]) => extractColorsFromValue(value));
+
+      allColors.forEach((color) => {
+        if (color && color !== "rgba(0, 0, 0, 0)" && color !== "transparent" && colorAlpha(color) >= 0.3) {
+          const normalized = normalizeColor(color);
+          const existing = colorMap.get(normalized) || { original: color, count: 0, bgCount: 0, bgArea: 0, score: 0, sources: new Set(), statusCount: 0, nonStatusCount: 0, isToken: tokenHexes.has(normalized) };
+          // The opaque form represents the token; alpha variants of the same
+          // normalized colour are usage, not identity.
+          if (colorAlpha(color) > colorAlpha(existing.original)) existing.original = color;
+          existing.count++;
+          if (isStatus) existing.statusCount++; else existing.nonStatusCount++;
+          if (extractColorsFromValue(bgColor).includes(color)) {
+            existing.bgCount++;
+            existing.bgArea += rect.width * rect.height;
+          }
+          existing.score += score;
+          if (score > 1) {
+            const source = context.split(" ")[0].substring(0, 30);
+            if (source && !source.includes("__")) existing.sources.add(source);
+          }
+          colorMap.set(normalized, existing);
+        }
+      });
+
+      if ((context.includes("primary") || el.matches('[class*="primary"]')) && !isRoleQualified(context)) {
+        const candidate = bgColor !== "rgba(0, 0, 0, 0)" && bgColor !== "transparent" ? bgColor : textColor;
+        if (colorAlpha(candidate) >= 0.7 && colorLightness(candidate) <= 0.95) { semanticColors.primary = candidate; primaryRule = 'class'; }
+      }
+      if (context.includes("secondary")) {
+        const a = colorAlpha(bgColor);
+        if (a >= 0.1) semanticColors.secondary = bgColor;
+      }
+    });
+
+    // Canonical page surface + body text. Read the real computed values off the
+    // document body rather than inferring from the palette: these are the actual
+    // background the content sits on and the dominant body text colour, which is
+    // exactly what a design system means by background/text tokens. The role
+    // data already exists on palette entries; this promotes it to a named token.
+    const surfaceEl = document.body || document.documentElement;
+    if (surfaceEl) {
+      let bgNode: Element | null = surfaceEl;
+      for (let hop = 0; hop < 5 && bgNode; hop++) {
+        const bg = toLegacy(getComputedStyle(bgNode).backgroundColor);
+        if (bg && colorAlpha(bg) >= 0.9) { semanticColors.background = bg; break; }
+        bgNode = bgNode.parentElement;
+      }
+      // Body and html often paint nothing, leaving the default white canvas the
+      // user actually sees. Dark sites always set an explicit dark background, so
+      // an unset chain means the rendered backdrop is white.
+      if (!semanticColors.background) semanticColors.background = 'rgb(255, 255, 255)';
+      const txt = toLegacy(getComputedStyle(surfaceEl).color);
+      if (txt && colorAlpha(txt) >= 0.5) semanticColors.text = txt;
+    }
+
+    // Use most-common CTA background as primary if class-based detection missed it
+    // Require at least 2 CTA occurrences to avoid single "Sign up" buttons dominating
+    if (!semanticColors.primary && ctaPrimaryMap.size > 0) {
+      let bestScore = -1;
+      for (const [norm, entry] of ctaPrimaryMap) {
+        if (entry.count < 2) continue;
+        const data = colorMap.get(norm);
+        if (data && data.score > bestScore) {
+          bestScore = data.score;
+          semanticColors.primary = entry.original;
+          primaryRule = 'cta';
+        }
+      }
+    }
+
+    const threshold = Math.max(3, Math.floor(totalElements * 0.01));
+
+    // Mirror of classifyStructural (lib/extractors/color-heuristics.ts). Saturation
+    // is computed once and reused. The high-usage branch now only fires for
+    // near-neutral colours: a saturated colour at high coverage is a deliberate
+    // brand fill (coloured section/card), not chrome noise. NaN-safe throughout.
+    function isStructuralColor(data, totalElements) {
+      if (data.isToken) return false;
+      if (data.original === "rgba(0, 0, 0, 0)" || data.original === "transparent") return true;
+      const total = totalElements > 0 ? totalElements : 1;
+      const usagePercent = (data.count / total) * 100;
+      const normalized = normalizeColor(data.original);
+      const hex = normalized.replace('#', '');
+      const r = parseInt(hex.substring(0, 2), 16);
+      const g = parseInt(hex.substring(2, 4), 16);
+      const b = parseInt(hex.substring(4, 6), 16);
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const saturation = Number.isFinite(max) && max > 0 ? (max - min) / max : 0;
+      // Near-neutral, high-usage, low-intent => layout fill / page background.
+      if (usagePercent > 40 && data.score < data.count * 1.2 && saturation <= 0.2) return true;
+      // Saturated, never a background, low-intent => incidental decoration.
+      // Background colours (bgCount > 0) are exempt so card/section fills survive.
+      if (data.bgCount === 0 && data.score < data.count * 1.5 && saturation > 0.3) return true;
+      return false;
+    }
+
+    function deltaE(rgb1, rgb2) {
+      function hexToRgb(hex) {
+        if (!hex.startsWith("#")) return null;
+        const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+        return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : null;
+      }
+      function rgbToXyz(r, g, b) {
+        r = r / 255; g = g / 255; b = b / 255;
+        r = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
+        g = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
+        b = b > 0.04045 ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+        return {
+          x: (r * 0.4124564 + g * 0.3575761 + b * 0.1804375) * 100,
+          y: (r * 0.2126729 + g * 0.7151522 + b * 0.0721750) * 100,
+          z: (r * 0.0193339 + g * 0.1191920 + b * 0.9503041) * 100,
+        };
+      }
+      function xyzToLab(x, y, z) {
+        // Exact CIE threshold constant, matching lib/colors.ts.
+        x = x / 95.047; y = y / 100.000; z = z / 108.883;
+        const f = (t) => t > 0.008856 ? Math.cbrt(t) : (903.3 * t + 16) / 116;
+        const fx = f(x), fy = f(y), fz = f(z);
+        return { L: 116 * fy - 16, a: 500 * (fx - fy), b: 200 * (fy - fz) };
+      }
+      const rgb1Obj = hexToRgb(rgb1);
+      const rgb2Obj = hexToRgb(rgb2);
+      if (!rgb1Obj || !rgb2Obj) return 999;
+      const xyz1 = rgbToXyz(rgb1Obj.r, rgb1Obj.g, rgb1Obj.b);
+      const lab1 = xyzToLab(xyz1.x, xyz1.y, xyz1.z);
+      const xyz2 = rgbToXyz(rgb2Obj.r, rgb2Obj.g, rgb2Obj.b);
+      const lab2 = xyzToLab(xyz2.x, xyz2.y, xyz2.z);
+      const dL = lab1.L - lab2.L, dA = lab1.a - lab2.a, dB = lab1.b - lab2.b;
+      return Math.sqrt(dL * dL + dA * dA + dB * dB);
+    }
+
+    const rawColors = Array.from(colorMap.entries())
+      .filter(([, data]) => data.count >= threshold)
+      .map(([normalized, data]) => ({ color: data.original, normalized, count: data.count }));
+
+    const palette = Array.from(colorMap.entries())
+      .filter(([norm, data]) => {
+        // Status/utility-only colours are not brand identity unless declared as
+        // a token or recurring as a CTA background.
+        const ctaEntry = ctaPrimaryMap.get(norm);
+        const isCtaPrimary = ctaEntry && ctaEntry.count >= 2;
+        if (!data.isToken && !isCtaPrimary && data.statusCount > 0 && data.nonStatusCount === 0) return false;
+        // Declared brand tokens always qualify regardless of element count.
+        const highScore = data.isToken || data.score >= 10 || (data.count > 0 && data.score / data.count >= 3);
+        if (!highScore && data.count < threshold) return false;
+        if (isStructuralColor(data, totalElements)) return false;
+        return true;
+      })
+      .map(([normalizedColor, data]) => ({
+        color: data.original,
+        normalized: normalizedColor,
+        count: data.count,
+        confidence: data.isToken
+          ? (data.score > 5 ? "high" : "medium")
+          : data.score > 20 ? "high" : data.score > 5 ? "medium" : "low",
+        sources: Array.from(data.sources).slice(0, 3),
+        ...(tokenNames.has(normalizedColor) ? { tokens: tokenNames.get(normalizedColor) } : {}),
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    const perceptuallyDeduped = [];
+    const merged = new Set();
+    palette.forEach((color, index) => {
+      if (merged.has(index)) return;
+      const similar = [color];
+      for (let i = index + 1; i < palette.length; i++) {
+        if (merged.has(i)) continue;
+        if (deltaE(color.normalized, palette[i].normalized) < 15) {
+          similar.push(palette[i]);
+          merged.add(i);
+        }
+      }
+      // Prefer a declared brand token as the canonical representative of a merged
+      // cluster, then highest usage. Keeps the author's exact brand hex rather
+      // than an incidental computed value 1-2 levels off (quantization drift).
+      const representative = similar.sort((a, b) =>
+        ((tokenHexes.has(b.normalized) ? 1 : 0) - (tokenHexes.has(a.normalized) ? 1 : 0))
+        || (b.count - a.count))[0];
+      const tokens = similar.flatMap((c) => c.tokens ?? []);
+      perceptuallyDeduped.push(tokens.length ? { ...representative, tokens } : representative);
+    });
+
+    // Fallback: pick most chromatic non-gray palette color as primary
+    if (!semanticColors.primary && perceptuallyDeduped.length > 0) {
+      const best = perceptuallyDeduped
+        .filter(c => c.confidence !== 'low')
+        .map(c => ({ c, chroma: chroma(c.normalized), isToken: tokenHexes.has(c.normalized) }))
+        .filter(({ chroma }) => chroma > 0.15)
+        // Brand-token provenance is a bonus on top of prominence, not an
+        // override: a declared token beats incidental colours, but a dominant
+        // high-usage colour still wins over a barely-used token.
+        .sort((a, b) =>
+          ((b.c.count + (b.isToken ? 20 : 0)) - (a.c.count + (a.isToken ? 20 : 0)))
+          || (b.chroma - a.chroma))[0];
+      if (best) { semanticColors.primary = best.c.color; primaryRule = best.isToken ? 'token' : 'chromatic'; }
+    }
+    // A monochrome site: the shared button fill is the primary.
+    if (!semanticColors.primary && ctaNeutralMap.size > 0) {
+      const top = [...ctaNeutralMap.values()].sort((a, b) => b.count - a.count)[0];
+      if (top.count >= 2) { semanticColors.primary = top.original; primaryRule = 'monochrome-cta'; }
+    }
+
+    // Near-neutral primaries are the dominant mis-pick: a dark text/background
+    // colour out-scores the real brand hue. If the chosen primary is near-neutral
+    // but a strong chromatic candidate exists (a declared brand token or a
+    // recurring CTA background), prefer the chromatic one. Genuinely monochrome
+    // brands have no such candidate, so they are left untouched.
+    if (semanticColors.primary) {
+      const primaryNorm = normalizeColor(semanticColors.primary);
+      if (typeof primaryNorm === 'string' && chroma(primaryNorm) < 0.20) {
+        // Only the strongest brand signals override a near-neutral primary: a
+        // declared brand token or a recurring CTA background. A merely
+        // high-confidence chromatic accent is not enough; that would demote a
+        // deliberately neutral brand identity for an incidental accent.
+        const chromatic = perceptuallyDeduped
+          .map((c) => ({ c, ch: chroma(c.normalized), isToken: tokenHexes.has(c.normalized), isCta: ctaPrimaryMap.has(c.normalized) }))
+          .filter((x) => x.ch > 0.25 && (x.isToken || x.isCta))
+          .sort((a, b) =>
+            ((b.c.count + (b.isToken ? 20 : 0) + (b.isCta ? 20 : 0)) - (a.c.count + (a.isToken ? 20 : 0) + (a.isCta ? 20 : 0)))
+            || (b.ch - a.ch))[0];
+        if (chromatic) { semanticColors.primary = chromatic.c.color; primaryRule = chromatic.isToken ? 'neutral-rescue-token' : 'neutral-rescue-cta'; }
+      }
+    }
+
+    const PRIMARY_REASONS: Record<string, string> = {
+      'class': 'an element class names it primary',
+      'cta': 'recurring call-to-action background',
+      'token': 'most used chromatic colour, declared as a custom property',
+      'chromatic': 'most used chromatic palette colour',
+      'monochrome-cta': 'shared button fill on a monochrome page',
+      'neutral-rescue-token': 'near-neutral pick replaced by a declared chromatic token',
+      'neutral-rescue-cta': 'near-neutral pick replaced by a recurring chromatic CTA',
+    };
+    const primaryNormalized = semanticColors.primary ? normalizeColor(semanticColors.primary) : null;
+    const primaryCandidates = perceptuallyDeduped
+      .filter(c => chroma(c.normalized) > 0.15 && c.normalized !== primaryNormalized)
+      .slice(0, 5)
+      .map(c => ({ color: c.normalized, count: c.count, sources: (c.sources || []).slice(0, 3) }));
+    const semanticEvidence = {
+      primary: semanticColors.primary
+        ? { decision: 'elected', rule: primaryRule, reason: PRIMARY_REASONS[primaryRule] || primaryRule,
+            tokens: tokenNames.get(primaryNormalized) || [], alternates: primaryCandidates }
+        : { decision: 'refused', rule: null,
+            reason: primaryCandidates.length === 0
+              ? 'no chromatic colour reached the palette'
+              : `${primaryCandidates.length} chromatic colours in the palette, all at low confidence`,
+            tokens: [], alternates: primaryCandidates },
+    };
+
+    // Accent vs primary. A brand often runs a primary alongside a distinct, more
+    // saturated accent (e.g. a cyan brand mark beside a navy primary). Surface
+    // the accent as its own token so the two are not collapsed: the most
+    // chromatic high-/medium-confidence palette colour whose hue is clearly
+    // different from primary. Additive only — never alters the primary pick,
+    // which already resolves most brands correctly.
+    if (semanticColors.primary) {
+      const primaryNorm = normalizeColor(semanticColors.primary);
+      const primaryHue = typeof primaryNorm === 'string' ? hueOf(primaryNorm) : -1;
+      const accent = perceptuallyDeduped
+        .filter(c => c.confidence !== 'low')
+        .map(c => ({ c, ch: chroma(c.normalized), hue: hueOf(c.normalized) }))
+        .filter(x => x.ch > 0.25 && x.c.normalized !== primaryNorm &&
+          (primaryHue < 0 || hueDistance(x.hue, primaryHue) > 30))
+        .sort((a, b) => b.ch - a.ch)[0];
+      if (accent) semanticColors.accent = accent.c.color;
+    }
+
+    // Full detected set — every colour that passed the alpha>=0.3 gate, with NO
+    // frequency threshold and NO perceptual merge, so near-identical shades survive
+    // as the design signal they are (six reds stay six reds). This is the high-recall
+    // candidate set the ML pipeline consumes; the curated `palette` above remains the
+    // product default. `usageFrac` counts elements; `areaFrac` is the share of
+    // painted background area, so a hero fill is not outranked by small icons.
+    // Nested fills each count their own box, so this is a ranking proxy and not
+    // a fraction of the screen.
+    const detectedTotal = Array.from(colorMap.values()).reduce((s, d) => s + (d.count || 0), 0) || 1;
+    const detectedArea = Array.from(colorMap.values()).reduce((s, d) => s + (d.bgArea || 0), 0);
+    const detected = Array.from(colorMap.entries())
+      .filter(([norm]) => typeof norm === 'string' && /^#[0-9a-f]{6}$/i.test(norm))
+      .map(([normalized, data]) => ({
+        color: data.original,
+        normalized,
+        count: data.count,
+        usageFrac: data.count / detectedTotal,
+        areaFrac: detectedArea > 0 ? data.bgArea / detectedArea : 0,
+        confidence: data.isToken
+          ? (data.score > 5 ? 'high' : 'medium')
+          : data.score > 20 ? 'high' : data.score > 5 ? 'medium' : 'low',
+        sources: Array.from(data.sources).slice(0, 5),
+        isToken: !!data.isToken,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    const occurrences = Array.from(occurrenceMap.values())
+      .filter((o) => /^#[0-9a-f]{6}$/i.test(o.hex))
+      .map((o) => ({ hex: o.hex, paints: o.paints, slot: null, count: o.count, area: Math.round(o.area), cssVar: tokenNames.get(o.hex)?.[0] ?? null, state: null }))
+      .sort((a, b) => b.count - a.count || a.hex.localeCompare(b.hex) || a.paints.localeCompare(b.paints));
+
+    return { semantic: semanticColors, semanticEvidence, palette: perceptuallyDeduped, cssVariables, detected, occurrences, _raw: rawColors };
+  });
+
+  if (result && result.palette) {
+    result.palette = result.palette.map((colorItem) => {
+      const converted = convertColor(colorItem.normalized || colorItem.color);
+      if (converted) return { ...colorItem, lch: converted.lch, oklch: converted.oklch };
+      return colorItem;
+    });
+
+    // Cluster alpha/lightness variants of the same hue under one token
+    // e.g. rgba(99,91,255,0.1) is a variant of #635bff, not a separate brand color
+    const primaryHex = result.semantic?.primary
+      ? hexToRgb(toOpaque(result.semantic.primary)) : null;
+
+    result.palette = result.palette.map((colorItem) => {
+      const hex = colorItem.normalized || colorItem.color;
+      const confidence = capConfidenceByUsage(colorItem.confidence, colorItem.count);
+      const role = colorRole(hex, { ...colorItem, confidence });
+      const onColor = bestOnColor(hex);
+      const hover = hoverVariant(hex);
+      // Mark alpha/lightness variants of primary
+      let variantOf = null;
+      if (primaryHex && role !== 'surface') {
+        const rgb = hexToRgb(hex);
+        if (rgb && isSameHueFamily(rgb, primaryHex)) {
+          variantOf = 'primary';
+        }
+      }
+      return {
+        ...colorItem,
+        confidence,
+        role,
+        onColor,
+        hover,
+        ...(variantOf ? { variantOf } : {}),
+      };
+    });
+  }
+
+  if (result && result.cssVariables) {
+    const enhancedCssVariables: Record<string, CssVariable> = {};
+    const declared = result.cssVariables as Record<string, { value: string; scope: 'root' | 'body' }>;
+    for (const [name, { value, scope }] of Object.entries(declared)) {
+      const converted = convertColor(value);
+      // value stays the author's declared token verbatim (provenance);
+      // hex gives consumers a parseable identity for modern notations.
+      enhancedCssVariables[name] = converted
+        ? { value, hex: converted.hex, lch: converted.lch, oklch: converted.oklch, scope }
+        : { value, scope };
+    }
+    result.cssVariables = enhancedCssVariables;
+  }
+
+  return result;
+}
+
+/**
+ * Confidence is a claim about brand identity, and semantic context alone cannot
+ * carry it. The palette scored context only, so a single hero element — or a
+ * declared token the page never actually paints — came out "high" off one
+ * occurrence. Spacing and radii have gated on usage from the start; this gives
+ * colour the same floor. A colour seen once is medium at best, whatever its
+ * score says, and two occurrences are the least that can support "high".
+ *
+ * Pure and exported so the floor is unit-testable without a browser.
+ */
+const MIN_COUNT_FOR_HIGH = 3;
+const MIN_COUNT_FOR_MEDIUM = 2;
+
+export function capConfidenceByUsage(confidence, count) {
+  const seen = typeof count === 'number' ? count : 0;
+  if (confidence === 'high' && seen < MIN_COUNT_FOR_HIGH) {
+    return seen >= MIN_COUNT_FOR_MEDIUM ? 'medium' : 'low';
+  }
+  if (confidence === 'medium' && seen < MIN_COUNT_FOR_MEDIUM) return 'low';
+  return confidence;
+}
+
+function hexToRgb(hex) {
+  const m = /^#([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (!m) return null;
+  return { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) };
+}
+
+function relativeLuminance({ r, g, b }) {
+  const lin = c => { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+function contrastRatio(hex1, hex2) {
+  const rgb1 = hexToRgb(hex1);
+  const rgb2 = hexToRgb(hex2);
+  if (!rgb1 || !rgb2) return 1;
+  const l1 = relativeLuminance(rgb1);
+  const l2 = relativeLuminance(rgb2);
+  const lighter = Math.max(l1, l2);
+  const darker = Math.min(l1, l2);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function bestOnColor(hex) {
+  const onWhite = contrastRatio(hex, '#ffffff');
+  const onBlack = contrastRatio(hex, '#000000');
+  return onWhite >= onBlack ? '#ffffff' : '#000000';
+}
+
+function colorRole(hex, colorItem) {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return 'unknown';
+  const lum = relativeLuminance(rgb);
+  // Surface: near-pure white or black only
+  if (lum > 0.9 || lum < 0.005) return 'surface';
+  // Neutral: low HSL saturation (grays, off-whites, taupes)
+  const max = Math.max(rgb.r, rgb.g, rgb.b) / 255;
+  const min = Math.min(rgb.r, rgb.g, rgb.b) / 255;
+  const saturation = max === 0 ? 0 : (max - min) / max;
+  if (saturation < 0.12) return 'neutral';
+  // Accent: anything chromatic with meaningful confidence
+  if (colorItem.confidence === 'high' || colorItem.confidence === 'medium') return 'accent';
+  return 'supporting';
+}
+
+function hoverVariant(hex) {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return null;
+  const lum = relativeLuminance(rgb);
+  // Lighten dark colors, darken light ones — always move toward better contrast
+  const factor = lum < 0.18 ? 1.2 : 0.85;
+  const clamp = v => Math.min(255, Math.max(0, Math.round(v)));
+  const r = clamp(rgb.r * factor);
+  const g = clamp(rgb.g * factor);
+  const b = clamp(rgb.b * factor);
+  return `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`;
+}
+
+function toOpaque(color) {
+  if (!color) return null;
+  if (color.startsWith('#')) return color;
+  const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+  if (!m) return null;
+  return `#${(+m[1]).toString(16).padStart(2,'0')}${(+m[2]).toString(16).padStart(2,'0')}${(+m[3]).toString(16).padStart(2,'0')}`;
+}
+
+function isSameHueFamily(rgb, primaryRgb, threshold = 30) {
+  // Compare hue in HSL space — same hue ±threshold degrees = variant
+  function toHsl({ r, g, b }) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const l = (max + min) / 2;
+    if (max === min) return { h: 0, s: 0, l };
+    const d = max - min;
+    const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    let h;
+    switch (max) {
+      case r: h = ((g - b) / d + (g < b ? 6 : 0)) / 6; break;
+      case g: h = ((b - r) / d + 2) / 6; break;
+      default: h = ((r - g) / d + 4) / 6;
+    }
+    return { h: h * 360, s, l };
+  }
+  const h1 = toHsl(rgb);
+  const h2 = toHsl(primaryRgb);
+  // Low saturation colors are not hue-family variants
+  if (h1.s < 0.1 || h2.s < 0.1) return false;
+  const diff = Math.abs(h1.h - h2.h);
+  return Math.min(diff, 360 - diff) < threshold;
+}
+
+export async function extractWcagPairs(page) {
+  let rawPairs = [];
+  try {
+    rawPairs = await page.evaluate(() => {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 1;
+      const ctx = canvas.getContext('2d');
+
+      function parseRgba(color) {
+        if (!color) return null;
+        try {
+          const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+          if (m) {
+            const a = m[4] !== undefined ? parseFloat(m[4]) : 1;
+            return { r: parseInt(m[1]), g: parseInt(m[2]), b: parseInt(m[3]), a };
+          }
+          if (/^#[0-9a-f]{6}$/i.test(color)) {
+            return { r: parseInt(color.slice(1, 3), 16), g: parseInt(color.slice(3, 5), 16), b: parseInt(color.slice(5, 7), 16), a: 1 };
+          }
+          if (!ctx) return null;
+          ctx.clearRect(0, 0, 1, 1);
+          ctx.fillStyle = 'rgba(0,0,0,0)';
+          ctx.fillStyle = color;
+          ctx.fillRect(0, 0, 1, 1);
+          const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+          return { r, g, b, a: a / 255 };
+        } catch {
+          return null;
+        }
+      }
+
+      function toHexFromRgb(r, g, b) {
+        const c = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+        return `#${c(r)}${c(g)}${c(b)}`;
+      }
+
+      // Alpha-composite background layers front-to-back over an assumed-white
+      // canvas. Pure array math, no DOM, so it's unit-testable on its own.
+      function compositeBackgroundLayers(layers) {
+        let rAcc = 0, gAcc = 0, bAcc = 0, alphaRem = 1;
+        for (const rgba of layers) {
+          if (alphaRem <= 0.001) break;
+          if (!rgba || rgba.a <= 0.001) continue;
+          rAcc += rgba.r * rgba.a * alphaRem;
+          gAcc += rgba.g * rgba.a * alphaRem;
+          bAcc += rgba.b * rgba.a * alphaRem;
+          alphaRem *= (1 - rgba.a);
+        }
+        if (alphaRem > 0.001) {
+          rAcc += 255 * alphaRem;
+          gAcc += 255 * alphaRem;
+          bAcc += 255 * alphaRem;
+        }
+        return { r: rAcc, g: gAcc, b: bAcc };
+      }
+
+      // Walk the ancestor chain, defaulting to white if nothing opaque is found.
+      function effectiveBackground(el) {
+        const layers = [];
+        let node = el;
+        let alphaRem = 1;
+        while (node && node.tagName !== 'HTML' && alphaRem > 0.001) {
+          try {
+            const rgba = parseRgba(getComputedStyle(node).backgroundColor);
+            if (rgba && rgba.a > 0.001) { layers.push(rgba); alphaRem *= (1 - rgba.a); }
+          } catch { /* skip stale node */ }
+          node = node.parentElement;
+        }
+        return compositeBackgroundLayers(layers);
+      }
+
+      // "logo" as a whole word: [class*=logo] alone also matches "logout".
+      const LOGO_NAME = /(^|[^a-z])(logo|wordmark)([^a-z]|$)/i;
+      const LOGO_SEL = '[class*="logo" i], [id*="logo" i], [class*="wordmark" i]';
+      function isExempt(el) {
+        if (el.closest('[aria-hidden="true"], [disabled], [aria-disabled="true"], fieldset[disabled]')) return true;
+        const hit = el.closest(LOGO_SEL);
+        if (!hit || !LOGO_NAME.test(hit.className + ' ' + hit.id)) return false;
+        // 1.4.3 exempts the logotype, not a container named after it: a
+        // ".logo-bar" header holding nav links is not a logotype.
+        return hit.textContent.trim() === el.textContent.trim();
+      }
+
+      function hasOwnText(el) {
+        for (const node of el.childNodes) {
+          if (node.nodeType === 3 && node.nodeValue.trim()) return true;
+        }
+        return false;
+      }
+
+      const seen = new Map();
+      let checked = 0;
+      const els = document.querySelectorAll('p, h1, h2, h3, h4, h5, h6, a, button, label, span, li, td, th, [role="button"]');
+
+      for (const el of els) {
+        if (checked++ > 1500) break;
+        try {
+          const s = getComputedStyle(el);
+          if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (!hasOwnText(el) || isExempt(el)) continue;
+          const fgRgba = parseRgba(s.color);
+          if (!fgRgba || fgRgba.a < 0.1) continue;
+          const bgRgb = effectiveBackground(el);
+          // Text with alpha composites over the background too.
+          const effR = fgRgba.a >= 0.999 ? fgRgba.r : fgRgba.r * fgRgba.a + bgRgb.r * (1 - fgRgba.a);
+          const effG = fgRgba.a >= 0.999 ? fgRgba.g : fgRgba.g * fgRgba.a + bgRgb.g * (1 - fgRgba.a);
+          const effB = fgRgba.a >= 0.999 ? fgRgba.b : fgRgba.b * fgRgba.a + bgRgb.b * (1 - fgRgba.a);
+          const fg = toHexFromRgb(effR, effG, effB);
+          const bg = toHexFromRgb(bgRgb.r, bgRgb.g, bgRgb.b);
+          if (fg === bg) continue;
+          const parsedSize = parseFloat(s.fontSize);
+          const fontSize = Number.isFinite(parsedSize) && parsedSize > 0 ? parsedSize : 16;
+          const weight = parseInt(s.fontWeight, 10) || 400;
+          const key = [fg, bg].sort().join('/') + '|' + fontSize + '|' + weight;
+          const entry = seen.get(key);
+          if (!entry) {
+            seen.set(key, { fg, bg, count: 1, fontSize, fontWeight: weight });
+          } else {
+            entry.count++;
+          }
+        } catch { /* skip any element that throws */ }
+      }
+
+      return Array.from(seen.values()).sort((a, b) => b.count - a.count).slice(0, 200);
+    });
+  } catch {
+    return [];
+  }
+
+  const { relativeLuminance, wcagVerdict, isLargeScale } = await import('../colors.js');
+
+  const byPair = new Map();
+  for (const { fg, bg, count, fontSize, fontWeight } of rawPairs) {
+    const large = fontSize === undefined ? undefined : isLargeScale(fontSize, fontWeight ?? 400);
+    const key = [fg, bg].sort().join('/') + (large === undefined ? '' : large ? '/lg' : '/sm');
+    const entry = byPair.get(key);
+    if (!entry) {
+      byPair.set(key, { fg, bg, count, fontSize, fontWeight, large });
+    } else {
+      entry.count += count;
+      // Report the smallest occurrence: it is the one closest to failing.
+      if (fontSize != null && (entry.fontSize == null || fontSize < entry.fontSize)) {
+        entry.fontSize = fontSize;
+        entry.fontWeight = fontWeight;
+      }
+    }
+  }
+
+  const pairs = [];
+  for (const { fg, bg, count, fontSize, fontWeight, large } of byPair.values()) {
+    try {
+      const l1 = relativeLuminance(fg);
+      const l2 = relativeLuminance(bg);
+      if (l1 === null || l2 === null) continue;
+      const lighter = Math.max(l1, l2);
+      const darker = Math.min(l1, l2);
+      const ratio = Math.round((lighter + 0.05) / (darker + 0.05) * 100) / 100;
+      pairs.push({
+        fg, bg, ratio, count,
+        aa: ratio >= 4.5, aaLarge: ratio >= 3, aaa: ratio >= 7,
+        ...wcagVerdict(ratio, large),
+        fontSize: fontSize === undefined ? undefined : Math.round(fontSize * 10) / 10,
+        fontWeight,
+      });
+    } catch { /* skip malformed pair */ }
+  }
+
+  return pairs.sort((a, b) => b.count - a.count).slice(0, 50);
+}
+
+/**
+ * Bind each observed WCAG contrast pair back onto the palette candidate it was
+ * measured against, so a colour carries "this is AA-compliant text against X"
+ * as a feature. Mutates each matching entry's `contrastAgainst` in place and
+ * returns the palette for convenience; entries with no observed pair are
+ * left untouched (no empty array).
+ */
+export function bindContrastToPalette(palette: unknown, wcagPairs: unknown): unknown {
+  if (!Array.isArray(palette) || !Array.isArray(wcagPairs) || !wcagPairs.length) return palette;
+  const byColor = new Map<string, { bg: string; ratio: number; aa: boolean }[]>();
+  const add = (self: string, other: string, ratio: number, aa: boolean) => {
+    if (!self || !other) return;
+    if (!byColor.has(self)) byColor.set(self, []);
+    byColor.get(self).push({ bg: other, ratio, aa });
+  };
+  for (const p of wcagPairs) {
+    if (!p || !p.fg || !p.bg) continue;
+    add(p.fg, p.bg, p.ratio, p.aa);
+    add(p.bg, p.fg, p.ratio, p.aa);
+  }
+  for (const entry of palette) {
+    if (!entry || !entry.normalized) continue;
+    const matches = byColor.get(entry.normalized);
+    if (!matches || !matches.length) continue;
+    const byOther = new Map();
+    for (const m of matches) {
+      const prev = byOther.get(m.bg);
+      if (!prev || m.ratio > prev.ratio) byOther.set(m.bg, m);
+    }
+    entry.contrastAgainst = Array.from(byOther.values()).sort((a, b) => b.ratio - a.ratio).slice(0, 10);
+  }
+  return palette;
+}

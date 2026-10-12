@@ -1,0 +1,56 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Atk4\Data\Persistence\Sql\Sqlite;
+
+use Atk4\Data\Persistence\Sql\Connection as BaseConnection;
+use Doctrine\DBAL\Configuration;
+use Doctrine\DBAL\Driver\AbstractSQLiteDriver\Middleware\EnableForeignKeys;
+use Doctrine\DBAL\DriverManager;
+
+class Connection extends BaseConnection
+{
+    private static string $driverVersion;
+
+    protected string $expressionClass = Expression::class;
+    protected string $queryClass = Query::class;
+
+    #[\Override]
+    protected static function createDbalConfiguration(): Configuration
+    {
+        $configuration = parent::createDbalConfiguration();
+
+        $configuration->setMiddlewares([
+            ...$configuration->getMiddlewares(),
+            new EnableForeignKeys(),
+            new PreserveAutoincrementOnRollbackMiddleware(),
+            ...(
+                version_compare(self::getDriverVersion(), '3.44') < 0
+                    ? [new CreateConcatFunctionMiddleware()]
+                    : []
+            ),
+            new CreateRegexpLikeFunctionMiddleware(),
+            new CreateRegexpReplaceFunctionMiddleware(),
+        ]);
+
+        return $configuration;
+    }
+
+    /**
+     * @internal
+     */
+    public static function getDriverVersion(): string
+    {
+        if ((self::$driverVersion ?? null) === null) {
+            $connection = new self();
+            \Closure::bind(static function () use ($connection) {
+                $connection->_connection = DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+            }, null, BaseConnection::class)();
+
+            self::$driverVersion = $connection->getServerVersion();
+        }
+
+        return self::$driverVersion;
+    }
+}

@@ -1,0 +1,363 @@
+package age
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"filippo.io/age"
+	"github.com/blang/semver/v4"
+	"github.com/cenkalti/backoff/v4"
+	"github.com/gopasspw/gopass/internal/backend/crypto/age/agent"
+	"github.com/gopasspw/gopass/internal/cache"
+	"github.com/gopasspw/gopass/internal/cache/ghssh"
+	"github.com/gopasspw/gopass/internal/config"
+	"github.com/gopasspw/gopass/pkg/appdir"
+	"github.com/gopasspw/gopass/pkg/ctxutil"
+	"github.com/gopasspw/gopass/pkg/debug"
+	"github.com/gopasspw/gopass/pkg/fsutil"
+)
+
+const (
+	// Ext is the file extension for age encrypted secrets.
+	Ext = "age"
+	// IDFile is the name for age recipients.
+	IDFile = ".age-recipients"
+	// SpawnGuardEnv is stamped on a spawned agent-starter process so its
+	// children cannot re-enter tryStartAgent. This is the defense against
+	// fork-bombing when gopass is embedded as a library in a host binary that
+	// does not own the `age agent start` subcommand (e.g. gopass-jsonapi): the
+	// host re-enters New -> tryStartAgent and would spawn another copy ad
+	// infinitum. See internal/ageagentlauncher for how the standalone CLI sets it.
+	SpawnGuardEnv = "GOPASS_AGE_AGENT_SPAWNING"
+)
+
+type githubSSHCacher interface {
+	ListKeys(ctx context.Context, user string) ([]string, error)
+	String() string
+}
+
+// Age is an age backend.
+type Age struct {
+	identity        string
+	ghCache         githubSSHCacher
+	askPass         *askPass
+	recpCache       *cache.OnDisk
+	loadSSHKeys     bool   // load (or not) SSH keys from default SSH dir (~/.ssh), or dir in GOPASS_SSH_DIR env var
+	sshKeyPath      string // custom SSH key or directory path; if set then they are loaded no matter value in loadSSHKeys
+	pwCallback      func(string, bool) ([]byte, error)
+	pwPurgeCallback func(string)
+}
+
+// New creates a new Age backend.
+func New(ctx context.Context, loadSSHKeys bool, sshKeyPath string) (*Age, error) {
+	ghc, err := ghssh.New()
+	if err != nil {
+		return nil, err
+	}
+
+	rc, err := cache.NewOnDisk("age-identity-recipients", 30*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+
+	// Expand ~/ so a custom path set via age.ssh-key-path works without shell expansion.
+	sshKeyPath = fsutil.ExpandHomedir(sshKeyPath)
+
+	a := &Age{
+		ghCache:     ghc,
+		recpCache:   rc,
+		identity:    filepath.Join(appdir.UserConfig(), "age", "identities"),
+		askPass:     newAskPass(ctx),
+		loadSSHKeys: loadSSHKeys,
+		sshKeyPath:  sshKeyPath,
+	}
+
+	// Capture any pre-configured passphrase (e.g. from GOPASS_AGE_PASSWORD).
+	if ap := ctxutil.GetAgePassphrase(ctx); ap != "" {
+		debug.Log("age: using pre-configured passphrase from context")
+		a.pwCallback = func(_ string, _ bool) ([]byte, error) { return []byte(ap), nil }
+		a.pwPurgeCallback = func(_ string) {} // no-op for static passwords
+	}
+	if ctxutil.HasPasswordCallback(ctx) {
+		debug.Log("age: using password callback from context")
+		a.pwCallback = ctxutil.GetPasswordCallback(ctx)
+		a.pwPurgeCallback = ctxutil.GetPasswordPurgeCallback(ctx)
+	}
+
+	a.tryStartAgent(ctx)
+
+	debug.Log("age initialized (ghc: %s, recipients: %s, identity: %s, loadSSHKeys: %t, sshKeyPath: %s)", a.ghCache.String(), a.recpCache.String(), a.identity, a.loadSSHKeys, a.sshKeyPath)
+
+	return a, nil
+}
+
+// SetPasswordCallback configures an external callback for obtaining
+// the password used to encrypt/decrypt the age identity file.
+// When set it takes precedence over the built-in interactive askPass prompt.
+func (a *Age) SetPasswordCallback(cb func(string, bool) ([]byte, error)) {
+	a.pwCallback = cb
+}
+
+// SetPasswordPurgeCallback configures an external callback that is invoked
+// when a cached password should be invalidated (e.g. after a decrypt failure).
+func (a *Age) SetPasswordPurgeCallback(cb func(string)) {
+	a.pwPurgeCallback = cb
+}
+
+// effectivePwCallback returns the password callback to use for the given
+// operation hint. If an external callback was configured it is returned;
+// otherwise a closure using the interactive askPass prompt is returned.
+func (a *Age) effectivePwCallback(ctx context.Context, hint string) func(string, bool) ([]byte, error) {
+	if a.pwCallback != nil {
+		return a.pwCallback
+	}
+
+	return func(prompt string, confirm bool) ([]byte, error) {
+		pw, err := a.askPass.Passphrase(ctx, prompt, hint, confirm)
+
+		return []byte(pw), err
+	}
+}
+
+// effectivePwPurgeCallback returns the purge callback to use.
+// Falls back to a.askPass.Remove when no external callback is configured.
+func (a *Age) effectivePwPurgeCallback() func(string) {
+	if a.pwPurgeCallback != nil {
+		return a.pwPurgeCallback
+	}
+
+	return a.askPass.Remove
+}
+
+// isAgentSpawnProcess reports whether the current process was spawned as an
+// agent starter (SpawnGuardEnv is set). Used to short-circuit tryStartAgent so
+// a mis-targeted spawn cannot cascade into a fork bomb.
+func isAgentSpawnProcess() bool {
+	return os.Getenv(SpawnGuardEnv) != ""
+}
+
+func (a *Age) tryStartAgent(ctx context.Context) {
+	// If this process was itself spawned as an agent starter, do not spawn
+	// another. Without this guard, embedding gopass in a host that re-enters
+	// New -> tryStartAgent (e.g. gopass-jsonapi, which runs api.New before CLI
+	// dispatch) fork-bombs. The standalone CLI sets SpawnGuardEnv on the spawned
+	// process via internal/ageagentlauncher.
+	if isAgentSpawnProcess() {
+		debug.Log("age agent spawn already in progress, skipping autostart to avoid fork bomb")
+
+		return
+	}
+
+	if !config.Bool(ctx, "age.agent-enabled") {
+		debug.Log("age agent disabled")
+
+		return
+	}
+
+	client := agent.NewClient()
+	if err := client.Ping(); err == nil {
+		debug.Log("age agent already running")
+		logAgentCapabilities(client)
+
+		return
+	}
+
+	launcher := GetAgentLauncher(ctx)
+	if launcher == nil {
+		// No launcher registered: this is a library consumer (or a unit test)
+		// that does not own the `age agent start` subcommand. Skip autostart
+		// rather than re-executing os.Args[0], which would fork-bomb. The
+		// standalone CLI registers its launcher via internal/ageagentlauncher.
+		debug.Log("no age agent launcher registered, skipping autostart")
+
+		return
+	}
+
+	debug.Log("age agent not running, starting it...")
+	if err := launcher(ctx); err != nil {
+		debug.Log("failed to start age agent: %s", err)
+
+		return
+	}
+
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = 25 * time.Millisecond
+	bo.MaxElapsedTime = 3 * time.Second
+	op := func() error {
+		return client.Ping()
+	}
+	if err := backoff.Retry(op, bo); err != nil {
+		debug.Log("failed to ping age agent after starting: %s", err)
+
+		return
+	}
+	logAgentCapabilities(client)
+
+	// Protected keyrings must be authenticated only when a session is requested,
+	// and loaded with their source binding rather than through the legacy path.
+	session, err := a.usesKeyringSession(ctx)
+	if err != nil {
+		_ = client.Lock()
+		debug.Log("failed to inspect age keyring protection: %s", err)
+
+		return
+	}
+	if session {
+		return
+	}
+
+	// send identities to agent
+	ids, err := a.getAllIds(ctx)
+	if err != nil {
+		debug.Log("failed to get identities: %s", err)
+
+		return
+	}
+
+	sIds, err := a.identitiesToString(ids)
+	if err != nil {
+		debug.Log("failed to serialize identities: %s", err)
+
+		return
+	}
+	if sIds != "" {
+		if err := client.SendIdentities(sIds); err != nil {
+			debug.Log("failed to send identities to agent: %s", err)
+		}
+	}
+
+	// set timeout
+	if timeout := config.AsInt(config.String(ctx, "age.agent-timeout")); timeout > 0 {
+		if err := client.SetTimeout(timeout); err != nil {
+			debug.Log("failed to set agent timeout: %s", err)
+		}
+	}
+}
+
+// Initialized returns nil.
+func (a *Age) Initialized(ctx context.Context) error {
+	if a == nil {
+		return fmt.Errorf("Age not initialized")
+	}
+
+	return nil
+}
+
+// Name returns age.
+func (a *Age) Name() string {
+	return "age"
+}
+
+// Version returns the version of the age dependency being used.
+func (a *Age) Version(ctx context.Context) semver.Version {
+	return debug.ModuleVersion("filippo.io/age")
+}
+
+// Ext returns the extension.
+func (a *Age) Ext() string {
+	return Ext
+}
+
+// IDFile return the recipients file.
+func (a *Age) IDFile() string {
+	return IDFile
+}
+
+// Concurrency returns 1 for `age` since otherwise it prompts for the identity password for each worker.
+func (a *Age) Concurrency() int {
+	return 1
+}
+
+// NeedsPublicKeyImport returns false because age public keys are the recipient
+// identifiers themselves and do not need to be imported into a separate keyring.
+func (a *Age) NeedsPublicKeyImport() bool {
+	return false
+}
+
+// GetFingerprint returns the fingerprint of a key.
+func (a *Age) GetFingerprint(ctx context.Context, key []byte) (string, error) {
+	return string(key), nil
+}
+
+// Lock flushes the password cache and locks any running age agent.
+func (a *Age) Lock() {
+	a.askPass.Lock()
+	if err := agent.NewClient().Lock(); err != nil {
+		debug.Log("failed to lock age agent: %s", err)
+	}
+}
+
+// identitiesToString serializes the given identities into a single-line,
+// space-separated string for the age agent's line-oriented "identities"
+// command.
+//
+// The agent reads commands one line at a time and parses only the tokens on
+// that line (it re-joins them with newlines before parsing). Sending identities
+// newline-separated therefore turns every identity after the first into a
+// spurious "unknown command" that the agent discards. All identities must live
+// on a single line, i.e. space-separated.
+//
+// Only natively serializable identity types are included. SSH identities
+// (filippo.io/age/agessh) expose no String() form for the private key and
+// cannot be round-tripped through the wire format; they are skipped here, and
+// decryption for them falls back to the local code path exactly as before. All
+// of these encodings are bech32 and therefore whitespace-free, so separating
+// them with spaces is unambiguous to the agent's space-splitting parser.
+func (a *Age) identitiesToString(ids []age.Identity) (string, error) {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		s, ok := identityToString(id)
+		if !ok {
+			debug.Log("skipping non-serializable identity %T for agent transfer", id)
+
+			continue
+		}
+		parts = append(parts, s)
+	}
+
+	return strings.Join(parts, " "), nil
+}
+
+// String implements fmt.Stringer.
+func (a *Age) String() string {
+	var sb strings.Builder
+	sb.WriteString("Age(")
+	if a == nil {
+		sb.WriteString("<nil>)")
+
+		return sb.String()
+	}
+	sb.WriteString("Identity: ")
+	sb.WriteString(a.identity)
+	fmt.Fprintf(&sb, ", loadSSHKeys: %t", a.loadSSHKeys)
+	if a.sshKeyPath != "" {
+		sb.WriteString(", sshKeyPath: ")
+		sb.WriteString(a.sshKeyPath)
+	}
+	sb.WriteString(")")
+
+	return sb.String()
+}
+
+// logAgentCapabilities performs a best-effort hello handshake with the
+// running agent and logs the result. It never changes control flow: hello
+// is stateless and optional, and pre-hello (legacy) agents simply answer
+// ERR. Gated on debug being enabled because this is diagnostic-only: the
+// already-running path in tryStartAgent executes on every gopass
+// invocation, and an unlogged probe would be a pure round-trip cost there.
+func logAgentCapabilities(client *agent.Client) {
+	if !debug.IsEnabled() {
+		return
+	}
+	caps, err := client.Capabilities()
+	if err != nil {
+		debug.Log("age agent is legacy (no capability negotiation): %s", err)
+
+		return
+	}
+	debug.Log("age agent capabilities: %s", caps.Raw())
+}

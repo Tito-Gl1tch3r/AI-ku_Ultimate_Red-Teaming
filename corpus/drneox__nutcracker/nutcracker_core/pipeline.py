@@ -1,0 +1,1133 @@
+"""Pipeline de extracción runtime de DEX: emulador Android y dispositivo físico."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import click
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+from nutcracker_core import toolbox
+from nutcracker_core.config import get as cfg_get
+from nutcracker_core.i18n import t
+from nutcracker_core.deobfuscator import check_adb
+from nutcracker_core.apk_tools import install_apk as emulator_install_apk
+from nutcracker_core.device import (
+    download_frida_server,
+    find_sdk_tools,
+    frida_arch_for_avd,
+    frida_arch_for_device,
+    get_frida_version,
+    setup_frida_server,
+    start_emulator,
+)
+from nutcracker_core.frida_bypass import fart_run_instructions, generate_fart_script
+from nutcracker_core.runtime import (
+    launch_with_dexdump,
+    launch_with_fart,
+    pull_dumps,
+    simulate_app_navigation,
+    stop_frida,
+    wait_for_dumps,
+)
+
+console = Console()
+
+
+# ── Resultado de extracción ───────────────────────────────────────────────────
+
+
+@dataclass
+class ExtractionResult:
+    """Datos producidos por una extracción runtime de DEX."""
+
+    dex_files: list[Path]
+    method_used: str
+    local_dump_dir: Path
+    clean_dir: Path
+
+
+# ── Config helpers (parametrizados con cfg dict) ──────────────────────────────
+
+
+def _auto(cfg: dict, key: str) -> bool | None:
+    auto_block = cfg.get("auto", {})
+    if not isinstance(auto_block, dict):
+        return None
+    val = auto_block.get(key)
+    return bool(val) if val is not None else None
+
+
+def _unattended(cfg: dict) -> bool:
+    return bool(cfg_get(cfg, "auto", "unattended", default=False))
+
+
+def _ask_or_auto(cfg: dict, prompt: str, key: str, default: bool = False) -> bool:
+    cfg_val = _auto(cfg, key)
+    if cfg_val is not None:
+        tag = "si" if cfg_val else "no"
+        console.print(f"[dim]  {t('pipe_auto_skip', key=key, tag=tag)}[/dim]")
+        return cfg_val
+    if _unattended(cfg):
+        tag = "si" if default else "no"
+        console.print(f"[dim]  {t('pipe_unattended_skip', prompt=prompt, tag=tag)}[/dim]")
+        return default
+    return click.confirm(prompt, default=default)
+
+
+# ── Utilidades ADB ────────────────────────────────────────────────────────────
+
+
+def connected_adb_devices() -> list[str]:
+    """Devuelve IDs de dispositivos adb en estado device."""
+    try:
+        result = subprocess.run(
+            ["adb", "devices"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+    devices: list[str] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of"):
+            continue
+        if "\tdevice" in line:
+            devices.append(line.split("\t", 1)[0])
+    return devices
+
+
+def is_emulator_serial(serial: str) -> bool:
+    s = serial.strip().lower()
+    return s.startswith("emulator-") or s.startswith("127.0.0.1:") or s.startswith("localhost:")
+
+
+# ── Pipeline helpers ──────────────────────────────────────────────────────────
+
+
+def _pick_avd(cfg: dict, avds: list[str]) -> str:
+    """Muestra un menú y devuelve el AVD elegido."""
+    preferred = str(cfg_get(cfg, "strategies", "default_emulator_avd", default="")).strip()
+
+    if preferred:
+        if preferred in avds:
+            console.print(f"[dim]  {t('pipe_avd_config', avd=preferred)}[/dim]")
+            return preferred
+        console.print(
+            f"[yellow]⚠[/yellow]  {t('pipe_avd_not_found', avd=preferred)}"
+        )
+
+    if len(avds) == 1:
+        return avds[0]
+    if _unattended(cfg):
+        console.print(f"[dim]  {t('pipe_unattended_avd', avd=avds[0])}[/dim]")
+        return avds[0]
+    console.print(t('pipe_avds_available'))
+    for i, avd in enumerate(avds, 1):
+        console.print(f"    [cyan]{i}[/cyan]) {avd}")
+    idx = click.prompt(
+        "  Elige un AVD",
+        default=1,
+        type=click.IntRange(1, len(avds)),
+    )
+    return avds[idx - 1]
+
+
+def deobf_method_order(cfg: dict, protected: bool = True) -> list[str]:
+    """
+    Devuelve el orden de métodos de extracción runtime.
+
+    Config:
+      pipelines.<protected|unprotected>.runtime_methods
+    Fallback:
+      deobfuscation.methods_order
+    """
+    scope = "protected" if protected else "unprotected"
+    raw = cfg_get(cfg, "pipelines", scope, "runtime_methods")
+    if not raw and not protected:
+        raw = cfg_get(cfg, "pipelines", "protected", "runtime_methods")
+    if not raw:
+        raw = cfg_get(cfg, "deobfuscation", "methods_order")
+
+    aliases = {
+        "frida_server": "frida_server",
+        "frida-server": "frida_server",
+        "server": "frida_server",
+        "gadget": "gadget",
+        "gadget_inject": "gadget",
+        "frida_gadget": "gadget",
+        "fart": "fart",
+    }
+
+    if isinstance(raw, list) and raw:
+        ordered: list[str] = []
+        for item in raw:
+            key = aliases.get(str(item).strip().lower())
+            if key and key not in ordered:
+                ordered.append(key)
+        if ordered:
+            return ordered
+
+    return ["frida_server", "gadget", "fart"]
+
+
+# ── Spinner helper ────────────────────────────────────────────────────────────
+
+
+def _with_spinner(label: str, fn):
+    """Ejecuta fn(callback) dentro de un spinner. Devuelve el resultado."""
+    out = [None]
+    last_msgs: list[str] = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task(label, total=None)
+
+        def _update(msg: str) -> None:
+            last_msgs.append(msg)
+            progress.update(task, description=msg)
+
+        out[0] = fn(_update)
+
+    _with_spinner._last_msgs = last_msgs  # type: ignore[attr-defined]
+    return out[0]
+
+
+# ── Pipeline: Emulador ────────────────────────────────────────────────────────
+
+
+def do_fart_emulator(
+    cfg: dict,
+    package: str,
+    apk_path: Path,
+    sdk_tools: dict,
+    avds: list[str],
+) -> ExtractionResult | None:
+    """Flujo FART totalmente automatizado usando el emulador Android."""
+
+    avd_name = _pick_avd(cfg, avds)
+    arch = frida_arch_for_avd(avd_name)
+    local_dump_dir = Path("./decompiled") / f"runtime_dump_{package}"
+    clean_dir = local_dump_dir / "source"
+
+    frida_proc = None
+
+    try:
+        method_order = deobf_method_order(cfg, protected=True)
+        console.print(f"[dim]  {t('pipe_extraction_pipeline', methods=' -> '.join(method_order))}[/dim]")
+
+        # ── A. Descargar frida-server ─────────────────────────────────────
+        _cfg_ver = str(cfg_get(cfg, "strategies", "frida_server_version") or "").strip()
+        frida_ver = _cfg_ver or get_frida_version()
+        if not frida_ver:
+            console.print(f"[red]✘[/red] {t('pipe_frida_not_found')}")
+            return None
+
+        # Sincronizar frida + frida-dexdump Python si la versión difiere
+        _installed_frida = get_frida_version()
+        if _installed_frida and _installed_frida != frida_ver:
+            console.print(
+                f"  [dim]{t('pipe_frida_sync', installed=_installed_frida, target=frida_ver)}[/dim]"
+            )
+            _pip_result = subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install", "--quiet",
+                    f"frida=={frida_ver}",
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            if _pip_result.returncode == 0:
+                console.print(f"  [green]✔[/green] {t('pipe_frida_updated', ver=frida_ver)}")
+            else:
+                console.print(
+                    f"  [yellow]⚠[/yellow]  {t('pipe_frida_update_failed', ver=frida_ver, err=_pip_result.stderr.strip()[:200])}"
+                )
+
+        console.print(f"  {t('pipe_frida_arch', ver=frida_ver, arch=arch)}")
+
+        try:
+            server_bin = _with_spinner(
+                t("pipe_downloading_frida", ver=frida_ver, arch=arch),
+                lambda cb: download_frida_server(frida_ver, arch, progress_callback=cb),
+            )
+        except RuntimeError as exc:
+            console.print(f"[red]✘[/red] {t('pipe_frida_download_error', err=exc)}")
+            console.print(
+                t('pipe_check_verify')
+                + t('pipe_check_internet')
+                + t('pipe_check_arch', arch=arch)
+                + t('pipe_check_write')
+            )
+            return None
+        console.print(f"[green]✔[/green] {t('pipe_frida_server_ready', name=server_bin.name)}")
+
+        # ── B. Arrancar emulador ───────────────────────────────────────────
+        console.print(f"[dim]  {t('pipe_starting_avd', avd=avd_name)}[/dim]")
+        serial = _with_spinner(
+            t("pipe_starting_emulator", avd=avd_name),
+            lambda cb: start_emulator(
+                avd_name,
+                sdk_tools,
+                progress_callback=cb,
+                show_window=bool(cfg_get(cfg, "strategies", "show_emulator", default=True)),
+            ),
+        )
+        if not serial:
+            console.print(f"[red]✘[/red] {t('pipe_emulator_timeout')}")
+            console.print(
+                t('pipe_check_verify')
+                + t('pipe_check_avd_exists')
+                + t('pipe_check_sdk_perms')
+                + t('pipe_check_hw')
+                + t('pipe_check_clean_avd', avd=avd_name)
+            )
+            return None
+        console.print(f"[green]✔[/green] {t('pipe_emulator_ready', serial=serial)}")
+
+        has_dexdump = bool(sdk_tools.get("frida-dexdump"))
+        dex_files: list[Path] = []
+        method_used: str | None = None
+        attempted_methods: list[str] = []
+        frida_ready = False
+        app_installed = False
+        _frida_host = cfg_get(cfg, "strategies", "frida_host") or None
+
+        def _ensure_frida_server(force_restart: bool = False) -> bool:
+            nonlocal frida_ready
+            if frida_ready and not force_restart:
+                return True
+            frida_ready = False  # resetear para que setup_frida_server reintente
+            ok = _with_spinner(
+                t("pipe_configuring_frida_server"),
+                lambda cb: setup_frida_server(
+                    serial, sdk_tools, server_bin,
+                    progress_callback=cb,
+                    listen_all=bool(_frida_host),
+                    force_restart=force_restart,
+                ),
+            )
+            if not ok:
+                last_msgs = getattr(_with_spinner, "_last_msgs", [])
+                detail = last_msgs[-1] if last_msgs else "sin detalles"
+                console.print(f"[red]✘[/red] {t('pipe_frida_server_failed', detail=detail)}")
+                console.print(
+                    t('pipe_check_verify')
+                    + t('pipe_check_adb_conn', serial=serial)
+                    + t('pipe_check_emu_perms', serial=serial)
+                    + t('pipe_check_emu_reboot', serial=serial)
+                )
+                return False
+            console.print(f"[green]✔[/green] {t('pipe_frida_server_running')}")
+            frida_ready = True
+            return True
+
+        def _ensure_installed(target_apk: Path, pkg: str) -> bool:
+            nonlocal app_installed
+            if app_installed and target_apk == apk_path:
+                return True
+
+            ok = _with_spinner(
+                f"{t('pipe_installing_apk', package=package)}",
+                lambda cb: emulator_install_apk(
+                    serial,
+                    sdk_tools,
+                    target_apk,
+                    package_name=pkg,
+                    progress_callback=cb,
+                ),
+            )
+            if not ok:
+                last = getattr(_with_spinner, "_last_msgs", [])
+                detail = next(
+                    (m for m in reversed(last) if any(
+                        kw in m for kw in ("INSTALL_FAILED", "Error", "ERROR", "failed", "ABI")
+                    )),
+                    last[-1] if last else "sin detalles",
+                )
+                console.print(f"[red]✘[/red] {t('pipe_apk_install_failed')}")
+                console.print(f"  {t('pipe_apk_install_error', detail=detail)}")
+                if "INSTALL_FAILED_INVALID_APK" in str(detail):
+                    console.print(f"  {t('pipe_apk_corrupt')}")
+                elif "ABI" in str(detail):
+                    console.print(f"  {t('pipe_apk_abi_error', arch=arch)}")
+                return False
+            console.print(f"[green]✔[/green] {t('pipe_apk_installed', package=package)}")
+            if target_apk == apk_path:
+                app_installed = True
+            return True
+
+        for method in method_order:
+            if dex_files:
+                break
+            attempted_methods.append(method)
+
+            if method == "gadget":
+                console.print(f"[yellow]⚠[/yellow]  {t('pipe_trying_gadget')}")
+                gadget_dex = try_gadget_inject(
+                    apk_path, serial, sdk_tools, package, local_dump_dir,
+                    _with_spinner, cfg,
+                )
+                if gadget_dex:
+                    dex_files = gadget_dex
+                    method_used = "frida-gadget+frida-dexdump"
+                else:
+                    # Gadget puede haber reinstalado un APK parcheado en el emulador.
+                    # Desinstalar el parcheado para que el siguiente método pueda
+                    # instalar el original sin UPDATE_INCOMPATIBLE (firma debug ≠ Play Store).
+                    try:
+                        subprocess.run(
+                            [sdk_tools["adb"], "-s", serial, "uninstall", package],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                    except subprocess.TimeoutExpired:
+                        console.print(f"[yellow]⚠[/yellow]  {t('pipe_adb_uninstall_timeout')}")
+                    app_installed = False
+                continue
+
+            if method == "frida_server":
+                # force_restart: reinicia frida-server por si quedó corrupto tras un
+                # crash anterior (ej. DexGuard matando el proceso durante spawn).
+                if not _ensure_frida_server(force_restart=True):
+                    continue
+                # Reinstalar APK original: gadget puede haber dejado APK parcheado.
+                try:
+                    subprocess.run(
+                        [sdk_tools["adb"], "-s", serial, "uninstall", package],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                except subprocess.TimeoutExpired:
+                    console.print(f"[yellow]⚠[/yellow]  {t('pipe_adb_uninstall_timeout')}")
+                app_installed = False
+                if not _ensure_installed(apk_path, package):
+                    continue
+
+                if has_dexdump:
+                    dex_files, dexdump_err = _with_spinner(
+                        t('pipe_dexdump_memory_spinner', package=package),
+                        lambda cb: launch_with_dexdump(
+                            serial, package, local_dump_dir, sdk_tools,
+                            progress_callback=cb,
+                            frida_host=_frida_host,
+                        ),
+                    )
+                    if dex_files:
+                        console.print(
+                            f"[green]✔[/green] {t('pipe_dex_dumped_dexdump', count=len(dex_files), dir=local_dump_dir)}"
+                        )
+                        method_used = "frida-server+frida-dexdump"
+                    else:
+                        console.print(
+                            f"[yellow]⚠[/yellow]  {t('pipe_dexdump_warning', err=dexdump_err)}"
+                        )
+                continue
+
+            if method == "fart":
+                console.print(f"[dim]  {t('pipe_trying_fart')}[/dim]")
+                # force_restart: reinicia frida-server por si quedó corrupto tras un
+                # crash anterior (ej. DexGuard matando el proceso durante spawn).
+                if not _ensure_frida_server(force_restart=True):
+                    continue
+                # Reinstalar siempre el APK original antes de FART: si un intento
+                # previo de gadget tuvo éxito dejó un APK parcheado con
+                # libfrida-gadget.so. Hacer spawn sobre ese APK causa doble
+                # inyección → DeadSystemException en el system_server.
+                try:
+                    subprocess.run(
+                        [sdk_tools["adb"], "-s", serial, "uninstall", package],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                except subprocess.TimeoutExpired:
+                    console.print(f"[yellow]⚠[/yellow]  {t('pipe_adb_uninstall_timeout')}")
+                app_installed = False
+                if not _ensure_installed(apk_path, package):
+                    continue
+
+                frida_proc = None
+                import tempfile as _tempfile
+                _tmp_scripts = Path(_tempfile.mkdtemp(prefix="apkmon_fart_"))
+                try:
+                    _fart_script = generate_fart_script(package, _tmp_scripts)
+                except Exception as _exc:
+                    console.print(f"[red]✘[/red] {t('pipe_fart_script_error', err=_exc)}")
+                    continue
+                _frida_host = cfg_get(cfg, "strategies", "frida_host") or None
+                frida_proc, frida_err = launch_with_fart(
+                    serial, package, _fart_script, sdk_tools,
+                    frida_host=_frida_host,
+                )
+                if not frida_proc:
+                    console.print(f"[red]✘[/red] {t('pipe_frida_launch_error', err=frida_err)}")
+                    continue
+                console.print(
+                    f"[green]✔[/green] {t('pipe_fart_launched')}"
+                )
+
+                import threading
+                _ui_stop = threading.Event()
+                _ui_thread = threading.Thread(
+                    target=simulate_app_navigation,
+                    args=(serial, sdk_tools, _ui_stop),
+                    kwargs={"progress_callback": lambda m: None},
+                    daemon=True,
+                )
+                _ui_thread.start()
+
+                found = _with_spinner(
+                    t("pipe_fart_waiting", package=package),
+                    lambda cb: wait_for_dumps(
+                        serial, sdk_tools, package,
+                        timeout=300,
+                        progress_callback=cb,
+                    ),
+                )
+                _ui_stop.set()
+                _ui_thread.join(timeout=5)
+
+                if not found:
+                    console.print(
+                        f"[yellow]⚠[/yellow]  {t('pipe_fart_no_dumps')}"
+                    )
+                    continue
+
+                dex_files = _with_spinner(
+                    t("pipe_fart_downloading"),
+                    lambda cb: pull_dumps(
+                        serial, sdk_tools, package, local_dump_dir, progress_callback=cb
+                    ),
+                )
+                if dex_files:
+                    console.print(f"[green]✔[/green] {t('pipe_fart_downloaded', count=len(dex_files), dir=local_dump_dir)}")
+                    method_used = "FART (classloader hook)"
+                else:
+                    console.print(f"[yellow]⚠[/yellow]  {t('pipe_fart_no_dex')}")
+                continue
+
+        if not dex_files:
+            tried = " -> ".join(attempted_methods) if attempted_methods else "(sin métodos)"
+            console.print(f"[red]✘[/red] {t('pipe_no_dex_extracted')}")
+            console.print(f"[dim]  {t('pipe_methods_tried', methods=tried)}[/dim]")
+            return None
+
+    finally:
+        stop_frida(frida_proc)
+
+    return ExtractionResult(
+        dex_files=dex_files,
+        method_used=method_used or "emulator-pipeline",
+        local_dump_dir=local_dump_dir,
+        clean_dir=clean_dir,
+    )
+
+
+# ── Pipeline: Gadget Inject ───────────────────────────────────────────────────
+
+
+def try_gadget_inject(
+    apk_path: Path,
+    serial: str,
+    sdk_tools: dict,
+    package: str,
+    dump_dir: Path,
+    with_spinner,
+    cfg: dict | None = None,
+) -> list[Path] | None:
+    """
+    Intenta extraer DEX inyectando Frida Gadget en el APK.
+
+    Flujo:
+      1. Desempaqueta el APK con apktool.
+      2. Descarga libfrida-gadget.so para la arquitectura del AVD.
+      3. Copia el gadget en lib/<abi>/ y añade System.loadLibrary al smali.
+      4. Reempaqueta + refirma.
+      5. Reinstala y conecta con frida para volcar DEX.
+
+    Devuelve lista de DEX volcados o None si algo falla.
+    """
+    import shutil as _shutil
+    import tempfile as _tempfile
+    import zipfile as _zipfile
+
+    from nutcracker_core.apk_tools import (
+        find_apksigner as _find_apksigner,
+        ensure_debug_keystore as _ensure_debug_keystore,
+    )
+    from nutcracker_core.device import find_sdk_root
+
+    # ── Verificar apktool ────────────────────────────────────────────────────
+    # FIX (encontrado en vivo, 2026-08-05, mismo bug que decompiler.py/
+    # analyzer.py/deobfuscator.py): exigía SIEMPRE el binario local de apktool,
+    # incluso con toolbox.enabled=true -- apktool sí está en la imagen del
+    # toolbox (ver toolbox.STATIC_TOOLS).
+    use_toolbox_apktool = toolbox.is_enabled(cfg)
+    if not use_toolbox_apktool and not _shutil.which("apktool"):
+        console.print(
+            f"[yellow]⚠[/yellow]  {t('pipe_apktool_not_found')}"
+        )
+        return None
+
+    sdk = find_sdk_root()
+    apksigner = _find_apksigner(sdk)
+    if not apksigner:
+        console.print(
+            f"[yellow]⚠[/yellow]  {t('pipe_apksigner_not_found')}"
+        )
+        return None
+
+    keystore = _ensure_debug_keystore()
+    if not keystore:
+        console.print(f"[yellow]⚠[/yellow]  {t('pipe_keytool_not_found')}")
+        return None
+
+    # toolbox.run() solo monta Path.cwd() en el contenedor -- tempfile.mkdtemp()
+    # a secas crea bajo /tmp del sistema, invisible ahí adentro. Con el
+    # toolbox habilitado para apktool, work_dir tiene que vivir bajo cwd
+    # (toolbox.scratch_dir(), mismo mecanismo que leak_scanner.py) para que
+    # decompiled_dir/patched_unsigned_raw (los paths que sí se le pasan a
+    # apktool vía toolbox.run()) sean legibles/escribibles desde el contenedor.
+    _work_dir_parent = str(toolbox.scratch_dir()) if use_toolbox_apktool else None
+    work_dir = Path(_tempfile.mkdtemp(prefix="apkmon_gadget_", dir=_work_dir_parent))
+
+    try:
+        # ── 1. Detectar ABI del emulador ────────────────────────────────────
+        import subprocess as _sp
+        abi_result = _sp.run(
+            [sdk_tools["adb"], "-s", serial, "shell", "getprop", "ro.product.cpu.abi"],
+            capture_output=True, text=True, timeout=10,
+        )
+        abi = abi_result.stdout.strip() or "arm64-v8a"
+        console.print(f"  {t('pipe_emulator_abi', abi=abi)}")
+
+        _ABI_GADGET = {
+            "arm64-v8a": "arm64",
+            "armeabi-v7a": "arm",
+            "x86_64": "x86_64",
+            "x86": "x86",
+        }
+        frida_arch = _ABI_GADGET.get(abi, "arm64")
+
+        # ── 2. Descargar Frida Gadget .so ───────────────────────────────────
+        import frida  # type: ignore[import]
+        frida_ver = frida.__version__
+        gadget_url = (
+            f"https://github.com/frida/frida/releases/download/{frida_ver}/"
+            f"frida-gadget-{frida_ver}-android-{frida_arch}.so.xz"
+        )
+        gadget_xz = work_dir / "frida-gadget.so.xz"
+        gadget_so = work_dir / "libfrida-gadget.so"
+
+        console.print(f"  {t('pipe_downloading_gadget', ver=frida_ver, arch=frida_arch)}")
+        import urllib.request as _req
+        try:
+            _req.urlretrieve(gadget_url, gadget_xz)  # noqa: S310
+        except Exception as exc:
+            console.print(f"[yellow]⚠[/yellow]  {t('pipe_gadget_download_error', err=exc)}")
+            return None
+
+        import lzma as _lzma
+        with _lzma.open(gadget_xz, "rb") as xz_f, open(gadget_so, "wb") as out_f:
+            out_f.write(xz_f.read())
+
+        # ── 3. Desempaquetar APK con apktool ────────────────────────────────
+        decompiled_dir = work_dir / "decompiled"
+        console.print(f"  {t('pipe_apktool_decompiling')}")
+        # toolbox.run() monta Path.cwd() en el contenedor en la MISMA ruta
+        # absoluta -- work_dir ya es absoluto (tempfile.mkdtemp()), pero
+        # apk_path podría no serlo si vino relativo del llamador.
+        apktool_d_args = ["d", str(apk_path.resolve()), "-o", str(decompiled_dir), "-f", "--no-res"]
+        if use_toolbox_apktool:
+            r = toolbox.run("apktool", apktool_d_args, config=cfg, timeout=120)
+        else:
+            r = _sp.run(["apktool", *apktool_d_args], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            console.print(f"[yellow]⚠[/yellow]  {t('pipe_apktool_failed', err=r.stderr[:200])}")
+            return None
+
+        # ── 4. Copiar gadget en lib/<abi>/ ───────────────────────────────────
+        lib_dir = decompiled_dir / "lib" / abi
+        lib_dir.mkdir(parents=True, exist_ok=True)
+        _shutil.copy2(gadget_so, lib_dir / "libfrida-gadget.so")
+
+        # ── 5. Parchear el smali del Application / MainActivity ──────────────
+        smali_dirs = list(decompiled_dir.glob("smali*"))
+        load_line = (
+            "\n    const-string v0, \"frida-gadget\"\n"
+            "    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n"
+        )
+        patched = False
+        for smali_root in smali_dirs:
+            for smali_file in smali_root.rglob("*.smali"):
+                content = smali_file.read_text(encoding="utf-8", errors="replace")
+                if (
+                    "Landroid/app/Application;" in content
+                    or "extends Application" in content
+                ) and ".method public constructor <init>()V" in content:
+                    content = content.replace(
+                        ".method public constructor <init>()V",
+                        ".method public constructor <init>()V" + load_line,
+                        1,
+                    )
+                    smali_file.write_text(content, encoding="utf-8")
+                    patched = True
+                    console.print(f"  {t('pipe_gadget_injected', name=smali_file.name)}")
+                    break
+            if patched:
+                break
+
+        if not patched:
+            console.print(
+                f"[yellow]⚠[/yellow]  {t('pipe_gadget_no_app_class')}"
+            )
+            return None
+
+        # ── 6. Reempaquetar con apktool ──────────────────────────────────────
+        patched_unsigned_raw = work_dir / f"{package}_gadget_unsigned_raw.apk"
+        patched_unsigned = work_dir / f"{package}_gadget_unsigned.apk"
+        console.print(f"  {t('pipe_repackaging_apk')}")
+        apktool_b_args = ["b", str(decompiled_dir), "-o", str(patched_unsigned_raw)]
+        if use_toolbox_apktool:
+            r = toolbox.run("apktool", apktool_b_args, config=cfg, timeout=120)
+        else:
+            r = _sp.run(["apktool", *apktool_b_args], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            console.print(f"[yellow]⚠[/yellow]  {t('pipe_apktool_build_failed', err=r.stderr[:200])}")
+            return None
+
+        # ── 6b. Reempaquetar .so como STORED (sin compresión) ────────────────
+        console.print(f"  {t('pipe_repackaging_stored')}")
+        with _zipfile.ZipFile(patched_unsigned_raw, "r") as zin, \
+             _zipfile.ZipFile(str(patched_unsigned), "w") as zout:
+            for item in zin.infolist():
+                raw = zin.read(item.filename)
+                if item.filename.endswith(".so"):
+                    zout.writestr(item, raw, compress_type=_zipfile.ZIP_STORED)
+                else:
+                    zout.writestr(item, raw, compress_type=item.compress_type)
+        patched_unsigned_raw.unlink(missing_ok=True)
+
+        # ── 6c. Eliminar requiredSplitTypes del manifiesto binario ───────────
+        # Permite instalar solo base.apk cuando la app es un bundle y no
+        # se tienen los demás splits (apkeep solo descargó base).
+        try:
+            from nutcracker_core.apk_tools import strip_required_splits_from_manifest as _strip_splits
+            import zipfile as _zf2
+            _stripped_apk = work_dir / f"{package}_gadget_stripped.apk"
+            with _zf2.ZipFile(str(patched_unsigned), "r") as _zin, \
+                 _zf2.ZipFile(str(_stripped_apk), "w") as _zout:
+                for _item in _zin.infolist():
+                    _raw = _zin.read(_item.filename)
+                    if _item.filename == "AndroidManifest.xml":
+                        _raw = _strip_splits(_raw)
+                    _zout.writestr(_item, _raw, compress_type=_item.compress_type)
+            patched_unsigned.unlink(missing_ok=True)
+            patched_unsigned = _stripped_apk
+            console.print(f"  {t('pipe_split_types_removed')}")
+        except Exception as _e:
+            console.print(f"[yellow]⚠[/yellow]  {t('pipe_split_types_error', err=_e)}")
+
+        # ── 6d. zipalign ─────────────────────────────────────────────────────
+        zipalign_bin = str(Path(apksigner).parent / "zipalign")
+        patched_aligned = work_dir / f"{package}_gadget_aligned.apk"
+        if Path(zipalign_bin).exists():
+            console.print(f"  {t('pipe_zipaligning')}")
+            za = _sp.run(
+                [zipalign_bin, "-f", "-p", "4", str(patched_unsigned), str(patched_aligned)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if za.returncode == 0:
+                patched_unsigned.unlink(missing_ok=True)
+                patched_unsigned = patched_aligned
+            else:
+                console.print(f"[yellow]⚠[/yellow]  {t('pipe_zipalign_failed', err=za.stderr[:100])}")
+                patched_aligned.unlink(missing_ok=True)
+        else:
+            console.print(f"[yellow]⚠[/yellow]  {t('pipe_zipalign_not_found')}")
+
+        # ── 7. Firmar ─────────────────────────────────────────────────────────
+        patched_apk = work_dir / f"{package}_gadget.apk"
+        console.print(f"  {t('pipe_signing_apk')}")
+        r = _sp.run(
+            [
+                apksigner, "sign",
+                "--ks", str(keystore),
+                "--ks-pass", "pass:android",
+                "--key-pass", "pass:android",
+                "--ks-key-alias", "androiddebugkey",
+                "--out", str(patched_apk),
+                str(patched_unsigned),
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0:
+            console.print(f"[yellow]⚠[/yellow]  {t('pipe_sign_failed', err=r.stderr[:200])}")
+            return None
+
+        # ── 8. Reinstalar e intentar dexdump sobre el gadget ─────────────────
+        from nutcracker_core.apk_tools import install_apk as _install_apk, find_split_apks as _find_split_apks
+        console.print(f"  {t('pipe_reinstalling_apk')}")
+
+        # Si el APK original es parte de un bundle, copiar los splits
+        # al work_dir, REFIRMARLOS con el mismo keystore debug (Android exige
+        # firma consistente entre todos los splits) y renombrarlos con el
+        # prefijo del patched_apk para que find_split_apks los detecte.
+        orig_splits = _find_split_apks(apk_path)
+        if len(orig_splits) > 1:
+            patched_stem = patched_apk.stem  
+            orig_stem = apk_path.stem        
+            for s in orig_splits:
+                if s.resolve() == apk_path.resolve():
+                    continue
+                new_name = s.name
+                if s.name.startswith(orig_stem + "."):
+                    new_name = patched_stem + s.name[len(orig_stem):]
+                dest = work_dir / new_name
+                _shutil.copy2(s, dest)
+                # Refirmar split con la misma firma debug que el base parcheado
+                rsign = _sp.run(
+                    [apksigner, "sign",
+                     "--ks", str(keystore),
+                     "--ks-pass", "pass:android",
+                     "--key-pass", "pass:android",
+                     "--ks-key-alias", "androiddebugkey",
+                     str(dest)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if rsign.returncode != 0:
+                    console.print(
+                        f"[yellow]⚠[/yellow]  {t('pipe_split_resign_failed', name=s.name, err=rsign.stderr[:150])}"
+                    )
+            console.print(
+                f"  {t('pipe_bundle_detected', count=len(orig_splits), stem=patched_stem)}"
+            )
+
+        _install_msgs: list[str] = []
+        # Si hay splits, instalar todos juntos para no perder libs nativas
+        if len(orig_splits) > 1:
+            patched_splits = sorted(
+                p for p in work_dir.glob(f"{patched_apk.stem}*.apk")
+                if not p.stem.endswith(("_aligned", "_unsigned"))
+            )
+            console.print(f"  {t('pipe_installing_splits_gadget', count=len(patched_splits))}")
+            # Desinstalar primero (firma cambió)
+            try:
+                subprocess.run([sdk_tools["adb"], "-s", serial, "uninstall", package],
+                               capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                console.print(f"[yellow]⚠[/yellow]  {t('pipe_adb_uninstall_timeout')}")
+            r = subprocess.run(
+                [sdk_tools["adb"], "-s", serial, "install-multiple", "-r", "-t", "-d",
+                 *[str(p) for p in patched_splits]],
+                capture_output=True, text=True, timeout=180,
+            )
+            ok = "Success" in (r.stdout + r.stderr)
+            if not ok:
+                _install_msgs.append((r.stdout + r.stderr)[-300:].strip())
+        else:
+            ok = _install_apk(
+                serial,
+                sdk_tools,
+                patched_apk,
+                package_name=package,
+                progress_callback=_install_msgs.append,
+            )
+        if not ok:
+            detail = _install_msgs[-1] if _install_msgs else t('pipe_no_details')
+            console.print(
+                f"[yellow]⚠[/yellow]  {t('pipe_gadget_reinstall_failed', detail=detail)}"
+            )
+            return None
+
+        console.print(f"  {t('pipe_gadget_dumping_dex')}")
+        dex_files, err = with_spinner(
+            t('pipe_gadget_dex_spinner', package=package),
+            lambda cb: launch_with_dexdump(serial, package, dump_dir, sdk_tools, progress_callback=cb, frida_host=(cfg_get(cfg, "strategies", "frida_host") or None) if cfg else None),
+        )
+        if dex_files:
+            console.print(f"[green]✔[/green] {t('pipe_gadget_dex_ok', count=len(dex_files))}")
+            return dex_files
+
+        console.print(f"[yellow]⚠[/yellow]  {t('pipe_gadget_dexdump_failed', err=err)}")
+        return None
+
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]⚠[/yellow]  {t('pipe_gadget_inject_error', exc=exc)}")
+        return None
+    finally:
+        _shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ── Pipeline: Dispositivo físico ──────────────────────────────────────────────
+
+
+def do_fart_manual(
+    cfg: dict,
+    package: str,
+    script_path: Path,
+    apk_path: Path,
+    method_order: list[str] | None = None,
+) -> ExtractionResult | None:
+    """Flujo runtime en dispositivo físico respetando runtime_methods."""
+
+    console.print(fart_run_instructions(package, script_path))
+
+    adb_ok, adb_msg = check_adb()
+    if not adb_ok:
+        console.print(f"[yellow]⚠[/yellow]  {adb_msg}")
+        console.print(
+            f"  {t('pipe_adb_manual_hint', package=package, script_path=script_path)}"
+        )
+        return None
+    console.print(f"[green]✔[/green] {adb_msg}")
+
+    preferred_device = str(cfg_get(cfg, "strategies", "default_device_id", default="")).strip()
+    devices = [d for d in connected_adb_devices() if not is_emulator_serial(d)]
+    selected_device = ""
+    if preferred_device and preferred_device in devices:
+        selected_device = preferred_device
+    elif preferred_device and preferred_device not in devices:
+        console.print(
+            f"[yellow]⚠[/yellow]  {t('pipe_device_id_not_connected', device=preferred_device)}"
+        )
+    if not selected_device and devices:
+        selected_device = devices[0]
+
+    if not selected_device:
+        console.print(
+            f"[red]✘[/red] {t('pipe_no_physical_device')}"
+        )
+        return None
+
+    if selected_device:
+        os.environ["ANDROID_SERIAL"] = selected_device
+        console.print(f"[dim]  {t('pipe_device_target', serial=selected_device)}[/dim]")
+
+    frida_proc = None
+    local_dump_dir = Path("./decompiled") / f"runtime_dump_{package}"
+    clean_dir = local_dump_dir / "source"
+
+    sdk_tools = find_sdk_tools()
+    has_dexdump = bool(sdk_tools.get("frida-dexdump"))
+    methods = method_order or ["fart"]
+    console.print(f"[dim]  {t('pipe_extraction_pipeline', methods=' -> '.join(methods))} (device)[/dim]")
+
+    # ── Instalar APK en el device ─────────────────────────────────────────────
+    if selected_device and apk_path and apk_path.exists():
+        console.print(f"[dim]  {t('pipe_device_installing_dim', serial=selected_device)}[/dim]")
+        apk_installed = _with_spinner(
+            t('pipe_device_install_spinner', package=package),
+            lambda cb: emulator_install_apk(
+                selected_device, sdk_tools, apk_path, package, progress_callback=cb
+            ),
+        )
+        if apk_installed:
+            console.print(f"[green]✔[/green] {t('pipe_device_apk_ok')}")
+        else:
+            console.print(
+                f"[yellow]⚠[/yellow]  {t('pipe_device_install_failed')}"
+            )
+
+    dex_files: list[Path] = []
+    method_used: str | None = None
+    attempted_methods: list[str] = []
+    try:
+        for method in methods:
+            if dex_files:
+                break
+            attempted_methods.append(method)
+            console.print(f"[dim]  {t('pipe_device_trying_method', method=method)}[/dim]")
+
+            if method == "gadget":
+                console.print(f"[yellow]⚠[/yellow]  {t('pipe_gadget_device_unsupported')}")
+                continue
+
+            if method == "frida_server":
+                if not selected_device:
+                    console.print("[yellow]⚠[/yellow]  Sin serial de dispositivo para frida-dexdump.")
+                    continue
+                if not has_dexdump:
+                    console.print(f"[yellow]⚠[/yellow]  {t('pipe_dexdump_not_installed')}")
+                    continue
+
+                # ── Auto-instalar frida-server en el device ────────────────
+                # Versión de frida-server: config > auto-detectada del entorno Python
+                _cfg_ver = str(cfg_get(cfg, "strategies", "frida_server_version") or "").strip()
+                frida_ver = _cfg_ver or get_frida_version()
+                if frida_ver:
+                    # Sincronizar frida + frida-dexdump Python si la versión difiere
+                    _installed_frida = get_frida_version()
+                    if _installed_frida and _installed_frida != frida_ver:
+                        console.print(
+                            f"  [dim]{t('pipe_frida_sync', installed=_installed_frida, target=frida_ver)}[/dim]"
+                        )
+                        _pip_result = subprocess.run(
+                            [
+                                sys.executable, "-m", "pip", "install", "--quiet",
+                                f"frida=={frida_ver}",
+                            ],
+                            capture_output=True, text=True, timeout=120,
+                        )
+                        if _pip_result.returncode == 0:
+                            console.print(f"  [green]✔[/green] {t('pipe_frida_updated', ver=frida_ver)}")
+                        else:
+                            console.print(
+                                f"  [yellow]⚠[/yellow]  {t('pipe_frida_update_failed', ver=frida_ver, err=_pip_result.stderr.strip()[:200])}"
+                            )
+
+                    _dev_arch = frida_arch_for_device(selected_device, sdk_tools)
+                    console.print(f"  {t('pipe_frida_arch_device', ver=frida_ver, arch=_dev_arch)}")
+                    _frida_host_dev = cfg_get(cfg, "strategies", "frida_host") or None
+                    try:
+                        _server_bin = _with_spinner(
+                            t("pipe_downloading_frida", ver=frida_ver, arch=_dev_arch),
+                            lambda cb: download_frida_server(frida_ver, _dev_arch, progress_callback=cb),
+                        )
+                        _fs_ok = _with_spinner(
+                            t("pipe_frida_server_install_spinner", ver=frida_ver),
+                            lambda cb: setup_frida_server(
+                                selected_device, sdk_tools, _server_bin,
+                                progress_callback=cb,
+                                listen_all=bool(_frida_host_dev),
+                            ),
+                        )
+                        if _fs_ok:
+                            console.print(f"[green]✔[/green] {t('pipe_frida_server_running_device', ver=frida_ver)}")
+                        else:
+                            console.print(
+                                f"[yellow]⚠[/yellow]  {t('pipe_frida_server_auto_failed')}"
+                            )
+                    except RuntimeError as _exc:
+                        console.print(f"[yellow]⚠[/yellow]  {t('pipe_frida_download_error_device', err=_exc)}")
+                else:
+                    console.print(f"[yellow]⚠[/yellow]  {t('pipe_frida_no_version_device')}")
+
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    console=console,
+                    transient=True,
+                ) as progress:
+                    task = progress.add_task(t("pipe_dexdump_spinner"), total=None)
+                    _frida_host_dex = cfg_get(cfg, "strategies", "frida_host") or None
+                    dex_files, dexdump_err = launch_with_dexdump(
+                        selected_device,
+                        package,
+                        local_dump_dir,
+                        sdk_tools,
+                        progress_callback=lambda m: progress.update(task, description=m),
+                        frida_host=_frida_host_dex,
+                    )
+
+                if dex_files:
+                    method_used = "frida-server+frida-dexdump"
+                    console.print(f"[green]✔[/green] {t('pipe_dex_dumped_device', count=len(dex_files))}")
+                else:
+                    console.print(f"[yellow]⚠[/yellow]  {t('pipe_dexdump_no_dex', err=dexdump_err)}")
+                continue
+
+            if method == "fart":
+                if _ask_or_auto(
+                    cfg,
+                    "\n  ¿Lanzar automáticamente Frida/FART en dispositivo físico?",
+                    "auto_launch_fart_device",
+                    default=True,
+                ):
+                    if not selected_device:
+                        console.print(
+                            f"[yellow]⚠[/yellow]  {t('pipe_fart_no_serial')}"
+                        )
+                    else:
+                        _frida_host = cfg_get(cfg, "strategies", "frida_host") or None
+                        frida_proc, frida_err = launch_with_fart(
+                            selected_device,
+                            package,
+                            script_path,
+                            sdk_tools,
+                            frida_host=_frida_host,
+                        )
+                        if frida_proc:
+                            console.print(f"[green]✔[/green] {t('pipe_fart_launched_device')}")
+                        else:
+                            console.print(f"[yellow]⚠[/yellow]  {t('pipe_fart_auto_launch_failed', err=frida_err)}")
+                            console.print(f"[dim]  {t('pipe_fart_manual_hint')}[/dim]")
+
+                import threading as _threading
+                _ui_stop = _threading.Event()
+                _ui_thread = _threading.Thread(
+                    target=simulate_app_navigation,
+                    args=(selected_device, sdk_tools, _ui_stop),
+                    kwargs={"progress_callback": lambda m: None},
+                    daemon=True,
+                )
+                _ui_thread.start()
+
+                if not _ask_or_auto(cfg, "\n  ¿Esperar automáticamente los volcados DEX?", "wait_fart_dumps", default=True):
+                    _ui_stop.set()
+                    _ui_thread.join(timeout=5)
+                    continue
+
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    console=console,
+                    transient=True,
+                ) as progress:
+                    task = progress.add_task(t('pipe_waiting_dex_dumps'), total=None)
+                    found = wait_for_dumps(
+                        selected_device, sdk_tools, package,
+                        timeout=300,
+                        progress_callback=lambda m: progress.update(task, description=m),
+                    )
+
+                _ui_stop.set()
+                _ui_thread.join(timeout=5)
+
+                if not found:
+                    console.print(f"[yellow]⚠[/yellow]  {t('pipe_fart_timeout_device')}")
+                    continue
+
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    console=console,
+                    transient=True,
+                ) as progress:
+                    task = progress.add_task(t('pipe_downloading_dex_dumps'), total=None)
+                    dex_files = pull_dumps(
+                        selected_device, sdk_tools, package,
+                        local_dump_dir,
+                        progress_callback=lambda m: progress.update(task, description=m),
+                    )
+
+                if dex_files:
+                    method_used = "FART (classloader hook)"
+                    console.print(f"[green]✔[/green] {t('pipe_fart_downloaded', count=len(dex_files), dir=local_dump_dir)}")
+                else:
+                    console.print(f"[yellow]⚠[/yellow]  {t('pipe_fart_no_dex_device')}")
+                continue
+
+        if not dex_files:
+            tried = " -> ".join(attempted_methods) if attempted_methods else "(sin métodos)"
+            console.print(f"[red]✘[/red] {t('pipe_no_dex_extracted_device')}")
+            console.print(f"[dim]  {t('pipe_methods_tried', methods=tried)}[/dim]")
+            return None
+
+    finally:
+        stop_frida(frida_proc)
+
+    return ExtractionResult(
+        dex_files=dex_files,
+        method_used=method_used or "device-pipeline",
+        local_dump_dir=local_dump_dir,
+        clean_dir=clean_dir,
+    )

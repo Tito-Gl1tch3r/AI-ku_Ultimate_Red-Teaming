@@ -1,0 +1,1273 @@
+#!/usr/bin/env python3
+"""Enrich Discover engagement hosts with Shodan host-by-IP data.
+
+Phase 1: collect unique public IPs from Active httpx output, query the
+Shodan host API (membership / paid keys), write artifacts under
+``tools/shodan/``, and append an Audit log line.
+
+SHODAN_API_KEY is required. Discover checks, in order:
+  1. Existing shell environment (export SHODAN_API_KEY=...)
+  2. Private key file: ~/.discover/api-keys
+
+Legacy ``$DISCOVER/.env`` and ``~/.discover/.env`` are moved into
+``~/.discover/api-keys`` automatically when found.
+
+IP lookups do not consume Shodan query credits. Rate-limit with a short
+sleep between requests (default 1.1s). Resume skips IPs that already have
+a successful cache file under tools/shodan/hosts/.
+
+Usage:
+  python3 recon/shodan-enrich.py <report_dir> [--force] [--limit N] [--sleep SEC]
+  python3 recon/shodan-enrich.py <report_dir> --dry-run
+  python3 recon/shodan-enrich.py <report_dir> --ip <IP> [--json]
+  python3 recon/shodan-enrich.py --refresh-kev [--all-engagements]
+  python3 recon/shodan-enrich.py --refresh-kev <report_dir>
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import importlib.util
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any
+
+SHODAN_HOST_API = "https://api.shodan.io/shodan/host/{ip}"
+USER_AGENT = "Discover-shodan-enrich/1.0 (https://github.com/leebaird/discover)"
+DEFAULT_SLEEP = 1.1
+CACHE_VERSION = 1
+SUMMARY_VERSION = 1
+_ENV_FILES_LOADED = False
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def _discover_root() -> str:
+    explicit = (os.environ.get("DISCOVER") or "").strip()
+    if explicit:
+        return explicit
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_software_cve_module() -> Any | None:
+    """Load recon/software-cve.py (hyphenated filename) when available."""
+    module_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "software-cve.py")
+    if not os.path.isfile(module_path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("software_cve", module_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+def _parse_env_line(line: str) -> tuple[str, str] | None:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[7:].strip()
+    if "=" not in line:
+        return None
+    key, _, value = line.partition("=")
+    key = key.strip()
+    if not key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return key, value
+
+
+def load_discover_env_files() -> list[str]:
+    """Load KEY=VALUE from private key files (shell exports win).
+
+    Prefers software-cve.py's loader when present so NVD/Shodan share one path
+    (``~/.discover/api-keys``, then legacy ``.env`` files).
+    """
+    global _ENV_FILES_LOADED
+    software_cve = _load_software_cve_module()
+    if software_cve is not None and hasattr(software_cve, "load_discover_env_files"):
+        loaded = software_cve.load_discover_env_files()
+        _ENV_FILES_LOADED = True
+        return list(loaded or [])
+
+    loaded: list[str] = []
+    home_discover = os.path.join(os.path.expanduser("~"), ".discover")
+    candidates = [
+        os.path.join(home_discover, "api-keys"),
+        os.path.join(_discover_root(), ".env"),
+        os.path.join(home_discover, ".env"),
+    ]
+    seen: set[str] = set()
+    for path in candidates:
+        abs_path = os.path.abspath(path)
+        if abs_path in seen or not os.path.isfile(abs_path):
+            continue
+        seen.add(abs_path)
+        try:
+            with open(abs_path, encoding="utf-8") as handle:
+                for raw in handle:
+                    parsed = _parse_env_line(raw)
+                    if not parsed:
+                        continue
+                    key, value = parsed
+                    if (os.environ.get(key) or "").strip():
+                        continue
+                    os.environ[key] = value
+            loaded.append(abs_path)
+        except OSError:
+            continue
+    _ENV_FILES_LOADED = True
+    return loaded
+
+
+def get_shodan_api_key() -> str:
+    if not _ENV_FILES_LOADED:
+        load_discover_env_files()
+    return (os.environ.get("SHODAN_API_KEY") or "").strip()
+
+
+def is_public_ip(value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    return bool(addr.is_global)
+
+
+def collect_ips_from_httpx(httpx_path: str) -> list[str]:
+    """Unique public IPs from tools/httpx.jsonl (host_ip, then a[])."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def add(raw: object) -> None:
+        if raw is None:
+            return
+        if isinstance(raw, list):
+            for item in raw:
+                add(item)
+            return
+        text = str(raw).strip()
+        if not text or text in seen:
+            return
+        if not is_public_ip(text):
+            return
+        seen.add(text)
+        ordered.append(text)
+
+    if not os.path.isfile(httpx_path):
+        return ordered
+
+    with open(httpx_path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            add(row.get("host_ip"))
+            add(row.get("a"))
+            add(row.get("ip"))
+            # Some httpx builds nest under "input"
+            inp = row.get("input")
+            if isinstance(inp, dict):
+                add(inp.get("host_ip") or inp.get("ip"))
+
+    return ordered
+
+
+def host_cache_path(shodan_dir: str, ip: str) -> str:
+    # Filesystem-safe name (IPv4 dots ok; IPv6 colons -> underscores)
+    safe = ip.replace(":", "_")
+    return os.path.join(shodan_dir, "hosts", f"{safe}.json")
+
+
+def load_cached_host(path: str) -> dict[str, Any] | None:
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            return None
+        # Only skip when we previously got a terminal result (ok or not_found)
+        status = (data.get("discover_status") or "").strip()
+        if status in {"ok", "not_found"}:
+            return data
+        return None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def shodan_host_lookup(ip: str, api_key: str, timeout: float = 45.0) -> dict[str, Any]:
+    """Call Shodan host API. Returns a Discover-wrapped record."""
+    params = urllib.parse.urlencode({"key": api_key})
+    url = f"{SHODAN_HOST_API.format(ip=urllib.parse.quote(ip))}?{params}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+    fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                return {
+                    "ip": ip,
+                    "discover_status": "error",
+                    "discover_error": "unexpected_response_type",
+                    "fetched_at": fetched_at,
+                    "cache_version": CACHE_VERSION,
+                }
+            return {
+                "ip": ip,
+                "discover_status": "ok",
+                "fetched_at": fetched_at,
+                "cache_version": CACHE_VERSION,
+                "shodan": payload,
+            }
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except OSError:
+            pass
+        # 404 = IP not in Shodan (normal for many hosts)
+        if exc.code == 404:
+            return {
+                "ip": ip,
+                "discover_status": "not_found",
+                "fetched_at": fetched_at,
+                "cache_version": CACHE_VERSION,
+                "http_status": 404,
+            }
+        msg = f"http_{exc.code}"
+        try:
+            err_json = json.loads(err_body) if err_body else {}
+            if isinstance(err_json, dict) and err_json.get("error"):
+                msg = str(err_json.get("error"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            if err_body:
+                msg = err_body[:200]
+        return {
+            "ip": ip,
+            "discover_status": "error",
+            "discover_error": msg,
+            "http_status": exc.code,
+            "fetched_at": fetched_at,
+            "cache_version": CACHE_VERSION,
+        }
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        return {
+            "ip": ip,
+            "discover_status": "error",
+            "discover_error": str(exc)[:300],
+            "fetched_at": fetched_at,
+            "cache_version": CACHE_VERSION,
+        }
+
+
+def summarize_record(rec: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one host record for summary.json / TSV."""
+    ip = rec.get("ip") or ""
+    status = rec.get("discover_status") or ""
+    row: dict[str, Any] = {
+        "ip": ip,
+        "status": status,
+        "org": "",
+        "isp": "",
+        "os": "",
+        "country": "",
+        "city": "",
+        "ports": "",
+        "port_count": 0,
+        "hostnames": "",
+        "vuln_count": 0,
+        "vulns": "",
+        "last_update": "",
+        "fetched_at": rec.get("fetched_at") or "",
+    }
+    if status != "ok":
+        row["error"] = rec.get("discover_error") or (
+            "not in Shodan" if status == "not_found" else ""
+        )
+        return row
+
+    sh = rec.get("shodan") if isinstance(rec.get("shodan"), dict) else {}
+    row["org"] = str(sh.get("org") or "")
+    row["isp"] = str(sh.get("isp") or "")
+    row["os"] = str(sh.get("os") or "")
+    row["country"] = str(sh.get("country_code") or sh.get("country_name") or "")
+    row["city"] = str(sh.get("city") or "")
+    row["last_update"] = str(sh.get("last_update") or "")
+
+    ports = sh.get("ports") or []
+    if isinstance(ports, list):
+        port_strs = sorted({str(p) for p in ports if p is not None}, key=lambda x: int(x) if x.isdigit() else 0)
+        row["ports"] = ",".join(port_strs)
+        row["port_count"] = len(port_strs)
+
+    hostnames = sh.get("hostnames") or []
+    if isinstance(hostnames, list):
+        row["hostnames"] = ", ".join(str(h) for h in hostnames if h)
+
+    vulns = sh.get("vulns") or []
+    if isinstance(vulns, dict):
+        vuln_ids = sorted(vulns.keys())
+    elif isinstance(vulns, list):
+        vuln_ids = sorted(str(v) for v in vulns)
+    else:
+        vuln_ids = []
+    row["vuln_count"] = len(vuln_ids)
+    row["vuln_ids"] = vuln_ids  # full list for Subdomains UI / index.js
+    # TSV-friendly truncated string
+    row["vulns"] = ",".join(vuln_ids[:40])
+    if len(vuln_ids) > 40:
+        row["vulns"] += f",…(+{len(vuln_ids) - 40})"
+    return row
+
+
+def write_json(path: str, data: Any) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, sort_keys=False)
+        handle.write("\n")
+
+
+def load_cisa_kev_ids() -> list[str]:
+    """Sorted CVE IDs from Discover's CISA KEV catalog (for Subdomains UI)."""
+    root = _discover_root()
+    catalog = os.path.join(root, "resource", "kevs.json")
+    if not os.path.isfile(catalog):
+        legacy = os.path.join(root, "resource", "known_exploited_vulnerabilities.json")
+        if os.path.isfile(legacy):
+            catalog = legacy
+    if not os.path.isfile(catalog):
+        return []
+    try:
+        with open(catalog, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return []
+    ids: set[str] = set()
+    for entry in payload.get("vulnerabilities") or []:
+        if not isinstance(entry, dict):
+            continue
+        cve_id = (entry.get("cveID") or entry.get("cve_id") or "").strip().upper()
+        if cve_id.startswith("CVE-"):
+            ids.add(cve_id)
+    return sorted(ids)
+
+
+def write_kev_ids_js(shodan_dir: str) -> int:
+    """Write tools/shodan/kev-ids.js for file://-safe KEV badges in the UI."""
+    ids = load_cisa_kev_ids()
+    path = os.path.join(shodan_dir, "kev-ids.js")
+    try:
+        os.makedirs(shodan_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("/* Generated by shodan-enrich.py from CISA KEV catalog. */\n")
+            handle.write("window.DISCOVER_KEV_IDS = ")
+            json.dump(ids, handle, separators=(",", ":"))
+            handle.write(";\n")
+    except OSError as exc:
+        eprint(f"[!] Could not write {path}: {exc}")
+        return 0
+    return len(ids)
+
+
+def report_has_shodan_artifacts(report_dir: str) -> bool:
+    """True when engagement already has Shodan enrichment output."""
+    shodan_dir = os.path.join(report_dir, "tools", "shodan")
+    if not os.path.isdir(shodan_dir):
+        return False
+    for name in ("index.js", "index.json", "summary.json"):
+        if os.path.isfile(os.path.join(shodan_dir, name)):
+            return True
+    hosts = os.path.join(shodan_dir, "hosts")
+    if os.path.isdir(hosts):
+        try:
+            return any(fn.endswith(".json") for fn in os.listdir(hosts))
+        except OSError:
+            return False
+    return False
+
+
+def find_shodan_engagements(
+    data_root: str | None = None,
+    session_file: str | None = None,
+) -> list[str]:
+    """Engagement roots that already have tools/shodan artifacts."""
+    home = os.path.expanduser("~")
+    if not data_root:
+        data_root = os.environ.get("DISCOVER_DATA_ROOT") or os.path.join(home, "data")
+    if not session_file:
+        session_file = os.environ.get("DISCOVER_SESSION_FILE") or os.path.join(
+            home, ".discover", "current-report"
+        )
+
+    candidates: list[str] = []
+    if session_file and os.path.isfile(session_file):
+        try:
+            line = open(session_file, encoding="utf-8").readline().strip()
+            if line:
+                candidates.append(os.path.expanduser(line))
+        except OSError:
+            pass
+
+    if data_root and os.path.isdir(data_root):
+        try:
+            for name in sorted(os.listdir(data_root)):
+                path = os.path.join(data_root, name)
+                if os.path.isdir(path):
+                    candidates.append(path)
+        except OSError:
+            pass
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in candidates:
+        path = os.path.abspath(os.path.expanduser(raw))
+        if path in seen:
+            continue
+        seen.add(path)
+        if not os.path.isdir(path):
+            continue
+        if not os.path.isdir(os.path.join(path, "pages")):
+            continue
+        if report_has_shodan_artifacts(path):
+            out.append(path)
+    return out
+
+
+def refresh_kev_for_report(report_dir: str) -> tuple[bool, int]:
+    """Rewrite tools/shodan/kev-ids.js for one engagement. Returns (ok, id_count)."""
+    report_dir = os.path.abspath(os.path.expanduser(report_dir))
+    if not report_has_shodan_artifacts(report_dir):
+        return False, 0
+    shodan_dir = os.path.join(report_dir, "tools", "shodan")
+    n = write_kev_ids_js(shodan_dir)
+    return n > 0, n
+
+
+def index_entry_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Compact IP index entry for Subdomains UI (index.json / index.js)."""
+    return {
+        "status": row.get("status") or "",
+        "org": row.get("org") or "",
+        "isp": row.get("isp") or "",
+        "city": row.get("city") or "",
+        "country": row.get("country") or "",
+        "ports": row.get("ports") or "",
+        "vuln_count": row.get("vuln_count") or 0,
+        "vulns": row.get("vuln_ids") or [],
+        "hostnames": row.get("hostnames") or "",
+        "last_update": row.get("last_update") or "",
+    }
+
+
+def load_index_json(shodan_dir: str) -> dict[str, Any]:
+    path = os.path.join(shodan_dir, "index.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def write_index_files(shodan_dir: str, index: dict[str, Any]) -> None:
+    """Write index.json + file://-safe index.js for Subdomains UI."""
+    write_json(os.path.join(shodan_dir, "index.json"), index)
+    index_js_path = os.path.join(shodan_dir, "index.js")
+    try:
+        with open(index_js_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "/* Generated by shodan-enrich.py — do not edit. */\n"
+                "window.DISCOVER_SHODAN_INDEX = "
+            )
+            json.dump(index, handle, indent=None, sort_keys=True, separators=(",", ":"))
+            handle.write(";\n")
+    except OSError as exc:
+        eprint(f"[!] Could not write {index_js_path}: {exc}")
+
+
+def patch_summary_for_ip(shodan_dir: str, row: dict[str, Any]) -> None:
+    """Update or insert one host row in summary.json / summary.tsv when present."""
+    summary_path = os.path.join(shodan_dir, "summary.json")
+    if not os.path.isfile(summary_path):
+        return
+    try:
+        with open(summary_path, encoding="utf-8") as handle:
+            summary = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return
+    if not isinstance(summary, dict):
+        return
+    hosts = summary.get("hosts")
+    if not isinstance(hosts, list):
+        hosts = []
+    ip = row.get("ip") or ""
+    found = False
+    for i, existing in enumerate(hosts):
+        if isinstance(existing, dict) and (existing.get("ip") or "") == ip:
+            hosts[i] = row
+            found = True
+            break
+    if not found and ip:
+        hosts.append(row)
+    summary["hosts"] = hosts
+    summary["generated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        write_json(summary_path, summary)
+        # Rebuild TSV from full host list when we can
+        write_summary_tsv(
+            os.path.join(shodan_dir, "summary.tsv"),
+            [h for h in hosts if isinstance(h, dict)],
+        )
+    except OSError as exc:
+        eprint(f"[!] Could not patch summary for {ip}: {exc}")
+
+
+def refresh_one_ip(
+    report_dir: str,
+    ip: str,
+    *,
+    audit: bool = True,
+) -> dict[str, Any]:
+    """Force-refresh one IP from the Shodan host API and update UI artifacts.
+
+    Used by statusd POST /shodan-refresh (Subdomains Update button).
+    """
+    ip = (ip or "").strip()
+    result: dict[str, Any] = {"ok": False, "ip": ip}
+
+    try:
+        parsed = ipaddress.ip_address(ip)
+    except ValueError:
+        result["error"] = "invalid IP address"
+        return result
+    if parsed.is_private or parsed.is_loopback or parsed.is_link_local or parsed.is_multicast:
+        result["error"] = "IP is not a public address"
+        return result
+
+    report_dir = os.path.abspath(os.path.expanduser(report_dir))
+    if not os.path.isdir(report_dir):
+        result["error"] = f"report not found: {report_dir}"
+        return result
+
+    api_key = get_shodan_api_key()
+    if not api_key:
+        result["error"] = "SHODAN_API_KEY not set"
+        return result
+
+    shodan_dir = os.path.join(report_dir, "tools", "shodan")
+    hosts_dir = os.path.join(shodan_dir, "hosts")
+    try:
+        os.makedirs(hosts_dir, exist_ok=True)
+    except OSError as exc:
+        result["error"] = f"cannot create hosts dir: {exc}"
+        return result
+
+    rec = shodan_host_lookup(ip, api_key)
+    cache_path = host_cache_path(shodan_dir, ip)
+    try:
+        write_json(cache_path, rec)
+    except OSError as exc:
+        result["error"] = f"cannot write cache: {exc}"
+        return result
+
+    row = summarize_record(rec)
+    status = (row.get("status") or rec.get("discover_status") or "").strip()
+    entry = index_entry_from_row(row)
+
+    index = load_index_json(shodan_dir)
+    if status == "ok":
+        index[ip] = entry
+    else:
+        # not_found / error: drop from UI index so chevron matches live data
+        index.pop(ip, None)
+    write_index_files(shodan_dir, index)
+    patch_summary_for_ip(shodan_dir, row)
+
+    if audit:
+        try:
+            touch_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "touch-report-date.py"
+            )
+            if os.path.isfile(touch_path):
+                _spec = importlib.util.spec_from_file_location(
+                    "touch_report_date", touch_path
+                )
+                if _spec is not None and _spec.loader is not None:
+                    _mod = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    _mod.touch_report_index_date(report_dir)
+        except Exception:
+            pass
+
+    result["ok"] = status in {"ok", "not_found"}
+    result["status"] = status
+    result["index"] = entry if status == "ok" else None
+    result["host"] = rec
+    result["last_update"] = row.get("last_update") or ""
+    result["fetched_at"] = rec.get("fetched_at") or ""
+    if status not in {"ok", "not_found"}:
+        result["error"] = rec.get("discover_error") or "Shodan query failed"
+        result["ok"] = False
+    elif status == "not_found":
+        result["error"] = "not in Shodan"
+    return result
+
+
+def write_summary_tsv(path: str, rows: list[dict[str, Any]]) -> None:
+    fields = [
+        "ip",
+        "status",
+        "org",
+        "isp",
+        "os",
+        "country",
+        "city",
+        "port_count",
+        "ports",
+        "vuln_count",
+        "vulns",
+        "hostnames",
+        "last_update",
+        "fetched_at",
+        "error",
+    ]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore", delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def append_audit_log(report_dir: str, action: str) -> None:
+    audit_dir = os.path.join(report_dir, "tools", "audit")
+    audit_log = os.path.join(audit_dir, "log.txt")
+    try:
+        os.makedirs(audit_dir, exist_ok=True)
+    except OSError:
+        return
+    ts = datetime.now(timezone.utc).strftime("%m/%d/%Y - %H:%M Z")
+    if not action.endswith("."):
+        action = action + "."
+    # Operator name from ~/.discover; IP is always "-" for Shodan (no egress on Audit).
+    op = "unknown"
+    try:
+        op_path = os.path.join(os.path.expanduser("~"), ".discover", "operator-name")
+        if os.path.isfile(op_path):
+            raw = open(op_path, encoding="utf-8", errors="replace").readline().strip()
+            cleaned = re.sub(r"[^A-Za-z]", "", raw)[:10]
+            if cleaned:
+                op = cleaned
+    except OSError:
+        pass
+    line = f"{ts} | {op} | - | {action}\n"
+    try:
+        with open(audit_log, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+
+
+def rebuild_audit_page(report_dir: str) -> None:
+    discover = (os.environ.get("DISCOVER") or "").strip()
+    if not discover:
+        discover = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    builder = os.path.join(discover, "recon", "audit-build.py")
+    template = os.path.join(discover, "report", "pages", "audit.htm")
+    if not os.path.isfile(builder):
+        return
+    import subprocess
+
+    cmd = [sys.executable, builder, report_dir]
+    if os.path.isfile(template):
+        cmd.append(template)
+    try:
+        subprocess.run(cmd, check=False, capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Enrich Discover report IPs with Shodan host data.",
+    )
+    parser.add_argument(
+        "report_dir",
+        nargs="?",
+        default=None,
+        help="Path to engagement report root (contains tools/ and pages/)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-query IPs even when a successful cache file exists",
+    )
+    parser.add_argument(
+        "--ip",
+        default=None,
+        metavar="IP",
+        help="Force-refresh a single public IP from Shodan and update index (statusd Update)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="With --ip: print one JSON object on stdout (for statusd)",
+    )
+    parser.add_argument(
+        "--json-summary",
+        action="store_true",
+        help="After bulk enrich: print one JSON stats object on stdout (for statusd)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Max IPs to query this run (0 = all; useful for smoke tests)",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=DEFAULT_SLEEP,
+        help=f"Seconds between API calls (default {DEFAULT_SLEEP})",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List IPs that would be queried; do not call Shodan",
+    )
+    parser.add_argument(
+        "--skip-audit",
+        action="store_true",
+        help="Do not append audit log or rebuild audit.htm (shell wrapper handles it)",
+    )
+    parser.add_argument(
+        "--refresh-kev",
+        action="store_true",
+        help="Only rewrite tools/shodan/kev-ids.js from the CISA KEV catalog (no API calls)",
+    )
+    parser.add_argument(
+        "--all-engagements",
+        action="store_true",
+        help="With --refresh-kev: refresh every $HOME/data/* report that has Shodan artifacts "
+        "(plus ~/.discover/current-report)",
+    )
+    parser.add_argument(
+        "--data-root",
+        default=None,
+        help="Engagement data root for --all-engagements (default: $HOME/data)",
+    )
+    parser.add_argument(
+        "--session-file",
+        default=None,
+        help="Path to current-report session file (default: ~/.discover/current-report)",
+    )
+    args = parser.parse_args(argv)
+
+    # --- KEV-only refresh (used by Discover Update; no Shodan API) ---
+    if args.refresh_kev:
+        catalog_ids = load_cisa_kev_ids()
+        if not catalog_ids:
+            eprint("[!] CISA KEV catalog not found or empty.")
+            eprint(f"    Expected: {_discover_root()}/resource/kevs.json")
+            eprint("    Run Discover Update to download it.")
+            return 1
+
+        targets: list[str] = []
+        if args.all_engagements or not args.report_dir:
+            targets = find_shodan_engagements(
+                data_root=args.data_root,
+                session_file=args.session_file,
+            )
+            if args.report_dir:
+                one = os.path.abspath(os.path.expanduser(args.report_dir))
+                if one not in targets and report_has_shodan_artifacts(one):
+                    targets.insert(0, one)
+        else:
+            one = os.path.abspath(os.path.expanduser(args.report_dir))
+            if not os.path.isdir(one):
+                eprint(f"[!] Report directory not found: {one}")
+                return 1
+            targets = [one]
+
+        if not targets:
+            print(
+                f"[*] CISA KEV catalog has {len(catalog_ids)} IDs; "
+                "no engagement reports with tools/shodan/ found to refresh.",
+                flush=True,
+            )
+            return 0
+
+        print("[*] Refreshing Shodan KEV badges.", flush=True)
+        ok_n = 0
+        for report in targets:
+            ok, _ = refresh_kev_for_report(report)
+            if ok:
+                ok_n += 1
+            else:
+                eprint(f"[!] skipped {report} (no Shodan artifacts or write failed)")
+        return 0 if ok_n == len(targets) else (0 if ok_n > 0 else 1)
+
+    if not args.report_dir:
+        eprint("[!] report_dir is required (unless using --refresh-kev).")
+        parser.print_help()
+        return 1
+
+    report_dir = os.path.abspath(os.path.expanduser(args.report_dir))
+    if not os.path.isdir(report_dir):
+        eprint(f"[!] Report directory not found: {report_dir}")
+        return 1
+    if not os.path.isdir(os.path.join(report_dir, "pages")):
+        eprint(f"[!] Not a Discover report (missing pages/): {report_dir}")
+        return 1
+
+    # Single-IP force refresh (Subdomains Shodan Update button / statusd)
+    if args.ip:
+        result = refresh_one_ip(
+            report_dir,
+            args.ip,
+            audit=not args.skip_audit,
+        )
+        if args.json:
+            # Host payload can be large; statusd returns it for the panel.
+            print(json.dumps(result, separators=(",", ":")), flush=True)
+        else:
+            status = result.get("status") or ("error" if not result.get("ok") else "ok")
+            if result.get("ok"):
+                print(f"[*] Shodan update {result.get('ip')}: {status}", flush=True)
+                if result.get("last_update"):
+                    print(f"    last_update: {result['last_update']}", flush=True)
+            else:
+                eprint(f"[!] Shodan update failed for {result.get('ip')}: {result.get('error')}")
+        return 0 if result.get("ok") else 1
+
+    httpx_path = os.path.join(report_dir, "tools", "httpx.jsonl")
+    if not os.path.isfile(httpx_path):
+        eprint(f"[!] No Active httpx data at tools/httpx.jsonl")
+        eprint("    Run Active recon first, then re-run Shodan enrichment.")
+        return 1
+
+    ips = collect_ips_from_httpx(httpx_path)
+    if not ips:
+        eprint("[!] No public IPs found in tools/httpx.jsonl")
+        return 1
+
+    print(f"[*] Report:  {report_dir}", flush=True)
+    print(f"[*] Source:  tools/httpx.jsonl", flush=True)
+    print(f"[*] Public IPs found: {len(ips)}", flush=True)
+
+    if args.dry_run:
+        limit = args.limit if args.limit and args.limit > 0 else len(ips)
+        print(f"[*] Dry-run — would query up to {min(limit, len(ips))} IP(s):", flush=True)
+        for ip in ips[:limit]:
+            print(f"    {ip}", flush=True)
+        if len(ips) > limit:
+            print(f"    … and {len(ips) - limit} more", flush=True)
+        return 0
+
+    api_key = get_shodan_api_key()
+    if not api_key:
+        print("[!] SHODAN_API_KEY not set — skipping Shodan enrichment.", flush=True)
+        print("    export SHODAN_API_KEY=... or add it to ~/.discover/api-keys", flush=True)
+        print("    Template: resource/api-keys.example — see README (Shodan enrichment).", flush=True)
+        if getattr(args, "json_summary", False):
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "SHODAN_API_KEY not set",
+                        "stats": {},
+                        "report": report_dir,
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+        return 0  # soft skip — not a hard failure
+
+    shodan_dir = os.path.join(report_dir, "tools", "shodan")
+    hosts_dir = os.path.join(shodan_dir, "hosts")
+    os.makedirs(hosts_dir, exist_ok=True)
+
+    # Snapshot for operator change summary (statusd Update modal).
+    index_before = load_index_json(shodan_dir) if args.force or args.json_summary else {}
+
+    to_query = ips
+    if args.limit and args.limit > 0:
+        to_query = ips[: args.limit]
+        print(f"[*] Limit:   {args.limit} IP(s) this run")
+
+    stats = {
+        "queried": 0,
+        "cached": 0,
+        "ok": 0,
+        "not_found": 0,
+        "error": 0,
+    }
+    all_records: list[dict[str, Any]] = []
+    sleep_s = max(0.0, float(args.sleep))
+    total = len(to_query)
+    need_sleep = False
+
+    for idx, ip in enumerate(to_query, start=1):
+        cache_path = host_cache_path(shodan_dir, ip)
+        if not args.force:
+            cached = load_cached_host(cache_path)
+            if cached is not None:
+                stats["cached"] += 1
+                all_records.append(cached)
+                status = cached.get("discover_status") or "?"
+                if status == "ok":
+                    stats["ok"] += 1
+                elif status == "not_found":
+                    stats["not_found"] += 1
+                print(f"[{idx}/{total}] {ip}  (cached: {status})")
+                continue
+
+        if need_sleep and sleep_s > 0:
+            time.sleep(sleep_s)
+        need_sleep = True
+
+        print(f"[{idx}/{total}] {ip}  querying…", end="", flush=True)
+        rec = shodan_host_lookup(ip, api_key)
+        stats["queried"] += 1
+        status = rec.get("discover_status") or "error"
+        if status == "ok":
+            stats["ok"] += 1
+            ports = (rec.get("shodan") or {}).get("ports") if isinstance(rec.get("shodan"), dict) else None
+            nports = len(ports) if isinstance(ports, list) else 0
+            print(f" ok ({nports} port(s))")
+        elif status == "not_found":
+            stats["not_found"] += 1
+            print(" not in Shodan")
+        else:
+            stats["error"] += 1
+            print(f" error: {rec.get('discover_error') or 'unknown'}")
+            # Back off harder on rate limits
+            if rec.get("http_status") == 429:
+                eprint("    [!] Rate limited — sleeping 5s")
+                time.sleep(5.0)
+
+        # Persist errors too so operators can inspect; resume only skips ok/not_found
+        write_json(cache_path, rec)
+        all_records.append(rec)
+
+    # Include cached IPs beyond --limit only when no limit? Keep summary to this run set.
+    # Also load any other host caches for a full-directory summary when not limited.
+    if not args.limit:
+        known = {r.get("ip") for r in all_records}
+        for name in os.listdir(hosts_dir) if os.path.isdir(hosts_dir) else []:
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(hosts_dir, name)
+            rec = load_cached_host(path)
+            if rec and rec.get("ip") not in known:
+                all_records.append(rec)
+                known.add(rec.get("ip"))
+
+    # Sort by IP for stable output
+    def _ip_sort_key(rec: dict[str, Any]) -> tuple:
+        ip = str(rec.get("ip") or "")
+        try:
+            return (0, ipaddress.ip_address(ip).packed)
+        except ValueError:
+            return (1, ip.encode())
+
+    all_records.sort(key=_ip_sort_key)
+    summary_rows = [summarize_record(r) for r in all_records]
+
+    summary = {
+        "version": SUMMARY_VERSION,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "report": report_dir,
+        "source": "tools/httpx.jsonl",
+        "api": "shodan/host",
+        "public_ips_in_httpx": len(ips),
+        "stats": stats,
+        "hosts": summary_rows,
+    }
+    write_json(os.path.join(shodan_dir, "summary.json"), summary)
+    write_summary_tsv(os.path.join(shodan_dir, "summary.tsv"), summary_rows)
+
+    # Compact index of IP → fields for Subdomains UI / other tools
+    index = {
+        row["ip"]: index_entry_from_row(row)
+        for row in summary_rows
+        if row.get("ip")
+    }
+    write_index_files(shodan_dir, index)
+
+    kev_n = write_kev_ids_js(shodan_dir)
+
+    print()
+    print(f"[*] Done. Queried={stats['queried']}  cached={stats['cached']}  "
+          f"ok={stats['ok']}  not_found={stats['not_found']}  error={stats['error']}")
+    print(f"[*] Artifacts: {shodan_dir}/")
+    print(f"    hosts/*.json   per-IP Shodan response")
+    print(f"    summary.json   aggregate + stats")
+    print(f"    summary.tsv    spreadsheet-friendly")
+    print(f"    index.json     IP → ports/org/hostnames")
+    print(f"    index.js       Subdomains UI (file:// safe)")
+    if kev_n:
+        print(f"    kev-ids.js    CISA KEV catalog ({kev_n} IDs) for CVE badges")
+    else:
+        print("    kev-ids.js    (missing — run Discover Update for CISA KEV catalog)")
+
+    try:
+        touch_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "touch-report-date.py"
+        )
+        if os.path.isfile(touch_path):
+            _spec = importlib.util.spec_from_file_location(
+                "touch_report_date", touch_path
+            )
+            if _spec is not None and _spec.loader is not None:
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _mod.touch_report_index_date(report_dir)
+    except Exception:
+        pass
+
+    # Hard fail only if every live query errored and nothing useful remains
+    hard_fail = (
+        stats["queried"] > 0
+        and stats["ok"] == 0
+        and stats["not_found"] == 0
+        and stats["error"] == stats["queried"]
+    )
+    if hard_fail:
+        eprint("[!] All Shodan queries failed — check API key and network.")
+
+    def _port_set(raw: object) -> set[str]:
+        """Parse index ports field (comma-separated string or list) to a set of port strings."""
+        if raw is None:
+            return set()
+        if isinstance(raw, list):
+            return {str(p).strip() for p in raw if str(p).strip()}
+        text = str(raw).strip()
+        if not text:
+            return set()
+        return {p.strip() for p in text.replace(" ", "").split(",") if p.strip()}
+
+    def _vuln_set(raw: object) -> set[str]:
+        if raw is None:
+            return set()
+        if isinstance(raw, dict):
+            raw = list(raw.keys())
+        if isinstance(raw, list):
+            return {str(v).strip().upper() for v in raw if str(v).strip()}
+        text = str(raw).strip()
+        if not text:
+            return set()
+        return {p.strip().upper() for p in text.split(",") if p.strip()}
+
+    def _sorted_cves(cves: set[str]) -> list[str]:
+        return sorted(cves)
+
+    def _sorted_ports(ports: set[str]) -> list[str]:
+        def key(p: str):
+            try:
+                return (0, int(p))
+            except ValueError:
+                return (1, p)
+
+        return sorted(ports, key=key)
+
+    # Diff index for "what changed" (ports / last_update / vulns / status).
+    changes_summary: dict[str, Any] = {
+        "ips_updated": 0,
+        "ips_new_ok": 0,
+        "ips_now_missing": 0,
+        "ports_changed": 0,  # IPs whose port set changed
+        "ports_added_total": 0,  # sum of newly seen ports across IPs
+        "ports_removed_total": 0,
+        "last_update_changed": 0,
+        "vuln_count_changed": 0,
+        "samples": [],  # per-IP deltas (prefer port changes first)
+        "port_samples": [],  # IPs with port add/remove detail (full list, capped)
+        "vuln_samples": [],  # IPs whose CVE set or count changed
+    }
+    if args.force or args.json_summary:
+        index_after = load_index_json(shodan_dir)
+        sample_cap = 40
+        port_sample_cap = 80
+        vuln_sample_cap = 80
+        all_ips = set(index_before) | set(index_after)
+        for ip in sorted(all_ips):
+            b = index_before.get(ip) if isinstance(index_before.get(ip), dict) else {}
+            a = index_after.get(ip) if isinstance(index_after.get(ip), dict) else {}
+            if not b and a and (a.get("status") or "").lower() == "ok":
+                changes_summary["ips_new_ok"] += 1
+            if b and not a:
+                changes_summary["ips_now_missing"] += 1
+            if not a:
+                continue
+
+            ports_b_set = _port_set(b.get("ports") if b else "")
+            ports_a_set = _port_set(a.get("ports"))
+            added = _sorted_ports(ports_a_set - ports_b_set)
+            removed = _sorted_ports(ports_b_set - ports_a_set)
+            ports_b = ",".join(_sorted_ports(ports_b_set))
+            ports_a = ",".join(_sorted_ports(ports_a_set))
+            lu_b = str(b.get("last_update") or "") if b else ""
+            lu_a = str(a.get("last_update") or "")
+            vc_b = b.get("vuln_count") if b else None
+            vc_a = a.get("vuln_count")
+            vulns_b_set = _vuln_set(b.get("vulns") if b else [])
+            vulns_a_set = _vuln_set(a.get("vulns"))
+            vuln_added = _sorted_cves(vulns_a_set - vulns_b_set)
+            vuln_removed = _sorted_cves(vulns_b_set - vulns_a_set)
+            status_changed = (b.get("status") or "") != (a.get("status") or "") if b else bool(a)
+
+            is_new_ok = not b and a
+            ports_changed = bool(added or removed)
+            lu_changed = bool(b) and lu_b != lu_a
+            vc_changed = bool(b) and (
+                vc_b != vc_a or bool(vuln_added or vuln_removed)
+            )
+            meaningful = is_new_ok or (
+                b
+                and (
+                    ports_changed
+                    or lu_changed
+                    or vc_changed
+                    or status_changed
+                )
+            )
+            if not meaningful:
+                continue
+
+            changes_summary["ips_updated"] += 1
+            if ports_changed:
+                changes_summary["ports_changed"] += 1
+                changes_summary["ports_added_total"] += len(added)
+                changes_summary["ports_removed_total"] += len(removed)
+            if lu_changed:
+                changes_summary["last_update_changed"] += 1
+            if vc_changed:
+                changes_summary["vuln_count_changed"] += 1
+
+            sample = {
+                "ip": ip,
+                "ports_before": ports_b,
+                "ports_after": ports_a,
+                "ports_added": added,
+                "ports_removed": removed,
+                "last_update_before": lu_b,
+                "last_update_after": lu_a,
+                "vuln_count_before": vc_b,
+                "vuln_count_after": vc_a,
+                "vulns_added": vuln_added,
+                "vulns_removed": vuln_removed,
+                "is_new": bool(is_new_ok),
+            }
+            if ports_changed or is_new_ok:
+                if len(changes_summary["port_samples"]) < port_sample_cap:
+                    changes_summary["port_samples"].append(sample)
+            if vc_changed:
+                if len(changes_summary["vuln_samples"]) < vuln_sample_cap:
+                    changes_summary["vuln_samples"].append(sample)
+            if len(changes_summary["samples"]) < sample_cap:
+                changes_summary["samples"].append(sample)
+
+        vuln_now: list[dict[str, Any]] = []
+        for ip in sorted(index_after):
+            cur = index_after.get(ip)
+            if not isinstance(cur, dict):
+                continue
+            ids = _sorted_cves(_vuln_set(cur.get("vulns")))
+            try:
+                count = int(cur.get("vuln_count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count < 1 and not ids:
+                continue
+            vuln_now.append(
+                {
+                    "ip": ip,
+                    "vuln_count": count or len(ids),
+                    "vulns": ids,
+                }
+            )
+        changes_summary["vuln_now_total"] = len(vuln_now)
+        changes_summary["vuln_now"] = vuln_now[:80]
+
+        common_http = {"80", "443"}
+        port_extra: list[dict[str, Any]] = []
+        port_http: list[dict[str, Any]] = []
+        for ip in sorted(index_after):
+            cur = index_after.get(ip)
+            if not isinstance(cur, dict):
+                continue
+            ports = _sorted_ports(_port_set(cur.get("ports")))
+            if not ports:
+                continue
+            row = {"ip": ip, "ports": ports}
+            if any(p not in common_http for p in ports):
+                port_extra.append(row)
+            else:
+                port_http.append(row)
+        port_now = port_extra + port_http
+        changes_summary["port_now_total"] = len(port_now)
+        changes_summary["port_now_extra"] = len(port_extra)
+        changes_summary["port_now"] = port_now[:80]
+
+    if args.json_summary:
+        print(
+            json.dumps(
+                {
+                    "ok": not hard_fail,
+                    "stats": stats,
+                    "changes": changes_summary,
+                    "public_ips": len(ips),
+                    "report": report_dir,
+                    "force": bool(args.force),
+                    "error": (
+                        "all Shodan queries failed"
+                        if hard_fail
+                        else ""
+                    ),
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+
+    return 1 if hard_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

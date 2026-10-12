@@ -1,0 +1,1415 @@
+#!/usr/bin/env python3
+# Planning by Lee Baird (@discoverscripts)
+# Coded by Grok (xAI)
+"""Localhost-only status helper + static report server for Discover operator UI.
+
+Usage:
+  host-scan-statusd.py <report_root> [port]
+
+Binds 127.0.0.1 only. Serves:
+  GET /status  -> tools/host-scans/status.json
+  GET /mode    -> assets/report-mode.json
+  GET /health  -> ok
+  GET /shodan-status -> {"ok":true,"api_key":true|false} (never returns the key)
+  POST /export -> run recon/export-report.sh (JSON body: {"kind":"client"|"defender"|"operator"})
+  POST /import-operator-package -> merge another operator report
+      (JSON: {"source":"/path/to/unpacked-report","operator":"Bob"})
+  POST /import-names -> merge manual names TSV into current report
+      (JSON: {"manual":"/optional/path/names-manual.tsv"})
+  POST /import-names-titles-emails -> merge external names dump
+      (JSON: {"source":"/path/to/names.txt"})
+  POST /import-subdomains -> import hosts (existing sources or CSV list)
+      (JSON: {"mode":"existing"|"team-csv","path":"...","run_active":false})
+  POST /shodan-refresh -> force-refresh one IP via recon/shodan-enrich.py --ip (JSON: {"ip":"..."})
+  POST /shodan-refresh-all -> force Shodan enrich all public IPs (--force --json-summary)
+  POST /software-cve-refresh -> force NVD software CVEs + rebuild active.htm
+  GET  /config -> operator config (api keys, name, view timezone, this report Google Sheet URL)
+  POST /config/api-keys -> save NVD/SHODAN/WPSCAN keys to ~/.discover/api-keys
+  POST /config/operator-name -> set name; rewrite this report audit log; rebuild Audit
+  POST /config/timezone -> set view timezone (display + metrics windows); stamps stay UTC
+  POST /config/op-notes -> save this report Google Sheet URL (tools/op-notes-url)
+  POST /config/op-notes-authorize -> browser OAuth; write ~/.discover/google-token.json
+  POST /config/open-theharvester -> open ~/.theHarvester/api-keys.yaml (open / xdg-open)
+  POST /audit-line-delete -> remove one tools/audit/log.txt line by SHA-256 hash
+      (JSON: {"hash":"<sha256 hex>"}; rebuilds pages/audit.htm)
+  GET /*       -> files under report_root (operator browser via http://127.0.0.1:port/)
+
+Host-scan chevrons, Export, Import/Config (Audit), audit line delete, Shodan Update, and Active
+Enrich only appear when the report is opened through this server (Open report / Active), not file://.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+# Content-Type allowlist / safe fallback (CodeQL http-response-splitting).
+_SAFE_CONTENT_TYPES = frozenset(
+    {
+        "application/json",
+        "application/javascript",
+        "application/javascript; charset=utf-8",
+        "application/octet-stream",
+        "text/css",
+        "text/css; charset=utf-8",
+        "text/html",
+        "text/html; charset=utf-8",
+        "text/javascript",
+        "text/javascript; charset=utf-8",
+        "text/plain",
+        "text/plain; charset=utf-8",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/svg+xml",
+        "font/woff",
+        "font/woff2",
+    }
+)
+
+
+def _safe_content_type(value: str) -> str:
+    """Sanitize Content-Type (no CR/LF; allowlist of MIME types)."""
+    text = str(value or "").replace("\r", "").replace("\n", "").strip()
+    if not text or len(text) > 128:
+        return "application/octet-stream"
+    low = text.lower()
+    base = low.split(";", 1)[0].strip()
+    allowed_base = {
+        "application/json",
+        "application/javascript",
+        "application/octet-stream",
+        "text/css",
+        "text/html",
+        "text/javascript",
+        "text/plain",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/svg+xml",
+        "font/woff",
+        "font/woff2",
+    }
+    if base not in allowed_base and low not in _SAFE_CONTENT_TYPES:
+        return "application/octet-stream"
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._+\-]+/[A-Za-z0-9][A-Za-z0-9._+\-]*(?:;\s*charset=utf-8)?",
+        text,
+    ):
+        return "application/octet-stream"
+    return text
+
+
+def _safe_cache_control(value: str) -> str:
+    """Sanitize Cache-Control header (no CR/LF)."""
+    text = str(value or "").replace("\r", "").replace("\n", "").strip()
+    if not text or len(text) > 64:
+        return "no-store"
+    if not re.fullmatch(r"[A-Za-z0-9 _\-,.=]+", text):
+        return "no-store"
+    return text
+
+
+def _safe_user_path(raw: str) -> str | None:
+    """Validate a user-supplied filesystem path for use as a subprocess argument.
+
+    Rejects empty values, NUL, option-like values (leading ``-``). Returns an
+    absolute real path only (CodeQL argument-injection: absolute non-option).
+    """
+    text = str(raw or "").strip()
+    if not text or "\x00" in text:
+        return None
+    # Option injection (CWE-88): never pass as argv.
+    if text.startswith("-"):
+        return None
+    try:
+        expanded = os.path.expanduser(text)
+        resolved = os.path.realpath(expanded)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not resolved or resolved.startswith("-"):
+        return None
+    # Absolute path only (Unix). Relative results are rejected.
+    if not os.path.isabs(resolved) or not resolved.startswith(os.sep):
+        return None
+    return resolved
+
+
+def _path_under_root(root_real: str, candidate_real: str) -> bool:
+    """True if candidate_real is root_real or a file/dir under it (after realpath)."""
+    if not root_real or not candidate_real:
+        return False
+    root_real = os.path.realpath(root_real)
+    candidate_real = os.path.realpath(candidate_real)
+    if candidate_real == root_real:
+        return True
+    prefix = root_real if root_real.endswith(os.sep) else root_real + os.sep
+    # startswith after realpath is the usual CodeQL path-injection barrier.
+    return candidate_real.startswith(prefix)
+
+
+def load_discover_config_module(discover_root: Path):
+    """Load recon/discover-config.py for in-process config (no secret logging)."""
+    path = discover_root / "recon" / "discover-config.py"
+    if not path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "discover_config_statusd", str(path)
+        )
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def shodan_api_key_configured(discover_root: Path) -> bool:
+    """True when SHODAN_API_KEY is set in the environment or private key files.
+
+    Does not return or log the key value.
+    """
+    # Prefer enricher's loader (api-keys + legacy .env migration).
+    enrich = discover_root / "recon" / "shodan-enrich.py"
+    if enrich.is_file():
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "discover_shodan_enrich", str(enrich)
+            )
+            if spec is not None and spec.loader is not None:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                if hasattr(mod, "get_shodan_api_key"):
+                    return bool((mod.get_shodan_api_key() or "").strip())
+        except Exception:
+            pass
+    return bool((os.environ.get("SHODAN_API_KEY") or "").strip())
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print("Usage: host-scan-statusd.py <report_root> [port]", file=sys.stderr)
+        return 2
+
+    report_root = Path(argv[1]).resolve()
+    if not report_root.is_dir():
+        print(f"Not a directory: {report_root}", file=sys.stderr)
+        return 2
+
+    port = int(argv[2]) if len(argv) > 2 else 17322
+    status_path = report_root / "tools" / "host-scans" / "status.json"
+    mode_path = report_root / "assets" / "report-mode.json"
+
+    # Discover install root (…/discover) from this script: misc/ → parent
+    discover_root = Path(__file__).resolve().parent.parent
+    export_script = discover_root / "recon" / "export-report.sh"
+    import_operator_script = discover_root / "recon" / "import-operator-package.py"
+    import_names_script = discover_root / "recon" / "import-names.sh"
+    import_nte_script = discover_root / "recon" / "import-names-titles-emails.sh"
+    import_subdomains_script = discover_root / "recon" / "import-subdomains.sh"
+    config_script = discover_root / "recon" / "discover-config.py"
+    shodan_enrich = discover_root / "recon" / "shodan-enrich.py"
+    active_tech = discover_root / "recon" / "active-tech.py"
+    audit_build = discover_root / "recon" / "audit-build.py"
+
+    report_root_real = os.path.realpath(str(report_root))
+
+    def safe_report_file(url_path: str) -> str | None:
+        """Map URL path to a realpath under report_root, or None.
+
+        Returns a str path only after realpath + startswith containment check
+        (CodeQL path-injection barrier). Localhost static file server only.
+        """
+        rel = unquote(url_path).split("?", 1)[0]
+        rel = rel.lstrip("/")
+        if not rel:
+            for name in ("index.htm", "index.html"):
+                cand = os.path.realpath(os.path.join(report_root_real, name))
+                if os.path.isfile(cand) and _path_under_root(report_root_real, cand):
+                    return cand
+            return None
+        # Reject absolute / traversal segments before join.
+        parts = rel.replace("\\", "/").split("/")
+        if any(p == ".." or p == "" or p.startswith("/") for p in parts):
+            return None
+        if "\x00" in rel:
+            return None
+        joined = os.path.join(report_root_real, *parts)
+        candidate = os.path.realpath(joined)
+        if not _path_under_root(report_root_real, candidate):
+            return None
+        if os.path.isfile(candidate):
+            return candidate
+        return None
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def _send(
+            self,
+            code: int,
+            body: bytes,
+            content_type: str = "application/json",
+            cache: str = "no-store",
+        ):
+            safe_ct = _safe_content_type(content_type)
+            safe_cache = _safe_cache_control(cache)
+            self.send_response(code)
+            self.send_header("Content-Type", safe_ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Cache-Control", safe_cache)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            self._send(204, b"")
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            path = parsed.path or "/"
+            if path not in {
+                "/export",
+                "/import-operator-package",
+                "/import-names",
+                "/import-names-titles-emails",
+                "/import-subdomains",
+                "/shodan-refresh",
+                "/shodan-refresh-all",
+                "/software-cve-refresh",
+                "/config/api-keys",
+                "/config/operator-name",
+                "/config/timezone",
+                "/config/op-notes",
+                "/config/op-notes-authorize",
+                "/config/open-theharvester",
+                "/audit-line-delete",
+            }:
+                self._send(404, b'{"ok":false,"error":"not found"}\n')
+                return
+
+            length = int(self.headers.get("Content-Length") or "0")
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self._send(400, b'{"ok":false,"error":"invalid JSON"}\n')
+                return
+
+            env = os.environ.copy()
+            env["DISCOVER"] = str(discover_root)
+            env["HOME"] = str(Path.home())
+
+            def _parse_json_stdout(stdout: str) -> dict | None:
+                for ln in reversed(
+                    [x.strip() for x in (stdout or "").splitlines() if x.strip()]
+                ):
+                    try:
+                        cand = json.loads(ln)
+                        if isinstance(cand, dict):
+                            return cand
+                    except json.JSONDecodeError:
+                        continue
+                return None
+
+            if path == "/shodan-refresh-all":
+                if not shodan_enrich.is_file():
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": f"shodan-enrich missing: {shodan_enrich}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                try:
+                    proc = subprocess.run(
+                        [
+                            sys.executable,
+                            str(shodan_enrich),
+                            str(report_root),
+                            "--force",
+                            "--json-summary",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=7200,
+                        env=env,
+                        cwd=str(discover_root),
+                    )
+                except subprocess.TimeoutExpired:
+                    self._send(
+                        504,
+                        b'{"ok":false,"error":"Shodan bulk refresh timed out"}\n',
+                    )
+                    return
+                except OSError as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)}).encode()
+                        + b"\n",
+                    )
+                    return
+                result = _parse_json_stdout(proc.stdout or "")
+                if not isinstance(result, dict):
+                    err = (proc.stderr or proc.stdout or "shodan bulk failed").strip()
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err[:500]
+                                or f"shodan-enrich exit {proc.returncode}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                code = 200 if result.get("ok") else 400
+                self._send(code, json.dumps(result).encode() + b"\n")
+                return
+
+            if path == "/software-cve-refresh":
+                if not active_tech.is_file():
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": f"active-tech missing: {active_tech}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                force_all = bool(body.get("force_all"))
+                cmd = [
+                    sys.executable,
+                    str(active_tech),
+                    str(report_root),
+                    "--refresh-cves",
+                    "--json",
+                ]
+                if force_all:
+                    cmd.append("--force-all")
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=3600,
+                        env=env,
+                        cwd=str(discover_root),
+                    )
+                except subprocess.TimeoutExpired:
+                    self._send(
+                        504,
+                        b'{"ok":false,"error":"Software CVE refresh timed out"}\n',
+                    )
+                    return
+                except OSError as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)}).encode()
+                        + b"\n",
+                    )
+                    return
+                result = _parse_json_stdout(proc.stdout or "")
+                if not isinstance(result, dict):
+                    err = (proc.stderr or proc.stdout or "cve refresh failed").strip()
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err[:500]
+                                or f"active-tech exit {proc.returncode}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                code = 200 if result.get("ok") else 400
+                self._send(code, json.dumps(result).encode() + b"\n")
+                return
+
+            if path == "/shodan-refresh":
+                ip = str(body.get("ip") or "").strip()
+                if not ip:
+                    self._send(400, b'{"ok":false,"error":"ip is required"}\n')
+                    return
+                if not shodan_enrich.is_file():
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": f"shodan-enrich missing: {shodan_enrich}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                try:
+                    proc = subprocess.run(
+                        [
+                            sys.executable,
+                            str(shodan_enrich),
+                            str(report_root),
+                            "--ip",
+                            ip,
+                            "--json",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=90,
+                        env=env,
+                        cwd=str(discover_root),
+                    )
+                except subprocess.TimeoutExpired:
+                    self._send(
+                        504,
+                        b'{"ok":false,"error":"Shodan refresh timed out"}\n',
+                    )
+                    return
+                except OSError as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)}).encode()
+                        + b"\n",
+                    )
+                    return
+
+                result = None
+                for ln in reversed(
+                    [x.strip() for x in (proc.stdout or "").splitlines() if x.strip()]
+                ):
+                    try:
+                        cand = json.loads(ln)
+                        if isinstance(cand, dict):
+                            result = cand
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+                if not isinstance(result, dict):
+                    err = (proc.stderr or proc.stdout or "shodan refresh failed").strip()
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err[:500]
+                                or f"shodan-enrich exit {proc.returncode}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+
+                code = 200 if result.get("ok") else 400
+                if proc.returncode != 0 and result.get("ok"):
+                    result["ok"] = False
+                    result.setdefault(
+                        "error", f"shodan-enrich exit {proc.returncode}"
+                    )
+                    code = 500
+                self._send(code, json.dumps(result).encode() + b"\n")
+                return
+
+            # --- Google Sheet URL for this engagement ---
+            if path == "/config/op-notes":
+                cfg_mod = load_discover_config_module(discover_root)
+                if cfg_mod is None or not hasattr(cfg_mod, "write_op_notes_url"):
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": f"config module missing: {config_script}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                url = str(body.get("url") or "")
+                try:
+                    cfg_mod.write_op_notes_url(report_root, url)
+                    result = cfg_mod.op_notes_status(report_root)
+                except ValueError as exc:
+                    self._send(
+                        400,
+                        json.dumps({"ok": False, "error": str(exc)[:200]}).encode()
+                        + b"\n",
+                    )
+                    return
+                except Exception as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)[:400]}).encode()
+                        + b"\n",
+                    )
+                    return
+                if not isinstance(result, dict):
+                    self._send(500, b'{"ok":false,"error":"config get failed"}\n')
+                    return
+                result["ok"] = True
+                result["saved"] = True
+                self._send(200, json.dumps(result).encode() + b"\n")
+                return
+
+            # --- Google Sheet OAuth (browser; token under ~/.discover) ---
+            if path == "/config/op-notes-authorize":
+                script = discover_root / "misc" / "op_notes.py"
+                if not script.is_file():
+                    self._send(
+                        500,
+                        b'{"ok":false,"error":"op_notes.py missing"}\n',
+                    )
+                    return
+                uv_bin = os.path.expanduser("~/.local/bin/uv")
+                if os.path.isfile(uv_bin) and os.access(uv_bin, os.X_OK):
+                    argv = [uv_bin, "run", str(script), "authorize"]
+                else:
+                    argv = ["uv", "run", str(script), "authorize"]
+                try:
+                    proc = subprocess.run(
+                        argv,
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                        env=env,
+                        cwd=str(Path.home()),
+                    )
+                except subprocess.TimeoutExpired:
+                    self._send(
+                        504,
+                        b'{"ok":false,"error":"Google authorization timed out"}\n',
+                    )
+                    return
+                except FileNotFoundError:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"uv is not installed. Run Discover (installs uv)."}\n',
+                    )
+                    return
+                except OSError as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)}).encode()
+                        + b"\n",
+                    )
+                    return
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout or "authorize failed").strip()
+                    self._send(
+                        400,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err[:400]
+                                or "Google authorization failed.",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                cfg_mod = load_discover_config_module(discover_root)
+                result = {"ok": True, "authorized": True}
+                if cfg_mod is not None and hasattr(cfg_mod, "op_notes_status"):
+                    try:
+                        result.update(cfg_mod.op_notes_status(report_root))
+                    except Exception:
+                        pass
+                    result["ok"] = True
+                    result["authorized"] = True
+                self._send(200, json.dumps(result).encode() + b"\n")
+                return
+
+            # --- open theHarvester keys (fixed path only; no client path) ---
+            if path == "/config/open-theharvester":
+                opener = discover_root / "misc" / "open-theharvester-keys.sh"
+                if not opener.is_file():
+                    self._send(
+                        500,
+                        b'{"ok":false,"error":"open-theharvester-keys.sh missing"}\n',
+                    )
+                    return
+                try:
+                    proc = subprocess.run(
+                        ["bash", str(opener)],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        env=env,
+                        cwd=str(Path.home()),
+                    )
+                except subprocess.TimeoutExpired:
+                    self._send(
+                        504,
+                        b'{"ok":false,"error":"open theHarvester keys timed out"}\n',
+                    )
+                    return
+                except OSError as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)}).encode()
+                        + b"\n",
+                    )
+                    return
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout or "open failed").strip()
+                    self._send(
+                        400,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err[:400]
+                                or "Could not open ~/.theHarvester/api-keys.yaml",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                self._send(
+                    200,
+                    b'{"ok":true,"opened":"~/.theHarvester/api-keys.yaml"}\n',
+                )
+                return
+
+            # --- /config/* (operator machine settings under ~/.discover) ---
+            if path in {
+                "/config/api-keys",
+                "/config/operator-name",
+                "/config/timezone",
+            }:
+                if not config_script.is_file():
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": f"config script missing: {config_script}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                try:
+                    if path == "/config/api-keys":
+                        proc = subprocess.run(
+                            [
+                                sys.executable,
+                                str(config_script),
+                                "set-api-keys",
+                                "--json",
+                                "--body",
+                                json.dumps(body),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            env=env,
+                            cwd=str(discover_root),
+                        )
+                    elif path == "/config/operator-name":
+                        name = str(
+                            body.get("name") or body.get("operator") or ""
+                        ).strip()
+                        proc = subprocess.run(
+                            [
+                                sys.executable,
+                                str(config_script),
+                                "set-operator-name",
+                                "--json",
+                                "--name",
+                                name,
+                                "--report",
+                                str(report_root),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                            env=env,
+                            cwd=str(discover_root),
+                        )
+                    else:
+                        tz = str(body.get("timezone") or body.get("tz") or "").strip()
+                        proc = subprocess.run(
+                            [
+                                sys.executable,
+                                str(config_script),
+                                "set-timezone",
+                                "--json",
+                                "--tz",
+                                tz,
+                                "--report",
+                                str(report_root),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            env=env,
+                            cwd=str(discover_root),
+                        )
+                except subprocess.TimeoutExpired:
+                    self._send(
+                        504,
+                        b'{"ok":false,"error":"config update timed out"}\n',
+                    )
+                    return
+                except OSError as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)}).encode()
+                        + b"\n",
+                    )
+                    return
+                result = _parse_json_stdout(proc.stdout or "")
+                if not isinstance(result, dict):
+                    err = (proc.stderr or proc.stdout or "config failed").strip()
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err[:800]
+                                or f"config exit {proc.returncode}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                code = 200 if result.get("ok") and proc.returncode == 0 else 400
+                if proc.returncode != 0 and result.get("ok"):
+                    result["ok"] = False
+                    result.setdefault("error", f"config exit {proc.returncode}")
+                    code = 500
+                self._send(code, json.dumps(result).encode() + b"\n")
+                return
+
+            def _run_bash_import(
+                script: Path,
+                *,
+                report: str,
+                extra_args: list[str],
+                timeout: int = 3600,
+                label: str = "import",
+            ) -> None:
+                """Run a Discover bash import script with a fixed argv shape.
+
+                extra_args must already be validated (absolute paths or fixed
+                tokens like firefox). Executable and script paths are not user input.
+                """
+                if not script.is_file():
+                    self._send(
+                        500,
+                        json.dumps(
+                            {"ok": False, "error": f"import script missing: {script}"}
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                # Only absolute report path (statusd-owned) + validated extras.
+                if not os.path.isabs(report) or not report.startswith(os.sep):
+                    self._send(
+                        500,
+                        b'{"ok":false,"error":"internal report path invalid"}\n',
+                    )
+                    return
+                known_flags = {
+                    "--manual",
+                    "--import",
+                    "--mode",
+                    "--source",
+                    "--run-active",
+                    "existing",
+                    "team-csv",
+                    "firefox",
+                }
+                for a in extra_args:
+                    if not isinstance(a, str) or not a or "\x00" in a:
+                        self._send(
+                            400,
+                            b'{"ok":false,"error":"invalid import argument"}\n',
+                        )
+                        return
+                    if a in known_flags or a.startswith("--"):
+                        continue
+                    # Path-like values: absolute only, never option-shaped.
+                    if a.startswith("-") or not os.path.isabs(a):
+                        self._send(
+                            400,
+                            b'{"ok":false,"error":"invalid import argument"}\n',
+                        )
+                        return
+                try:
+                    proc = subprocess.run(
+                        [
+                            "bash",
+                            str(script),
+                            "--report",
+                            report,
+                            *extra_args,
+                            "--json",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        env=env,
+                        cwd=str(discover_root),
+                        shell=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    self._send(
+                        504,
+                        json.dumps(
+                            {"ok": False, "error": f"{label} timed out"}
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                except OSError as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)}).encode()
+                        + b"\n",
+                    )
+                    return
+                result = _parse_json_stdout(proc.stdout or "")
+                if not isinstance(result, dict):
+                    err = (proc.stderr or proc.stdout or f"{label} failed").strip()
+                    for ln in reversed((proc.stderr or "").splitlines()):
+                        s = ln.strip()
+                        if s.startswith("[!]"):
+                            err = s[3:].strip() or err
+                            break
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err[:800]
+                                or f"{label} exit {proc.returncode}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                code = 200 if result.get("ok") and proc.returncode == 0 else 400
+                if proc.returncode != 0 and result.get("ok"):
+                    result["ok"] = False
+                    result.setdefault(
+                        "error", f"{label} exit {proc.returncode}"
+                    )
+                    code = 500
+                if not result.get("ok") and proc.stderr:
+                    result.setdefault(
+                        "error_detail", (proc.stderr or "")[:400]
+                    )
+                self._send(code, json.dumps(result).encode() + b"\n")
+
+            # --- /import-operator-package ---
+            if path == "/import-operator-package":
+                source_raw = str(body.get("source") or body.get("path") or "").strip()
+                operator = str(body.get("operator") or "").strip()
+                if not source_raw:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"source path is required"}\n',
+                    )
+                    return
+                if not operator:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"operator name is required"}\n',
+                    )
+                    return
+                if not re.fullmatch(r"[A-Za-z]{1,10}", operator):
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"operator name must be 1-10 letters"}\n',
+                    )
+                    return
+                source = _safe_user_path(source_raw)
+                if not source:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"invalid source path"}\n',
+                    )
+                    return
+                # In-process Python (no shell/subprocess argv injection surface).
+                import io
+                from contextlib import redirect_stdout, redirect_stderr
+
+                try:
+                    spec = importlib.util.spec_from_file_location(
+                        "discover_import_operator",
+                        str(import_operator_script),
+                    )
+                    if spec is None or spec.loader is None:
+                        raise RuntimeError("import-operator module load failed")
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    buf_out = io.StringIO()
+                    buf_err = io.StringIO()
+                    with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                        rc = mod.main(
+                            [
+                                "--dest",
+                                str(report_root),
+                                "--source",
+                                source,
+                                "--operator",
+                                operator,
+                                "--json",
+                            ]
+                        )
+                except Exception as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)[:800]}).encode()
+                        + b"\n",
+                    )
+                    return
+                result = _parse_json_stdout(buf_out.getvalue())
+                if not isinstance(result, dict):
+                    err = (buf_err.getvalue() or "import failed").strip()[:800]
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err or f"import exit {rc}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                code = 200 if result.get("ok") and rc == 0 else 400
+                if rc != 0 and result.get("ok"):
+                    result["ok"] = False
+                    result.setdefault("error", f"import exit {rc}")
+                    code = 500
+                self._send(code, json.dumps(result).encode() + b"\n")
+                return
+
+            # --- /import-names ---
+            if path == "/import-names":
+                manual_raw = str(body.get("manual") or body.get("path") or "").strip()
+                extra: list[str] = []
+                if manual_raw:
+                    manual = _safe_user_path(manual_raw)
+                    if not manual:
+                        self._send(
+                            400,
+                            b'{"ok":false,"error":"invalid manual path"}\n',
+                        )
+                        return
+                    extra.extend(["--manual", manual])
+                _run_bash_import(
+                    import_names_script,
+                    report=str(report_root),
+                    extra_args=extra,
+                    timeout=600,
+                    label="import names",
+                )
+                return
+
+            # --- /import-names-titles-emails ---
+            if path == "/import-names-titles-emails":
+                source_raw = str(body.get("source") or body.get("path") or "").strip()
+                if not source_raw:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"source path is required"}\n',
+                    )
+                    return
+                source = _safe_user_path(source_raw)
+                if not source:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"invalid source path"}\n',
+                    )
+                    return
+                _run_bash_import(
+                    import_nte_script,
+                    report=str(report_root),
+                    extra_args=["--source", source],
+                    timeout=600,
+                    label="import names titles emails",
+                )
+                return
+
+            # --- /import-subdomains ---
+            if path == "/import-subdomains":
+                mode = str(body.get("mode") or "").strip().lower()
+                import_path_raw = str(
+                    body.get("path")
+                    or body.get("source")
+                    or body.get("import")
+                    or ""
+                ).strip()
+                run_active = body.get("run_active") in (True, 1, "1", "true", "yes")
+                if mode in {"1", "existing", "exist", "firefox", "tsv", "pt", "pentest"}:
+                    mode = "existing"
+                elif mode in {"2", "team-csv", "csv", "list"}:
+                    mode = "team-csv"
+                else:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"mode must be existing or team-csv"}\n',
+                    )
+                    return
+                if not import_path_raw:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"path is required (file or firefox)"}\n',
+                    )
+                    return
+                # Special token for Firefox localStorage (not a filesystem path).
+                if import_path_raw.lower() in {"firefox", "ff"}:
+                    import_path = "firefox"
+                else:
+                    import_path = _safe_user_path(import_path_raw)
+                    if not import_path:
+                        self._send(
+                            400,
+                            b'{"ok":false,"error":"invalid import path"}\n',
+                        )
+                        return
+                extra = ["--mode", mode, "--import", import_path]
+                if run_active and mode == "team-csv":
+                    extra.append("--run-active")
+                timeout = 7200 if run_active else 1800
+                _run_bash_import(
+                    import_subdomains_script,
+                    report=str(report_root),
+                    extra_args=extra,
+                    timeout=timeout,
+                    label="import subdomains",
+                )
+                return
+
+            # --- /audit-line-delete ---
+            if path == "/audit-line-delete":
+                line_hash = str(
+                    body.get("hash") or body.get("line_hash") or ""
+                ).strip()
+                if not line_hash:
+                    self._send(
+                        400,
+                        b'{"ok":false,"error":"hash is required"}\n',
+                    )
+                    return
+                if not audit_build.is_file():
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": f"audit-build missing: {audit_build}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                try:
+                    proc = subprocess.run(
+                        [
+                            sys.executable,
+                            str(audit_build),
+                            "--delete-line",
+                            line_hash,
+                            str(report_root),
+                            "--json",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        env=env,
+                        cwd=str(discover_root),
+                    )
+                except subprocess.TimeoutExpired:
+                    self._send(
+                        504,
+                        b'{"ok":false,"error":"delete timed out"}\n',
+                    )
+                    return
+                except OSError as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)}).encode()
+                        + b"\n",
+                    )
+                    return
+                result = _parse_json_stdout(proc.stdout or "")
+                if not isinstance(result, dict):
+                    err = (proc.stderr or proc.stdout or "delete failed").strip()
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": err[:800]
+                                or f"delete exit {proc.returncode}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                code = 200 if result.get("ok") and proc.returncode == 0 else 400
+                if proc.returncode != 0 and result.get("ok"):
+                    result["ok"] = False
+                    result.setdefault(
+                        "error", f"delete exit {proc.returncode}"
+                    )
+                    code = 500
+                self._send(code, json.dumps(result).encode() + b"\n")
+                return
+
+            # --- /export ---
+            kind = str(body.get("kind") or "").strip().lower()
+            if kind not in {"client", "defender", "operator"}:
+                self._send(
+                    400,
+                    b'{"ok":false,"error":"kind must be client, defender, or operator"}\n',
+                )
+                return
+
+            if not export_script.is_file():
+                self._send(
+                    500,
+                    json.dumps(
+                        {"ok": False, "error": f"export script missing: {export_script}"}
+                    ).encode()
+                    + b"\n",
+                )
+                return
+
+            out_dir = Path.home() / "data"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._send(
+                    500,
+                    json.dumps({"ok": False, "error": f"out dir: {exc}"}).encode()
+                    + b"\n",
+                )
+                return
+
+            try:
+                proc = subprocess.run(
+                    [
+                        "bash",
+                        str(export_script),
+                        "--kind",
+                        kind,
+                        "--report",
+                        str(report_root),
+                        "--out-dir",
+                        str(out_dir),
+                        "--quiet",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
+                    env=env,
+                    cwd=str(discover_root),
+                )
+            except subprocess.TimeoutExpired:
+                self._send(504, b'{"ok":false,"error":"export timed out"}\n')
+                return
+            except OSError as exc:
+                self._send(
+                    500,
+                    json.dumps({"ok": False, "error": str(exc)}).encode() + b"\n",
+                )
+                return
+
+            # Last non-empty line should be JSON from export-report.sh
+            lines = [
+                ln.strip()
+                for ln in (proc.stdout or "").splitlines()
+                if ln.strip()
+            ]
+            result = None
+            for ln in reversed(lines):
+                try:
+                    result = json.loads(ln)
+                    if isinstance(result, dict):
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+            if not isinstance(result, dict):
+                err = (proc.stderr or proc.stdout or "export failed").strip()
+                self._send(
+                    500 if proc.returncode else 500,
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": err[:500] or f"export exit {proc.returncode}",
+                        }
+                    ).encode()
+                    + b"\n",
+                )
+                return
+
+            code = 200 if result.get("ok") and proc.returncode == 0 else 400
+            if proc.returncode != 0 and result.get("ok"):
+                result["ok"] = False
+                result.setdefault("error", f"export exit {proc.returncode}")
+                code = 500
+            self._send(code, json.dumps(result).encode() + b"\n")
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            path = parsed.path or "/"
+
+            if path == "/health":
+                self._send(200, b'{"ok":true}\n')
+                return
+            if path == "/mode":
+                if mode_path.is_file():
+                    self._send(200, mode_path.read_bytes())
+                else:
+                    self._send(
+                        200,
+                        b'{"mode":"operator","launches":true}\n',
+                    )
+                return
+            if path == "/status":
+                if status_path.is_file():
+                    self._send(200, status_path.read_bytes())
+                else:
+                    self._send(200, b'{"running":false,"hosts":{}}\n')
+                return
+            if path == "/shodan-status":
+                # Presence only — never return the key material.
+                configured = shodan_api_key_configured(discover_root)
+                self._send(
+                    200,
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "api_key": configured,
+                            "path": str(Path.home() / ".discover" / "api-keys"),
+                        }
+                    ).encode()
+                    + b"\n",
+                )
+                return
+            if path == "/config":
+                # In-process get_all() so API key values reach Audit Config without
+                # going through discover-config CLI print (CodeQL clear-text logging).
+                cfg_mod = load_discover_config_module(discover_root)
+                if cfg_mod is None or not hasattr(cfg_mod, "get_all"):
+                    self._send(
+                        500,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": f"config module missing: {config_script}",
+                            }
+                        ).encode()
+                        + b"\n",
+                    )
+                    return
+                try:
+                    result = cfg_mod.get_all()
+                    if hasattr(cfg_mod, "op_notes_status"):
+                        result["op_notes"] = cfg_mod.op_notes_status(report_root)
+                except Exception as exc:
+                    self._send(
+                        500,
+                        json.dumps({"ok": False, "error": str(exc)[:400]}).encode()
+                        + b"\n",
+                    )
+                    return
+                if not isinstance(result, dict):
+                    self._send(
+                        500,
+                        b'{"ok":false,"error":"config get failed"}\n',
+                    )
+                    return
+                self._send(200, json.dumps(result).encode() + b"\n")
+                return
+
+            if path == "/":
+                path = "/index.htm"
+            safe_s = safe_report_file(path)
+            if safe_s is None:
+                self._send(404, b'{"error":"not found"}\n')
+                return
+            # Containment already enforced; re-check startswith before open.
+            if not _path_under_root(report_root_real, safe_s):
+                self._send(404, b'{"error":"not found"}\n')
+                return
+            try:
+                with open(safe_s, "rb") as handle:
+                    body = handle.read()
+            except OSError:
+                self._send(404, b'{"error":"not found"}\n')
+                return
+            # Fixed content types by extension only (no user string → header).
+            ext = os.path.splitext(safe_s)[1].lower()
+            ext_ctype = {
+                ".htm": "text/html; charset=utf-8",
+                ".html": "text/html; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+                ".json": "application/json",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".gif": "image/gif",
+                ".webp": "image/webp",
+                ".svg": "image/svg+xml",
+                ".woff": "font/woff",
+                ".woff2": "font/woff2",
+                ".txt": "text/plain; charset=utf-8",
+            }
+            ctype = ext_ctype.get(ext, "application/octet-stream")
+            cache = (
+                "no-cache"
+                if ext in {".htm", ".html", ".js", ".css", ".json"}
+                else "private, max-age=3600"
+            )
+            self._send(200, body, content_type=ctype, cache=cache)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    port_file = report_root / "tools" / "host-scans" / "statusd.port"
+    port_file.parent.mkdir(parents=True, exist_ok=True)
+    port_file.write_text(str(port) + "\n", encoding="utf-8")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            port_file.unlink()
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

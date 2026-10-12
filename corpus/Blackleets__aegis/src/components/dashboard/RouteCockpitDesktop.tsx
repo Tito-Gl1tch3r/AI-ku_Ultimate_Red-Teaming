@@ -1,0 +1,198 @@
+'use client';
+
+import { useEffect, useMemo, useState } from 'react';
+import { motion } from 'framer-motion';
+import { type RouteRiskSummary, type RouteSnapshot, type RouteStep, formatCoordinateLabel, formatRouteDistance, formatRouteDuration, formatRouteModeLabel } from '@/lib/routing-shell';
+import { formatTomTomTrafficLabel } from '@/lib/tomtom-route-traffic';
+
+type GpsSignalStatus = 'idle' | 'acquiring' | 'live' | 'degraded' | 'denied' | 'unavailable';
+
+type RouteCockpitDesktopProps = {
+  routeSnapshot: RouteSnapshot;
+  navigationActive: boolean;
+  remainingRouteDistance: number;
+  routeEtaLabel: string;
+  routeProgressLabel: string;
+  routeRiskSummary: RouteRiskSummary | null;
+  currentRouteStep: RouteStep | null;
+  onToggleNavigationFollow: () => void;
+  onClearNavigationState: () => void;
+  onSelectRouteOption: (routeId: string) => void;
+  trafficInsight?: {
+    status: 'loading' | 'live' | 'unavailable';
+    configured?: boolean;
+    level?: 'clear' | 'light' | 'moderate' | 'heavy';
+    delaySeconds?: number;
+  } | null;
+};
+
+function getGpsQualityLabel(status: GpsSignalStatus, accuracyMeters: number | null) {
+  if (status === 'acquiring') return 'Buscando GPS';
+  if (status === 'denied') return 'GPS sin permiso';
+  if (status === 'unavailable') return 'GPS sin señal';
+  if (status === 'degraded') return accuracyMeters === null ? 'GPS débil' : `GPS ±${Math.round(accuracyMeters)} m`;
+  if (accuracyMeters === null) return 'GPS preparado';
+  if (accuracyMeters <= 15) return 'GPS preciso';
+  return `GPS ±${Math.round(accuracyMeters)} m`;
+}
+
+export default function RouteCockpitDesktop({
+  routeSnapshot,
+  navigationActive,
+  remainingRouteDistance,
+  routeEtaLabel,
+  routeProgressLabel,
+  routeRiskSummary,
+  currentRouteStep,
+  onToggleNavigationFollow,
+  onClearNavigationState,
+  onSelectRouteOption,
+  trafficInsight = null,
+}: RouteCockpitDesktopProps) {
+  const [speedKmh, setSpeedKmh] = useState<number | null>(null);
+  const [gpsAccuracyMeters, setGpsAccuracyMeters] = useState<number | null>(null);
+  const [gpsStatus, setGpsStatus] = useState<GpsSignalStatus>('idle');
+
+  useEffect(() => {
+    if (!navigationActive) {
+      queueMicrotask(() => {
+        setSpeedKmh(null);
+        setGpsAccuracyMeters(null);
+        setGpsStatus('idle');
+      });
+      return;
+    }
+
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      queueMicrotask(() => setGpsStatus('unavailable'));
+      return;
+    }
+
+    queueMicrotask(() => setGpsStatus('acquiring'));
+    const watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        const accuracy = Number.isFinite(position.coords.accuracy) ? position.coords.accuracy : null;
+        const nextSpeed = typeof position.coords.speed === 'number' && Number.isFinite(position.coords.speed)
+          ? Math.max(0, position.coords.speed * 3.6)
+          : null;
+        setGpsAccuracyMeters(accuracy);
+        setSpeedKmh(nextSpeed);
+        setGpsStatus(accuracy !== null && accuracy > 40 ? 'degraded' : 'live');
+      },
+      (error) => {
+        setSpeedKmh(null);
+        setGpsAccuracyMeters(null);
+        setGpsStatus(error.code === error.PERMISSION_DENIED ? 'denied' : 'unavailable');
+      },
+      { enableHighAccuracy: true, maximumAge: 2_000, timeout: 12_000 },
+    );
+
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [navigationActive]);
+
+  const gpsQualityLabel = useMemo(
+    () => getGpsQualityLabel(gpsStatus, gpsAccuracyMeters),
+    [gpsAccuracyMeters, gpsStatus],
+  );
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 16 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: 0.12, duration: 0.35 }}
+      className="absolute right-4 top-[6.25rem] z-[210] w-[min(24rem,calc(100vw-3rem))] pointer-events-auto md:right-5"
+    >
+      <div className="rounded-[1.35rem] border border-cyan-400/18 bg-[rgba(8,18,28,0.88)] px-3.5 py-3 shadow-[0_18px_52px_rgba(0,0,0,0.24)] backdrop-blur-lg">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <div className="relative h-8 w-8 shrink-0 rounded-xl border border-cyan-400/20 bg-[radial-gradient(circle_at_center,rgba(34,211,238,0.18),rgba(8,18,28,0.08)_55%,rgba(8,18,28,0.02)_78%)]">
+                <div className="absolute inset-[5px] rounded-full border border-cyan-400/18" />
+                <div className="absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-300" />
+              </div>
+              <div className="text-[8px] font-mono uppercase tracking-[0.26em] text-cyan-300">VECTOR MODE</div>
+            </div>
+            <div className="mt-1 text-sm font-semibold tracking-[0.06em] text-white">{routeSnapshot.destination.label}</div>
+            <div className="mt-2 grid gap-2 text-[8px] font-mono uppercase tracking-[0.16em] text-[var(--text-secondary)] sm:grid-cols-2">
+              <div className="rounded-xl border border-white/8 bg-black/20 px-2.5 py-2">
+                <div className="text-[7px] tracking-[0.2em] text-cyan-300">From</div>
+                <div className="mt-1 text-[10px] font-semibold tracking-[0.05em] text-white">Live position</div>
+                <div className="mt-0.5 text-[8px] text-[var(--text-secondary)]">{formatCoordinateLabel(routeSnapshot.origin)}</div>
+              </div>
+              <div className="rounded-xl border border-white/8 bg-black/20 px-2.5 py-2">
+                <div className="text-[7px] tracking-[0.2em] text-cyan-300">To</div>
+                <div className="mt-1 truncate text-[10px] font-semibold tracking-[0.05em] text-white">{routeSnapshot.destination.label}</div>
+                <div className="mt-0.5 text-[8px] text-[var(--text-secondary)]">{formatCoordinateLabel(routeSnapshot.destination)}</div>
+              </div>
+            </div>
+            {routeSnapshot.waypoints.length > 0 && (
+              <div className="mt-2 rounded-xl border border-[rgba(212,175,55,0.14)] bg-[rgba(212,175,55,0.06)] px-2.5 py-2">
+                <div className="text-[7px] font-mono uppercase tracking-[0.18em] text-[var(--gold-primary)]">Stops</div>
+                <div className="mt-1 flex flex-wrap gap-1.5 text-[7px] font-mono uppercase tracking-[0.14em] text-white/85">
+                  {routeSnapshot.waypoints.map((waypoint, index) => (
+                    <span key={`${waypoint.label}-${index}-${waypoint.lat}-${waypoint.lng}`} className="rounded-full border border-[rgba(212,175,55,0.18)] bg-[rgba(212,175,55,0.08)] px-2 py-1">
+                      S{index + 1} · {waypoint.label ?? formatCoordinateLabel(waypoint)}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="mt-2 grid grid-cols-2 gap-2 lg:grid-cols-5">
+              <div className="rounded-xl border border-cyan-400/14 bg-cyan-400/[0.06] px-2.5 py-2">
+                <div className="text-[7px] font-mono uppercase tracking-[0.18em] text-cyan-300">Mode</div>
+                <div className="mt-1 text-[11px] font-semibold tracking-[0.05em] text-white">{formatRouteModeLabel(routeSnapshot.mode)}</div>
+              </div>
+              <div className="rounded-xl border border-cyan-400/18 bg-cyan-400/[0.08] px-2.5 py-2">
+                <div className="text-[7px] font-mono uppercase tracking-[0.18em] text-cyan-300">Speed</div>
+                <div className="mt-1 text-[11px] font-semibold tracking-[0.05em] text-white tabular-nums">{speedKmh === null ? '— km/h' : `${Math.round(speedKmh)} km/h`}</div>
+              </div>
+              <div className="rounded-xl border border-white/8 bg-black/20 px-2.5 py-2">
+                <div className="text-[7px] font-mono uppercase tracking-[0.18em] text-cyan-300">Remaining</div>
+                <div className="mt-1 text-[11px] font-semibold tracking-[0.05em] text-white">{formatRouteDistance(remainingRouteDistance || routeSnapshot.distanceMeters)}</div>
+              </div>
+              <div className="rounded-xl border border-white/8 bg-black/20 px-2.5 py-2">
+                <div className="text-[7px] font-mono uppercase tracking-[0.18em] text-cyan-300">ETA</div>
+                <div className="mt-1 text-[11px] font-semibold tracking-[0.05em] text-white">{routeEtaLabel}</div>
+              </div>
+              <div className="rounded-xl border border-white/8 bg-black/20 px-2.5 py-2">
+                <div className="text-[7px] font-mono uppercase tracking-[0.18em] text-cyan-300">Progress</div>
+                <div className="mt-1 text-[11px] font-semibold tracking-[0.05em] text-white">{routeProgressLabel}</div>
+              </div>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2 text-[10px] font-mono uppercase tracking-[0.16em] text-[var(--text-secondary)]">
+              <span>{formatRouteDuration(routeSnapshot.durationSeconds)}</span>
+              <span>•</span>
+              <span>{navigationActive ? 'FOLLOW LIVE' : 'READY TO FOLLOW'}</span>
+              <span>•</span>
+              <span className={gpsStatus === 'degraded' || gpsStatus === 'denied' || gpsStatus === 'unavailable' ? 'text-amber-300' : 'text-cyan-200'}>{gpsQualityLabel}</span>
+              {routeRiskSummary && (
+                <>
+                  <span>•</span>
+                  <span className={routeRiskSummary.level === 'high' ? 'text-rose-300' : routeRiskSummary.level === 'elevated' ? 'text-amber-300' : 'text-emerald-300'}>
+                    RISK {routeRiskSummary.score}
+                  </span>
+                </>
+              )}
+              {formatTomTomTrafficLabel(trafficInsight) && (
+                <>
+                  <span>•</span>
+                  <span className={trafficInsight?.level === 'heavy' ? 'text-rose-300' : trafficInsight?.level === 'moderate' ? 'text-amber-300' : 'text-cyan-200'}>
+                    {formatTomTomTrafficLabel(trafficInsight)}
+                  </span>
+                </>
+              )}
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button type="button" onClick={onToggleNavigationFollow} className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-3 py-1.5 text-[10px] font-mono uppercase tracking-[0.16em] text-cyan-200 hover:bg-cyan-400/18">
+              {navigationActive ? 'Pause Vector' : 'Start Vector'}
+            </button>
+            <button type="button" onClick={onClearNavigationState} className="rounded-full border border-white/10 px-3 py-1.5 text-[10px] font-mono uppercase tracking-[0.16em] text-[var(--text-muted)] hover:text-white">
+              Clear Route
+            </button>
+          </div>
+        </div>
+      </div>
+    </motion.div>
+  );
+}

@@ -1,0 +1,192 @@
+import logging
+import threading
+import time
+from typing import Any
+
+import jwt
+import requests
+
+from models.base_engine import BaseEngine
+from models.observable import Observable, ObservableType
+
+logger = logging.getLogger(__name__)
+
+
+class MDEEngine(BaseEngine):
+    _cached_token: str | None = None
+    _token_lock = threading.Lock()
+
+    @property
+    def name(self):
+        return "mde"
+
+    @property
+    def supported_types(self) -> ObservableType:
+        return (
+            ObservableType.BOGON
+            | ObservableType.IPV4
+            | ObservableType.IPV6
+            | ObservableType.FQDN
+            | ObservableType.URL
+            | ObservableType.MD5
+            | ObservableType.SHA1
+            | ObservableType.SHA256
+        )
+
+    def _check_token_validity(self, token: str) -> bool:
+        try:
+            decoded_token = jwt.decode(token, options={"verify_signature": False})
+            exp = decoded_token.get("exp")
+            if exp is None:
+                logger.warning("MDE Token has no expiration claim.")
+                return False
+            if exp > time.time():
+                return True
+            logger.warning("MDE Token has expired.")
+            return False
+        except Exception as e:
+            logger.error("Failed to decode MDE token: %s", e, exc_info=True)
+            return False
+
+    def _read_token(self) -> str | None:
+        with self._token_lock:
+            token = self._cached_token
+
+        if token:
+            token = token.strip()
+
+        if token and self._check_token_validity(token):
+            return token
+
+        return None
+
+    def _get_token(self) -> str:
+        cached_token = self._read_token()
+        if cached_token:
+            return cached_token
+
+        url = f"https://login.microsoftonline.com/{self.secrets.mde_tenant_id}/oauth2/token"
+        resource_app_id_uri = "https://api.securitycenter.microsoft.com"
+        # TODO: Future refactoring - Consider pre-validating that mde_tenant_id,
+        # mde_client_id, and mde_client_secret are non-empty before making the API call.
+        # Currently, missing or empty secrets will result in an API error rather than
+        # failing fast with a clear validation error.
+        body = {
+            "resource": resource_app_id_uri,
+            "client_id": self.secrets.mde_client_id,
+            "client_secret": self.secrets.mde_client_secret,
+            "grant_type": "client_credentials",
+        }
+        try:
+            response = requests.post(url, data=body, proxies=self.proxies, verify=self.ssl_verify)
+            response.raise_for_status()
+            json_response = response.json()
+        except Exception as err:
+            logger.error("Error fetching token from Microsoft: %s", err, exc_info=True)
+            return "invalid"
+
+        try:
+            aad_token = json_response["access_token"]
+
+            with self._token_lock:
+                type(self)._cached_token = aad_token
+
+            return aad_token
+        except KeyError:
+            logger.error("Unable to retrieve token from JSON response: %s", json_response)
+            return "invalid"
+
+    def analyze(self, observable: Observable) -> dict[str, Any] | None:
+        try:
+            jwt_token = self._read_token() or self._get_token()
+            if "invalid" in jwt_token:
+                logger.error("No valid token available for Microsoft Defender for Endpoint.")
+                return None
+
+            headers = {"Authorization": f"Bearer {jwt_token}"}
+            file_info_url = None
+            link = None
+
+            extracted_domain = None
+
+            match observable.type:
+                case ObservableType.MD5 | ObservableType.SHA1 | ObservableType.SHA256:
+                    url = f"https://api.securitycenter.microsoft.com/api/files/{observable.value}/stats"
+                    file_info_url = (
+                        f"https://api.securitycenter.microsoft.com/api/files/{observable.value}"
+                    )
+                    link = f"https://security.microsoft.com/file/{observable.value}"
+                case ObservableType.IPV4 | ObservableType.IPV6 | ObservableType.BOGON:
+                    url = (
+                        f"https://api.securitycenter.microsoft.com/api/ips/{observable.value}/stats"
+                    )
+                    link = f"https://security.microsoft.com/ip/{observable.value}/overview"
+                case ObservableType.FQDN:
+                    url = f"https://api.securitycenter.microsoft.com/api/domains/{observable.value}/stats"
+                    link = f"https://security.microsoft.com/domains?urlDomain={observable.value}"
+                case ObservableType.URL:
+                    # TODO: Future refactoring - Line 124 uses fragile string split for URL parsing:
+                    # observable.value.split("/")[2].split(":")[0]
+                    # This approach fails on malformed URLs (e.g., missing protocol, no path).
+                    # Consider using urllib.parse.urlparse() for robust URL parsing instead.
+                    # Test coverage includes both valid URLs and known failure cases.
+                    extracted_domain = observable.value.split("/")[2].split(":")[0]
+                    url = f"https://api.securitycenter.microsoft.com/api/domains/{extracted_domain}/stats"
+                    link = f"https://security.microsoft.com/url?url={observable.value}"
+                case _:
+                    return None
+
+            response = requests.get(
+                url, headers=headers, proxies=self.proxies, verify=self.ssl_verify, timeout=5
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            data["link"] = link
+
+            # Retrieve extended file info if applicable
+            if file_info_url:
+                file_info_response = requests.get(
+                    file_info_url, headers=headers, proxies=self.proxies, verify=self.ssl_verify
+                )
+                file_info_response.raise_for_status()
+                file_info = file_info_response.json()
+                data["issuer"] = file_info.get("issuer", "Unknown")
+                data["signer"] = file_info.get("signer", "Unknown")
+                data["isValidCertificate"] = file_info.get("isValidCertificate", "Unknown")
+                data["filePublisher"] = file_info.get("filePublisher", "Unknown")
+                data["fileProductName"] = file_info.get("fileProductName", "Unknown")
+                data["determinationType"] = file_info.get("determinationType", "Unknown")
+                data["determinationValue"] = file_info.get("determinationValue", "Unknown")
+
+            # Simplify dates
+            # TODO: Future refactoring - Assume ISO datetime format with "T" separator.
+            # The split("T")[0] approach extracts the date portion but fails on non-ISO
+            # formats (e.g., Unix timestamp, other datetime formats). Consider using
+            # datetime.fromisoformat() or a robust date parsing library.
+            # Test coverage includes multiple ISO variants that work correctly.
+            if data.get("orgFirstSeen"):
+                data["orgFirstSeen"] = data["orgFirstSeen"].split("T")[0]
+            if data.get("orgLastSeen"):
+                data["orgLastSeen"] = data["orgLastSeen"].split("T")[0]
+
+            return data
+
+        except Exception as e:
+            logger.error(
+                "Error querying Microsoft Defender for Endpoint for '%s': %s",
+                observable.value,
+                e,
+                exc_info=True,
+            )
+            return None
+
+    def create_export_row(self, analysis_result: Any) -> dict:
+        if not analysis_result:
+            return {f"mde_{k}": None for k in ["first_seen", "last_seen", "org_prevalence"]}
+
+        return {
+            "mde_first_seen": analysis_result.get("orgFirstSeen"),
+            "mde_last_seen": analysis_result.get("orgLastSeen"),
+            "mde_org_prevalence": analysis_result.get("orgPrevalence"),
+        }

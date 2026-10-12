@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+use crate::{HvError, Hypervisor};
+use std::error::Error;
+use x86_64::{Efer, Rflags};
+
+pub type CpuFeats = Vec<FeatLeaf>;
+
+/// Provides processor specific methods.
+pub trait HypervisorExt: Hypervisor {
+    fn set_cpuid(&mut self, leaf: FeatLeaf) -> Result<(), HvError>;
+}
+
+/// States of a CPU.
+pub trait CpuStates {
+    type Err: Error + Send + Sync + 'static;
+
+    fn get_rax(&mut self) -> Result<usize, Self::Err>;
+    fn get_rbx(&mut self) -> Result<usize, Self::Err>;
+    fn get_rcx(&mut self) -> Result<usize, Self::Err>;
+    fn get_rdx(&mut self) -> Result<usize, Self::Err>;
+    fn set_rdx(&mut self, v: usize);
+    fn get_rbp(&mut self) -> Result<usize, Self::Err>;
+    fn get_r8(&mut self) -> Result<usize, Self::Err>;
+    fn get_r9(&mut self) -> Result<usize, Self::Err>;
+    fn get_r10(&mut self) -> Result<usize, Self::Err>;
+    fn get_r11(&mut self) -> Result<usize, Self::Err>;
+    fn get_r12(&mut self) -> Result<usize, Self::Err>;
+    fn get_r13(&mut self) -> Result<usize, Self::Err>;
+    fn get_r14(&mut self) -> Result<usize, Self::Err>;
+    fn get_r15(&mut self) -> Result<usize, Self::Err>;
+    fn get_rdi(&mut self) -> Result<usize, Self::Err>;
+    fn set_rdi(&mut self, v: usize);
+    fn get_rsi(&mut self) -> Result<usize, Self::Err>;
+    fn set_rsi(&mut self, v: usize);
+    fn get_rsp(&mut self) -> Result<usize, Self::Err>;
+    fn set_rsp(&mut self, v: usize);
+    fn get_rip(&mut self) -> Result<usize, Self::Err>;
+    fn set_rip(&mut self, v: usize);
+
+    fn set_cr0(&mut self, v: usize);
+    fn set_cr3(&mut self, v: usize);
+    fn set_cr4(&mut self, v: usize);
+    fn get_rflags(&mut self) -> Result<Rflags, Self::Err>;
+    fn set_rflags(&mut self, v: Rflags);
+    fn set_efer(&mut self, v: Efer);
+    fn get_cs(&mut self) -> Result<u16, Self::Err>;
+    fn set_cs(&mut self, ty: u8, dpl: u8, p: bool, l: bool, d: bool);
+    fn get_ds(&mut self) -> Result<u16, Self::Err>;
+    fn set_ds(&mut self, p: bool);
+    fn get_es(&mut self) -> Result<u16, Self::Err>;
+    fn set_es(&mut self, p: bool);
+    fn get_fs(&mut self) -> Result<u16, Self::Err>;
+    fn set_fs(&mut self, p: bool);
+    fn get_gs(&mut self) -> Result<u16, Self::Err>;
+    fn set_gs(&mut self, p: bool);
+    fn get_ss(&mut self) -> Result<u16, Self::Err>;
+    fn set_ss(&mut self, p: bool);
+
+    fn get_st0(&mut self) -> Result<[u8; 10], Self::Err>;
+    fn get_st1(&mut self) -> Result<[u8; 10], Self::Err>;
+    fn get_st2(&mut self) -> Result<[u8; 10], Self::Err>;
+    fn get_st3(&mut self) -> Result<[u8; 10], Self::Err>;
+    fn get_st4(&mut self) -> Result<[u8; 10], Self::Err>;
+    fn get_st5(&mut self) -> Result<[u8; 10], Self::Err>;
+    fn get_st6(&mut self) -> Result<[u8; 10], Self::Err>;
+    fn get_st7(&mut self) -> Result<[u8; 10], Self::Err>;
+
+    fn get_fcw(&mut self) -> Result<u32, Self::Err>;
+    fn get_fsw(&mut self) -> Result<u32, Self::Err>;
+    fn get_ftwx(&mut self) -> Result<u32, Self::Err>;
+    fn get_fiseg(&mut self) -> Result<u32, Self::Err>;
+    fn get_fioff(&mut self) -> Result<u32, Self::Err>;
+    fn get_foseg(&mut self) -> Result<u32, Self::Err>;
+    fn get_fooff(&mut self) -> Result<u32, Self::Err>;
+    fn get_fop(&mut self) -> Result<u32, Self::Err>;
+
+    fn get_xmm0(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm1(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm2(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm3(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm4(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm5(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm6(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm7(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm8(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm9(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm10(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm11(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm12(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm13(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm14(&mut self) -> Result<u128, Self::Err>;
+    fn get_xmm15(&mut self) -> Result<u128, Self::Err>;
+
+    fn get_mxcsr(&mut self) -> Result<u32, Self::Err>;
+}
+
+/// Contains values for single CPUID leaf.
+#[derive(Clone)]
+pub struct FeatLeaf {
+    pub id: u32,
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+}

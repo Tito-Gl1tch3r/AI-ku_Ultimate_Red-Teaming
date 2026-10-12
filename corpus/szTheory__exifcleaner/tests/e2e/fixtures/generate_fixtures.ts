@@ -1,0 +1,1306 @@
+/**
+ * Fixture generation script for E2E tests.
+ * Creates minimal test files with known metadata using the bundled ExifTool.
+ *
+ * Run with: npx tsx tests/e2e/fixtures/generate_fixtures.ts
+ */
+
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const EXIFTOOL =
+	process.platform === "win32"
+		? path.resolve(__dirname, "../../../.resources/win/bin/exiftool.exe")
+		: path.resolve(__dirname, "../../../.resources/nix/bin/exiftool");
+
+const DEFAULT_FIXTURES_DIR = __dirname;
+// Phase 51.1 (D-47): the bundled ExifTool distribution's own test-image corpus is the
+// source for the vendored RAW fixtures -- same provenance mechanism RAF-PROVENANCE.md
+// already documents for sample.raf.
+const RAW_UPSTREAM_DEFAULT_DIR = path.resolve(
+	__dirname,
+	"../../../exiftool_downloads/Image-ExifTool-13.59/t/images",
+);
+const QUICKTIME_DATE = "2019:10:02 00:49:04";
+const QUICKTIME_EPOCH_OFFSET_SECONDS = 2082844800;
+const ISSUE_240_TAGS = {
+	CreateDate: QUICKTIME_DATE,
+	TrackCreateDate: QUICKTIME_DATE,
+	MediaCreateDate: QUICKTIME_DATE,
+} as const;
+
+// Issue #344: Microsoft Pro Photo Tools writes the MicrosoftPhoto XMP namespace URI with a
+// trailing slash ("http://ns.microsoft.com/photo/1.0/"), which does not match ExifTool's
+// canonical URI (no trailing slash). ExifTool.pm's XMP parser recovers by toggling the
+// trailing slash and retrying (Image-ExifTool-13.59/lib/Image/ExifTool/XMP.pm:3902-3915,
+// the "patch for Nikon NX2 URI bug for Microsoft PhotoInfo namespace" branch), then emits
+// `$et->Warn("Fixed incorrect URI for xmlns:MicrosoftPhoto", 1)` -- the trailing `1` marks
+// this a *minor* warning (rendered as the `[minor] ` JSON value prefix), never an Error.
+// Measured this session: `xmlns:MicrosoftPhoto="http://ns.microsoft.com/photo/1.0/"` (WITH
+// the trailing slash) is the string that trips the recovery path and produces the warning;
+// declaring the canonical no-trailing-slash form produces no warning at all.
+const ISSUE_344_MICROSOFT_PHOTO_XMP = `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<rdf:Description rdf:about="" xmlns:MicrosoftPhoto="http://ns.microsoft.com/photo/1.0/">
+<MicrosoftPhoto:Rating>3</MicrosoftPhoto:Rating>
+</rdf:Description>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`;
+const ISSUE_344_EXPECTED_WARNING =
+	"[minor] Fixed incorrect URI for xmlns:MicrosoftPhoto";
+const ISSUE_344_COOCCURRENCE_NON_MINOR_WARNING = "Bad offset for IFD1 Make";
+
+// Minimal valid 1x1 white JPEG (JFIF)
+function createMinimalJpeg(): Buffer {
+	return Buffer.from([
+		// SOI
+		0xff, 0xd8,
+		// APP0 JFIF marker
+		0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+		0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+		// DQT (quantization table)
+		0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08,
+		0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b,
+		0x0b, 0x0c, 0x19, 0x12, 0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d,
+		0x1a, 0x1c, 0x1c, 0x20, 0x24, 0x2e, 0x27, 0x20, 0x22, 0x2c, 0x23, 0x1c,
+		0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1f, 0x27,
+		0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32,
+		// SOF0 (Start of Frame, baseline, 1x1, 1 component)
+		0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11,
+		0x00,
+		// DHT (Huffman table - DC)
+		0xff, 0xc4, 0x00, 0x1f, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01,
+		0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
+		0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+		// DHT (Huffman table - AC)
+		0xff, 0xc4, 0x00, 0xb5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04,
+		0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7d, 0x01, 0x02, 0x03,
+		0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61,
+		0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1,
+		0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a,
+		0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34,
+		0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+		0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64,
+		0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+		0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93,
+		0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6,
+		0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9,
+		0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3,
+		0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5,
+		0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+		0xf8, 0xf9, 0xfa,
+		// SOS (Start of Scan)
+		0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x7b, 0x40,
+		// Scan data (minimal 1x1 pixel)
+		0x1b,
+		// EOI
+		0xff, 0xd9,
+	]);
+}
+
+// Build an APP1 XMP segment: marker + big-endian 2-byte length + the NUL-terminated Adobe
+// XMP identifier + the raw XMP packet. Byte-deterministic -- no timestamps, no hostname.
+function buildXmpApp1Segment(xml: string): Buffer {
+	const identifier = Buffer.from("http://ns.adobe.com/xap/1.0/\0", "ascii");
+	const packet = Buffer.from(xml, "utf8");
+	const payload = Buffer.concat([identifier, packet]);
+	const length = Buffer.alloc(2);
+	// Segment length field counts itself (2 bytes) plus everything after it, per the JPEG
+	// marker-segment spec -- it does not include the 2-byte 0xFFE1 marker itself.
+	length.writeUInt16BE(payload.length + 2, 0);
+	return Buffer.concat([Buffer.from([0xff, 0xe1]), length, payload]);
+}
+
+// Splice one or more APP1 segments into a minimal JPEG immediately after the SOI marker
+// (the first two bytes), matching where real encoders place APP1. JPEG permits multiple
+// APP1 segments (one EXIF, one XMP is the real-world convention this mirrors).
+function spliceApp1(jpeg: Buffer, ...app1Segments: Buffer[]): Buffer {
+	return Buffer.concat([
+		jpeg.subarray(0, 2),
+		...app1Segments,
+		jpeg.subarray(2),
+	]);
+}
+
+// D-06 settlement fixture (issue #344 co-occurrence, Task 2): a minimal EXIF TIFF/IFD
+// structure with exactly one IFD1 entry (the Make tag, ASCII, count large enough to force
+// an out-of-line value pointer) whose value offset points past the end of the file. Read
+// this against Exif.pm's `$et->Warn("Bad offset for $dir $tagStr", $inMakerNotes)`
+// (Image-ExifTool-13.59/lib/Image/ExifTool/Exif.pm:6660): $inMakerNotes is falsy for an
+// ordinary IFD1 entry, so the warning carries no `[minor]` prefix -- a second, independent,
+// non-minor ExifTool-group diagnostic to co-occur with the D-10 MicrosoftPhoto one. Measured
+// this session: produces exactly "Bad offset for IFD1 Make".
+function buildExifApp1BadIfd1Offset(): Buffer {
+	const u16le = (n: number): Buffer => {
+		const b = Buffer.alloc(2);
+		b.writeUInt16LE(n, 0);
+		return b;
+	};
+	const u32le = (n: number): Buffer => {
+		const b = Buffer.alloc(4);
+		b.writeUInt32LE(n, 0);
+		return b;
+	};
+
+	const MAKE_TAG_ID = 0x010f;
+	const ASCII_TYPE = 2;
+	const OUT_OF_RANGE_VALUE_OFFSET = 0xfffffff0;
+
+	const tiffHeader = Buffer.concat([
+		Buffer.from("II", "ascii"), // little-endian byte order mark
+		u16le(42), // TIFF magic
+		u32le(8), // offset to IFD0, immediately after this 8-byte header
+	]);
+
+	// IFD0: zero entries, next-IFD offset points straight at IFD1 (the "Bad offset for
+	// IFD1 ..." dir name in Exif.pm's warning comes from processing IFD1, not IFD0).
+	const ifd1Start =
+		8 + 2 /* count */ + 0 * 12 /* entries */ + 4; /* next offset */
+	const ifd0 = Buffer.concat([
+		u16le(0), // entry count
+		u32le(ifd1Start), // next IFD offset -> IFD1
+	]);
+
+	// IFD1: one entry (Make, ASCII, count=20 so it needs an out-of-line value pointer),
+	// whose value offset is deliberately out of range.
+	const ifd1Entry = Buffer.concat([
+		u16le(MAKE_TAG_ID),
+		u16le(ASCII_TYPE),
+		u32le(20),
+		u32le(OUT_OF_RANGE_VALUE_OFFSET),
+	]);
+	const ifd1 = Buffer.concat([
+		u16le(1), // entry count
+		ifd1Entry,
+		u32le(0), // no further IFD
+	]);
+
+	const tiff = Buffer.concat([tiffHeader, ifd0, ifd1]);
+	const payload = Buffer.concat([Buffer.from("Exif\0\0", "ascii"), tiff]);
+	const length = Buffer.alloc(2);
+	length.writeUInt16BE(payload.length + 2, 0);
+	return Buffer.concat([Buffer.from([0xff, 0xe1]), length, payload]);
+}
+
+// Phase 51 (RMV-03/RMV-04): a single-strip, single-page TIFF/IFD encoder. Factored so
+// Phase 51-03's two-page builder can call it once per page, passing each page's own
+// start offset and the offset of the next IFD (0 for the last page).
+function tiffU16le(n: number): Buffer {
+	const b = Buffer.alloc(2);
+	b.writeUInt16LE(n, 0);
+	return b;
+}
+function tiffU32le(n: number): Buffer {
+	const b = Buffer.alloc(4);
+	b.writeUInt32LE(n, 0);
+	return b;
+}
+
+const TIFF_TYPE_SHORT = 3;
+const TIFF_TYPE_LONG = 4;
+const TIFF_TYPE_RATIONAL = 5;
+
+function tiffIfdEntry(
+	tag: number,
+	type: number,
+	count: number,
+	value: number,
+): Buffer {
+	return Buffer.concat([
+		tiffU16le(tag),
+		tiffU16le(type),
+		tiffU32le(count),
+		tiffU32le(value),
+	]);
+}
+
+// Encodes one TIFF page: a 12-entry IFD0-shaped directory (ImageWidth, ImageLength,
+// BitsPerSample, Compression, PhotometricInterpretation, StripOffsets, SamplesPerPixel,
+// RowsPerStrip (single strip, equal to image height), StripByteCounts, XResolution,
+// YResolution, ResolutionUnit), the two out-of-line RATIONAL values the resolution tags
+// point at, then the raw pixel strip -- in that byte order, immediately following the IFD
+// at `ifdStart`. Callers own offset bookkeeping across pages (each page's IFD, rationals,
+// and strip are contiguous, so the next page's `ifdStart` is this function's return
+// length added to the current `ifdStart`).
+function buildTiffPage({
+	ifdStart,
+	nextIfdOffset,
+	pixels,
+}: {
+	ifdStart: number;
+	nextIfdOffset: number;
+	pixels: Buffer;
+}): Buffer {
+	const entryCount = 12;
+	const ifdSize = 2 + entryCount * 12 + 4;
+	const xResolutionOffset = ifdStart + ifdSize;
+	const yResolutionOffset = xResolutionOffset + 8;
+	const stripOffset = yResolutionOffset + 8;
+
+	const entries = Buffer.concat([
+		tiffIfdEntry(256, TIFF_TYPE_SHORT, 1, 4), // ImageWidth
+		tiffIfdEntry(257, TIFF_TYPE_SHORT, 1, 4), // ImageLength
+		tiffIfdEntry(258, TIFF_TYPE_SHORT, 1, 8), // BitsPerSample
+		tiffIfdEntry(259, TIFF_TYPE_SHORT, 1, 1), // Compression (none)
+		tiffIfdEntry(262, TIFF_TYPE_SHORT, 1, 1), // PhotometricInterpretation (BlackIsZero)
+		tiffIfdEntry(273, TIFF_TYPE_LONG, 1, stripOffset), // StripOffsets
+		tiffIfdEntry(277, TIFF_TYPE_SHORT, 1, 1), // SamplesPerPixel
+		tiffIfdEntry(278, TIFF_TYPE_SHORT, 1, 4), // RowsPerStrip (== ImageLength)
+		tiffIfdEntry(279, TIFF_TYPE_LONG, 1, pixels.length), // StripByteCounts
+		tiffIfdEntry(282, TIFF_TYPE_RATIONAL, 1, xResolutionOffset), // XResolution
+		tiffIfdEntry(283, TIFF_TYPE_RATIONAL, 1, yResolutionOffset), // YResolution
+		tiffIfdEntry(296, TIFF_TYPE_SHORT, 1, 2), // ResolutionUnit (inches)
+	]);
+	const ifd = Buffer.concat([
+		tiffU16le(entryCount),
+		entries,
+		tiffU32le(nextIfdOffset),
+	]);
+	const xResolution = Buffer.concat([tiffU32le(72), tiffU32le(1)]); // 72/1
+	const yResolution = Buffer.concat([tiffU32le(72), tiffU32le(1)]); // 72/1
+
+	return Buffer.concat([ifd, xResolution, yResolution, pixels]);
+}
+
+// 4x4, 8-bit greyscale, single strip. Pixel bytes are deterministic (byte i = (i * 17) &
+// 0xff) so the fixture is reproducible and its content is assertable without a rendering
+// library.
+function createMinimalTiff(): Buffer {
+	const header = Buffer.concat([
+		Buffer.from("II", "ascii"), // little-endian byte order mark
+		tiffU16le(42), // TIFF magic
+		tiffU32le(8), // offset to IFD0, immediately after this 8-byte header
+	]);
+	const pixels = Buffer.alloc(16);
+	for (let i = 0; i < pixels.length; i += 1) {
+		pixels[i] = (i * 17) & 0xff;
+	}
+	const page = buildTiffPage({ ifdStart: 8, nextIfdOffset: 0, pixels });
+	return Buffer.concat([header, page]);
+}
+
+// Phase 51-03 (D-22, D-25): a two-page TIFF built on the same per-page encoder, each page
+// carrying its own deterministic 4x4 8-bit strip and its own next-IFD offset. Page one's
+// next-IFD offset points at page two's IFD; page two's is 0 (last page). Page two's pixel
+// bytes use a distinct formula so the two strips are never accidentally identical.
+function createTwoPageTiff(): Buffer {
+	const header = Buffer.concat([
+		Buffer.from("II", "ascii"), // little-endian byte order mark
+		tiffU16le(42), // TIFF magic
+		tiffU32le(8), // offset to IFD0, immediately after this 8-byte header
+	]);
+	const page1Pixels = Buffer.alloc(16);
+	for (let i = 0; i < page1Pixels.length; i += 1) {
+		page1Pixels[i] = (i * 17) & 0xff;
+	}
+	const page2Pixels = Buffer.alloc(16);
+	for (let i = 0; i < page2Pixels.length; i += 1) {
+		page2Pixels[i] = (255 - i * 13) & 0xff;
+	}
+	const page1Start = 8;
+	// buildTiffPage's returned length does not depend on nextIfdOffset's VALUE (it is always
+	// a fixed 4-byte field) -- build once with a placeholder to learn page one's length, then
+	// rebuild with the real offset to page two's IFD.
+	const page1Probe = buildTiffPage({
+		ifdStart: page1Start,
+		nextIfdOffset: 0,
+		pixels: page1Pixels,
+	});
+	const page2Start = page1Start + page1Probe.length;
+	const page1 = buildTiffPage({
+		ifdStart: page1Start,
+		nextIfdOffset: page2Start,
+		pixels: page1Pixels,
+	});
+	const page2 = buildTiffPage({
+		ifdStart: page2Start,
+		nextIfdOffset: 0,
+		pixels: page2Pixels,
+	});
+	return Buffer.concat([header, page1, page2]);
+}
+
+// Build a PNG chunk with correct CRC32 (covers type + data)
+function pngChunk(type: string, data: Buffer): Buffer {
+	const typeBytes = Buffer.from(type, "ascii");
+	const length = Buffer.alloc(4);
+	length.writeUInt32BE(data.length, 0);
+	const crcInput = Buffer.concat([typeBytes, data]);
+	const crc = Buffer.alloc(4);
+	crc.writeInt32BE(crc32(crcInput), 0);
+	return Buffer.concat([length, typeBytes, data, crc]);
+}
+
+// CRC32 for PNG (ISO 3309 / ITU-T V.42)
+function crc32(buf: Buffer): number {
+	let c = 0xffffffff;
+	for (let i = 0; i < buf.length; i++) {
+		c = c ^ buf[i]!;
+		for (let j = 0; j < 8; j++) {
+			c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+		}
+	}
+	return (c ^ 0xffffffff) | 0;
+}
+
+// Minimal valid 1x1 PNG (white pixel) with correct CRCs
+function createMinimalPng(): Buffer {
+	const signature = Buffer.from([
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+	]);
+	// IHDR: width=1, height=1, bit_depth=8, color_type=2 (RGB), compression=0, filter=0, interlace=0
+	const ihdrData = Buffer.from([
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+		0x00,
+	]);
+	// Raw pixel data: filter byte 0 + RGB white (255, 255, 255)
+	const rawPixel = Buffer.from([0x00, 0xff, 0xff, 0xff]);
+	const compressed = zlib.deflateSync(rawPixel);
+	return Buffer.concat([
+		signature,
+		pngChunk("IHDR", ihdrData),
+		pngChunk("IDAT", compressed),
+		pngChunk("IEND", Buffer.alloc(0)),
+	]);
+}
+
+// Minimal valid PDF with correct xref offsets
+// PDF spec: xref entries must be exactly 20 bytes each with \r\n or space+\n terminator
+function createMinimalPdf(): Buffer {
+	// Build body objects, tracking byte offsets precisely
+	const parts: string[] = [];
+	const offsets: number[] = [];
+	let pos = 0;
+
+	const addPart = (s: string): void => {
+		parts.push(s);
+		pos += Buffer.byteLength(s, "ascii");
+	};
+	const markOffset = (): void => {
+		offsets.push(pos);
+	};
+
+	addPart("%PDF-1.4\n");
+
+	markOffset(); // obj 1
+	addPart("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+	markOffset(); // obj 2
+	addPart("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+	markOffset(); // obj 3
+	addPart(
+		"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+	);
+
+	const xrefOffset = pos;
+	const pad = (n: number): string => String(n).padStart(10, "0");
+
+	// Each xref entry must be exactly 20 bytes: oooooooooo ggggg f/n \r\n (no trailing space before \r\n)
+	// Format: 10-digit offset + space + 5-digit generation + space + 'f'/'n' + space + \n = 20 bytes
+	// OR: 10-digit offset + space + 5-digit generation + space + 'f'/'n' + \r + \n = 20 bytes
+	addPart("xref\n");
+	addPart("0 4\n");
+	addPart(`${pad(0)} 65535 f\r\n`);
+	addPart(`${pad(offsets[0]!)} 00000 n\r\n`);
+	addPart(`${pad(offsets[1]!)} 00000 n\r\n`);
+	addPart(`${pad(offsets[2]!)} 00000 n\r\n`);
+	addPart("trailer\n<< /Size 4 /Root 1 0 R >>\n");
+	addPart(`startxref\n${xrefOffset}\n%%EOF\n`);
+
+	return Buffer.from(parts.join(""), "ascii");
+}
+
+// Minimal valid MP4 container (ftyp + moov atoms)
+function createMinimalMp4(): Buffer {
+	const ftyp = Buffer.from([
+		// ftyp box: size=20, 'ftyp', brand='isom', version=0x200, compat='isom'
+		0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d,
+		0x00, 0x00, 0x02, 0x00, 0x69, 0x73, 0x6f, 0x6d,
+	]);
+	const moov = Buffer.from([
+		// moov box: size=8, 'moov'
+		0x00, 0x00, 0x00, 0x08, 0x6d, 0x6f, 0x6f, 0x76,
+	]);
+	return Buffer.concat([ftyp, moov]);
+}
+
+function mp4Box(type: string, payload: Buffer): Buffer {
+	const box = Buffer.alloc(8);
+	box.writeUInt32BE(8 + payload.length, 0);
+	box.write(type, 4, "ascii");
+	return Buffer.concat([box, payload]);
+}
+
+function mp4FullBox(
+	type: string,
+	version: number,
+	flags: number,
+	payload: Buffer,
+): Buffer {
+	const header = Buffer.alloc(4);
+	header.writeUInt8(version, 0);
+	header.writeUIntBE(flags, 1, 3);
+	return mp4Box(type, Buffer.concat([header, payload]));
+}
+
+function quickTimeSeconds(date: string): number {
+	const match = /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(date);
+	if (match === null) {
+		throw new Error(`Invalid QuickTime timestamp: ${date}`);
+	}
+	const [, year, month, day, hour, minute, second] = match;
+	return (
+		Date.UTC(
+			Number(year),
+			Number(month) - 1,
+			Number(day),
+			Number(hour),
+			Number(minute),
+			Number(second),
+		) /
+			1000 +
+		QUICKTIME_EPOCH_OFFSET_SECONDS
+	);
+}
+
+function movieHeaderMp4(): Buffer {
+	const createdAt = quickTimeSeconds(QUICKTIME_DATE);
+	const timescale = 1000;
+	const duration = 1000;
+
+	const ftyp = mp4Box(
+		"ftyp",
+		Buffer.from([
+			0x69,
+			0x73,
+			0x6f,
+			0x6d, // major brand: isom
+			0x00,
+			0x00,
+			0x02,
+			0x00, // minor version
+			0x69,
+			0x73,
+			0x6f,
+			0x6d, // compatible: isom
+			0x6d,
+			0x70,
+			0x34,
+			0x32, // compatible: mp42
+		]),
+	);
+
+	const mvhdPayload = Buffer.alloc(96);
+	mvhdPayload.writeUInt32BE(createdAt, 0);
+	mvhdPayload.writeUInt32BE(createdAt, 4);
+	mvhdPayload.writeUInt32BE(timescale, 8);
+	mvhdPayload.writeUInt32BE(duration, 12);
+	mvhdPayload.writeUInt32BE(0x00010000, 16); // rate 1.0
+	mvhdPayload.writeUInt16BE(0x0100, 20); // volume 1.0
+	mvhdPayload.writeUInt32BE(0x00010000, 32);
+	mvhdPayload.writeUInt32BE(0x00010000, 48);
+	mvhdPayload.writeUInt32BE(0x40000000, 64);
+	mvhdPayload.writeUInt32BE(2, 92); // next track id
+
+	const tkhdPayload = Buffer.alloc(80);
+	tkhdPayload.writeUInt32BE(createdAt, 0);
+	tkhdPayload.writeUInt32BE(createdAt, 4);
+	tkhdPayload.writeUInt32BE(1, 8); // track id
+	tkhdPayload.writeUInt32BE(duration, 16);
+	tkhdPayload.writeUInt16BE(0x0100, 32); // volume 1.0
+	tkhdPayload.writeUInt32BE(0x00010000, 36);
+	tkhdPayload.writeUInt32BE(0x00010000, 52);
+	tkhdPayload.writeUInt32BE(0x40000000, 68);
+
+	const mdhdPayload = Buffer.alloc(20);
+	mdhdPayload.writeUInt32BE(createdAt, 0);
+	mdhdPayload.writeUInt32BE(createdAt, 4);
+	mdhdPayload.writeUInt32BE(timescale, 8);
+	mdhdPayload.writeUInt32BE(duration, 12);
+	mdhdPayload.writeUInt16BE(0x55c4, 16); // undetermined language
+
+	const mdia = mp4Box("mdia", mp4FullBox("mdhd", 0, 0, mdhdPayload));
+	const trak = mp4Box(
+		"trak",
+		Buffer.concat([mp4FullBox("tkhd", 0, 0x000007, tkhdPayload), mdia]),
+	);
+	const moov = mp4Box(
+		"moov",
+		Buffer.concat([mp4FullBox("mvhd", 0, 0, mvhdPayload), trak]),
+	);
+
+	return Buffer.concat([ftyp, moov]);
+}
+
+function readFixtureMetadata(filePath: string): Record<string, unknown> {
+	const output = execFileSync(EXIFTOOL, ["-G1", "-s", "-json", filePath], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const parsed = JSON.parse(output) as unknown;
+	if (!Array.isArray(parsed) || parsed.length !== 1) {
+		throw new Error(`Expected one ExifTool result for ${filePath}`);
+	}
+	const first = parsed[0];
+	if (first === null || typeof first !== "object" || Array.isArray(first)) {
+		throw new Error(`Expected ExifTool object result for ${filePath}`);
+	}
+	return first as Record<string, unknown>;
+}
+
+function assertIssue240Metadata(filePath: string): void {
+	const metadata = readFixtureMetadata(filePath);
+	for (const [tag, expected] of Object.entries(ISSUE_240_TAGS)) {
+		const actual =
+			metadata[tag] ??
+			metadata[`QuickTime:${tag}`] ??
+			metadata[`Track1:${tag}`];
+		if (actual !== expected) {
+			throw new Error(
+				`issue240.mp4 ${tag} expected ${expected}, got ${String(actual)}`,
+			);
+		}
+	}
+}
+
+// Phase 51 (D-25): re-reads sample.tif's seeded IFD0/GPS tags via the bundled binary and
+// throws naming the file, the tag, and the observed value on any mismatch -- no swallowed
+// try/catch, matching the sample.pdf fail-loud lesson above.
+function assertTiffSeeds(
+	filePath: string,
+	expected: Readonly<Record<string, string>>,
+): void {
+	const metadata = readFixtureMetadata(filePath);
+	for (const [tag, expectedValue] of Object.entries(expected)) {
+		const actual = metadata[tag];
+		if (actual !== expectedValue) {
+			throw new Error(
+				`${filePath} ${tag} expected ${expectedValue}, got ${String(actual)}`,
+			);
+		}
+	}
+}
+
+// Reads the bundled binary's grouped diagnostic output directly, rather than reusing
+// readFixtureMetadata's ungrouped -json, since ExifTool-group Error/Warning keys (the
+// values #344's fixtures must produce) only survive under -G.
+function readFixtureDiagnostics(
+	filePath: string,
+	groupArg = "-G1:2",
+): Record<string, unknown> {
+	const output = execFileSync(EXIFTOOL, ["-j", groupArg, filePath], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const parsed = JSON.parse(output) as unknown;
+	if (!Array.isArray(parsed) || parsed.length !== 1) {
+		throw new Error(`Expected one ExifTool result for ${filePath}`);
+	}
+	const first = parsed[0];
+	if (first === null || typeof first !== "object" || Array.isArray(first)) {
+		throw new Error(`Expected ExifTool object result for ${filePath}`);
+	}
+	return first as Record<string, unknown>;
+}
+
+// Verify with the real binary, per this file's own established convention: never assert a
+// fixture is correct by construction alone.
+function assertIssue344Warning(filePath: string): void {
+	const diagnostics = readFixtureDiagnostics(filePath);
+	const warning = diagnostics["ExifTool:Warning"];
+	if (warning !== ISSUE_344_EXPECTED_WARNING) {
+		throw new Error(
+			`${filePath} ExifTool:Warning expected "${ISSUE_344_EXPECTED_WARNING}", got ${String(warning)}`,
+		);
+	}
+}
+
+// D-06 settlement check: under -G1:2 alone the two diagnostics collide onto one suppressed
+// JSON key (measured this session -- see 48-D06-SETTLEMENT.md), so this asserts the
+// disambiguated -G1:2:4 shape the adopted fix actually reads.
+function assertIssue344Cooccurrence(filePath: string): void {
+	const diagnostics = readFixtureDiagnostics(filePath, "-G1:2:4");
+	const primary = diagnostics["ExifTool:Warning"];
+	const secondary = diagnostics["ExifTool:Copy1:Warning"];
+	if (primary !== ISSUE_344_COOCCURRENCE_NON_MINOR_WARNING) {
+		throw new Error(
+			`${filePath} ExifTool:Warning expected "${ISSUE_344_COOCCURRENCE_NON_MINOR_WARNING}", got ${String(primary)}`,
+		);
+	}
+	if (secondary !== ISSUE_344_EXPECTED_WARNING) {
+		throw new Error(
+			`${filePath} ExifTool:Copy1:Warning expected "${ISSUE_344_EXPECTED_WARNING}", got ${String(secondary)}`,
+		);
+	}
+}
+
+// Minimal valid WebP (VP8 lossy) — a proper 1x1 keyframe
+// VP8 spec: frame tag (3 bytes) + start code (3 bytes) + frame header
+function createMinimalWebp(): Buffer {
+	// Known-good minimal 1x1 VP8 bitstream (10 bytes)
+	// Frame tag: keyframe, version=0, show_frame=1, first_part_size
+	// Start code: 0x9D 0x01 0x2A
+	// Width=1 (no scale), Height=1 (no scale)
+	// Then minimal partition data
+	const vp8Data = Buffer.from([
+		// Frame tag: keyframe=0, version=0, show_frame=1, partition0_size=3
+		0x30,
+		0x01,
+		0x00,
+		// Start code + dimensions
+		0x9d,
+		0x01,
+		0x2a, // VP8 start code
+		0x01,
+		0x00, // width=1, scale=0
+		0x01,
+		0x00, // height=1, scale=0
+		// Minimal partition data (boolean decoder init + single macroblock)
+		0x02,
+		0x00,
+		0x34,
+		0x25,
+		0xa4,
+		0x00,
+		0x03,
+		0x70,
+		0x00,
+		0xfe,
+		0xfb,
+		0x94,
+		0x00,
+		0x00,
+	]);
+
+	// VP8 chunk size must match actual data (pad to even if needed)
+	const paddedVp8 =
+		vp8Data.length % 2 === 0
+			? vp8Data
+			: Buffer.concat([vp8Data, Buffer.alloc(1)]);
+
+	const vp8Header = Buffer.alloc(8);
+	vp8Header.write("VP8 ", 0);
+	vp8Header.writeUInt32LE(vp8Data.length, 4); // chunk size is unpadded
+
+	const riffPayloadSize = 4 + 8 + paddedVp8.length; // 'WEBP' + chunk header + padded data
+	const riffHeader = Buffer.alloc(12);
+	riffHeader.write("RIFF", 0);
+	riffHeader.writeUInt32LE(riffPayloadSize, 4);
+	riffHeader.write("WEBP", 8);
+
+	return Buffer.concat([riffHeader, vp8Header, paddedVp8]);
+}
+
+// Nikon Adobe RGB 4.0.0.3000 profile, extracted from ExifTool 13.59's public
+// test corpus and pinned here so the WebP oracle fixture remains reproducible.
+const WEBP_ORACLE_ICC_PROFILE = Buffer.from(
+	"AAAB7E5LT04CIAAAbW50clJHQiBYWVogB88ADAAHABIAOwAWYWNzcEFQUEwAAAAAbm9uZQAAAAEAAAAAAAAAAAAAAAAAAPbWAAEAAAAA0y0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJZGVzYwAAAPAAAABNclhZWgAAAUAAAAAUZ1hZWgAAAVQAAAAUYlhZWgAAAWgAAAAUclRSQwAAAXwAAAAOZ1RSQwAAAYwAAAAOYlRSQwAAAZwAAAAOd3RwdAAAAawAAAAUY3BydAAAAcAAAAAsZGVzYwAAAAAAAAAbTmlrb24gQWRvYmUgUkdCIDQuMC4wLjMwMDAAAAAAAAAAAAAAABtOaWtvbiBBZG9iZSBSR0IgNC4wLjAuMzAwMAAAAABYWVogAAAAAAAAnBkAAE+mAAAE/FhZWiAAAAAAAAA0iwAAoCsAAA+VWFlaIAAAAAAAACYyAAAQLwAAvqBjdXJ2AAAAAAAAAAECMwAAY3VydgAAAAAAAAABAjMAAGN1cnYAAAAAAAAAAQIzAABYWVogAAAAAAAA81QAAQAAAAEWz3RleHQAAAAATmlrb24gSW5jLiAmIE5pa29uIENvcnBvcmF0aW9uIDIwMDEA",
+	"base64",
+);
+
+// Phase 51.1 (D-42/D-43/D-47): each row's `expected` literal is what the fixture step
+// re-reads with the bundled binary immediately after seeding -- fail loudly if a seed did
+// not land, matching assertTiffSeeds's convention above.
+const RAW_FIXTURE_SPECS = [
+	{
+		name: "CanonRaw.cr2",
+		upstreamSha256:
+			"b5d3d26f3c85bcb35a52515eac060e2e362161893504013589ffd9ad2e9b004b",
+		fileType: "CR2",
+		expected: {
+			"IFD0:Artist": "ZZP511-ARTIST",
+			"IFD0:Software": "ZZP511-SOFT",
+			"IFD0:ImageDescription": "ZZP511-DESC",
+			"IFD0:Copyright": "ZZP511-COPY",
+			"IFD0:XPComment": "ZZP511-XPCOMMENT",
+			"IFD0:XPTitle": "ZZP511-XPTITLE",
+			"ExifIFD:UserComment": "ZZP511-COMMENT",
+			"ExifIFD:SerialNumber": "ZZP511-BODYSN",
+			"ExifIFD:LensSerialNumber": "ZZP511-LENSSN",
+			"ExifIFD:OwnerName": "ZZP511-OWNER",
+			"GPS:GPSLatitudeRef": "North",
+			"ExifIFD:DateTimeOriginal": "2005:08:03 18:59:18",
+			"Canon:SerialNumber": "0123456789",
+		},
+	},
+	{
+		// Phase 51.1-02 (D-47): upstream digest re-measured this session -- the value
+		// transcribed into 51.1-02-PLAN.md's <interfaces> table did not match `shasum -a 256`
+		// on the vendored file (a documented, self-correcting transcription slip the plan
+		// itself warned the executor to re-measure, not copy).
+		name: "DNG.dng",
+		upstreamSha256:
+			"daa9ce7a2c6923815390d8566254ef4d4a75d68d1531afdb264bd4b39a8dfd89",
+		fileType: "DNG",
+		expected: {
+			"IFD0:Artist": "ZZP511-ARTIST",
+			"IFD0:Software": "ZZP511-SOFT",
+			"IFD0:ImageDescription": "ZZP511-DESC",
+			"IFD0:Copyright": "ZZP511-COPY",
+			"IFD0:XPComment": "ZZP511-XPCOMMENT",
+			"IFD0:XPTitle": "ZZP511-XPTITLE",
+			"ExifIFD:UserComment": "ZZP511-COMMENT",
+			"ExifIFD:SerialNumber": "ZZP511-BODYSN",
+			"ExifIFD:LensSerialNumber": "ZZP511-LENSSN",
+			"ExifIFD:OwnerName": "ZZP511-OWNER",
+			"GPS:GPSLatitudeRef": "North",
+			// Upstream identifying values already present in the vendored file (not seeded by
+			// RAW_SEED_ARGS) -- re-read here to confirm the vendored bytes still carry them.
+			"IFD0:CameraSerialNumber": "012345678",
+			"IFD0:RawDataUniqueID": "0358DB4E08632D90925171A6BB8848A2",
+			"IFD0:OriginalRawFileName": "Canon350D.CR2",
+			"IFD0:UniqueCameraModel": "Canon EOS 350D",
+		},
+	},
+	{
+		name: "CanonRaw.cr3",
+		upstreamSha256:
+			"dc02aa55e277935b690879584e97c2d013f54d854afaec6f9d3274c99a918fd6",
+		fileType: "CR3",
+		expected: {
+			"IFD0:Artist": "ZZP511-ARTIST",
+			"IFD0:Software": "ZZP511-SOFT",
+			"IFD0:ImageDescription": "ZZP511-DESC",
+			"IFD0:Copyright": "ZZP511-COPY",
+			"IFD0:XPComment": "ZZP511-XPCOMMENT",
+			"IFD0:XPTitle": "ZZP511-XPTITLE",
+			"ExifIFD:UserComment": "ZZP511-COMMENT",
+			"ExifIFD:SerialNumber": "ZZP511-BODYSN",
+			"ExifIFD:LensSerialNumber": "ZZP511-LENSSN",
+			"ExifIFD:OwnerName": "ZZP511-OWNER",
+			"GPS:GPSLatitudeRef": "North",
+			// Upstream identifying values already present in the vendored file.
+			"Canon:InternalSerialNumber": "CG0156580",
+			"ExifIFD:OffsetTime": "+00:00",
+			"ExifIFD:SubSecTimeOriginal": 21,
+			"ExifIFD:DateTimeOriginal": "2018:02:21 12:08:56",
+		},
+	},
+	{
+		// RW2's IFD0 seeds land ONLY in the embedded JpgFromRaw preview -- but
+		// readFixtureMetadata (below) reads with plain -G1 -s -json (no -a, no -G3), under
+		// which ExifTool's duplicate-key JSON suppression collapses the embedded preview's
+		// IFD0 group onto the SAME "IFD0:<Tag>" key used elsewhere in this table (measured
+		// this session; confirmed there is no separate main-IFD0 copy to collide with). Do
+		// not confuse this with raw_probe.ts's readRawTags, which uses -G3:1 and DOES report
+		// these under a "Doc1:IFD0:<Tag>" key (see RAW_CASES below).
+		name: "Panasonic.rw2",
+		upstreamSha256:
+			"431a1239713ce1bca8f0b422b9a094372246669432060e2a0a21d1fd2f761678",
+		fileType: "RW2",
+		expected: {
+			"IFD0:Artist": "ZZP511-ARTIST",
+			"IFD0:Software": "ZZP511-SOFT",
+			"IFD0:ImageDescription": "ZZP511-DESC",
+			"IFD0:Copyright": "ZZP511-COPY",
+			"IFD0:XPComment": "ZZP511-XPCOMMENT",
+			"IFD0:XPTitle": "ZZP511-XPTITLE",
+			"ExifIFD:UserComment": "ZZP511-COMMENT",
+			"ExifIFD:SerialNumber": "ZZP511-BODYSN",
+			"ExifIFD:LensSerialNumber": "ZZP511-LENSSN",
+			"ExifIFD:OwnerName": "ZZP511-OWNER",
+			"GPS:GPSLatitudeRef": "North",
+			// Upstream identifying value already present in the vendored file.
+			"ExifIFD:DateTimeOriginal": "2008:08:06 15:21:56",
+		},
+	},
+] as const;
+
+const RAW_SEED_ARGS = [
+	"-GPSLatitude=37.7749",
+	"-GPSLatitudeRef=N",
+	"-GPSLongitude=-122.4194",
+	"-GPSLongitudeRef=W",
+	"-IFD0:Artist=ZZP511-ARTIST",
+	"-IFD0:Software=ZZP511-SOFT",
+	"-IFD0:ImageDescription=ZZP511-DESC",
+	"-IFD0:Copyright=ZZP511-COPY",
+	"-IFD0:XPComment=ZZP511-XPCOMMENT",
+	"-IFD0:XPAuthor=ZZP511-XPAUTHOR",
+	"-IFD0:XPTitle=ZZP511-XPTITLE",
+	"-IFD0:XPSubject=ZZP511-XPSUBJECT",
+	"-IFD0:XPKeywords=ZZP511-XPKEYWORDS",
+	"-ExifIFD:UserComment=ZZP511-COMMENT",
+	"-ExifIFD:SerialNumber=ZZP511-BODYSN",
+	"-ExifIFD:LensSerialNumber=ZZP511-LENSSN",
+	"-ExifIFD:OwnerName=ZZP511-OWNER",
+] as const;
+
+function assertRawSeeds(
+	filePath: string,
+	spec: (typeof RAW_FIXTURE_SPECS)[number],
+): void {
+	const metadata = readFixtureMetadata(filePath);
+	const fileType = metadata["File:FileType"];
+	if (fileType !== spec.fileType) {
+		throw new Error(
+			`${filePath} File:FileType expected ${spec.fileType}, got ${String(fileType)}`,
+		);
+	}
+	for (const [tag, expectedValue] of Object.entries(spec.expected)) {
+		const actual = metadata[tag];
+		if (actual !== expectedValue) {
+			throw new Error(
+				`${filePath} ${tag} expected ${expectedValue}, got ${String(actual)}`,
+			);
+		}
+	}
+}
+
+// Phase 51.1 (D-47): vendors the RAW fixture from the bundled ExifTool distribution's own
+// t/images/ corpus, verifies it against the pinned upstream digest, seeds it with the
+// RAW_SEED_ARGS literal argument array (never a string split -- CONTEXT D-43's zsh
+// word-splitting pitfall), then re-reads and fail-loudly confirms every seed landed.
+function generateRawFixtures(fixturesDir: string, upstreamDir: string): void {
+	for (const spec of RAW_FIXTURE_SPECS) {
+		const upstreamPath = path.join(upstreamDir, spec.name);
+		if (!fs.existsSync(upstreamPath)) {
+			throw new Error(`RAW fixture upstream source missing: ${upstreamPath}`);
+		}
+		const upstreamBytes = fs.readFileSync(upstreamPath);
+		const upstreamDigest = createHash("sha256")
+			.update(upstreamBytes)
+			.digest("hex");
+		if (upstreamDigest !== spec.upstreamSha256) {
+			throw new Error(
+				`RAW fixture upstream digest mismatch for ${spec.name}: expected ${spec.upstreamSha256}, got ${upstreamDigest}`,
+			);
+		}
+		const filePath = path.join(fixturesDir, spec.name);
+		fs.copyFileSync(upstreamPath, filePath);
+		execFileSync(EXIFTOOL, ["-overwrite_original", ...RAW_SEED_ARGS, filePath]);
+		assertRawSeeds(filePath, spec);
+		console.log(
+			`  Created ${spec.name} (vendored ExifTool 13.59 t/images sample, seeded, FileType=${spec.fileType})`,
+		);
+	}
+}
+
+// Phase 52-04 (FID-03, D-37): seven formats the D-37 negative-control matrix needs that the
+// RAW corpus above does not provide (BMP, SVG, AVI, WMV are unwritable; GIF, HEIC, MOV round
+// out the writable families). Vendored unmodified -- no seed args, unlike RAW_FIXTURE_SPECS --
+// mirroring RAF-PROVENANCE.md's "committed unmodified" precedent, not RAW_SEED_ARGS's
+// vendor-then-seed pattern.
+const MATRIX_FIXTURE_SPECS = [
+	{
+		name: "GIF.gif",
+		upstreamSha256:
+			"55f8d30ea6fac980f35d5af11a90b10ddc0186d961b0273e66df2f8b7c5aa6be",
+		fileType: "GIF",
+	},
+	{
+		name: "QuickTime.heic",
+		upstreamSha256:
+			"4e1785e9924600d0274176f52609a2d514481877103b91c714bd2088ea803ae7",
+		fileType: "HEIF",
+	},
+	{
+		name: "QuickTime.mov",
+		upstreamSha256:
+			"eea529609b6026e0cd7b3d9188b997889f905cd89a93421ad7a9063c670449ec",
+		fileType: "MOV",
+	},
+	{
+		name: "BMP.bmp",
+		upstreamSha256:
+			"fab182ec28064483847443e29982d592b64d7019fc4f1db85e02501a40e1dcf8",
+		fileType: "BMP",
+	},
+	{
+		name: "XMP.svg",
+		upstreamSha256:
+			"1e6449dc39a0e61bc9a4d27beaef5e68bc72fc59c6bf1772d174fd34f5f400c2",
+		fileType: "SVG",
+	},
+	{
+		name: "RIFF.avi",
+		upstreamSha256:
+			"7c03b77d115118e3293833e6c1b5d5795c998051d145674368e0b97f02719d4b",
+		fileType: "AVI",
+	},
+	{
+		name: "ASF.wmv",
+		upstreamSha256:
+			"c3cafee199bbf19bb2fdce56211d44d108454ea7efd8ecc7c4cdda7ebce87c97",
+		fileType: "WMV",
+	},
+] as const;
+
+// Vendors each MATRIX_FIXTURE_SPECS row from the same bundled-ExifTool upstream corpus
+// generateRawFixtures reads from: verify upstream digest, copy verbatim (no seeding), re-hash
+// the copy, then confirm -s3 -FileType matches the pinned value.
+function generateMatrixFixtures(
+	fixturesDir: string,
+	upstreamDir: string,
+): void {
+	for (const spec of MATRIX_FIXTURE_SPECS) {
+		const upstreamPath = path.join(upstreamDir, spec.name);
+		if (!fs.existsSync(upstreamPath)) {
+			throw new Error(
+				`Matrix fixture upstream source missing: ${upstreamPath}`,
+			);
+		}
+		const upstreamBytes = fs.readFileSync(upstreamPath);
+		const upstreamDigest = createHash("sha256")
+			.update(upstreamBytes)
+			.digest("hex");
+		if (upstreamDigest !== spec.upstreamSha256) {
+			throw new Error(
+				`Matrix fixture upstream digest mismatch for ${spec.name}: expected ${spec.upstreamSha256}, got ${upstreamDigest}`,
+			);
+		}
+		const filePath = path.join(fixturesDir, spec.name);
+		fs.copyFileSync(upstreamPath, filePath);
+		const copyDigest = createHash("sha256")
+			.update(fs.readFileSync(filePath))
+			.digest("hex");
+		if (copyDigest !== spec.upstreamSha256) {
+			throw new Error(
+				`Matrix fixture copy digest mismatch for ${spec.name}: expected ${spec.upstreamSha256}, got ${copyDigest}`,
+			);
+		}
+		const observedType = execFileSync(EXIFTOOL, ["-s3", "-FileType", filePath])
+			.toString()
+			.trim();
+		if (observedType !== spec.fileType) {
+			throw new Error(
+				`Matrix fixture ${spec.name} expected FileType ${spec.fileType}, got ${observedType}`,
+			);
+		}
+		console.log(
+			`  Created ${spec.name} (vendored ExifTool 13.59 t/images sample, unmodified)`,
+		);
+	}
+}
+
+function generateFixtures(fixturesDir = DEFAULT_FIXTURES_DIR): void {
+	console.log("Generating E2E test fixtures...");
+	fs.mkdirSync(fixturesDir, { recursive: true });
+
+	// sample.jpg - JPEG with known EXIF tags
+	const jpegPath = path.join(fixturesDir, "sample.jpg");
+	fs.writeFileSync(jpegPath, createMinimalJpeg());
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Artist=Test Author",
+		"-Copyright=Test Copyright 2024",
+		"-GPSLatitude=37.7749",
+		"-GPSLongitude=-122.4194",
+		"-Make=TestCamera",
+		"-Model=TestModel",
+		"-DateTimeOriginal=2024:01:01 12:00:00",
+		jpegPath,
+	]);
+	console.log("  Created sample.jpg (JPEG with EXIF)");
+
+	// sample.png - PNG with known metadata (tEXt chunks)
+	const pngPath = path.join(fixturesDir, "sample.png");
+	fs.writeFileSync(pngPath, createMinimalPng());
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Author=Test Author",
+		"-Copyright=Test Copyright 2024",
+		pngPath,
+	]);
+	console.log("  Created sample.png (PNG with metadata)");
+
+	// sample.pdf - PDF with metadata
+	const pdfPath = path.join(fixturesDir, "sample.pdf");
+	fs.writeFileSync(pdfPath, createMinimalPdf());
+	// Deliberately NOT wrapped in try/catch. This call used to swallow its failure behind
+	// a comment claiming the file was "still valid" -- it wasn't. createMinimalPdf briefly
+	// emitted 19-byte xref entries instead of the 20 the spec requires, so ExifTool
+	// rejected the fixture with "Invalid xref table" and could not write it. The generator
+	// was fixed but the committed fixture was never regenerated, and because the only test
+	// using sample.pdf asserted on the file *count* rather than on success, the suite went
+	// on passing while PDF metadata removal was entirely unverified. Let it throw.
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Author=Test Author",
+		"-Title=Test Document",
+		"-Creator=TestCreator",
+		pdfPath,
+	]);
+	console.log("  Created sample.pdf (PDF with metadata)");
+
+	// sample.mp4 - MP4 with metadata
+	const mp4Path = path.join(fixturesDir, "sample.mp4");
+	fs.writeFileSync(mp4Path, createMinimalMp4());
+	// Not wrapped: execFileSync throws only on a nonzero exit, and ExifTool exits 0 for
+	// warnings. So a catch here could never absorb "minor structure warnings" -- only a
+	// genuine failure to write the fixture. See the sample.pdf note above.
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Artist=Test Author",
+		"-Title=Test Video",
+		mp4Path,
+	]);
+	console.log("  Created sample.mp4 (MP4 container)");
+
+	// sample.m4a - MPEG-4 audio container with metadata
+	const m4aPath = path.join(fixturesDir, "sample.m4a");
+	fs.writeFileSync(m4aPath, createMinimalMp4());
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Artist=Test Author",
+		"-Title=Test Audio",
+		m4aPath,
+	]);
+	console.log("  Created sample.m4a (MPEG-4 audio container)");
+
+	// issue240.mp4 - MP4 with the measured create-date family that survives stripping
+	const issue240Path = path.join(fixturesDir, "issue240.mp4");
+	fs.writeFileSync(issue240Path, movieHeaderMp4());
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Title=Issue 240 synthetic strip marker",
+		issue240Path,
+	]);
+	assertIssue240Metadata(issue240Path);
+	console.log("  Created issue240.mp4 (measured create-date family)");
+
+	// issue344_microsoft_photo.jpg - JPEG carrying only the malformed MicrosoftPhoto XMP
+	// namespace URI -- produces exactly one [minor] ExifTool:Warning and no ExifTool:Error.
+	const issue344Path = path.join(fixturesDir, "issue344_microsoft_photo.jpg");
+	fs.writeFileSync(
+		issue344Path,
+		spliceApp1(
+			createMinimalJpeg(),
+			buildXmpApp1Segment(ISSUE_344_MICROSOFT_PHOTO_XMP),
+		),
+	);
+	assertIssue344Warning(issue344Path);
+	console.log(
+		"  Created issue344_microsoft_photo.jpg (malformed MicrosoftPhoto XMP URI)",
+	);
+
+	// issue344_cooccurrence.jpg - the same malformed MicrosoftPhoto XMP PLUS an independent,
+	// non-minor ExifTool-group diagnostic (a corrupted EXIF IFD1 value offset) on one
+	// record -- the D-06 settlement fixture: a benign [minor] warning must never mask a
+	// serious sibling.
+	const issue344CooccurrencePath = path.join(
+		fixturesDir,
+		"issue344_cooccurrence.jpg",
+	);
+	fs.writeFileSync(
+		issue344CooccurrencePath,
+		spliceApp1(
+			createMinimalJpeg(),
+			buildExifApp1BadIfd1Offset(),
+			buildXmpApp1Segment(ISSUE_344_MICROSOFT_PHOTO_XMP),
+		),
+	);
+	assertIssue344Cooccurrence(issue344CooccurrencePath);
+	console.log(
+		"  Created issue344_cooccurrence.jpg (co-occurring minor + non-minor ExifTool diagnostics)",
+	);
+
+	// sample.webp - WebP with metadata
+	// sample.webp - provenance-pinned WebP with removable EXIF and opt-in
+	// Orientation/ICC/timestamp preservation evidence for the native oracle test.
+	const webpPath = path.join(fixturesDir, "sample.webp");
+	const webpIccPath = path.join(fixturesDir, "webp-oracle-profile.icc");
+	fs.writeFileSync(webpIccPath, WEBP_ORACLE_ICC_PROFILE);
+	fs.writeFileSync(webpPath, createMinimalWebp());
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Artist=Test Author",
+		"-Make=TestCamera",
+		"-Orientation#=6",
+		`-icc_profile<=${webpIccPath}`,
+		webpPath,
+	]);
+	console.log("  Created sample.webp (WebP with EXIF, Orientation, and ICC)");
+
+	// Error fixtures
+	// corrupted.jpg - JPEG magic bytes followed by garbage
+	const corruptedPath = path.join(fixturesDir, "corrupted.jpg");
+	const corruptedData = Buffer.alloc(50);
+	corruptedData[0] = 0xff;
+	corruptedData[1] = 0xd8;
+	corruptedData[2] = 0xff;
+	for (let i = 3; i < 50; i++) {
+		corruptedData[i] = (i * 37 + 11) % 256;
+	}
+	fs.writeFileSync(corruptedPath, corruptedData);
+	console.log("  Created corrupted.jpg (garbled content)");
+
+	// unsupported.txt - plain text file
+	const txtPath = path.join(fixturesDir, "unsupported.txt");
+	fs.writeFileSync(txtPath, "This is not an image file.");
+	console.log("  Created unsupported.txt (unsupported format)");
+
+	// sample.mkv - enough of an EBML header for ExifTool to report its MKV write refusal
+	const mkvPath = path.join(fixturesDir, "sample.mkv");
+	fs.writeFileSync(mkvPath, Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x80]));
+	console.log("  Created sample.mkv (unsupported Matroska container)");
+
+	// zero_byte.jpg - empty file
+	const zeroPath = path.join(fixturesDir, "zero_byte.jpg");
+	fs.writeFileSync(zeroPath, Buffer.alloc(0));
+	console.log("  Created zero_byte.jpg (zero bytes)");
+
+	// no_metadata.jpg - valid JPEG with no EXIF injected
+	const noMetaPath = path.join(fixturesDir, "no_metadata.jpg");
+	fs.writeFileSync(noMetaPath, createMinimalJpeg());
+	console.log("  Created no_metadata.jpg (JPEG without EXIF)");
+
+	// orientation.jpg - JPEG with exact pre-strip Orientation value
+	const orientationPath = path.join(fixturesDir, "orientation.jpg");
+	fs.writeFileSync(orientationPath, createMinimalJpeg());
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Orientation#=6",
+		orientationPath,
+	]);
+	console.log("  Created orientation.jpg (Rotate 90 CW)");
+
+	// orientation.png - PNG with Orientation written to an eXIf chunk (IFD0), plus
+	// removable tEXt Author/Copyright, for the native PNG oracle row (58-06, D-21).
+	const orientationPngPath = path.join(fixturesDir, "orientation.png");
+	fs.writeFileSync(orientationPngPath, createMinimalPng());
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Author=Test Author",
+		"-Copyright=Test Copyright 2024",
+		"-Orientation#=6",
+		orientationPngPath,
+	]);
+	console.log(
+		"  Created orientation.png (eXIf Rotate 90 CW with tEXt metadata)",
+	);
+
+	// orientation-xmp-only.png - PNG whose only Orientation lives in XMP-tiff (no eXIf
+	// chunk), so exifcleaner-node's own pre-write admission decline is exercised end to
+	// end (58-06, D-21 negative fixture).
+	const orientationXmpOnlyPngPath = path.join(
+		fixturesDir,
+		"orientation-xmp-only.png",
+	);
+	fs.writeFileSync(orientationXmpOnlyPngPath, createMinimalPng());
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-Author=Test Author",
+		"-XMP-tiff:Orientation#=6",
+		orientationXmpOnlyPngPath,
+	]);
+	console.log("  Created orientation-xmp-only.png (Orientation only in XMP)");
+
+	// sample.tif - single-strip TIFF with IFD0 private tags (ImageDescription, Software,
+	// Artist, Copyright) and GPS, for Phase 51 (RMV-03/RMV-04). Validate the unseeded bytes
+	// first (after GPS seeding, ExifTool's validator warns about GPSProcessingMethod).
+	const tiffPath = path.join(fixturesDir, "sample.tif");
+	fs.writeFileSync(tiffPath, createMinimalTiff());
+	const tiffValidation = execFileSync(EXIFTOOL, ["-validate", "-s3", tiffPath])
+		.toString()
+		.trim();
+	if (tiffValidation !== "OK") {
+		throw new Error(
+			`sample.tif failed -validate before seeding: expected OK, got "${tiffValidation}"`,
+		);
+	}
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-ImageDescription=ZZP51-DESC",
+		"-Software=ZZP51-SOFT",
+		"-Artist=ZZP51-ARTIST",
+		"-Copyright=ZZP51-COPY",
+		"-GPSLatitude=37.7749",
+		"-GPSLatitudeRef=N",
+		"-GPSLongitude=-122.4194",
+		"-GPSLongitudeRef=W",
+		tiffPath,
+	]);
+	assertTiffSeeds(tiffPath, {
+		"IFD0:ImageDescription": "ZZP51-DESC",
+		"IFD0:Software": "ZZP51-SOFT",
+		"IFD0:Artist": "ZZP51-ARTIST",
+		"IFD0:Copyright": "ZZP51-COPY",
+		"GPS:GPSLatitudeRef": "North",
+	});
+	console.log(
+		"  Created sample.tif (single-strip TIFF with IFD0 private tags and GPS)",
+	);
+
+	// multipage.tif - two-page TIFF with distinct per-IFD private tags (IFD0 vs IFD1) and GPS
+	// on IFD0, for Phase 51-03's multi-page limitation pin (D-22, D-25).
+	const multipagePath = path.join(fixturesDir, "multipage.tif");
+	fs.writeFileSync(multipagePath, createTwoPageTiff());
+	const multipageValidation = execFileSync(EXIFTOOL, [
+		"-validate",
+		"-s3",
+		multipagePath,
+	])
+		.toString()
+		.trim();
+	if (multipageValidation !== "OK") {
+		throw new Error(
+			`multipage.tif failed -validate before seeding: expected OK, got "${multipageValidation}"`,
+		);
+	}
+	execFileSync(EXIFTOOL, [
+		"-overwrite_original",
+		"-IFD0:ImageDescription=ZZP51-PAGE1-DESC",
+		"-IFD0:Software=ZZP51-PAGE1-SOFT",
+		"-IFD0:Artist=ZZP51-PAGE1-ARTIST",
+		"-IFD0:Copyright=ZZP51-PAGE1-COPY",
+		"-GPSLatitude=37.7749",
+		"-GPSLatitudeRef=N",
+		"-GPSLongitude=-122.4194",
+		"-GPSLongitudeRef=W",
+		"-IFD1:ImageDescription=ZZP51-PAGE2-DESC",
+		"-IFD1:Software=ZZP51-PAGE2-SOFT",
+		"-IFD1:Artist=ZZP51-PAGE2-ARTIST",
+		"-IFD1:Copyright=ZZP51-PAGE2-COPY",
+		multipagePath,
+	]);
+	assertTiffSeeds(multipagePath, {
+		"IFD0:ImageDescription": "ZZP51-PAGE1-DESC",
+		"IFD0:Software": "ZZP51-PAGE1-SOFT",
+		"IFD0:Artist": "ZZP51-PAGE1-ARTIST",
+		"IFD0:Copyright": "ZZP51-PAGE1-COPY",
+		"GPS:GPSLatitudeRef": "North",
+		"IFD1:ImageDescription": "ZZP51-PAGE2-DESC",
+		"IFD1:Software": "ZZP51-PAGE2-SOFT",
+		"IFD1:Artist": "ZZP51-PAGE2-ARTIST",
+		"IFD1:Copyright": "ZZP51-PAGE2-COPY",
+	});
+	console.log(
+		"  Created multipage.tif (two-page TIFF with distinct per-IFD private tags)",
+	);
+
+	generateRawFixtures(fixturesDir, rawUpstreamDir);
+	generateMatrixFixtures(fixturesDir, rawUpstreamDir);
+
+	console.log("\nAll 26 fixture files generated successfully.");
+}
+
+const outputFlag = process.argv.indexOf("--output-dir");
+if (outputFlag !== -1 && process.argv[outputFlag + 1] === undefined) {
+	throw new Error("--output-dir requires a path");
+}
+const outputDir =
+	outputFlag === -1
+		? DEFAULT_FIXTURES_DIR
+		: path.resolve(process.argv[outputFlag + 1]!);
+
+const rawUpstreamFlag = process.argv.indexOf("--raw-upstream-dir");
+if (rawUpstreamFlag !== -1 && process.argv[rawUpstreamFlag + 1] === undefined) {
+	throw new Error("--raw-upstream-dir requires a path");
+}
+const rawUpstreamDir =
+	rawUpstreamFlag === -1
+		? RAW_UPSTREAM_DEFAULT_DIR
+		: path.resolve(process.argv[rawUpstreamFlag + 1]!);
+
+generateFixtures(outputDir);

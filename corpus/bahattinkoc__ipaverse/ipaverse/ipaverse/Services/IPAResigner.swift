@@ -1,0 +1,881 @@
+//
+//  IPAResigner.swift
+//  ipaverse
+//
+//  Created by BAHATTIN KOC on 24.05.2026.
+//
+
+import Foundation
+import CryptoKit
+
+// MARK: - Models
+
+struct ResignerCertificate: Identifiable, Hashable, Sendable {
+    let id: String    // SHA1 hash — used as -s argument to codesign
+    let name: String  // "Apple Development: Ad Soyad (TEAMID)"
+
+    var teamID: String? {
+        guard let open = name.lastIndex(of: "("),
+              let close = name.lastIndex(of: ")"),
+              open < close else { return nil }
+        let start = name.index(after: open)
+        let value = String(name[start..<close])
+        return value.isEmpty ? nil : value
+    }
+
+    var isDevelopment: Bool { name.hasPrefix("Apple Development:") }
+    var isDistribution: Bool { name.hasPrefix("iPhone Distribution:") || name.hasPrefix("Apple Distribution:") }
+
+    var displayName: String {
+        if isDevelopment { return "⚙ \(name)" }
+        if isDistribution { return "📦 \(name)" }
+        return name
+    }
+}
+
+struct ResignConfig: @unchecked Sendable {
+    let certificate: ResignerCertificate
+    let plistEdits: [String: Any]
+    let fileReplacements: [String: Data]
+    let provisioningProfileURL: URL?
+    /// Disables ATS (NSAllowsArbitraryLoads) so the signed app's traffic can be
+    /// intercepted by a MITM proxy (Burp, mitmproxy) for security testing.
+    /// Does not bypass in-app certificate/public-key pinning.
+    var enableSecurityTestingMode: Bool = false
+    /// Injects the Frida Gadget into the app so it can be instrumented from a
+    /// host machine without a jailbreak. See DylibInjector.
+    var enableFridaGadgetInjection: Bool = false
+    /// Bare framework/dylib names (no extension) to delete from the bundle and
+    /// unlink from every binary that references them — for SDKs that
+    /// hard-crash when a capability their signing identity can't grant (Push,
+    /// App Groups, ...) is missing instead of degrading gracefully. See
+    /// FrameworkStripper.
+    var removedFrameworks: [String] = []
+    /// Old → new string pairs to overwrite directly inside every Mach-O
+    /// binary in the bundle — for an SDK that bakes its own identity string
+    /// (an App Group name, ...) into compiled code instead of reading it from
+    /// a plist/json config file, which BundleIdentityMigrator can't reach.
+    /// See BinaryStringPatcher; each `new` must be no longer (in UTF-8 bytes)
+    /// than its `old`.
+    var binaryStringReplacements: [(old: String, new: String)] = []
+    var extensionProfiles: [String: URL] = [:]
+}
+
+struct IPAFileNode: Identifiable, Sendable {
+    let id: String   // = path (IPA içindeki relative path)
+    let name: String
+    let path: String
+    let isDirectory: Bool
+    var children: [IPAFileNode]?
+
+    /// Bare name (no extension) if this node is a framework/dylib living
+    /// directly inside a Frameworks/ directory — nil otherwise. Used to offer
+    /// framework removal (FrameworkStripper) only for nodes it actually applies to.
+    var frameworkName: String? {
+        let parts = path.components(separatedBy: "/")
+        guard parts.count >= 2, parts[parts.count - 2] == "Frameworks" else { return nil }
+        if isDirectory, name.hasSuffix(".framework") { return String(name.dropLast(".framework".count)) }
+        if !isDirectory, name.hasSuffix(".dylib") { return String(name.dropLast(".dylib".count)) }
+        return nil
+    }
+}
+
+enum IPAResignError: LocalizedError {
+    case appBundleNotFound
+    case infoPlistNotFound
+    case mainExecutableNotFound
+    case unsafeReplacementPath(String)
+    case archiveOutputTooLarge(String)
+    case provisioningProfileRequired
+    case certificateNotInProfile(certificateName: String, profileName: String)
+    case fairPlayEncrypted
+    case processFailure(executable: String, stderr: String)
+    case codesignFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .appBundleNotFound: "No .app bundle found inside Payload"
+        case .infoPlistNotFound: "Info.plist not found"
+        case .mainExecutableNotFound: "CFBundleExecutable is missing, invalid, or does not exist in the app bundle"
+        case .unsafeReplacementPath(let path): "Unsafe replacement path in IPA: \(path)"
+        case .archiveOutputTooLarge(let item): "IPA data is too large to load safely: \(item)"
+        case .provisioningProfileRequired: "A provisioning profile (.mobileprovision) is required to install on a device"
+        case .certificateNotInProfile(let certName, let profileName):
+            "\"\(certName)\" is not authorized by \"\(profileName)\" — the profile's DeveloperCertificates list doesn't include this certificate's private key. Pick a provisioning profile generated for this exact certificate (Apple Developer portal → Profiles), or select a different certificate whose team issued this profile."
+        case .fairPlayEncrypted:
+            "This IPA is encrypted with FairPlay DRM. Re-signing does not work with encrypted App Store IPAs — only your own builds or decrypted IPAs can be signed."
+        case .processFailure(let exe, let err): "\(URL(fileURLWithPath: exe).lastPathComponent) failed: \(err)"
+        case .codesignFailed(let msg): "Signing failed: \(msg)"
+        }
+    }
+}
+
+// MARK: - IPAResigner
+
+struct IPAResigner {
+
+    private final class ProcessDataBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+
+        func store(_ value: Data) {
+            lock.lock()
+            data = value
+            lock.unlock()
+        }
+
+        func load() -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return data
+        }
+    }
+
+    // MARK: - Static helpers
+
+    static func listCertificates() throws -> [ResignerCertificate] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-identity", "-v", "-p", "codesigning"]
+        process.useUTF8Locale()  // certificate names may contain non-ASCII (e.g. "Apple Development: Ahmet Çelik")
+        let pipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = errPipe
+        try process.run()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        // Line format: "  1) HASH "Name""
+        var certs: [ResignerCertificate] = []
+        for line in output.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let parenIdx = trimmed.firstIndex(of: ")") else { continue }
+            let rest = trimmed[trimmed.index(after: parenIdx)...].trimmingCharacters(in: .whitespaces)
+            guard rest.hasPrefix("\"") || rest.count >= 40 else { continue }
+
+            // rest = "HASH \"Name\"" or "HASH \"Name\" (TEAMID)"
+            let parts = rest.components(separatedBy: " ")
+            guard let hash = parts.first, hash.count == 40 else { continue }
+
+            let quotedName = parts.dropFirst().joined(separator: " ")
+            let name = quotedName.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            guard !name.isEmpty else { continue }
+            certs.append(ResignerCertificate(id: hash, name: name))
+        }
+        // Development certificates first, then Distribution, duplicates removed
+        var seen = Set<String>()
+        return certs
+            .filter { seen.insert($0.id).inserted }
+            .sorted { $0.isDevelopment && !$1.isDevelopment }
+    }
+
+    static func loadInfoPlist(ipaPath: String) throws -> [String: Any] {
+        let entries = try listEntries(ipaPath: ipaPath)
+        guard let plistEntry = entries.first(where: { isMainInfoPlist($0) }) else {
+            throw IPAResignError.infoPlistNotFound
+        }
+        let data = try readEntry(ipaPath: ipaPath, entryName: plistEntry)
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            throw IPAResignError.infoPlistNotFound
+        }
+        return plist
+    }
+
+    /// The Apple ID (email) this IPA's FairPlay license is bound to, read from
+    /// the root `iTunesMetadata.plist`. App Store downloads carry this; a
+    /// FairPlay-encrypted app only decrypts on a device signed into that same
+    /// Apple ID, so installing it under a different account crashes it on launch.
+    /// Returns nil when the IPA has no such metadata (e.g. a DRM-free or
+    /// self-built IPA, where no account binding exists).
+    static func boundAppleID(ipaPath: String) -> String? {
+        guard let entry = (try? listEntries(ipaPath: ipaPath))?.first(where: {
+            ($0 as NSString).lastPathComponent.caseInsensitiveCompare("iTunesMetadata.plist") == .orderedSame
+        }) else { return nil }
+
+        guard let data = try? readEntry(ipaPath: ipaPath, entryName: entry),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
+        else { return nil }
+
+        return extractAppleID(from: plist)
+    }
+
+    /// Pulls the downloading account's email out of an iTunesMetadata plist.
+    /// Different stores/tools spell it differently, so try the well-known
+    /// top-level keys first, then the nested download-info account record.
+    private static func extractAppleID(from plist: [String: Any]) -> String? {
+        for key in ["apple-id", "appleId", "userName"] {
+            if let value = plist[key] as? String, value.contains("@") { return value }
+        }
+        for infoKey in ["download-info", "com.apple.iTunesStore.downloadInfo"] {
+            if let info = plist[infoKey] as? [String: Any],
+               let account = info["accountInfo"] as? [String: Any],
+               let value = account["AppleID"] as? String, value.contains("@") {
+                return value
+            }
+        }
+        return nil
+    }
+
+    static func buildFileTree(ipaPath: String) throws -> [IPAFileNode] {
+        let entries = try listEntries(ipaPath: ipaPath)
+        return buildTree(from: entries)
+    }
+
+    /// Extracts the app's primary home-screen icon as raw PNG data. The bytes are
+    /// returned exactly as stored in the IPA, which for App Store builds is Apple's
+    /// "CgBI" optimized PNG — ImageIO/`NSImage` decode this correctly. Returns nil
+    /// when no suitable icon file can be located.
+    static func extractRawAppIcon(ipaPath: String) throws -> Data? {
+        let entries = try listEntries(ipaPath: ipaPath)
+
+        // PNGs directly at the .app bundle root: Payload/<x>.app/<file>.png
+        let rootPNGs = entries.filter { entry in
+            let parts = entry.components(separatedBy: "/")
+            return parts.count == 3 && parts[0] == "Payload"
+                && parts[1].hasSuffix(".app") && parts[2].lowercased().hasSuffix(".png")
+        }
+        guard !rootPNGs.isEmpty else { return nil }
+
+        let baseNames = iconBaseNames(from: (try? loadInfoPlist(ipaPath: ipaPath)) ?? [:])
+
+        func normalize(_ filename: String) -> String {
+            var n = (filename as NSString).lastPathComponent
+            if let dot = n.range(of: ".png", options: [.caseInsensitive, .backwards]) {
+                n = String(n[..<dot.lowerBound])
+            }
+            for suffix in ["@2x", "@3x", "~ipad", "~iphone"] {
+                n = n.replacingOccurrences(of: suffix, with: "")
+            }
+            return n
+        }
+        // Prefer higher scale, then larger dimension hinted in the name (e.g. Icon-76).
+        func score(_ entry: String) -> Int {
+            let file = (entry as NSString).lastPathComponent
+            let scale = file.contains("@3x") ? 3 : (file.contains("@2x") ? 2 : 1)
+            let dimension = normalize(file)
+                .components(separatedBy: CharacterSet.decimalDigits.inverted)
+                .compactMap { Int($0) }.max() ?? 0
+            return scale * 10000 + dimension
+        }
+
+        var candidates = rootPNGs
+        if !baseNames.isEmpty {
+            let matched = rootPNGs.filter { baseNames.contains(normalize($0)) }
+            if !matched.isEmpty { candidates = matched }
+        } else {
+            // Asset-catalog apps reference the icon by name only; the rendered files
+            // are conventionally "AppIcon*.png" at the bundle root.
+            let appIcons = rootPNGs.filter { (($0 as NSString).lastPathComponent).lowercased().hasPrefix("appicon") }
+            if !appIcons.isEmpty { candidates = appIcons }
+        }
+
+        guard let chosen = candidates.max(by: { score($0) < score($1) }) else { return nil }
+        let data = try readEntry(ipaPath: ipaPath, entryName: chosen)
+        return data.isEmpty ? nil : data
+    }
+
+    /// Best-effort build date of the app, read from the zip modification time of
+    /// the bundle's Info.plist (set by Xcode when the app was built). This is a far
+    /// more meaningful date for an imported IPA than "now". Returns nil if it can't
+    /// be determined.
+    static func appBuildDate(ipaPath: String) -> Date? {
+        guard let entry = (try? listEntries(ipaPath: ipaPath))?.first(where: { isMainInfoPlist($0) }) else {
+            return nil
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        process.arguments = ["-Z", "-T", ipaPath, entry]  // zipinfo, sortable timestamps
+        process.useUTF8Locale()
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do { try process.run() } catch { return nil }
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        process.waitUntilExit()
+
+        // Timestamp token has the form "yyyymmdd.hhmmss".
+        guard let range = output.range(of: #"\d{8}\.\d{6}"#, options: .regularExpression) else { return nil }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd.HHmmss"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.date(from: String(output[range]))
+    }
+
+    /// Collects the base names (without extension/scale suffix) the Info.plist
+    /// declares as app icons, across the modern and legacy key layouts.
+    private static func iconBaseNames(from plist: [String: Any]) -> Set<String> {
+        var names = Set<String>()
+        func collect(_ icons: [String: Any]?) {
+            guard let primary = icons?["CFBundlePrimaryIcon"] as? [String: Any],
+                  let files = primary["CFBundleIconFiles"] as? [String] else { return }
+            names.formUnion(files)
+        }
+        collect(plist["CFBundleIcons"] as? [String: Any])
+        collect(plist["CFBundleIcons~ipad"] as? [String: Any])
+        if let files = plist["CFBundleIconFiles"] as? [String] { names.formUnion(files) }
+        if let file = plist["CFBundleIconFile"] as? String {
+            var f = file
+            if let dot = f.range(of: ".png", options: [.caseInsensitive, .backwards]) {
+                f = String(f[..<dot.lowerBound])
+            }
+            names.insert(f)
+        }
+        return names
+    }
+
+    // MARK: - Sign
+
+    func sign(
+        ipaPath: String,
+        config: ResignConfig,
+        outputPath: String,
+        allowFairPlayEncrypted: Bool = false,
+        progress: @escaping (String) -> Void
+    ) throws {
+        guard URL(fileURLWithPath: ipaPath).standardizedFileURL != URL(fileURLWithPath: outputPath).standardizedFileURL else {
+            throw IPAPreflight.Failure.blocked("Choose a different output file to preserve the original IPA.")
+        }
+        let checks = try IPAPreflight.signing(ipaPath: ipaPath, profileURL: config.provisioningProfileURL,
+            certificate: config.certificate, newMainID: config.plistEdits["CFBundleIdentifier"] as? String,
+            extensionProfiles: config.extensionProfiles)
+        let blockers = checks.filter { $0.status == .blocked }
+        guard blockers.isEmpty else { throw IPAPreflight.Failure.blocked(blockers.map { $0.title + ": " + $0.detail }.joined(separator: "\n")) }
+        let workDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+
+        // 1. Extract IPA
+        progress("Opening IPA...")
+        try Self.validateArchiveForProcessing(ipaPath: ipaPath)
+        try runProcess(executable: "/usr/bin/unzip", arguments: ["-q", ipaPath, "-d", workDir.path])
+        try Self.validateExtractedArchive(at: workDir)
+
+        // 2. .app bundle'ı bul
+        let appURL = try findAppBundle(in: workDir.appendingPathComponent("Payload"))
+        let infoPlistURL = appURL.appendingPathComponent("Info.plist")
+        let initialPlist = try PropertyListSerialization.propertyList(
+            from: Data(contentsOf: infoPlistURL), options: [], format: nil
+        ) as? [String: Any]
+
+        // 2.1 FairPlay encryption check — encrypted binaries cannot be re-signed
+        guard let executableName = initialPlist?["CFBundleExecutable"] as? String,
+              Self.isSafeExecutableName(executableName) else {
+            throw IPAResignError.mainExecutableNotFound
+        }
+        let mainBinaryURL = appURL.appendingPathComponent(executableName)
+        guard FileManager.default.fileExists(atPath: mainBinaryURL.path) else {
+            throw IPAResignError.mainExecutableNotFound
+        }
+        print("⚙️ [IPAResigner] Checking FairPlay: \(mainBinaryURL.lastPathComponent)")
+        if Self.isFairPlayEncrypted(binaryURL: mainBinaryURL) {
+            print("⚙️ [IPAResigner] ❌ FairPlay encrypted (cryptid=1)")
+            if !allowFairPlayEncrypted {
+                throw IPAResignError.fairPlayEncrypted
+            }
+            print("⚙️ [IPAResigner] ⚠️ Continuing despite FairPlay encryption (user override)")
+        }
+        print("⚙️ [IPAResigner] ✓ Not FairPlay encrypted (cryptid=0)")
+
+        // 3. Apply Info.plist edits (+ Security Testing Mode ATS bypass)
+        if !config.plistEdits.isEmpty || config.enableSecurityTestingMode {
+            progress("Applying changes...")
+            var plist = initialPlist ?? [:]
+            let originalBundleID = plist["CFBundleIdentifier"] as? String ?? ""
+            for (key, value) in config.plistEdits { plist[key] = value }
+
+            if config.enableSecurityTestingMode {
+                // Merge rather than overwrite so any existing NSExceptionDomains
+                // configuration set by the original developer is preserved.
+                var ats = plist["NSAppTransportSecurity"] as? [String: Any] ?? [:]
+                ats["NSAllowsArbitraryLoads"] = true
+                plist["NSAppTransportSecurity"] = ats
+                print("⚙️ [IPAResigner] Security Testing Mode: NSAllowsArbitraryLoads=true")
+            }
+
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0)
+            try data.write(to: infoPlistURL)
+
+            // If bundle ID changed, update PlugIns and XPC extensions too
+            if let newBundleID = config.plistEdits["CFBundleIdentifier"] as? String,
+               !originalBundleID.isEmpty, newBundleID != originalBundleID {
+                updateNestedBundleIDs(in: appURL, oldPrefix: originalBundleID, newPrefix: newBundleID)
+            }
+        }
+
+        // 4. Apply file replacements
+        if !config.fileReplacements.isEmpty {
+            if config.plistEdits.isEmpty && !config.enableSecurityTestingMode { progress("Applying changes...") }
+            for (relativePath, data) in config.fileReplacements {
+                let fileURL = try safeReplacementURL(relativePath: relativePath, root: workDir)
+                try FileManager.default.createDirectory(
+                    at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+                )
+                try data.write(to: fileURL)
+            }
+        }
+
+        // 4.2 Strip frameworks the user flagged as unusable under this signing
+        // identity (e.g. a Push/App-Groups-dependent SDK that fatalErrors
+        // instead of degrading gracefully when that capability is missing).
+        if !config.removedFrameworks.isEmpty {
+            progress("Removing frameworks...")
+            try FrameworkStripper.remove(frameworkNames: config.removedFrameworks, from: appURL, progress: progress)
+        }
+
+        // 4.3 Patch identity strings baked directly into compiled binaries —
+        // the class of reference BundleIdentityMigrator's plist/json scan
+        // can't reach. Same old→new pairs as the plist migration, so it's a
+        // no-op unless "Move to New Identity" was actually applied.
+        if !config.binaryStringReplacements.isEmpty {
+            progress("Patching identity strings...")
+            try BinaryStringPatcher.patch(config.binaryStringReplacements, in: appURL, progress: progress)
+        }
+
+        // 4.5 Inject Frida Gadget (Security Testing Mode: dynamic instrumentation
+        // without a jailbreak — attach with `frida -H <device-ip>:27042 -n Gadget`)
+        if config.enableFridaGadgetInjection {
+            try DylibInjector.injectFridaGadget(appURL: appURL, mainBinaryURL: mainBinaryURL, progress: progress)
+        }
+
+        // 5. Remove old signatures and original mobileprovision
+        progress("Removing old signatures...")
+        removeCodeSignatures(in: appURL)
+        // Original IPA's distribution profile causes signature mismatch — always remove
+        try? FileManager.default.removeItem(at: appURL.appendingPathComponent("embedded.mobileprovision"))
+
+        // 6. Embed provisioning profile (required)
+        guard let profileURL = config.provisioningProfileURL else {
+            throw IPAResignError.provisioningProfileRequired
+        }
+
+        // installd rejects the install at the *device* with an opaque
+        // "valid provisioning profile not found" error if the signing
+        // certificate isn't one of the profile's DeveloperCertificates —
+        // catch that here instead, with the actual reason.
+        let profileCertFingerprints = Self.developerCertificateFingerprints(from: profileURL)
+        if !profileCertFingerprints.isEmpty && !profileCertFingerprints.contains(config.certificate.id.uppercased()) {
+            throw IPAResignError.certificateNotInProfile(
+                certificateName: config.certificate.name, profileName: profileURL.lastPathComponent
+            )
+        }
+
+        try FileManager.default.copyItem(at: profileURL, to: appURL.appendingPathComponent("embedded.mobileprovision"))
+        print("⚙️ [IPAResigner] mobileprovision embedded: \(profileURL.lastPathComponent)")
+
+        // 7. Read final bundle ID (for entitlements)
+        let finalPlist = (try? PropertyListSerialization.propertyList(
+            from: Data(contentsOf: infoPlistURL), options: [], format: nil
+        ) as? [String: Any]) ?? [:]
+        let bundleID = finalPlist["CFBundleIdentifier"] as? String ?? ""
+
+        // 8. Entitlements — derive from provisioning profile (no unauthorized entitlements added)
+        let signingProfile = try ProvisioningProfile.read(profileURL)
+        let profileEntitlements = signingProfile.entitlements
+
+        // Team ID: extract from profile (authoritative source), not from certificate name
+        let teamID: String = {
+            if let t = profileEntitlements["com.apple.developer.team-identifier"] as? String, !t.isEmpty { return t }
+            if let appID = profileEntitlements["application-identifier"] as? String {
+                let prefix = appID.components(separatedBy: ".").first ?? ""
+                if !prefix.isEmpty && prefix != "*" { return prefix }
+            }
+            return config.certificate.teamID ?? ""
+        }()
+        print("⚙️ [IPAResigner] teamID=\(teamID) (profile: \(profileEntitlements["com.apple.developer.team-identifier"] as? String ?? "—"), cert: \(config.certificate.teamID ?? "—"))")
+
+        let entitlements = try signingProfile.signingEntitlements(bundleID: bundleID)
+        let entsURL = workDir.appendingPathComponent("entitlements.plist")
+        let entsData = try PropertyListSerialization.data(fromPropertyList: entitlements, format: .xml, options: 0)
+        try entsData.write(to: entsURL)
+        print("⚙️ [IPAResigner] entitlements (profile-based): \(entitlements.keys.sorted())")
+
+        // 9. Sign — inside-out: Frameworks → PlugIns/.appex → main .app
+        progress("Signing...")
+        try signInsideOut(appURL: appURL, certificate: config.certificate.id, workDir: workDir,
+                          profileURL: profileURL, extensionProfiles: config.extensionProfiles)
+        _ = try ProcessRunner.run("/usr/bin/codesign", ["--verify", "--deep", "--strict", appURL.path])
+        progress("Creating IPA...")
+        let destination = URL(fileURLWithPath: outputPath)
+        let staged = AtomicFile.stagingURL(for: destination)
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try runProcess(executable: "/usr/bin/zip", workingDirectory: workDir, arguments: ["-qrX0", staged.path, "Payload"])
+        _ = try ProcessRunner.run("/usr/bin/unzip", ["-tqq", staged.path])
+        try AtomicFile.commit(staged, to: destination)
+    }
+
+    // MARK: - Private helpers
+
+    private static func isSafeExecutableName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." &&
+        !name.contains("/") && !name.contains("\\")
+    }
+
+    private static func validateArchiveForProcessing(ipaPath: String) throws {
+        do {
+            try IPASecurityScanner.validateArchiveLimits(ipaPath: ipaPath)
+        } catch {
+            throw IPAResignError.processFailure(executable: "IPA validation", stderr: error.localizedDescription)
+        }
+    }
+
+    private static func validateExtractedArchive(at root: URL) throws {
+        do {
+            try IPASecurityScanner.validateExtractedTree(at: root)
+        } catch {
+            throw IPAResignError.processFailure(executable: "IPA validation", stderr: error.localizedDescription)
+        }
+    }
+
+    private func safeReplacementURL(relativePath: String, root: URL) throws -> URL {
+        guard !relativePath.hasPrefix("/"), !relativePath.isEmpty else {
+            throw IPAResignError.unsafeReplacementPath(relativePath)
+        }
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw IPAResignError.unsafeReplacementPath(relativePath)
+        }
+
+        var candidate = root
+        for component in components {
+            candidate.appendPathComponent(component)
+            if FileManager.default.fileExists(atPath: candidate.path),
+               (try candidate.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink == true {
+                throw IPAResignError.unsafeReplacementPath(relativePath)
+            }
+        }
+
+        let canonicalRoot = root.standardizedFileURL.path + "/"
+        guard candidate.standardizedFileURL.path.hasPrefix(canonicalRoot) else {
+            throw IPAResignError.unsafeReplacementPath(relativePath)
+        }
+        return candidate
+    }
+
+    @discardableResult
+    private func runProcess(executable: String, workingDirectory: URL? = nil, arguments: [String]) throws -> String {
+        String(decoding: try ProcessRunner.run(executable, arguments, directory: workingDirectory).output, as: UTF8.self)
+    }
+
+    private func signInsideOut(appURL: URL, certificate: String, workDir: URL,
+                               profileURL: URL, extensionProfiles: [String: URL]) throws {
+        let fm = FileManager.default
+        let enumerator = fm.enumerator(at: appURL, includingPropertiesForKeys: [.isDirectoryKey])
+        var targets: [URL] = []
+        while let item = enumerator?.nextObject() as? URL {
+            if ["framework", "dylib", "appex", "app", "xpc"].contains(item.pathExtension) { targets.append(item) }
+        }
+        targets.append(appURL)
+        targets.sort { $0.pathComponents.count > $1.pathComponents.count }
+        for target in targets {
+            try Task.checkCancellation()
+            var arguments = ["-f", "-s", certificate]
+            if ["app", "appex", "xpc"].contains(target.pathExtension) {
+                let data = try Data(contentsOf: target.appendingPathComponent("Info.plist"))
+                guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                      let bundleID = plist["CFBundleIdentifier"] as? String else { throw IPAResignError.infoPlistNotFound }
+                let selectedProfile = target == appURL ? profileURL : extensionProfiles[bundleID] ?? profileURL
+                let profile = try ProvisioningProfile.read(selectedProfile)
+                let blockers = profile.checks(bundleID: bundleID, certificateID: certificate).filter { $0.status == .blocked }
+                guard blockers.isEmpty else { throw IPAPreflight.Failure.blocked(blockers.map { $0.title + ": " + $0.detail }.joined(separator: "\n")) }
+                let embedded = target.appendingPathComponent("embedded.mobileprovision")
+                if fm.fileExists(atPath: embedded.path) { try fm.removeItem(at: embedded) }
+                try fm.copyItem(at: selectedProfile, to: embedded)
+                let ents = try profile.signingEntitlements(bundleID: bundleID)
+                let entsURL = workDir.appendingPathComponent(UUID().uuidString + ".plist")
+                try PropertyListSerialization.data(fromPropertyList: ents, format: .xml, options: 0).write(to: entsURL)
+                arguments += ["--entitlements", entsURL.path]
+            }
+            arguments.append(target.path)
+            _ = try ProcessRunner.run("/usr/bin/codesign", arguments)
+        }
+    }
+
+    private func updateNestedBundleIDs(in appURL: URL, oldPrefix: String, newPrefix: String) {
+        // iOS requires all .appex bundle IDs to start with the main bundle ID prefix.
+        // Watch extensions, notification extensions, intents, etc. live under PlugIns.
+        // Some apps may also contain XPCServices.
+        guard let enumerator = FileManager.default.enumerator(at: appURL, includingPropertiesForKeys: nil) else { return }
+        for case let bundleURL as URL in enumerator where ["app", "appex", "xpc"].contains(bundleURL.pathExtension) {
+            rewriteBundleID(in: bundleURL.appendingPathComponent("Info.plist"), oldPrefix: oldPrefix, newPrefix: newPrefix)
+        }
+    }
+
+    private func rewriteBundleID(in plistURL: URL, oldPrefix: String, newPrefix: String) {
+        guard let data = try? Data(contentsOf: plistURL),
+              var plist = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any],
+              let current = plist["CFBundleIdentifier"] as? String,
+              (current == oldPrefix || current.hasPrefix(oldPrefix + ".")) else { return }
+        let suffix = String(current.dropFirst(oldPrefix.count))
+        plist["CFBundleIdentifier"] = newPrefix + suffix
+        if let written = try? PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0) {
+            try? written.write(to: plistURL)
+        }
+    }
+
+    /// The entitlements a binary is *currently* signed with — e.g. the
+    /// original App Store signature on a freshly downloaded/decrypted IPA,
+    /// before resigning replaces it. Used to detect capabilities (App Groups,
+    /// Push, Associated Domains, ...) the original developer's signing
+    /// identity had that a new provisioning profile might not grant.
+    static func extractSignedEntitlements(fromBinaryAt url: URL) -> [String: Any] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        process.arguments = ["-d", "--entitlements", "-", "--xml", url.path]
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        guard (try? process.run()) != nil else { return [:] }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        _ = errPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]) ?? [:]
+    }
+
+    static func isFairPlayEncrypted(binaryURL: URL) -> Bool {
+        guard let data = try? Data(contentsOf: binaryURL), data.count > 8 else {
+            print("⚙️ [IPAResigner] FairPlay: binary unreadable or too small — \(binaryURL.lastPathComponent)")
+            return false
+        }
+        guard let magic = data.safeUInt32(at: 0) else { return false }
+        var offsets: [Int] = []
+        let fatMagic: UInt32 = 0xCAFEBABE
+        let fatMagicSwapped: UInt32 = 0xBEBAFECA
+        let macho64: UInt32 = 0xFEEDFACF
+        let macho64Swapped: UInt32 = 0xCFFAEDFE
+        let macho32: UInt32 = 0xFEEDFACE
+        let macho32Swapped: UInt32 = 0xCEFAEDFE
+
+        if magic == fatMagic || magic == fatMagicSwapped {
+            guard let rawCount = data.safeUInt32(at: 4) else { return false }
+            let count = magic == fatMagic ? rawCount.byteSwapped : rawCount
+            print("⚙️ [IPAResigner] FairPlay: fat binary, \(count) slices")
+            for i in 0..<Int(count) {
+                let base = 8 + i * 20
+                guard let rawOffset = data.safeUInt32(at: base + 8) else { break }
+                offsets.append(Int(rawOffset.byteSwapped))
+            }
+        } else if magic == macho64 || magic == macho64Swapped || magic == macho32 || magic == macho32Swapped {
+            let arch = (magic == macho64 || magic == macho64Swapped) ? "arm64" : "arm32"
+            print("⚙️ [IPAResigner] FairPlay: thin binary (\(arch))")
+            offsets.append(0)
+        } else {
+            print("⚙️ [IPAResigner] FairPlay: unknown binary format (magic=0x\(String(magic, radix: 16)))")
+            return false
+        }
+
+        for offset in offsets {
+            if checkEncryptionInMacho(data: data, offset: offset) { return true }
+        }
+        return false
+    }
+
+    private static func checkEncryptionInMacho(data: Data, offset: Int) -> Bool {
+        guard offset + 16 <= data.count, let magic = data.safeUInt32(at: offset) else { return false }
+        let needsSwap = magic == 0xCFFAEDFE || magic == 0xCEFAEDFE
+        func u32(at byteOffset: Int) -> UInt32 {
+            guard let v = data.safeUInt32(at: byteOffset) else { return 0 }
+            return needsSwap ? v.byteSwapped : v
+        }
+        let ncmds = Int(u32(at: offset + 16))
+        let is64 = magic == 0xFEEDFACF || magic == 0xCFFAEDFE
+        var cmdOffset = offset + (is64 ? 32 : 28)
+        for _ in 0..<ncmds {
+            guard cmdOffset + 8 <= data.count else { break }
+            let cmd = u32(at: cmdOffset)
+            let cmdsize = Int(u32(at: cmdOffset + 4))
+            // LC_ENCRYPTION_INFO = 0x21, LC_ENCRYPTION_INFO_64 = 0x2C
+            if (cmd == 0x21 || cmd == 0x2C) && cmdOffset + 20 <= data.count {
+                let cryptid = u32(at: cmdOffset + 16)
+                let cmdName = cmd == 0x2C ? "LC_ENCRYPTION_INFO_64" : "LC_ENCRYPTION_INFO"
+                print("⚙️ [IPAResigner] FairPlay: \(cmdName) found — cryptid=\(cryptid)")
+                if cryptid == 1 { return true }
+            }
+            guard cmdsize >= 8 else { break }
+            cmdOffset += cmdsize
+        }
+        return false
+    }
+
+    /// Capabilities that commonly crash an app at launch — not just get
+    /// rejected at install — when the original build had them but the
+    /// resigning profile doesn't grant them: an SDK checks for the
+    /// capability during init (e.g. a push SDK's DI container fatalError-ing
+    /// on an unresolved registration) instead of degrading gracefully. Used
+    /// by the pre-sign warning UI (ResigningVM.watchedEntitlements) to flag
+    /// the gap — fixing it means getting the capability actually added to
+    /// the App ID/profile (or migrating the app off whatever hardcodes the
+    /// missing one — see BundleIdentityMigrator/BinaryStringPatcher), not
+    /// forcing an unauthorized entitlement into the signature.
+    static let watchedCapabilityKeys: [String] = [
+        "com.apple.security.application-groups",
+        "aps-environment",
+        "com.apple.developer.associated-domains",
+        "com.apple.developer.devicecheck.appattest-environment",
+        "com.apple.developer.nfc.readersession.formats",
+        "com.apple.developer.healthkit",
+        "com.apple.developer.in-app-payments",
+    ]
+
+    // SHA1 fingerprints (uppercase hex, matching `security find-identity` / codesign -s format)
+    // of every certificate embedded in the profile's DeveloperCertificates array.
+    static func developerCertificateFingerprints(from profileURL: URL) -> Set<String> {
+        (try? ProvisioningProfile.read(profileURL).certificates) ?? []
+    }
+
+    static func extractEntitlements(from profileURL: URL) throws -> [String: Any] {
+        try ProvisioningProfile.read(profileURL).entitlements
+    }
+
+    private func findAppBundle(in payloadURL: URL) throws -> URL {
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: payloadURL, includingPropertiesForKeys: nil
+        )
+        guard let appURL = contents.first(where: { $0.pathExtension == "app" }) else {
+            throw IPAResignError.appBundleNotFound
+        }
+        return appURL
+    }
+
+    private func removeCodeSignatures(in directory: URL) {
+        let fm = FileManager.default
+        // Do NOT use skipsPackageDescendants — must recurse into .app/.framework/.appex
+        guard let enumerator = fm.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: []
+        ) else { return }
+
+        var toRemove: [URL] = []
+        for case let url as URL in enumerator {
+            if url.lastPathComponent == "_CodeSignature" {
+                toRemove.append(url)
+                enumerator.skipDescendants() // no need to enumerate inside _CodeSignature
+            }
+        }
+        for url in toRemove {
+            try? fm.removeItem(at: url)
+            print("⚙️ [IPAResigner] _CodeSignature removed: \(url.path)")
+        }
+    }
+
+    // MARK: - Static zip helpers (unzip -Z1 pattern)
+
+    static func listEntries(ipaPath: String) throws -> [String] {
+        let data = try captureUnzip(
+            arguments: ["-Z1", ipaPath],
+            maxOutputBytes: 64 * 1_024 * 1_024,
+            itemDescription: "archive file list"
+        )
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return output.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    static func readEntry(ipaPath: String, entryName: String) throws -> Data {
+        try captureUnzip(
+            arguments: ["-p", ipaPath, entryName],
+            maxOutputBytes: 512 * 1_024 * 1_024,
+            itemDescription: entryName
+        )
+    }
+
+    private static func captureUnzip(
+        arguments: [String], maxOutputBytes: Int, itemDescription: String
+    ) throws -> Data {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        process.arguments = arguments
+        process.useUTF8Locale()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        try process.run()
+
+        let errorBox = ProcessDataBox()
+        let errorDone = DispatchSemaphore(value: 0)
+        // .userInitiated, not .utility: the caller below blocks on `errorDone.wait()`
+        // at whatever (often higher) QoS it's running at, and a lower-QoS drain thread
+        // triggers a priority-inversion warning — same fix as ClassDumper's stdin writer.
+        DispatchQueue.global(qos: .userInitiated).async {
+            errorBox.store(errPipe.fileHandleForReading.readDataToEndOfFile())
+            errorDone.signal()
+        }
+
+        var data = Data()
+        var exceededLimit = false
+        while true {
+            let chunk = outPipe.fileHandleForReading.readData(ofLength: 1_048_576)
+            if chunk.isEmpty { break }
+            if chunk.count > maxOutputBytes - data.count {
+                exceededLimit = true
+                if process.isRunning { process.terminate() }
+                _ = outPipe.fileHandleForReading.readDataToEndOfFile()
+                break
+            }
+            data.append(chunk)
+        }
+        process.waitUntilExit()
+        errorDone.wait()
+        if exceededLimit {
+            throw IPAResignError.archiveOutputTooLarge(itemDescription)
+        }
+        guard process.terminationStatus == 0 else {
+            let stderr = String(data: errorBox.load(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw IPAResignError.processFailure(executable: "/usr/bin/unzip", stderr: stderr)
+        }
+        return data
+    }
+
+    private static func isMainInfoPlist(_ path: String) -> Bool {
+        let parts = path.components(separatedBy: "/")
+        return parts.count == 3 && parts[0] == "Payload" && parts[1].hasSuffix(".app") && parts[2] == "Info.plist"
+    }
+
+    private static func buildTree(from entries: [String]) -> [IPAFileNode] {
+        var dirPaths = Set<String>()
+        var allPaths: [String] = []
+
+        for entry in entries {
+            if entry.hasSuffix("/") {
+                let clean = String(entry.dropLast())
+                dirPaths.insert(clean)
+                allPaths.append(clean)
+            } else {
+                allPaths.append(entry)
+            }
+        }
+
+        var childrenMap: [String: [String]] = ["": []]
+        for path in allPaths.sorted() {
+            let parts = path.components(separatedBy: "/")
+            let parent = parts.dropLast().joined(separator: "/")
+            childrenMap[parent, default: []].append(path)
+            if dirPaths.contains(path) {
+                childrenMap[path] = childrenMap[path] ?? []
+            }
+        }
+
+        func buildNodes(at parent: String) -> [IPAFileNode] {
+            guard let paths = childrenMap[parent] else { return [] }
+            return paths.map { path in
+                let name = path.components(separatedBy: "/").last ?? path
+                let isDir = dirPaths.contains(path)
+                return IPAFileNode(
+                    id: path, name: name, path: path, isDirectory: isDir,
+                    children: isDir ? buildNodes(at: path) : nil
+                )
+            }.sorted {
+                if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+        }
+
+        return buildNodes(at: "")
+    }
+}

@@ -1,0 +1,794 @@
+import { test, expect } from "@playwright/test";
+import type { ElectronApplication, Page } from "playwright";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { launchApp, closeApp } from "./helpers/app_launcher";
+import { createFixtureDir } from "../helpers/fixture_copier";
+import { readMetadataTags } from "./helpers/metadata_assertions";
+import { waitForProcessing } from "./helpers/wait_for_processing";
+import { snapshotDir, assertDirEffect } from "../helpers/dir_effect";
+import {
+	GENERIC_SEED_ARGS,
+	JPEG_CONFLICT_RESOLUTION_ARGS,
+	resolutionLines,
+	seedFile,
+	seededTagKeys,
+} from "../helpers/resolution_probe";
+import { readRawTagLines } from "../helpers/raw_probe";
+
+const german = readLocale("de");
+const french = readLocale("fr");
+
+const EXIFTOOL_PATH =
+	process.platform === "win32"
+		? path.resolve(".resources/win/bin/exiftool.exe")
+		: path.resolve(".resources/nix/bin/exiftool");
+
+test.describe("Settings", () => {
+	let app: ElectronApplication;
+	let page: Page;
+	let userDataDir: string;
+	let consoleErrors: string[];
+
+	test.beforeEach(async () => {
+		consoleErrors = [];
+		const launched = await launchApp();
+		app = launched.app;
+		page = launched.window;
+		userDataDir = launched.userDataDir;
+
+		page.on("console", (msg) => {
+			if (msg.type() === "error") {
+				consoleErrors.push(msg.text());
+			}
+		});
+	});
+
+	test.afterEach(async () => {
+		const unexpectedErrors = consoleErrors.filter(
+			(msg) => !msg.includes("ExifTool") && !msg.includes("ENOENT"),
+		);
+		if (app) {
+			await closeApp(app);
+		}
+		expect(unexpectedErrors, "Unexpected console.error messages").toEqual([]);
+	});
+
+	test("opens and closes the settings drawer", async () => {
+		// Click the gear icon to open settings
+		const gearButton = page.locator(".gear-icon");
+		await expect(gearButton).toBeVisible();
+		await gearButton.click();
+
+		// Verify settings drawer is visible
+		const drawer = page.locator('[role="dialog"]');
+		await expect(drawer).toBeVisible();
+
+		// Verify the localized drawer has a non-empty title.
+		const title = drawer.locator("h2");
+		await expect(title).toHaveText(/\S/);
+
+		// Close via the close button
+		const closeButton = drawer.locator(".settings-drawer__close");
+		await closeButton.click();
+
+		// Verify drawer closes (no longer has --open class)
+		await expect(drawer).toHaveCount(0);
+	});
+
+	test("switches every settings string immediately and persists the locale", async () => {
+		await page.locator(".gear-icon").click();
+		let drawer = page.locator('[role="dialog"]');
+		await drawer.locator(".language-dropdown__trigger").click();
+		await drawer.getByRole("option", { name: /Deutsch/ }).click();
+
+		await expect(page.locator("html")).toHaveAttribute("lang", "de");
+		await expect(drawer.locator("h2")).toHaveText(
+			localeValue(german, "menu.app.settings"),
+		);
+		await expect(
+			drawer.locator(".settings-drawer__section-label").first(),
+		).toHaveText(localeValue(german, "appearance"));
+		await expect(drawer.locator(".toggle-switch__label").first()).toHaveText(
+			localeValue(german, "settings.preserveOrientation.label"),
+		);
+		await expect(
+			drawer.locator(".toggle-switch__description").first(),
+		).toHaveText(
+			localeValue(german, "settings.preserveOrientation.description"),
+		);
+		await expect(page.locator(".empty-state__title")).toHaveText(
+			localeValue(german, "empty.title"),
+		);
+		await expect
+			.poll(() => page.evaluate(() => window.api.settings.get()))
+			.toMatchObject({ language: "de" });
+
+		await closeApp(app, { keepUserDataDir: true });
+		const relaunched = await launchApp({ userDataDir, pinEnglish: false });
+		app = relaunched.app;
+		page = relaunched.window;
+		page.on("console", (msg) => {
+			if (msg.type() === "error") consoleErrors.push(msg.text());
+		});
+
+		await expect(page.locator("html")).toHaveAttribute("lang", "de");
+		await page.locator(".gear-icon").click();
+		drawer = page.locator('[role="dialog"]');
+		await expect(drawer.locator("h2")).toHaveText(
+			localeValue(german, "menu.app.settings"),
+		);
+
+		await drawer.locator(".language-dropdown__trigger").click();
+		await drawer
+			.getByRole("option", { name: localeValue(german, "languageSystem") })
+			.click();
+		const systemLocale = await app.evaluate(({ app: electronApp }) =>
+			electronApp.getLocale(),
+		);
+		await expect(page.locator("html")).toHaveAttribute("lang", systemLocale);
+
+		await drawer.locator(".language-dropdown__trigger").click();
+		await drawer.getByRole("option", { name: /العربية/ }).click();
+		await expect(page.locator("html")).toHaveAttribute("lang", "ar");
+		await expect(page.locator("html")).toHaveAttribute("dir", "rtl");
+	});
+
+	test("applies native View-menu language changes without a restart", async () => {
+		await page.locator(".gear-icon").click();
+		const drawer = page.locator('[role="dialog"]');
+
+		await app.evaluate(({ BrowserWindow, Menu }) => {
+			const window = BrowserWindow.getAllWindows()[0];
+			const view = Menu.getApplicationMenu()?.items.find(
+				(item) => item.label === "View",
+			);
+			const language = view?.submenu?.items.find(
+				(item) => item.label === "Language",
+			);
+			const frenchItem = language?.submenu?.items.find(
+				(item) => item.label === "Français",
+			);
+			if (!window || !frenchItem?.click) {
+				throw new Error("French View-menu language item not found");
+			}
+			frenchItem.click(frenchItem, window, {} as never);
+		});
+
+		await expect(page.locator("html")).toHaveAttribute("lang", "fr");
+		await expect(drawer.locator("h2")).toHaveText(
+			localeValue(french, "menu.app.settings"),
+		);
+		await expect(drawer.locator(".language-dropdown__trigger")).toContainText(
+			"Français",
+		);
+		await expect
+			.poll(() => page.evaluate(() => window.api.settings.get()))
+			.toMatchObject({ language: "fr" });
+	});
+
+	test("toggles preserve orientation switch", async () => {
+		// Open settings
+		const gearButton = page.locator(".gear-icon");
+		await gearButton.click();
+
+		// Get initial state via settings API
+		const initialSettings = await page.evaluate(() =>
+			window.api.settings.get(),
+		);
+		expect(initialSettings.preserveOrientation).toBe(true);
+
+		// Toggle off via settings API
+		await page.evaluate(() =>
+			window.api.settings.set({ preserveOrientation: false }),
+		);
+		await page.waitForTimeout(300); // Let React re-render
+
+		// Verify the checkbox reflects the change
+		const orientationInput = page.locator("#toggle-preserve-orientation");
+		const afterToggle = await orientationInput.isChecked();
+		expect(afterToggle).toBe(false);
+
+		// Toggle back on
+		await page.evaluate(() =>
+			window.api.settings.set({ preserveOrientation: true }),
+		);
+		await page.waitForTimeout(300);
+		const afterToggleBack = await orientationInput.isChecked();
+		expect(afterToggleBack).toBe(true);
+	});
+
+	test("toggles preserve timestamps switch", async () => {
+		// Open settings
+		const gearButton = page.locator(".gear-icon");
+		await gearButton.click();
+
+		// Get initial state
+		const initialSettings = await page.evaluate(() =>
+			window.api.settings.get(),
+		);
+		expect(initialSettings.preserveTimestamps).toBe(false);
+
+		// Toggle on via settings API
+		await page.evaluate(() =>
+			window.api.settings.set({ preserveTimestamps: true }),
+		);
+		await page.waitForTimeout(300);
+
+		const timestampsInput = page.locator("#toggle-preserve-timestamps");
+		const afterToggle = await timestampsInput.isChecked();
+		expect(afterToggle).toBe(true);
+
+		// Reset
+		await page.evaluate(() =>
+			window.api.settings.set({ preserveTimestamps: false }),
+		);
+	});
+
+	test("toggles preserve resolution switch as the third row (FID-01, D-39)", async () => {
+		await page.locator(".gear-icon").click();
+		const drawer = page.locator('[role="dialog"]');
+
+		const initialSettings = await page.evaluate(() =>
+			window.api.settings.get(),
+		);
+		expect(initialSettings.preserveResolution).toBe(true);
+		const resolutionInput = page.locator("#toggle-preserve-resolution");
+		await expect(resolutionInput).toBeChecked();
+
+		const switchIds = await drawer
+			.locator('input[role="switch"]')
+			.evaluateAll((inputs) => inputs.map((input) => input.id));
+		expect(switchIds.slice(0, 3)).toEqual([
+			"toggle-preserve-orientation",
+			"toggle-preserve-color-profile",
+			"toggle-preserve-resolution",
+		]);
+		expect(switchIds[3]).toBe("toggle-save-as-copy");
+
+		const resolutionRow = page.locator(
+			'label.toggle-switch[for="toggle-preserve-resolution"]',
+		);
+		await expect(resolutionRow.locator(".toggle-switch__label")).toHaveText(
+			"Preserve resolution",
+		);
+		await expect(
+			resolutionRow.locator(".toggle-switch__description"),
+		).toHaveText("Keep the DPI so prints stay the right size");
+
+		// Click the row label (not the visually-hidden switch input directly) --
+		// native <label for> semantics forward the click to the associated
+		// input, matching how a real user activates this control.
+		await resolutionRow.click();
+
+		await expect
+			.poll(() => page.evaluate(() => window.api.settings.get()))
+			.toMatchObject({ preserveResolution: false });
+
+		await expect
+			.poll(() => {
+				try {
+					const raw = fs.readFileSync(
+						path.join(userDataDir, "settings.json"),
+						"utf8",
+					);
+					const parsed = JSON.parse(raw) as {
+						version: number;
+						settings: { preserveResolution: boolean };
+					};
+					return (
+						parsed.version === 5 && parsed.settings.preserveResolution === false
+					);
+				} catch {
+					return false;
+				}
+			})
+			.toBe(true);
+
+		// Restore default for subsequent tests.
+		await page.evaluate(() =>
+			window.api.settings.set({ preserveResolution: true }),
+		);
+	});
+
+	test("an existing v4 settings file upgrades with Preserve resolution on and every stored value kept (FID-05, D-40)", async () => {
+		const v4ProfileDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "exifcleaner-v4-profile-"),
+		);
+		const v4Settings = {
+			preserveOrientation: false,
+			preserveColorProfile: true,
+			saveAsCopy: false,
+			removeXattrs: false,
+			preserveTimestamps: true,
+			language: "en",
+			themeMode: "dark",
+		};
+		fs.writeFileSync(
+			path.join(v4ProfileDir, "settings.json"),
+			JSON.stringify({ version: 4, settings: v4Settings }, null, "\t"),
+		);
+
+		await closeApp(app);
+		const relaunched = await launchApp({
+			userDataDir: v4ProfileDir,
+			pinEnglish: false,
+		});
+		app = relaunched.app;
+		page = relaunched.window;
+		page.on("console", (msg) => {
+			if (msg.type() === "error") consoleErrors.push(msg.text());
+		});
+
+		const upgraded = { ...v4Settings, preserveResolution: true };
+		await expect
+			.poll(() => page.evaluate(() => window.api.settings.get()))
+			.toEqual(upgraded);
+
+		await page.locator(".gear-icon").click();
+		const drawer = page.locator('[role="dialog"]');
+		await expect(drawer.locator("#toggle-preserve-resolution")).toBeChecked();
+		await expect(
+			drawer.locator("#toggle-preserve-orientation"),
+		).not.toBeChecked();
+
+		await expect
+			.poll(() => {
+				try {
+					const raw = fs.readFileSync(
+						path.join(v4ProfileDir, "settings.json"),
+						"utf8",
+					);
+					return JSON.parse(raw) as unknown;
+				} catch {
+					return null;
+				}
+			})
+			.toEqual({ version: 5, settings: upgraded });
+	});
+
+	test("switching Preserve resolution off in the drawer restores pre-phase output for a JPEG (ROADMAP criterion 5)", async () => {
+		await page.evaluate(() => window.api.settings.set({ saveAsCopy: true }));
+
+		await page.locator(".gear-icon").click();
+		const drawer = page.locator('[role="dialog"]');
+		const resolutionRow = drawer.locator(
+			'label.toggle-switch[for="toggle-preserve-resolution"]',
+		);
+		await resolutionRow.click();
+		await expect
+			.poll(() => page.evaluate(() => window.api.settings.get()))
+			.toMatchObject({ preserveResolution: false });
+
+		const { dir, copyFixture, cleanup } = createFixtureDir();
+		try {
+			const tempFile = copyFixture("sample.jpg");
+			seedFile(
+				tempFile,
+				EXIFTOOL_PATH,
+				[...JPEG_CONFLICT_RESOLUTION_ARGS, ...GENERIC_SEED_ARGS],
+				{ "JFIF:XResolution": "300", "IFD0:Artist": "ZZP52-ARTIST" },
+			);
+
+			const before = snapshotDir(dir);
+
+			await app.evaluate(
+				({ BrowserWindow }, filePaths) => {
+					const win = BrowserWindow.getAllWindows()[0];
+					if (win) {
+						win.webContents.send("file-open-add-files", filePaths);
+					}
+				},
+				[tempFile],
+			);
+
+			await waitForProcessing(page, { timeout: 15000 });
+			const after = snapshotDir(dir);
+
+			assertDirEffect(before, after, {
+				added: ["sample_cleaned.jpg"],
+				unchanged: ["sample.jpg"],
+				modified: [],
+				removed: [],
+			});
+
+			const outputPath = path.join(dir, "sample_cleaned.jpg");
+			const outputLines = readRawTagLines(outputPath, EXIFTOOL_PATH);
+			expect(
+				resolutionLines(outputLines).filter(
+					(line) => line.startsWith("JFIF:") || line.startsWith("IFD0:"),
+				),
+			).toEqual([]);
+			expect(seededTagKeys(outputLines)).toEqual([]);
+		} finally {
+			await page.evaluate(() =>
+				window.api.settings.set({
+					preserveResolution: true,
+					saveAsCopy: false,
+				}),
+			);
+			cleanup();
+		}
+	});
+
+	test("the resolution row fits in German, Hungarian, Arabic and Persian (D-41)", async () => {
+		const locales = ["de", "hu", "ar", "fa"] as const;
+		for (const language of locales) {
+			await page.evaluate(
+				(lang) => window.api.settings.set({ language: lang }),
+				language,
+			);
+			await page.locator(".gear-icon").click();
+			const drawer = page.locator('[role="dialog"]');
+			const localeStrings = readLocale(language);
+			const expectedLabel = localeValue(
+				localeStrings,
+				"settings.preserveResolution.label",
+			);
+			const row = drawer.locator(
+				'label.toggle-switch[for="toggle-preserve-resolution"]',
+			);
+			await expect(row.locator(".toggle-switch__label")).toHaveText(
+				expectedLabel,
+			);
+
+			if (language === "ar" || language === "fa") {
+				await expect(page.locator("html")).toHaveAttribute("dir", "rtl");
+			}
+
+			// The drawer body scrolls; getBoundingClientRect reflects the row's
+			// actual scroll position, so it must be scrolled into view first or
+			// the fit check below spuriously fails against an off-screen rect.
+			await row.scrollIntoViewIfNeeded();
+
+			const fits = await row.evaluate((rowEl) => {
+				const textEl = rowEl.querySelector(".toggle-switch__text");
+				const inputEl = rowEl.querySelector('input[role="switch"]');
+				const dialogEl = rowEl.closest('[role="dialog"]');
+				if (!textEl || !inputEl || !dialogEl) return false;
+				const rowRect = rowEl.getBoundingClientRect();
+				const dialogRect = dialogEl.getBoundingClientRect();
+				const inputRect = (
+					inputEl.parentElement ?? inputEl
+				).getBoundingClientRect();
+				const TOLERANCE = 1;
+				const withinDialog =
+					rowRect.left >= dialogRect.left - TOLERANCE &&
+					rowRect.right <= dialogRect.right + TOLERANCE &&
+					rowRect.top >= dialogRect.top - TOLERANCE &&
+					rowRect.bottom <= dialogRect.bottom + TOLERANCE;
+				const inputWithinRow =
+					inputRect.left >= rowRect.left - TOLERANCE &&
+					inputRect.right <= rowRect.right + TOLERANCE;
+				return (
+					rowEl.scrollWidth <= rowEl.clientWidth &&
+					textEl.scrollWidth <= textEl.clientWidth &&
+					withinDialog &&
+					inputWithinRow
+				);
+			});
+			expect(fits, `row does not fit for locale ${language}`).toBe(true);
+
+			await drawer.locator(".settings-drawer__close").click();
+			await expect(drawer).toHaveCount(0);
+		}
+
+		await page.evaluate(() => window.api.settings.set({ language: "en" }));
+	});
+
+	test("preserves orientation metadata when toggle is enabled", async () => {
+		await page.evaluate(() => window.api.settings.set({ saveAsCopy: false }));
+		const { dir, copyFixture, cleanup } = createFixtureDir();
+		try {
+			const expectedOrientation = "Rotate 90 CW";
+			const tempFile = copyFixture("orientation.jpg");
+			const tagsBefore = await readMetadataTags(tempFile);
+			expect(tagsBefore.Orientation).toBe(expectedOrientation);
+
+			// Ensure orientation preservation is enabled (default: true)
+			const settings = await page.evaluate(() => window.api.settings.get());
+			expect(settings.preserveOrientation).toBe(true);
+			const before = snapshotDir(dir);
+
+			// Process the file
+			await app.evaluate(
+				({ BrowserWindow }, filePaths) => {
+					const win = BrowserWindow.getAllWindows()[0];
+					if (win) {
+						win.webContents.send("file-open-add-files", filePaths);
+					}
+				},
+				[tempFile],
+			);
+
+			await waitForProcessing(page, { timeout: 15000 });
+			const after = snapshotDir(dir);
+			assertDirEffect(before, after, { modified: ["orientation.jpg"] });
+
+			const tagsAfter = await readMetadataTags(tempFile);
+			expect(tagsAfter.Orientation).toBe(expectedOrientation);
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("toggles save-as-copy switch and verifies _cleaned setting propagation", async () => {
+		// Open settings
+		const gearButton = page.locator(".gear-icon");
+		await gearButton.click();
+
+		// Get initial state
+		const initialSettings = await page.evaluate(() =>
+			window.api.settings.get(),
+		);
+
+		// Toggle save-as-copy to opposite of current
+		const newValue = !initialSettings.saveAsCopy;
+		await page.evaluate(
+			(v) => window.api.settings.set({ saveAsCopy: v }),
+			newValue,
+		);
+		await page.waitForTimeout(300);
+
+		// Verify the checkbox reflects the change
+		const saveAsCopyInput = page.locator("#toggle-save-as-copy");
+		const afterToggle = await saveAsCopyInput.isChecked();
+		expect(afterToggle).toBe(newValue);
+
+		// Verify the setting was persisted via IPC
+		const updatedSettings = await page.evaluate(() =>
+			window.api.settings.get(),
+		);
+		expect(updatedSettings.saveAsCopy).toBe(newValue);
+
+		// The executable #304 marker below owns the full pipeline contract.
+		// This test only verifies settings propagation.
+
+		// Restore the new-install default.
+		await page.evaluate(() => window.api.settings.set({ saveAsCopy: true }));
+	});
+
+	test("#304 save-as-copy on: original survives, a cleaned copy appears", async () => {
+		const { dir, copyFixture, cleanup } = createFixtureDir();
+		try {
+			const tempFile = copyFixture("sample.jpg");
+
+			await page.evaluate(() => window.api.settings.set({ saveAsCopy: true }));
+			await page.waitForTimeout(300);
+
+			const before = snapshotDir(dir);
+
+			await app.evaluate(
+				({ BrowserWindow }, filePaths) => {
+					const win = BrowserWindow.getAllWindows()[0];
+					if (win) {
+						win.webContents.send("file-open-add-files", filePaths);
+					}
+				},
+				[tempFile],
+			);
+
+			await waitForProcessing(page, { timeout: 15000 });
+
+			const after = snapshotDir(dir);
+
+			assertDirEffect(before, after, {
+				added: ["sample_cleaned.jpg"],
+				unchanged: ["sample.jpg"],
+				modified: [],
+				removed: [],
+			});
+		} finally {
+			await page.evaluate(() => window.api.settings.set({ saveAsCopy: false }));
+			cleanup();
+		}
+	});
+
+	// Regression guard (D-05 test 3): this is NOT a #304 proof and must STAY GREEN after
+	// Phase 21. Overwrite mode (save-as-copy off) is measured GREEN today because #304
+	// collapses both settings onto the same code path and both modes produce
+	// bit-identical output — do not reword this assertion if it ever goes red.
+	test("#304 overwrite mode (not a #304 proof, stays green after the fix): save-as-copy off overwrites in place", async () => {
+		const { dir, copyFixture, cleanup } = createFixtureDir();
+		try {
+			const tempFile = copyFixture("sample.jpg");
+			await app.evaluate(({ Menu }) => {
+				const originalBuildFromTemplate = Menu.buildFromTemplate;
+				Reflect.set(globalThis, "__issue304OverwriteMenuBuilds", 0);
+				Reflect.set(globalThis, "__issue304RestoreOverwriteMenu", () => {
+					Menu.buildFromTemplate = originalBuildFromTemplate;
+				});
+				Menu.buildFromTemplate = ((template) => {
+					const builds = Reflect.get(
+						globalThis,
+						"__issue304OverwriteMenuBuilds",
+					) as number;
+					Reflect.set(globalThis, "__issue304OverwriteMenuBuilds", builds + 1);
+					return { popup: () => undefined } as ReturnType<
+						typeof Menu.buildFromTemplate
+					>;
+				}) as typeof Menu.buildFromTemplate;
+			});
+
+			await page.evaluate(() => window.api.settings.set({ saveAsCopy: false }));
+			await page.waitForTimeout(300);
+
+			const before = snapshotDir(dir);
+
+			await app.evaluate(
+				({ BrowserWindow }, filePaths) => {
+					const win = BrowserWindow.getAllWindows()[0];
+					if (win) {
+						win.webContents.send("file-open-add-files", filePaths);
+					}
+				},
+				[tempFile],
+			);
+
+			await waitForProcessing(page, { timeout: 15000 });
+
+			const after = snapshotDir(dir);
+
+			assertDirEffect(before, after, {
+				modified: ["sample.jpg"],
+				added: [],
+				removed: [],
+			});
+
+			await page
+				.locator(".file-table__reveal")
+				.first()
+				.click({ button: "right" });
+			const menuBuilds = await app.evaluate(() => {
+				return Reflect.get(
+					globalThis,
+					"__issue304OverwriteMenuBuilds",
+				) as number;
+			});
+			expect(menuBuilds).toBe(0);
+		} finally {
+			await app.evaluate(() => {
+				const restore = Reflect.get(
+					globalThis,
+					"__issue304RestoreOverwriteMenu",
+				) as (() => void) | undefined;
+				restore?.();
+			});
+			cleanup();
+		}
+	});
+
+	test("#304 collision: save-as-copy writes _cleaned_2 and reveals that artifact", async () => {
+		const { dir, copyFixture, cleanup } = createFixtureDir();
+		try {
+			const tempFile = copyFixture("sample.jpg");
+			const preExistingCleaned = path.join(dir, "sample_cleaned.jpg");
+			const collisionOutput = path.join(dir, "sample_cleaned_2.jpg");
+			fs.copyFileSync(tempFile, preExistingCleaned);
+
+			await page.evaluate(() => window.api.settings.set({ saveAsCopy: true }));
+			await page.waitForTimeout(300);
+
+			await app.evaluate(({ Menu, shell }) => {
+				const calls: string[] = [];
+				const menuBuilds: string[][] = [];
+				const selections = ["reveal-cleaned-copy", "reveal-original"];
+				const originalShowItemInFolder = shell.showItemInFolder;
+				const originalBuildFromTemplate = Menu.buildFromTemplate;
+				Reflect.set(globalThis, "__issue304RevealCalls", calls);
+				Reflect.set(globalThis, "__issue304MenuBuilds", menuBuilds);
+				Reflect.set(globalThis, "__issue304RestoreReveal", () => {
+					shell.showItemInFolder = originalShowItemInFolder;
+					Menu.buildFromTemplate = originalBuildFromTemplate;
+				});
+				shell.showItemInFolder = (filePath: string): void => {
+					calls.push(filePath);
+				};
+				Menu.buildFromTemplate = ((template) => {
+					const items = template as Array<{
+						id?: string;
+						click?: () => void;
+					}>;
+					menuBuilds.push(items.map(({ id }) => id ?? ""));
+					return {
+						popup: () => {
+							const selection = selections[menuBuilds.length - 1];
+							items.find(({ id }) => id === selection)?.click?.();
+						},
+					} as ReturnType<typeof Menu.buildFromTemplate>;
+				}) as typeof Menu.buildFromTemplate;
+			});
+
+			const before = snapshotDir(dir);
+
+			await app.evaluate(
+				({ BrowserWindow }, filePaths) => {
+					const win = BrowserWindow.getAllWindows()[0];
+					if (win) {
+						win.webContents.send("file-open-add-files", filePaths);
+					}
+				},
+				[tempFile],
+			);
+
+			await waitForProcessing(page, { timeout: 15000 });
+
+			const after = snapshotDir(dir);
+			assertDirEffect(before, after, {
+				added: ["sample_cleaned_2.jpg"],
+				unchanged: ["sample.jpg", "sample_cleaned.jpg"],
+				modified: [],
+				removed: [],
+			});
+
+			const expectedAfterCount = await page.evaluate(async (filePath) => {
+				const metadata = await window.api.exif.readMetadata(filePath);
+				return Object.keys(metadata).length;
+			}, collisionOutput);
+			const afterCell = page
+				.locator(".file-table__row")
+				.first()
+				.locator(".file-table__cell")
+				.nth(5);
+			await expect(afterCell).toContainText(String(expectedAfterCount));
+
+			const revealButton = page.locator(".file-table__reveal").first();
+			await page.evaluate(() => window.api.settings.set({ saveAsCopy: false }));
+			await page.waitForTimeout(300);
+			await revealButton.click();
+			await revealButton.press("Enter");
+
+			const revealCalls = await app.evaluate(() => {
+				return Reflect.get(globalThis, "__issue304RevealCalls") as string[];
+			});
+			expect(revealCalls).toEqual([collisionOutput, collisionOutput]);
+
+			await app.evaluate(() => {
+				const calls = Reflect.get(
+					globalThis,
+					"__issue304RevealCalls",
+				) as string[];
+				calls.length = 0;
+			});
+			await revealButton.click({ button: "right" });
+			await revealButton.click({ button: "right" });
+
+			await expect
+				.poll(async () => {
+					return app.evaluate(() => {
+						return Reflect.get(globalThis, "__issue304RevealCalls") as string[];
+					});
+				})
+				.toEqual([collisionOutput, tempFile]);
+			const menuBuilds = await app.evaluate(() => {
+				return Reflect.get(globalThis, "__issue304MenuBuilds") as string[][];
+			});
+			expect(menuBuilds).toEqual([
+				["reveal-cleaned-copy", "reveal-original"],
+				["reveal-cleaned-copy", "reveal-original"],
+			]);
+		} finally {
+			await app.evaluate(() => {
+				const restore = Reflect.get(globalThis, "__issue304RestoreReveal") as
+					(() => void) | undefined;
+				restore?.();
+			});
+			await page.evaluate(() => window.api.settings.set({ saveAsCopy: false }));
+			cleanup();
+		}
+	});
+});
+
+function readLocale(locale: string): Record<string, string> {
+	return JSON.parse(
+		fs.readFileSync(path.resolve(`.resources/locales/${locale}.json`), "utf8"),
+	) as Record<string, string>;
+}
+
+function localeValue(strings: Record<string, string>, key: string): string {
+	const value = strings[key];
+	if (value === undefined)
+		throw new Error(`Missing locale fixture key: ${key}`);
+	return value;
+}

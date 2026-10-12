@@ -1,0 +1,281 @@
+//
+//  DeviceInstallVM.swift
+//  ipaverse
+//
+//  Created by BAHATTIN KOC on 25.05.2026.
+//
+
+import SwiftUI
+
+@MainActor
+final class DeviceInstallVM: ObservableObject {
+
+    enum State: Equatable {
+        case idle
+        case loadingDevices
+        case installing(message: String)
+        case success(deviceName: String)
+        case error(String)
+    }
+
+    @Published var devices: [ConnectedDevice] = []
+    @Published var selectedDevice: ConnectedDevice? { didSet { refreshPreflight() } }
+    @Published var preflightChecks: [PreflightCheck] = []
+    @Published var isCheckingPreflight = false
+    private var preflightGeneration = 0
+    var preflightBlocksInstallation: Bool { isCheckingPreflight || preflightChecks.isEmpty || preflightChecks.contains { $0.status == .blocked } }
+
+    func refreshPreflight() {
+        preflightGeneration += 1
+        let generation = preflightGeneration
+        guard let device = selectedDevice else { preflightChecks = []; isCheckingPreflight = false; return }
+        // Simulator installs strip the provisioning profile and re-sign ad-hoc
+        // instead of using it — the profile/device-registration checks below
+        // don't apply and would just be misleading noise for this target.
+        guard !device.isSimulator else {
+            preflightChecks = [PreflightCheck(status: .warning, title: "Simulator (Experimental)",
+                detail: "ipaverse removes this app's device signature and retags its binary to run on Simulator. Store purchases, push notifications, and camera/Face ID-dependent features will not work.")]
+            isCheckingPreflight = false
+            return
+        }
+        isCheckingPreflight = true
+        let path = ipaPath
+        Task {
+            let checks = await Task.detached { () -> [PreflightCheck] in
+                do { return try IPAPreflight.installation(ipaPath: path, device: device) }
+                catch { return [PreflightCheck(status: .blocked, title: "Package validation", detail: error.localizedDescription)] }
+            }.value
+            guard generation == preflightGeneration else { return }
+            preflightChecks = checks
+            isCheckingPreflight = false
+        }
+    }
+
+    @Published var state: State = .idle
+
+    /// Minimum iOS version the IPA declares (Info.plist `MinimumOSVersion`).
+    /// nil when unknown — in that case we don't block any device.
+    @Published var minimumOSVersion: String?
+
+    /// Apple ID this IPA's FairPlay license is bound to (from iTunesMetadata).
+    /// nil when the IPA carries no binding (DRM-free / self-built).
+    @Published var boundAppleID: String?
+
+    /// Resolved once per IPA — `boundAppleID` being nil is a valid answer, so we
+    /// track resolution separately to avoid re-reading the zip on every refresh.
+    private var didResolveBinding = false
+
+    let ipaPath: String
+
+    /// Apple ID currently signed into ipaverse, used to detect an account
+    /// mismatch against the IPA's FairPlay binding. nil when unknown.
+    let activeAppleID: String?
+
+    init(ipaPath: String, activeAppleID: String? = nil) {
+        self.ipaPath = ipaPath
+        self.activeAppleID = activeAppleID
+    }
+
+    /// True when the IPA is bound to a different Apple ID than the active one —
+    /// installing it then risks a FairPlay crash on launch. Only fires when both
+    /// IDs are known and genuinely differ.
+    var accountMismatch: Bool {
+        guard let bound = boundAppleID, let active = activeAppleID,
+              !bound.isEmpty, !active.isEmpty else { return false }
+        return bound.caseInsensitiveCompare(active) != .orderedSame
+    }
+
+    var isInstalling: Bool {
+        if case .installing = state { return true }
+        return false
+    }
+
+    var installMessage: String? {
+        if case .installing(let msg) = state { return msg }
+        return nil
+    }
+
+    var errorMessage: String? {
+        if case .error(let msg) = state { return msg }
+        return nil
+    }
+
+    var successMessage: String? {
+        if case .success(let name) = state { return name }
+        return nil
+    }
+
+    /// True when the install just failed (as opposed to "no devices found",
+    /// which is surfaced by the empty state).
+    var hasInstallError: Bool {
+        if case .error = state, !devices.isEmpty { return true }
+        return false
+    }
+
+    // MARK: - Compatibility
+
+    /// Whether `device`'s iOS version meets the IPA's MinimumOSVersion.
+    /// Unknown minimum (or unknown device version) is treated as compatible.
+    func isCompatible(_ device: ConnectedDevice) -> Bool {
+        guard let minOS = minimumOSVersion, !minOS.isEmpty,
+              !device.osVersion.isEmpty else { return true }
+        return Self.compareVersions(device.osVersion, minOS) != .orderedAscending
+    }
+
+    /// Warning to show for an incompatible device, or nil if it's fine.
+    func requirementNote(for device: ConnectedDevice) -> String? {
+        guard !isCompatible(device), let minOS = minimumOSVersion else { return nil }
+        return "Requires iOS \(minOS) or later"
+    }
+
+    /// Component-wise numeric version compare ("9.0" < "10.0", "12.1.2" ok).
+    static func compareVersions(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let l = lhs.split(separator: ".").map { Int($0) ?? 0 }
+        let r = rhs.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(l.count, r.count) {
+            let a = i < l.count ? l[i] : 0
+            let b = i < r.count ? r[i] : 0
+            if a != b { return a < b ? .orderedAscending : .orderedDescending }
+        }
+        return .orderedSame
+    }
+
+    func clearError() {
+        if case .error = state { state = .idle }
+    }
+
+    /// Physical hardware only — the ones the main Install button/preflight
+    /// checks/selection apply to.
+    var physicalDevices: [ConnectedDevice] { devices.filter { !$0.isSimulator } }
+    /// Simulator devices — handled entirely separately (SimulatorInstaller,
+    /// `installOnSimulator`), each with its own inline Run button and state.
+    var simulatorDevices: [ConnectedDevice] { devices.filter { $0.isSimulator } }
+    var hasAnyDevices: Bool { !devices.isEmpty }
+
+    /// Pick the best default selection: prefer a connected device that can run
+    /// the app, then any compatible one, then any connected device.
+    private func preferredDevice(from list: [ConnectedDevice]) -> ConnectedDevice? {
+        if let d = list.first(where: { $0.isAvailable && isCompatible($0) }) { return d }
+        if let d = list.first(where: { isCompatible($0) }) { return d }
+        if let d = list.first(where: { $0.isAvailable }) { return d }
+        return list.first
+    }
+
+    // MARK: - Load
+
+    func loadDevices() async {
+        state = .loadingDevices
+        let path = ipaPath
+        let needMinOS = (minimumOSVersion == nil)
+        let needBound = !didResolveBinding
+
+        let result = await Task.detached { () -> ([ConnectedDevice], String?, String?) in
+            var devices = (try? DeviceInstaller.listDevices()) ?? []
+            // devicectl can list an iOS 16-or-earlier device but can never install
+            // to it (its live tunnel needs RemoteXPC, an iOS 17+-only service) — it
+            // just sits at isAvailable=false forever. Fall back to the classic
+            // usbmuxd/lockdownd stack for exactly those devices.
+            let classicDevices: [ConnectedDevice]
+            do {
+                classicDevices = try ClassicDeviceInstaller.listDevices()
+                print("⚙️ [DeviceInstallVM] classic backend found \(classicDevices.count) device(s)")
+            } catch {
+                print("⚙️ [DeviceInstallVM] classic backend failed: \(error)")
+                classicDevices = []
+            }
+            for classicDevice in classicDevices {
+                if let idx = devices.firstIndex(where: { $0.id == classicDevice.id }) {
+                    if !devices[idx].isAvailable { devices[idx] = classicDevice }
+                } else {
+                    devices.append(classicDevice)
+                }
+            }
+            let minOS: String? = needMinOS
+                ? ((try? IPAResigner.loadInfoPlist(ipaPath: path))?["MinimumOSVersion"]) as? String
+                : nil
+            let bound: String? = needBound ? IPAResigner.boundAppleID(ipaPath: path) : nil
+            return (devices, minOS, bound)
+        }.value
+
+        if needMinOS, let minOS = result.1, !minOS.isEmpty {
+            minimumOSVersion = minOS
+        }
+        if needBound {
+            boundAppleID = result.2
+            didResolveBinding = true
+        }
+
+        devices = result.0.filter { $0.isIPhone }
+        // Prefer a physical device when one's available; fall back to a
+        // simulator only if that's all there is — both install from the same
+        // selection + bottom Install button.
+        selectedDevice = preferredDevice(from: physicalDevices) ?? preferredDevice(from: simulatorDevices)
+        state = .idle
+
+        if !hasAnyDevices {
+            state = .error(DeviceInstallerError.noDevicesFound.localizedDescription)
+        }
+    }
+
+    // MARK: - Install
+
+    func install() {
+        guard let device = selectedDevice, !isInstalling, !preflightBlocksInstallation else { return }
+
+        guard isCompatible(device) else {
+            state = .error(
+                "This version requires iOS \(minimumOSVersion ?? "?") or later, "
+                + "but \(device.name) is running iOS \(device.osVersion). "
+                + "Choose a device on a newer iOS, or download a version that supports iOS \(device.osVersion)."
+            )
+            return
+        }
+
+        let path = ipaPath
+        state = .installing(message: "Checking installation readiness…")
+
+        Task.detached { [weak self] in
+            // Captured once, up front, as a genuine local `let` — the nested
+            // progress-callback closures below can then reference it directly
+            // without each needing their own `[weak self]`/re-unwrap, which is
+            // what was tripping Swift 6's "captured var 'self'" diagnostic.
+            guard let self else { return }
+            do {
+                if device.backend == .simulator {
+                    // No provisioning-profile preflight here: SimulatorInstaller
+                    // strips the original device signature entirely and re-signs
+                    // ad-hoc, so profile/device-registration checks don't apply.
+                    try SimulatorInstaller.install(ipaPath: path, device: device) { message in
+                        Task { @MainActor in self.state = .installing(message: message) }
+                    }
+                } else {
+                    let blockers = try IPAPreflight.installation(ipaPath: path, device: device).filter { $0.status == .blocked }
+                    guard blockers.isEmpty else { throw IPAPreflight.Failure.blocked(blockers.map { $0.title + ": " + $0.detail }.joined(separator: "\n")) }
+                    switch device.backend {
+                    case .coreDevice:
+                        try DeviceInstaller.install(ipaPath: path, device: device) { message in
+                            Task { @MainActor in self.state = .installing(message: message) }
+                        }
+                    case .classic:
+                        try ClassicDeviceInstaller.install(ipaPath: path, device: device) { message in
+                            Task { @MainActor in self.state = .installing(message: message) }
+                        }
+                    case .simulator:
+                        break // handled above
+                    }
+                }
+                await self.markInstalled(deviceName: device.name)
+            } catch {
+                await self.markInstallError(error.localizedDescription)
+            }
+        }
+    }
+
+    private func markInstalled(deviceName: String) {
+        state = .success(deviceName: deviceName)
+    }
+
+    private func markInstallError(_ message: String) {
+        state = .error(message)
+    }
+}

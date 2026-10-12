@@ -1,0 +1,468 @@
+//! Typed errors.
+//!
+//! Callers must be able to distinguish "this format is not supported" from "this file is
+//! corrupt" from "the disk is full", because those three demand different actions from the
+//! user and different exit codes from the CLI. That is why `strypt-core` uses `thiserror`
+//! and never `anyhow` (ADR-0008): a boxed, stringly-typed error erases exactly the
+//! distinction the front-ends need to make.
+//!
+//! # These messages must never contain metadata values
+//!
+//! An error string is durable — it lands in terminal scrollback, in a shell's history file,
+//! in a bug report pasted into a public issue tracker. A message that helpfully quoted the
+//! GPS coordinate it failed to parse would be a durable copy of the secret the user was
+//! trying to destroy (`docs/THREAT_MODEL.md` §5.5). Errors here name *fields, offsets, and
+//! counts*. They never name values.
+
+use crate::detect::Format;
+
+/// Everything that can go wrong in `strypt-core`.
+///
+/// Non-exhaustive: new variants are additive and must not break front-ends that match on it.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StryptError {
+    /// The underlying I/O operation failed.
+    ///
+    /// `action` says what was being attempted, so a front-end can render "could not read the
+    /// input" rather than a bare `ENOENT`.
+    #[error("i/o failure while {action}")]
+    Io {
+        /// What the operation was trying to do.
+        action: IoAction,
+        /// The operating system's error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The destination exists and the caller did not ask to replace it. A refusal, not an I/O
+    /// failure: the fix is the caller's, so it must not read as a disk problem.
+    #[error("the output file already exists")]
+    OutputExists,
+
+    /// The input exceeds the configured size limit and was not read.
+    ///
+    /// This is a refusal, not a failure: an unbounded read of an attacker-supplied file is a
+    /// memory-exhaustion vector (`docs/ARCHITECTURE.md` §5.1), so strypt declines rather than
+    /// trying and dying.
+    #[error("input is larger than the configured limit of {limit} bytes")]
+    InputTooLarge {
+        /// The limit that was exceeded, in bytes.
+        limit: u64,
+        /// The input's actual size, where the source could report it.
+        actual: Option<u64>,
+    },
+
+    /// The content was recognised, but no handler for it exists in this release.
+    ///
+    /// Reported explicitly and never silently passed through — a silent pass-through is the
+    /// failure mode in `docs/THREAT_MODEL.md` §5.4, where the user publishes a file the tool
+    /// implied it had cleaned.
+    #[error("{format} is not supported in this release")]
+    UnsupportedFormat {
+        /// What the content was identified as.
+        format: UnsupportedKind,
+    },
+
+    /// The content matched no format strypt recognises at all.
+    #[error("the content does not match any format strypt recognises")]
+    UnrecognisedFormat,
+
+    /// The file claims to be `format` but violates its structure.
+    ///
+    // The offset is formatted by hand because `{offset:?}` on an `Option` renders "None" or
+    // "Some(42)" — debug syntax shown to someone deciding whether to publish a document. When
+    // the position is unknown, saying nothing is better than saying "None".
+    #[error("malformed {format}{}: {detail}", .offset.map_or_else(String::new, |o| format!(" at byte offset {o}")))]
+    Malformed {
+        /// The format whose rules were broken.
+        format: Format,
+        /// Where the parser gave up, when the position is known.
+        offset: Option<u64>,
+        /// Which structural rule was violated. Never contains a metadata value.
+        detail: MalformedDetail,
+    },
+
+    /// A hostile or pathological file hit one of the parser's resource ceilings.
+    ///
+    /// For memory-safe Rust this is the realistic residual attack class, not memory
+    /// corruption (`docs/THREAT_MODEL.md` §5.1), so it gets its own variant rather than being
+    /// folded into [`StryptError::Malformed`].
+    #[error("{format} parsing exceeded the {limit} limit")]
+    LimitExceeded {
+        /// The format being parsed when the ceiling was hit.
+        format: Format,
+        /// Which ceiling.
+        limit: ResourceLimit,
+    },
+
+    /// The handler produced output, but re-inspecting that output still found metadata.
+    ///
+    /// The output is discarded. This is the verification pass in `docs/ARCHITECTURE.md` §1
+    /// doing its job: it converts a silent handler bug into a loud, safe failure, which is
+    /// the whole reason it exists.
+    #[error("verification failed: {residual} metadata item(s) survived stripping")]
+    VerificationFailed {
+        /// The format that was being stripped.
+        format: Format,
+        /// How many items the re-inspection still found. Counts only — never the values.
+        residual: usize,
+    },
+}
+
+/// What an I/O operation was attempting when it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IoAction {
+    /// Opening or reading the input file.
+    ReadingInput,
+    /// Determining the input's size before reading it.
+    MeasuringInput,
+    /// Creating the temporary file that output is written to.
+    CreatingTemporary,
+    /// Writing sanitised bytes.
+    WritingOutput,
+    /// Flushing and synchronising output to disk.
+    SyncingOutput,
+    /// Renaming the temporary file over the destination.
+    ReplacingDestination,
+    /// Setting permissions on the output.
+    SettingPermissions,
+    /// Removing a temporary file after a failure.
+    CleaningUp,
+}
+
+impl std::fmt::Display for IoAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::ReadingInput => "reading the input",
+            Self::MeasuringInput => "measuring the input",
+            Self::CreatingTemporary => "creating a temporary file",
+            Self::WritingOutput => "writing output",
+            Self::SyncingOutput => "syncing output to disk",
+            Self::ReplacingDestination => "replacing the destination file",
+            Self::SettingPermissions => "setting output permissions",
+            Self::CleaningUp => "removing a temporary file",
+        };
+        f.write_str(s)
+    }
+}
+
+/// A format strypt can identify but cannot yet process.
+///
+/// Naming it is worth the small amount of detection code: "this is an `OpenXML` document,
+/// which arrives in Phase 2" is actionable, where "unrecognised" sends the user away
+/// believing their file is exotic when it is merely out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnsupportedKind {
+    /// A format strypt identifies and has a place for, but whose handler has not landed yet.
+    ///
+    /// Distinct from the Phase 2 formats below, because the advice differs: "not in this
+    /// release" versus "not in this phase of the project".
+    NotYetImplemented(crate::detect::Format),
+    /// A ZIP container, which may be an Office document, an ODF document, or an archive.
+    ZipContainer,
+    /// A macro-enabled Office document — `.docm`, `.xlsm`, `.pptm`.
+    ///
+    /// Refused rather than handled, and named separately from [`Self::ZipContainer`] because
+    /// the advice differs. This is not "a later phase will get to it": the document carries a
+    /// `vbaProject.bin`, which is an OLE compound file with its own directory and its own
+    /// metadata streams that strypt cannot read. Reporting the document clean while a container
+    /// inside it went unexamined is the failure in `docs/THREAT_MODEL.md` §5.4 (ADR-0029).
+    MacroEnabledOffice,
+    /// An `OpenDocument` package of a type this release does not handle — a drawing, a formula,
+    /// a chart, a database, or any of the `-template` variants.
+    ///
+    /// Named separately from [`Self::ZipContainer`] because the two say different things to a
+    /// user: this one means the file was understood and declined, where the generic refusal
+    /// sounds like it was not recognised at all. `docs/ROADMAP.md` Phase 2 group 2 is `.odt`,
+    /// `.ods`, and `.odp`, and widening that needs a superseding ADR (ADR-0027).
+    OtherOpenDocument,
+    /// `BigTIFF`: the same byte-order marks as TIFF but magic number 43, with eight-byte
+    /// offsets throughout. Refused by name rather than parsed as the TIFF it is not, because a
+    /// parser reading its directories as ordinary TIFF ones produces confident nonsense
+    /// (ADR-0033).
+    BigTiff,
+    /// An ISO base-media file whose brands name nothing this release handles.
+    ///
+    /// Still HEIF and AVIF, progressive MP4 and M4A all have handlers, so what reaches this variant
+    /// is a container declaring some other brand entirely — or a motion HEIF, which carries a
+    /// still-image brand alongside a sequence one.
+    IsoBaseMedia,
+    /// A fragmented MP4 — a `moof`, `mfra`, `mvex`, `styp` or `sidx` box, or a DASH/CMAF brand.
+    ///
+    /// Refused rather than edited. `tfhd`'s `base_data_offset` and every `tfra` entry are absolute
+    /// file offsets again, spread across fragments this handler does not read, so the relocation
+    /// table the MP4 handler is built on cannot be constructed for them (ADR-0042). A fragmented
+    /// file edited as though it were progressive still opens and plays nothing.
+    FragmentedMp4,
+    /// An MP4 or M4A under Common Encryption or `FairPlay` — a `pssh` box, an `encv`/`enca`/`drms`
+    /// sample entry, or the `M4P ` brand.
+    ///
+    /// Refused on the reasoning behind [`Self::MacroEnabledOffice`]: the samples are ciphertext no
+    /// rule here matches, so reporting the file clean would mean reporting on a file nobody
+    /// examined (`docs/THREAT_MODEL.md` §5.4, ADR-0042).
+    ProtectedMedia,
+    /// A `QuickTime` movie — a `.mov`, declaring the `qt  ` brand.
+    ///
+    /// The same box grammar as MP4 and a different vocabulary on top of it. Phase 2's fourth group
+    /// is MP4 and M4A (ADR-0037); widening it is a superseding ADR rather than a judgement call.
+    QuickTimeMovie,
+    /// A 3GPP or 3GPP2 file — the `3gp`/`3g2` brand family.
+    ///
+    /// Named rather than left as [`Self::IsoBaseMedia`], because it is a format a user has a name
+    /// for. Out of ADR-0037's scope for the reason [`Self::QuickTimeMovie`] is.
+    ThirdGenerationPartnership,
+    /// A HEIF or AVIF that carries a motion sequence as well as, or instead of, a still image.
+    ///
+    /// An Apple Live Photo is the common case: an ordinary-looking `.HEIC` with a video track
+    /// beside the picture. Named separately from [`Self::IsoBaseMedia`] because the user's file
+    /// *is* a photograph as far as they are concerned, and "this is an MP4" would be baffling.
+    ///
+    /// Refused rather than partly cleaned. `docs/ROADMAP.md` puts video containers in Phase 2's
+    /// fourth group; stripping the still and discarding the track would change what the file is
+    /// (`docs/PRD.md` §8.1) and would delete a track carrying its own metadata that nobody
+    /// parsed (ADR-0034).
+    MotionHeif,
+    /// An Ogg carrying Theora video.
+    ///
+    /// Video is Phase 2's fifth tranche at the earliest (ADR-0037), and a Theora stream carries
+    /// its own comment header this handler has not read.
+    OggTheora,
+    /// An Ogg whose codec strypt has no mapping for — Speex, Skeleton, or something unrecognised.
+    ///
+    /// The container is the same; what is in the packets is not, and the metadata lives in the
+    /// packets (ADR-0041).
+    OtherOggCodec,
+    /// An Ogg carrying more than one logical bitstream: a multiplexed or a chained file.
+    ///
+    /// Refused rather than partly cleaned. A second stream is a second mapping with a second
+    /// comment header, and cleaning one while copying the other through is the failure in
+    /// `docs/THREAT_MODEL.md` §5.4 (ADR-0041 decision 6).
+    MultiplexedOgg,
+    /// MPEG audio that is not Layer III — an `.mp1` or `.mp2`.
+    ///
+    /// The same frame grammar as MP3 and a different format, so it is named rather than stripped
+    /// as one. Phase 2's scope is MP3 (ADR-0027), and the layer field is what says which of the
+    /// three a file is (ADR-0040).
+    MpegAudioNotLayerThree,
+    /// A RIFF container that is neither WebP nor WAV, such as AVI.
+    OtherRiff,
+    /// An RF64 or BW64 file: a WAV whose payload exceeds what a 32-bit RIFF size can express.
+    ///
+    /// A different container spelling, not a large WAV. The real sizes live in a `ds64` chunk and
+    /// the RIFF size field is a `-1` placeholder, so a handler that treated it as WAV would walk
+    /// the wrong extent. Named rather than left unrecognised (ADR-0039).
+    Rf64,
+    /// A WAV whose audio is a `wavl` wave list rather than a single `data` chunk.
+    ///
+    /// The one WAV shape where removing a chunk could move something: `cue ` offsets index into
+    /// the wave list's data section, which is exactly what ADR-0034 found in HEIF. Refused rather
+    /// than edited, because getting it wrong yields a file that still plays the wrong bytes
+    /// (ADR-0039).
+    WaveList,
+    /// An XML document that is not an SVG this release claims.
+    ///
+    /// Also where an SVG with a *prefixed* root element — `<svg:svg>`, which very old Inkscape
+    /// releases wrote — lands. The handler removes prefixed elements on an allow-list (ADR-0035),
+    /// so claiming that document would mean removing it; refusing is fail-closed.
+    Xml,
+    /// A gzip stream, which in this project's world is usually a `.svgz`.
+    ///
+    /// Refused rather than handled. Inflating it would put a decompressor on the input path and a
+    /// compressor on the output path for no metadata gain, and the user can decompress it
+    /// themselves in one command (ADR-0035). Named rather than left unrecognised, because
+    /// "unrecognised" is untrue for a common spelling of a format strypt does handle.
+    Gzip,
+    /// An SVG carrying a script, an event-handler attribute, or a `foreignObject`.
+    ///
+    /// Refused rather than partly cleaned, on the same reasoning as [`Self::MacroEnabledOffice`]:
+    /// the document contains executable code strypt has no parser for, which is free to hold a
+    /// name, a path, a credential, or a base64 copy of anything at all. Removing it would change
+    /// what the file does (`docs/PRD.md` §8.1); keeping it would mean reporting success on a file
+    /// that runs unexamined code the moment a reader opens it, which is
+    /// `docs/THREAT_MODEL.md` §5.4. mat2 re-renders SVG and is the better recommendation for a
+    /// user who needs the script gone (ADR-0035).
+    ScriptedSvg,
+    /// A JPEG XL carrying a top-level box strypt does not recognise.
+    ///
+    /// Boxes reach the output from an allow-list, so an unrecognised one is refused rather than
+    /// copied through: an unknown top-level box in a format that keeps its metadata in top-level
+    /// boxes is more likely to be metadata than not (ADR-0036).
+    UnknownJxlBox,
+}
+
+impl std::fmt::Display for UnsupportedKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Written as a total match rather than an early return plus `unreachable!()`: this
+        // crate has no panic paths, and "obviously unreachable" is how they get introduced.
+        let s = match self {
+            Self::NotYetImplemented(format) => {
+                return write!(f, "{format}, whose handler has not landed yet");
+            }
+            Self::ZipContainer => "a ZIP container (Office, OpenDocument, or archive)",
+            Self::MacroEnabledOffice => {
+                "a macro-enabled Office document, whose embedded VBA project strypt cannot read"
+            }
+            Self::OtherOpenDocument => {
+                "an OpenDocument type strypt does not handle yet (a drawing, formula, chart, or template)"
+            }
+            Self::BigTiff => "BigTIFF",
+            Self::IsoBaseMedia => {
+                "an ISO base-media file whose brands name no format strypt handles"
+            }
+            Self::FragmentedMp4 => {
+                "a fragmented MP4, whose sample offsets strypt will not relocate"
+            }
+            Self::ProtectedMedia => {
+                "an encrypted MP4 or M4A (Common Encryption or FairPlay), whose samples strypt \
+                 cannot examine"
+            }
+            Self::QuickTimeMovie => "a QuickTime movie (.mov), which is a different vocabulary",
+            Self::ThirdGenerationPartnership => "a 3GPP or 3GPP2 file",
+            Self::MotionHeif => "a motion HEIF or AVIF (an Apple Live Photo, for instance)",
+            Self::OggTheora => "an Ogg carrying Theora video",
+            Self::OtherOggCodec => {
+                "an Ogg carrying a codec strypt has no mapping for (Speex or Skeleton, for instance)"
+            }
+            Self::MultiplexedOgg => {
+                "an Ogg carrying more than one logical bitstream, which strypt will not partly clean"
+            }
+            Self::MpegAudioNotLayerThree => {
+                "MPEG audio that is not Layer III (an .mp1 or .mp2), which is a different format"
+            }
+            Self::OtherRiff => "a RIFF container other than WebP or WAV",
+            Self::Rf64 => {
+                "an RF64 or BW64 file, which is a different container from WAV and not a large one"
+            }
+            Self::WaveList => "a WAV whose audio is a wave list rather than a single data chunk",
+            Self::Xml => "an XML document that is not an SVG strypt can process",
+            Self::Gzip => "a gzip-compressed file, most likely a .svgz; decompress it first",
+            Self::UnknownJxlBox => "a JPEG XL carrying a top-level box strypt does not recognise",
+            Self::ScriptedSvg => {
+                "an SVG containing a script, an event handler, or a foreignObject, \
+                 which strypt will not partly clean"
+            }
+        };
+        f.write_str(s)
+    }
+}
+
+/// Which structural rule a malformed file broke.
+///
+/// Deliberately coarse. The purpose is to let a user tell "this file is truncated" from
+/// "this file is not really the format it claims", not to provide a parser trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MalformedDetail {
+    /// The file ends in the middle of a structure that declared more bytes.
+    Truncated,
+    /// A length or offset field points outside the file.
+    LengthOutOfRange,
+    /// A required structural marker is missing.
+    MissingMarker,
+    /// A structural marker appeared where it is not permitted.
+    UnexpectedMarker,
+    /// The cross-reference or index structure is unusable.
+    BrokenIndex,
+    /// The file's objects reference each other in a cycle.
+    CyclicReference,
+    /// The file uses a feature strypt will not process, such as encryption.
+    UnsupportedFeature,
+    /// The rewritten file did not read back as the document that was written.
+    ///
+    /// Distinct from every other variant here because it describes a failure found in
+    /// strypt's *output* rather than in the input: the document parsed, scrubbed, and
+    /// serialised, and the result then did not round-trip. The input is still what caused it
+    /// — a structure lenient enough to parse but not to reproduce — so it belongs with the
+    /// malformed refusals rather than being reported as an internal error, which would tell
+    /// the user to file a bug about a file that is genuinely broken.
+    NotRoundTrippable,
+    /// A third-party parser panicked on this file and the panic was contained.
+    ///
+    /// Reported as malformed input rather than as an internal error because that is what it
+    /// means for the user: the file was not processed and nothing was written. It is a
+    /// distinct variant rather than being folded into `BrokenIndex` because a panic in a
+    /// dependency is a defect worth being able to find in the wild, not an ordinary refusal
+    /// (`crate::panic_guard`).
+    DependencyPanic,
+}
+
+impl std::fmt::Display for MalformedDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Truncated => "the file ends mid-structure",
+            Self::LengthOutOfRange => "a declared length or offset falls outside the file",
+            Self::MissingMarker => "a required structural marker is missing",
+            Self::UnexpectedMarker => "a structural marker appeared where it is not allowed",
+            Self::BrokenIndex => "the cross-reference structure is unusable",
+            Self::CyclicReference => "objects reference each other in a cycle",
+            Self::UnsupportedFeature => "the file uses a feature strypt will not process",
+            Self::NotRoundTrippable => {
+                "the file cannot be rewritten faithfully, so nothing was written"
+            }
+            Self::DependencyPanic => "the parser failed on this file and it was not processed",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Which parser ceiling a file hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResourceLimit {
+    /// Nesting depth. Guards against stack exhaustion, which aborts the process and so
+    /// cannot be recovered from after the fact.
+    Depth,
+    /// Number of objects, segments, or chunks.
+    ItemCount,
+    /// Total bytes a single structure may expand to.
+    ExpandedSize,
+}
+
+impl std::fmt::Display for ResourceLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Depth => "nesting depth",
+            Self::ItemCount => "item count",
+            Self::ExpandedSize => "expanded size",
+        };
+        f.write_str(s)
+    }
+}
+
+/// The result type used throughout `strypt-core`.
+pub type Result<T> = std::result::Result<T, StryptError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_messages_carry_structure_not_values() {
+        // The guard from docs/THREAT_MODEL.md §5.5: a rendered error is durable, so it may
+        // report counts and offsets but never the metadata itself.
+        let e = StryptError::VerificationFailed {
+            format: Format::Pdf,
+            residual: 3,
+        };
+        let rendered = e.to_string();
+        assert!(rendered.contains('3'));
+        assert!(!rendered.contains("Author"));
+    }
+
+    #[test]
+    fn unsupported_is_distinguishable_from_unrecognised() {
+        // A front-end must be able to tell "Phase 2 will handle this" from "no idea what
+        // this is" — they warrant different advice and different exit codes.
+        let known = StryptError::UnsupportedFormat {
+            format: UnsupportedKind::ZipContainer,
+        };
+        assert!(matches!(known, StryptError::UnsupportedFormat { .. }));
+        assert!(matches!(
+            StryptError::UnrecognisedFormat,
+            StryptError::UnrecognisedFormat
+        ));
+    }
+}

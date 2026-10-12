@@ -1,0 +1,262 @@
+import { getMetloConfig } from "services/metlo-config"
+import { MetloContext } from "types"
+import jsyaml from "js-yaml"
+import { RiskScore, __DataClass_INTERNAL__ } from "@common/enums"
+import { DataClass, MetloConfigResp } from "@common/types"
+import {
+  __DATA_CLASS_TO_RISK_SCORE_INTERNAL__,
+  __DATA_CLASS_TO_SHORT_NAME_INTERNAL__,
+} from "@common/maps"
+import {
+  __DATA_CLASS_KEY_REGEX_MAP_INTERNAL__,
+  __DATA_CLASS_REGEX_MAP_INTERNAL__,
+} from "services/scanner/scan"
+import { RedisClient } from "../../utils/redis"
+import { customDataClass, rawDataClass } from "./utils"
+import { DataField } from "models"
+import { getEntityManager } from "services/database/utils"
+import { ArrayOverlap } from "typeorm"
+import { AppDataSource } from "data-source"
+import mlog from "logger"
+import { NodeCache } from "utils/node-cache"
+import { MAX_DATA_CLASSES } from "resource-limit"
+
+const DATA_CLASS_KEY = "CACHED_DATA_CLASSES"
+const DEFAULT_CLASSES = Object.values(__DataClass_INTERNAL__)
+const dataClassesCache = new NodeCache({ stdTTL: 30, checkperiod: 10 })
+
+async function getOrSet(
+  ctx: MetloContext,
+  key: string,
+  fn: () => Promise<DataClass[]>,
+) {
+  const startGetFromRedis = performance.now()
+  const fetchValue = dataClassesCache.get(ctx, key) as DataClass[] | undefined
+  mlog.time("analyzer.get_dc_from_redis", performance.now() - startGetFromRedis)
+  if (fetchValue && fetchValue.length > 0) {
+    return fetchValue
+  } else {
+    const fnValue = await fn()
+    dataClassesCache.set(ctx, key, fnValue, 30)
+    return fnValue
+  }
+}
+
+function getValidMetloDataClasses(ctx: MetloContext, jsConfig: object) {
+  if (
+    "disabledDataClass" in jsConfig &&
+    jsConfig["disabledDataClass"].hasOwnProperty("length") &&
+    (jsConfig["disabledDataClass"] as unknown[]).length > 0
+  ) {
+    const disabledClasses = jsConfig["disabledDataClass"] as string[]
+    const filteredClasses = Object.keys(__DataClass_INTERNAL__)
+      .filter(clsName => !disabledClasses.includes(clsName))
+      .map(clsName => __DataClass_INTERNAL__[clsName])
+    return filteredClasses
+  } else {
+    return DEFAULT_CLASSES
+  }
+}
+
+export const getCombinedDataClasses = async (ctx: MetloContext) => {
+  let metloConfig = await getMetloConfig(ctx)
+  if (!metloConfig) {
+    metloConfig = {
+      uuid: "",
+      configString: "",
+    }
+  }
+  const jsConfig = (jsyaml.load(metloConfig.configString) as object) || {}
+  let metloDefinedClassMap = [] as rawDataClass[]
+  let userDefinedClassMap = [] as rawDataClass[]
+  if ("sensitiveData" in jsConfig) {
+    const roughMap = Object.entries(jsConfig["sensitiveData"])
+      .map(([configName, config]) => {
+        const parsedData = customDataClass.safeParse(config)
+        if (parsedData.success) {
+          return { [`${configName}`]: parsedData.data }
+        } else {
+          // TODO ?
+          return undefined
+        }
+      })
+      .filter(v => v !== undefined)
+    roughMap.forEach(v => {
+      const [
+        key,
+        { severity, patterns: regexList, keyPatterns: keyRegexList, ...rest1 },
+        ...rest
+      ] = Object.entries(v)[0]
+      userDefinedClassMap.push({
+        className: key,
+        severity: RiskScore[severity] as RiskScore,
+        regex:
+          regexList && regexList.length > 0
+            ? new RegExp(regexList.map(regex => `(${regex})`).join("|"))
+            : null,
+        keyRegex:
+          keyRegexList && keyRegexList.length > 0
+            ? new RegExp(keyRegexList.map(regex => `(${regex})`).join("|"))
+            : null,
+      })
+    })
+  }
+  getValidMetloDataClasses(ctx, jsConfig).forEach(enumKey => {
+    const reg = __DATA_CLASS_REGEX_MAP_INTERNAL__[enumKey]
+    const keyRegex = __DATA_CLASS_KEY_REGEX_MAP_INTERNAL__[enumKey]
+    metloDefinedClassMap.push({
+      className: enumKey,
+      severity: __DATA_CLASS_TO_RISK_SCORE_INTERNAL__[enumKey],
+      shortName: __DATA_CLASS_TO_SHORT_NAME_INTERNAL__[enumKey],
+      regex: reg,
+      keyRegex,
+    })
+  })
+  return [...metloDefinedClassMap, ...userDefinedClassMap].map(cls => {
+    if (cls.regex) {
+      if (cls.keyRegex) {
+        return {
+          ...cls,
+          regex: cls.regex.source,
+          keyRegex: cls.keyRegex.source,
+        }
+      }
+      return { ...cls, regex: cls.regex.source }
+    } else if (cls.keyRegex) {
+      return { ...cls, keyRegex: cls.keyRegex.source }
+    } else {
+      return {
+        className: cls.className,
+        severity: cls.severity,
+        shortName: cls.shortName,
+      }
+    }
+  }) as DataClass[]
+}
+
+export async function getCombinedDataClassesCached(ctx: MetloContext) {
+  return getOrSet(ctx, DATA_CLASS_KEY, () => getCombinedDataClasses(ctx))
+}
+
+export async function clearDataClassCache(ctx: MetloContext) {
+  RedisClient.deleteFromRedis(ctx, [DATA_CLASS_KEY])
+}
+
+export async function cleanupStoredDataClasses(
+  ctx: MetloContext,
+  currentConfigResp: MetloConfigResp,
+  newConfigResp: string,
+) {
+  let currentConfig = currentConfigResp
+  if (!currentConfig) {
+    currentConfig = {
+      uuid: "",
+      configString: "",
+    }
+  }
+  const jsConfigCurrent =
+    (jsyaml.load(currentConfig.configString) as object) || {}
+  const jsConfigNew = (jsyaml.load(newConfigResp) as object) || {}
+
+  const dataClassesDiff = new Set<string>()
+  if ("sensitiveData" in jsConfigCurrent) {
+    Object.keys(jsConfigCurrent["sensitiveData"]).forEach(configName => {
+      dataClassesDiff.add(configName)
+    })
+  }
+  if ("sensitiveData" in jsConfigNew) {
+    Object.keys(jsConfigNew["sensitiveData"]).forEach(configName => {
+      dataClassesDiff.delete(configName)
+    })
+  }
+
+  if (
+    "disabledDataClass" in jsConfigNew &&
+    jsConfigNew["disabledDataClass"].hasOwnProperty("length") &&
+    (jsConfigNew["disabledDataClass"] as unknown[]).length > 0
+  ) {
+    const disabledClasses = jsConfigNew["disabledDataClass"] as string[]
+    disabledClasses.forEach(cls =>
+      dataClassesDiff.add(__DataClass_INTERNAL__[cls]),
+    )
+  }
+
+  const dataClassesDiffReadonly: readonly string[] = Array.from(dataClassesDiff)
+
+  const queryRunner = AppDataSource.createQueryRunner()
+  await queryRunner.connect()
+  let error = false
+  try {
+    await queryRunner.startTransaction()
+    const DFs = await getEntityManager(ctx, queryRunner).find(DataField, {
+      select: {
+        uuid: true,
+        dataClasses: true,
+        falsePositives: true,
+        scannerIdentified: true,
+      },
+      where: {
+        dataClasses: ArrayOverlap(dataClassesDiffReadonly),
+      },
+    })
+
+    const newDFs = DFs.map(DF => {
+      DF.dataClasses = DF.dataClasses.filter(dc => !dataClassesDiff.has(dc))
+      DF.falsePositives = DF.falsePositives.filter(
+        dc => !dataClassesDiff.has(dc),
+      )
+      DF.scannerIdentified = DF.scannerIdentified.filter(
+        dc => !dataClassesDiff.has(dc),
+      )
+      if (DF.dataClasses.length === 0) {
+        DF.dataTag = null
+      }
+      return DF
+    })
+
+    await getEntityManager(ctx, queryRunner).saveList(newDFs)
+    await queryRunner.commitTransaction()
+  } catch (err) {
+    if (queryRunner.isTransactionActive) {
+      await queryRunner.rollbackTransaction()
+    }
+    error = true
+  } finally {
+    await queryRunner.release()
+  }
+  if (error) {
+    throw new Error("Couldn't modify existing data classes ")
+  }
+}
+
+export async function ensureValidCustomDataClasses(
+  ctx: MetloContext,
+  newConfigResp: string,
+) {
+  const newConfig = (jsyaml.load(newConfigResp) as object) || {}
+  if ("sensitiveData" in newConfig) {
+    const existingClasses = DEFAULT_CLASSES as string[]
+    const newDataClasses = Object.keys(newConfig["sensitiveData"])
+    if (newDataClasses.length > MAX_DATA_CLASSES) {
+      return {
+        success: false,
+        msg: `Cannot have more than ${MAX_DATA_CLASSES} data classes.`,
+        err: new Error(
+          `Cannot have more than ${MAX_DATA_CLASSES} data classes.`,
+        ),
+      }
+    }
+    for (const configName of Object.keys(newConfig["sensitiveData"])) {
+      if (existingClasses.includes(configName)) {
+        return {
+          success: false,
+          msg: `Dataclass "${configName}" already exists as a Metlo Defined Dataclass`,
+          err: new Error(
+            `Custom class name matches existing class name ${configName}`,
+          ),
+        }
+      }
+    }
+  }
+  return { success: true, msg: "", err: {} }
+}

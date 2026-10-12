@@ -1,0 +1,193 @@
+/**
+ *  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance
+ *  with the License. A copy of the License is located at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  or in the 'license' file accompanying this file. This file is distributed on an 'AS IS' BASIS, WITHOUT WARRANTIES
+ *  OR CONDITIONS OF ANY KIND, express or implied. See the License for the specific language governing permissions
+ *  and limitations under the License.
+ */
+
+import { Template, Capture } from 'aws-cdk-lib/assertions';
+import { App, Aws } from 'aws-cdk-lib';
+
+import ForensicSolutionStack = require('../lib/forensic-solution-builder-stack');
+
+import {
+    ENV_NAME,
+    SOLUTION_BUCKET,
+    SOLUTION_ID,
+    SOLUTION_NAME,
+    SOLUTION_PROVIDER,
+    SOLUTION_TMN,
+    SOLUTION_VERSION,
+} from '../lib/infra-utils/aws-solution-environment';
+import {
+    FORENSIC_BUCKET_COMPLIANCE_MODE,
+    FORENSIC_BUCKET_RETENTION_DAYS,
+    FORENSIC_BUCKET_ACCESS_IAM_ROLES_NAMES,
+    SSM_OUTPUT_LOG_GROUP_PREFIX,
+} from '../lib/infra-utils/infra-types';
+import { AuthorizationType } from '../lib/infra-utils/aws-appsync-api';
+
+/*
+ * Forensic  snapshot test
+ */
+test('Forensics Solutions snapshot test', () => {
+    const app = new App({
+        context: {
+            sendAnonymousMetric: 'Yes',
+            deployApi: true,
+            apiAllowedIps: [],
+            apiNotifications: true,
+            apiRateLimit: 1000,
+            forensicBucketComplianceMode: true,
+            forensicBucketRetentionDays: 30,
+            forensicBucketAccessIamRoleNames: [],
+            ssmDocumentsDir: './ssm-documents',
+            vol2ProfilesBucket: '',
+            ssmExecutionTimeout: '1800',
+            diskSize: '512',
+            forensicImageName: 'forensic-analysis-ami',
+            appForensicAliasKMS: 'forensickey',
+            applicationAccounts: ['*'],
+            customerManagedCMKArns: {},
+            ec2ForensicImage: '',
+            sandbox: true,
+            toolsAMI: {
+                'ap-southeast-2': { amiID: 'ami-07620139298af599e' },
+                'ap-southeast-1': { amiID: 'ami-0c802847a7dd848c0' },
+                'us-east-1': { amiID: 'ami-0cff7528ff583bf9a' },
+                'us-east-2': { amiID: 'ami-02d1e544b84bf7502' },
+                'us-west-1': { amiID: 'ami-0d9858aa3c6322f73' },
+                'us-west-2': { amiID: 'ami-098e42ae54c764c35' },
+                'ca-central-1': { amiID: 'ami-00f881f027a6d74a0' },
+                'ap-northeast-1': { amiID: 'ami-0b7546e839d7ace12' },
+            },
+            imageBuilderPipelines: [
+                {
+                    name: 'forensic-analysis',
+                    dir: './image-builder-components',
+                    cfnImageRecipeName: 'forensic-analysis-al2023',
+                    version: '1.0.0',
+                    parentImageSsmParameter:
+                        '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64',
+                    instanceTypes: ['t3.large', 't3.xlarge'],
+                    rootVolumeSizeGiB: 30,
+                    buildSchedule: 'cron(0 8 1 * ? *)',
+                    buildOnDeploy: true,
+                },
+            ],
+            vpcInfo: {
+                vpcCidr: '10.1.0.0/16',
+                maxAZs: 2,
+                bastionInstance: false,
+                enableVpcFlowLog: true,
+                enableVPCEndpoints: true,
+                subnetConfig: [
+                    {
+                        cidrMask: 24,
+                        name: 'externalDMZ',
+                        subnetType: 'Public',
+                        mapPublicIpOnLaunch: false,
+                    },
+                    {
+                        cidrMask: 24,
+                        name: 'service',
+                        subnetType: 'Private',
+                    },
+                    {
+                        cidrMask: 24,
+                        name: 'database',
+                        subnetType: 'Isolated',
+                    },
+                    {
+                        cidrMask: 24,
+                        name: 'internalDMZ',
+                        subnetType: 'Isolated',
+                    },
+                ],
+            },
+            vpcConfigDetails: {
+                isExistingVPC: false,
+                enableVPCEndpoints: false,
+                enableVpcFlowLog: false,
+            },
+        },
+    });
+    const stackPrefix = 'Forensics-'.concat(ENV_NAME);
+    const accountId = Aws.ACCOUNT_ID;
+    const region = Aws.REGION;
+    // WHEN
+    const stack = new ForensicSolutionStack.ForensicsSolutionsConstructsStack(
+        app,
+        'TestSecurityHubSolutionsConstructsStack',
+        {
+            description: `(${SOLUTION_ID}) - The AWS CDK template for deployment of the ${SOLUTION_NAME}, version: ${SOLUTION_VERSION}`,
+            solutionId: SOLUTION_ID,
+            solutionTradeMarkName: SOLUTION_TMN,
+            solutionProvider: SOLUTION_PROVIDER,
+            solutionBucket: SOLUTION_BUCKET,
+            solutionName: SOLUTION_NAME,
+            solutionVersion: SOLUTION_VERSION,
+            stackPrefix: stackPrefix,
+            env: {
+                account: app.node.tryGetContext('account') || accountId,
+                region: app.node.tryGetContext('region') || region,
+            },
+            forensicBucketRetentionDays:
+                app.node.tryGetContext(FORENSIC_BUCKET_RETENTION_DAYS) || 30,
+            forensicBucketComplianceMode:
+                app.node.tryGetContext(FORENSIC_BUCKET_COMPLIANCE_MODE) || false,
+            forensicBucketAccessIamRoleNames:
+                app.node.tryGetContext(FORENSIC_BUCKET_ACCESS_IAM_ROLES_NAMES) || [],
+            deployForensicApi: app.node.tryGetContext('deployApi') || false,
+            apiNotifications: app.node.tryGetContext('apiNotifications') || false,
+            wafAllowList: app.node.tryGetContext('apiAllowedIps'),
+            wafRateLimit: app.node.tryGetContext('apiRateLimit'),
+            apiAuthorizationConfig: {
+                defaultAuthorization: {
+                    authorizationType: AuthorizationType.IAM,
+                },
+            },
+        }
+    );
+    const template = Template.fromStack(stack);
+
+    const runtimeCapture = new Capture();
+
+    template.hasResourceProperties('AWS::Lambda::Function', {
+        Runtime: runtimeCapture,
+    });
+
+    expect(runtimeCapture.asString()).toEqual('python3.12');
+
+    /*
+     * The instance role must be able to create the log group the SSM agent is
+     * told to archive command output to. AmazonSSMManagedInstanceCore carries
+     * no CloudWatch Logs write permissions, so without this statement the
+     * agent is denied, no log group is ever created, and the only record of a
+     * command is SSM's own 24 KB-truncated output - which volatility3's
+     * progress output alone overflows. Every memory investigation that failed
+     * lost its diagnostic that way.
+     */
+    const policies = template.findResources('AWS::IAM::Policy');
+    const grantsLogWrites = Object.values(policies).some((policy) => {
+        const statements = policy.Properties?.PolicyDocument?.Statement ?? [];
+        return statements.some((statement: { Action?: string | string[]; Resource?: unknown }) => {
+            const actions = ([] as string[]).concat(statement.Action ?? []);
+            const resources = JSON.stringify(statement.Resource ?? '');
+            return (
+                actions.includes('logs:CreateLogGroup') &&
+                actions.includes('logs:CreateLogStream') &&
+                actions.includes('logs:PutLogEvents') &&
+                resources.includes(SSM_OUTPUT_LOG_GROUP_PREFIX)
+            );
+        });
+    });
+
+    expect(grantsLogWrites).toBe(true);
+});

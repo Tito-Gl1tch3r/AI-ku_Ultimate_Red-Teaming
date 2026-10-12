@@ -1,0 +1,458 @@
+import hashlib
+import json
+import logging
+import threading
+import time
+import uuid
+from functools import lru_cache
+from pathlib import Path
+
+import ioc_fanger
+import requests
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory
+from flask.json.provider import DefaultJSONProvider
+from flask_caching import Cache
+from flask_cors import CORS
+
+from models.analysis_result import AnalysisResult, db
+from models.observable import Observable, ObservableFlag
+from utils.analysis import check_analysis_in_progress, perform_analysis
+from utils.bad_asn_manager import background_updater
+from utils.config import (
+    BASE_DIR,
+    Secrets,
+    get_config,
+)
+from utils.export import export_to_csv, export_to_excel, prepare_data_for_export
+from utils.history import (
+    apply_search_filter,
+    apply_time_range_filter,
+    calculate_pagination_metadata,
+    filter_by_observable,
+    validate_history_params,
+)
+from utils.stats import get_analysis_stats
+from utils.utils import extract_observables
+
+# Canonical version string displayed in the about page and used for update checks
+VERSION: str = "v0.15.4"
+
+
+class InvalidCachefileError(Exception):
+    pass
+
+
+class CyberbroJSONProvider(DefaultJSONProvider):
+    """Custom JSON serializer for Observable objects."""
+
+    @staticmethod
+    def default(obj: object) -> str:
+        if isinstance(obj, Observable):
+            return str(obj)
+        if isinstance(obj, ObservableFlag):
+            return str(obj)
+        return super(CyberbroJSONProvider, CyberbroJSONProvider).default(obj)
+
+
+app: Flask = Flask(__name__)
+app.json_provider_class = CyberbroJSONProvider
+app.json = CyberbroJSONProvider(app)
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+# Enable CORS, very permisive. If you want to restrict it, you can use
+# the origins parameter (can break the GUI)
+CORS(app)
+
+# Ensure the data directory exists
+DATA_DIR: Path = Path(BASE_DIR) / "data"
+if not DATA_DIR.exists():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Read the secrets from environment variables / .env
+secrets: Secrets = get_config()
+
+# Cache configuration
+app.config["CACHE_TYPE"] = "SimpleCache"
+app.config["CACHE_DEFAULT_TIMEOUT"] = secrets.api_cache_timeout
+logger.debug(f"CACHE_DEFAULT_TIMEOUT: {app.config['CACHE_DEFAULT_TIMEOUT']}")
+
+cache: Cache = Cache(app)
+
+# Retrieve from secrets or default to 1MB
+# MAX_FORM_MEMORY_SIZE is the maximum size of the form data in bytes
+app.config["MAX_FORM_MEMORY_SIZE"] = secrets.max_form_memory_size
+logger.debug(f"MAX_FORM_MEMORY_SIZE: {app.config['MAX_FORM_MEMORY_SIZE']}")
+
+# Define API_PREFIX
+API_PREFIX: str = secrets.api_prefix
+
+# Define GUI_ENABLED_ENGINES
+GUI_ENABLED_ENGINES: list = secrets.gui_enabled_engines
+
+# Update the database URI to use the data directory
+app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DATA_DIR / 'results.db'}"
+
+# Disable modification tracking to save memory
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Set the size of the database connection pool
+app.config["SQLALCHEMY_POOL_SIZE"] = 10
+
+# Set the maximum overflow size of the connection pool
+app.config["SQLALCHEMY_MAX_OVERFLOW"] = 20
+
+# Set version
+app.config["VERSION"] = VERSION
+
+# Initialize the database
+db.init_app(app)
+
+# Create the database tables if they do not exist
+with app.app_context():
+    db.create_all()
+
+
+def initialize_background_services():
+    """
+    Initialize background services for the application.
+
+    This function starts daemon threads for long-running background tasks:
+    - Bad ASN database updater: Periodically updates malicious ASN lists from
+      external sources (Spamhaus ASNDROP, Brianhama Bad ASN database).
+
+    These threads are marked as daemon threads, so they will automatically
+    terminate when the main application exits.
+    """
+    # Start Bad ASN background updater thread
+    # This maintains up-to-date lists of malicious ASNs for IP reputation checks
+    bad_asn_thread = threading.Thread(target=background_updater, daemon=True, name="BadASNUpdater")
+    bad_asn_thread.start()
+    logger.info("Bad ASN background updater thread started")
+
+
+# Initialize background services when the module is loaded
+# This ensures that the background services are started even when running with gunicorn
+initialize_background_services()
+
+PROXIES: dict[str, str] = {"https": secrets.proxy_url, "http": secrets.proxy_url}
+
+SSL_VERIFY: bool = secrets.ssl_verify
+
+
+def get_latest_version_from_cache_file(cache_file: Path) -> str:
+    """Check if the cache file exists and is not older than a day.
+
+    Return True if the cache file is valid and recent, False otherwise.
+    """
+
+    if not cache_file.exists():
+        raise InvalidCachefileError("Cache file does not exist.")
+
+    try:
+        with cache_file.open() as f:
+            try:
+                cache_data = json.load(f)
+            except json.JSONDecodeError as e:
+                print("Cache file is corrupted, fetching latest version.")
+                logger.warning("Cache file is corrupted, fetching latest version.")
+                raise InvalidCachefileError("Cache file is corrupted.") from e
+
+            last_checked = cache_data["last_checked"]
+            if time.time() - last_checked > 86400:
+                raise InvalidCachefileError("Cache file is too old.")
+    except (OSError, KeyError) as e:
+        raise InvalidCachefileError("Cache file is not readable.") from e
+
+    return cache_data.get("latest_version", "")
+
+
+def get_latest_version_from_updated_cache_file(cache_file: Path) -> str:
+    """Update the cache file with the latest version and current time."""
+
+    url: str = "https://api.github.com/repos/stanfrbd/cyberbro/releases/latest"
+
+    if not cache_file.exists():
+        cache_file.touch()
+
+    try:
+        response = requests.get(url, proxies=PROXIES, verify=SSL_VERIFY, timeout=5)
+        response.raise_for_status()
+        latest_release: dict = response.json()
+        latest_version = latest_release.get("tag_name", "")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching latest version: {e}")
+        return ""
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON response: {e}")
+        return ""
+
+    try:
+        with cache_file.open("w") as f:
+            json.dump({"last_checked": time.time(), "latest_version": latest_version}, f)
+            logger.info(f"Cache file updated with latest version: {latest_version}")
+    except OSError as e:
+        logger.error(f"Error writing to cache file: {e}")
+
+    return latest_version
+
+
+@lru_cache
+def check_for_new_version(current_version: str) -> bool:
+    """Check if a new version of the application is available."""
+
+    if get_config().disable_version_check:
+        return False
+
+    cache_file: Path = DATA_DIR / "version_cache.json"
+
+    # Check if cache file exists and is not older than a day
+    try:
+        latest_version: str = get_latest_version_from_cache_file(cache_file)
+    except InvalidCachefileError:
+        latest_version: str = get_latest_version_from_updated_cache_file(cache_file)
+
+    return latest_version != current_version
+
+
+@app.route("/")
+def index():
+    """Render the index page."""
+
+    new_version_available: bool = check_for_new_version(app.config["VERSION"])
+
+    return render_template(
+        "index.html",
+        results=[],
+        API_PREFIX=API_PREFIX,
+        GUI_ENABLED_ENGINES=GUI_ENABLED_ENGINES,
+        new_version_available=new_version_available,
+    )
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze() -> tuple[str, int]:
+    """Handle the analyze request with caching and an option to ignore cache."""
+    form_data = ioc_fanger.fang(request.form.get("observables", ""))
+    observables: list[Observable] = extract_observables(form_data)
+    selected_engines: list[str] = request.form.getlist("engines")
+    ignore_cache: bool = request.args.get("ignore_cache", "false").lower() == "true"
+
+    # Generate a secure hash for form data and engines using SHA-256
+    combined_data: str = f"{form_data}|{','.join(selected_engines)}"
+    cache_key: str = f"web-analyze-{hashlib.sha256(combined_data.encode('utf-8')).hexdigest()}"
+
+    if not ignore_cache:
+        # Check cache
+        cached_result = cache.get(cache_key)
+        if cached_result:
+            logger.debug(f"Cache hit: {cache_key}")
+            logger.debug(f"Cached result: {cached_result}")
+            return render_template(
+                "waiting.html",
+                analysis_id=cached_result["analysis_id"],
+                API_PREFIX=API_PREFIX,
+            ), 200
+
+    # If no cache
+    analysis_id: str = str(uuid.uuid4())
+    threading.Thread(
+        target=perform_analysis, args=(app, observables, selected_engines, analysis_id)
+    ).start()
+
+    # Generate response
+    response_data = {"analysis_id": analysis_id}
+    # Store in cache with a custom timeout from secrets or default to 30 minutes
+    gui_cache_timeout = secrets.gui_cache_timeout
+    cache.set(cache_key, response_data, timeout=gui_cache_timeout)
+
+    return render_template("waiting.html", analysis_id=analysis_id, API_PREFIX=API_PREFIX), 200
+
+
+@app.route("/results/<analysis_id>", methods=["GET"])
+def show_results(analysis_id: str) -> tuple[str, int]:
+    """Show the results of the analysis."""
+
+    # If URL includes "?display=table", force a table view of results
+    display: str = request.args.get("display", "default")
+    analysis_results = db.session.get(AnalysisResult, analysis_id)
+    if analysis_results:
+        return render_template(
+            "results.html",
+            analysis_results=analysis_results,
+            API_PREFIX=API_PREFIX,
+            display_mode=display,
+        ), 200
+    return render_template("404.html"), 404
+
+
+@app.route(f"/{API_PREFIX}/is_analysis_complete/<analysis_id>", methods=["GET"])
+def is_analysis_complete(analysis_id: str) -> Response:
+    """Check if the analysis is complete."""
+    complete = not check_analysis_in_progress(analysis_id)
+    return jsonify({"complete": complete})
+
+
+@app.route("/export/<analysis_id>")
+def export(analysis_id: str) -> Response | tuple[Response, int]:
+    """Export the analysis results."""
+    format: str | None = request.args.get("format")
+    analysis_results = db.session.get(AnalysisResult, analysis_id)
+    data: list[dict] = prepare_data_for_export(analysis_results)
+    timestamp = time.strftime("%Y-%m-%d_%H_%M_%S", time.localtime())
+
+    if format == "csv":
+        return export_to_csv(data, timestamp)
+    if format == "excel":
+        return export_to_excel(data, timestamp)
+    return jsonify({"error": "Invalid export format requested."}), 400
+
+
+@app.route("/favicon.ico")
+def favicon() -> Response:
+    """Serve the favicon."""
+    return send_from_directory(
+        Path(app.root_path) / "images",
+        "favicon.ico",
+        mimetype="image/vnd.microsoft.icon",
+    )
+
+
+@app.errorhandler(404)
+def page_not_found(_) -> tuple[str, int]:
+    """Handle 404 errors."""
+    return render_template("404.html"), 404
+
+
+@app.errorhandler(500)
+def internal_server_error(_) -> tuple[str, int]:
+    """Handle 500 errors."""
+    return render_template("500.html"), 500
+
+
+@app.errorhandler(413)
+def request_entity_too_large(_) -> tuple[str, int]:
+    """Handle 413 errors."""
+    return render_template("413.html"), 413
+
+
+@app.route("/history")
+def history():
+    """Render the history page with pagination and search."""
+    # Get and validate parameters
+    page: int = request.args.get("page", 1, type=int)
+    per_page: int = request.args.get("per_page", 20, type=int)
+    search_query: str = request.args.get("search", "", type=str).strip()
+    search_type: str = request.args.get("search_type", "observable", type=str)
+    time_range: str = request.args.get("time_range", "7d", type=str)
+
+    page, per_page, search_type, time_range = validate_history_params(
+        page, per_page, search_type, time_range
+    )
+
+    # Calculate offset
+    offset: int = (page - 1) * per_page
+
+    # Build base query
+    base_query = db.session.query(AnalysisResult).filter(AnalysisResult.results != [])
+    base_query = apply_time_range_filter(base_query, time_range)
+    base_query = apply_search_filter(base_query, search_query, search_type)
+
+    # Handle observable search separately (requires in-memory filtering)
+    if search_query and search_type == "observable":
+        all_results = base_query.order_by(AnalysisResult.end_time.desc()).all()
+        filtered_results = filter_by_observable(all_results, search_query)
+        total_count = len(filtered_results)
+        analysis_results = filtered_results[offset : offset + per_page]
+    else:
+        total_count = base_query.count()
+        analysis_results = (
+            base_query.order_by(AnalysisResult.end_time.desc()).limit(per_page).offset(offset).all()
+        )
+
+    # Calculate pagination metadata
+    pagination = calculate_pagination_metadata(page, per_page, total_count)
+
+    return render_template(
+        "history.html",
+        analysis_results=analysis_results,
+        page=page,
+        per_page=per_page,
+        total_count=total_count,
+        search_query=search_query,
+        search_type=search_type,
+        time_range=time_range,
+        **pagination,
+    )
+
+
+@app.route("/stats")
+def stats() -> tuple[str, int]:
+    """Render the stats page."""
+    stats = get_analysis_stats()
+    return render_template("stats.html", stats=stats), 200
+
+
+@app.route("/about")
+def about() -> tuple[str, int]:
+    """Render the about page."""
+    return render_template("about.html", version=app.config["VERSION"]), 200
+
+
+@app.route(f"/{API_PREFIX}/results/<analysis_id>", methods=["GET"])
+def get_results(analysis_id: str) -> tuple[Response, int]:
+    """Get the results of the analysis."""
+    analysis_results = db.session.get(AnalysisResult, analysis_id)
+    if analysis_results:
+        return jsonify(analysis_results.results), 200
+    return jsonify({"error": "Analysis not found."}), 404
+
+
+@app.route(f"/{API_PREFIX}/analyze", methods=["POST"])
+def analyze_api() -> tuple[Response, int]:
+    """Handle the analyze request via API with caching and hashing."""
+    data: dict = request.get_json()
+    form_data: str = ioc_fanger.fang(data.get("text", ""))
+    selected_engines: list[str] = data.get("engines", [])
+    ignore_cache: bool = data.get("ignore_cache", False)
+
+    # Generate a secure hash for form data and engines using SHA-256
+    combined_data: str = f"{form_data}|{','.join(selected_engines)}"
+    cache_key: str = f"api-analyze-{hashlib.sha256(combined_data.encode('utf-8')).hexdigest()}"
+
+    if not ignore_cache:
+        # Check cache
+        cached_result: str | None = cache.get(cache_key)
+        if cached_result:
+            logger.debug(f"Cache hit: {cache_key}")
+            logger.debug(f"Cached result: {cached_result}")
+            return jsonify(cached_result), 200
+
+    # If no cache
+    analysis_id: str = str(uuid.uuid4())
+    threading.Thread(
+        target=perform_analysis,
+        args=(app, extract_observables(form_data), selected_engines, analysis_id),
+    ).start()
+
+    # Generate response
+    response_data: dict[str, str] = {"analysis_id": analysis_id, "link": f"/results/{analysis_id}"}
+    response = jsonify(response_data)
+
+    # Store in cache with the specified timeout for the API (api_cache_timeout)
+    cache.set(cache_key, response_data)
+
+    return response, 200
+
+
+@app.route("/graph/<analysis_id>", methods=["GET"])
+def graph(analysis_id: str) -> tuple[str, int]:
+    """Render the graph visualization for the given analysis ID."""
+    analysis_results = db.session.get(AnalysisResult, analysis_id)
+    if analysis_results:
+        return render_template("graph.html", analysis_id=analysis_id, API_PREFIX=API_PREFIX), 200
+    return render_template("404.html"), 404
+
+
+if __name__ == "__main__":
+    app.run(port=secrets.flask_port, debug=secrets.flask_debug, host=secrets.flask_host)

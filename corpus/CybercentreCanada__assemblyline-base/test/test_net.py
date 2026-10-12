@@ -1,0 +1,117 @@
+import os
+
+import assemblyline.common.net
+from assemblyline.common.net import is_valid_port, is_valid_domain, is_valid_ip, is_valid_email, is_ip_in_network, find_top_level_domains
+from assemblyline.common.net_static import TLDS_ALPHA_BY_DOMAIN
+
+import requests
+
+
+def test_domain_list():
+    """Make sure we aren't missing any domains."""
+    response = requests.get('https://data.iana.org/TLD/tlds-alpha-by-domain.txt')
+    for line in response.text.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        assert line in TLDS_ALPHA_BY_DOMAIN
+
+
+def test_port_check():
+    assert is_valid_port(1)
+    assert is_valid_port(2**16-1)
+    assert is_valid_port('1')
+    assert is_valid_port(str(2**16-1))
+    assert is_valid_port(1.0)
+
+    assert not is_valid_port(0)
+    assert not is_valid_port(-1)
+    assert not is_valid_port(2**16)
+    assert not is_valid_port('PORT')
+
+
+def test_valid_domain():
+    assert is_valid_domain('cyber.gc.ca')
+    assert is_valid_domain('münchen.de')
+    assert not is_valid_domain('user@cyber.gc.ca')
+    assert not is_valid_domain('user')
+    assert not is_valid_domain('')
+    assert not is_valid_domain('-domain.gc.ca')
+    assert not is_valid_domain('domain-.gc.ca')
+    assert not is_valid_domain('dom_ain.gc.ca')
+    assert not is_valid_domain('gc..ca')
+
+
+def test_valid_ip():
+    assert is_valid_ip('5.5.5.5')
+    assert not is_valid_ip('5,5.5.5')
+    assert not is_valid_ip('5.S.5.5')
+    assert not is_valid_ip('5.5.5')
+    assert not is_valid_ip('5..5.5')
+    assert not is_valid_ip('5.5.5.5.5')
+    assert not is_valid_ip('0.5.5.5')
+    assert not is_valid_ip('5.256.5.5')
+    assert not is_valid_ip('5.5.-1.5')
+    assert is_valid_ip('5.0.5.5')
+    assert is_valid_ip('5.5.0.5')
+    assert not is_valid_ip('5.5.5.0')
+
+
+def test_valid_email():
+    assert is_valid_email('user@cyber.gc.ca')
+    assert is_valid_email('user.name@cyber.gc.ca')
+    assert is_valid_email('u#ser@cyber.gc.ca')
+    assert is_valid_email('"u#ser"@cyber.gc.ca')
+    assert is_valid_email('"user..name"@cyber.gc.ca')
+    assert is_valid_email('user+tag@cyber.gc.ca')
+    assert not is_valid_email('@cyber.gc.ca')
+    assert not is_valid_email('user@')
+    assert not is_valid_email('user@cyber')
+    assert not is_valid_email('user@cy#ber.gc.ca')
+    assert not is_valid_email('user..name@cyber.gc.ca')
+    assert not is_valid_email('user@domain@evil.ca')
+    assert not is_valid_email('.user@cyber.gc.ca')
+    assert not is_valid_email('user.@cyber.gc.ca')
+    assert not is_valid_email('')
+    assert not is_valid_email('""@cyber.gc.ca')
+
+    # Missing structure
+    assert not is_valid_email("admin*")
+    assert not is_valid_email("x || email:*")
+    assert not is_valid_email("x && email:*")
+    assert not is_valid_email("email:* OR uname:admin")
+    assert not is_valid_email("admin@cyber.gc.ca AND password:*")
+    assert not is_valid_email("x}email:{*")
+    assert not is_valid_email('" OR email:*')
+
+    # Space in input (always invalid)
+    assert not is_valid_email("test@example.com OR email:*")
+
+    # Backslash splits into multiple @ contexts
+    assert not is_valid_email("user\\@evil.com@legit.com")
+
+
+def test_is_ip_in_network():
+    from ipaddress import ip_network
+    assert not is_ip_in_network("1...1", ip_network("2.0.0.0/24"))
+    assert not is_ip_in_network("1.1.1.1", ip_network("2.0.0.0/24"))
+    assert is_ip_in_network("2.2.2.2", ip_network("2.0.0.0/8"))
+
+
+def test_custom_domains():
+    original_tld = assemblyline.common.net.SYSTEM_LOCAL_TLD
+    try:
+        # Get the basic list and make sure no empty strings got in
+        assemblyline.common.net.SYSTEM_LOCAL_TLD = ''
+        find_top_level_domains.cache_clear()
+        domains = find_top_level_domains()
+        assert '' not in domains
+
+        # inject a fake domain a few different ways
+        cd = 'NOT-REAL-TEST-DOMAIN'
+        for envar in [cd, f'{cd};', f'{cd};{cd}', f'.{cd};;', f';.{cd}.;']:
+            assemblyline.common.net.SYSTEM_LOCAL_TLD = envar
+            find_top_level_domains.cache_clear()
+            assert cd in find_top_level_domains(), envar
+    finally:
+        assemblyline.common.net.SYSTEM_LOCAL_TLD = original_tld
+        find_top_level_domains.cache_clear()

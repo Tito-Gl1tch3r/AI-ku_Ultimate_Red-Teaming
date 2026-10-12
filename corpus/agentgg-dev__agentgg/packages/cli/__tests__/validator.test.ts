@@ -1,0 +1,441 @@
+import type { Finding } from "@agentgg/core";
+import { MockLanguageModelV1 } from "ai/test";
+import { describe, expect, it } from "vitest";
+import { VercelAgentDetector } from "../src/detectors/vercel-agent.js";
+import {
+  asValidationField,
+  buildScopeValidatePrompt,
+  buildValidatePrompt,
+  fitMembers,
+  GROUP_MEMBER_CHAR_CAP,
+  LlmValidation,
+} from "../src/validator.js";
+
+function makeFinding(overrides: Partial<Finding> = {}): Finding {
+  return {
+    id: "abc123abc123",
+    agentSlug: "sql-injection",
+    title: "Concatenated SQL in login handler",
+    vulnSlug: "sql-injection",
+    filePath: "src/login.ts",
+    lineRange: [12, 14],
+    summary: "Login handler builds SQL via string concatenation.",
+    details:
+      "Line 12 builds the query via string concat. Untrusted `req.params.id` flows in unsanitised.",
+    poc: "curl '/users/1 OR 1=1'",
+    impact: "Unauthenticated read/write to users table.",
+    references: ["CWE-89"],
+    confidence: 0.9,
+    notifications: [],
+    ...overrides,
+  };
+}
+
+function mockModelReturning(payload: unknown): MockLanguageModelV1 {
+  return new MockLanguageModelV1({
+    defaultObjectGenerationMode: "json",
+    doGenerate: async () => ({
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      finishReason: "stop",
+      usage: { promptTokens: 10, completionTokens: 10 },
+      text: JSON.stringify(payload),
+    }),
+  });
+}
+
+describe("buildValidatePrompt", () => {
+  it("includes the finding's narrative fields", () => {
+    const finding = makeFinding();
+    const out = buildValidatePrompt({
+      finding,
+      fileContent: "const x = 1;",
+    });
+    expect(out).toContain(finding.title);
+    expect(out).toContain(finding.summary);
+    expect(out).toContain(finding.details);
+    expect(out).toContain(finding.poc);
+    expect(out).toContain(finding.impact);
+  });
+
+  it("includes the file path and a line hint when lineRange is present", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding({ lineRange: [42, 50] }),
+      fileContent: "x",
+    });
+    expect(out).toContain("src/login.ts");
+    expect(out).toContain("42");
+    expect(out).toContain("50");
+  });
+
+  it("renders 'unspecified lines' when lineRange is missing", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding({ lineRange: undefined }),
+      fileContent: "x",
+    });
+    expect(out).toContain("unspecified lines");
+  });
+
+  it("embeds the full file content in a fenced code block", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "const UNIQUE_TOKEN = 1;",
+    });
+    expect(out).toContain("```typescript");
+    expect(out).toContain("UNIQUE_TOKEN");
+  });
+
+  it("offers all four verdicts when a scope document is supplied", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+      scope: "# Scope\nout_of_scope: [examples/**]",
+    });
+    expect(out).toContain("confirmed");
+    expect(out).toContain("false-positive");
+    expect(out).toContain("out-of-scope");
+    expect(out).toContain("uncertain");
+  });
+
+  it("withholds the `out-of-scope` verdict when no scope is supplied", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+    });
+    // The schema enum lists the three remaining verdicts.
+    expect(out).toMatch(/"confirmed"\s*\|\s*"false-positive"\s*\|\s*"uncertain"/);
+    // And the prompt explicitly tells the model not to pick it.
+    expect(out).toContain("No scope document was supplied");
+  });
+
+  it("includes scope content verbatim when supplied", () => {
+    const scope = "## Out of scope\n- examples/**\n- vendor/**\nUNIQUE_SCOPE_TOKEN";
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+      scope,
+    });
+    expect(out).toContain("UNIQUE_SCOPE_TOKEN");
+    expect(out).toContain("Scope rules");
+  });
+
+  it("does not mention scope when none supplied", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+    });
+    expect(out).not.toContain("## Scope rules");
+  });
+
+  it("keeps the default judgement rules when the agent supplies no prompt", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+    });
+    expect(out).toContain("Be skeptical");
+    expect(out).toContain("'confirmed' requires ALL of");
+  });
+
+  it("replaces the default judgement rules with the agent's validation prompt", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+      validationPrompt: "AGENT_RULES: confirm only live credentials.",
+    });
+    expect(out).toContain("AGENT_RULES: confirm only live credentials.");
+    expect(out).not.toContain("Be skeptical");
+    expect(out).not.toContain("'confirmed' requires ALL of");
+  });
+
+  it("places the agent's validation prompt after the finding and the source code", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "const UNIQUE_TOKEN = 1;",
+      validationPrompt: "AGENT_RULES_TOKEN",
+    });
+    expect(out.indexOf("AGENT_RULES_TOKEN")).toBeGreaterThan(out.indexOf("UNIQUE_TOKEN"));
+  });
+
+  it("keeps the injected blocks and the verdict contract with a custom prompt", () => {
+    const finding = makeFinding();
+    const out = buildValidatePrompt({
+      finding,
+      fileContent: "const UNIQUE_TOKEN = 1;",
+      scope: "UNIQUE_SCOPE_TOKEN",
+      root: "/repo",
+      validationPrompt: "AGENT_RULES_TOKEN",
+    });
+    expect(out).toContain("You are reviewing a security finding");
+    expect(out).toContain(finding.title);
+    expect(out).toContain("UNIQUE_TOKEN");
+    expect(out).toContain("UNIQUE_SCOPE_TOKEN");
+    expect(out).toContain("Trace the chain across files");
+    expect(out).toContain("Return a verdict");
+  });
+
+  // Type dispatch (`instanceof`, a visitor, a registered class) is found by the
+  // class name; a search for the method name misses it.
+  it("tells a tool-enabled validator to search the class name for type dispatch", () => {
+    const out = buildValidatePrompt({ finding: makeFinding(), fileContent: "x", root: "/repo" });
+    expect(out).toContain("instanceof");
+    expect(out).toMatch(/class name/i);
+  });
+
+  it("keeps the type-dispatch advice when an agent sets its own rules", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+      root: "/repo",
+      validationPrompt: "AGENT_RULES_TOKEN",
+    });
+    expect(out).toContain("instanceof");
+  });
+
+  // One home per case. The scope document sent trusted input to out-of-scope
+  // while these rules sent it to uncertain, and that overlap is what makes a
+  // verdict flip between one validation and the next.
+  it("does not send a trusted or privileged actor to uncertain", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+      root: "/repo",
+      scope: "SCOPE",
+    });
+    expect(out).not.toMatch(/privileged or otherwise trusted actor/);
+    expect(out).not.toMatch(/reachable only by a privileged actor/);
+  });
+
+  it("names trust-boundary rules as a reason for out-of-scope", () => {
+    const out = buildValidatePrompt({ finding: makeFinding(), fileContent: "x", scope: "SCOPE" });
+    expect(out).toMatch(/trust.boundary/i);
+  });
+
+  it("calls a guard that lets only trusted values reach the sink a false positive", () => {
+    const out = buildValidatePrompt({ finding: makeFinding(), fileContent: "x", root: "/repo" });
+    expect(out).toMatch(/only trusted values/i);
+  });
+
+  it("ignores a blank validation prompt and keeps the default rules", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+      validationPrompt: "   ",
+    });
+    expect(out).toContain("Be skeptical");
+  });
+});
+
+describe("LlmValidation schema", () => {
+  it("accepts a well-formed payload", () => {
+    const parsed = LlmValidation.parse({
+      verdict: "confirmed",
+      reasoning: "Line 12 concatenates req.params.id without escaping.",
+      confidence: 0.9,
+    });
+    expect(parsed.verdict).toBe("confirmed");
+  });
+
+  it("defaults confidence when the model omits it", () => {
+    // A model that closes the object early (unescaped quote in `reasoning`)
+    // still yields a usable verdict instead of failing the whole finding.
+    const parsed = LlmValidation.parse({
+      verdict: "confirmed",
+      reasoning: "The handler interpolates `id` straight into the query.",
+    });
+    expect(parsed.confidence).toBe(0.5);
+    expect(parsed.verdict).toBe("confirmed");
+  });
+
+  it("rejects an unknown verdict", () => {
+    expect(() =>
+      LlmValidation.parse({
+        verdict: "maybe-vulnerable",
+        reasoning: "x",
+        confidence: 0.5,
+      }),
+    ).toThrow();
+  });
+
+  it("rejects confidence outside [0, 1]", () => {
+    // Negative values fail the lower bound. The schema intentionally rescues
+    // raw-percentage form (e.g. 75 → 0.75) for LLMs that ignore the prompt;
+    // see the preprocessor in validator.ts.
+    expect(() =>
+      LlmValidation.parse({
+        verdict: "confirmed",
+        reasoning: "x",
+        confidence: -0.5,
+      }),
+    ).toThrow();
+  });
+});
+
+describe("asValidationField", () => {
+  it("drops confidence (not stored on Finding.validation)", () => {
+    const field = asValidationField({
+      verdict: "false-positive",
+      reasoning: "The middleware sanitises this above the handler.",
+      confidence: 0.8,
+    });
+    expect(field).toEqual({
+      verdict: "false-positive",
+      reasoning: "The middleware sanitises this above the handler.",
+    });
+    expect("confidence" in field).toBe(false);
+  });
+});
+
+// The tool-less, single-shot validation path (no `root`): buildValidatePrompt
+// → generateObject → LlmValidation. Exercised here through VercelAgentDetector,
+// which owns that branch for every non-Claude provider.
+describe("VercelAgentDetector.validateFinding (single-shot, no root)", () => {
+  it("returns the verdict + reasoning the model emitted", async () => {
+    const model = mockModelReturning({
+      verdict: "confirmed",
+      reasoning: "Line 12 concatenates user input into the SQL string.",
+      confidence: 0.95,
+    });
+    const detector = new VercelAgentDetector("anthropic-api", model);
+    const result = await detector.validateFinding({
+      finding: makeFinding(),
+      fileContent: "db.query('SELECT * FROM users WHERE id=' + req.params.id)",
+    });
+    expect(result.verdict).toBe("confirmed");
+    expect(result.reasoning).toContain("concatenates");
+  });
+
+  it("propagates a false-positive verdict unchanged", async () => {
+    const model = mockModelReturning({
+      verdict: "false-positive",
+      reasoning: "The query is parameterised; the detector misread it.",
+      confidence: 0.85,
+    });
+    const detector = new VercelAgentDetector("anthropic-api", model);
+    const result = await detector.validateFinding({
+      finding: makeFinding(),
+      fileContent: "db.query('SELECT * FROM users WHERE id=?', [req.params.id])",
+    });
+    expect(result.verdict).toBe("false-positive");
+  });
+
+  it("returns an out-of-scope verdict when scope rules disqualify the finding", async () => {
+    const model = mockModelReturning({
+      verdict: "out-of-scope",
+      reasoning: "examples/** is excluded by the supplied SECURITY.md.",
+      confidence: 0.9,
+    });
+    const detector = new VercelAgentDetector("anthropic-api", model);
+    const result = await detector.validateFinding({
+      finding: makeFinding({ filePath: "examples/demo.ts" }),
+      fileContent: "x",
+      scope: "out_of_scope:\n  paths:\n    - examples/**",
+    });
+    expect(result.verdict).toBe("out-of-scope");
+    expect(result.reasoning).toContain("examples");
+  });
+
+  it("rejects a model response with an invalid verdict", async () => {
+    const model = mockModelReturning({
+      verdict: "totally-vulnerable",
+      reasoning: "x",
+      confidence: 0.5,
+    });
+    const detector = new VercelAgentDetector("anthropic-api", model);
+    await expect(
+      detector.validateFinding({
+        finding: makeFinding(),
+        fileContent: "x",
+      }),
+    ).rejects.toThrow();
+  });
+});
+
+describe("group validation", () => {
+  const member = (id: string, impact: string) =>
+    makeFinding({ id, agentSlug: "missing-auth", impact, poc: `poc-${id}` });
+
+  it("lists every duplicate's id, agent, impact and PoC", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+      members: [member("dup111", "Reads any user's notes.")],
+    });
+    expect(out).toContain("## Other reports of the same bug");
+    expect(out).toContain("dup111");
+    expect(out).toContain("missing-auth");
+    expect(out).toContain("Reads any user's notes.");
+    expect(out).toContain("poc-dup111");
+  });
+
+  it("tells the validator to judge the worst claim it can confirm", () => {
+    const out = buildValidatePrompt({
+      finding: makeFinding(),
+      fileContent: "x",
+      members: [member("dup111", "i")],
+    });
+    expect(out).toContain("worst claim in this group that you can confirm");
+    expect(out).toContain("leadId");
+    expect(out).toContain("primaryClaimHolds");
+  });
+
+  it("has no group section for a singleton but still asks for confirmedImpact", () => {
+    const out = buildValidatePrompt({ finding: makeFinding(), fileContent: "x" });
+    expect(out).not.toContain("## Other reports of the same bug");
+    expect(out).toContain("confirmedImpact");
+    expect(out).toMatch(/only\s+when the verdict is confirmed/);
+  });
+
+  // 5 members with only a long impact never exceed the 6000 cap after the
+  // 600-char impact clip. 10 members, each pushing summary/impact/poc to
+  // their own clip ceiling, do.
+  it("caps member text and says how many members it left out", () => {
+    const members = Array.from({ length: 10 }, (_, i) =>
+      makeFinding({
+        id: `dup${i}`,
+        agentSlug: "missing-auth",
+        summary: "s".repeat(400),
+        impact: "i".repeat(600),
+        poc: "p".repeat(800),
+      }),
+    );
+    const out = buildValidatePrompt({ finding: makeFinding(), fileContent: "x", members });
+    const section = out.slice(out.indexOf("## Other reports of the same bug"));
+    const body = section.slice(0, section.indexOf("\n## ", 5));
+    expect(body.length).toBeLessThan(GROUP_MEMBER_CHAR_CAP + 500);
+    const { shown, left } = fitMembers(members);
+    expect(shown.length + left.length).toBe(10);
+    expect(left.length).toBeGreaterThan(0);
+    expect(body).toContain(`${left.length} more report(s) left out`);
+    for (const m of left) expect(body).not.toContain(`### Report ${m.id}`);
+  });
+
+  it("keeps the impact fields, leadId and primaryClaimHolds from the model's answer", () => {
+    const v = LlmValidation.parse({
+      verdict: "confirmed",
+      reasoning: "r",
+      confirmedImpact: "Reads any user's notes.",
+      unconfirmedImpact: "Full database dump.",
+      leadId: "dup111",
+      primaryClaimHolds: false,
+    });
+    expect(asValidationField(v)).toEqual({
+      verdict: "confirmed",
+      reasoning: "r",
+      confirmedImpact: "Reads any user's notes.",
+      unconfirmedImpact: "Full database dump.",
+      leadId: "dup111",
+      primaryClaimHolds: false,
+    });
+  });
+
+  it("drops empty impact strings", () => {
+    const v = LlmValidation.parse({ verdict: "uncertain", reasoning: "r", confirmedImpact: "" });
+    expect(asValidationField(v)).toEqual({ verdict: "uncertain", reasoning: "r" });
+  });
+});
+
+describe("buildScopeValidatePrompt", () => {
+  it("names trust-boundary rules as a reason for out-of-scope", () => {
+    const out = buildScopeValidatePrompt({ finding: makeFinding(), scope: "SCOPE" });
+    expect(out).toMatch(/trust.boundary/i);
+  });
+});

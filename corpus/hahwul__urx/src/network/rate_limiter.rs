@@ -1,0 +1,130 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+/// Minimum-interval rate limiter that paces a provider's HTTP requests.
+///
+/// Built from a requests-per-second rate; each [`RateLimiter::acquire`] blocks
+/// until at least `1/rate` seconds have elapsed since the previous acquire, so
+/// requests go out no faster than the configured rate. Cloning shares the same
+/// timestamp, so every request paced by a given limiter is throttled together.
+///
+/// Providers build one per `fetch_urls` call and `acquire()` before each
+/// request, which paces a domain's (often paginated) requests. This is what
+/// makes `--rate-limit` / `--rate-limit-by` actually take effect — previously
+/// the configured rate was stored but never enforced.
+#[derive(Clone, Debug)]
+pub struct RateLimiter {
+    last: Arc<Mutex<Option<Instant>>>,
+    min_interval: Duration,
+}
+
+impl RateLimiter {
+    /// Longest interval a limiter will enforce, and therefore the slowest rate
+    /// that is distinguishable from "one request an hour". `1/rate` for a rate
+    /// small enough overflows a `Duration` outright — `Duration::from_secs_f32`
+    /// *panics* on that, so `--rate-limit 1e-30` took the whole run down.
+    const MAX_INTERVAL: Duration = Duration::from_secs(3600);
+
+    /// Build a limiter for `requests_per_sec`. Returns `None` for a
+    /// non-positive or non-finite rate, i.e. "no limiting".
+    pub fn new(requests_per_sec: f32) -> Option<Self> {
+        if requests_per_sec <= 0.0 || !requests_per_sec.is_finite() {
+            return None;
+        }
+        // `try_from_secs_f32` is the non-panicking form; an absurdly small rate
+        // is clamped to MAX_INTERVAL rather than crashing.
+        let min_interval = Duration::try_from_secs_f32(1.0 / requests_per_sec)
+            .unwrap_or(Self::MAX_INTERVAL)
+            .min(Self::MAX_INTERVAL);
+        Some(Self {
+            last: Arc::new(Mutex::new(None)),
+            min_interval,
+        })
+    }
+
+    /// Block until issuing the next request respects the configured rate. The
+    /// lock is held across the sleep so concurrent callers queue rather than
+    /// all firing at once.
+    pub async fn acquire(&self) {
+        let mut guard = self.last.lock().await;
+        if let Some(prev) = *guard {
+            let elapsed = prev.elapsed();
+            if elapsed < self.min_interval {
+                tokio::time::sleep(self.min_interval - elapsed).await;
+            }
+        }
+        *guard = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_non_positive_rate_disables_limiting() {
+        assert!(RateLimiter::new(0.0).is_none());
+        assert!(RateLimiter::new(-1.0).is_none());
+        assert!(RateLimiter::new(f32::NAN).is_none());
+        assert!(RateLimiter::new(f32::INFINITY).is_none());
+    }
+
+    #[test]
+    fn test_tiny_rate_is_clamped_not_a_panic() {
+        // Regression: `--rate-limit 1e-30` makes 1/rate overflow a Duration, and
+        // Duration::from_secs_f32 panics rather than erroring — the whole run
+        // aborted before a single request went out.
+        for rate in [1e-30f32, f32::MIN_POSITIVE, 1e-12] {
+            let limiter = RateLimiter::new(rate).expect("positive rate must yield a limiter");
+            assert_eq!(limiter.min_interval, RateLimiter::MAX_INTERVAL, "{rate}");
+        }
+        // A sane rate is untouched.
+        assert_eq!(
+            RateLimiter::new(2.0).unwrap().min_interval,
+            Duration::from_millis(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_spaces_requests() {
+        // 20 req/s => 50ms minimum interval.
+        let limiter = RateLimiter::new(20.0).unwrap();
+        let start = Instant::now();
+        limiter.acquire().await; // first: no wait
+        limiter.acquire().await; // second: ~50ms
+        limiter.acquire().await; // third: ~50ms
+                                 // Two enforced gaps (~100ms); allow scheduler slack.
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "elapsed too short: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clones_share_pacing() {
+        // The runner clones a provider (and thus its limiter) once per
+        // concurrent domain. Those clones MUST share one schedule, or
+        // concurrent fetches would each pace independently and blow past
+        // --rate-limit. 20 req/s => a 50ms gap the clone is forced to observe.
+        let a = RateLimiter::new(20.0).unwrap();
+        let b = a.clone();
+        let start = Instant::now();
+        a.acquire().await; // first: no wait
+        b.acquire().await; // clone sees a's timestamp => must wait ~50ms
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "clones must share pacing; elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_acquire_does_not_block() {
+        let limiter = RateLimiter::new(1.0).unwrap(); // 1s interval
+        let start = Instant::now();
+        limiter.acquire().await; // first acquire must be immediate
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+}

@@ -1,0 +1,446 @@
+"""Tools database — loads tools_config.json, .versions, checks install status."""
+
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Optional
+
+
+def _resolve_registry_path(root: Path) -> Path:
+    """Resolve the fixed tools registry path under a validated project root.
+
+    Supports symlinks where ``tools_config.json`` itself is a link out of the
+    project tree — e.g. WSL setups where the registry symlinks to a
+    Windows-mounted path under ``/mnt/c/...``. The path is *constructed* under
+    ``root``, so the "directly under root" guarantee comes from construction;
+    we do not need to additionally constrain where the symlink target lives.
+    """
+    resolved_root = root.resolve(strict=True)
+    config_path = resolved_root / "tools_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"tools_config.json not found directly under {resolved_root}")
+    return config_path
+
+
+def _discover_project_root() -> Path:
+    """Locate the installer root that contains tools_config.json.
+
+    Resolution order:
+    0. CYBERSEC_INSTALLER_ROOT env var (explicit override)
+    1. Current working directory and its parents
+    2. The source tree relative to this file
+    """
+    override = os.environ.get("CYBERSEC_INSTALLER_ROOT")
+    if override:
+        # Honor the override unconditionally so a misconfigured path fails loudly
+        # at registry load (FileNotFoundError) instead of silently resolving a
+        # different repo's tools_config.json via cwd discovery.
+        return Path(override).expanduser()
+
+    module_path = Path(__file__).resolve()
+    search_roots = [Path.cwd().resolve(), module_path.parent, module_path.parent.parent]
+    seen: set[Path] = set()
+
+    for start in search_roots:
+        for candidate in (start, *start.parents):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if (candidate / "tools_config.json").exists():
+                return candidate
+
+    return module_path.parent.parent
+
+
+PROJECT_ROOT = _discover_project_root()
+
+# Pipx package name → binary name mapping (from _PIPX_BIN_NAMES in scripts/verify.sh).
+# Most pipx packages install a binary with the same name — these are the exceptions.
+PIPX_BIN_NAMES: dict[str, str] = {
+    "arsenal-cli": "arsenal",
+    "sherlock-project": "sherlock",
+    "osrframework": "usufy",
+    "raccoon-scanner": "raccoon",
+    "factordb-python": "factordb",
+    "z3-solver": "z3",
+    "pwntools": "pwn",
+    "boofuzz": "boo",
+    "frida-tools": "frida",
+    "volatility3": "vol",
+    "oletools": "olevba",
+    "mvt": "mvt-android",
+    "hachoir": "hachoir-metadata",
+    "peepdf-3": "peepdf",
+    "impacket": "impacket-secretsdump",
+    "certipy-ad": "certipy",
+    "bloodhound": "bloodhound-python",
+    "ldapsearchad": "ldapsearch-ad.py",
+    "sipvicious": "sipvicious_svmap",
+    "scoutsuite": "scout",
+    "sigma-cli": "sigma",
+    "quark-engine": "quark",
+    "slither-analyzer": "slither",
+    "mythril": "myth",
+    "eth-ape": "ape",
+    "vcdvcd": "vcdcat",
+    "lascar": "lascarctl",
+    "plaso": "log2timeline",
+    "pyrit": "pyrit_scan",
+    "cisco-ai-mcp-scanner": "mcp-scanner",
+    "cisco-ai-skill-scanner": "skill-scanner",
+    "knock-subdomains": "knockpy",
+    "principalmapper": "pmapper",
+    "dissect.target": "target-query",
+    "python-evtx": "evtx_dump",
+}
+
+# apt package name -> primary executable name, for packages whose binary differs
+# from the Debian package name. Used by check_installed's binary fallback so an
+# apt tool already on PATH is not reported missing when .versions is absent.
+# NOT sync-pinned (unlike PIPX_BIN_NAMES, which validate_mcp_sync.py mirrors to
+# scripts/verify.sh) — keep this list local to the MCP layer.
+APT_BIN_NAMES: dict[str, str] = {
+    "libimage-exiftool-perl": "exiftool",
+    "netcat-openbsd": "nc",
+    "wireshark-common": "tshark",
+    "upx-ucl": "upx",
+    "dnsutils": "dig",
+}
+
+# "special"-method tool name -> primary executable name, for tools installed via
+# bespoke installers whose binary differs from the registry name. Lets
+# check_installed find system/Kali/manual installs that have no .versions row
+# (e.g. metasploit shipping msfconsole). steampipe's binary == its name, so it is
+# already covered by the plain PATH check and intentionally omitted here.
+SPECIAL_BIN_NAMES: dict[str, str] = {
+    "metasploit": "msfconsole",
+    "foundry": "forge",
+}
+
+
+def resolve_binary_name(method: str, tool_name: str) -> str:
+    """Map a registry tool name to its installed executable name, by install method.
+
+    Single source of truth for the package-name != executable-name mapping so the
+    local PATH check and the remote SSH ``which`` check resolve the same binary
+    (otherwise apt-renamed/special-method tools always report "not installed" on
+    remote hosts). Returns *tool_name* unchanged when no mapping applies.
+    """
+    if method == "pipx":
+        return PIPX_BIN_NAMES.get(tool_name, tool_name)
+    if method == "apt":
+        return APT_BIN_NAMES.get(tool_name, tool_name)
+    if method == "special":
+        return SPECIAL_BIN_NAMES.get(tool_name, tool_name)
+    return tool_name
+
+
+# Registry tools installed ONLY when INCLUDE_C2=true (the redteam/full profiles, or
+# --include-c2). The installer gates these in modules/misc.sh and modules/pwn.sh;
+# mirror that here so MCP tool/profile output reflects the gating. Synced from bash
+# by validate_mcp_sync.py:
+#   git    -> modules/misc.sh MISC_C2_GIT_NAMES + modules/pwn.sh PWN_C2_GIT_NAMES
+#   binary -> lib/installers.sh BINARY_RELEASES_MISC_C2 (2nd |-field)
+#   docker -> empire (bcsecurity/empire), gated in install_module_misc
+C2_TOOLS: frozenset[str] = frozenset(
+    {
+        # Pwn-module C2 / reverse-shell frameworks (PWN_C2_GIT_NAMES)
+        "Hoaxshell",
+        "Villain",
+        "SET",
+        "Zphisher",
+        "EvilGoPhish",
+        "SquarePhish",
+        "CredMaster",
+        "Modlishka",
+        "Caldera",
+        "Loki-C2",
+        "gophish",
+        "sliver-server",
+        "sliver-client",
+        "evilginx",
+        "empire",
+        # INCLUDE_C2-gated post-exploitation tools
+        "LaZagne",
+        "mimipenguin",
+        "PyExfil",
+        "usbkill",
+        # C2 frameworks (git-cloned, INCLUDE_C2-gated)
+        "Mythic",
+        "Havoc",
+        "PoshC2",
+        "merlin",
+    }
+)
+
+# Module descriptions (from MODULE_DESCRIPTIONS in lib/common.sh).
+MODULE_DESCRIPTIONS: dict[str, str] = {
+    "misc": "Security tools, utilities, resources, C2, social engineering",
+    "networking": "Port scanning, packet capture, tunneling, MITM",
+    "recon": "Subdomain enum, OSINT, intelligence gathering",
+    "web": "Web app testing, fuzzing, scanning",
+    "crypto": "Cryptography analysis, cipher cracking",
+    "pwn": "Binary exploitation, shellcode, fuzzers",
+    "reversing": "Disassembly, debugging, binary analysis",
+    "forensics": "Disk/memory forensics, file carving",
+    "enterprise": "AD, Kerberos, LDAP, Azure AD, lateral movement",
+    "wireless": "WiFi, Bluetooth, SDR",
+    "cracking": "Hash cracking, brute force, wordlists",
+    "stego": "Steganography tools",
+    "cloud": "AWS/Azure/GCP security",
+    "containers": "Docker/Kubernetes security",
+    "blueteam": "Defensive security, IDS/IPS, SIEM, IR, malware analysis",
+    "mobile": "Android/iOS app testing, APK analysis",
+    "blockchain": "Smart contract auditing, analysis, reversing",
+    "llm": "LLM red teaming, prompt injection, AI security",
+}
+
+# Docker image registry (from ALL_DOCKER_IMAGES in lib/installers.sh).
+# Maps tool label → docker image.
+DOCKER_IMAGES: dict[str, str] = {
+    "BeEF": "beefproject/beef",
+    "Empire": "bcsecurity/empire",
+    "MobSF": "opensecurity/mobile-security-framework-mobsf",
+    "SpiderFoot": "spiderfoot/spiderfoot",
+    "BloodHound CE": "specterops/bloodhound",
+    "TheHive": "strangebee/thehive:latest",
+    "Cortex": "thehiveproject/cortex:latest",
+    "Echidna": "trailofbits/echidna",
+    "PentAGI": "vxcontrol/pentagi:latest",
+    "Zeek": "zeek/zeek:latest",
+    "Zircolite": "wagga40/zircolite:latest",
+    "KICS": "checkmarx/kics:latest",
+    "SageMath": "sagemath/sagemath:latest",
+}
+
+
+class ToolsDatabase:
+    """Loads and queries the cybersec tools registry."""
+
+    def __init__(self, project_root: Optional[Path] = None):
+        self.root = Path(project_root) if project_root else PROJECT_ROOT
+        self._tools: list[dict] = []
+        self.tools_by_name: dict[str, dict] = {}
+        self._versions: dict[str, dict] = {}
+        self._versions_ts: float = 0.0  # last reload timestamp
+        self._docker_refs: set[str] = set()
+        self._docker_refs_ts: float = 0.0
+        self._load_tools()
+
+    def _load_tools(self) -> None:
+        config_path = _resolve_registry_path(self.root)
+        with open(config_path, "r", encoding="utf-8") as f:
+            self._tools = json.load(f)
+        self.tools_by_name = {t["name"]: t for t in self._tools}
+
+    def reload_versions(self, ttl: float = 2.0) -> dict[str, dict]:
+        """Parse .versions file (tool|method|version|timestamp format).
+
+        Results are cached for *ttl* seconds (default 2s) to avoid re-reading
+        the file on every check_installed() call during a batch operation like
+        list_tools(installed_only=True).
+        """
+        now = time.monotonic()
+        if self._versions_ts > 0 and (now - self._versions_ts) < ttl:
+            return self._versions
+
+        # Built aside and swapped in whole: sync tools run in a threadpool, and a
+        # reader must never see a half-filled dict.
+        versions: dict[str, dict] = {}
+        versions_path = self.root / ".versions"
+        try:
+            with open(versions_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split("|")
+                    if len(parts) >= 4:
+                        versions[parts[0]] = {
+                            "method": parts[1],
+                            "version": parts[2],
+                            "timestamp": parts[3],
+                        }
+        except (OSError, ValueError):
+            # Missing, unreadable, corrupt or non-UTF-8 .versions: fall through to
+            # the PATH/pipx/docker checks.
+            versions = {}
+        self._versions = versions
+        self._versions_ts = now
+        return versions
+
+    def check_installed(self, tool_name: str) -> dict:
+        """Multi-strategy install check for a tool.
+
+        Returns dict with: installed (bool), method (str), details (str).
+        """
+        tool = self.tools_by_name.get(tool_name)
+        if not tool:
+            return {
+                "installed": False,
+                "method": "unknown",
+                "details": f"Tool '{tool_name}' not found in registry",
+            }
+
+        # 1. Check .versions tracking
+        versions = self.reload_versions()
+        if tool_name in versions:
+            v = versions[tool_name]
+            return {
+                "installed": True,
+                "method": "versions_tracked",
+                "details": f"Tracked: {v['version']} ({v['method']}, {v['timestamp']})",
+            }
+
+        # 2. PATH check via shutil.which
+        if shutil.which(tool_name):
+            return {
+                "installed": True,
+                "method": "path",
+                "details": f"Found in PATH: {shutil.which(tool_name)}",
+            }
+
+        # 3. Binary name fallback (package name != executable name)
+        resolved = resolve_binary_name(tool["method"], tool_name)
+        bin_name = resolved if resolved != tool_name else None
+        if bin_name and shutil.which(bin_name):
+            return {
+                "installed": True,
+                "method": f"{tool['method']}_binary",
+                "details": f"Binary '{bin_name}' found in PATH",
+            }
+
+        # 4. Git clone directory check (Termux: ~/tools, Linux: /opt)
+        if tool["method"] == "git":
+            custom_dir = os.environ.get("GITHUB_TOOL_DIR")
+            git_dirs = [Path(custom_dir or "/opt") / tool_name]
+            if os.environ.get("TERMUX_VERSION"):
+                git_dirs.insert(0, Path.home() / "tools" / tool_name)
+            for git_path in git_dirs:
+                if git_path.is_dir():
+                    return {
+                        "installed": True,
+                        "method": "git_directory",
+                        "details": f"Git clone found at {git_path}",
+                    }
+
+        # 5. run_script venv check: "ctf-<name>-venv" is the venv the server hands
+        # to run_script(venv="<name>"), so its interpreter is the install proof.
+        # Checked directly rather than through .versions so a manually created
+        # venv — the documented fallback — also reports honestly.
+        if tool["method"] == "special" and tool_name.startswith("ctf-") and tool_name.endswith("-venv"):
+            venvs_dir = os.environ.get("CYBERSEC_MCP_VENVS_DIR", "").strip()
+            venv_root = Path(venvs_dir) if venvs_dir else Path.home() / ".ctf-venvs"
+            venv_python = venv_root / tool_name[len("ctf-") : -len("-venv")] / "bin" / "python"
+            if venv_python.is_file():
+                return {
+                    "installed": True,
+                    "method": "venv",
+                    "details": f"Venv interpreter: {venv_python}",
+                }
+
+        # 6. Docker image check
+        if tool["method"] == "docker":
+            image = self._find_docker_image(tool_name)
+            if image and self._docker_image_exists(image):
+                return {
+                    "installed": True,
+                    "method": "docker",
+                    "details": f"Docker image '{image}' found locally",
+                }
+
+        return {
+            "installed": False,
+            "method": tool["method"],
+            "details": "Not found via any detection method",
+        }
+
+    def _find_docker_image(self, tool_name: str) -> Optional[str]:
+        """Find the docker image for a tool name."""
+        name_lower = tool_name.lower()
+        # Exact match on label (case-insensitive)
+        for label, image in DOCKER_IMAGES.items():
+            if name_lower == label.lower():
+                return image
+        # Exact match on image name (last component, strip tag, e.g. "empire" from "bcsecurity/empire")
+        for label, image in DOCKER_IMAGES.items():
+            image_name = image.rsplit("/", 1)[-1].split(":")[0].lower()
+            if name_lower == image_name:
+                return image
+        return None
+
+    def _docker_refs_cached(self, ttl: float = 2.0) -> set[str]:
+        """Local image refs as ``repo:tag``, cached briefly.
+
+        A registry-wide scan checks every docker tool; one ``docker images`` call
+        per scan replaces one per tool, and a hung daemon costs one timeout
+        instead of one per image.
+        """
+        now = time.monotonic()
+        if self._docker_refs_ts > 0 and (now - self._docker_refs_ts) < ttl:
+            return self._docker_refs
+        try:
+            result = subprocess.run(
+                ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            refs = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            refs = set()
+        self._docker_refs = refs
+        self._docker_refs_ts = now
+        return refs
+
+    def _docker_image_exists(self, image: str) -> bool:
+        """Check if a docker image exists locally (any tag when *image* names none)."""
+        repo, sep, tag = image.rpartition(":")
+        if not sep or "/" in tag:
+            # No tag, or the colon belonged to a registry port ("host:5000/repo").
+            repo, tag = image, ""
+        refs = self._docker_refs_cached()
+        if tag:
+            return f"{repo}:{tag}" in refs
+        return any(ref.rsplit(":", 1)[0] == repo for ref in refs)
+
+    def list_tools(
+        self,
+        module: Optional[str] = None,
+        method: Optional[str] = None,
+        installed_only: bool = False,
+    ) -> list[dict]:
+        """Filter and return tools from the registry."""
+        results = self._tools
+
+        if module:
+            results = [t for t in results if t["module"] == module]
+        if method:
+            results = [t for t in results if t["method"] == method]
+
+        if installed_only:
+            filtered = []
+            for t in results:
+                status = self.check_installed(t["name"])
+                if status["installed"]:
+                    t_copy = dict(t)
+                    t_copy["install_status"] = status
+                    filtered.append(t_copy)
+            results = filtered
+
+        return results
+
+    @property
+    def total_tools(self) -> int:
+        return len(self._tools)
+
+    @property
+    def modules(self) -> list[str]:
+        return sorted(set(t["module"] for t in self._tools))
+
+    @property
+    def methods(self) -> list[str]:
+        return sorted(set(t["method"] for t in self._tools))

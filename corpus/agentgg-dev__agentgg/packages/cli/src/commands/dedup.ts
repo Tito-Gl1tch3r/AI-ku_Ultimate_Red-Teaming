@@ -1,0 +1,468 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import type { FileRecord, Finding, Provider } from "@agentgg/core";
+import {
+  completeRun,
+  createRunMeta,
+  loadAllFileRecords,
+  readScanMeta,
+  writeFileRecord,
+  writeRunMeta,
+} from "@agentgg/core";
+import type { Command } from "commander";
+import { runConcurrent } from "../concurrent.js";
+import { dedupeCandidates, resolveDedup } from "../deduper.js";
+import { handleDetectorError } from "../diagnostics.js";
+import { loadOrSynthesizeConfig, resolveDetector } from "../llm.js";
+import { logError } from "../log.js";
+import { promote } from "../promote.js";
+import {
+  buildCredentialsFromOpts,
+  REGION_FLAG_HELP,
+  validateProviderFlags,
+} from "../providers/index.js";
+import { writeMarkdownReport } from "../reporters/md.js";
+import { createUsageMeter } from "../usage-meter.js";
+import { buildInvocation } from "./invocation.js";
+
+interface DedupOpts {
+  provider?: string;
+  apiKey?: string;
+  oauthToken?: string;
+  baseUrl?: string;
+  region?: string;
+  project?: string;
+  model?: string;
+  /** `--openrouter-routing`: see the twin option on `scan`. */
+  openrouterRouting?: string;
+  /** Re-run dedup over files that already carry dedup markers (clears them first). */
+  force?: boolean;
+  /**
+   * Physically remove duplicate findings from their FileRecords instead of
+   * just marking them, once the promotion pass has run. Off by default —
+   * the safe default keeps every finding on disk and only adds the `dedup`
+   * marker.
+   */
+  deleteDuplicates?: boolean;
+  verbose?: boolean;
+  /** Override the scanned root recorded in scan.json — rare. */
+  root?: string;
+  /** Drop false-positive findings from the markdown report (kept by default). */
+  excludeFalsePositives?: boolean;
+  /** `--no-summary` → skip re-rendering the markdown report. */
+  summary?: boolean;
+  /** Files de-duplicated in parallel (in-flight LLM calls). Default 5. */
+  concurrency?: number;
+}
+
+/**
+ * De-duplication phase over persisted findings.
+ *
+ * Findings are sharded on disk by `(agentSlug, filePath)`, so the same
+ * source file's full finding set is the union of every agent's record for
+ * that path. Dedup groups findings by `filePath` ACROSS agent shards, asks
+ * the model to cluster same-root-cause findings within each file, and
+ * marks the non-primary members with a `dedup` field pointing at the
+ * primary's stable `id`. The marker is orthogonal to the validation
+ * verdict — a `confirmed` finding can still be a duplicate.
+ *
+ * This cannot run distributed: it needs every finding for a file
+ * co-located. It runs on whatever findings exist, independent of whether
+ * they've been validated yet.
+ *
+ * By default a duplicate is only MARKED (kept on disk); `--delete-
+ * duplicates` strips it from its FileRecord instead. A finding that
+ * already carries a dedup marker, or that another finding already points
+ * at, is excluded from the candidate set unless `--force` clears markers
+ * first.
+ *
+ * Findings reaching this command often already carry verdicts, so it ends
+ * with a promotion pass: a primary the validator rejected hands its place
+ * to the first duplicate a verdict kept.
+ */
+export async function runDedup(
+  outputArg: string,
+  opts: DedupOpts,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const outputDir = resolve(outputArg);
+  const scanMeta = readScanMeta(outputDir);
+  if (!scanMeta) {
+    throw new Error(
+      `No scan state at ${outputDir}. Run \`agentgg scan <path> -o ${outputArg}\` first.`,
+    );
+  }
+  const rootPath = opts.root ? resolve(opts.root) : scanMeta.root;
+
+  const config = loadOrSynthesizeConfig(env, opts.provider);
+  const activeProvider = (opts.provider ?? config.provider) as Provider;
+  validateProviderFlags(activeProvider, opts);
+  const credentials = buildCredentialsFromOpts(opts);
+  const detector = resolveDetector(config, {
+    provider: opts.provider,
+    model: opts.model,
+    credentials,
+    verbose: opts.verbose,
+    openrouterRouting: opts.openrouterRouting,
+  });
+
+  // Same abort-on-fatal-diagnostic pattern as scan/revalidate.
+  const dedupAbortController = new AbortController();
+
+  const records = loadAllFileRecords(outputDir);
+  if (records.length === 0) {
+    console.log(`No FileRecords in ${outputDir}/state/files/.`);
+    console.log("  Run `agentgg scan` first to populate findings.");
+    return;
+  }
+
+  // Index every finding by id → {finding, record}, then group the
+  // comparable ones by source filePath (unioning across agent shards).
+  const index = new Map<string, { finding: Finding; record: FileRecord }>();
+  const dirtyRecords = new Set<FileRecord>();
+  const allFindings: Finding[] = [];
+  for (const record of records) {
+    for (const finding of record.findings) {
+      index.set(finding.id, { finding, record });
+      // --force clears prior markers up front so a recompute starts clean.
+      if (opts.force && finding.dedup) {
+        finding.dedup = undefined;
+        dirtyRecords.add(record);
+      }
+      allFindings.push(finding);
+    }
+  }
+  const alreadyMarked = allFindings.filter((f) => f.dedup).length;
+  const byFile = new Map<string, Finding[]>();
+  for (const finding of dedupeCandidates(allFindings)) {
+    const bucket = byFile.get(finding.filePath);
+    if (bucket) bucket.push(finding);
+    else byFile.set(finding.filePath, [finding]);
+  }
+
+  // Candidate files: 2+ findings not yet deduped.
+  type Task = { filePath: string; findings: Finding[] };
+  const tasks: Task[] = [];
+  for (const [filePath, findings] of byFile) {
+    if (findings.length < 2) continue;
+    tasks.push({ filePath, findings });
+  }
+
+  if (tasks.length === 0) {
+    console.log(
+      `Nothing to de-duplicate. ${byFile.size} file(s) still to compare; none have 2 or more findings${
+        alreadyMarked > 0 ? ` (${alreadyMarked} finding(s) already de-duplicated)` : ""
+      }.`,
+    );
+    console.log("  Pass --force to re-run de-duplication over already-processed files.");
+    return;
+  }
+
+  console.log(`De-duplicating findings across ${tasks.length} file(s) in ${outputDir}`);
+  console.log(`  Root:        ${rootPath}`);
+  console.log(`  Provider:    ${detector.name}`);
+  if (alreadyMarked > 0) {
+    console.log(`  Skipped:     ${alreadyMarked} finding(s) already de-duplicated`);
+  }
+  if (opts.force) console.log(`  Force:       cleared prior markers, recomputing`);
+  if (opts.deleteDuplicates) console.log(`  Mode:        deleting duplicates (not just marking)`);
+  console.log("");
+
+  const runMeta = createRunMeta({
+    type: "dedup",
+    invocation: buildInvocation({ command: "dedup" }),
+  });
+  writeRunMeta(outputDir, runMeta);
+
+  // Token-usage metering — dedup is an LLM pass, so it's recorded too.
+  // Checkpoints to state/usage.json (incrementally as the pool resolves files),
+  // flushed on shutdown + finalize. Seeded from any prior ledger in this dir.
+  const usageMeter = createUsageMeter(outputDir, detector.name);
+  detector.attachUsageMeter?.(usageMeter);
+
+  // SIGINT (Ctrl+C) / SIGTERM handler: stamp the run as errored on disk.
+  // SIGTERM matters when this CLI runs inside a Cloud Run Job — cancel
+  // sends SIGTERM and we want the run sidecar to reflect that exit.
+  let runFinalized = false;
+  const shutdownHandler = (signal: NodeJS.Signals) => {
+    if (!runFinalized) {
+      runFinalized = true;
+      try {
+        usageMeter.flush();
+      } catch {
+        // metering must never block shutdown
+      }
+      try {
+        completeRun(outputDir, runMeta.runId, "error", {});
+      } catch {
+        // best-effort
+      }
+      console.error("");
+      logError(`Interrupted (${signal}). Partial dedup state persisted; re-run to resume.`);
+    }
+    process.exit(signal === "SIGTERM" ? 143 : 130);
+  };
+  process.on("SIGINT", shutdownHandler);
+  process.on("SIGTERM", shutdownHandler);
+
+  const startedAt = new Date();
+  const fileCache = new Map<string, string | null>();
+  let totalDuplicates = 0;
+  let filesWithDuplicates = 0;
+
+  // Pre-pool persistence of --force-cleared records: with end-of-phase
+  // persistence removed (we now write inside the runConcurrent callback
+  // so SIGTERM mid-pool preserves work), records cleared by --force but
+  // never touched by the in-pool dedup would never be written. Flush
+  // them here so the cleared state is durable independent of pool work.
+  for (const record of dirtyRecords) {
+    record.analysisHistory.push({
+      runId: runMeta.runId,
+      phase: "dedup",
+      ranAt: new Date().toISOString(),
+      durationMs: 0,
+      provider: detector.name,
+      agentSlugs: [record.agentSlug],
+      findingCount: record.findings.length,
+    });
+    try {
+      writeFileRecord(outputDir, record);
+    } catch (err) {
+      logError(`persist (force-clear) failed for ${record.filePath}: ${(err as Error).message}`);
+    }
+  }
+
+  // One bounded pool over files. Each file's findings belong to distinct
+  // records (per agent), and different files never share a record, so
+  // concurrent workers never mutate the same record. Per-task persistence:
+  // each callback writes its dirtied records before returning, so a
+  // mid-pool SIGTERM (Job cancel, OOM) preserves the dedup work that
+  // already resolved instead of throwing away the whole phase.
+  const concurrency = Math.max(1, opts.concurrency ?? 5);
+  await runConcurrent(tasks, concurrency, async ({ filePath, findings }) => {
+    let content = fileCache.get(filePath);
+    if (content === undefined) {
+      try {
+        content = readFileSync(resolve(rootPath, filePath), "utf8");
+      } catch {
+        content = null;
+      }
+      fileCache.set(filePath, content);
+    }
+
+    try {
+      const clusters = await detector.dedupeFindings({
+        filePath,
+        findings,
+        fileContent: content ?? undefined,
+        signal: dedupAbortController.signal,
+      });
+      const assignments = resolveDedup(findings, clusters);
+      if (assignments.length === 0) {
+        if (opts.verbose) console.log(`  ${filePath}: no duplicates`);
+        return;
+      }
+      filesWithDuplicates++;
+      // Records touched by THIS file — kept local so we can persist them
+      // immediately at the end of this task, independent of the global
+      // dirtyRecords set.
+      const localDirtyRecords = new Set<FileRecord>();
+      for (const a of assignments) {
+        const entry = index.get(a.id);
+        if (!entry) continue;
+        entry.finding.dedup = {
+          duplicateOf: a.duplicateOf,
+          reasoning: a.reasoning,
+          runId: runMeta.runId,
+        };
+        dirtyRecords.add(entry.record);
+        localDirtyRecords.add(entry.record);
+        totalDuplicates++;
+      }
+      if (opts.verbose) {
+        console.log(`  ${filePath}: marked ${assignments.length} duplicate(s)`);
+      }
+
+      // Per-task persistence: write each dirtied record now so SIGTERM
+      // mid-pool doesn't throw away resolved work. analysisHistory entry
+      // is added once per record (idempotent on re-run via runId).
+      for (const record of localDirtyRecords) {
+        record.analysisHistory.push({
+          runId: runMeta.runId,
+          phase: "dedup",
+          ranAt: new Date().toISOString(),
+          durationMs: 0,
+          provider: detector.name,
+          agentSlugs: [record.agentSlug],
+          findingCount: record.findings.length,
+        });
+        try {
+          writeFileRecord(outputDir, record);
+        } catch (writeErr) {
+          logError(`persist failed for ${record.filePath}: ${(writeErr as Error).message}`);
+        }
+      }
+    } catch (err) {
+      handleDetectorError(opts, `dedup:${filePath}`, err, dedupAbortController);
+    }
+  });
+
+  // Findings here usually arrive with a verdict already (the platform
+  // validates before it calls this command), so a rejected finding can end
+  // up the primary of a group that contains a real one. Hand the group to
+  // the first duplicate a verdict kept. This command owns every shard in
+  // the directory, so nothing is off limits.
+  const promoted = promote(
+    records.flatMap((r) => r.findings),
+    () => true,
+  );
+  if (promoted.length > 0) {
+    const promotedRecords = new Set<FileRecord>();
+    for (const finding of promoted) {
+      const entry = index.get(finding.id);
+      if (entry) promotedRecords.add(entry.record);
+    }
+    for (const record of promotedRecords) {
+      record.analysisHistory.push({
+        runId: runMeta.runId,
+        phase: "dedup",
+        ranAt: new Date().toISOString(),
+        durationMs: 0,
+        provider: detector.name,
+        agentSlugs: [record.agentSlug],
+        findingCount: record.findings.length,
+      });
+      dirtyRecords.add(record);
+      try {
+        writeFileRecord(outputDir, record);
+      } catch (err) {
+        logError(`persist (promotion) failed for ${record.filePath}: ${(err as Error).message}`);
+      }
+    }
+    const heirs = promoted.filter((f) => !f.dedup).length;
+    console.log(`  Promoted ${heirs} finding(s) whose primary was rejected.`);
+  }
+
+  // `--delete-duplicates` strips this run's duplicates only now, after
+  // promotion: a duplicate may have just taken over from a rejected primary.
+  // Markers from earlier runs are left alone, as they were before.
+  if (opts.deleteDuplicates) {
+    for (const record of records) {
+      const kept = record.findings.filter((f) => f.dedup?.runId !== runMeta.runId);
+      if (kept.length === record.findings.length) continue;
+      record.findings = kept;
+      dirtyRecords.add(record);
+      try {
+        writeFileRecord(outputDir, record);
+      } catch (err) {
+        logError(`persist (delete) failed for ${record.filePath}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  const completedAt = new Date();
+  completeRun(outputDir, runMeta.runId, "done", {
+    findingsCount: totalDuplicates,
+    totalDurationMs: completedAt.getTime() - startedAt.getTime(),
+  });
+  usageMeter.flush();
+  runFinalized = true;
+  process.off("SIGINT", shutdownHandler);
+  process.off("SIGTERM", shutdownHandler);
+
+  // Re-render so the report collapses the freshly-marked duplicates.
+  if (opts.summary !== false) {
+    const allFindings = records.flatMap((r) => r.findings);
+    const byAgent: Record<string, number> = {};
+    for (const f of allFindings) {
+      byAgent[f.agentSlug] = (byAgent[f.agentSlug] ?? 0) + 1;
+    }
+    writeMarkdownReport({
+      outDir: outputDir,
+      root: rootPath,
+      startedAt,
+      completedAt,
+      findings: allFindings,
+      filesScanned: records.length,
+      byAgent,
+      excludeFalsePositives: opts.excludeFalsePositives,
+    });
+  }
+
+  const verb = opts.deleteDuplicates ? "Deleted" : "Marked";
+  console.log(
+    `Done. ${verb} ${totalDuplicates} duplicate(s) across ${filesWithDuplicates} file(s).`,
+  );
+  console.log(`  Rewrote ${dirtyRecords.size} FileRecord(s).`);
+  if (opts.summary === false) {
+    console.log("  Summary: skipped (--no-summary). Run `agentgg summary` to render it.");
+  }
+}
+
+export function registerDedupCommand(program: Command): void {
+  program
+    .command("dedup")
+    .description(
+      "de-duplicate findings: group same-root-cause findings per file (across agents) and mark the non-primary ones",
+    )
+    .argument(
+      "[output-dir]",
+      "path to the scan's --output directory (defaults to ./scan-results)",
+      "./scan-results",
+    )
+    .option(
+      "--root <path>",
+      "override the scanned root recorded in scan.json (only needed if the working copy moved)",
+    )
+    .option(
+      "--provider <name>",
+      "LLM provider for this run: anthropic | openai | ollama | bedrock | vertex (overrides saved default)",
+    )
+    .option("--api-key <key>", "One-shot API key (not persisted). Valid for: anthropic, openai.")
+    .option(
+      "--oauth-token <token>",
+      "One-shot Anthropic OAuth token (sk-ant-oat…). Not persisted. Anthropic only.",
+    )
+    .option("--base-url <url>", "One-shot Ollama base URL (not persisted). Ollama only.")
+    .option("--region <name>", REGION_FLAG_HELP)
+    .option(
+      "--project <id>",
+      "GCP project ID for Vertex AI. Falls back to $GOOGLE_CLOUD_PROJECT / $GCLOUD_PROJECT. Vertex only.",
+    )
+    .option("--model <name>", "One-shot model override for the selected provider (not persisted)")
+    .option(
+      "--openrouter-routing <json|file>",
+      "OpenRouter provider-routing block, overriding OPENROUTER_* env for this run: inline JSON (must start with {) or a path to a .json file (avoids shell-quoting JSON on Windows). Invalid JSON aborts before any LLM call. OpenRouter only.",
+    )
+    .option(
+      "--delete-duplicates",
+      "Physically remove this run's duplicate findings from their FileRecords (default: keep them and only add a `dedup` marker). Removal happens after promotion, so a duplicate that takes over from a rejected primary is kept.",
+    )
+    .option(
+      "--exclude-false-positives",
+      "Drop false-positive findings from the markdown report (default: keep them).",
+    )
+    .option(
+      "--no-summary",
+      "Skip re-rendering the markdown report after de-duplication. Markers still persist to state/files/*; render later with `agentgg summary`.",
+    )
+    .option(
+      "--force",
+      "re-run de-duplication over files that already have dedup markers (clears them first)",
+    )
+    .option(
+      "--concurrency <n>",
+      "files de-duplicated in parallel (in-flight LLM calls)",
+      (v) => parseInt(v, 10),
+      5,
+    )
+    .option("-v, --verbose", "verbose output")
+    .action(async (outputDir: string, opts: DedupOpts) => {
+      try {
+        await runDedup(outputDir, opts);
+      } catch (err) {
+        logError(`dedup failed: ${err instanceof Error ? err.message : String(err)}`);
+        process.exitCode = 1;
+      }
+    });
+}

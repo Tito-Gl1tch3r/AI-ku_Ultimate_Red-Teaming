@@ -1,0 +1,586 @@
+/**
+ * Translate raw LLM/SDK errors into actionable, user-facing diagnostics.
+ *
+ * The scan pipeline surfaces failures from many layers (HTTP, JSON parsing,
+ * provider quirks, auth, rate limits). Most of them ship a Zod stack or a
+ * "Type validation failed" dump that's useless to operators. A diagnostic
+ * recognizes one specific failure shape and rewrites it into a single sentence
+ * with concrete remedies.
+ *
+ * To add a new diagnostic: subclass `ScanDiagnostic`, implement the static
+ * `from(err)` (return `null` if it doesn't match) and `format()`, then add
+ * the class to `DIAGNOSTICS`. The caller code never changes.
+ */
+
+import { logError } from "./log.js";
+export abstract class ScanDiagnostic {
+  abstract format(): string;
+  /**
+   * When true, this failure mode will reproduce on every subsequent
+   * detector call — there is no point continuing the run. Callers
+   * surface the message once and abort.
+   */
+  readonly fatal: boolean = false;
+}
+
+interface DiagnosticConstructor {
+  from(err: unknown): ScanDiagnostic | null;
+}
+
+/**
+ * Thrown out of `handleDetectorError` when the underlying error is
+ * unrecoverable (e.g. invalid API key). Bubbles up past the
+ * per-file / per-agent try/catches so the scan as a whole aborts
+ * instead of repeating the same failure on every remaining file.
+ */
+export class FatalScanError extends Error {
+  constructor(
+    public readonly diagnostic: ScanDiagnostic,
+    public readonly label: string,
+  ) {
+    super(diagnostic.format());
+    this.name = "FatalScanError";
+  }
+}
+
+/**
+ * OpenRouter rejects a call when its possible cost plus the calls still open
+ * exceeds the balance. It clears once those calls finish or credit is added,
+ * so it is a wait-and-retry, never exhausted credit.
+ */
+export function isInFlightCreditError(text: string): boolean {
+  return /given your current in-flight requests|in-flight requests settle/i.test(text);
+}
+
+/**
+ * Ollama returns a partial response (`done:false`, missing eval counts) when
+ * the model overflows its context window — special tokens like `<|im_start|>`
+ * leak out and the Vercel SDK rejects the payload as "Invalid JSON response".
+ * The stacktrace is unactionable; the actual remedy is more context, a better
+ * model, or a tighter scan scope.
+ */
+class OllamaContextOverflow extends ScanDiagnostic {
+  private constructor(private readonly model: string) {
+    super();
+  }
+
+  static from(err: unknown): OllamaContextOverflow | null {
+    if (!(err instanceof Error)) return null;
+    if (!/invalid json response/i.test(err.message)) return null;
+
+    const haystack = collectResponseBodies(err).join(" ");
+    if (!haystack) return null;
+
+    const truncated = /"done"\s*:\s*false/.test(haystack);
+    const templateLeak = /<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>/.test(haystack);
+    if (!truncated && !templateLeak) return null;
+
+    const modelMatch = haystack.match(/"model"\s*:\s*"([^"]+)"/);
+    return new OllamaContextOverflow(modelMatch?.[1] ?? "the model");
+  }
+
+  format(): string {
+    return (
+      `Ollama returned an incomplete response from ${this.model}, likely because the ` +
+      `conversation grew past its context window. Use a more capable model, narrow the ` +
+      `scan with --only / --exclude, or raise num_ctx in your Ollama Modelfile and re-run.`
+    );
+  }
+}
+
+/**
+ * The provider rejected the credentials. Every subsequent call in this
+ * run will fail the same way, so the scan should bail immediately
+ * rather than churn through every (file, agent) pair.
+ *
+ * Recognizes the common shapes:
+ *   - HTTP 401 / 403 carried on the error or its cause.
+ *   - Anthropic `authentication_error` / "invalid x-api-key" payloads.
+ *   - OpenAI "Incorrect API key" / "invalid_api_key" payloads.
+ *   - claude-agent-sdk subprocess stderr containing the same phrases
+ *     when the CLI fails to auth.
+ */
+class AuthFailure extends ScanDiagnostic {
+  override readonly fatal = true;
+
+  private constructor(private readonly providerLabel: string) {
+    super();
+  }
+
+  static from(err: unknown): AuthFailure | null {
+    if (!(err instanceof Error)) return null;
+    const e = err as Error & {
+      statusCode?: number;
+      responseBody?: string;
+      cause?: unknown;
+    };
+    const cause =
+      typeof e.cause === "object" && e.cause !== null
+        ? (e.cause as { statusCode?: number; responseBody?: string; message?: string })
+        : undefined;
+
+    const status = e.statusCode ?? cause?.statusCode;
+    const isAuthStatus = status === 401 || status === 403;
+
+    const haystack = [e.message, e.responseBody, cause?.message, cause?.responseBody]
+      .filter((v): v is string => typeof v === "string" && v.length > 0)
+      .join("\n");
+
+    const authPhrase =
+      /authentication[_\s-]?error|invalid[_\s-]*(?:x-?)?api[_\s-]?key|incorrect[_\s-]?api[_\s-]?key|invalid[_\s-]?bearer[_\s-]?token|oauth[_\s-]?token[_\s-]?(?:invalid|expired)|\b401\b\s*(?:unauthor|invalid)|unauthorized.*(?:api|token|credential)/i.test(
+        haystack,
+      );
+
+    if (!isAuthStatus && !authPhrase) return null;
+
+    let provider = "The LLM provider";
+    if (/anthropic|claude|x-api-key|sk-ant/i.test(haystack)) provider = "Anthropic";
+    else if (/openai|sk-[A-Za-z0-9_-]{20,}/i.test(haystack)) provider = "OpenAI";
+
+    return new AuthFailure(provider);
+  }
+
+  format(): string {
+    const hint =
+      this.providerLabel === "Anthropic"
+        ? "Verify your `--api-key` (sk-ant-…) or `--oauth-token` (sk-ant-oat-…), or re-run `agentgg init`."
+        : this.providerLabel === "OpenAI"
+          ? "Verify your `--api-key` (sk-…), or re-run `agentgg init`."
+          : "Verify the credentials for your provider, or re-run `agentgg init`.";
+    return `${this.providerLabel} rejected the credentials. ${hint}`;
+  }
+}
+
+/**
+ * Provider quota / billing / credit exhaustion. Distinct from short-term
+ * rate limiting: rate limits resolve in seconds (handled by withTpmRetry
+ * in the Vercel detector); quota exhaustion needs a top-up / quota
+ * increase request and won't fix itself inside a single scan run. Marked
+ * fatal so the scan aborts cleanly and resume picks up where it stopped.
+ *
+ * Recognized shapes (verified against provider docs / community reports —
+ * see packages/cli/src/__tests__/fixtures/quota/ for canonical bodies):
+ *
+ *   Anthropic API key — modern: HTTP 402 with error.type === "billing_error".
+ *   Anthropic API key — legacy: HTTP 400 with error.type === "invalid_request_error"
+ *                              AND body matching /credit balance is too low/i.
+ *                              Same handler still surfaces in the wild via the
+ *                              Claude Agent SDK subprocess stderr.
+ *   OpenAI:               HTTP 429 with error.type or error.code === "insufficient_quota"
+ *                         (status alone is ambiguous — short-term rate limits are also 429).
+ *   AWS Bedrock:          ServiceQuotaExceededException — recognized via the AWS SDK's
+ *                         __type field or the exception's name property.
+ *
+ * Deliberately NOT recognized (handled elsewhere or kept retryable):
+ *   - Anthropic 429 rate_limit_error: retryable (existing withTpmRetry) for
+ *     API-key TPM and OAuth Pro/Max usage-window cases. The OAuth window
+ *     case may need a separate diagnostic later — pending real-error
+ *     capture to confirm the body shape.
+ *   - OpenAI 429 rate_limit_exceeded: retryable.
+ *   - Bedrock ThrottlingException: retryable.
+ */
+class QuotaExhausted extends ScanDiagnostic {
+  override readonly fatal = true;
+
+  private constructor(
+    private readonly providerLabel: string,
+    private readonly remediation: string,
+  ) {
+    super();
+  }
+
+  static from(err: unknown): QuotaExhausted | null {
+    if (!(err instanceof Error)) return null;
+    const e = err as Error & {
+      statusCode?: number;
+      responseBody?: string;
+      cause?: unknown;
+      name?: string;
+      // AWS SDK v3 attaches these on service exceptions.
+      $metadata?: { httpStatusCode?: number };
+      __type?: string;
+    };
+    const cause =
+      typeof e.cause === "object" && e.cause !== null
+        ? (e.cause as {
+            statusCode?: number;
+            responseBody?: string;
+            message?: string;
+            name?: string;
+            $metadata?: { httpStatusCode?: number };
+            __type?: string;
+          })
+        : undefined;
+
+    const status = e.statusCode ?? cause?.statusCode ?? e.$metadata?.httpStatusCode;
+    const haystack = [e.message, e.responseBody, cause?.message, cause?.responseBody]
+      .filter((v): v is string => typeof v === "string" && v.length > 0)
+      .join("\n");
+
+    // OpenRouter's in-flight check clears once open requests finish, so it is
+    // not exhausted credit. withTpmRetry waits it out; a call that still hits
+    // it fails its batch, not the whole scan.
+    if (isInFlightCreditError(haystack)) return null;
+
+    // OpenRouter: insufficient-credits path. Must run before the generic
+    // 402 -> Anthropic branch below, else it mislabels it. A bare openrouter.ai
+    // link is not enough: other OpenRouter errors carry one too.
+    if (
+      /requires more credits, or fewer max_tokens/i.test(haystack) ||
+      (/openrouter/i.test(haystack) && (status === 402 || /insufficient credits/i.test(haystack)))
+    ) {
+      return new QuotaExhausted(
+        "OpenRouter",
+        "Add credits at https://openrouter.ai/settings/credits, then re-run the scan. Resume picks up pending files automatically.",
+      );
+    }
+
+    // Anthropic — modern billing_error path: HTTP 402 OR error.type
+    // explicitly named. Body shape per platform.claude.com errors doc.
+    if (status === 402 || /"type"\s*:\s*"billing_error"/i.test(haystack)) {
+      return new QuotaExhausted(
+        "Anthropic",
+        "Top up at https://console.anthropic.com/settings/billing, then re-run the scan — resume picks up pending files automatically.",
+      );
+    }
+
+    // Anthropic — legacy/secondary shape: 400 invalid_request_error with
+    // "credit balance is too low" body. Still observed in the wild and
+    // surfaces verbatim through the Claude Agent SDK subprocess stderr,
+    // so match on the message string regardless of statusCode.
+    if (/credit balance is too low/i.test(haystack)) {
+      return new QuotaExhausted(
+        "Anthropic",
+        "Top up at https://console.anthropic.com/settings/billing, then re-run the scan — resume picks up pending files automatically.",
+      );
+    }
+
+    // OpenAI — distinguish quota from short-term rate limit by the body
+    // type/code field. Both are HTTP 429, so status alone is ambiguous.
+    // Match the literal token rather than the message string because
+    // OpenAI rewords the user-facing message periodically.
+    if (
+      /"(?:type|code)"\s*:\s*"insufficient_quota"/i.test(haystack) ||
+      /insufficient_quota/i.test(e.name ?? "")
+    ) {
+      return new QuotaExhausted(
+        "OpenAI",
+        "Add credits or upgrade your plan at https://platform.openai.com/account/billing, then re-run the scan — resume picks up pending files automatically.",
+      );
+    }
+
+    // AWS Bedrock — account-level service quota exceeded. AWS SDK v3
+    // surfaces this as a typed exception with `name === "ServiceQuotaExceededException"`
+    // and (sometimes) `__type` set on the wire payload. Distinct from
+    // ThrottlingException (short-term, retryable).
+    const bedrockName = e.name ?? cause?.name ?? "";
+    const bedrockType = e.__type ?? cause?.__type ?? "";
+    if (
+      /ServiceQuotaExceededException/.test(bedrockName) ||
+      /ServiceQuotaExceededException/.test(bedrockType) ||
+      /"__type"\s*:\s*"[^"]*ServiceQuotaExceededException/i.test(haystack)
+    ) {
+      return new QuotaExhausted(
+        "AWS Bedrock",
+        "Request a quota increase via AWS Support (Service Quotas → Amazon Bedrock), then re-run the scan — resume picks up pending files automatically.",
+      );
+    }
+
+    return null;
+  }
+
+  format(): string {
+    return `${this.providerLabel} quota / credits exhausted. ${this.remediation}`;
+  }
+}
+
+/**
+ * Claude.ai web / Pro / Max plan usage-window limit, surfaced through the
+ * Claude Agent SDK subprocess as `"You've hit your limit · resets <time>"`.
+ *
+ * Distinct from:
+ *   - AuthFailure (401/403): credentials are still valid, just throttled.
+ *   - QuotaExhausted (API billing): different surface — that path is for
+ *     `sk-ant-…` keys hitting credit/billing limits, not Pro/Max plans.
+ *   - Anthropic 429 rate_limit_error: short-term TPM throttling, retryable
+ *     by withTpmRetry on seconds-scale backoff.
+ *
+ * This one resets at a wall-clock time that's typically hours away, so
+ * every queued (file, agent) pair is guaranteed to hit the same error.
+ * Fatal so the scan aborts immediately; `agentgg scan --resume` picks up
+ * the unfinished files after the reset.
+ */
+class ClaudeUsageLimit extends ScanDiagnostic {
+  override readonly fatal = true;
+
+  private constructor(private readonly resetHint: string | null) {
+    super();
+  }
+
+  static from(err: unknown): ClaudeUsageLimit | null {
+    if (!(err instanceof Error)) return null;
+    const e = err as Error & { responseBody?: string; cause?: unknown };
+    const cause =
+      typeof e.cause === "object" && e.cause !== null
+        ? (e.cause as { message?: string; responseBody?: string })
+        : undefined;
+    const haystack = [e.message, e.responseBody, cause?.message, cause?.responseBody]
+      .filter((v): v is string => typeof v === "string" && v.length > 0)
+      .join("\n");
+
+    // Match both curly (’) and straight (') apostrophes — the SDK uses curly,
+    // but downstream tooling sometimes re-serializes through ASCII.
+    if (!/you[’']ve hit your (?:usage )?limit/i.test(haystack)) return null;
+
+    // Best-effort capture of "resets <time> (tz)" so the diagnostic echoes
+    // the SDK's hint instead of saying just "reset later".
+    const resetMatch = haystack.match(/resets\s+([^\n·]+?)(?:\s*$|\s*[·\n])/i);
+    return new ClaudeUsageLimit(resetMatch?.[1]?.trim() ?? null);
+  }
+
+  format(): string {
+    const when = this.resetHint ? ` Resets ${this.resetHint}.` : "";
+    return (
+      `Claude.ai plan usage limit reached.${when} ` +
+      `Wait for the window to reset and re-run with \`agentgg scan --resume\`, ` +
+      `or switch to API-key billing via \`--api-key sk-ant-…\` to bypass the plan limit.`
+    );
+  }
+}
+
+/**
+ * Deterministic provider-config rejection: the request is malformed for the
+ * selected model / provider preferences, so it fails identically on every
+ * retry and every sibling file. Fatal, so the scan surfaces it once and aborts
+ * instead of grinding the same 400 through every file or agent.
+ *
+ * Covers OpenRouter's provider-routing validation (a bad --openrouter-routing
+ * block -> "provider: Unrecognized key: ..."), an over-narrow provider filter
+ * ("No allowed providers are available ..."), and an unknown model
+ * ("... is not a valid model ID" / "No endpoints found ...").
+ */
+class ProviderConfigRejected extends ScanDiagnostic {
+  override readonly fatal = true;
+
+  private constructor(private readonly detail: string) {
+    super();
+  }
+
+  static from(err: unknown): ProviderConfigRejected | null {
+    if (!(err instanceof Error)) return null;
+    const e = err as Error & {
+      responseBody?: string;
+      statusCode?: number;
+      $metadata?: { httpStatusCode?: number };
+      cause?: unknown;
+    };
+    const cause =
+      typeof e.cause === "object" && e.cause !== null
+        ? (e.cause as { message?: string; responseBody?: string; statusCode?: number })
+        : undefined;
+    const status = e.statusCode ?? cause?.statusCode ?? e.$metadata?.httpStatusCode;
+    const haystack = [e.message, e.responseBody, cause?.message, cause?.responseBody]
+      .filter((v): v is string => typeof v === "string" && v.length > 0)
+      .join("\n");
+
+    // OpenRouter prefixes provider-preference validation errors with
+    // "provider: ..." and returns 400 (e.g. a typo'd --openrouter-routing key).
+    if (status === 400 && /\bprovider:\s/i.test(haystack)) {
+      const line = haystack.match(/provider:[^\n]*/i)?.[0] ?? "invalid provider routing";
+      return new ProviderConfigRejected(line.trim());
+    }
+    // Provider filter matched nothing, or the model/provider isn't served.
+    if (/no allowed providers are available/i.test(haystack)) {
+      return new ProviderConfigRejected("no providers match your routing filters for this model");
+    }
+    if (/no endpoints found/i.test(haystack) || /is not a valid model/i.test(haystack)) {
+      return new ProviderConfigRejected("the requested model or provider is not available");
+    }
+    return null;
+  }
+
+  format(): string {
+    return (
+      `provider request rejected as misconfigured: ${this.detail}. ` +
+      "Fix --openrouter-routing / --model and re-run; resume continues from where it stopped."
+    );
+  }
+}
+
+const DIAGNOSTICS: DiagnosticConstructor[] = [
+  AuthFailure,
+  QuotaExhausted,
+  ProviderConfigRejected,
+  ClaudeUsageLimit,
+  OllamaContextOverflow,
+];
+
+export function diagnoseScanError(err: unknown): ScanDiagnostic | null {
+  for (const cls of DIAGNOSTICS) {
+    const result = cls.from(err);
+    if (result) return result;
+  }
+  return null;
+}
+
+/** Detect whether an error came from an `AbortController.abort()` we initiated. */
+function isAbortError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === "AbortError") return true;
+  // Vercel AI SDK + node fetch wrap aborts as DOMException("AbortError")
+  // or surface them via the `cause` chain. Walk one level of cause.
+  const cause = (err as Error & { cause?: unknown }).cause;
+  if (
+    cause instanceof Error &&
+    (cause.name === "AbortError" || /aborted|abort_err/i.test(cause.message))
+  ) {
+    return true;
+  }
+  return /\b(aborted|the operation was aborted|request was aborted)\b/i.test(err.message);
+}
+
+/**
+ * Single sink for detector-side errors. Recoverable errors get logged
+ * inline with optional stack-trace context; fatal errors (e.g. bad
+ * credentials) are converted into a `FatalScanError` and thrown so the
+ * caller's outer try/catch can abort the run cleanly.
+ *
+ * When `abortController` is passed and the diagnostic is fatal, the
+ * controller is aborted BEFORE the throw — that cancels every in-flight
+ * detector HTTP request so sibling workers exit immediately instead of
+ * waiting for their (doomed) requests to settle. The thrown
+ * `FatalScanError` still propagates up via `runConcurrent` to the outer
+ * scan handler.
+ *
+ * Once `abortController.signal.aborted` is true, subsequent calls into
+ * this sink for the same scan are expected to be `AbortError`s from
+ * sibling in-flight requests (they all share the same dead credential).
+ * Those get a single-line "cancelled" log instead of the full stack +
+ * response body dump — there's nothing actionable about an abort
+ * triggered by an earlier diagnostic.
+ */
+/**
+ * A failure the detector raised deliberately, whose message already says
+ * everything a reader needs. `handleDetectorError` prints the message but
+ * skips the stack dump, even under --verbose: every frame is our own plumbing,
+ * so the traceback is noise that buries the genuine crashes around it.
+ */
+export class ExpectedDetectorError extends Error {
+  readonly expected = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "ExpectedDetectorError";
+  }
+}
+
+export function handleDetectorError(
+  opts: { verbose?: boolean },
+  label: string,
+  err: unknown,
+  abortController?: AbortController,
+): void {
+  const e = err as Error & {
+    cause?: unknown;
+    responseBody?: string;
+    statusCode?: number;
+    url?: string;
+  };
+  // A deliberate, self-describing failure needs no traceback (see
+  // ExpectedDetectorError). Checked by property, not instanceof, so an error
+  // that crossed a module boundary still counts.
+  const selfExplanatory = (err as { expected?: unknown })?.expected === true;
+
+  // Already-aborted scan: in-flight siblings throw AbortError once the
+  // controller fires. Surface them as a one-liner — the originating
+  // fatal diagnostic has already been printed by the worker that hit it.
+  if (abortController?.signal.aborted && isAbortError(err)) {
+    if (opts.verbose) {
+      logError(`${label}: cancelled (scan aborted)`);
+    }
+    return;
+  }
+
+  // Provider-side call id, when the SDK carried one (NoObjectGeneratedError
+  // and friends). Without it a failed call is unopenable in the provider
+  // dashboard, which is the only place the raw request survives.
+  const genId = generationIdOf(err);
+
+  const diagnostic = diagnoseScanError(err);
+  if (diagnostic?.fatal) {
+    // Cancel in-flight sibling requests before throwing so they unwind
+    // immediately instead of waiting out their HTTP timeout against an
+    // exhausted credential.
+    abortController?.abort(new FatalScanError(diagnostic, label));
+    throw new FatalScanError(diagnostic, label);
+  }
+
+  const msg = e.message || String(err);
+
+  if (diagnostic) {
+    logError(`${label}: ${diagnostic.format()}`);
+    if (genId) console.error(`      Generation: ${genId}`);
+    if (opts.verbose && !selfExplanatory && e.stack) {
+      console.error(
+        e.stack
+          .split("\n")
+          .slice(0, 8)
+          .map((l) => `      ${l}`)
+          .join("\n"),
+      );
+    }
+    return;
+  }
+
+  // The label already names the phase and target (`dedup:src/db.ts`), so a
+  // hardcoded "detection failed" is both redundant and wrong for the validate /
+  // score / dedup phases that share this path. Matches the diagnostic branch above.
+  logError(`${label}: ${msg}`);
+  if (genId) console.error(`      Generation: ${genId}`);
+  if (e.statusCode) console.error(`      HTTP ${e.statusCode} ${e.url ?? ""}`);
+  if (e.responseBody) {
+    console.error(`      Response: ${String(e.responseBody).slice(0, 300)}`);
+  }
+  if (e.cause && typeof e.cause === "object") {
+    const c = e.cause as Error & { responseBody?: string; statusCode?: number };
+    if (c.message && c.message !== msg) console.error(`      Cause: ${c.message}`);
+    if (c.statusCode) console.error(`      Cause HTTP: ${c.statusCode}`);
+    if (c.responseBody) {
+      console.error(`      Cause body: ${String(c.responseBody).slice(0, 300)}`);
+    }
+  }
+  if (opts.verbose && !selfExplanatory && e.stack) {
+    console.error(
+      e.stack
+        .split("\n")
+        .slice(0, 8)
+        .map((l) => `      ${l}`)
+        .join("\n"),
+    );
+  }
+}
+
+/**
+ * Provider call id off an SDK error, or null. `NoObjectGeneratedError` and the
+ * other AI SDK errors carry `response.id`; for OpenRouter that is the argument
+ * to `GET /api/v1/generation?id=`, the only way to reopen a failed call. Walks
+ * one level of `cause` because the SDK nests the parse failure. Defensive: any
+ * missing field degrades to null rather than throwing inside an error handler.
+ */
+function generationIdOf(err: unknown): string | null {
+  const seen = [err, (err as { cause?: unknown } | null)?.cause];
+  for (const node of seen) {
+    const id = (node as { response?: { id?: unknown } } | null | undefined)?.response?.id;
+    if (typeof id === "string" && id.length > 0) return id;
+  }
+  return null;
+}
+
+function collectResponseBodies(err: Error): string[] {
+  const bodies: string[] = [];
+  const e = err as Error & { responseBody?: string; cause?: unknown };
+  if (e.responseBody) bodies.push(e.responseBody);
+  const cause = e.cause as { responseBody?: string; message?: string } | undefined;
+  if (cause?.responseBody) bodies.push(cause.responseBody);
+  if (cause?.message) bodies.push(cause.message);
+  return bodies;
+}

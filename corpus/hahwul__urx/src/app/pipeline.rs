@@ -1,0 +1,2354 @@
+//! Turning flags into the objects that decide which URLs survive a run.
+//!
+//! A URL can reach the output through three different paths — the batch list,
+//! the `--stream` sink, and links discovered by `--extract-links` — and all
+//! three must apply the same rules. That is why the filter and transformer are
+//! built by shared constructors here rather than assembled at each call site.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+
+use crate::cli::{self, Args};
+use crate::filters::{
+    compile_url_regexes, HostValidator, MetaFilter, MetaFilterStats, ScopeMatcher, UrlFilter,
+};
+use crate::network::{NetworkScope, NetworkSettings};
+use crate::output;
+use crate::progress::ProgressManager;
+use crate::readers::read_urls_from_file;
+use crate::runner::ProviderRunResult;
+use crate::tester_manager::{self, apply_network_settings_to_tester};
+use crate::testers::{
+    ArchiveBodyExtractor, ArchiveBodyStats, ArchiveCapture, BodyArchive, JsEndpointExtractor,
+    LinkExtractor, SpecExpander, StatusChecker, Tester,
+};
+use crate::utils::{verbose_print, ParamView, UrlTransformer};
+
+/// Raw targets named directly on the command line: positional args plus every
+/// `--domain-list` file, before host normalization. stdin is handled as a
+/// fallback by [`collect_domains`].
+fn cli_domain_inputs(args: &Args) -> Result<Vec<String>> {
+    let mut domains: Vec<String> = args.domains.clone();
+
+    for path in &args.domain_list {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("Failed to open domain list: {}", path.display()))?;
+        let file_domains =
+            cli::read_domains(std::io::BufReader::new(file), &path.display().to_string())?;
+        verbose_print(
+            args,
+            format!(
+                "Loaded {} domains from {}",
+                file_domains.len(),
+                path.display()
+            ),
+        );
+        domains.extend(file_domains);
+    }
+
+    Ok(domains)
+}
+
+/// Reduce each target to `host` or `host/path` so a pasted full URL doesn't
+/// silently corrupt provider queries (a common copy/paste footgun) while a
+/// deliberate path scope survives. Inputs with no recoverable host drop out.
+fn normalize_domains(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .filter_map(|d| cli::normalize_target(d))
+        .collect()
+}
+
+/// Collect the effective domain list from CLI positional args, `--domain-list`
+/// files, and (when both are empty) stdin. Duplicates are removed while
+/// preserving first-seen order so the run order is predictable.
+pub fn collect_domains(args: &Args) -> Result<Vec<String>> {
+    collect_domains_with_stdin(args, || {
+        cli::read_domains(std::io::stdin().lock(), "line from stdin")
+    })
+}
+
+/// Resolve explicit targets first and read stdin only when there are none.
+/// Taking the reader as a closure keeps the fallback rule testable without
+/// replacing the process-wide stdin handle.
+fn collect_domains_with_stdin(
+    args: &Args,
+    read_stdin: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<Vec<String>> {
+    let mut domains = cli_domain_inputs(args)?;
+
+    // Only fall back to stdin when no domains were supplied via flags/files,
+    // otherwise piped data would silently get appended on every invocation.
+    // This check runs on the raw inputs: reading stdin blocks, so a target that
+    // merely failed to normalize must not send us looking for one there.
+    if domains.is_empty() {
+        domains.extend(read_stdin()?);
+    }
+
+    let mut normalized = normalize_domains(&domains);
+    let mut seen = HashSet::new();
+    normalized.retain(|d| seen.insert(d.clone()));
+    Ok(normalized)
+}
+
+/// The one-line advisory for a run whose targets carry a path scope, or `None`
+/// when none do.
+///
+/// A path in a target used to be discarded, so `urx https://example.com/shop`
+/// scanned the whole site; it now scans `/shop`. That is the point of the
+/// feature, but it is also a silent narrowing for anyone who habitually pastes
+/// a full URL as the target, and "why did this return 40 URLs" is an expensive
+/// question to have to work out. Saying it once, up front, costs a line.
+///
+/// `subs` is taken into account because it changes what the scope *costs*: a
+/// `--subs` query cannot carry the path, so the archive sends the whole
+/// subdomain index and the scope is applied to the result. That is a large
+/// difference in run time for no difference in output, and it is worth saying
+/// before the fetch rather than after it.
+pub fn path_scope_note(domains: &[String], subs: bool) -> Option<String> {
+    let scoped: Vec<&String> = domains
+        .iter()
+        .filter(|d| cli::split_target(d).1.is_some())
+        .collect();
+    if scoped.is_empty() {
+        return None;
+    }
+    let listed: Vec<&str> = scoped.iter().take(3).map(|d| d.as_str()).collect();
+    let more = match scoped.len().saturating_sub(listed.len()) {
+        0 => String::new(),
+        n => format!(" (+{n} more)"),
+    };
+    let cost = if subs {
+        " With --subs the archive cannot filter by path, so the whole subdomain index is fetched and narrowed here."
+    } else {
+        ""
+    };
+    Some(format!(
+        "[urx] scoped to a path: {}{more} — only URLs under it are collected. Pass just the host for the whole site.{cost}",
+        listed.join(", "),
+    ))
+}
+
+/// Read URLs from every `--files` path, or `None` when the flag wasn't used.
+pub fn read_urls_from_files(args: &Args) -> Result<Option<Vec<String>>> {
+    if args.files.is_empty() {
+        return Ok(None);
+    }
+
+    let mut all_file_urls = Vec::new();
+
+    for file_path in &args.files {
+        let urls = read_urls_from_file(file_path).inspect_err(|e| {
+            if !args.silent {
+                eprintln!("Error reading file {}: {}", file_path.display(), e);
+            }
+        })?;
+        verbose_print(
+            args,
+            format!(
+                "Read {} URLs from file: {}",
+                urls.len(),
+                file_path.display()
+            ),
+        );
+        all_file_urls.extend(urls);
+    }
+
+    verbose_print(
+        args,
+        format!(
+            "Read {} URLs total from {} file(s)",
+            all_file_urls.len(),
+            args.files.len()
+        ),
+    );
+
+    Ok(Some(all_file_urls))
+}
+
+/// Build a [`HostValidator`] from the already resolved fetch targets, or `None`
+/// when there is nothing to check: no host-bearing target was supplied, or
+/// strict mode is off *and* no target named a path scope.
+pub fn build_host_validator(args: &Args, domains: &[String]) -> Option<HostValidator> {
+    if domains.is_empty() {
+        return None;
+    }
+    if !args.strict_enabled() {
+        // `--no-strict` waives the *host* check, not the target's path scope:
+        // `urx example.com/shop --no-strict` still asked for /shop, and a path
+        // prefix is part of what the target is rather than a filter over it.
+        // With no path anywhere, there is nothing left to check.
+        return HostValidator::paths_only(domains, args.subs);
+    }
+    Some(HostValidator::new(domains, args.subs))
+}
+
+/// Build the URL filter from the `--preset`/extension/pattern/length flags.
+///
+/// Shared by the batch path, the streaming sink, and the extracted-link filter
+/// so a URL is judged identically no matter which one emits it.
+/// Fails when `--match-regex` or `--filter-regex` was given a pattern that does
+/// not compile, so a bad expression stops the run instead of quietly matching
+/// nothing on every URL.
+pub fn build_url_filter(args: &Args) -> Result<UrlFilter> {
+    let mut url_filter = UrlFilter::new();
+    // Presets seed the filter; the explicit flags below are combined with them.
+    if !args.preset.is_empty() {
+        url_filter.apply_presets(&args.preset);
+    }
+    url_filter
+        .with_extensions(args.extensions.clone())
+        .with_exclude_extensions(args.exclude_extensions.clone())
+        .with_patterns(args.patterns.clone())
+        .with_exclude_patterns(args.exclude_patterns.clone())
+        .with_match_regex(compile_url_regexes(&args.match_regex, "--match-regex")?)
+        .with_filter_regex(compile_url_regexes(&args.filter_regex, "--filter-regex")?)
+        .with_min_length(args.min_length)
+        .with_max_length(args.max_length)
+        // --- result-filters ---
+        // Attached to the shared filter so the batch list, the --stream sink
+        // and the extracted-link filter all enforce the same scope.
+        .with_scope(ScopeMatcher::from_files(&args.scope_file)?);
+    // --- end result-filters ---
+    Ok(url_filter)
+}
+
+// --- result-filters ---
+/// Build the post-collection metadata filter from the `--meta-*` flags.
+///
+/// Fails on a date or status pattern urx cannot honour: unlike `--from`/`--to`,
+/// which warn and carry on because a dropped archive-side filter still yields a
+/// usable (if wider) result, these decide the *final* result set, so ignoring
+/// one would hand back URLs the user explicitly excluded.
+pub fn build_meta_filter(args: &Args) -> Result<MetaFilter> {
+    let mut filter = MetaFilter::new();
+    filter.with_first_seen(
+        args.meta_first_seen_after.as_deref(),
+        args.meta_first_seen_before.as_deref(),
+    )?;
+    filter.with_last_seen(
+        args.meta_last_seen_after.as_deref(),
+        args.meta_last_seen_before.as_deref(),
+    )?;
+    filter.with_mime(&args.meta_mime, &args.meta_exclude_mime);
+    filter.with_archive_status(&args.meta_status, &args.meta_exclude_status)?;
+    Ok(filter)
+}
+
+/// Reject a `--scope-file` or `--meta-*` value urx cannot honour, before the
+/// scan starts.
+///
+/// Both are otherwise first built once collection has finished — the scope file
+/// inside [`build_url_filter`], the metadata predicates inside
+/// [`apply_meta_filters`] — so a typo in a scope file or a date bound would
+/// surface only after minutes of fetching. Same reason [`build_stream_sink`] is
+/// called before the run rather than at first use.
+pub fn validate_result_filters(args: &Args) -> Result<()> {
+    ScopeMatcher::from_files(&args.scope_file)?;
+    build_meta_filter(args)?;
+    // These output views reshape URLs into hosts, paths or parameter names,
+    // and they run before the testers — which then request those: `--params
+    // --check-status` checked `id`, `page` and `q`, and with `--is 200`
+    // silently printed nothing. `--fuzz-placeholder` is not among them: its
+    // templates keep the real path and are requestable URLs.
+    let view = [
+        (args.show_only_host, "--show-only-host"),
+        (args.show_only_path, "--show-only-path"),
+        (args.show_only_param, "--show-only-param"),
+        (args.params, "--params"),
+        (args.params_by_endpoint, "--params-by-endpoint"),
+    ]
+    .into_iter()
+    .find_map(|(on, flag)| on.then_some(flag));
+    let tester = [
+        (
+            should_check_status(args),
+            "--check-status / --include-status / --exclude-status / --check-title",
+        ),
+        (args.extract_links, "--extract-links"),
+        (args.extract_js_endpoints, "--extract-js-endpoints"),
+        (args.archive_body, "--archive-body"),
+        (args.expand_specs, "--expand-specs"),
+    ]
+    .into_iter()
+    .find_map(|(on, flag)| on.then_some(flag));
+    if let (Some(view), Some(tester)) = (view, tester) {
+        anyhow::bail!(
+            "{view} cannot be combined with {tester}: the view rewrites URLs before they would be requested"
+        );
+    }
+    // clap's `requires` covers the command line, but a config file can set
+    // `archive_body_dir` on its own, and the run would then quietly write
+    // nothing at all — the exact failure mode the unknown-key warning exists
+    // to prevent, arriving through a key urx does recognise.
+    if args.archive_body_dir.is_some() && !args.archive_body {
+        anyhow::bail!(
+            "--archive-body-dir has nothing to store without --archive-body (it keeps the bodies that flag replays)"
+        );
+    }
+    // Create the corpus directory *here*, at start-up, and drop the handle.
+    // The tester that writes to it is built only once every provider has
+    // finished, so an unwritable path used to abort the run after all the
+    // collection work had been done and before a single URL was written —
+    // the opposite of what the tester's own comment promised. Creating twice
+    // is harmless: the second call reuses the directory and reopens the index
+    // for appending.
+    if let Some(dir) = &args.archive_body_dir {
+        crate::testers::BodyArchive::create(dir.clone())?;
+    }
+    Ok(())
+}
+
+/// Apply the `--meta-*` filters to the batch result.
+///
+/// Runs *before* [`apply_url_transformations`]: `--merge-endpoint` and
+/// `--show-only-host` rewrite URLs, and a rewritten URL no longer keys into the
+/// run result that holds its metadata.
+///
+/// The report is deliberately louder than a plain count. A URL carries archive
+/// metadata only when a CDX provider reported it in *this* run — not from a
+/// cache hit, not from `--files`, not from `otx`/`vt`/`urlscan`/`github`/
+/// `bevigil`/`robots`/`sitemap` — so the failure mode of these flags is a run
+/// that returns nothing and looks exactly like a target with nothing to find.
+pub fn apply_meta_filters(
+    args: &Args,
+    run_result: &ProviderRunResult,
+    urls: Vec<String>,
+    progress_manager: &ProgressManager,
+) -> Result<Vec<String>> {
+    let filter = build_meta_filter(args)?;
+    if filter.is_empty() {
+        return Ok(urls);
+    }
+
+    let before = urls.len();
+    let (kept, stats) = filter.apply(urls, |url| run_result.urls.get(url).map(|e| &e.meta));
+    report_meta_filter_stats(args, before, stats, progress_manager);
+    Ok(kept)
+}
+
+/// Say what the metadata filters did, and why, when the answer is surprising.
+fn report_meta_filter_stats(
+    args: &Args,
+    before: usize,
+    stats: MetaFilterStats,
+    progress_manager: &ProgressManager,
+) {
+    verbose_print(
+        args,
+        format!(
+            "Metadata filters kept {}/{before} URLs ({} failed a predicate, {} carried no archive metadata to test)",
+            stats.kept, stats.rejected, stats.unknown
+        ),
+    );
+
+    // Worth saying without -v as well: nothing failed a predicate, everything
+    // simply had nothing to test, so the empty result is about the run's shape
+    // rather than about the target.
+    if stats.dropped_everything_for_lack_of_metadata() && !args.silent {
+        progress_manager.note(format!(
+            "[urx] --meta-* dropped all {} URLs because none carries archive metadata. \
+             Cached results, --files input and the non-CDX providers have none; \
+             a CDX provider (wayback, cc, arquivo) run with --no-cache does.",
+            stats.unknown
+        ));
+    }
+}
+// --- end result-filters ---
+
+/// Build the per-URL transformer used everywhere a URL must be decided on its
+/// own: streaming output and links discovered by `--extract-links`.
+///
+/// `--merge-endpoint` is deliberately absent — it folds several URLs into one and
+/// so has no single-URL form (see [`UrlTransformer::transform_one`]).
+pub fn build_url_transformer(args: &Args) -> UrlTransformer {
+    UrlTransformer {
+        normalize_url: args.normalize_url,
+        show_only_host: args.show_only_host,
+        show_only_path: args.show_only_path,
+        show_only_param: args.show_only_param,
+        ..Default::default()
+    }
+}
+
+/// True when any flag that narrows the URL list is set, which is the only case
+/// where a filtering progress bar is worth drawing.
+fn has_url_filters(args: &Args) -> bool {
+    !args.extensions.is_empty()
+        || !args.patterns.is_empty()
+        || !args.exclude_extensions.is_empty()
+        || !args.exclude_patterns.is_empty()
+        || !args.match_regex.is_empty()
+        || !args.filter_regex.is_empty()
+        || args.min_length.is_some()
+        || args.max_length.is_some()
+        // --- result-filters ---
+        || !args.scope_file.is_empty()
+    // --- end result-filters ---
+}
+
+// --- result-filters ---
+/// True when any `--meta-*` flag is set. A cheap flag-shape test, unlike
+/// [`build_meta_filter`] which also validates the values.
+fn has_meta_filters(args: &Args) -> bool {
+    args.meta_first_seen_after.is_some()
+        || args.meta_first_seen_before.is_some()
+        || args.meta_last_seen_after.is_some()
+        || args.meta_last_seen_before.is_some()
+        || !args.meta_mime.is_empty()
+        || !args.meta_exclude_mime.is_empty()
+        || !args.meta_status.is_empty()
+        || !args.meta_exclude_status.is_empty()
+}
+// --- end result-filters ---
+
+/// What to suggest when host validation discarded most of the result.
+///
+/// With a path scope in play, part of what was removed fell outside the
+/// *path*, and `--no-strict` does not widen a path scope — so offering it
+/// would send the reader in a circle.
+///
+/// `--subs` is offered only while the host check is on. In paths-only mode
+/// (`--no-strict` with a scope) it does the opposite of what the sentence
+/// promises: without it a subdomain's URL never matches a target host and
+/// passes unjudged, and with it the URL is matched and then measured against
+/// the scope — so the flag *shrinks* the result set it is being recommended to
+/// grow.
+fn drops_most_hint(has_path_scopes: bool, strict: bool) -> &'static str {
+    match (has_path_scopes, strict) {
+        (true, true) => {
+            "pass --subs to keep subdomains, or drop the path from the target to scan the whole site"
+        }
+        (true, false) => "drop the path from the target to scan the whole site",
+        (false, _) => "pass --subs to keep subdomains or --no-strict to keep all hosts",
+    }
+}
+
+/// Build the one-line advisory shown when host or path validation removes
+/// most provider results. Kept separate so stdin-resolved targets follow the
+/// same hint rules as positional targets.
+fn host_validation_hint(
+    before: usize,
+    removed: usize,
+    validator: &HostValidator,
+    args: &Args,
+) -> Option<String> {
+    let drops_most = before > 0 && (removed == before || removed * 2 > before);
+    if !drops_most || args.silent || args.subs {
+        return None;
+    }
+
+    let hint = drops_most_hint(validator.has_path_scopes(), args.strict_enabled());
+    let what = if args.strict_enabled() {
+        "strict host validation"
+    } else {
+        "the target's path scope"
+    };
+    Some(format!(
+        "[urx] {what} removed {removed}/{before} URLs; {hint}"
+    ))
+}
+
+/// Apply URL filtering and, in strict mode, host validation to the batch result.
+pub fn apply_url_filters(
+    args: &Args,
+    domains: &[String],
+    urls: &HashSet<String>,
+    progress_manager: &ProgressManager,
+) -> Result<Vec<String>> {
+    let filter_bar = has_url_filters(args).then(|| {
+        let bar = progress_manager.create_filter_bar();
+        bar.set_message("Applying filters to URLs...");
+        bar
+    });
+
+    let mut sorted_urls = build_url_filter(args)?.apply_filters(urls);
+
+    // Host validation only applies to domain-driven runs: file input has no
+    // queried domain to validate against.
+    //
+    // Not gated on `--strict` any more: `build_host_validator` also returns a
+    // validator under `--no-strict` when a target named a path, because the
+    // scope was asked for explicitly and only the *host* check was waived.
+    // Gating here as well left the batch path emitting the whole host while
+    // --stream and the extracted-link filter — which both call
+    // `build_host_validator` directly — applied the scope, so one run gave two
+    // different answers depending on the output mode.
+    if args.files.is_empty() {
+        if let Some(host_validator) = build_host_validator(args, domains) {
+            verbose_print(
+                args,
+                if args.strict_enabled() {
+                    "Enforcing strict host validation..."
+                } else {
+                    "Enforcing the targets' path scopes..."
+                },
+            );
+            let before = sorted_urls.len();
+            sorted_urls.retain(|url| host_validator.is_valid_host(url));
+            let removed = before - sorted_urls.len();
+
+            // When validation discards most or all of what providers returned,
+            // a quiet, much-smaller result looks like a broken provider. Surface
+            // one hint even without -v; --silent suppresses it.
+            if let Some(hint) = host_validation_hint(before, removed, &host_validator, args) {
+                eprintln!("{hint}");
+            }
+
+            verbose_print(
+                args,
+                format!(
+                    "Number of valid URLs after host validation: {}",
+                    sorted_urls.len()
+                ),
+            );
+        }
+    }
+
+    if let Some(bar) = filter_bar {
+        bar.finish_with_message(format!("Filtered to {} URLs", sorted_urls.len()));
+    }
+
+    verbose_print(
+        args,
+        format!("Total unique URLs after filtering: {}", sorted_urls.len()),
+    );
+
+    Ok(sorted_urls)
+}
+
+/// Apply the display-shaping options to the batch result.
+pub fn apply_url_transformations(
+    args: &Args,
+    urls: Vec<String>,
+    progress_manager: &ProgressManager,
+) -> Vec<String> {
+    let reshapes_urls = args.merge_endpoint
+        || args.dedup_similar
+        || args.show_only_host
+        || args.show_only_path
+        || args.show_only_param
+        // --- output-views ---
+        || args.params
+        || args.params_by_endpoint
+        || args.fuzz_placeholder.is_some();
+    let transform_bar = reshapes_urls.then(|| {
+        let bar = progress_manager.create_transform_bar();
+        bar.set_message("Applying URL transformations...");
+        bar
+    });
+
+    // The batch path is the one place that can honour --merge-endpoint and
+    // --dedup-similar, since it alone holds every URL at once.
+    let url_transformer = UrlTransformer {
+        merge_endpoint: args.merge_endpoint,
+        dedup_similar: args.dedup_similar,
+        // --- output-views ---
+        // Set here and not in build_url_transformer(): an inventory view needs
+        // the whole list, so only the batch path can honour it. The streaming
+        // sink and the extracted-link filter both work one URL at a time and
+        // must never see it half-applied — --stream rejects the flags outright.
+        param_view: param_view(args),
+        ..build_url_transformer(args)
+    };
+
+    let (transformed_urls, stats) = url_transformer.transform_with_stats(urls);
+
+    if let Some(bar) = transform_bar {
+        bar.finish_with_message(format!("Transformed to {} URLs", transformed_urls.len()));
+    }
+
+    // Worth saying out loud: --dedup-similar can drop most of a result set, and
+    // without a number the user cannot tell a well-collapsed run from a run
+    // that found little.
+    if args.dedup_similar {
+        verbose_print(
+            args,
+            format!(
+                "Collapsed {} near-duplicate URLs; {} distinct endpoints remain",
+                stats.similar_collapsed,
+                transformed_urls.len()
+            ),
+        );
+    }
+
+    transformed_urls
+}
+
+/// Options that need the complete result set and therefore cannot be combined
+/// with `--stream`. Returned as (flag, why) so the error can say more than "not
+/// supported".
+pub fn streaming_conflicts(args: &Args) -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+
+    if args.merge_endpoint {
+        out.push((
+            "--merge-endpoint",
+            "it folds URLs sharing a path into one, which needs every URL first",
+        ));
+    }
+    if args.dedup_similar {
+        out.push((
+            "--dedup-similar",
+            "it keeps the lexicographically smallest URL of each group, which needs every URL first",
+        ));
+    }
+    if args.check_status || !args.include_status.is_empty() || !args.exclude_status.is_empty() {
+        out.push((
+            "--check-status / --include-status / --exclude-status",
+            "they re-request each URL after collection finishes",
+        ));
+    }
+    if args.extract_links {
+        out.push((
+            "--extract-links",
+            "it fetches collected URLs after collection finishes",
+        ));
+    }
+    if args.extract_js_endpoints {
+        out.push((
+            "--extract-js-endpoints",
+            "it fetches collected scripts after collection finishes",
+        ));
+    }
+    if args.archive_body {
+        out.push((
+            "--archive-body",
+            "it replays collected URLs from the archive after collection finishes",
+        ));
+    }
+    // --- spec-expansion ---
+    if args.expand_specs {
+        out.push((
+            "--expand-specs",
+            "it fetches collected specification documents after collection finishes",
+        ));
+    }
+    if args.incremental {
+        out.push((
+            "--incremental",
+            "it diffs this run against the previous one, which needs the full set",
+        ));
+    }
+    if args.show_sources {
+        out.push((
+            "--show-sources",
+            "a URL is printed on first sighting, before later providers can report it too",
+        ));
+    }
+    if args.show_meta {
+        out.push((
+            "--show-meta",
+            "a URL is printed on first sighting, before later captures can widen its first/last seen range",
+        ));
+    }
+    if args.output_dir.is_some() {
+        out.push((
+            "--output-dir",
+            "it groups URLs by domain once the scan has finished",
+        ));
+    }
+    if !args.files.is_empty() {
+        out.push((
+            "--files",
+            "file input is read up front, so there is nothing to stream",
+        ));
+    }
+    // --- output-views ---
+    if args.params {
+        out.push((
+            "--params",
+            "it reports the parameter names of the whole target, which needs every URL first",
+        ));
+    }
+    if args.params_by_endpoint {
+        out.push((
+            "--params-by-endpoint",
+            "it unions the parameters seen per endpoint, which needs every URL first",
+        ));
+    }
+    if args.fuzz_placeholder.is_some() {
+        out.push((
+            "--fuzz-placeholder",
+            "it keeps one URL per parameter signature, which needs every URL first",
+        ));
+    }
+    if args.check_title {
+        out.push((
+            "--check-title",
+            "it re-requests each URL after collection finishes",
+        ));
+    }
+    // --- result-filters ---
+    // The sink deliberately drops capture metadata: it prints a URL on first
+    // sighting, before the providers that would widen its first/last seen range
+    // have answered. There is nothing for these to read, so accepting them
+    // would silently emit an unfiltered stream — the same reason --show-meta is
+    // rejected here.
+    if has_meta_filters(args) {
+        out.push((
+            "--meta-first-seen-* / --meta-last-seen-* / --meta-mime / --meta-status",
+            "they read capture metadata, which is only complete once every provider has answered",
+        ));
+    }
+    // --- end result-filters ---
+    out
+}
+
+/// Construct the streaming sink when `--stream` is set, after rejecting the
+/// option combinations it cannot honour.
+pub fn validate_stream_options(args: &Args) -> Result<()> {
+    if !args.stream {
+        return Ok(());
+    }
+
+    let conflicts = streaming_conflicts(args);
+    if !conflicts.is_empty() {
+        let detail = conflicts
+            .iter()
+            .map(|(flag, why)| format!("  {flag}: {why}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!("--stream cannot be combined with:\n{detail}");
+    }
+
+    if !output::format_supports_streaming(args.format) {
+        anyhow::bail!(output::streaming_format_error(args.format));
+    }
+
+    Ok(())
+}
+
+/// Construct the streaming sink when `--stream` is set, using the targets
+/// already resolved for provider queries.
+pub fn build_stream_sink(
+    args: &Args,
+    domains: &[String],
+) -> Result<Option<Arc<output::StreamSink>>> {
+    validate_stream_options(args)?;
+    if !args.stream {
+        return Ok(None);
+    }
+
+    let writer: Box<dyn std::io::Write + Send> = match &args.output {
+        Some(path) => Box::new(
+            std::fs::File::create(path)
+                .with_context(|| format!("Failed to create output file: {}", path.display()))?,
+        ),
+        None => Box::new(std::io::stdout()),
+    };
+
+    // Colour would be baked into a redirected stream, and streamed rows carry
+    // no status to colourise anyway.
+    if args.output.is_some() {
+        console::set_colors_enabled(false);
+    }
+
+    Ok(Some(Arc::new(output::StreamSink::new(
+        build_url_filter(args)?,
+        build_url_transformer(args),
+        // Host validation mirrors the batch path, and returns `None` when
+        // there is nothing to enforce — no target, or `--no-strict` with no
+        // path scope among the resolved targets.
+        build_host_validator(args, domains),
+        args.format,
+        writer,
+    )?)))
+}
+
+/// The filter applied to links `--extract-links`, `--extract-js-endpoints` and
+/// `--archive-body` discover, or `None` when none of the extractors is
+/// running.
+///
+/// Links found *inside* pages come into existence after
+/// [`apply_url_filters`]/[`apply_url_transformations`] have already run over the
+/// primary list, so they have to be put through the same rules here. Without
+/// this, `--extract-links` silently bypasses every filter the user set: `-e js`
+/// emits non-JS links, and strict host validation (on by default) emits every
+/// off-site link a page happens to point at.
+pub fn build_extracted_link_filter(
+    args: &Args,
+    domains: &[String],
+) -> Result<Option<Arc<tester_manager::ExtractedLinkFilter>>> {
+    // --- spec-expansion --- (`|| args.expand_specs`)
+    if !args.extract_links && !args.extract_js_endpoints && !args.archive_body && !args.expand_specs
+    {
+        return Ok(None);
+    }
+    // File input has no queried domain to validate against, which is why the
+    // batch path skips host validation for it too.
+    let host_validator = if args.files.is_empty() {
+        build_host_validator(args, domains)
+    } else {
+        None
+    };
+    Ok(Some(Arc::new(tester_manager::ExtractedLinkFilter::new(
+        build_url_filter(args)?,
+        build_url_transformer(args),
+        host_validator,
+    ))))
+}
+
+/// True when URLs must be re-requested after collection — either because the
+/// user asked for statuses or because a status filter needs them.
+pub fn should_check_status(args: &Args) -> bool {
+    args.check_status
+        || !args.include_status.is_empty()
+        || !args.exclude_status.is_empty()
+        // --- output-views ---
+        // --check-title has nothing to attach a title to without the request
+        // the status checker already makes, so it turns that pass on.
+        || args.check_title
+}
+
+// --- output-views ---
+/// The inventory view the flags select, or [`ParamView::None`]. The three flags
+/// are mutually exclusive (clap enforces it), so the order here is arbitrary.
+fn param_view(args: &Args) -> ParamView {
+    if args.params {
+        ParamView::Names
+    } else if args.params_by_endpoint {
+        ParamView::ByEndpoint
+    } else if let Some(placeholder) = &args.fuzz_placeholder {
+        ParamView::Fuzz(placeholder.clone())
+    } else {
+        ParamView::None
+    }
+}
+
+/// Whether per-URL metadata — the archive capture fields, and the free response
+/// facts (`Location`, `Content-Length`, `Content-Type`) a `--check-status`
+/// request already carries — should reach the output.
+///
+/// The structured formats always take it (absent keys are omitted, so a run
+/// that collected none is byte-identical to before the fields existed), while
+/// plain text is a pipeline contract — `urx target.com | httpx` must keep
+/// working — and keeps one bare URL per line unless `--show-meta` asks
+/// otherwise.
+pub fn wants_meta(args: &Args) -> bool {
+    args.show_meta
+        || matches!(
+            args.format,
+            output::Format::Json | output::Format::Jsonl | output::Format::Csv
+        )
+}
+
+/// Build the post-collection testers implied by the flags, or an empty vec when
+/// no second pass over the URLs is needed.
+pub fn build_testers(args: &Args, network_settings: &NetworkSettings) -> Vec<Box<dyn Tester>> {
+    let mut testers: Vec<Box<dyn Tester>> = Vec::new();
+
+    if should_check_status(args) {
+        verbose_print(args, "Checking HTTP status codes for URLs");
+
+        let mut status_checker = StatusChecker::new();
+        apply_network_settings_to_tester(&mut status_checker, network_settings);
+
+        if !args.include_status.is_empty() {
+            status_checker.with_include_status(Some(args.include_status.clone()));
+            verbose_print(
+                args,
+                format!(
+                    "Including only status codes that match: {}",
+                    args.include_status.join(", ")
+                ),
+            );
+        }
+
+        if !args.exclude_status.is_empty() {
+            status_checker.with_exclude_status(Some(args.exclude_status.clone()));
+            verbose_print(
+                args,
+                format!(
+                    "Excluding status codes that match: {}",
+                    args.exclude_status.join(", ")
+                ),
+            );
+        }
+
+        // --- output-views ---
+        status_checker.with_response_meta(wants_meta(args));
+        status_checker.with_response_title(args.check_title);
+        if args.check_title {
+            verbose_print(args, "Reading response bodies to record HTML titles");
+        }
+
+        testers.push(Box::new(status_checker));
+    }
+
+    if args.extract_links {
+        verbose_print(args, "Extracting links from HTML content");
+
+        let mut link_extractor = LinkExtractor::new();
+        apply_network_settings_to_tester(&mut link_extractor, network_settings);
+        testers.push(Box::new(link_extractor));
+    }
+
+    if args.extract_js_endpoints {
+        verbose_print(args, "Extracting endpoints from JavaScript content");
+
+        let mut js_extractor = JsEndpointExtractor::new();
+        apply_network_settings_to_tester(&mut js_extractor, network_settings);
+        // --rate-limit arrives with the network settings: this tester
+        // re-requests a large slice of the result set from the target.
+        js_extractor.with_max_files(args.max_js_files);
+        testers.push(Box::new(js_extractor));
+    }
+
+    // --- spec-expansion ---
+    if args.expand_specs {
+        verbose_print(args, "Expanding endpoints from API specification documents");
+
+        let mut spec_expander = SpecExpander::new();
+        apply_network_settings_to_tester(&mut spec_expander, network_settings);
+        spec_expander.with_max_files(args.max_spec_files);
+        testers.push(Box::new(spec_expander));
+    }
+
+    testers
+}
+
+/// URL → the capture `--archive-body` should replay, for every URL the run
+/// reported with a digest-bearing capture.
+///
+/// Built from the run result rather than the output list on purpose: the
+/// output may have been reshaped by `--show-only-*`, and a URL that no longer
+/// matches what the providers reported has no capture to look up.
+pub fn archive_captures(run_result: &ProviderRunResult) -> HashMap<String, ArchiveCapture> {
+    run_result
+        .urls
+        .iter()
+        .filter_map(|(url, entry)| {
+            let (timestamp, digest) = match entry.meta.newest_capture() {
+                Some((ts, digest)) => (ts, Some(digest.to_string())),
+                // A capture with a timestamp but no digest can still be
+                // replayed; it just cannot be deduplicated against others.
+                None => (entry.meta.last_seen()?, None),
+            };
+            Some((
+                url.clone(),
+                ArchiveCapture {
+                    timestamp: timestamp.to_string(),
+                    digest,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Build the `--archive-body` tester over the run result, or `None` when the
+/// flag is off. The returned stats handle stays readable after the tester has
+/// been boxed away and cloned per worker.
+pub fn build_archive_body_extractor(
+    args: &Args,
+    network_settings: &NetworkSettings,
+    run_result: &ProviderRunResult,
+) -> Result<Option<(ArchiveBodyExtractor, Arc<ArchiveBodyStats>)>> {
+    if !args.archive_body {
+        return Ok(None);
+    }
+    verbose_print(args, "Extracting links from archived response bodies");
+
+    let mut extractor =
+        ArchiveBodyExtractor::new(archive_captures(run_result), args.archive_body_limit);
+    apply_network_settings_to_tester(&mut extractor, network_settings);
+    // Every replay request goes to the Wayback Machine, so the rate that
+    // applies is the one the user set for it — `--rate-limit-by wayback=N`
+    // first, the global `--rate-limit` otherwise. The tester scope rule is
+    // honoured the way it is for the other settings.
+    if network_settings.scope != NetworkScope::Providers {
+        let rate = args
+            .rate_limit_overrides()
+            .get("wayback")
+            .copied()
+            .or(network_settings.rate_limit);
+        extractor.with_rate_limit(rate);
+    }
+    // --- spec-expansion ---
+    // With --expand-specs also on, an archived specification is read as one
+    // rather than run through the HTML link extractor.
+    extractor.with_expand_specs(args.expand_specs);
+    // --- archived JS ---
+    // And with --extract-js-endpoints also on, an archived script is mined the
+    // way the live path mines a live one. This is the combination that reaches
+    // a bundle the site no longer serves under that build-hash name.
+    extractor.with_extract_js_endpoints(args.extract_js_endpoints);
+
+    if let Some(dir) = &args.archive_body_dir {
+        // Already created and proved writable at start-up by
+        // `validate_result_filters`; this reopens the index for appending.
+        let archive = Arc::new(BodyArchive::create(dir.clone())?);
+        verbose_print(
+            args,
+            format!("Storing archived response bodies in {}", dir.display()),
+        );
+        extractor.with_body_archive(Some(archive));
+    }
+
+    let stats = extractor.stats();
+    Ok(Some((extractor, stats)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::build_test_args;
+    use clap::Parser;
+
+    fn target_domains(args: &Args) -> Vec<String> {
+        normalize_domains(&args.domains)
+    }
+
+    #[test]
+    fn test_streaming_rejects_options_needing_the_full_result_set() {
+        // Each of these is rejected for a concrete reason, and the reason is
+        // shown to the user — so assert on the flag list, not just on failure.
+        let cases = [
+            (vec!["--merge-endpoint"], "--merge-endpoint"),
+            (vec!["--dedup-similar"], "--dedup-similar"),
+            (vec!["--check-status"], "--check-status"),
+            (vec!["--extract-links"], "--extract-links"),
+            (vec!["--extract-js-endpoints"], "--extract-js-endpoints"),
+            (vec!["--archive-body"], "--archive-body"),
+            (vec!["--incremental"], "--incremental"),
+            (vec!["--show-sources"], "--show-sources"),
+            (vec!["--show-meta"], "--show-meta"),
+            // --- spec-expansion ---
+            (vec!["--expand-specs"], "--expand-specs"),
+            // --- output-views ---
+            (vec!["--params"], "--params"),
+            (vec!["--params-by-endpoint"], "--params-by-endpoint"),
+            (vec!["--fuzz-placeholder", "FUZZ"], "--fuzz-placeholder"),
+        ];
+
+        for (flags, expected) in cases {
+            let mut argv = vec!["urx", "--stream"];
+            argv.extend(flags.iter().copied());
+            argv.push("example.com");
+            let args = Args::parse_from(argv);
+
+            let conflicts = streaming_conflicts(&args);
+            assert!(
+                conflicts.iter().any(|(flag, _)| flag.contains(expected)),
+                "{expected} should conflict with --stream, got {conflicts:?}"
+            );
+            let domains = target_domains(&args);
+            let err = match build_stream_sink(&args, &domains) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{expected} should have been rejected"),
+            };
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_response_metadata_follows_the_capture_metadata_rule() {
+        // Structured formats always take it (absent keys are omitted, so a run
+        // that collected none is unchanged); plain text is a pipeline contract
+        // and stays one bare URL per line unless --show-meta asks otherwise.
+        let mut args = build_test_args();
+        args.format = output::Format::Plain;
+        assert!(!wants_meta(&args));
+
+        args.show_meta = true;
+        assert!(wants_meta(&args));
+
+        args.show_meta = false;
+        for format in [
+            output::Format::Json,
+            output::Format::Jsonl,
+            output::Format::Csv,
+        ] {
+            args.format = format;
+            assert!(wants_meta(&args), "{format:?}");
+        }
+
+        // A wordlist carries no per-URL fields at all, so there is nothing to
+        // populate them for.
+        args.format = output::Format::Wordlist;
+        assert!(!wants_meta(&args));
+    }
+
+    #[test]
+    fn test_check_title_turns_the_status_pass_on() {
+        // Without the status checker's request there is no response to read a
+        // title out of, so the flag implies the pass rather than silently
+        // doing nothing.
+        let mut args = build_test_args();
+        assert!(!should_check_status(&args));
+
+        args.check_title = true;
+        assert!(should_check_status(&args));
+    }
+
+    #[test]
+    fn test_build_url_filter_rejects_a_malformed_regex() {
+        // A bad pattern has to stop the run at startup. Compiling per URL would
+        // either fail once per URL or, worse, quietly match nothing.
+        for (flag, argv_flag) in [
+            ("--match-regex", "--match-regex"),
+            ("--filter-regex", "--filter-regex"),
+        ] {
+            let args = Args::parse_from(["urx", argv_flag, "(unclosed", "example.com"]);
+            let err = match build_url_filter(&args) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("{flag} should have rejected an invalid pattern"),
+            };
+            assert!(err.contains(flag), "{err}");
+            assert!(err.contains("(unclosed"), "{err}");
+        }
+
+        // ...and it is caught before any network work, by the same up-front
+        // check that rejects a misspelled --preset.
+        let args = Args::parse_from(["urx", "--match-regex", "(unclosed", "example.com"]);
+        let err = crate::app::selection::validate_selection_flags(&args)
+            .expect_err("a malformed regex must fail validation")
+            .to_string();
+        assert!(err.contains("--match-regex"), "{err}");
+    }
+
+    #[test]
+    fn test_regex_flags_are_repeatable_and_not_comma_split() {
+        // A regex can legitimately contain a comma (`\d{2,3}`), so unlike
+        // --patterns these flags never split on one.
+        let args = Args::parse_from([
+            "urx",
+            "--match-regex",
+            r"/id/\d{2,3}$",
+            "--match-regex",
+            "admin",
+            "--filter-regex",
+            r"\.(png|jpg)$",
+            "example.com",
+        ]);
+        assert_eq!(args.match_regex, vec![r"/id/\d{2,3}$", "admin"]);
+        assert_eq!(args.filter_regex, vec![r"\.(png|jpg)$"]);
+
+        let filter = build_url_filter(&args).unwrap();
+        assert!(filter.matches("https://example.com/id/123"));
+        assert!(filter.matches("https://example.com/admin/panel"));
+        assert!(!filter.matches("https://example.com/id/1"));
+        assert!(!filter.matches("https://example.com/admin/logo.png"));
+    }
+
+    #[test]
+    fn test_dedup_similar_is_applied_by_the_batch_transformations() {
+        let mut args = build_test_args();
+        args.dedup_similar = true;
+
+        let urls: Vec<String> = ["/post/1", "/post/2", "/post/3", "/about"]
+            .iter()
+            .map(|p| format!("https://example.com{p}"))
+            .collect();
+
+        let out = apply_url_transformations(&args, urls.clone(), &ProgressManager::new(true));
+        assert_eq!(
+            out,
+            vec![
+                "https://example.com/about".to_string(),
+                "https://example.com/post/1".to_string(),
+            ]
+        );
+
+        // ...and it stays off unless asked for.
+        args.dedup_similar = false;
+        assert_eq!(
+            apply_url_transformations(&args, urls.clone(), &ProgressManager::new(true)).len(),
+            urls.len()
+        );
+    }
+
+    #[test]
+    fn test_streaming_rejects_value_taking_options_too() {
+        // --files and --output-dir take values, so they don't fit the flag-only
+        // table above — but they conflict for the same reason.
+        //
+        // --files is rejected here rather than when the file is read: main builds
+        // the sink before touching input, so `--stream --files missing.txt`
+        // reports the unsupported combination instead of a read error for a file
+        // streaming would never have used.
+        for (argv, expected) in [
+            (
+                vec!["urx", "--stream", "--files", "urls.txt", "example.com"],
+                "--files",
+            ),
+            (
+                vec!["urx", "--stream", "--output-dir", "/tmp/out", "example.com"],
+                "--output-dir",
+            ),
+        ] {
+            let args = Args::parse_from(argv);
+            assert!(streaming_conflicts(&args)
+                .iter()
+                .any(|(flag, _)| flag.contains(expected)));
+            match build_stream_sink(&args, &target_domains(&args)) {
+                Err(e) => assert!(e.to_string().contains(expected), "{e}"),
+                Ok(_) => panic!("{expected} should have been rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_streaming_allows_per_url_options() {
+        // --normalize-url and the show-only views are per-URL, so they stream
+        // fine; only cross-URL work is off limits.
+        let args = Args::parse_from([
+            "urx",
+            "--stream",
+            "--normalize-url",
+            "--show-only-path",
+            "-e",
+            "js",
+            "example.com",
+        ]);
+        assert!(streaming_conflicts(&args).is_empty());
+        assert!(build_stream_sink(&args, &target_domains(&args))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_streaming_rejects_json_and_points_at_jsonl() {
+        let args = Args::parse_from(["urx", "--stream", "-f", "json", "example.com"]);
+        let err = match build_stream_sink(&args, &target_domains(&args)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("--format json should have been rejected"),
+        };
+        assert!(err.contains("jsonl"), "should suggest jsonl, got {err}");
+
+        for format in ["plain", "jsonl", "csv"] {
+            let args = Args::parse_from(["urx", "--stream", "-f", format, "example.com"]);
+            assert!(
+                build_stream_sink(&args, &target_domains(&args)).is_ok(),
+                "{format} should stream"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_stream_flag_builds_no_sink() {
+        let args = Args::parse_from(["urx", "example.com"]);
+        assert!(build_stream_sink(&args, &target_domains(&args))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_extract_links_filter_is_wired_up_and_applies_every_rule() {
+        // Regression: extracted links were appended straight to the results,
+        // after filtering and host validation had already run — so this filter
+        // has to exist *and* be handed to the tester stage.
+        let args = Args::parse_from([
+            "urx",
+            "--extract-links",
+            "-e",
+            "js",
+            "--silent",
+            "example.com",
+        ]);
+        let filter = build_extracted_link_filter(&args, &target_domains(&args))
+            .unwrap()
+            .expect("--extract-links must build a filter");
+
+        // Extension filter applies...
+        assert_eq!(
+            filter.accept("https://example.com/app.js").as_deref(),
+            Some("https://example.com/app.js")
+        );
+        assert!(filter.accept("https://example.com/index.html").is_none());
+        // ...and so does strict host validation, which is on by default.
+        assert!(filter.accept("https://ads.tracker.net/a.js").is_none());
+    }
+
+    #[test]
+    fn test_no_extract_links_builds_no_filter() {
+        let args = Args::parse_from(["urx", "example.com"]);
+        assert!(build_extracted_link_filter(&args, &target_domains(&args))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_archive_body_links_get_the_same_filter_as_extracted_links() {
+        // The archived-body path discovers links after filtering has run over
+        // the primary list, exactly like --extract-links, so it must be given
+        // the same filter — or `-e js` and strict host validation are silently
+        // bypassed for everything it finds.
+        let args = Args::parse_from([
+            "urx",
+            "--archive-body",
+            "-e",
+            "js",
+            "--silent",
+            "example.com",
+        ]);
+        let filter = build_extracted_link_filter(&args, &target_domains(&args))
+            .unwrap()
+            .expect("--archive-body must build a filter");
+        assert!(filter.accept("https://example.com/app.js").is_some());
+        assert!(filter.accept("https://example.com/index.html").is_none());
+        assert!(filter.accept("https://cdn.other.net/a.js").is_none());
+    }
+
+    #[test]
+    fn test_archive_captures_pair_each_url_with_its_newest_capture() {
+        use crate::providers::CaptureMeta;
+        use crate::runner::UrlEntry;
+
+        let mut run_result = ProviderRunResult::default();
+        let mut with_two = UrlEntry::default();
+        with_two.absorb(
+            "wayback",
+            &CaptureMeta::capture(Some("20050101000000"), None, None, Some("OLD")),
+        );
+        with_two.absorb(
+            "cc",
+            &CaptureMeta::capture(Some("20240101000000"), None, None, Some("NEW")),
+        );
+        run_result
+            .urls
+            .insert("https://example.com/a".to_string(), with_two);
+
+        let mut undigested = UrlEntry::default();
+        undigested.absorb(
+            "arquivo",
+            &CaptureMeta::capture(Some("20200101000000"), None, None, None),
+        );
+        run_result
+            .urls
+            .insert("https://example.com/b".to_string(), undigested);
+
+        // A URL from a provider without a capture index has nothing to replay.
+        run_result
+            .urls
+            .insert("https://example.com/c".to_string(), UrlEntry::default());
+
+        let captures = archive_captures(&run_result);
+        assert_eq!(
+            captures["https://example.com/a"],
+            ArchiveCapture {
+                timestamp: "20240101000000".to_string(),
+                digest: Some("NEW".to_string()),
+            }
+        );
+        assert_eq!(
+            captures["https://example.com/b"],
+            ArchiveCapture {
+                timestamp: "20200101000000".to_string(),
+                digest: None,
+            }
+        );
+        assert!(!captures.contains_key("https://example.com/c"));
+    }
+
+    #[test]
+    fn test_build_archive_body_extractor_follows_the_flag_and_the_wayback_rate() {
+        let settings = NetworkSettings::default();
+        let run_result = ProviderRunResult::default();
+
+        let args = build_test_args();
+        assert!(build_archive_body_extractor(&args, &settings, &run_result)
+            .unwrap()
+            .is_none());
+
+        let mut args = build_test_args();
+        args.archive_body = true;
+        args.archive_body_limit = 7;
+        let (extractor, stats) = build_archive_body_extractor(&args, &settings, &run_result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(extractor.candidate_count(), 0);
+        assert_eq!(stats.fetched(), 0);
+    }
+
+    #[test]
+    fn test_extract_links_filter_skips_host_validation_for_file_input() {
+        // With --files there is no queried domain to validate against, matching
+        // how the batch path treats file input.
+        let args = Args::parse_from(["urx", "--extract-links", "--files", "urls.txt", "--silent"]);
+        let filter = build_extracted_link_filter(&args, &target_domains(&args))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            filter.accept("https://anywhere.test/x").as_deref(),
+            Some("https://anywhere.test/x")
+        );
+    }
+
+    #[test]
+    fn test_collect_domains_merges_inputs_and_dedupes() -> Result<()> {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new()?;
+        writeln!(file, "from-file.test\nexample.com")?; // example.com overlaps positional
+
+        let mut args = build_test_args();
+        args.domains = vec!["example.com".to_string(), "another.test".to_string()];
+        args.domain_list = vec![file.path().to_path_buf()];
+
+        let domains = collect_domains(&args)?;
+        // Positional first, file second, dedupe keeps first occurrence.
+        assert_eq!(
+            domains,
+            vec!["example.com", "another.test", "from-file.test"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_domains_keeps_a_path_as_scope_but_drops_the_rest() -> Result<()> {
+        let mut args = build_test_args();
+        args.domains = vec![
+            // A path is scope and survives; the query string and fragment
+            // narrow a request rather than a scope, and go.
+            "https://example.com/some/path?q=1#frag".to_string(),
+            // A bare host, and the two spellings of "the whole host", all
+            // reduce to the same target.
+            "example.com".to_string(),
+            "https://example.com/".to_string(),
+            "example.com/?utm=x".to_string(),
+            // A trailing slash does not make a different scope.
+            "example.com/some/path/".to_string(),
+        ];
+
+        assert_eq!(
+            collect_domains(&args)?,
+            vec!["example.com/some/path", "example.com"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stdin_only_targets_are_used_for_batch_host_validation_and_hints() -> Result<()> {
+        use std::cell::Cell;
+
+        let mut args = build_test_args();
+        args.strict = true;
+        args.silent = false;
+        let stdin_reads = Cell::new(0);
+        let domains = collect_domains_with_stdin(&args, || {
+            stdin_reads.set(stdin_reads.get() + 1);
+            Ok(vec!["example.com".to_string()])
+        })?;
+
+        assert_eq!(stdin_reads.get(), 1, "stdin is resolved once");
+        assert_eq!(domains, vec!["example.com"]);
+
+        let validator = build_host_validator(&args, &domains).unwrap();
+        let hint = host_validation_hint(3, 2, &validator, &args).unwrap();
+        assert!(hint.starts_with("[urx] strict host validation removed 2/3 URLs;"));
+
+        let urls = HashSet::from([
+            "https://example.com/page".to_string(),
+            "http://evil.test/x".to_string(),
+            "https://other.test/y".to_string(),
+        ]);
+        args.silent = true;
+        assert_eq!(
+            apply_url_filters(&args, &domains, &urls, &ProgressManager::new(true))?,
+            vec!["https://example.com/page"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stdin_path_scope_filters_batch_results_and_is_announced() -> Result<()> {
+        let mut args = build_test_args();
+        args.strict = true;
+        let domains = collect_domains_with_stdin(&args, || {
+            Ok(vec!["https://example.com/shop?from=stdin".to_string()])
+        })?;
+        assert_eq!(domains, vec!["example.com/shop"]);
+
+        let urls = HashSet::from([
+            "https://example.com/shop/item".to_string(),
+            "https://example.com/other".to_string(),
+            "https://evil.test/shop/item".to_string(),
+        ]);
+        assert_eq!(
+            apply_url_filters(&args, &domains, &urls, &ProgressManager::new(true))?,
+            vec!["https://example.com/shop/item"]
+        );
+
+        let note = path_scope_note(&domains, args.subs).unwrap();
+        assert!(note.contains("example.com/shop"), "{note}");
+        Ok(())
+    }
+
+    #[test]
+    fn comment_only_domain_list_falls_back_to_stdin() -> Result<()> {
+        use std::cell::Cell;
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new()?;
+        writeln!(file, "# targets are listed below\n  # still no targets\n  ")?;
+        let mut args = build_test_args();
+        args.domain_list.push(file.path().to_path_buf());
+
+        let stdin_reads = Cell::new(0);
+        let domains = collect_domains_with_stdin(&args, || {
+            stdin_reads.set(stdin_reads.get() + 1);
+            Ok(vec!["fallback.example".to_string()])
+        })?;
+        assert_eq!(stdin_reads.get(), 1);
+        assert_eq!(domains, vec!["fallback.example"]);
+        Ok(())
+    }
+
+    #[test]
+    fn stdin_targets_reach_the_stream_sink_host_validator() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let output_path = temp.path().join("stream.txt");
+        let mut args = build_test_args();
+        args.strict = true;
+        args.stream = true;
+        args.output = Some(output_path.clone());
+
+        let domains =
+            collect_domains_with_stdin(&args, || Ok(vec!["example.com/shop".to_string()]))?;
+        let sink = build_stream_sink(&args, &domains)?.unwrap();
+        let records = [
+            crate::providers::UrlRecord::bare("https://example.com/shop/item".to_string()),
+            crate::providers::UrlRecord::bare("https://example.com/other".to_string()),
+            crate::providers::UrlRecord::bare("https://evil.test/shop/item".to_string()),
+        ];
+        assert_eq!(sink.emit(&records)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(output_path)?
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["https://example.com/shop/item"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stdin_targets_reach_the_extracted_link_host_validator() -> Result<()> {
+        let mut args = build_test_args();
+        args.strict = true;
+        args.extract_links = true;
+        let domains =
+            collect_domains_with_stdin(&args, || Ok(vec!["example.com/shop".to_string()]))?;
+        let filter = build_extracted_link_filter(&args, &domains)?.unwrap();
+
+        assert_eq!(
+            filter.accept("https://example.com/shop/item").as_deref(),
+            Some("https://example.com/shop/item")
+        );
+        assert!(filter.accept("https://example.com/other").is_none());
+        assert!(filter.accept("https://evil.test/shop/item").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_host_validator_is_none_without_strict_mode() -> Result<()> {
+        let mut args = build_test_args();
+        args.domains = vec!["example.com".to_string()];
+        args.strict = false;
+        args.no_strict = true;
+        let domains = target_domains(&args);
+        assert!(build_host_validator(&args, &domains).is_none());
+
+        args.strict = true;
+        args.no_strict = false;
+        assert!(build_host_validator(&args, &domains).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_url_filter_and_stream_sink_agree_on_the_same_rules() {
+        // The batch list and the stream must never disagree about which URLs
+        // qualify — both go through build_url_filter.
+        let args = Args::parse_from(["urx", "-e", "js", "--silent", "example.com"]);
+        let urls = HashSet::from([
+            "https://example.com/app.js".to_string(),
+            "https://example.com/index.html".to_string(),
+        ]);
+
+        let batch = build_url_filter(&args).unwrap().apply_filters(&urls);
+        assert_eq!(batch, vec!["https://example.com/app.js"]);
+    }
+
+    #[test]
+    fn test_collect_domains_errors_when_domain_list_cannot_be_read() {
+        let mut args = build_test_args();
+        args.strict = true;
+        args.domain_list = vec![std::path::PathBuf::from("/definitely/missing-domains.txt")];
+
+        let err = collect_domains(&args).unwrap_err();
+
+        assert!(err.to_string().contains("Failed to open domain list"));
+    }
+
+    #[test]
+    fn test_apply_url_filters_applies_extensions_and_strict_hosts() -> Result<()> {
+        let mut args = build_test_args();
+        args.domains = vec!["example.com".to_string()];
+        args.strict = true;
+        args.extensions = vec!["js".to_string()];
+
+        let urls = HashSet::from([
+            "https://example.com/app.js".to_string(),
+            "https://example.com/page.html".to_string(),
+            "https://evil.test/other.js".to_string(),
+        ]);
+
+        let filtered = apply_url_filters(
+            &args,
+            &target_domains(&args),
+            &urls,
+            &ProgressManager::new(true),
+        )?;
+        assert_eq!(filtered, vec!["https://example.com/app.js"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_url_transformations_honours_merge_endpoint() {
+        // --merge-endpoint is the one option the shared transformer omits, so
+        // the batch path has to opt into it explicitly.
+        let mut args = build_test_args();
+        args.merge_endpoint = true;
+
+        let urls = vec![
+            "https://example.com/item?id=1".to_string(),
+            "https://example.com/item?id=2".to_string(),
+        ];
+        let merged = apply_url_transformations(&args, urls, &ProgressManager::new(true));
+        assert_eq!(
+            merged.len(),
+            1,
+            "same path should fold into one: {merged:?}"
+        );
+
+        // ...and it stays off when the flag isn't set.
+        let mut args = build_test_args();
+        args.merge_endpoint = false;
+        let urls = vec![
+            "https://example.com/item?id=1".to_string(),
+            "https://example.com/item?id=2".to_string(),
+        ];
+        assert_eq!(
+            apply_url_transformations(&args, urls, &ProgressManager::new(true)).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_read_urls_from_files_is_none_without_the_flag() -> Result<()> {
+        let args = build_test_args();
+        assert!(read_urls_from_files(&args)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_urls_from_files_concatenates_every_path() -> Result<()> {
+        use std::io::Write;
+        let mut a = tempfile::NamedTempFile::new()?;
+        writeln!(a, "https://example.com/a")?;
+        let mut b = tempfile::NamedTempFile::new()?;
+        writeln!(b, "https://example.com/b")?;
+
+        let mut args = build_test_args();
+        args.files = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+
+        let urls = read_urls_from_files(&args)?.expect("--files should produce a list");
+        assert_eq!(urls, vec!["https://example.com/a", "https://example.com/b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_testers_follows_the_flags() {
+        let settings = NetworkSettings::default();
+
+        let args = build_test_args();
+        assert!(build_testers(&args, &settings).is_empty());
+
+        let mut args = build_test_args();
+        args.check_status = true;
+        assert_eq!(build_testers(&args, &settings).len(), 1);
+
+        let mut args = build_test_args();
+        args.extract_links = true;
+        assert_eq!(build_testers(&args, &settings).len(), 1);
+
+        // A status filter implies a status check even without --check-status.
+        let mut args = build_test_args();
+        args.include_status = vec!["200".to_string()];
+        args.extract_links = true;
+        assert!(should_check_status(&args));
+        assert_eq!(build_testers(&args, &settings).len(), 2);
+
+        // --extract-js-endpoints is a third tester, independent of the others.
+        let mut args = build_test_args();
+        args.extract_js_endpoints = true;
+        assert_eq!(build_testers(&args, &settings).len(), 1);
+
+        let mut args = build_test_args();
+        args.check_status = true;
+        args.extract_links = true;
+        args.extract_js_endpoints = true;
+        assert_eq!(build_testers(&args, &settings).len(), 3);
+    }
+
+    #[test]
+    fn test_extract_js_endpoints_filter_is_wired_up() {
+        // Endpoints mined from scripts come into existence after the filters
+        // ran over the primary list, exactly like extracted links — so the
+        // same filter must be built for them, including strict host
+        // validation (on by default).
+        let args = Args::parse_from(["urx", "--extract-js-endpoints", "--silent", "example.com"]);
+        let filter = build_extracted_link_filter(&args, &target_domains(&args))
+            .unwrap()
+            .expect("--extract-js-endpoints must build a filter");
+        assert_eq!(
+            filter.accept("https://example.com/api/v1/users").as_deref(),
+            Some("https://example.com/api/v1/users")
+        );
+        assert!(filter
+            .accept("https://api.thirdparty.net/v1/track")
+            .is_none());
+    }
+
+    // --- spec-expansion ---
+
+    #[test]
+    fn test_expand_specs_is_its_own_tester_and_honours_max_spec_files() {
+        let settings = NetworkSettings::default();
+
+        let mut args = build_test_args();
+        args.expand_specs = true;
+        assert_eq!(build_testers(&args, &settings).len(), 1);
+
+        // Independent of the other extractors: all four can run in one pass,
+        // and the status checker still comes first.
+        let mut args = build_test_args();
+        args.check_status = true;
+        args.extract_links = true;
+        args.extract_js_endpoints = true;
+        args.expand_specs = true;
+        assert_eq!(build_testers(&args, &settings).len(), 4);
+
+        // The flag alone builds nothing when it is off.
+        let args = build_test_args();
+        assert!(build_testers(&args, &settings).is_empty());
+    }
+
+    #[test]
+    fn test_expand_specs_filter_is_wired_up() {
+        // Routes read out of a specification come into existence after the
+        // filters ran over the primary list, exactly like extracted links — so
+        // the same filter must be built for them, including strict host
+        // validation (on by default).
+        let args = Args::parse_from(["urx", "--expand-specs", "--silent", "example.com"]);
+        let filter = build_extracted_link_filter(&args, &target_domains(&args))
+            .unwrap()
+            .expect("--expand-specs must build a filter");
+        assert_eq!(
+            filter
+                .accept("https://example.com/v3/users/{id}")
+                .as_deref(),
+            Some("https://example.com/v3/users/{id}")
+        );
+        assert!(filter
+            .accept("https://api.thirdparty.net/v1/track")
+            .is_none());
+    }
+
+    #[test]
+    fn test_archive_body_expands_specs_only_when_both_flags_are_on() {
+        let settings = NetworkSettings::default();
+        let run_result = ProviderRunResult::default();
+
+        let mut args = build_test_args();
+        args.archive_body = true;
+        let (extractor, _) = build_archive_body_extractor(&args, &settings, &run_result)
+            .unwrap()
+            .unwrap();
+        assert!(!extractor.expands_specs());
+
+        args.expand_specs = true;
+        let (extractor, _) = build_archive_body_extractor(&args, &settings, &run_result)
+            .unwrap()
+            .unwrap();
+        assert!(extractor.expands_specs());
+    }
+
+    #[test]
+    fn test_max_spec_files_defaults_match_the_expander() {
+        let args = Args::parse_from(["urx", "example.com"]);
+        assert_eq!(args.max_spec_files, SpecExpander::DEFAULT_MAX_FILES);
+    }
+    // --- result-filters ---
+    /// Write `text` to a temp file and return the handle, which must outlive the
+    /// use — dropping it deletes the file.
+    fn scope_file(text: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "{text}").unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// A run result in which each `(url, first_seen, mime, archive_status)` was
+    /// reported by a CDX provider, and every other URL was not.
+    fn run_result_with_meta(rows: &[(&str, &str, &str, &str)]) -> ProviderRunResult {
+        let mut result = ProviderRunResult::default();
+        for (url, ts, mime, status) in rows {
+            result.urls.insert(
+                (*url).to_string(),
+                crate::runner::UrlEntry {
+                    sources: HashSet::from(["wayback".to_string()]),
+                    meta: crate::providers::CaptureMeta::capture(
+                        (!ts.is_empty()).then_some(ts),
+                        (!mime.is_empty()).then_some(mime),
+                        (!status.is_empty()).then_some(status),
+                        None,
+                    ),
+                },
+            );
+        }
+        result
+    }
+
+    fn urls(list: &[&str]) -> Vec<String> {
+        list.iter().map(|u| u.to_string()).collect()
+    }
+
+    #[test]
+    fn a_scope_file_reaches_the_shared_url_filter() {
+        let file = scope_file("*.example.com\n!admin.example.com\n");
+        let mut args = build_test_args();
+        args.scope_file = vec![file.path().to_path_buf()];
+
+        let filter = build_url_filter(&args).unwrap();
+        assert!(filter.matches("https://api.example.com/v1"));
+        assert!(!filter.matches("https://admin.example.com/v1"));
+        assert!(!filter.matches("https://example.org/v1"));
+
+        // ...and it composes with the other filters rather than replacing them.
+        args.extensions = vec!["js".to_string()];
+        let filter = build_url_filter(&args).unwrap();
+        assert!(filter.matches("https://api.example.com/app.js"));
+        assert!(!filter.matches("https://api.example.com/index.html"));
+    }
+
+    #[test]
+    fn a_scope_file_survives_the_stream_and_extracted_link_paths() {
+        // The three emission paths share one filter precisely so a scope cannot
+        // apply to some of them and not others.
+        let file = scope_file("api.example.com\n");
+        let args = Args::parse_from([
+            "urx",
+            "--extract-links",
+            "--no-strict",
+            "--silent",
+            "--scope-file",
+            file.path().to_str().unwrap(),
+            "example.com",
+        ]);
+
+        let link_filter = build_extracted_link_filter(&args, &target_domains(&args))
+            .unwrap()
+            .expect("--extract-links must build a filter");
+        assert_eq!(
+            link_filter.accept("https://api.example.com/v1").as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert!(link_filter.accept("https://cdn.example.com/x.js").is_none());
+
+        // Streaming is not one of the combinations a scope file conflicts with.
+        let args = Args::parse_from([
+            "urx",
+            "--stream",
+            "--scope-file",
+            file.path().to_str().unwrap(),
+            "example.com",
+        ]);
+        assert!(streaming_conflicts(&args).is_empty());
+    }
+
+    #[test]
+    fn a_scope_file_that_cannot_be_parsed_stops_the_run() {
+        // Silently dropping the entry would run against a wider scope than the
+        // file describes, which for a bug bounty is the expensive direction.
+        let file = scope_file("*.example.com\nhttps://example.com/only/this/path\n");
+        let mut args = build_test_args();
+        args.scope_file = vec![file.path().to_path_buf()];
+
+        match build_url_filter(&args) {
+            Ok(_) => panic!("an unhonourable scope line must be fatal"),
+            Err(err) => {
+                let rendered = format!("{err:#}");
+                assert!(rendered.contains("path-scoped"), "{rendered}");
+                assert!(rendered.contains(":2"), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_scope_file_is_anded_with_strict_host_validation() {
+        // The two gates are independent, and strict mode runs first: a wildcard
+        // scope over a bare-apex query still needs --subs.
+        let file = scope_file("*.example.com\n");
+        let with_subs = Args::parse_from([
+            "urx",
+            "--subs",
+            "--silent",
+            "--scope-file",
+            file.path().to_str().unwrap(),
+            "example.com",
+        ]);
+        let strict_only = Args::parse_from([
+            "urx",
+            "--silent",
+            "--scope-file",
+            file.path().to_str().unwrap(),
+            "example.com",
+        ]);
+
+        let discovered: HashSet<String> = urls(&[
+            "https://example.com/a",
+            "https://api.example.com/a",
+            "https://example.org/a",
+        ])
+        .into_iter()
+        .collect();
+
+        let kept = apply_url_filters(
+            &with_subs,
+            &target_domains(&with_subs),
+            &discovered,
+            &ProgressManager::new(true),
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            urls(&["https://api.example.com/a", "https://example.com/a"])
+        );
+
+        // Without --subs, host validation removes the subdomain before the
+        // scope file ever sees it — the scope does not widen the query.
+        let kept = apply_url_filters(
+            &strict_only,
+            &target_domains(&strict_only),
+            &discovered,
+            &ProgressManager::new(true),
+        )
+        .unwrap();
+        assert_eq!(kept, urls(&["https://example.com/a"]));
+    }
+
+    #[test]
+    fn a_scope_file_makes_the_filter_progress_bar_worth_drawing() {
+        let file = scope_file("*.example.com\n");
+        let mut args = build_test_args();
+        assert!(!has_url_filters(&args));
+        args.scope_file = vec![file.path().to_path_buf()];
+        assert!(has_url_filters(&args));
+    }
+
+    #[test]
+    fn meta_filters_narrow_the_batch_result_uniformly_across_providers() {
+        // The case the archive-side filters cannot serve: a positive multi-value
+        // status list, applied to URLs from a mix of providers.
+        let run_result = run_result_with_meta(&[
+            (
+                "https://example.com/ok",
+                "20200101000000",
+                "text/html",
+                "200",
+            ),
+            (
+                "https://example.com/moved",
+                "20200101000000",
+                "text/html",
+                "301",
+            ),
+            (
+                "https://example.com/gone",
+                "20200101000000",
+                "text/html",
+                "404",
+            ),
+        ]);
+
+        let mut args = build_test_args();
+        args.meta_status = vec!["200".to_string(), "301".to_string()];
+
+        let kept = apply_meta_filters(
+            &args,
+            &run_result,
+            urls(&[
+                "https://example.com/ok",
+                "https://example.com/moved",
+                "https://example.com/gone",
+            ]),
+            &ProgressManager::new(true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            kept,
+            urls(&["https://example.com/ok", "https://example.com/moved"])
+        );
+    }
+
+    #[test]
+    fn meta_date_filters_read_the_merged_capture_range() {
+        let run_result = run_result_with_meta(&[
+            ("https://example.com/old", "20050101000000", "", ""),
+            ("https://example.com/new", "20240101000000", "", ""),
+        ]);
+
+        let mut args = build_test_args();
+        args.meta_last_seen_before = Some("2010".to_string());
+
+        let kept = apply_meta_filters(
+            &args,
+            &run_result,
+            urls(&["https://example.com/old", "https://example.com/new"]),
+            &ProgressManager::new(true),
+        )
+        .unwrap();
+        assert_eq!(kept, urls(&["https://example.com/old"]));
+    }
+
+    #[test]
+    fn urls_with_no_metadata_survive_an_exclusion_but_not_a_positive_filter() {
+        // The documented policy for cache hits, --files input and the providers
+        // with no capture index.
+        let run_result = ProviderRunResult::default();
+        let list = urls(&["https://example.com/a", "https://example.com/b"]);
+
+        let mut positive = build_test_args();
+        positive.meta_mime = vec!["text/html".to_string()];
+        assert!(apply_meta_filters(
+            &positive,
+            &run_result,
+            list.clone(),
+            &ProgressManager::new(true)
+        )
+        .unwrap()
+        .is_empty());
+
+        let mut negative = build_test_args();
+        negative.meta_exclude_mime = vec!["image/*".to_string()];
+        assert_eq!(
+            apply_meta_filters(
+                &negative,
+                &run_result,
+                list.clone(),
+                &ProgressManager::new(true)
+            )
+            .unwrap(),
+            list
+        );
+    }
+
+    #[test]
+    fn no_meta_flag_leaves_the_list_untouched() {
+        let run_result = ProviderRunResult::default();
+        let list = urls(&["https://example.com/a", "https://example.com/b"]);
+        assert_eq!(
+            apply_meta_filters(
+                &build_test_args(),
+                &run_result,
+                list.clone(),
+                &ProgressManager::new(true)
+            )
+            .unwrap(),
+            list
+        );
+    }
+
+    #[test]
+    fn a_result_set_emptied_only_by_missing_metadata_says_so_without_verbose() {
+        let (progress, notes) = ProgressManager::capturing();
+        let mut args = build_test_args();
+        args.silent = false;
+        args.meta_status = vec!["200".to_string()];
+
+        let kept = apply_meta_filters(
+            &args,
+            &ProviderRunResult::default(),
+            urls(&["https://example.com/a"]),
+            &progress,
+        )
+        .unwrap();
+
+        assert!(kept.is_empty());
+        let notes = notes.lock().unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("--no-cache"), "{}", notes[0]);
+    }
+
+    #[test]
+    fn a_partially_filtered_result_set_stays_quiet() {
+        // Something did fail a predicate, so the result is about the data, not
+        // about the run's shape — no note.
+        let (progress, notes) = ProgressManager::capturing();
+        let mut args = build_test_args();
+        args.silent = false;
+        args.meta_status = vec!["200".to_string()];
+
+        let run_result =
+            run_result_with_meta(&[("https://example.com/gone", "20200101000000", "", "404")]);
+        let kept = apply_meta_filters(
+            &args,
+            &run_result,
+            urls(&["https://example.com/gone", "https://example.com/bare"]),
+            &progress,
+        )
+        .unwrap();
+
+        assert!(kept.is_empty());
+        assert!(notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unhonourable_meta_value_stops_the_run() {
+        let mut bad_date = build_test_args();
+        bad_date.meta_first_seen_after = Some("last tuesday".to_string());
+        assert!(build_meta_filter(&bad_date).is_err());
+
+        let mut bad_status = build_test_args();
+        bad_status.meta_exclude_status = vec!["4o4".to_string()];
+        let err = build_meta_filter(&bad_status).unwrap_err();
+        assert!(err.to_string().contains("20x"), "{err}");
+    }
+
+    #[test]
+    fn streaming_rejects_every_meta_filter() {
+        for flag in [
+            "--meta-first-seen-after",
+            "--meta-first-seen-before",
+            "--meta-last-seen-after",
+            "--meta-last-seen-before",
+        ] {
+            let args = Args::parse_from(["urx", "--stream", flag, "2020", "example.com"]);
+            assert!(
+                !streaming_conflicts(&args).is_empty(),
+                "{flag} must not stream"
+            );
+            assert!(
+                build_stream_sink(&args, &target_domains(&args)).is_err(),
+                "{flag}"
+            );
+        }
+        for (flag, value) in [
+            ("--meta-mime", "text/html"),
+            ("--meta-exclude-mime", "image/*"),
+            ("--meta-status", "200"),
+            ("--meta-exclude-status", "404"),
+        ] {
+            let args = Args::parse_from(["urx", "--stream", flag, value, "example.com"]);
+            assert!(
+                !streaming_conflicts(&args).is_empty(),
+                "{flag} must not stream"
+            );
+        }
+
+        // The reason is the one the user needs: the sink has no metadata to read.
+        let args = Args::parse_from(["urx", "--stream", "--meta-status", "200", "example.com"]);
+        match build_stream_sink(&args, &target_domains(&args)) {
+            Ok(_) => panic!("--meta-status must not stream"),
+            Err(err) => assert!(err.to_string().contains("capture metadata"), "{err}"),
+        }
+    }
+    #[test]
+    fn unhonourable_filter_values_are_rejected_before_the_scan_starts() {
+        // The point of the check: these are otherwise first built after
+        // collection, so a typo would cost the user the whole fetch.
+        assert!(validate_result_filters(&build_test_args()).is_ok());
+
+        let good = scope_file("*.example.com\n");
+        let mut args = build_test_args();
+        args.scope_file = vec![good.path().to_path_buf()];
+        args.meta_status = vec!["20x".to_string()];
+        args.meta_last_seen_after = Some("2020".to_string());
+        assert!(validate_result_filters(&args).is_ok());
+
+        let bad = scope_file("example.com:8080\n");
+        let mut args = build_test_args();
+        args.scope_file = vec![bad.path().to_path_buf()];
+        assert!(validate_result_filters(&args).is_err());
+
+        let mut args = build_test_args();
+        args.meta_first_seen_before = Some("nope".to_string());
+        assert!(validate_result_filters(&args).is_err());
+    }
+    // --- end result-filters ---
+
+    #[test]
+    fn a_body_directory_without_archive_body_is_refused() {
+        // Reachable only through a config file — clap rejects the CLI form —
+        // and a run that silently wrote nothing would be read as "the archive
+        // had nothing to store".
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = build_test_args();
+        args.archive_body_dir = Some(dir.path().join("corpus"));
+        let err = validate_result_filters(&args).expect_err("should be refused");
+        assert!(format!("{err}").contains("--archive-body-dir"), "{err}");
+
+        args.archive_body = true;
+        assert!(validate_result_filters(&args).is_ok());
+    }
+
+    #[test]
+    fn an_output_view_cannot_feed_a_tester() {
+        // Regression: the view ran first, so the status checker requested
+        // parameter names and bare paths as if they were URLs.
+        let mut args = build_test_args();
+        args.params = true;
+        assert!(validate_result_filters(&args).is_ok());
+        args.check_status = true;
+        let err = validate_result_filters(&args).expect_err("should be refused");
+        assert!(format!("{err}").contains("--params"), "{err}");
+
+        let mut args = build_test_args();
+        args.show_only_path = true;
+        args.extract_links = true;
+        assert!(validate_result_filters(&args).is_err());
+
+        // Fuzz templates are real URLs; checking them is a fair request.
+        let mut args = build_test_args();
+        args.fuzz_placeholder = Some("FUZZ".to_string());
+        args.check_status = true;
+        assert!(validate_result_filters(&args).is_ok());
+    }
+
+    #[test]
+    fn an_unwritable_body_directory_fails_before_any_collection() {
+        // The tester that writes the corpus is built only after every provider
+        // has finished, so discovering the problem there would throw away a
+        // whole run's work. `validate_result_filters` runs at start-up.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("taken");
+        std::fs::write(&blocked, b"").unwrap();
+
+        let mut args = build_test_args();
+        args.archive_body = true;
+        args.archive_body_dir = Some(blocked);
+        assert!(validate_result_filters(&args).is_err());
+    }
+
+    #[test]
+    fn a_path_scoped_run_says_so_before_it_starts() {
+        // The narrowing is deliberate but silent, and "why did this return 40
+        // URLs" is expensive to work out after the fact.
+        let note = path_scope_note(&["example.com/shop".to_string()], false).unwrap();
+        assert!(note.contains("example.com/shop"), "{note}");
+        assert!(!note.contains("--subs"), "{note}");
+
+        // An unscoped run has nothing to say.
+        assert!(path_scope_note(&["example.com".to_string()], false).is_none());
+    }
+
+    #[test]
+    fn the_subs_note_warns_that_the_archive_cannot_filter_by_path() {
+        // Same output, very different run time: worth knowing beforehand.
+        let note = path_scope_note(&["example.com/shop".to_string()], true).unwrap();
+        assert!(note.contains("--subs"), "{note}");
+    }
+
+    #[test]
+    fn the_note_stays_one_line_however_many_targets_are_scoped() {
+        let domains: Vec<String> = (0..10).map(|i| format!("example{i}.com/shop")).collect();
+        let note = path_scope_note(&domains, false).unwrap();
+        assert!(note.contains("(+7 more)"), "{note}");
+        assert_eq!(note.lines().count(), 1, "{note}");
+    }
+
+    #[test]
+    fn no_strict_keeps_the_path_scope_on_the_batch_path() -> Result<()> {
+        // The bug this pins: `apply_url_filters` used to gate host validation
+        // on `--strict`, so `--no-strict` with a path scope emitted the whole
+        // host in batch mode while --stream (which calls
+        // `build_host_validator` directly) applied the scope. One run, two
+        // answers, decided by the output mode.
+        let mut args = build_test_args();
+        args.domains = vec!["example.com/shop".to_string()];
+        args.strict = false;
+        args.no_strict = true;
+        args.silent = true;
+
+        let urls: HashSet<String> = [
+            "https://example.com/shop/item",
+            "https://example.com/about",
+            // Off-host: --no-strict was asked for, so this stays.
+            "https://other.test/anything",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let kept = apply_url_filters(
+            &args,
+            &target_domains(&args),
+            &urls,
+            &ProgressManager::new(true),
+        )?;
+        assert!(kept.contains(&"https://example.com/shop/item".to_string()));
+        assert!(kept.contains(&"https://other.test/anything".to_string()));
+        assert!(!kept.contains(&"https://example.com/about".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn no_strict_without_a_path_scope_still_validates_nothing() -> Result<()> {
+        let mut args = build_test_args();
+        args.domains = vec!["example.com".to_string()];
+        args.strict = false;
+        args.no_strict = true;
+        args.silent = true;
+
+        let urls: HashSet<String> = ["https://other.test/anything"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let kept = apply_url_filters(
+            &args,
+            &target_domains(&args),
+            &urls,
+            &ProgressManager::new(true),
+        )?;
+        assert_eq!(kept, vec!["https://other.test/anything".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn paths_only_mode_does_not_recommend_a_flag_that_would_shrink_the_result() {
+        // Under --no-strict with a scope, `--subs` inverts: without it a
+        // subdomain's URL never matches a target host and passes unjudged;
+        // with it the URL is matched and then measured against the scope. So
+        // the advisory must not offer it as a way to keep more URLs.
+        let mut args = build_test_args();
+        args.domains = vec!["example.com/shop".to_string()];
+        args.strict = false;
+        args.no_strict = true;
+
+        let domains = target_domains(&args);
+        let validator = build_host_validator(&args, &domains).unwrap();
+        assert!(validator.has_path_scopes());
+        assert!(!args.strict_enabled());
+
+        let hint = drops_most_hint(validator.has_path_scopes(), args.strict_enabled());
+        assert!(!hint.contains("--subs"), "{hint}");
+
+        // With the host check on, --subs really does widen the result, so it
+        // is still the right thing to offer.
+        args.strict = true;
+        args.no_strict = false;
+        let validator = build_host_validator(&args, &domains).unwrap();
+        let hint = drops_most_hint(validator.has_path_scopes(), args.strict_enabled());
+        assert!(hint.contains("--subs"), "{hint}");
+
+        // An unscoped run is untouched: --subs and --no-strict both widen it.
+        let hint = drops_most_hint(false, true);
+        assert!(
+            hint.contains("--subs") && hint.contains("--no-strict"),
+            "{hint}"
+        );
+    }
+}

@@ -1,0 +1,264 @@
+import logging
+import urllib.parse
+from typing import Any
+
+import requests
+
+from models.base_engine import BaseEngine
+from models.observable import Observable, ObservableType
+
+logger = logging.getLogger(__name__)
+
+
+class RLAnalyzeEngine(BaseEngine):
+    @property
+    def name(self):
+        return "rl_analyze"
+
+    @property
+    def supported_types(self) -> ObservableType:
+        return (
+            ObservableType.FQDN
+            | ObservableType.IPV4
+            | ObservableType.IPV6
+            | ObservableType.MD5
+            | ObservableType.SHA1
+            | ObservableType.SHA256
+            | ObservableType.URL
+        )
+
+    def _get_api_endpoint(
+        self, observable_value: str, observable_type: ObservableType
+    ) -> str | None:
+        endpoint_map = {
+            ObservableType.IPV4: f"/api/network-threat-intel/ip/{observable_value}/report/",
+            ObservableType.IPV6: f"/api/network-threat-intel/ip/{observable_value}/report/",
+            ObservableType.FQDN: f"/api/network-threat-intel/domain/{observable_value}/",
+            ObservableType.URL: (
+                f"/api/network-threat-intel/url/?url={urllib.parse.quote_plus(observable_value)}"
+            ),
+            ObservableType.MD5: f"/api/samples/v3/{observable_value}/classification/?av_scanners=1",
+            ObservableType.SHA1: (
+                f"/api/samples/v3/{observable_value}/classification/?av_scanners=1"
+            ),
+            ObservableType.SHA256: (
+                f"/api/samples/v3/{observable_value}/classification/?av_scanners=1"
+            ),
+        }
+        return endpoint_map.get(observable_type)
+
+    def _get_ui_endpoint(
+        self, observable_value: str, observable_type: ObservableType
+    ) -> str | None:
+        endpoint_map = {
+            ObservableType.IPV4: f"/ip/{observable_value}/analysis/ip/",
+            ObservableType.IPV6: f"/ip/{observable_value}/analysis/ip/",
+            ObservableType.FQDN: f"/domain/{observable_value}/analysis/domain/",
+            ObservableType.URL: f"/url/{urllib.parse.quote_plus(observable_value)}/analysis/url/",
+            ObservableType.MD5: f"/{observable_value}/",
+            ObservableType.SHA1: f"/{observable_value}/",
+            ObservableType.SHA256: f"/{observable_value}/",
+        }
+        return endpoint_map.get(observable_type)
+
+    def _parse_rl_response(
+        self, result: dict, observable_value: str, observable_type: ObservableType, url: str
+    ) -> dict:
+        threats: list[str] = []
+        ui_link = url + self._get_ui_endpoint(observable_value, observable_type)
+
+        if observable_type in [ObservableType.IPV4, ObservableType.IPV6, ObservableType.FQDN]:
+            threats.extend([i.get("threat_name") for i in result.get("top_threats", [])])
+            total_files: int = result.get("downloaded_files_statistics", {}).get("total", 0)
+            malicious_files: int = result.get("downloaded_files_statistics", {}).get("malicious", 0)
+            suspicious_files: int = result.get("downloaded_files_statistics", {}).get(
+                "suspicious", 0
+            )
+
+            reputation = result.get("third_party_reputations", {}).get("statistics", {})
+            malicious: int = reputation.get("malicious", 0)
+            suspicious: int = reputation.get("suspicious", 0)
+            total: int = reputation.get("total", 0)
+
+            report_color = "green"
+            if malicious > 2 or suspicious > 3:
+                report_color = "red"
+            elif malicious > 0 or suspicious > 0:
+                report_color = "yellow"
+
+            if total > 0:
+                return {
+                    "report_type": "network",
+                    "report_color": report_color,
+                    "reports": total,
+                    "malicious": malicious,
+                    "suspicious": suspicious,
+                    "total_files": total_files,
+                    "malicious_files": malicious_files,
+                    "suspicious_files": suspicious_files,
+                    "threats": threats,
+                    "link": ui_link,
+                }
+
+        elif observable_type is ObservableType.URL:
+            # NOTE: Potential issue - if "analysis" key is missing from result, this will fail
+            # with AttributeError. Should defensively handle with .get("analysis", {})
+            # Candidate for future remediation to match safer pattern used elsewhere.
+            threats.extend(
+                [i.get("threat_name") for i in result.get("analysis").get("top_threats", [])]
+            )
+            threats.append(result.get("threat_name"))
+            threats.extend(result.get("categories", []))
+
+            reputation = result.get("third_party_reputations", {}).get("statistics", {})
+            malicious: int = reputation.get("malicious", 0)
+            suspicious: int = reputation.get("suspicious", 0)
+            total: int = reputation.get("total", 0)
+
+            report_color = "green"
+            if malicious > 2 or suspicious > 3:
+                report_color = "red"
+            elif malicious > 0 or suspicious > 0:
+                report_color = "yellow"
+
+            if total > 0:
+                return {
+                    "report_type": "network",
+                    "report_color": report_color,
+                    "reports": total,
+                    "malicious": malicious,
+                    "suspicious": suspicious,
+                    "threats": threats,
+                    "link": ui_link,
+                }
+
+        elif observable_type in [ObservableType.MD5, ObservableType.SHA1, ObservableType.SHA256]:
+            threats.append(result.get("classification"))
+            threats.append(result.get("classification_result"))
+            threats.append(result.get("classification_reason"))
+
+            classification: str = result.get("classification", "")
+            riskscore: int = result.get("riskscore", 0)
+
+            report_color = "green"
+            if classification == "malicious" and riskscore > 2:
+                report_color = "red"
+            elif classification != "goodware" or riskscore > 5:
+                report_color = "yellow"
+
+            av_scanners = result.get("av_scanners", {})
+            if av_scanners:
+                total: int = av_scanners.get("scanner_count", 0)
+                scanners = av_scanners.get("scanner_match", 0)
+
+                return {
+                    "report_type": "file",
+                    "report_color": report_color,
+                    "reports": total,
+                    "scanners": scanners,
+                    "classification": classification.upper(),
+                    "riskscore": riskscore,
+                    "threats": threats,
+                    "link": ui_link,
+                }
+
+        return {}
+
+    def analyze(self, observable: Observable) -> dict[str, Any] | None:
+        api_key = self.secrets.rl_analyze_api_key
+        rl_analyze_url = self.secrets.rl_analyze_url
+
+        endpoint = self._get_api_endpoint(observable.value, observable.type)
+        if not endpoint:
+            return None
+
+        try:
+            url = f"{rl_analyze_url}{endpoint}"
+            headers = {
+                "Authorization": f"Token {api_key}",
+                "accept": "application/json",
+            }
+
+            # NOTE: Original implementation uses proxies=None
+            response = requests.get(
+                url, headers=headers, proxies=None, verify=self.ssl_verify, timeout=5
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            return self._parse_rl_response(data, observable.value, observable.type, rl_analyze_url)
+
+        except Exception as e:
+            logger.error(
+                "Error querying Reversing Labs for '%s': %s", observable.value, e, exc_info=True
+            )
+            return None
+
+    def create_export_row(self, analysis_result: Any) -> dict:
+        if not analysis_result:
+            return {
+                f"rl_analyze_{k}": None
+                for k in [
+                    "total_count",
+                    "malicious",
+                    "suspicious",
+                    "total_files",
+                    "malicious_files",
+                    "suspicious_files",
+                    "av_scanners",
+                    "threats",
+                    "riskscore",
+                    "link",
+                ]
+            }
+
+        # Helper for common fields
+        common = {
+            "rl_analyze_total_count": analysis_result.get("reports"),
+            "rl_analyze_malicious": analysis_result.get("malicious"),
+            "rl_analyze_suspicious": analysis_result.get("suspicious"),
+            "rl_analyze_threats": ", ".join([t for t in analysis_result.get("threats", []) if t]),
+            "rl_analyze_link": analysis_result.get("link"),
+        }
+
+        if analysis_result.get("report_type") == "network":
+            # Network report fields
+            common.update(
+                {
+                    "rl_analyze_total_files": analysis_result.get("total_files"),
+                    "rl_analyze_malicious_files": analysis_result.get("malicious_files"),
+                    "rl_analyze_suspicious_files": analysis_result.get("suspicious_files"),
+                    "rl_analyze_av_scanners": None,  # Not applicable to network
+                    "rl_analyze_riskscore": None,  # Not applicable to network
+                }
+            )
+        elif analysis_result.get("report_type") == "file":
+            # File hash report fields
+            common.update(
+                {
+                    "rl_analyze_total_files": None,
+                    "rl_analyze_malicious_files": None,
+                    "rl_analyze_suspicious_files": None,
+                    "rl_analyze_av_scanners": analysis_result.get("scanners"),
+                    "rl_analyze_riskscore": analysis_result.get("riskscore"),
+                }
+            )
+
+        # Ensure all expected keys are present even if None
+        final_row = {
+            f"rl_analyze_{k}": None
+            for k in [
+                "total_count",
+                "malicious",
+                "suspicious",
+                "total_files",
+                "malicious_files",
+                "suspicious_files",
+                "av_scanners",
+                "threats",
+                "riskscore",
+                "link",
+            ]
+        }
+        final_row.update(common)
+        return final_row

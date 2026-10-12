@@ -1,0 +1,791 @@
+# -*- coding: utf-8 -*-
+
+# =================================================================================
+# osintgpt
+#
+# Author: @estebanpdl
+#
+# File: test_agentic_loop.py
+# Description: The loop the model drives. Three properties matter more than
+#   the mechanics: an empty answer is impossible, the cap is never disclosed,
+#   and a model that cannot call tools still answers.
+# =================================================================================
+
+# import modules
+import json
+import math
+import pytest
+
+# import osintgpt
+from osintgpt import Project, agentic_answer, index_project
+from osintgpt.agentic import MAX_ROUNDS, TOOL_NAMES, TOOL_SPECS, run_tool
+from osintgpt.agentic.tools import ToolContext
+from osintgpt.ingestion import Corpus
+from osintgpt.llm.base import (
+    EmbeddingProvider,
+    EmbeddingPurpose,
+    GenerationProvider
+)
+from osintgpt.llm.calling import ModelTurn, ToolCall, ToolCallingUnsupported
+
+MODEL = 'test-embedding'
+
+
+class WordEmbedder(EmbeddingProvider):
+    model = MODEL
+    VOCABULARY = 'aardvark zebra quokka'.split()
+
+    def embed(self, texts, *, purpose=EmbeddingPurpose.DOCUMENT):
+        return [self._vector(t) for t in texts]
+
+    def _vector(self, text):
+        low = text.lower()
+        counts = [float(low.count(w)) for w in self.VOCABULARY]
+        length = math.sqrt(sum(c * c for c in counts)) or 1.0
+
+        return [c / length for c in counts]
+
+
+class ScriptedModel(GenerationProvider):
+    '''
+    Plays prepared turns in order, and records what it was offered.
+    '''
+
+    model = 'test-generation'
+    supports_tools = True
+
+    def __init__(self, *turns, error=None):
+        self.turns = list(turns)
+        self.error = error
+        self.offered = []
+        self.systems = []
+        self.histories = []
+        # None records a call made without the parameter at all, which is
+        # different from one made with an empty window.
+        self.conversations = []
+
+    def generate(self, system, user, **kwargs):
+        return 'static answer'
+
+    def generate_with_tools(
+        self, system, user, tools, history=None, conversation=None
+    ):
+        if self.error:
+            raise self.error
+
+        self.offered.append([t.name for t in tools])
+        self.systems.append(system)
+        self.histories.append(list(history or []))
+        self.conversations.append(conversation)
+
+        if not self.turns:
+            return ModelTurn(text='ran out of script')
+
+        return self.turns.pop(0)
+
+
+class ToollessModel(GenerationProvider):
+    model = 'small-local-model'
+    supports_tools = False
+
+    def generate(self, system, user, **kwargs):
+        return 'answered without tools'
+
+
+def calls(*names):
+    return ModelTurn(
+        text='',
+        calls=[
+            ToolCall(id=f'c{i}', name=name, arguments=args)
+            for i, (name, args) in enumerate(names)
+        ]
+    )
+
+
+@pytest.fixture
+def embedder():
+    return WordEmbedder()
+
+
+@pytest.fixture
+def project(tmp_path, embedder):
+    instance = Project.create('Case', home=tmp_path)
+    material = instance.paths.root / 'material'
+    material.mkdir()
+    (material / 'alpha.md').write_text(
+        '# Alpha\n\nA report about aardvark sightings near @acct_1.',
+        encoding='utf-8'
+    )
+    Corpus.load(instance.paths.sources).register('material')
+    index_project(instance, embedder)
+
+    return instance
+
+
+class TestAnEmptyAnswerIsImpossible:
+    '''
+    Whatever goes wrong, something is returned. An analyst can act on "the
+    corpus does not cover this"; they cannot act on silence.
+    '''
+
+    def test_a_model_that_cannot_call_tools_still_answers(
+        self, project, embedder
+    ):
+        answer = agentic_answer(project, 'q', embedder, ToollessModel())
+
+        assert answer.text
+        assert answer.degraded
+
+    def test_a_provider_refusing_tools_degrades(self, project, embedder):
+        model = ScriptedModel(error=ToolCallingUnsupported('no tools here'))
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.text
+        assert 'no tools here' in answer.trace.degraded
+
+    def test_a_provider_error_degrades_rather_than_raising(
+        self, project, embedder
+    ):
+        model = ScriptedModel(error=RuntimeError('the endpoint fell over'))
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.text
+        assert 'fell over' in answer.trace.degraded
+
+    def test_a_model_that_calls_forever_still_produces_an_answer(
+        self, project, embedder
+    ):
+        forever = [calls(('semantic_search', {'query': 'aardvark'}))] * 20
+        model = ScriptedModel(*forever)
+
+        answer = agentic_answer(project, 'q', embedder, model, max_rounds=3)
+
+        assert answer.text
+
+    def test_a_final_round_producing_nothing_falls_back(
+        self, project, embedder
+    ):
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='   ')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model, max_rounds=1)
+
+        assert answer.text
+        assert answer.degraded
+
+
+class TestTheCapIsNotDisclosed:
+    '''
+    Knowing a budget invites spending it. The model is told what the tools do
+    and nothing about how many rounds it has.
+    '''
+
+    def test_the_prompt_never_names_a_round_limit(self, project, embedder):
+        model = ScriptedModel(ModelTurn(text='done'))
+        agentic_answer(project, 'q', embedder, model)
+        system = model.systems[0].lower()
+
+        for leak in ('round', 'budget', 'limit of', 'you have', 'attempts'):
+            assert leak not in system
+
+    def test_the_cap_is_a_small_number_of_rounds(self):
+        assert 2 <= MAX_ROUNDS <= 12
+
+
+class TestTheFinalAsk:
+    def test_the_last_request_offers_no_tools(self, project, embedder):
+        '''
+        With nothing left to call, the model must answer from what it has
+        rather than asking for more it cannot get.
+        '''
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='the answer')
+        )
+
+        agentic_answer(project, 'q', embedder, model, max_rounds=1)
+
+        assert model.offered[0]
+        assert model.offered[-1] == []
+
+    def test_it_answers_from_what_it_gathered(self, project, embedder):
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='gathered answer')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model, max_rounds=1)
+
+        assert answer.text == 'gathered answer'
+        assert not answer.degraded
+
+
+class TestStoppingEarly:
+    def test_a_model_that_answers_immediately_is_not_pushed_further(
+        self, project, embedder
+    ):
+        model = ScriptedModel(ModelTurn(text='I already know'))
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.text == 'I already know'
+        assert len(model.offered) == 1
+
+    def test_there_is_no_minimum_number_of_calls(self, project, embedder):
+        model = ScriptedModel(ModelTurn(text='no retrieval needed'))
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.trace.calls == 0
+
+
+class TestConversationContext:
+    '''
+    Earlier turns reach the model so a follow-up has something to resolve
+    against. Without them every question is answered as though it were the
+    first, which is right for a one-shot call and wrong inside a thread.
+    '''
+
+    def test_the_window_reaches_every_round(self, project, embedder):
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='done')
+        )
+        pairs = [('What is alpha?', 'Aardvarks.')]
+
+        agentic_answer(
+            project, 'and the second one?', embedder, model,
+            conversation=pairs
+        )
+
+        assert all(seen == pairs for seen in model.conversations)
+
+    def test_the_final_round_gets_it_too(self, project, embedder):
+        '''
+        The last request is where the answer is actually written, so leaving
+        the conversation out of it loses the context exactly when it matters.
+        '''
+        model = ScriptedModel(
+            *[calls(('list_documents', {}))] * 6,
+            ModelTurn(text='done')
+        )
+        pairs = [('What is alpha?', 'Aardvarks.')]
+
+        agentic_answer(
+            project, 'q', embedder, model, max_rounds=6, conversation=pairs
+        )
+
+        assert len(model.conversations) == 7
+        assert model.conversations[-1] == pairs
+
+    def test_without_one_nothing_is_passed(self, project, embedder):
+        '''
+        A provider written against the earlier signature has no such
+        parameter. Passing it unconditionally would break every caller rather
+        than only the ones using a thread.
+        '''
+        model = ScriptedModel(ModelTurn(text='done'))
+
+        agentic_answer(project, 'q', embedder, model)
+
+        assert model.conversations == [None]
+
+    def test_an_empty_window_passes_nothing(self, project, embedder):
+        model = ScriptedModel(ModelTurn(text='done'))
+
+        agentic_answer(project, 'q', embedder, model, conversation=[])
+
+        assert model.conversations == [None]
+
+    def test_a_provider_from_before_this_still_works(self, project, embedder):
+        '''
+        The guarantee for anyone who wrote their own backend against the
+        published interface.
+        '''
+        class OlderProvider:
+            model = 'older'
+            supports_tools = True
+
+            def generate_with_tools(self, system, user, tools, history=None):
+                return ModelTurn(text='answered')
+
+        answer = agentic_answer(project, 'q', embedder, OlderProvider())
+
+        assert answer.text == 'answered'
+        assert not answer.degraded
+
+
+class TestTheTrace:
+    def test_every_call_is_recorded(self, project, embedder):
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'}),
+                  ('list_documents', {})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.trace.calls == 2
+        assert answer.trace.tools_used == ['semantic_search', 'list_documents']
+
+    def test_a_call_records_its_arguments(self, project, embedder):
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert 'aardvark' in answer.trace.entries[0].label
+
+    def test_each_tool_names_its_own_unit(self, project, embedder):
+        '''
+        Lines, passages and documents are not comparable quantities, and a
+        trace that calls them all "results" reads as though they were.
+        '''
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'}),
+                  ('list_documents', {}),
+                  ('fetch_source', {'ref': 'material/alpha.md'}),
+                  ('exact_search', {'terms': ['aardvark'], 'mode': 'refs'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+        units = {e.tool: e.unit for e in answer.trace.entries}
+
+        assert units == {
+            'semantic_search': 'passage',
+            'list_documents': 'document',
+            'fetch_source': 'line',
+            'exact_search': 'document'
+        }
+
+    def test_a_single_result_is_not_pluralized(self, project, embedder):
+        model = ScriptedModel(
+            calls(('fetch_source', {'ref': 'material/alpha.md', 'limit': 1})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert '1 line,' in answer.trace.entries[0].label
+
+    def test_the_same_tool_can_return_different_units(
+        self, project, embedder
+    ):
+        '''
+        exact_search returns documents in refs mode and passages in snippets
+        mode, so the unit cannot be derived from the tool name.
+        '''
+        model = ScriptedModel(
+            calls(('exact_search', {'terms': ['aardvark'], 'mode': 'refs'}),
+                  ('exact_search', {'terms': ['aardvark'],
+                                    'mode': 'snippets'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert [e.unit for e in answer.trace.entries] == [
+            'document', 'passage'
+        ]
+
+    def test_the_model_s_narration_is_kept(self, project, embedder):
+        speaking = ModelTurn(
+            text='Let me survey first.',
+            calls=[ToolCall(id='c0', name='list_documents', arguments={})]
+        )
+        model = ScriptedModel(speaking, ModelTurn(text='done'))
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert [n.text for n in answer.trace.narration] == [
+            'Let me survey first.'
+        ]
+        assert answer.trace.narration[0].round == 1
+
+    def test_the_answer_is_not_repeated_as_narration(
+        self, project, embedder
+    ):
+        '''
+        The answering turn's text is the answer. Narrating it too prints the
+        whole answer a second time inside the trace, under "How I searched".
+        '''
+        model = ScriptedModel(
+            calls(('list_documents', {})),
+            ModelTurn(text='The corpus says aardvarks.')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.text == 'The corpus says aardvarks.'
+        assert answer.trace.narration == []
+
+    def test_narration_leads_the_calls_it_introduced(
+        self, project, embedder
+    ):
+        '''
+        A turn carries its words and its calls together, so what the model
+        said belongs above them, in its own round.
+        '''
+        model = ScriptedModel(
+            ModelTurn(
+                text='Let me survey first.',
+                calls=[ToolCall(id='c0', name='list_documents', arguments={})]
+            ),
+            ModelTurn(text='done')
+        )
+
+        lines = agentic_answer(project, 'q', embedder, model).trace.lines()
+
+        assert lines[0] == 'round 1'
+        assert lines[1] == '  said: Let me survey first.'
+        assert lines[2].startswith('  list_documents(')
+
+    def test_a_call_records_the_documents_it_touched(
+        self, project, embedder
+    ):
+        '''
+        A trace that says a search found passages but not which documents
+        they came from records that retrieval happened, not what it read.
+        '''
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.trace.entries[0].refs == ('material/alpha.md',)
+
+    def test_a_document_carries_what_the_call_measured(
+        self, project, embedder
+    ):
+        '''
+        The ranking shows only a document's best passage, so without the count
+        beside it a document carrying several is indistinguishable from one
+        that got lucky once.
+        '''
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+        document = answer.trace.entries[0].documents[0]
+
+        assert document.ref == 'material/alpha.md'
+        assert document.passages >= 1
+        assert document.best is not None
+        assert document.scored
+
+    def test_a_document_reached_twice_is_one_entry_counted_twice(
+        self, project, embedder
+    ):
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark', 'limit': 30})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+        documents = answer.trace.entries[0].documents
+        refs = [document.ref for document in documents]
+
+        assert len(refs) == len(set(refs))
+        assert sum(d.passages for d in documents) == answer.trace.entries[0].count
+
+    def test_the_best_score_is_the_first_one_returned(
+        self, project, embedder
+    ):
+        '''
+        Results arrive ranked, so the first passage from a document is its
+        best. Taking any later one would understate the document.
+        '''
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark', 'limit': 30})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+        scores = [
+            d.best for d in answer.trace.entries[0].documents
+            if d.best is not None
+        ]
+
+        assert scores == sorted(scores, reverse=True)
+
+    def test_an_exact_search_records_its_matches_and_terms(
+        self, project, embedder
+    ):
+        model = ScriptedModel(
+            calls(('exact_search', {
+                'terms': ['aardvark', 'unfindable-string'], 'mode': 'refs'
+            })),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+        document = answer.trace.entries[0].documents[0]
+
+        assert document.matches >= 1
+        assert document.terms == ('aardvark',)
+
+    def test_a_listing_is_recorded_without_inventing_measurements(
+        self, project, embedder
+    ):
+        '''
+        A listing reports existence and nothing else. Zeroes here would read
+        as "measured, found nothing", which is a different claim.
+        '''
+        model = ScriptedModel(
+            calls(('list_documents', {})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+        document = answer.trace.entries[0].documents[0]
+
+        assert document.ref == 'material/alpha.md'
+        assert document.best is None
+        assert document.scored is False
+
+    def test_a_listing_of_bare_refs_is_recorded_too(
+        self, project, embedder
+    ):
+        '''
+        list_documents returns refs as plain strings rather than as evidence
+        carrying a ref, so an extractor written for citations skips it — and
+        "which documents did it look at" is exactly what an audit asks.
+        '''
+        model = ScriptedModel(
+            calls(('list_documents', {})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.trace.entries[0].refs == ('material/alpha.md',)
+
+    def test_a_listing_is_not_mistaken_for_a_citation(
+        self, project, embedder
+    ):
+        '''
+        What a call touched and what an answer cites are different questions.
+        A directory listing answers the first and must not answer the second.
+        '''
+        model = ScriptedModel(
+            calls(('list_documents', {})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.trace.entries[0].refs
+        assert answer.sources == []
+
+    def test_a_failed_call_records_no_documents(self, project, embedder):
+        model = ScriptedModel(
+            calls(('fetch_source', {'ref': '../escape.md'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.trace.entries[0].refs == ()
+
+    def test_a_ref_is_shown_by_where_it_ends(self, project, embedder):
+        '''
+        Every ref in a project shares its leading path, so truncating from the
+        right identifies nothing.
+        '''
+        model = ScriptedModel(
+            calls(('fetch_source', {'ref': 'material/alpha.md'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert "ref='material/alpha.md'" in answer.trace.entries[0].label
+
+    def test_a_failing_call_is_recorded_not_raised(self, project, embedder):
+        model = ScriptedModel(
+            calls(('fetch_source', {'ref': '../escape.md'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert answer.trace.failures
+        assert answer.text == 'done'
+
+    def test_the_trace_reads_the_same_shape_whatever_the_provider(
+        self, project, embedder
+    ):
+        '''
+        Nothing provider-shaped reaches the trace, so one can be compared
+        against another.
+        '''
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+        lines = answer.trace.lines()
+
+        assert lines[0] == 'round 1'
+        assert 'semantic_search' in lines[1]
+
+    def test_it_says_when_the_static_pipeline_answered(
+        self, project, embedder
+    ):
+        answer = agentic_answer(project, 'q', embedder, ToollessModel())
+
+        assert 'Static pipeline' in ' '.join(answer.trace.reading)
+
+
+class TestToolResultsReachTheModel:
+    def test_a_result_comes_back_as_json(self, project, embedder):
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='done')
+        )
+        agentic_answer(project, 'q', embedder, model)
+
+        exchange = model.histories[-1][0]
+        payload = json.loads(list(exchange.results.values())[0])
+
+        assert 'passages' in payload
+
+    def test_an_error_comes_back_as_an_error_the_model_can_read(
+        self, project, embedder
+    ):
+        model = ScriptedModel(
+            calls(('no_such_tool', {})),
+            ModelTurn(text='done')
+        )
+        agentic_answer(project, 'q', embedder, model)
+
+        payload = json.loads(
+            list(model.histories[-1][0].results.values())[0]
+        )
+
+        assert 'no tool named' in payload['error']
+
+    def test_sources_are_gathered_from_what_the_tools_returned(
+        self, project, embedder
+    ):
+        model = ScriptedModel(
+            calls(('semantic_search', {'query': 'aardvark'})),
+            ModelTurn(text='done')
+        )
+
+        answer = agentic_answer(project, 'q', embedder, model)
+
+        assert any('alpha' in ref for ref in answer.sources)
+
+
+class TestTheRegistry:
+    def test_every_tool_has_a_handler(self, project, embedder):
+        context = ToolContext(project=project, embedder=embedder)
+
+        for name in TOOL_NAMES:
+            assert 'no tool named' not in (
+                run_tool(context, name, _minimal(name)).error or ''
+            )
+
+    def test_an_unknown_tool_reports_rather_than_raises(
+        self, project, embedder
+    ):
+        context = ToolContext(project=project, embedder=embedder)
+
+        result = run_tool(context, 'invented', {})
+
+        assert 'no tool named' in result.error
+
+    def test_a_wrong_argument_reports_rather_than_raises(
+        self, project, embedder
+    ):
+        '''
+        The model can read the problem and correct itself; a raised error
+        would end the round.
+        '''
+        context = ToolContext(project=project, embedder=embedder)
+
+        result = run_tool(context, 'semantic_search', {'nonsense': 1})
+
+        assert 'could not be called that way' in result.error
+
+    def test_a_bug_inside_a_tool_is_not_blamed_on_the_call(
+        self, project, embedder, monkeypatch
+    ):
+        '''
+        A TypeError raised inside a tool reported as a bad call sends the
+        model retrying arguments that were never the problem.
+        '''
+        from osintgpt.agentic import registry
+
+        def broken(context, query):
+            raise TypeError('internal')
+
+        monkeypatch.setitem(registry._HANDLERS, 'semantic_search', broken)
+        context = ToolContext(project=project, embedder=embedder)
+
+        with pytest.raises(TypeError, match='internal'):
+            run_tool(context, 'semantic_search', {'query': 'q'})
+
+    def test_no_search_tool_offers_a_days_filter(self):
+        for spec in TOOL_SPECS:
+            assert 'days' not in spec.parameters['properties']
+
+    def test_the_survey_mode_is_offered_in_the_schema(self):
+        spec = next(s for s in TOOL_SPECS if s.name == 'exact_search')
+
+        assert 'refs' in spec.parameters['properties']['mode']['enum']
+
+    def test_every_provider_is_offered_the_same_tools(self):
+        '''
+        Answer quality must not depend on which vendor was picked, so there is
+        one table rather than a set per provider.
+        '''
+        assert len(TOOL_SPECS) == len(TOOL_NAMES) == 6
+
+
+class TestTheSystemPrompt:
+    def test_it_teaches_surveying_before_reading(self, project, embedder):
+        model = ScriptedModel(ModelTurn(text='done'))
+        agentic_answer(project, 'q', embedder, model)
+
+        assert 'Survey before you read' in model.systems[0]
+
+    def test_it_carries_today_s_date(self, project, embedder):
+        from datetime import date
+
+        model = ScriptedModel(ModelTurn(text='done'))
+        agentic_answer(project, 'q', embedder, model)
+
+        assert date.today().isoformat() in model.systems[0]
+
+    def test_it_names_no_language(self, project, embedder):
+        model = ScriptedModel(ModelTurn(text='done'))
+        agentic_answer(project, 'q', embedder, model)
+        system = model.systems[0].lower()
+
+        for language in ('english', 'spanish', 'in english'):
+            assert language not in system
+
+
+def _minimal(name):
+    return {
+        'semantic_search': {'query': 'x'},
+        'exact_search': {'terms': ['x']},
+        'list_documents': {},
+        'snowball': {'query': 'x', 'depth': 1},
+        'graph_query': {'entity': 'x'},
+        'fetch_source': {'ref': 'material/alpha.md'}
+    }[name]

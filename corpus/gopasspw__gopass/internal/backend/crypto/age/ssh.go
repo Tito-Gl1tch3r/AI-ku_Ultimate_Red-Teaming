@@ -1,0 +1,250 @@
+package age
+
+import (
+	"context"
+	"crypto"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"filippo.io/age"
+	"filippo.io/age/agessh"
+	"github.com/gopasspw/gopass/pkg/appdir"
+	"github.com/gopasspw/gopass/pkg/debug"
+	"github.com/gopasspw/gopass/pkg/fsutil"
+	"golang.org/x/crypto/ssh"
+)
+
+var (
+	sshCache   map[string]age.Identity
+	sshCacheMu sync.RWMutex
+	// ErrNoSSHDir signals that no SSH dir was found. Callers
+	// are usually expected to ignore this.
+	ErrNoSSHDir = errors.New("no ssh directory")
+)
+
+// agentSSHIdentity wraps an encrypted SSH identity and retains a temporary,
+// unencrypted OpenSSH encoding only after that identity successfully unwraps a
+// file key. This lets the caller transfer the unlocked identity to the age
+// agent without prompting for unrelated SSH keys.
+type agentSSHIdentity struct {
+	inner *agessh.EncryptedSSHIdentity
+
+	mux        sync.Mutex
+	privateKey crypto.PrivateKey
+	used       bool
+}
+
+func (i *agentSSHIdentity) Recipient() age.Recipient {
+	return i.inner.Recipient()
+}
+
+func (i *agentSSHIdentity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
+	fileKey, err := i.inner.Unwrap(stanzas)
+	if err != nil {
+		i.mux.Lock()
+		i.privateKey = nil
+		i.mux.Unlock()
+
+		return nil, err
+	}
+
+	i.mux.Lock()
+	i.used = true
+	i.mux.Unlock()
+
+	return fileKey, nil
+}
+
+// takePrivateKey returns the temporary OpenSSH encoding after this identity
+// was used successfully. Ownership of the returned slice passes to the caller;
+// the wrapper drops its reference so the transfer material can be cleared as
+// soon as the agent request completes.
+func (i *agentSSHIdentity) takePrivateKey() ([]byte, error) {
+	i.mux.Lock()
+	defer i.mux.Unlock()
+
+	if !i.used || i.privateKey == nil {
+		return nil, nil
+	}
+
+	privateKey := i.privateKey
+	i.privateKey = nil
+
+	block, err := ssh.MarshalPrivateKey(privateKey, "gopass age agent")
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize unlocked SSH identity: %w", err)
+	}
+
+	return pem.EncodeToMemory(block), nil
+}
+
+func (i *agentSSHIdentity) cachePrivateKey(privateKey crypto.PrivateKey) {
+	i.mux.Lock()
+	i.privateKey = privateKey
+	i.mux.Unlock()
+}
+
+// getSSHIdentities returns all SSH identities available for the current user.
+func (a *Age) getSSHIdentities(ctx context.Context) (map[string]age.Identity, error) {
+	sshCacheMu.Lock()
+	defer sshCacheMu.Unlock()
+	// Re-check after acquiring the write lock (another goroutine may have
+	// populated the cache between the RUnlock and Lock above).
+	if sshCache != nil {
+		debug.Log("using sshCache")
+
+		return sshCache, nil
+	}
+
+	ids := make(map[string]age.Identity, 10) // preallocate some space for the cache
+	sshDirs := make([]string, 0, 2)
+
+	if a.loadSSHKeys {
+		sshDir, err := getSSHDir()
+		if err != nil {
+			debug.Log("no .ssh directory found at %s.", sshDir)
+		}
+		if sshDir != "" {
+			debug.Log("found .ssh directory at %s", sshDir)
+			sshDirs = append(sshDirs, sshDir)
+		}
+	} else {
+		debug.Log("not loading keys from default SSH dir")
+	}
+
+	// also check the SSH key path, if set
+	if a.sshKeyPath != "" { //nolint:nestif
+		debug.Log("using custom SSH key path %s", a.sshKeyPath)
+		if fsutil.IsDir(a.sshKeyPath) {
+			sshDirs = append(sshDirs, a.sshKeyPath)
+		} else if fsutil.IsFile(a.sshKeyPath) {
+			debug.Log("using custom SSH key file %s", a.sshKeyPath)
+			recp, id, err := a.parseSSHIdentity(ctx, a.sshKeyPath)
+			if err != nil {
+				debug.Log("unable to parse custom SSH key %s: %s", a.sshKeyPath, err)
+			} else {
+				debug.Log("found custom SSH identity %s", recp)
+				ids[recp] = id
+			}
+		}
+	}
+
+	if len(sshDirs) < 1 {
+		return nil, fmt.Errorf("no SSH identities found: %w", ErrNoSSHDir)
+	}
+
+	debug.Log("searching for SSH identities in %d directories: %s", len(sshDirs), strings.Join(sshDirs, ", "))
+
+	for _, sshDir := range sshDirs {
+		debug.Log("searching for SSH identities in %s", sshDir)
+		files, err := os.ReadDir(sshDir)
+		if err != nil {
+			debug.Log("unable to read SSH keys from dir %s: %s", sshDir, err)
+
+			return nil, fmt.Errorf("no identities found: %w", ErrNoSSHDir)
+		}
+
+		for _, file := range files {
+			fn := filepath.Join(sshDir, file.Name())
+			if !strings.HasSuffix(fn, ".pub") {
+				continue
+			}
+
+			recp, id, err := a.parseSSHIdentity(ctx, fn)
+			if err != nil {
+				continue
+			}
+
+			ids[recp] = id
+		}
+	}
+	sshCache = ids
+	debug.Log("returned %d SSH Identities", len(ids))
+
+	return ids, nil
+}
+
+func getSSHDir() (string, error) {
+	preferredPath := os.Getenv("GOPASS_SSH_DIR")
+	sshDir := filepath.Join(preferredPath, ".ssh")
+	if preferredPath != "" && fsutil.IsDir(sshDir) {
+		return preferredPath, nil
+	}
+
+	// notice that this respects the GOPASS_HOMEDIR env variable, and won't
+	// find a .ssh folder in your home directory if you set GOPASS_HOMEDIR
+	uhd := appdir.UserHome()
+	sshDir = filepath.Join(uhd, ".ssh")
+	if fsutil.IsDir(sshDir) {
+		return sshDir, nil
+	}
+
+	return "", ErrNoSSHDir
+}
+
+// parseSSHIdentity parses a SSH public key file and returns the recipient and the identity.
+func (a *Age) parseSSHIdentity(ctx context.Context, pubFn string) (string, age.Identity, error) {
+	privFn := strings.TrimSuffix(pubFn, ".pub")
+	_, err := os.Stat(privFn)
+	if err != nil {
+		return "", nil, err
+	}
+
+	pubBuf, err := os.ReadFile(pubFn)
+	if err != nil {
+		return "", nil, err
+	}
+
+	privBuf, err := os.ReadFile(privFn)
+	if err != nil {
+		return "", nil, err
+	}
+
+	pubkey, _, _, _, err := ssh.ParseAuthorizedKey(pubBuf) //nolint:dogsled
+	if err != nil {
+		return "", nil, err
+	}
+
+	recp := strings.TrimSuffix(string(ssh.MarshalAuthorizedKey(pubkey)), "\n")
+	id, err := agessh.ParseIdentity(privBuf)
+	if err == nil {
+		return recp, id, nil
+	}
+
+	var perr *ssh.PassphraseMissingError
+	if !errors.As(err, &perr) {
+		return "", nil, err
+	}
+
+	id, err = a.newAgentSSHIdentity(ctx, pubFn, pubkey, privBuf)
+
+	return recp, id, err
+}
+
+func (a *Age) newAgentSSHIdentity(ctx context.Context, pubFn string, pubkey ssh.PublicKey, privBuf []byte) (age.Identity, error) {
+	var wrapped *agentSSHIdentity
+	encrypted, err := agessh.NewEncryptedSSHIdentity(pubkey, privBuf, func() ([]byte, error) {
+		passphrase, err := a.effectivePwCallback(ctx, fmt.Sprintf("to unlock the SSH key %s", pubFn))(pubFn, false)
+		if err != nil {
+			return nil, err
+		}
+
+		privateKey, err := ssh.ParseRawPrivateKeyWithPassphrase(privBuf, passphrase)
+		if err == nil {
+			wrapped.cachePrivateKey(privateKey)
+		}
+
+		return passphrase, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	wrapped = &agentSSHIdentity{inner: encrypted}
+
+	return wrapped, nil
+}

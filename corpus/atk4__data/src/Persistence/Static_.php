@@ -1,0 +1,164 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Atk4\Data\Persistence;
+
+use Atk4\Data\Model;
+
+/**
+ * Implements a very basic array-access pattern:.
+ *
+ * $m = new Model(Persistence\Static_(['hello', 'world']));
+ * $m->load(1);
+ *
+ * echo $m->get('name'); // world
+ */
+class Static_ extends Array_
+{
+    /** @var string This will be the title field for the model. */
+    public ?string $titleFieldForModel = null;
+
+    /** @var array<string, array<mixed>> Populate the following fields for the model. */
+    public array $fieldsForModel;
+
+    /**
+     * @param array<int|string, mixed> $data
+     */
+    public function __construct(array $data = [])
+    {
+        if (count($data) > 0 && !is_array(array_first($data))) {
+            $dataOrig = $data;
+            $data = [];
+            foreach ($dataOrig as $k => $v) {
+                $data[] = ['id' => $k, 'name' => $v];
+            }
+        }
+
+        // detect types from values
+        $fieldTypes = [];
+        foreach ($data as $row) {
+            foreach ($row as $k => $v) {
+                if (isset($fieldTypes[$k])) {
+                    continue;
+                }
+
+                if (is_bool($v)) {
+                    $type = 'boolean';
+                } elseif (is_int($v)) {
+                    $type = 'bigint';
+                } elseif (is_float($v)) {
+                    $type = 'float';
+                } elseif (is_array($v)) {
+                    $type = 'json';
+                } elseif ($v instanceof \DateTimeInterface) {
+                    $type = 'datetime';
+                } elseif (is_object($v)) {
+                    $type = 'object';
+                } elseif ($v !== null) {
+                    $type = 'string';
+                } else {
+                    $type = null;
+                }
+
+                $fieldTypes[$k] = $type;
+            }
+        }
+        foreach ($fieldTypes as $k => $type) {
+            if ($type === null) {
+                $fieldTypes[$k] = 'string';
+            }
+        }
+
+        if (isset($fieldTypes['name'])) {
+            $this->titleFieldForModel = 'name';
+        } elseif (isset($fieldTypes['title'])) {
+            $this->titleFieldForModel = 'title';
+        }
+
+        $defTypes = [];
+        $keyOverride = [];
+        $mustOverride = false;
+        foreach ($fieldTypes as $k => $type) {
+            $defTypes[$k] = ['type' => $type];
+
+            // id information present, use it instead
+            if ($k === 'id') {
+                $mustOverride = true;
+            }
+
+            // if title is not set, use first key
+            if ($this->titleFieldForModel === null) {
+                if (is_int($k)) {
+                    $keyOverride[$k] = 'name';
+                    $this->titleFieldForModel = 'name';
+                    $mustOverride = true;
+
+                    continue;
+                }
+
+                $this->titleFieldForModel = $k;
+            }
+
+            if (is_int($k)) {
+                $keyOverride[$k] = 'field' . $k;
+                $mustOverride = true;
+            } else {
+                $keyOverride[$k] = $k;
+            }
+        }
+
+        if ($mustOverride) {
+            $dataOrig = $data;
+            $data = [];
+            foreach ($dataOrig as $k => $row) {
+                $row = array_combine($keyOverride, $row);
+                if (isset($row['id'])) {
+                    $k = $row['id'];
+                }
+                $data[$k] = $row;
+            }
+        }
+
+        $this->fieldsForModel = array_combine($keyOverride, $defTypes);
+
+        parent::__construct($data);
+    }
+
+    #[\Override]
+    public function add(Model $model, array $defaults = []): void
+    {
+        if ($model->idField && !$model->hasField($model->idField)) {
+            // init model, but prevent array persistence data seeding, id field with correct type must be setup first
+            get_parent_class(parent::class)::add($model, $defaults);
+            \Closure::bind(static function () use ($model) {
+                $model->_persistence = null;
+            }, null, Model::class)();
+
+            if (isset($this->fieldsForModel[$model->idField])) {
+                $model->getIdField()->type = $this->fieldsForModel[$model->idField]['type'];
+            }
+        }
+        $this->addMissingFieldsToModel($model);
+
+        parent::add($model, $defaults);
+    }
+
+    /**
+     * Automatically adds missing model fields.
+     */
+    protected function addMissingFieldsToModel(Model $model): void
+    {
+        if ($this->titleFieldForModel !== null) {
+            $model->titleField = $this->titleFieldForModel;
+        }
+
+        foreach ($this->fieldsForModel as $field => $def) {
+            if ($model->hasField($field)) {
+                continue;
+            }
+
+            $model->addField($field, $def);
+        }
+    }
+}

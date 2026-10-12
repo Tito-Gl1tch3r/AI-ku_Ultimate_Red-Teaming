@@ -1,0 +1,84 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+// Browser-free CLI plumbing tests: arg parsing, exit codes, help output. These
+// run before any extraction, so they need no browser. Import resolution is now
+// covered by tsc/build (an unresolved import fails compilation), so there is no
+// separate runtime module-load test here.
+
+const indexJs = fileURLToPath(new URL('../index.js', import.meta.url));
+
+function run(args, opts = {}) {
+  return spawnSync('node', [indexJs, ...args], { encoding: 'utf8', ...opts });
+}
+
+test('--version exits 0 and prints a semver', () => {
+  const r = run(['--version']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+/);
+});
+
+test('--help exits 0 and shows the extraction usage', () => {
+  const r = run(['--help']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /Extract design tokens/);
+  assert.match(r.stdout, /--dtcg/);
+});
+
+test('--tailwind is documented with its optional path', () => {
+  const r = run(['--help']);
+  assert.equal(r.status, 0);
+  // The path is optional: bare --tailwind writes output/<domain>/theme.css.
+  // Documenting it as required would send users to a nonexistent default.
+  assert.match(r.stdout, /--tailwind \[path\]/);
+});
+
+test('reveal is standard (no enable flag exposed)', () => {
+  const r = run(['--help']);
+  assert.equal(r.status, 0);
+  // Reveal runs by default; there must be no --menus/--reveal opt-in flag.
+  assert.doesNotMatch(r.stdout, /--menus|--reveal\b/);
+});
+
+test('the missing-engine hint names the engine so the fix actually applies', async () => {
+  const { PlaywrightMissingError } = await import('../lib/browser.js');
+  // install-browser defaults to chromium, so a bare hint sends a firefox user
+  // to a command that reinstalls chromium and leaves the same error standing.
+  assert.match(new PlaywrightMissingError('firefox').message, /install-browser firefox/);
+  assert.match(new PlaywrightMissingError().message, /install-browser chromium/);
+});
+
+test('a missing browser binary is told apart from a missing module', async () => {
+  const { isMissingBrowserBinary } = await import('../lib/browser.js');
+  // The two failures read alike and need opposite fixes: a missing binary is
+  // recoverable by installing it mid-run, a missing module is not. Playwright
+  // exposes no code for the first, so this matches its message.
+  assert.equal(isMissingBrowserBinary(new Error("Executable doesn't exist at /x/y")), true);
+  assert.equal(isMissingBrowserBinary(new Error("Cannot find module 'playwright-core'")), false);
+  assert.equal(isMissingBrowserBinary(null), false);
+  assert.equal(isMissingBrowserBinary(undefined), false);
+  assert.equal(isMissingBrowserBinary({}), false);
+});
+
+test('--color-format rejects an unknown notation with the valid values listed', () => {
+  const r = run(['dembrandt.com', '--color-format=hsl']);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /--color-format/);
+  for (const f of ['hex', 'rgb', 'oklch', 'lch', 'source']) {
+    assert.ok(r.stderr.includes(f), `${f} missing from the error: ${r.stderr}`);
+  }
+});
+
+test('--color-format appears in --help with its accepted values', () => {
+  const r = run(['--help']);
+  assert.match(r.stdout, /--color-format/);
+  assert.match(r.stdout, /hex\|rgb\|oklch\|lch\|source/);
+});
+
+test('--color-format is case-insensitive', () => {
+  // Validation lowercases before the check, so OKLCH must not be a hard error.
+  const r = run(['--color-format=OKLCH', '--help']);
+  assert.equal(r.status, 0);
+});

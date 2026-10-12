@@ -1,0 +1,198 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+#  king_phisher/server/build.py
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions are
+#  met:
+#
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above
+#    copyright notice, this list of conditions and the following disclaimer
+#    in the documentation and/or other materials provided with the
+#    distribution.
+#  * Neither the name of the project nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+#  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+#  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+#  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+#  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+#  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+import collections
+import logging
+import os
+import socket
+
+from king_phisher import errors
+from king_phisher.server import letsencrypt
+from king_phisher.server import signals
+from king_phisher.server.server import KingPhisherRequestHandler, KingPhisherServer
+
+import advancedhttpserver
+
+logger = logging.getLogger('KingPhisher.Server.build')
+
+_BindAddress = collections.namedtuple('_BindAddress', ('address', 'port', 'ssl'))
+def get_bind_addresses(config):
+	"""
+	Retrieve the addresses on which the server should bind to. Each of these
+	addresses should be an IP address, port and optionally enable SSL. The
+	returned list will contain tuples for each address found in the
+	configuration. These tuples will be in the (host, port, use_ssl) format that
+	is compatible with AdvancedHTTPServer.
+
+	:param config: Configuration to retrieve settings from.
+	:type config: :py:class:`smoke_zephyr.configuration.Configuration`
+	:return: The specified addresses to bind to.
+	:rtype: list
+	"""
+	addresses = []
+	for entry, address in enumerate(config.get('server.addresses')):
+		port = address['port']
+		if not (0 <= port <= 0xffff):
+			logger.critical("setting server.addresses[{0}] invalid port specified".format(entry))
+			raise errors.KingPhisherError("invalid port configuration for address #{0}".format(entry + 1))
+		addresses.append(_BindAddress(address['host'], port, address.get('ssl', False)))
+
+	for host, port, use_ssl in addresses:
+		if port in (443, 8443) and not use_ssl:
+			logger.warning("running on port {0} without ssl, this is generally unintended behaviour".format(port))
+		elif port in (80, 8080) and use_ssl:
+			logger.warning("running on port {0} with ssl, this is generally unintended behaviour".format(port))
+	return addresses
+
+def get_ssl_hostnames(config):
+	"""
+	Retrieve the SSL hosts that are specified within the configuration. This
+	also ensures that the settings appear to be valid by ensuring that the
+	necessary files are defined and readable.
+
+	:param config: Configuration to retrieve settings from.
+	:type config: :py:class:`smoke_zephyr.configuration.Configuration`
+	:return: The specified SSH hosts.
+	:rtype: list
+	"""
+	ssl_hostnames = []
+	for entry, ssl_host in enumerate(config.get_if_exists('server.ssl_hosts', [])):
+		hostname = ssl_host.get('host')
+		if hostname is None:
+			logger.critical("setting server.ssl_hosts[{0}] host not specified".format(entry))
+			raise errors.KingPhisherError("invalid ssl host configuration #{0}, host must be specified".format(entry + 1))
+		ssl_certfile = ssl_host.get('ssl_cert')
+		if ssl_certfile is None:
+			logger.critical("setting server.ssl_hosts[{0}] cert file not specified".format(entry))
+			raise errors.KingPhisherError("invalid ssl host configuration #{0}, missing certificate file".format(entry + 1))
+		if not os.access(ssl_certfile, os.R_OK):
+			logger.critical("setting server.ssl_hosts[{0}] file '{1}' not found".format(entry, ssl_certfile))
+			raise errors.KingPhisherError("invalid ssl host configuration #{0}, missing certificate file".format(entry + 1))
+		ssl_keyfile = ssl_host.get('ssl_key')
+		if ssl_keyfile is not None and not os.access(ssl_keyfile, os.R_OK):
+			logger.critical("setting server.ssl_hosts[{0}] file '{1}' not found".format(entry, ssl_keyfile))
+			raise errors.KingPhisherError("invalid ssl host configuration #{0}, missing key file".format(entry + 1))
+		ssl_hostnames.append(advancedhttpserver.SSLSNICertificate(hostname, ssl_certfile, ssl_keyfile))
+	return ssl_hostnames
+
+def _server_add_sni_cert(server, hostname, sni_config):
+	if not os.path.isfile(sni_config.certfile):
+		logger.warning("skipping ssl configuration for hostname: {} (missing certificate file: {})".format(hostname, sni_config.certfile))
+		return False
+	if not os.access(sni_config.certfile, os.R_OK):
+		logger.warning("skipping ssl configuration for hostname: {} (unreadable certificate file: {})".format(hostname, sni_config.certfile))
+		return False
+	if not os.path.isfile(sni_config.keyfile):
+		logger.warning("skipping ssl configuration for hostname: {} (missing key file: {})".format(hostname, sni_config.keyfile))
+		return False
+	if not os.access(sni_config.keyfile, os.R_OK):
+		logger.warning("skipping ssl configuration for hostname: {} (unreadable key file: {})".format(hostname, sni_config.keyfile))
+		return False
+	logger.info("setting configuration for ssl hostname: {0} with certificate file: {1}".format(hostname, sni_config.certfile))
+	server.add_sni_cert(hostname, ssl_certfile=sni_config.certfile, ssl_keyfile=sni_config.keyfile)
+	return True
+
+def server_from_config(config, handler_klass=None, plugin_manager=None):
+	"""
+	Build a server from a provided configuration instance. If *handler_klass* is
+	specified, then the object must inherit from the corresponding
+	KingPhisherServer base class.
+
+	:param config: Configuration to retrieve settings from.
+	:type config: :py:class:`smoke_zephyr.configuration.Configuration`
+	:param handler_klass: Alternative handler class to use.
+	:type handler_klass: :py:class:`.KingPhisherRequestHandler`
+	:param plugin_manager: The server's plugin manager instance.
+	:type plugin_manager: :py:class:`~king_phisher.server.plugins.ServerPluginManager`
+	:return: A configured server instance.
+	:rtype: :py:class:`.KingPhisherServer`
+	"""
+	handler_klass = (handler_klass or KingPhisherRequestHandler)
+	addresses = get_bind_addresses(config)
+
+	if not len(addresses):
+		raise errors.KingPhisherError('at least one address to listen on must be specified')
+
+	ssl_certfile = None
+	ssl_keyfile = None
+	if config.has_option('server.ssl_cert'):
+		ssl_certfile = config.get('server.ssl_cert')
+		if not os.access(ssl_certfile, os.R_OK):
+			logger.critical("setting server.ssl_cert file '{0}' not found".format(ssl_certfile))
+			raise errors.KingPhisherError('invalid ssl configuration, missing certificate file')
+		logger.info("using default ssl cert file '{0}'".format(ssl_certfile))
+		if config.has_option('server.ssl_key'):
+			ssl_keyfile = config.get('server.ssl_key')
+			if not os.access(ssl_keyfile, os.R_OK):
+				logger.critical("setting server.ssl_key file '{0}' not found".format(ssl_keyfile))
+				raise errors.KingPhisherError('invalid ssl configuration, missing key file')
+
+	if any([address.ssl for address in addresses]):
+		ssl_hostnames = get_ssl_hostnames(config)
+		if ssl_certfile is None:
+			if not ssl_hostnames:
+				raise errors.KingPhisherError('an ssl certificate must be specified when ssl is enabled')
+			sni_config = ssl_hostnames[0]
+			logger.warning('no default certificate file was specified, using ssl host configuration: ' + sni_config.hostname)
+			ssl_certfile = sni_config.certfile
+			ssl_keyfile = sni_config.keyfile
+	else:
+		ssl_certfile = None
+		ssl_keyfile = None
+		ssl_hostnames = []
+
+	try:
+		server = KingPhisherServer(config, plugin_manager, handler_klass, addresses=addresses, ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
+	except socket.error as error:
+		error_number, error_message = error.args
+		error_message = "socket error #{0} ({1})".format((error_number or 'NOT-SET'), error_message)
+		if error_number == 98:
+			logger.error('failed to bind server to address (socket error #98)')
+		logger.error(error_message, exc_info=True)
+		raise errors.KingPhisherError(error_message) from None
+	if config.has_option('server.server_header'):
+		server.server_version = config.get('server.server_header')
+		logger.info("setting the server version to the custom header: '{0}'".format(config.get('server.server_header')))
+
+	for hostname, ssl_certfile, ssl_keyfile in ssl_hostnames:
+		sni_config = letsencrypt.get_sni_hostname_config(hostname, config)
+		if sni_config is None:
+			letsencrypt.set_sni_hostname(hostname, ssl_certfile, ssl_keyfile, enabled=True)
+
+	for hostname, sni_config in letsencrypt.get_sni_hostnames(config, check_files=False).items():
+		if not sni_config.enabled:
+			continue
+		if not _server_add_sni_cert(server, hostname, sni_config):
+			letsencrypt.set_sni_hostname(hostname, sni_config.certfile, sni_config.keyfile, enabled=False)
+
+	signals.server_initialized.send(server)
+	return server

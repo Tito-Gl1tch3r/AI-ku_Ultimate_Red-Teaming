@@ -1,0 +1,830 @@
+import copy
+import dataclasses
+import enum
+import functools
+import hashlib
+import json
+import os
+import shutil
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Generator, List, Optional, Type
+
+from karton.core import Task
+from pydantic import BaseModel
+from sqlalchemy import (  # type: ignore
+    JSON,
+    Boolean,
+    Column,
+    Computed,
+    DateTime,
+    Enum,
+    Index,
+    Integer,
+    String,
+    and_,
+    create_engine,
+    delete,
+    func,
+    or_,
+)
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.orm import declarative_base, sessionmaker  # type: ignore
+from sqlalchemy.orm.exc import NoResultFound
+from sqlalchemy.sql.expression import select, text
+from sqlalchemy.types import TypeDecorator
+
+from artemis.binds import TaskStatus
+from artemis.config import Config
+from artemis.json_utils import JSONEncoderAdditionalTypes
+from artemis.reporting.base.language import Language
+from artemis.task_utils import get_task_target
+from artemis.utils import build_logger
+
+
+@dataclasses.dataclass
+class ColumnOrdering:
+    column_name: str
+    ascending: bool
+
+
+class TaskFilter(str, enum.Enum):
+    INTERESTING = "interesting"
+
+    def as_dict(self) -> Dict[str, Any]:
+        if self.value == TaskFilter.INTERESTING.value:
+            return {"status": "INTERESTING"}
+        else:
+            assert False
+
+
+Base = declarative_base()
+
+
+class TSVector(TypeDecorator):  # type: ignore
+    impl = TSVECTOR
+
+
+class TaskPriority(enum.Enum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
+class ModuleStartedTask(Base):  # type: ignore
+    """Tracks which tasks have already been started by each module, for per-module deduplication."""
+
+    __tablename__ = "module_started_task"
+    module_identity = Column(String, primary_key=True)
+    analysis_id = Column(String, primary_key=True)
+    # The purpose of this column is to be able to quickly find identical scheduled tasks. Therefore
+    # we convert them to a string form (created by the
+    # _get_task_deduplication_data method) and store the hash of the string in the indexed
+    # deduplication_data column (because PostgreSQL limits the max length of indexed column).
+    deduplication_data = Column(String, primary_key=True)
+    created_at = Column(DateTime, server_default=text("NOW()"))
+
+
+class Analysis(Base):  # type: ignore
+    """
+    Represents an analysis entry in the Artemis system.
+    An analysis is a scan of an entered domain and can consist of multiple :class:`~artemis.db.TaskResult`.
+
+    :ivar id: Unique identifier for the analysis.
+    :ivar created_at: Timestamp when the analysis was created.
+    :ivar target: Target of the analysis (e.g., domain, IP).
+    :ivar tag: Tag associated with the analysis.
+    :ivar stopped: Whether the analysis has been stopped.
+    :ivar disabled_modules: Comma-separated list of disabled modules for this analysis.
+    :ivar priority: Priority of tasks created by the analysis.
+    :ivar desired_priority: Target priority of tasks. If different to `priority`, Artemis will try to reprioritize `Analysis`.
+    """
+
+    __tablename__ = "analysis"
+    id = Column(String, primary_key=True)
+    created_at = Column(DateTime, server_default=text("NOW()"))
+    target = Column(String, index=True)
+    tag = Column(String, index=True)
+    stopped = Column(Boolean, index=True)
+    disabled_modules = Column(String, index=True)  # comma-separated
+    priority = Column(Enum(TaskPriority, values_callable=lambda obj: [e.value for e in obj]))
+    desired_priority = Column(Enum(TaskPriority, values_callable=lambda obj: [e.value for e in obj]))
+
+    fulltext = Column(
+        TSVector(),
+        Computed("to_tsvector('english', COALESCE(tag, '') || ' ' || COALESCE(target, ''))", persisted=True),
+    )
+
+    __table_args__ = (Index("analysis_fulltext", fulltext, postgresql_using="gin"),)
+
+
+class TaskResult(Base):  # type: ignore
+    """
+    Stores the result of a Karton :class:`~karton.core.task.Task` execution.
+
+    :ivar id: Unique identifier for the task result.
+    :ivar analysis_id: Identifier of the related analysis.
+    :ivar created_at: Timestamp when the result was created.
+    :ivar status: :class:`~artemis.binds.TaskStatus` (e.g., OK, ERROR, INTERESTING).
+    :ivar tag: Tag associated with the result.
+    :ivar receiver: Receiver module for the task.
+    :ivar target_string: Target string for the result.
+    :ivar status_reason: Reason for the status.
+    :ivar headers_string: String of all headers for searching.
+    :ivar logs: Logs associated with the task.
+    :ivar task: JSON representation of the original task.
+    :ivar result: JSON representation of the result data.
+    :ivar additional_info: JSON representation of the additional data that can be saved
+    """
+
+    __tablename__ = "task_result"
+    id = Column(String, primary_key=True)
+    analysis_id = Column(String, index=True)
+    created_at = Column(DateTime, server_default=text("NOW()"))
+    status = Column(String, index=True)
+    tag = Column(String, index=True)
+    receiver = Column(String, index=True)
+    target_string = Column(String, index=True)
+    status_reason = Column(String)
+    headers_string = Column(String)
+    logs = Column(String)
+    task = Column(JSON)
+    result = Column(JSON)
+    additional_info = Column(JSONB)
+
+    fulltext = Column(
+        TSVector(),
+        Computed(
+            "to_tsvector('english', COALESCE(status, '') || ' ' || COALESCE(tag, '') || ' ' || COALESCE(target_string, '') || "
+            "' ' || COALESCE(headers_string, '') || ' ' || COALESCE(status_reason, ''))",
+            persisted=True,
+        ),
+    )
+
+    __table_args__ = (Index("task_result_fulltext", fulltext, postgresql_using="gin"),)
+
+
+class ReportGenerationTaskStatus(str, enum.Enum):
+    PENDING = "pending"
+    DONE = "done"
+    FAILED = "failed"
+
+
+class ReportGenerationTask(Base):  # type: ignore
+    """
+    Represents a report generation task in the Artemis system.
+    For more information on report generation, see :ref:`generating-reports`
+
+    :ivar id: Unique identifier for the report generation task.
+    :ivar created_at: Timestamp when the report generation task was created.
+    :ivar comment: Optional comment for the task.
+    :ivar status: Status of the report generation task.
+    :ivar tag: Optional tag for the task.
+    :ivar language: Language for the report.
+    :ivar skip_previously_exported: Whether to skip previously exported reports.
+    :ivar skip_hooks: Whether to skip hooks during report generation.
+    :ivar skip_suspicious_reports: Whether to skip suspicious reports.
+    :ivar custom_template_arguments: Custom arguments for the report template.
+    :ivar output_location: Output location for the report.
+    :ivar error: Error message, if any.
+    :ivar alerts: Alerts associated with the report generation task.
+    """
+
+    __tablename__ = "report_generation_task"
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, server_default=text("NOW()"))
+    comment = Column(String, index=True)
+
+    status = Column(String, index=True)
+    tag = Column(String, nullable=True)
+    language = Column(String)
+    include_only_results_since = Column(DateTime, nullable=True)
+    skip_previously_exported = Column(Boolean)
+    skip_hooks = Column(Boolean)
+    skip_suspicious_reports = Column(Boolean)
+    custom_template_arguments = Column(JSON)
+    output_location = Column(String, nullable=True)
+    error = Column(String, nullable=True)
+    alerts = Column(JSON, nullable=True)
+
+
+class Tag(Base):  # type: ignore
+    """
+    Represents a tag used for categorizing analyses.
+
+    :ivar id: Unique identifier for the tag.
+    :ivar tag_name: Name of the tag.
+    :ivar created_at: Timestamp when the tag was created.
+    """
+
+    __tablename__ = "tag"
+
+    id = Column(Integer, primary_key=True)
+    tag_name = Column(String, index=True, unique=True)
+    created_at = Column(DateTime, server_default=text("NOW()"))
+
+
+@dataclasses.dataclass
+class PaginatedResults:
+    records_count_total: int
+    records_count_filtered: int
+    data: List[Dict[str, Any]]
+
+
+class TagArchiveRequest(Base):  # type: ignore
+    __tablename__ = "tag_archive_request"
+    id = Column(Integer, primary_key=True)
+    tag = Column(String, index=True)
+    created_at = Column(DateTime, server_default=text("NOW()"))
+
+
+class DB:
+    def __init__(self) -> None:
+        self.logger = build_logger(__name__)
+
+        self._engine = create_engine(
+            Config.Data.POSTGRES_CONN_STR,
+            json_serializer=functools.partial(json.dumps, cls=JSONEncoderAdditionalTypes),
+            pool_pre_ping=True,
+        )
+        self.session = sessionmaker(bind=self._engine)
+
+    def list_analysis(self) -> List[Dict[str, Any]]:
+        with self.session() as session:
+            return [self._strip_internal_db_info(item.__dict__) for item in session.query(Analysis).all()]
+
+    def mark_analysis_as_stopped(self, analysis_id: str) -> None:
+        with self.session() as session:
+            analysis = session.query(Analysis).get(analysis_id)
+            analysis.stopped = True
+            session.add(analysis)
+            session.commit()
+
+    def save_task_logs(self, task_id: str, logs: bytes) -> None:
+        with self.session() as session:
+            try:
+                task = session.query(TaskResult).get(task_id)
+            except NoResultFound:
+                return
+
+            if not task:
+                return
+
+            task.logs = logs.decode("utf-8", errors="replace")
+            session.add(task)
+            session.commit()
+
+    def create_analysis(self, analysis: Task) -> None:
+        """
+        Create a new :class:`~artemis.db.Analysis` entry in the database from a given Karton :class:`~karton.core.task.Task`.
+
+        :param analysis: The Karton Task object containing analysis information.
+        :type analysis: :class:`~karton.core.task.Task`
+        :returns: None
+        """
+        analysis_dict = self.task_to_dict(analysis)
+
+        analysis = Analysis(
+            id=analysis.root_uid,
+            target=analysis_dict["payload"]["data"],
+            tag=analysis_dict["payload_persistent"].get("tag", None),
+            stopped=False,
+            disabled_modules=analysis_dict["payload_persistent"]["disabled_modules"],
+            priority=analysis_dict["priority"],
+        )
+        with self.session() as session:
+            session.add(analysis)
+            session.commit()
+
+    def save_task_result(
+        self, task: Task, *, status: TaskStatus, status_reason: Optional[str] = None, data: Optional[Any] = None
+    ) -> None:
+        """
+        Save the result of a :class:`~karton.core.task.Task` execution to the database.
+
+        :param task: The Karton Task object for which the result is being saved.
+        :type task: :class:`~karton.core.task.Task`
+        :param status: The status of the task (e.g., OK, INTERESTING, etc.).
+        :type status: :class:`~artemis.binds.TaskStatus`
+        :param status_reason: Optional reason or message describing the status.
+        :type status_reason: Optional[str]
+        :param data: Optional result data, can be a Pydantic model, Exception, or any serializable object.
+        :type data: Optional[Any]
+        :returns: None
+        """
+        to_save = dict(
+            task=self.task_to_dict(task),
+            id=task.uid,
+            analysis_id=task.root_uid,
+            status=status,
+            tag=task.payload_persistent.get("tag", None),
+            receiver=task.headers.get("receiver", None),
+            target_string=get_task_target(task),
+            status_reason=status_reason,
+            # Used to allow searching in the names and values of all existing headers
+            headers_string=" ".join([key + " " + value for key, value in task.headers.items()]),
+        )
+
+        # at the moment of saving it's "started", which will be misleading
+        del to_save["task"]["status"]  # type: ignore[union-attr]
+
+        if isinstance(data, BaseModel):
+            to_save["result"] = data.dict()
+        elif isinstance(data, Exception):
+            to_save["result"] = str(data)
+        else:
+            to_save["result"] = data
+
+        statement = postgres_insert(TaskResult).values([copy.copy(to_save)])
+        del to_save["id"]
+        statement = statement.on_conflict_do_update(index_elements=[TaskResult.id], set_=to_save)
+
+        with self.session() as session:
+            session.execute(statement)
+            session.commit()
+
+    def get_analysis_by_id(self, analysis_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve an :class:`~artemis.db.Analysis` entry from the database by its analysis ID.
+
+        :param analysis_id: The unique identifier of the analysis to retrieve. It's `Task.root_uuid`.
+        :type analysis_id: str
+        :return: The analysis data as a dictionary if found, otherwise None.
+        :rtype: Optional[Dict[str, Any]]
+        """
+        try:
+            with self.session() as session:
+                item = session.query(Analysis).get(analysis_id)
+
+                if item:
+                    return self._strip_internal_db_info(item.__dict__)
+                else:
+                    return None
+        except NoResultFound:
+            return None
+
+    def set_analysis_desired_priority(self, analysis_id: str, desired_priority: TaskPriority) -> bool:
+        """
+        Change desired priority for :class:`~artemis.db.Analysis`.
+
+        Any Analysis with new `desired priority` will go through reprioritize job, which will change
+        priority of tasks.
+
+        :param analysis_id: The unique identifier of the analysis to retrieve. It's `Task.root_uuid`.
+        :type analysis_id: str
+        :param desired_priority: Desired task priority for given analysis
+        :type desired_priority: `artemis.db.TaskPriority`
+        :return: True if desired priority successfully changed, otherwise False
+        :rtype: bool
+        """
+        with self.session() as session:
+            item = session.query(Analysis).get(analysis_id)
+            if item:
+                item.desired_priority = desired_priority
+                session.commit()
+                return True
+
+        return False
+
+    def get_analyses_by_tag(self, tag: str) -> List[Dict[str, Any]]:
+        with self.session() as session:
+            return [
+                self._strip_internal_db_info(item.__dict__)
+                for item in session.query(Analysis).filter(Analysis.tag == tag).all()
+            ]
+
+    def get_analyses_to_reprioritize(self) -> List[Dict[str, Any]]:
+        with self.session() as session:
+            return [
+                self._strip_internal_db_info(item.__dict__)
+                for item in (
+                    session.query(Analysis)
+                    .filter(Analysis.stopped == False)  # noqa
+                    .filter(
+                        or_(
+                            Analysis.priority != Analysis.desired_priority,
+                            and_(Analysis.priority.is_(None), Analysis.desired_priority.isnot(None)),  # type: ignore
+                        )
+                    )
+                    .all()
+                )
+            ]
+
+    def get_paginated_analyses(
+        self,
+        start: int,
+        length: int,
+        ordering: List[ColumnOrdering],
+        *,
+        search_query: Optional[str] = None,
+    ) -> PaginatedResults:
+        ordering_postgresql = [
+            (
+                getattr(Analysis, ordering_rule.column_name)
+                if ordering_rule.ascending
+                else getattr(Analysis, ordering_rule.column_name).desc()
+            )
+            for ordering_rule in ordering
+        ]
+
+        with self.session() as session:
+            records_count_total = session.query(Analysis).count()
+
+            query = session.query(Analysis)
+
+            if search_query:
+                query = query.filter(Analysis.fulltext.match(self._to_postgresql_query(search_query)))  # type: ignore
+
+            records_count_filtered: int = query.count()
+            results_page = [
+                self._strip_internal_db_info(item.__dict__)
+                for item in query.order_by(*ordering_postgresql).slice(start, start + length)
+            ]
+            return PaginatedResults(
+                records_count_total=records_count_total,
+                records_count_filtered=records_count_filtered,
+                data=results_page,
+            )
+
+    def get_paginated_task_results(
+        self,
+        start: int,
+        length: int,
+        ordering: List[ColumnOrdering],
+        *,
+        search_query: Optional[str] = None,
+        analysis_id: Optional[str] = None,
+        task_filter: Optional[TaskFilter] = None,
+        apply_custom_filter: Optional[Callable] = None,  # type: ignore
+    ) -> PaginatedResults:
+        ordering_postgresql = [
+            (
+                getattr(TaskResult, ordering_rule.column_name)
+                if ordering_rule.ascending
+                else getattr(TaskResult, ordering_rule.column_name).desc()
+            )
+            for ordering_rule in ordering
+        ]
+
+        with self.session() as session:
+            records_count_total = session.query(TaskResult).count()
+
+            query = session.query(TaskResult)
+
+            if search_query:
+                query = query.filter(TaskResult.fulltext.match(self._to_postgresql_query(search_query)))  # type: ignore
+
+            if analysis_id:
+                query = query.filter(TaskResult.analysis_id == analysis_id)
+
+            if task_filter:
+                for key, value in task_filter.as_dict().items():
+                    query = query.filter(getattr(TaskResult, key) == value)
+
+            if apply_custom_filter:
+                query = apply_custom_filter(query)
+
+            records_count_filtered = query.count()
+            results_page = [
+                self._strip_internal_db_info(item.__dict__)
+                for item in query.order_by(*ordering_postgresql).slice(start, start + length)
+            ]
+            return PaginatedResults(
+                records_count_total=records_count_total,
+                records_count_filtered=records_count_filtered,
+                data=results_page,
+            )
+
+    def get_task_by_id(self, task_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self.session() as session:
+                item = session.query(TaskResult).get(task_id)
+
+                if item:
+                    return self._strip_internal_db_info(item.__dict__)
+                else:
+                    return None
+        except NoResultFound:
+            return None
+
+    def delete_analysis(self, id: str) -> None:
+        with self.session() as session:
+            analysis = session.query(Analysis).get(id)
+            session.delete(analysis)
+            session.commit()
+
+    def delete_task_result(self, id: str) -> None:
+        with self.session() as session:
+            task_result = session.query(TaskResult).get(id)
+            session.delete(task_result)
+            session.commit()
+
+    def delete_task_results_by_ids(self, ids: List[str]) -> None:
+        with self.session() as session:
+            session.execute(delete(TaskResult).where(TaskResult.id.in_(ids)))  # type: ignore
+            session.commit()
+
+    def save_module_started_task(self, module_identity: str, task: Task) -> bool:
+        """
+        Records that a module has started a task. Returns True if this is the first time
+        this module started this task, False if it was already started.
+        """
+        self.logger.info(
+            "Saving module started task: module_identity=%s, deduplication_data=%s",
+            module_identity,
+            self._get_task_deduplication_data(task),
+        )
+        record = {
+            "module_identity": module_identity,
+            "analysis_id": task.root_uid,
+            # PostgreSQL limits the length of string if it's an indexed column
+            "deduplication_data": hashlib.sha256(self._get_task_deduplication_data(task).encode("utf-8")).hexdigest(),
+        }
+        statement = postgres_insert(ModuleStartedTask).values([record])
+        statement = statement.on_conflict_do_nothing()
+        with self.session() as session:
+            result = session.execute(statement)
+            session.commit()
+            return bool(result.rowcount)
+
+    def delete_module_started_tasks_for_analyses(self, analysis_ids: list[str]) -> int:
+        query = delete(ModuleStartedTask).where(ModuleStartedTask.analysis_id.in_(analysis_ids))  # type: ignore
+        with self.session() as session:
+            result = session.execute(query)
+            session.commit()
+            return int(result.rowcount)
+
+    def get_task_results_since(
+        self, time_from: datetime, tag: Optional[str] = None, batch_size: int = 100
+    ) -> Generator[Dict[str, Any], None, None]:
+        query = select(TaskResult).filter(TaskResult.created_at >= time_from)  # type: ignore
+        if tag:
+            query = query.filter(TaskResult.tag == tag)
+        return self._iter_results(query, batch_size)
+
+    def iter_oldest_task_results_with_tag(
+        self, tag: str, max_length: int, batch_size: int = 100, time_to: datetime | None = None
+    ) -> Generator[Dict[str, Any], None, None]:
+        query = select(TaskResult).filter(TaskResult.tag == tag).order_by(TaskResult.created_at).limit(max_length)  # type: ignore
+        if time_to is not None:
+            query = query.filter(TaskResult.created_at <= time_to)
+        for item in self._iter_results(query, batch_size):
+            yield self._strip_internal_db_info(dict(item))
+
+    def iter_oldest_task_results_before(
+        self, time_to: datetime, max_length: int, interesting: bool, batch_size: int = 100
+    ) -> Generator[Dict[str, Any], None, None]:
+        query = select(TaskResult).filter(TaskResult.created_at <= time_to).order_by(TaskResult.created_at)  # type: ignore
+
+        if interesting:
+            query = query.filter(TaskResult.status == "INTERESTING")
+        else:
+            query = query.filter(TaskResult.status != "INTERESTING")
+
+        query = query.limit(max_length)
+
+        for item in self._iter_results(query, batch_size):
+            yield self._strip_internal_db_info(dict(item))
+
+    def count_oldest_task_results_before(self, time_to: datetime, max_length: int, interesting: bool) -> int:
+        with self.session() as session:
+            query = select(TaskResult).filter(TaskResult.created_at <= time_to)  # type: ignore
+            if interesting:
+                query = query.filter(TaskResult.status == "INTERESTING")
+            else:
+                query = query.filter(TaskResult.status != "INTERESTING")
+            query = query.limit(max_length)
+            subquery = query.subquery()
+            result = session.execute(select(func.count()).select_from(subquery)).scalar()
+            return result or 0
+
+    def count_interesting_tasks_by_receiver(self, day: date) -> dict[str, int]:
+        start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        with self.session() as session:
+            rows = session.execute(
+                select(TaskResult.receiver, func.count(TaskResult.id).label("count"))  # type: ignore[arg-type]
+                .where(TaskResult.status == TaskStatus.INTERESTING.value)
+                .where(TaskResult.created_at >= start)
+                .where(TaskResult.created_at < end)
+                .group_by(TaskResult.receiver)
+            ).all()
+        return {row.receiver: row.count for row in rows}
+
+    @staticmethod
+    def dict_to_str(d: Dict[str, Any]) -> str:
+        result = ""
+        # We sort the items so that the same dict will always have the same representation
+        # regardless of how are the items ordered internally.
+        for key, value in sorted(d.items()):
+            if isinstance(value, dict):
+                result += f"{key}={{{DB.dict_to_str(value)}}}"
+            else:
+                if result:
+                    result += ", "
+                result += f"{key}={value}"
+        return result
+
+    def task_to_dict(self, task: Task) -> Dict[str, Any]:
+        return task.to_dict()
+
+    def take_single_report_generation_task(self) -> Optional[ReportGenerationTask]:
+        with self.session() as session:
+            return (  # type: ignore
+                session.query(ReportGenerationTask)
+                .filter(ReportGenerationTask.status == ReportGenerationTaskStatus.PENDING.value)
+                .first()
+            )
+
+    def save_report_generation_task_results(
+        self,
+        task: ReportGenerationTask,
+        status: ReportGenerationTaskStatus,
+        output_location: Optional[str] = None,
+        error: Optional[str] = None,
+        alerts: Optional[List[str]] = None,
+    ) -> None:
+        with self.session() as session:
+            task.status = status.value
+            if output_location:
+                task.output_location = output_location
+            if error:
+                task.error = error
+            if alerts:
+                task.alerts = alerts
+            session.add(task)
+            session.commit()
+
+    def create_report_generation_task(
+        self,
+        tag: Optional[str],
+        comment: Optional[str],
+        language: Language,
+        skip_previously_exported: bool,
+        skip_hooks: bool = False,
+        skip_suspicious_reports: bool = False,
+        custom_template_arguments: Dict[str, Any] = {},
+        include_only_results_since: datetime | None = None,
+    ) -> None:
+        with self.session() as session:
+            task = ReportGenerationTask(
+                tag=tag,
+                comment=comment,
+                language=language.value,
+                skip_previously_exported=skip_previously_exported,
+                status=ReportGenerationTaskStatus.PENDING,
+                skip_hooks=skip_hooks,
+                skip_suspicious_reports=skip_suspicious_reports,
+                custom_template_arguments=custom_template_arguments,
+                include_only_results_since=include_only_results_since,
+            )
+            session.add(task)
+            session.commit()
+
+    def get_report_generation_task(self, id: int) -> Optional[ReportGenerationTask]:
+        with self.session() as session:
+            return session.query(ReportGenerationTask).filter(ReportGenerationTask.id == id).first()  # type: ignore
+
+    def list_report_generation_tasks(self, tag_prefix: Optional[str] = None) -> List[ReportGenerationTask]:
+        with self.session() as session:
+            query = session.query(ReportGenerationTask)
+            if tag_prefix:
+                if "%" in tag_prefix:
+                    raise NotImplementedError()
+
+                query = query.filter(ReportGenerationTask.tag.like(tag_prefix + "%"))
+            return list(query.order_by(ReportGenerationTask.created_at.desc()))
+
+    def delete_report_generation_task(self, id: int) -> None:
+        with self.session() as session:
+            task = session.query(ReportGenerationTask).get(id)
+            if task.output_location:
+                output_location = "/opt/" + task.output_location
+                if os.path.exists(output_location):
+                    # Make sure we don't remove too much
+                    assert os.path.normpath(output_location).startswith("/opt/output/autoreporter/")
+                    shutil.rmtree(output_location)
+            session.delete(task)
+            session.commit()
+
+    def _iter_results(self, query: Any, batch_size: int) -> Generator[Dict[str, Any], None, None]:
+        with self._engine.connect() as conn:
+            with conn.execution_options(stream_results=True, max_row_buffer=batch_size).execute(query) as result:
+                for item in result:
+                    yield item._mapping
+
+    def _get_task_deduplication_data(self, task: Task) -> str:
+        """
+        Represents a task so that two identical tasks with different IDs will have the same representation.
+
+        Instead of dictionaries, strings are used (so that e.g. {"domain": "google.com"} becomes
+        domain=google.com to facillitate indexing.
+        """
+
+        # We convert the task to dict so that we don't have problems e.g. with enums.
+        task_as_dict = copy.deepcopy(self.task_to_dict(task))
+
+        # We treat a task that originates from a different karton than an existing one
+        # as an existing one.
+        if "origin" in task_as_dict["headers"]:
+            del task_as_dict["headers"]["origin"]
+        if "receiver" in task_as_dict["headers"]:
+            del task_as_dict["headers"]["receiver"]
+        if "last_domain" in task_as_dict["payload"]:
+            del task_as_dict["payload"]["last_domain"]
+        if "created_at" in task_as_dict["payload"]:
+            del task_as_dict["payload"]["created_at"]
+        # it may come from 'process_multiple' logic
+        if "start_time" in task_as_dict["payload"]:
+            del task_as_dict["payload"]["start_time"]
+        if task.receiver in Config.Miscellaneous.MODULES_WHITELIST_FOR_ORIGINAL_HOST_DEDUPLICATION:
+            if "original_target" in task_as_dict["payload_persistent"]:
+                del task_as_dict["payload_persistent"]["original_target"]
+            if "original_ip" in task_as_dict["payload_persistent"]:
+                del task_as_dict["payload_persistent"]["original_ip"]
+            if "original_domain" in task_as_dict["payload_persistent"]:
+                del task_as_dict["payload_persistent"]["original_domain"]
+
+        return self.dict_to_str(
+            {
+                "headers": task_as_dict["headers"],
+                "payload": task_as_dict["payload"],
+                "payload_persistent": task_as_dict["payload_persistent"],
+            }
+        ).replace("\x00", " ")
+
+    def _to_postgresql_query(self, query: str) -> str:
+        """Converts a space-separated query (e.g. directory_index wp-content) to a MongoDB query
+        that requires all words to be present (in that case it would be "directory_index" AND "wp-content").
+        """
+
+        query = query.replace("\\", " ")  # just in case
+        query = query.replace('"', " ")  # just in case
+        return " & ".join([f'"{item}"' for item in query.split(" ") if item])
+
+    @staticmethod
+    def _strip_internal_db_info(d: Dict[str, Any]) -> Dict[str, Any]:
+        if "_sa_instance_state" in d:
+            del d["_sa_instance_state"]
+        if "fulltext" in d:
+            del d["fulltext"]
+        if "headers_string" in d:
+            del d["headers_string"]
+        return d
+
+    def save_tag(self, tag_name: str | None) -> None:
+        if tag_name is not None:
+            statement = postgres_insert(Tag).values(tag_name=tag_name)
+            statement = statement.on_conflict_do_nothing(index_elements=[Tag.tag_name])
+            with self.session() as session:
+                session.execute(statement)
+                session.commit()
+
+    def get_tags(self) -> List[Type[Tag]] | Any:
+        with self.session() as session:
+            return session.query(Tag).all()
+
+    def list_tag_archive_requests(self, min_age: datetime) -> List[Dict[str, Any]]:
+        with self.session() as session:
+            return [
+                self._strip_internal_db_info(item.__dict__)
+                for item in session.query(TagArchiveRequest).filter(TagArchiveRequest.created_at <= min_age)
+            ]
+
+    def create_tag_archive_request(self, tag: str) -> None:
+        tag_archive_request = TagArchiveRequest(tag=tag)
+        with self.session() as session:
+            session.add(tag_archive_request)
+            session.commit()
+
+    def delete_tag_archive_request(self, tag: str) -> None:
+        with self.session() as session:
+            tag_archive_requests = session.query(TagArchiveRequest).filter(TagArchiveRequest.tag == tag)
+            for tag_archive_request in tag_archive_requests:
+                session.delete(tag_archive_request)
+                session.commit()
+
+
+class TestDB:
+    def __init__(self) -> None:
+        self.logger = build_logger(__name__)
+
+        self._engine = create_engine(
+            Config.Data.POSTGRES_CONN_STR,
+            json_serializer=functools.partial(json.dumps, cls=JSONEncoderAdditionalTypes),
+            pool_pre_ping=True,
+        )
+        self.session = sessionmaker(bind=self._engine)
+
+    def delete_task_results(self) -> None:
+        with self.session() as session:
+            task_results = session.query(TaskResult).all()
+            for task_result in task_results:
+                session.delete(task_result)
+            session.commit()
+
+    def get_single_task_result(self) -> Dict[str, Any]:
+        with self.session() as session:
+            (task_result,) = tuple(session.query(TaskResult).all())
+            return DB._strip_internal_db_info(task_result.__dict__)

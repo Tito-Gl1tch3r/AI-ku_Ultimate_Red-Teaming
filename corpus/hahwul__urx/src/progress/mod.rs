@@ -1,0 +1,674 @@
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+
+/// Braille-dot spinner frames — the calm, ubiquitous "modern CLI" spinner.
+/// Cycled at ~80ms it reads as smooth, light motion that pairs with the thin
+/// rails below without competing with them for weight.
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Thin "rail" fill for determinate bars: full `━`, a heavy `╸` leading head,
+/// and a light `─` track. The first char is "full", the last is "empty", and
+/// the middle ones render the leading edge — so a half cell shows the `╸` head
+/// rather than a hard jump. Reads as a slim accent line, not a heavy block.
+const BAR_FILL: &str = "━━╸─";
+
+// Modern Rail palette (truecolor hex, applied directly inside the indicatif
+// templates below). `console` strips these automatically when stdout
+// isn't a TTY or NO_COLOR is set, so every state stays legible in monochrome.
+//
+//   #5ad1cd  accent      — rail fill, header/footer frame, Domains & Filtering
+//   #56b6f6  running     — spinner glyph; Testing bar fill
+//   #7ee787  success ✓
+//   #e3b341  partial ◐
+//   #f47067  error   ✗
+//   #c29bf5  transform   — Transform bar fill
+//   #3b424d  track       — unfilled portion of every rail
+//   #8b949e  dim         — elapsed timers, secondary message text
+//   #a7b6c2  label       — the `◇ <phase>` section labels
+
+/// Steady-tick interval for spinners (ms). Fast enough to feel alive, slow
+/// enough not to flicker or burn CPU.
+const SPINNER_TICK_MS: u64 = 80;
+
+/// Steady-tick interval for determinate bars (ms).
+const BAR_TICK_MS: u64 = 80;
+
+/// Style for a provider line while a fetch is in flight: the spinner is the
+/// gutter glyph (col 3), the bold provider name follows, a dimmed elapsed timer
+/// in a fixed column, then the free-form status message. Elapsed sits *before*
+/// the message (not after) so the elastic `{wide_msg}` absorbs slack at the line
+/// end — keeping the timer column aligned across rows instead of flung to the
+/// right edge on a wide terminal. The finished styles below drop `{spinner}` and
+/// bake a status glyph into the prefix so it lands in the *same* column — the
+/// row never shifts left when a fetch completes.
+pub fn provider_running_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "  {spinner:.#56b6f6.bold} {prefix:.bold} {elapsed:>5.#8b949e}  {wide_msg}",
+    )
+    .expect("static provider running template is valid")
+    .tick_strings(SPINNER_FRAMES)
+}
+
+/// Terminal style for a provider line once its fetch is done. The prefix is
+/// expected to lead with the status glyph (set by the runner), tinted `color`
+/// like the name; the message is tinted `msg_color`.
+fn provider_done_style(color: &str, msg_color: &str) -> ProgressStyle {
+    ProgressStyle::with_template(&format!(
+        "  {{prefix:.{color}.bold}} {{elapsed:>5.#8b949e}}  {{wide_msg:.{msg_color}}}"
+    ))
+    .expect("static provider done template is valid")
+}
+
+/// A successful fetch: a green ✓ line with a dimmed message.
+pub fn provider_success_style() -> ProgressStyle {
+    provider_done_style("#7ee787", "#8b949e")
+}
+
+/// A failed fetch: a red ✗ line.
+pub fn provider_error_style() -> ProgressStyle {
+    provider_done_style("#f47067", "#f47067")
+}
+
+/// A fetch that succeeded but returned *incomplete* results (e.g. a paginating
+/// fetch lost a page mid-cursor): an amber ◐ line, visually distinct from a
+/// clean ✓ and from a hard ✗.
+pub fn provider_partial_style() -> ProgressStyle {
+    provider_done_style("#e3b341", "#e3b341")
+}
+
+/// A run-wide "wrap up now" flag, shared by every [`ProgressReporter`] handed
+/// to a provider.
+///
+/// `--max-time` (and Ctrl-C) end a run by cancelling the provider tasks. A
+/// cancelled future is *dropped*, and a paginating provider accumulates its
+/// results in a local buffer until it returns — so every URL it had already
+/// paged in dies with the future. That is why a 90-second `--max-time` run over
+/// a domain with hundreds of thousands of captures yields zero URLs, despite
+/// `--max-time` being documented as "urx proceeds with whatever URLs have been
+/// collected so far".
+///
+/// The fix is cooperative: the runner raises this flag at the deadline and
+/// gives in-flight fetches a short grace window to notice. A provider that
+/// walks a cursor checks it between requests and takes the path it already has
+/// for a mid-walk failure — [`ProgressReporter::mark_partial`] and `break`,
+/// returning what it collected — instead of being cancelled with it.
+#[derive(Clone, Debug, Default)]
+pub struct StopSignal(Arc<AtomicBool>);
+
+impl StopSignal {
+    /// Ask every fetch sharing this signal to stop at its next checkpoint.
+    pub fn request_stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a stop has been requested.
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Resolve once a stop has been requested, so a provider can race this
+    /// against an in-flight request instead of only checking between pages.
+    ///
+    /// Checking between pages is not enough on its own: a Wayback CDX slice of
+    /// `limit=50000` takes tens of seconds, far longer than the runner's grace
+    /// window, so a deadline landing mid-page was never noticed and the whole
+    /// buffer died with the cancelled future. Polling rather than notifying
+    /// keeps [`StopSignal`] a plain flag usable from synchronous code; the
+    /// interval is negligible against any network fetch it races.
+    pub async fn stopped(&self) {
+        while !self.is_stopped() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// A small, cloneable handle that providers use to surface fine-grained
+/// progress (e.g. "page 3/12") on their own line without knowing anything
+/// about `indicatif`. Cloning is cheap and updates are no-ops on a hidden bar,
+/// so passing one in costs nothing when progress is disabled.
+#[derive(Clone)]
+pub struct ProgressReporter {
+    bar: ProgressBar,
+    /// Stable leading context (e.g. "(1/3) example.com · ") prepended to every
+    /// detail so the line keeps identifying which domain is being worked.
+    prefix: String,
+    /// Raised by the runner when the run must end. See [`StopSignal`].
+    stop: StopSignal,
+    /// Set by a provider when the results it is about to return are known to be
+    /// incomplete (e.g. a paginating fetch lost a page after already collecting
+    /// some). Shared across clones via `Arc`, so the runner that handed the
+    /// reporter in can read it back after the fetch resolves and avoid
+    /// presenting a truncated result as a clean success.
+    partial: Arc<AtomicBool>,
+    /// Where a provider's `--verbose`-only remarks go, when the run wants them.
+    /// `None` outside verbose mode, so a provider can call [`note`] freely
+    /// without checking the flag itself.
+    ///
+    /// [`note`]: ProgressReporter::note
+    notes: Option<Notifier>,
+}
+
+impl ProgressReporter {
+    /// Build a reporter that writes to `bar`, prefixing each detail with
+    /// `prefix` (which should already include any trailing separator).
+    pub fn new(bar: ProgressBar, prefix: impl Into<String>) -> Self {
+        ProgressReporter {
+            bar,
+            prefix: prefix.into(),
+            partial: Arc::new(AtomicBool::new(false)),
+            stop: StopSignal::default(),
+            notes: None,
+        }
+    }
+
+    /// Route the provider's verbose remarks through `notifier`. Only attached
+    /// when the run is verbose; otherwise [`note`] is a no-op.
+    ///
+    /// A provider that skips something on purpose — a robots.txt capture the
+    /// archive recorded as a 401 — has to be able to say so somewhere: a
+    /// detail on the progress line is overwritten by the next update, and a
+    /// provider has no other channel to the operator.
+    ///
+    /// [`note`]: ProgressReporter::note
+    pub fn with_notifier(mut self, notifier: Notifier) -> Self {
+        self.notes = Some(notifier);
+        self
+    }
+
+    /// Write one operator-facing line, if the run asked for verbose output.
+    pub fn note(&self, msg: impl AsRef<str>) {
+        if let Some(n) = &self.notes {
+            n.note(msg);
+        }
+    }
+
+    /// Attach the run-wide stop signal, so this reporter's provider can wrap up
+    /// gracefully when the run ends.
+    pub fn with_stop_signal(mut self, stop: StopSignal) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    /// Whether the run has asked this fetch to stop.
+    ///
+    /// A provider walking a paginated cursor should check this between requests
+    /// and, when it is `true`, call [`mark_partial`] and return the URLs it has
+    /// already collected. Ignoring it is safe but costs those URLs: the runner
+    /// hard-cancels whatever is still in flight once the grace window closes.
+    ///
+    /// [`mark_partial`]: ProgressReporter::mark_partial
+    pub fn stop_requested(&self) -> bool {
+        self.stop.is_stopped()
+    }
+
+    /// Resolve once the run asks this fetch to stop. See [`StopSignal::stopped`].
+    pub async fn stopped(&self) {
+        self.stop.stopped().await
+    }
+
+    /// Replace the trailing status detail, keeping the stable prefix.
+    pub fn detail(&self, detail: impl AsRef<str>) {
+        self.bar
+            .set_message(format!("{}{}", self.prefix, detail.as_ref()));
+    }
+
+    /// Flag the result as incomplete. The runner reads this via [`is_partial`]
+    /// after the fetch to mark the line partial and warn instead of reporting a
+    /// clean success.
+    ///
+    /// [`is_partial`]: ProgressReporter::is_partial
+    pub fn mark_partial(&self) {
+        self.partial.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the provider flagged the result as incomplete.
+    pub fn is_partial(&self) -> bool {
+        self.partial.load(Ordering::Relaxed)
+    }
+}
+
+/// Where an out-of-band operator line is written.
+#[derive(Clone)]
+enum NoteSink {
+    /// Above the live region, through `MultiProgress` (which draws to stderr)
+    /// so the region's line tracking stays correct — or straight to stderr
+    /// when the region is hidden.
+    Region(MultiProgress),
+    /// Test-only: collect the lines so a test can assert *that* a message went
+    /// through this channel rather than to stdout.
+    #[cfg(test)]
+    Capture(Arc<Mutex<Vec<String>>>),
+}
+
+/// A cloneable, `Send + Sync` handle for writing an operator-facing line from
+/// inside a spawned task.
+///
+/// Everything urx says *about* a run belongs on stderr: stdout carries the URL
+/// list a caller pipes onward. The runner's per-domain verbose lines used to go
+/// through `println!`, so `urx -v > urls.txt` interleaved "Domain completed: …"
+/// into the results — and, written straight to the terminal, they also bypassed
+/// `MultiProgress`, desyncing its line tracking so a later [`ProgressManager::clear`]
+/// left stale bars behind.
+#[derive(Clone)]
+pub struct Notifier {
+    sink: NoteSink,
+}
+
+/// Whether a note aimed at `multi` has to go straight to stderr instead.
+///
+/// `MultiProgress::println` draws through the region's draw target, and
+/// indicatif hides that target when stderr is not a terminal — so every
+/// advisory sent that way vanished the moment output was piped, which is
+/// exactly when a scripted run needs to read them. A hidden region is also one
+/// with no line tracking left to desync, which is the reason `println` is
+/// otherwise mandatory here, so the bypass is safe precisely when it is needed.
+fn note_bypasses_region(multi: &MultiProgress) -> bool {
+    multi.is_hidden()
+}
+
+impl Notifier {
+    /// Write one line above the live region (or to stderr when there is none).
+    pub fn note(&self, msg: impl AsRef<str>) {
+        match &self.sink {
+            NoteSink::Region(multi) if note_bypasses_region(multi) => {
+                eprintln!("{}", msg.as_ref())
+            }
+            NoteSink::Region(multi) => {
+                let _ = multi.println(msg.as_ref());
+            }
+            #[cfg(test)]
+            NoteSink::Capture(lines) => lines
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(msg.as_ref().to_string()),
+        }
+    }
+}
+
+pub struct ProgressManager {
+    multi_progress: MultiProgress,
+    notes: NoteSink,
+}
+
+impl ProgressManager {
+    /// With `no_progress` the region draws nowhere: every bar still accepts
+    /// updates, so callers drive them unconditionally, and notes go straight
+    /// to stderr.
+    pub fn new(no_progress: bool) -> Self {
+        let multi_progress = if no_progress {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        } else {
+            MultiProgress::new()
+        };
+        ProgressManager {
+            notes: NoteSink::Region(multi_progress.clone()),
+            multi_progress,
+        }
+    }
+
+    /// A [`ProgressManager`] whose notes are collected instead of printed, plus
+    /// the buffer they land in.
+    #[cfg(test)]
+    pub fn capturing() -> (Self, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let manager = ProgressManager {
+            multi_progress: MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
+            notes: NoteSink::Capture(Arc::clone(&lines)),
+        };
+        (manager, lines)
+    }
+
+    /// A handle the spawned provider/tester tasks can carry, so their
+    /// operator-facing lines reach the same place [`note`] writes to.
+    ///
+    /// [`note`]: ProgressManager::note
+    pub fn notifier(&self) -> Notifier {
+        Notifier {
+            sink: self.notes.clone(),
+        }
+    }
+
+    /// Add `bar` to the live region, ticking it while the region is visible.
+    fn add(&self, bar: ProgressBar, tick_ms: u64) -> ProgressBar {
+        let bar = self.multi_progress.add(bar);
+        if !bar.is_hidden() {
+            bar.enable_steady_tick(std::time::Duration::from_millis(tick_ms));
+        }
+        bar
+    }
+
+    /// One `◇ <label>` rail of `len` steps, filled in `color`. `counter` is the
+    /// `{pos}/{len}` column, or empty for a stage without one.
+    fn stage_bar(&self, label: &str, len: usize, color: &str, counter: &str) -> ProgressBar {
+        let style = ProgressStyle::with_template(&format!(
+            "  {{prefix:.#a7b6c2}} {{bar:26.{color}/#3b424d}}  {counter}{{wide_msg:.#8b949e}}"
+        ))
+        .expect("stage bar template is valid")
+        .progress_chars(BAR_FILL);
+        let bar = ProgressBar::new(len as u64).with_style(style);
+        // "◇ <label>" — the ◇ sits in the same gutter column as the provider
+        // status glyphs; the 12-wide label keeps every rail starting at one column.
+        bar.set_prefix(format!("◇ {label:<12}"));
+        self.add(bar, BAR_TICK_MS)
+    }
+
+    pub fn create_domain_bar(&self, total: usize) -> ProgressBar {
+        self.stage_bar("Domains", total, "#5ad1cd", "{pos:>3}/{len:<3}  ")
+    }
+
+    pub fn create_provider_bars(&self, provider_names: &[String]) -> Vec<ProgressBar> {
+        let style = provider_running_style();
+
+        // Indeterminate spinner per provider: a fetch has no honest percentage
+        // (the archive doesn't tell us up front how much it will return), so we
+        // animate motion + elapsed time rather than faking a filling bar.
+        let bars: Vec<ProgressBar> = provider_names
+            .iter()
+            .map(|name| {
+                let bar = ProgressBar::new_spinner().with_style(style.clone());
+                // 16-wide name field. The running style renders this after the
+                // spinner+space; the finished styles render "glyph + space + name"
+                // (18 cols) in the same slot, so the name column stays put across
+                // states. The runner resets this prefix each domain.
+                bar.set_prefix(format!("{name:<16}"));
+                bar.set_message("queued…");
+                self.add(bar, SPINNER_TICK_MS)
+            })
+            .collect();
+
+        // Force an initial draw so every line claims its row in the terminal.
+        for bar in &bars {
+            bar.tick();
+        }
+
+        bars
+    }
+
+    pub fn create_filter_bar(&self) -> ProgressBar {
+        self.stage_bar("Filtering", 100, "#5ad1cd", "")
+    }
+
+    pub fn create_transform_bar(&self) -> ProgressBar {
+        self.stage_bar("Transform", 100, "#c29bf5", "")
+    }
+
+    pub fn create_test_bar(&self, total: usize) -> ProgressBar {
+        self.stage_bar("Testing", total, "#56b6f6", "{pos:>5}/{len:<5}  ")
+    }
+
+    /// Add the run header as a static (non-animated) line at the top of the
+    /// live region. It is a *managed* line rather than a plain print, so it is
+    /// erased together with the bars when [`clear`] runs — the whole progress
+    /// block is transient and leaves only the result (the URL list) behind.
+    ///
+    /// [`clear`]: ProgressManager::clear
+    pub fn create_header_line(&self, text: impl Into<String>) -> ProgressBar {
+        let bar = self.multi_progress.add(ProgressBar::new_spinner());
+        bar.set_style(
+            ProgressStyle::with_template("{msg}").expect("static header template is valid"),
+        );
+        // Finish immediately: the header is static, and a *finished* bar is a
+        // no-op on drop. An unfinished bar redraws itself when dropped, which in
+        // a MultiProgress repaints the whole region at the (post-output) cursor
+        // — printing the bars again below the URL list. The finished line still
+        // shows until `clear()` removes it.
+        bar.finish_with_message(text.into());
+        bar
+    }
+
+    /// Tear down the entire live region (header + every bar) once the run's
+    /// progress is finished. Progress is meant to be visible only *while*
+    /// scanning; clearing here keeps the final terminal output to just the URL
+    /// list.
+    pub fn clear(&self) {
+        let _ = self.multi_progress.clear();
+    }
+
+    /// Print an out-of-band notice (e.g. a timeout / Ctrl-C message) above the
+    /// live region. While bars are active this MUST go through `MultiProgress`
+    /// so the region's line tracking stays correct — a raw `eprintln` desyncs it
+    /// and makes a later [`clear`] miss lines. With progress disabled there is
+    /// no region, so a plain stderr write is fine.
+    ///
+    /// [`clear`]: ProgressManager::clear
+    pub fn note(&self, msg: impl AsRef<str>) {
+        self.notifier().note(msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_progress_manager_creation() {
+        let _manager = ProgressManager::new(false);
+        // Just verify it can be created without error
+    }
+
+    #[test]
+    fn test_progress_manager_creation_no_progress() {
+        let _manager = ProgressManager::new(true);
+        // Just verify it can be created without error when no_progress is true
+    }
+
+    #[test]
+    fn test_create_domain_bar() {
+        let manager = ProgressManager::new(false);
+        let bar = manager.create_domain_bar(10);
+
+        assert_eq!(bar.length(), Some(10));
+        assert_eq!(bar.position(), 0);
+    }
+
+    #[test]
+    fn test_create_domain_bar_no_progress() {
+        let manager = ProgressManager::new(true);
+        let bar = manager.create_domain_bar(10);
+
+        // Hidden bar should still have the correct length
+        assert_eq!(bar.length(), Some(10));
+        assert_eq!(bar.position(), 0);
+    }
+
+    #[test]
+    fn test_create_provider_bars() {
+        let manager = ProgressManager::new(false);
+        let provider_names = vec!["wayback".to_string(), "cc".to_string(), "otx".to_string()];
+
+        let bars = manager.create_provider_bars(&provider_names);
+
+        assert_eq!(bars.len(), provider_names.len());
+        for bar in bars.iter() {
+            // Provider lines are indeterminate spinners, so they carry no length.
+            assert_eq!(bar.length(), None);
+            assert_eq!(bar.position(), 0);
+        }
+    }
+
+    #[test]
+    fn test_create_provider_bars_no_progress() {
+        let manager = ProgressManager::new(true);
+        let provider_names = vec!["wayback".to_string(), "cc".to_string(), "otx".to_string()];
+
+        let bars = manager.create_provider_bars(&provider_names);
+
+        assert_eq!(bars.len(), provider_names.len());
+        for bar in bars.iter() {
+            assert!(bar.is_hidden());
+        }
+    }
+
+    #[test]
+    fn test_progress_reporter_updates_message() {
+        let manager = ProgressManager::new(false);
+        let bars = manager.create_provider_bars(&["wayback".to_string()]);
+        let reporter = ProgressReporter::new(bars[0].clone(), "(1/2) example.com · ");
+        reporter.detail("page 3/12");
+        assert_eq!(
+            bars[0].message(),
+            "(1/2) example.com · page 3/12".to_string()
+        );
+    }
+
+    #[test]
+    fn test_progress_reporter_partial_flag_shares_across_clones() {
+        let reporter = ProgressReporter::new(ProgressBar::hidden(), "x");
+        assert!(!reporter.is_partial());
+        let clone = reporter.clone();
+        // A provider holds a clone; marking it must be visible to the original
+        // handle the runner kept (shared Arc).
+        clone.mark_partial();
+        assert!(reporter.is_partial());
+    }
+
+    #[test]
+    fn test_stop_signal_reaches_every_reporter_sharing_it() {
+        // The runner raises one signal at the deadline; every in-flight fetch's
+        // reporter must see it, or a paginating provider keeps walking its
+        // cursor until it is cancelled — losing everything it had collected.
+        let signal = StopSignal::default();
+        let a =
+            ProgressReporter::new(ProgressBar::hidden(), "a · ").with_stop_signal(signal.clone());
+        let b =
+            ProgressReporter::new(ProgressBar::hidden(), "b · ").with_stop_signal(signal.clone());
+
+        assert!(!a.stop_requested());
+        assert!(!b.stop_requested());
+
+        signal.request_stop();
+
+        assert!(a.stop_requested());
+        assert!(b.stop_requested());
+        // A clone a provider is holding sees it too.
+        assert!(a.clone().stop_requested());
+    }
+
+    #[test]
+    fn test_reporter_without_a_signal_is_never_asked_to_stop() {
+        let reporter = ProgressReporter::new(ProgressBar::hidden(), "x");
+        let other = StopSignal::default();
+        other.request_stop();
+        assert!(!reporter.stop_requested());
+    }
+
+    #[test]
+    fn test_notes_are_captured_rather_than_printed_in_tests() {
+        let (manager, lines) = ProgressManager::capturing();
+        manager.note("first");
+        manager.notifier().note("second");
+        assert_eq!(lines.lock().unwrap().as_slice(), ["first", "second"]);
+    }
+
+    #[test]
+    fn test_create_provider_bars_empty() {
+        let manager = ProgressManager::new(false);
+        let provider_names: Vec<String> = vec![];
+
+        let bars = manager.create_provider_bars(&provider_names);
+
+        assert_eq!(bars.len(), 0);
+    }
+
+    #[test]
+    fn test_create_filter_bar() {
+        let manager = ProgressManager::new(false);
+        let bar = manager.create_filter_bar();
+
+        assert_eq!(bar.length(), Some(100));
+        assert_eq!(bar.position(), 0);
+    }
+
+    #[test]
+    fn test_create_filter_bar_no_progress() {
+        let manager = ProgressManager::new(true);
+        let bar = manager.create_filter_bar();
+
+        // Hidden bar should still have the correct length
+        assert_eq!(bar.length(), Some(100));
+        assert_eq!(bar.position(), 0);
+    }
+
+    #[test]
+    fn test_create_transform_bar() {
+        let manager = ProgressManager::new(false);
+        let bar = manager.create_transform_bar();
+
+        assert_eq!(bar.length(), Some(100));
+        assert_eq!(bar.position(), 0);
+    }
+
+    #[test]
+    fn test_create_transform_bar_no_progress() {
+        let manager = ProgressManager::new(true);
+        let bar = manager.create_transform_bar();
+
+        // Hidden bar should still have the correct length
+        assert_eq!(bar.length(), Some(100));
+        assert_eq!(bar.position(), 0);
+    }
+
+    #[test]
+    fn test_create_test_bar() {
+        let manager = ProgressManager::new(false);
+        let bar = manager.create_test_bar(50);
+
+        assert_eq!(bar.length(), Some(50));
+        assert_eq!(bar.position(), 0);
+    }
+
+    #[test]
+    fn test_create_test_bar_no_progress() {
+        let manager = ProgressManager::new(true);
+        let bar = manager.create_test_bar(50);
+
+        // Hidden bar should still have the correct length
+        assert_eq!(bar.length(), Some(50));
+        assert_eq!(bar.position(), 0);
+    }
+
+    #[test]
+    fn test_progress_bar_operations() {
+        let manager = ProgressManager::new(false);
+        let bar = manager.create_domain_bar(10);
+
+        // Test incrementing position
+        bar.set_position(5);
+        assert_eq!(bar.position(), 5);
+
+        // Test setting message
+        bar.set_message("Processing...");
+
+        // Test finishing
+        bar.finish();
+    }
+
+    #[test]
+    fn test_progress_bar_operations_no_progress() {
+        let manager = ProgressManager::new(true);
+        let bar = manager.create_domain_bar(10);
+
+        // Test incrementing position on hidden bar
+        bar.set_position(5);
+        assert_eq!(bar.position(), 5);
+
+        // Test setting message on hidden bar
+        bar.set_message("Processing...");
+
+        // Test finishing hidden bar
+        bar.finish();
+    }
+
+    #[test]
+    fn a_hidden_region_sends_notes_straight_to_stderr() {
+        // The regression this guards: a piped run hides indicatif's draw
+        // target, and `MultiProgress::println` then writes nowhere at all, so
+        // every `[urx] ...` advisory was silently dropped for exactly the
+        // callers that read stderr from a script.
+        let hidden = MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        assert!(note_bypasses_region(&hidden));
+    }
+}

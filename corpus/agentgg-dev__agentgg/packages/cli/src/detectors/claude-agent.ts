@@ -1,0 +1,735 @@
+import type { CvssScore, Finding, LiveResult, ReconReport } from "@agentgg/core";
+import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
+import { AgentSpec } from "../agent-spec.js";
+import { buildDedupePrompt, LlmDedup } from "../deduper.js";
+import {
+  buildAgentPrompt,
+  buildCreateAgentPrompt,
+  buildExcludePrompt,
+  buildPreconditionPrompt,
+  buildProofScriptPrompt,
+  buildReconPrompt,
+  buildReproducePrompt,
+  type CreateAgentArgs,
+  DetectionResult,
+  type Detector,
+  GeneratedProofScript,
+  hydrateFinding,
+  PreconditionCheck,
+  type PreconditionCheckArgs,
+  type ReconArgs,
+  ReconResult,
+  ReproduceFindingResult,
+  type RunAgentArgs,
+  repairFindingPath,
+  type SuggestExcludesArgs,
+  SuggestExcludesResult,
+} from "../detect.js";
+import { buildFixPrompt, type FixRetry, type LiveScript, LlmFix } from "../fixer.js";
+import { logError, logWarn } from "../log.js";
+import { asCvssScore, buildScorePrompt, LlmScore } from "../scoring.js";
+import type { CallUsage, UsageMeter } from "../usage-meter.js";
+import {
+  asValidationField,
+  buildScopeValidatePrompt,
+  buildValidatePrompt,
+  LlmValidation,
+} from "../validator.js";
+import { looksLikeRefusal, RefusalError } from "./refusal.js";
+
+const ENV_ALLOWLIST = new Set<string>([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TERM",
+  "TZ",
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "PWD",
+  "NODE_PATH",
+  "NODE_OPTIONS",
+  // Windows-specific essentials
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMFILES",
+  "PROGRAMDATA",
+  "SYSTEMROOT",
+  "WINDIR",
+  "COMSPEC",
+  "PATHEXT",
+]);
+
+/**
+ * Detector backed by `@anthropic-ai/claude-agent-sdk`. Spawns the
+ * `claude` CLI as a child process. Implements every `Detector` method for
+ * both Anthropic auth types (`apiKey` and `oauthToken`).
+ *
+ * `recon`, `runAgent`, and `createAgent` are tool-enabled (Read/Glob/Grep);
+ * the classification-only methods (`checkPrecondition`,
+ * `validateFindingByScope`, `scoreFinding`, `dedupeFindings`) run
+ * single-turn with no tools. Within `runAgent`, a scoped agent
+ * investigates its seeded candidate files; one with no file scope finds
+ * its own targets with the same tools, up to a caller-supplied
+ * `maxTurns` cap.
+ */
+export class ClaudeAgentDetector implements Detector {
+  readonly name: string;
+  private readonly apiKey?: string;
+  private readonly oauthToken?: string;
+  private readonly model: string;
+  private readonly verbose: boolean;
+  private readonly validateMaxTurns: number;
+  private readonly reproduceMaxTurns: number;
+  private readonly effort?: "low" | "medium" | "high" | "max";
+  private readonly thinking?: "off" | "adaptive" | "enabled";
+  private meter?: UsageMeter;
+
+  constructor(opts: {
+    apiKey?: string;
+    oauthToken?: string;
+    model: string;
+    /** Stream tool-use messages (Glob/Grep/Read/etc.) to stdout as the agent runs. */
+    verbose?: boolean;
+    /** Turn cap for the validator's single-finding call. Default 50. */
+    validateMaxTurns?: number;
+    /** Turn cap for the reproduce-finding browser session. Default 30. */
+    reproduceMaxTurns?: number;
+    /** SDK `effort` passed on every tool-using call. */
+    effort?: "low" | "medium" | "high" | "max";
+    /** SDK `thinking` mode. `adaptive` matches Claude Code interactive — the model decides per call. */
+    thinking?: "off" | "adaptive" | "enabled";
+  }) {
+    if (!opts.apiKey && !opts.oauthToken) {
+      throw new Error("ClaudeAgentDetector needs either apiKey or oauthToken");
+    }
+    this.apiKey = opts.apiKey;
+    this.oauthToken = opts.oauthToken;
+    this.model = opts.model;
+    this.verbose = opts.verbose ?? false;
+    this.validateMaxTurns = opts.validateMaxTurns ?? 50;
+    this.reproduceMaxTurns = opts.reproduceMaxTurns ?? 50;
+    this.effort = opts.effort;
+    this.thinking = opts.thinking;
+    this.name = opts.oauthToken ? "anthropic-oauth" : "anthropic-api";
+  }
+
+  attachUsageMeter(meter: UsageMeter): void {
+    this.meter = meter;
+  }
+
+  async recon(args: ReconArgs & { signal?: AbortSignal }): Promise<ReconResult> {
+    const prompt = buildReconPrompt({
+      instructions: args.instructions,
+      fingerprintTags: args.fingerprintTags,
+      excludePatterns: args.excludePatterns,
+      includePatterns: args.includePatterns,
+      maxFileSizeKb: args.maxFileSizeKb,
+    });
+    // Tool-enabled survey with SDK-enforced structured output. Same
+    // mechanism as an agent run — the model explores with Read/Glob/Grep
+    // and the final answer is constrained to the ReconResult schema.
+    return this.runStructured({
+      prompt,
+      tools: ["Read", "Glob", "Grep"],
+      maxTurns: args.maxTurns,
+      cwd: args.rootDir,
+      schema: ReconResult,
+      signal: args.signal,
+    });
+  }
+
+  async suggestExcludes(
+    args: SuggestExcludesArgs & { signal?: AbortSignal },
+  ): Promise<SuggestExcludesResult> {
+    // Single structured call, no tools: the directory tree is in the
+    // prompt, so the model classifies folders rather than exploring.
+    return this.runStructured({
+      prompt: buildExcludePrompt(args),
+      tools: [],
+      maxTurns: 3,
+      schema: SuggestExcludesResult,
+      signal: args.signal,
+    });
+  }
+
+  async createAgent(args: CreateAgentArgs & { signal?: AbortSignal }): Promise<AgentSpec> {
+    const prompt = buildCreateAgentPrompt({
+      instructions: args.instructions,
+      reportName: args.reportName,
+      reportContent: args.reportContent,
+      excludePatterns: args.excludePatterns,
+      includePatterns: args.includePatterns,
+      maxFileSizeKb: args.maxFileSizeKb,
+    });
+    // Tool-enabled (Read/Glob/Grep) so the model can ground the spec in
+    // the actual repo, with SDK-enforced AgentSpec output shape.
+    return this.runStructured({
+      prompt,
+      tools: ["Read", "Glob", "Grep"],
+      maxTurns: args.maxTurns,
+      cwd: args.rootDir,
+      schema: AgentSpec,
+      signal: args.signal,
+    });
+  }
+
+  async checkPrecondition(
+    args: PreconditionCheckArgs & { signal?: AbortSignal },
+  ): Promise<PreconditionCheck> {
+    // Cheap single call, no tools — the recon brief is already in the
+    // prompt, so the model just judges relevance.
+    return this.runStructured({
+      prompt: buildPreconditionPrompt(args),
+      tools: [],
+      maxTurns: 3,
+      schema: PreconditionCheck,
+      signal: args.signal,
+    });
+  }
+
+  async runAgent(args: RunAgentArgs & { signal?: AbortSignal }): Promise<Finding[]> {
+    const prompt = buildAgentPrompt(args);
+    // Always tool-enabled. The model investigates the seeded candidate
+    // files, or searches the whole repository for its own targets when
+    // there are none, with SDK-enforced structured output.
+    let result: z.infer<typeof DetectionResult>;
+    try {
+      result = await this.runStructured({
+        prompt,
+        tools: ["Read", "Glob", "Grep"],
+        maxTurns: args.maxTurns,
+        cwd: args.rootDir,
+        schema: DetectionResult,
+        signal: args.signal,
+      });
+    } catch (err) {
+      // Treat a refusal as an empty batch, not an agent failure: the agent
+      // still completes and the refusal doesn't count against the scan's
+      // failure ratio. Any other error still propagates.
+      if (err instanceof RefusalError) {
+        logWarn(
+          `[runAgent:${args.agent.slug}] model refused to analyze this batch; recording 0 findings`,
+        );
+        return [];
+      }
+      throw err;
+    }
+    const fallback = args.candidates[0]?.filePath ?? "(unknown)";
+    return result.findings.map((f) =>
+      hydrateFinding(repairFindingPath(f, args.rootDir, args.candidates), args.agent, fallback),
+    );
+  }
+
+  async validateFinding(args: {
+    finding: Finding;
+    fileContent: string;
+    scope?: string;
+    root?: string;
+    // Accepted for interface parity; the Claude Agent SDK's built-in
+    // Read/Glob/Grep don't take agentgg's exclude / size filters, so —
+    // exactly like this detector's runAgent path — they aren't applied here.
+    excludePatterns?: string[];
+    maxFileSizeKb?: number;
+    /** The reporting agent's own validation rules; replaces the defaults. */
+    validationPrompt?: string;
+    /** The group's duplicates; the verdict then covers the whole group. */
+    members?: Finding[];
+    signal?: AbortSignal;
+  }) {
+    const prompt = buildValidatePrompt(args);
+    // Tool-enabled when a repo root is supplied: the validator gets
+    // Read/Glob/Grep (same as the detection phase) so it can trace the exploit
+    // chain across files and catch an intermediate guard the finding's own
+    // file doesn't reveal, spending up to validateMaxTurns exploring.
+    // Without a root it degrades to a single-shot judgement over the
+    // embedded file content.
+    try {
+      const validated = await this.runStructured({
+        prompt,
+        tools: args.root ? ["Read", "Glob", "Grep"] : [],
+        maxTurns: this.validateMaxTurns,
+        cwd: args.root,
+        schema: LlmValidation,
+        signal: args.signal,
+      });
+      return asValidationField(validated);
+    } catch (err) {
+      // Record the refusal as uncertain rather than failing the finding: it
+      // stays unvalidated and survives into the report. Mirrors the Vercel
+      // detector's parseValidation.
+      if (err instanceof RefusalError) {
+        logWarn(
+          `[validate:${args.finding.id}] model refused to validate; recording uncertain+refused`,
+        );
+        return {
+          verdict: "uncertain" as const,
+          reasoning: "Model declined to validate this finding (refusal).",
+          refused: true,
+        };
+      }
+      throw err;
+    }
+  }
+
+  async generateReproScript(args: {
+    finding: Finding;
+    baseUrl: string;
+    context?: string;
+    proofRule?: string;
+    staticVerdict?: string;
+    staticReasoning?: string;
+    staticConfirmedImpact?: string;
+    signal?: AbortSignal;
+  }): Promise<string> {
+    const staticReview =
+      args.staticVerdict != null && args.staticReasoning != null
+        ? {
+            verdict: args.staticVerdict,
+            reasoning: args.staticReasoning,
+            ...(args.staticConfirmedImpact ? { confirmedImpact: args.staticConfirmedImpact } : {}),
+          }
+        : undefined;
+    // No tools and a single turn: this path exists to skip the browser loop, so
+    // giving it any tool would reintroduce the cost it is meant to avoid.
+    const result = await this.runStructured({
+      prompt: buildProofScriptPrompt(
+        args.finding,
+        args.baseUrl,
+        args.context,
+        args.proofRule,
+        staticReview,
+      ),
+      tools: [],
+      maxTurns: 1,
+      schema: GeneratedProofScript,
+      signal: args.signal,
+      settingSources: [],
+    });
+    return result.script;
+  }
+
+  async reproduceFinding(args: {
+    finding: Finding;
+    baseUrl: string;
+    browserEndpoint: string;
+    context?: string;
+    maxTurns?: number;
+    staticVerdict?: string;
+    staticReasoning?: string;
+    staticConfirmedImpact?: string;
+    proofRule?: string;
+    signal?: AbortSignal;
+  }): Promise<{
+    result: LiveResult;
+    reasoning: string;
+    counterevidence: string;
+    negativeControl?: string;
+    refused?: boolean;
+    script?: string;
+  }> {
+    const staticReview =
+      args.staticVerdict != null && args.staticReasoning != null
+        ? {
+            verdict: args.staticVerdict,
+            reasoning: args.staticReasoning,
+            ...(args.staticConfirmedImpact ? { confirmedImpact: args.staticConfirmedImpact } : {}),
+          }
+        : undefined;
+    const prompt = buildReproducePrompt(
+      args.finding,
+      args.baseUrl,
+      args.context,
+      staticReview,
+      args.proofRule,
+    );
+    // No built-in tools (no Read/Glob/Grep); this session works only against
+    // the live target through the Playwright MCP server the sandbox hosts.
+    // settingSources: [] isolates it from the user's ~/.claude settings and
+    // CLAUDE.md, so their rules cannot disable the MCP tools or forbid browsing.
+    try {
+      const result = await this.runStructured({
+        prompt,
+        tools: [],
+        maxTurns: args.maxTurns ?? this.reproduceMaxTurns,
+        schema: ReproduceFindingResult,
+        signal: args.signal,
+        // @playwright/mcp serves streamable HTTP at /mcp; the legacy /sse
+        // transport did not attach tools, so connect over /mcp instead.
+        mcpServers: {
+          playwright: { type: "http", url: args.browserEndpoint.replace(/\/sse$/, "/mcp") },
+        },
+        allowedTools: ["mcp__playwright__*"],
+        settingSources: [],
+      });
+      return result.result === "reproduced"
+        ? {
+            result: result.result,
+            reasoning: result.reasoning,
+            counterevidence: result.counterevidence,
+            negativeControl: result.negativeControl,
+            script: result.script,
+          }
+        : {
+            result: result.result,
+            reasoning: result.reasoning,
+            counterevidence: result.counterevidence,
+            negativeControl: result.negativeControl,
+          };
+    } catch (err) {
+      // Mirrors validateFinding: record the refusal instead of failing the
+      // reproduce pass outright.
+      if (err instanceof RefusalError) {
+        logWarn(
+          `[reproduce:${args.finding.id}] model refused to reproduce; recording inconclusive+refused`,
+        );
+        return {
+          result: "inconclusive",
+          reasoning: "Model declined to reproduce this finding (refusal).",
+          counterevidence: "",
+          refused: true,
+        };
+      }
+      throw err;
+    }
+  }
+
+  async validateFindingByScope(args: { finding: Finding; scope: string; signal?: AbortSignal }) {
+    const prompt = buildScopeValidatePrompt(args);
+    const validated = await this.runStructured({
+      prompt,
+      tools: [],
+      maxTurns: this.validateMaxTurns,
+      schema: LlmValidation,
+      signal: args.signal,
+    });
+    return asValidationField(validated);
+  }
+
+  async scoreFinding(args: {
+    finding: Finding;
+    fileContent: string;
+    recon?: ReconReport;
+    signal?: AbortSignal;
+  }): Promise<CvssScore> {
+    // Single-turn, no tools — same constraint as validation: the
+    // prompt already carries the full file content, so the model
+    // shouldn't burn turns on speculative reads.
+    const llmScore = await this.runStructured({
+      prompt: buildScorePrompt(args),
+      tools: [],
+      maxTurns: this.validateMaxTurns,
+      schema: LlmScore,
+      signal: args.signal,
+    });
+    return asCvssScore(llmScore);
+  }
+
+  async suggestFix(args: {
+    finding: Finding;
+    fileContent: string;
+    recon?: ReconReport;
+    liveScript?: LiveScript;
+    root?: string;
+    // Accepted for interface parity, as in validateFinding: the SDK's built-in
+    // Read/Glob/Grep don't take agentgg's exclude / size filters.
+    excludePatterns?: string[];
+    maxFileSizeKb?: number;
+    retry?: FixRetry;
+    signal?: AbortSignal;
+  }): Promise<string> {
+    const result = await this.runStructured({
+      prompt: buildFixPrompt(args),
+      tools: args.root ? ["Read", "Glob", "Grep"] : [],
+      maxTurns: this.validateMaxTurns,
+      cwd: args.root,
+      schema: LlmFix,
+      signal: args.signal,
+    });
+    return result.fix;
+  }
+
+  async dedupeFindings(args: {
+    filePath: string;
+    findings: Finding[];
+    fileContent?: string;
+    signal?: AbortSignal;
+  }): Promise<LlmDedup["clusters"]> {
+    // Single-turn, no tools — the finding metadata and (when readable) the
+    // file content are already in the prompt; clustering is pure reasoning.
+    const result = await this.runStructured({
+      prompt: buildDedupePrompt(args),
+      tools: [],
+      maxTurns: this.validateMaxTurns,
+      schema: LlmDedup,
+      signal: args.signal,
+    });
+    return result.clusters;
+  }
+
+  /**
+   * Variant of `run` that asks the SDK to enforce a JSON schema on the
+   * final output and returns the Zod-validated structured result.
+   *
+   * Used by the tool-enabled passes to skip the text→JSON parsing step
+   * entirely. The
+   * SDK converts the schema into a tool-call-style structured-output
+   * constraint at the protocol level, so the model literally cannot
+   * emit fences, prose, or mistyped fields in the final answer. The
+   * Zod `parse` at the end is defensive belt-and-suspenders in case
+   * the SDK ever hands us something unexpected.
+   */
+  private async runStructured<T extends z.ZodTypeAny>(opts: {
+    prompt: string;
+    /**
+     * Built-in tools the model is permitted to call. `[]` removes all
+     * tools from its context (true single-turn behavior). A non-empty
+     * list whitelists exactly those tool names. Maps to the SDK's
+     * `tools` option — NOT `allowedTools`, which is auto-approval, not
+     * restriction.
+     */
+    tools: string[];
+    maxTurns: number;
+    cwd?: string;
+    schema: T;
+    /**
+     * Parent scan abort signal. When the orchestrator decides to bail
+     * (fatal quota / auth diagnostic in a sibling worker), this signal
+     * fires; we mirror it onto a local `AbortController` and hand the
+     * controller to the SDK so its in-flight subprocess request is
+     * cancelled immediately rather than waiting for the next message.
+     */
+    signal?: AbortSignal;
+    /**
+     * MCP servers to attach for this call only (e.g. the Playwright MCP
+     * server the live-validation sandbox hosts). Independent of `tools`:
+     * that option only bounds the built-in tool set, so an MCP server's
+     * tools are additive even when `tools` is `[]`. Omitted by every pass
+     * except `reproduceFinding`.
+     */
+    mcpServers?: Record<string, McpServerConfig>;
+    /**
+     * Explicit allow-list for MCP tool names/namespaces (e.g.
+     * `mcp__playwright__*`). `permissionMode: "bypassPermissions"` already
+     * skips permission prompts, so this is belt-and-suspenders, kept so the
+     * model's exposed tool set is documented at the call site whenever
+     * `mcpServers` is set.
+     */
+    allowedTools?: string[];
+    /**
+     * Filesystem setting sources for the SDK to load. Pass `[]` for isolation:
+     * skip the user's ~/.claude settings and CLAUDE.md. Omitted by every pass
+     * except reproduceFinding, so the others keep the SDK's load-all default.
+     */
+    settingSources?: ("user" | "project" | "local")[];
+  }): Promise<z.infer<T>> {
+    const jsonSchema = zodToJsonSchema(opts.schema) as Record<string, unknown>;
+    // Bridge: parent gives us a signal, SDK wants a controller. Make a
+    // local controller and link parent → local so aborting the parent
+    // aborts ours. If the parent is already aborted, fail fast before
+    // even spawning the subprocess.
+    const sdkAbortController = new AbortController();
+    // Pull into a local const so the addEventListener arrow closure sees
+    // a definitely-non-undefined reference (the outer `opts.signal` would
+    // require a non-null assertion inside the closure).
+    const parentSignal = opts.signal;
+    if (parentSignal) {
+      if (parentSignal.aborted) {
+        sdkAbortController.abort(parentSignal.reason);
+      } else {
+        parentSignal.addEventListener(
+          "abort",
+          () => sdkAbortController.abort(parentSignal.reason),
+          { once: true },
+        );
+      }
+    }
+    let structured: unknown;
+    let resultText = "";
+    let capturedUsage: unknown;
+    try {
+      for await (const message of query({
+        prompt: opts.prompt,
+        options: {
+          ...(opts.cwd ? { cwd: opts.cwd } : {}),
+          ...(process.env.CLAUDE_CODE_EXECUTABLE
+            ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
+            : {}),
+          ...(this.effort ? { effort: this.effort } : {}),
+          ...(this.thinking && this.thinking !== "off"
+            ? { thinking: { type: this.thinking } }
+            : {}),
+          tools: opts.tools,
+          ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
+          ...(opts.allowedTools ? { allowedTools: opts.allowedTools } : {}),
+          ...(opts.settingSources !== undefined ? { settingSources: opts.settingSources } : {}),
+          permissionMode: "bypassPermissions",
+          maxTurns: opts.maxTurns,
+          model: this.model,
+          env: this.buildEnv(),
+          outputFormat: { type: "json_schema", schema: jsonSchema },
+          abortController: sdkAbortController,
+        },
+      })) {
+        const msg = message as Record<string, unknown>;
+        if (this.verbose && msg.type === "assistant") {
+          this.printToolUses(msg);
+        }
+        // Surface MCP server connection status so a live-validation run shows
+        // whether the browser tools actually attached (and why, if not).
+        if (opts.mcpServers && msg.type === "system" && msg.subtype === "init") {
+          const servers = (msg.mcp_servers as { name: string; status: string }[] | undefined) ?? [];
+          for (const s of servers) console.log(`  live validation: MCP ${s.name}: ${s.status}`);
+        }
+        // Capture the structured answer from any terminal `result` message,
+        // not just `subtype: "success"`. When a session stops at its turn cap
+        // (`error_max_turns`) the SDK can still carry the last structured
+        // output the model emitted — take whatever it got rather than
+        // discarding it and failing.
+        if (msg.type === "result") {
+          const so = (msg as { structured_output?: unknown }).structured_output;
+          if (so !== undefined) structured = so;
+          const r = (msg as { result?: unknown }).result;
+          if (r !== undefined) resultText = String(r);
+          // The terminal result message carries cumulative token usage for the
+          // whole session (across tool-use turns). Capture it for the meter.
+          const usage = (msg as { usage?: unknown }).usage;
+          if (usage !== undefined) capturedUsage = usage;
+        }
+      }
+    } catch (err) {
+      if (process.env.AGENTGG_DEBUG) {
+        const util = await import("node:util");
+        logError("---- ClaudeAgentDetector.runStructured raw error ----");
+        console.error(util.inspect(err, { depth: 5, colors: false }));
+        console.error("------------------------------------------------------");
+      }
+      throw err;
+    }
+    // Record usage even if the structured output is missing/unparsable below —
+    // the tokens were spent regardless.
+    if (capturedUsage !== undefined) {
+      this.meter?.record(extractClaudeUsage(capturedUsage), this.model);
+    }
+    if (structured === undefined) {
+      // A content refusal reaches here as prose with no structured_output.
+      // Distinguish it from a genuinely empty/failed generation so the
+      // phase-specific callers can substitute an empty result instead of
+      // failing the agent; everything else still throws as before.
+      if (looksLikeRefusal(resultText)) {
+        throw new RefusalError(resultText);
+      }
+      throw new Error(
+        `Claude Agent SDK produced no structured_output. Raw result text: ${resultText.slice(0, 200)}…`,
+      );
+    }
+    return opts.schema.parse(structured) as z.infer<T>;
+  }
+
+  /**
+   * Render tool-use blocks from one SDK assistant message to stdout.
+   * The SDK emits an assistant message whenever the model produces a
+   * turn; each turn's `content` is a list of blocks, some of which are
+   * `tool_use` blocks carrying the tool name + input args. Mirroring
+   * Claude Code's interactive output so the operator can see what the
+   * agent is doing instead of staring at silence.
+   */
+  private printToolUses(msg: Record<string, unknown>): void {
+    const message = msg.message as { content?: unknown[] } | undefined;
+    if (!message || !Array.isArray(message.content)) return;
+    for (const block of message.content) {
+      const b = block as { type?: string; name?: string; input?: Record<string, unknown> };
+      if (b.type !== "tool_use" || !b.name) continue;
+      if (b.name === "StructuredOutput") continue;
+      const arg = formatToolArg(b.name, b.input ?? {});
+      console.log(arg ? `    ${b.name} ${arg}` : `    ${b.name}`);
+    }
+  }
+
+  private buildEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (typeof v !== "string") continue;
+      if (ENV_ALLOWLIST.has(k) || k.startsWith("LC_") || k === "Path") {
+        env[k] = v;
+      }
+    }
+    if (this.oauthToken) env.CLAUDE_CODE_OAUTH_TOKEN = this.oauthToken;
+    if (this.apiKey) env.ANTHROPIC_API_KEY = this.apiKey;
+    return env;
+  }
+}
+
+/**
+ * Map the Claude Agent SDK result message's `usage` block into the meter's
+ * normalized `CallUsage`. The SDK reports the Anthropic API shape, where the
+ * prompt side is split across `input_tokens` (uncached), `cache_read_input_tokens`,
+ * and `cache_creation_input_tokens`. We fold all three into `inputTokens` (so it
+ * matches the OpenAI-compat path, where prompt tokens already include cached)
+ * and surface the cache-hit subset as `cachedInputTokens`. Defensive — any
+ * missing field degrades to 0.
+ */
+export function extractClaudeUsage(usage: unknown): CallUsage {
+  const u = (usage ?? {}) as {
+    input_tokens?: unknown;
+    output_tokens?: unknown;
+    cache_read_input_tokens?: unknown;
+    cache_creation_input_tokens?: unknown;
+  };
+  const cachedInputTokens = claudeNumberish(u.cache_read_input_tokens);
+  const inputTokens =
+    claudeNumberish(u.input_tokens) +
+    cachedInputTokens +
+    claudeNumberish(u.cache_creation_input_tokens);
+  return { inputTokens, outputTokens: claudeNumberish(u.output_tokens), cachedInputTokens };
+}
+
+/** A finite positive number, else 0. Token counts are never negative. */
+function claudeNumberish(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+/**
+ * Format a tool_use block's input args into a one-line summary for
+ * the verbose stream. Picks the field most useful per tool — file
+ * path for Read, pattern for Glob/Grep, command for Bash — and elides
+ * the rest. Long values are truncated so output stays readable on
+ * narrow terminals.
+ */
+function formatToolArg(name: string, input: Record<string, unknown>): string {
+  const pick = (key: string): string | undefined => {
+    const v = input[key];
+    return typeof v === "string" && v.length > 0 ? v : undefined;
+  };
+  let value: string | undefined;
+  switch (name) {
+    case "Read":
+    case "Write":
+    case "Edit":
+      value = pick("file_path") ?? pick("path");
+      break;
+    case "Glob":
+      value = pick("pattern");
+      break;
+    case "Grep":
+      value = pick("pattern");
+      break;
+    case "Bash":
+      value = pick("command");
+      break;
+    default:
+      value = pick("path") ?? pick("file_path") ?? pick("pattern") ?? pick("command");
+  }
+  if (!value) return "";
+  return value.length > 100 ? `${value.slice(0, 97)}…` : value;
+}

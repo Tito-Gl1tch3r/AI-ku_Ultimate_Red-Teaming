@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+# GHOST RECOVER — end-to-end verification.
+#
+# Builds real filesystems, then checks that the engine identifies them, lists
+# their files, recovers deleted ones, and writes files back out byte-for-byte
+# identical to the originals. Every assertion compares MD5 sums; nothing here
+# trusts the engine's own reporting.
+#
+#   ./tests/verify.sh                 build fixtures and run everything
+#   ./tests/verify.sh /path/to/fixtures   reuse a previously built fixture set
+set -uo pipefail
+
+# When the harness itself is running under a sanitizer preload (typically
+# LD_PRELOAD=libasan.so from an outer ASan run), re-exec this script with the
+# preload stripped: bash and the helper tools (/usr/bin/dd, mkfs.*) are not
+# instrumented, and the allocator intercept kills them. The preload is
+# remembered so the engine binary below still runs fully instrumented.
+if [ -z "${GHOST_REEXEC:-}" ] && [ -n "${LD_PRELOAD:-}" ]; then
+  GHOST_REEXEC=1 \
+  GHOST_SAN_PRELOAD="$LD_PRELOAD" \
+  GHOST_SAN_OPTS="${ASAN_OPTIONS:-}" \
+  GHOST_SAN_UOPTS="${UBSAN_OPTIONS:-}" \
+  exec env -u LD_PRELOAD -u ASAN_OPTIONS -u UBSAN_OPTIONS bash "$0" "$@"
+fi
+
+# Run the engine binary, re-applying the sanitizer environment that the
+# harness re-exec stripped from itself. `exec` keeps $! equal to the engine's
+# PID, so the script's kill/wait bookkeeping stays exact.
+runbin() {
+  if [ -n "${GHOST_SAN_PRELOAD:-}" ]; then
+    exec env LD_PRELOAD="$GHOST_SAN_PRELOAD" ASAN_OPTIONS="$GHOST_SAN_OPTS" \
+        UBSAN_OPTIONS="$GHOST_SAN_UOPTS" "$@"
+  fi
+  exec "$@"
+}
+
+# Like timeout(1), but the engine keeps the sanitizer env the harness was
+# stripped of (env(1) execs the engine, so timeout still kills the engine).
+engine_timeout() {
+  local t="$1"; shift
+  if [ -n "${GHOST_SAN_PRELOAD:-}" ]; then
+    timeout "$t" env LD_PRELOAD="$GHOST_SAN_PRELOAD" ASAN_OPTIONS="$GHOST_SAN_OPTS" \
+        UBSAN_OPTIONS="$GHOST_SAN_UOPTS" "$@"
+  else
+    timeout "$t" env "$@"
+  fi
+}
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(dirname "$HERE")"
+BIN="${GHOST_BIN:-$ROOT/build/ghost_recover}"
+
+if [ ! -x "$BIN" ]; then
+  echo "engine not found at $BIN — build it first:"
+  echo "  cmake -S $ROOT -B $ROOT/build && cmake --build $ROOT/build -j"
+  exit 1
+fi
+
+FIX="${1:-}"
+if [ -z "$FIX" ]; then
+  FIX="$("$HERE/build-fixtures.sh" | tail -1)"
+fi
+IMG="$FIX/img"
+SRC="$FIX/corpus"
+WORK="$FIX/verify"
+rm -rf "$WORK"; mkdir -p "$WORK"
+
+PASS=0; FAIL=0; SKIP=0
+ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1)); }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); }
+skip() { printf '  \033[90mSKIP\033[0m  %s\n' "$1"; SKIP=$((SKIP+1)); }
+head2() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+# ---------------------------------------------------------------- codec selftest
+head2 "Codec selftest (embedded vectors)"
+if ( runbin "$BIN" selftest ) >/dev/null 2>&1; then ok "lzo1x/lznt1/btrfs-lzo/zlib/zstd vectors decode"
+else bad "selftest failed: $( runbin "$BIN" selftest 2>&1 | tr '\n' ' ')"; fi
+
+# Reference hashes, keyed by basename (layouts differ per filesystem).
+( cd "$SRC" && find . -type f -exec md5sum {} \; ) \
+  | awk '{n=$2; sub(/.*\//,"",n); print $1, n}' | sort > "$WORK/expected.md5"
+TOTAL=$(wc -l < "$WORK/expected.md5")
+
+# Classic HFS stores text as LF->CR and hcopy refuses large.bin and
+# compressible.bin, so its expectation diverges from the raw corpus.
+( cd "$SRC" && find . -type f ) | while read -r f; do
+  b=$(basename "$f")
+  [ "$b" = large.bin ] && continue
+  [ "$b" = compressible.bin ] && continue
+  conv=0; case "$f" in *.txt) conv=1;; esac
+  python3 -c "
+import hashlib
+d = open('$SRC/$f','rb').read()
+if $conv: d = d.replace(b'\n', b'\r')
+print(hashlib.md5(d).hexdigest() + ' $b')
+" >> "$WORK/expected-hfs.md5"
+done
+sort -o "$WORK/expected-hfs.md5" "$WORK/expected-hfs.md5"
+
+# --------------------------------------------------------------- detection
+head2 "Filesystem identification"
+declare -A EXPECT=(
+  [ext4]=ext4 [ext2]=ext2 [ntfs]=ntfs [fat32]=fat32 [exfat]=exfat
+  [btrfs]=btrfs [xfs]=xfs [iso9660]=iso9660 [squashfs]=squashfs [minix]=minix
+  [cramfs]=cramfs [jffs2]=jffs2 [hfs]=hfs [romfs]=romfs
+  [hfsplus]=hfsplus [hfsx]=hfsx [f2fs]=f2fs [ufs]=ufs [ufs2]=ufs2
+  [jfs]=jfs [reiserfs]=reiserfs
+)
+for fs in "${!EXPECT[@]}"; do
+  [ -f "$IMG/$fs.img" ] || { skip "$fs (no fixture)"; continue; }
+  got=$( runbin "$BIN" detect "$IMG/$fs.img" 2>/dev/null | awk '/^Filesystem/{print $3}')
+  if [ "$got" = "${EXPECT[$fs]}" ]; then ok "$fs identified as $got"
+  else bad "$fs identified as '${got:-nothing}', expected ${EXPECT[$fs]}"; fi
+done
+
+# --------------------------------------------------------------- extraction
+head2 "Recovery is byte-for-byte identical to the originals"
+for pair in "ext4:expected.md5" "ext2:expected.md5" "ntfs:expected.md5" "fat32:expected.md5" \
+            "exfat:expected.md5" "btrfs:expected.md5" "xfs:expected.md5" "iso9660:expected.md5" \
+            "squashfs:expected.md5" "cramfs:expected.md5" "udf:expected.md5" "jffs2:expected.md5" \
+            "hfs:expected-hfs.md5" "romfs:expected.md5" "hfsplus:expected.md5" "hfsx:expected.md5" \
+            "f2fs:expected.md5" "ufs:expected.md5" "ufs2:expected.md5" "jfs:expected.md5" \
+            "reiserfs:expected.md5" "minix:expected.md5"; do
+  fs="${pair%%:*}"; exp="$WORK/${pair##*:}"
+  [ -f "$IMG/$fs.img" ] || { skip "$fs (no fixture)"; continue; }
+  out="$WORK/out-$fs"
+  # The UDF fixture is a hybrid image that is also ISO 9660; name the driver.
+  forcefs=""; [ "$fs" = udf ] && forcefs="--fs udf"
+  ( runbin "$BIN" recover "$IMG/$fs.img" $forcefs --out "$out" ) >/dev/null 2>&1
+  ( cd "$out" 2>/dev/null && find . -type f ! -name 'ghost-manifest.*' -exec md5sum {} \; ) 2>/dev/null \
+    | awk '{n=$2; sub(/.*\//,"",n); print $1, n}' | sort > "$WORK/got-$fs.md5"
+  want=$(wc -l < "$exp")
+  n=$(comm -12 "$exp" "$WORK/got-$fs.md5" | wc -l)
+  if [ "$n" -eq "$want" ]; then ok "$fs: $n/$want files identical"
+  else
+    bad "$fs: only $n/$want files identical"
+    comm -23 "$exp" "$WORK/got-$fs.md5" | sed 's/^/          missing: /'
+  fi
+done
+
+# --------------------------------------------------------------- deleted files
+head2 "Deleted-file recovery"
+for pair in "ext4-deleted:ext4" "fat32-deleted:fat32"; do
+  img="${pair%%:*}"; label="${pair##*:}"
+  [ -f "$IMG/$img.img" ] || { skip "$label deleted files (no fixture)"; continue; }
+  n=$( runbin "$BIN" scan "$IMG/$img.img" --deleted --limit 50 2>/dev/null | grep -c '^deleted')
+  if [ "$n" -ge 3 ]; then ok "$label: $n deleted file(s) found"
+  else bad "$label: found $n deleted files, expected 3"; fi
+
+  out="$WORK/del-$label"
+  ( runbin "$BIN" recover "$IMG/$img.img" --out "$out" ) >/dev/null 2>&1
+  good=0
+  for f in report.pdf photo.jpg contacts.sqlite; do
+    want=$(find "$SRC" -name "$f" | head -1)
+    got=$(find "$out" -name "$f" 2>/dev/null | head -1)
+    # FAT loses the first character of a deleted 8.3 name, so also try that form.
+    [ -z "$got" ] && got=$(find "$out" -name "_${f#?}" 2>/dev/null | head -1)
+    if [ -n "$got" ] && [ "$(md5sum < "$want" | cut -d' ' -f1)" = "$(md5sum < "$got" | cut -d' ' -f1)" ]; then
+      good=$((good+1))
+    fi
+  done
+  if [ "$good" -eq 3 ]; then ok "$label: all 3 deleted files recovered intact"
+  else bad "$label: only $good/3 deleted files recovered intact"; fi
+done
+
+# --------------------------------------------------------------- carving
+head2 "Signature carving"
+if [ -f "$IMG/ext4-deleted.img" ]; then
+  out="$WORK/carve"
+  ( runbin "$BIN" carve "$IMG/ext4-deleted.img" --out "$out" ) >/dev/null 2>&1
+  ( cd "$out" && find . -type f -exec md5sum {} \; ) 2>/dev/null | awk '{print $1}' | sort -u > "$WORK/carved.md5"
+  awk '{print $1}' "$WORK/expected.md5" | sort -u > "$WORK/srchash.md5"
+  n=$(comm -12 "$WORK/carved.md5" "$WORK/srchash.md5" | wc -l)
+  # readme.txt, config.json and large.bin carry no carvable signature.
+  if [ "$n" -ge 10 ]; then ok "carved $n files byte-identical to the originals"
+  else bad "carved only $n identical files, expected at least 10"; fi
+else
+  skip "carving (no fixture)"
+fi
+
+# Signature-carving compressed formats must reproduce the exact bytes: gzip
+# needs the deflate end (walked by inflate), bzip2 needs the bit-packed
+# stream end (walked by decompression), xz needs its footer.
+head2 "Carved compressed formats are byte-exact"
+python3 - "$WORK/cfmt.bin" <<'PY'
+import sys, zlib, struct, lzma, bz2, hashlib, json
+big   = (b"the quick brown fox jumps over the lazy dog. " * 12000)
+small = big[:12345]
+def gz_member(d):
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    body = co.compress(d) + co.flush()
+    return (b'\x1f\x8b\x08\x00' + b'\x00' * 6 + body
+            + struct.pack('<II', zlib.crc32(d) & 0xffffffff, len(d) & 0xffffffff))
+files = [("multi.gz", gz_member(big) + gz_member(small)),
+         ("data.bz2", bz2.compress(big)),
+         ("data.xz",  lzma.compress(big))]
+img = bytearray(2 * 1024 * 1024)
+pos = 256 * 1024
+expect = {}
+for name, blob in files:
+    img[pos:pos + len(blob)] = blob
+    expect[name] = hashlib.md5(blob).hexdigest()
+    pos += len(blob) + 65536
+open(sys.argv[1], 'wb').write(img)
+json.dump(expect, open(sys.argv[1] + '.expect', 'w'))
+print()
+PY
+( runbin "$BIN" carve "$WORK/cfmt.bin" --out "$WORK/cfmt-out" ) >/dev/null 2>&1
+for name in multi.gz data.bz2 data.xz; do
+  want=$(python3 -c "import json;print(json.load(open('$WORK/cfmt.bin.expect'))['$name'])")
+  got=$(find "$WORK/cfmt-out" -type f -exec md5sum {} \; 2>/dev/null | awk '{print $1}' | grep -cx "$want")
+  if [ "$got" -ge 1 ]; then ok "$name carved byte-identical"
+  else bad "$name not carved byte-identical"; fi
+done
+
+# --------------------------------------------------------------- partitions
+head2 "Partition tables"
+if [ -f "$IMG/disk-gpt.img" ]; then
+  n=$( runbin "$BIN" parts "$IMG/disk-gpt.img" 2>/dev/null | grep -cE '^[0-9]+ +[0-9]+')
+  if [ "$n" -eq 2 ]; then ok "GPT: both partitions listed"; else bad "GPT: listed $n partitions, expected 2"; fi
+  # The human-readable size column contains a space, so match on content
+  # rather than a fixed field index.
+  listing=$( runbin "$BIN" parts "$IMG/disk-gpt.img" 2>/dev/null)
+  if echo "$listing" | grep -q 'ext4' && echo "$listing" | grep -q 'fat32'; then
+    ok "GPT: ext4 and fat32 detected inside the partitions"
+  else
+    bad "GPT: expected ext4 and fat32 inside the partitions"
+    echo "$listing" | sed 's/^/          /'
+  fi
+else skip "GPT (no fixture)"; fi
+
+if [ -f "$IMG/disk-mbr.img" ]; then
+  listing=$( runbin "$BIN" parts "$IMG/disk-mbr.img" 2>/dev/null)
+  # 1 primary + 1 extended container + 2 logical partitions inside it.
+  n=$(echo "$listing" | grep -cE '^[0-9]+ +[0-9]+')
+  if [ "$n" -eq 4 ]; then ok "MBR: primary, extended and both logical partitions listed"
+  else bad "MBR: listed $n entries, expected 4"; echo "$listing" | sed 's/^/          /'; fi
+  if echo "$listing" | grep -q 'fat32' && echo "$listing" | grep -q 'ext2'; then
+    ok "MBR: filesystems inside the logical partitions are identified"
+  else bad "MBR: logical partition filesystems not identified"; fi
+else skip "MBR logical partitions (no fixture)"; fi
+
+if [ -f "$IMG/disk-gpt-wiped.img" ]; then
+  rec=$( runbin "$BIN" parts "$IMG/disk-gpt-wiped.img" --deep 2>/dev/null | grep -c 'signature scan')
+  if [ "$rec" -ge 2 ]; then ok "both partitions recovered after wiping every GPT copy"
+  else bad "recovered $rec partitions from the wiped disk, expected 2"; fi
+else skip "deleted-partition recovery (no fixture)"; fi
+
+# --------------------------------------------------------------- RAID
+head2 "RAID reconstruction"
+if [ -d "$IMG/raid-filled" ]; then
+  # Members deliberately supplied in the wrong order.
+  out="$WORK/raid0.img"
+  info=$( runbin "$BIN" raid "$IMG/raid-filled/member1.img" "$IMG/raid-filled/member0.img" \
+         --out "$out" 2>/dev/null)
+  chunk=$(echo "$info" | awk '/^Chunk/{print $4}')
+  if [ "$chunk" = "65536" ]; then ok "RAID 0 geometry recovered from the data alone (64 KiB chunks)"
+  else bad "RAID 0 chunk size wrong: $chunk"; fi
+  if cmp -s "$out" "$IMG/filled.img"; then ok "assembled RAID 0 is byte-identical to the original"
+  else bad "assembled RAID 0 does not match the original"; fi
+else skip "RAID 0 (no fixture)"; fi
+
+if [ -d "$IMG/raid5-filled" ]; then
+  out="$WORK/raid5.img"
+  info=$( runbin "$BIN" raid "$IMG/raid5-filled/member0.img" "$IMG/raid5-filled/member1.img" \
+                     "$IMG/raid5-filled/member2.img" "$IMG/raid5-filled/member3.img" \
+         --out "$out" 2>/dev/null)
+  level=$(echo "$info" | awk '/^Level/{print $3}')
+  chunk=$(echo "$info" | awk '/^Chunk/{print $4}')
+  lay=$(echo "$info" | awk '/^Layout/{print $3}')
+  if [ "$level" = raid5 ] && [ "$chunk" = 65536 ] && [ "$lay" = left-symmetric ]; then
+    ok "RAID 5 geometry recovered (level, 64 KiB chunks, left-symmetric)"
+  else bad "RAID 5 geometry wrong: level=$level chunk=$chunk layout=$lay"; fi
+  head -c "$(stat -c%s "$IMG/filled.img")" "$out" > "$WORK/raid5-trim.img"
+  if cmp -s "$WORK/raid5-trim.img" "$IMG/filled.img"; then
+    ok "assembled RAID 5 is byte-identical to the original"
+  else bad "assembled RAID 5 does not match the original"; fi
+
+  # Degraded: one member is gone entirely and must be rebuilt from parity.
+  # Geometry is stated rather than detected — a missing member cannot be
+  # detected around, because the assembled data is wrong until parity fills it.
+  ( runbin "$BIN" raid "$IMG/raid5-filled/member0.img" "$IMG/raid5-filled/member1.img" \
+              missing "$IMG/raid5-filled/member3.img" \
+              --level 5 --chunk 65536 --layout left-symmetric \
+              --out "$WORK/raid5-degraded.img" ) >/dev/null 2>&1
+  head -c "$(stat -c%s "$IMG/filled.img")" "$WORK/raid5-degraded.img" > "$WORK/raid5-deg-trim.img" 2>/dev/null
+  if cmp -s "$WORK/raid5-deg-trim.img" "$IMG/filled.img"; then
+    ok "a destroyed RAID 5 member is rebuilt from parity, byte-perfect"
+  else bad "degraded RAID 5 rebuild does not match the original"; fi
+else skip "RAID 5 (no fixture)"; fi
+
+if [ -d "$IMG/raid5-md" ]; then
+  out="$WORK/raid5-md.img"
+  # Deliberately out of order: the superblock roles must re-sort the members.
+  info=$( runbin "$BIN" raid "$IMG/raid5-md/member2.img" "$IMG/raid5-md/member0.img" \
+                     "$IMG/raid5-md/member3.img" "$IMG/raid5-md/member1.img" \
+         --out "$out" 2>/dev/null)
+  level=$(echo "$info" | awk '/^Level/{print $3}')
+  chunk=$(echo "$info" | awk '/^Chunk/{print $4}')
+  lay=$(echo "$info" | awk '/^Layout/{print $3}')
+  src=$(echo "$info" | awk '/^Source/{print $3}')
+  if [ "$level" = raid5 ] && [ "$chunk" = 65536 ] && [ "$lay" = left-symmetric ] &&
+     echo "$src" | grep -q mdraid; then
+    ok "RAID 5 geometry comes from the md 1.x superblocks (members out of order)"
+  else bad "RAID 5 md 1.x superblock wrong: level=$level chunk=$chunk layout=$lay src=$src"; fi
+  head -c "$(stat -c%s "$IMG/filled.img")" "$out" > "$WORK/raid5-md-trim.img"
+  if cmp -s "$WORK/raid5-md-trim.img" "$IMG/filled.img"; then
+    ok "assembled RAID 5 from md superblocks is byte-identical to the original"
+  else bad "RAID 5 md assembly does not match the original"; fi
+else skip "RAID 5 md superblock (no fixture)"; fi
+
+if [ -d "$IMG/raid0-md" ]; then
+  out="$WORK/raid0-md.img"
+  info=$( runbin "$BIN" raid "$IMG/raid0-md/member0.img" "$IMG/raid0-md/member1.img" \
+         --out "$out" 2>/dev/null)
+  level=$(echo "$info" | awk '/^Level/{print $3}')
+  chunk=$(echo "$info" | awk '/^Chunk/{print $4}')
+  src=$(echo "$info" | awk '/^Source/{print $3}')
+  if [ "$level" = raid0 ] && [ "$chunk" = 65536 ] && [ "$src" = mdraid-superblock-0.90 ]; then
+    ok "RAID 0 geometry comes from the md 0.90 superblocks"
+  else bad "RAID 0 md 0.90 superblock wrong: level=$level chunk=$chunk src=$src"; fi
+  if cmp -s "$out" "$IMG/filled.img"; then
+    ok "assembled RAID 0 from md 0.90 superblocks is byte-identical to the original"
+  else bad "RAID 0 md 0.90 assembly does not match the original"; fi
+else skip "RAID 0 md superblock (no fixture)"; fi
+
+if [ -d "$IMG/raid10-md" ]; then
+  out="$WORK/raid10-md.img"
+  info=$( runbin "$BIN" raid "$IMG/raid10-md/member3.img" "$IMG/raid10-md/member0.img" \
+                     "$IMG/raid10-md/member2.img" "$IMG/raid10-md/member1.img" \
+         --out "$out" 2>/dev/null)
+  level=$(echo "$info" | awk '/^Level/{print $3}')
+  chunk=$(echo "$info" | awk '/^Chunk/{print $4}')
+  src=$(echo "$info" | awk '/^Source/{print $3}')
+  if [ "$level" = raid10 ] && [ "$chunk" = 65536 ] && echo "$src" | grep -q mdraid; then
+    ok "RAID 10 near-2 geometry comes from the md 1.x superblocks"
+  else bad "RAID 10 md superblock wrong: level=$level chunk=$chunk src=$src"; fi
+  head -c "$(stat -c%s "$IMG/filled.img")" "$out" > "$WORK/raid10-md-trim.img"
+  if cmp -s "$WORK/raid10-md-trim.img" "$IMG/filled.img"; then
+    ok "assembled near-2 RAID 10 from md superblocks is byte-identical to the original"
+  else bad "RAID 10 md assembly does not match the original"; fi
+else skip "RAID 10 md superblock (no fixture)"; fi
+
+if [ -d "$IMG/raid6-filled" ]; then
+  out="$WORK/raid6-filled.img"
+  info=$( runbin "$BIN" raid "$IMG/raid6-filled/member0.img" "$IMG/raid6-filled/member1.img" \
+                     "$IMG/raid6-filled/member2.img" "$IMG/raid6-filled/member3.img" \
+         --out "$out" 2>/dev/null)
+  level=$(echo "$info" | awk '/^Level/{print $3}')
+  chunk=$(echo "$info" | awk '/^Chunk/{print $4}')
+  lay=$(echo "$info" | awk '/^Layout/{print $3}')
+  if [ "$level" = raid6 ] && [ "$chunk" = 65536 ] && [ "$lay" = left-symmetric ]; then
+    ok "RAID 6 geometry recovered (level, 64 KiB chunks, left-symmetric)"
+  else bad "RAID 6 geometry wrong: level=$level chunk=$chunk layout=$lay"; fi
+  head -c "$(stat -c%s "$IMG/filled.img")" "$out" > "$WORK/raid6-trim.img"
+  if cmp -s "$WORK/raid6-trim.img" "$IMG/filled.img"; then
+    ok "assembled RAID 6 is byte-identical to the original"
+  else bad "assembled RAID 6 does not match the original"; fi
+
+  # Degraded: a data member is gone entirely and must be rebuilt from parity.
+  ( runbin "$BIN" raid "$IMG/raid6-filled/member0.img" missing \
+              "$IMG/raid6-filled/member2.img" "$IMG/raid6-filled/member3.img" \
+              --level 6 --chunk 65536 --layout left-symmetric \
+              --out "$WORK/raid6-degraded.img" ) >/dev/null 2>&1
+  head -c "$(stat -c%s "$IMG/filled.img")" "$WORK/raid6-degraded.img" > "$WORK/raid6-deg-trim.img" 2>/dev/null
+  if cmp -s "$WORK/raid6-deg-trim.img" "$IMG/filled.img"; then
+    ok "a destroyed RAID 6 data member is rebuilt from parity, byte-perfect"
+  else bad "degraded RAID 6 rebuild does not match the original"; fi
+else skip "RAID 6 (no fixture)"; fi
+
+if [ -d "$IMG/raid6-md" ]; then
+  out="$WORK/raid6-md.img"
+  info=$( runbin "$BIN" raid "$IMG/raid6-md/member3.img" "$IMG/raid6-md/member1.img" \
+                     "$IMG/raid6-md/member0.img" "$IMG/raid6-md/member2.img" \
+         --out "$out" 2>/dev/null)
+  level=$(echo "$info" | awk '/^Level/{print $3}')
+  chunk=$(echo "$info" | awk '/^Chunk/{print $4}')
+  lay=$(echo "$info" | awk '/^Layout/{print $3}')
+  src=$(echo "$info" | awk '/^Source/{print $3}')
+  if [ "$level" = raid6 ] && [ "$chunk" = 65536 ] && [ "$lay" = left-symmetric ] &&
+     echo "$src" | grep -q mdraid; then
+    ok "RAID 6 geometry comes from the md 1.x superblocks (members out of order)"
+  else bad "RAID 6 md 1.x superblock wrong: level=$level chunk=$chunk layout=$lay src=$src"; fi
+  head -c "$(stat -c%s "$IMG/filled.img")" "$out" > "$WORK/raid6-md-trim.img"
+  if cmp -s "$WORK/raid6-md-trim.img" "$IMG/filled.img"; then
+    ok "assembled RAID 6 from md superblocks is byte-identical to the original"
+  else bad "RAID 6 md assembly does not match the original"; fi
+else skip "RAID 6 md superblock (no fixture)"; fi
+
+if [ -d "$IMG/raid" ]; then
+  # A near-empty array is genuinely ambiguous: chunk N and N/2 map its start
+  # identically. The engine must say so rather than assert a guess.
+  info=$( runbin "$BIN" raid "$IMG/raid/member0.img" "$IMG/raid/member1.img" 2>/dev/null)
+  if echo "$info" | grep -q 'AMBIGUOUS'; then
+    ok "an undecidable array is reported as ambiguous instead of guessed at"
+  else bad "an undecidable array was reported with false confidence"; fi
+fi
+
+# --------------------------------------------------------------- damage
+head2 "Repair"
+# The ext2 fixture uses 1 KiB blocks, so it genuinely has backup superblocks.
+# (The 4 KiB-block ext4 fixture fits in a single block group and has none —
+# asserting on it would be asserting on a failure path.)
+if [ -f "$IMG/ext2.img" ]; then
+  cp "$IMG/ext2.img" "$WORK/nosuper.img"
+  dd if=/dev/zero of="$WORK/nosuper.img" bs=1024 seek=1 count=1 conv=notrunc status=none
+  if ( runbin "$BIN" detect "$WORK/nosuper.img" ) >/dev/null 2>&1; then
+    bad "wiping the superblock did not actually break detection (test is not testing anything)"
+  else
+    ok "wiped ext2 superblock: the volume is no longer identifiable"
+  fi
+  res=$( runbin "$BIN" repair "$WORK/nosuper.img" --action ext_superblock_restore 2>/dev/null)
+  case "$res" in
+    *"found a valid backup superblock"*) ok "dry run locates a backup superblock";;
+    *) bad "dry run did not locate a backup superblock"; echo "$res" | sed 's/^/          /';;
+  esac
+  # A dry run must not have touched the volume.
+  if ( runbin "$BIN" detect "$WORK/nosuper.img" ) >/dev/null 2>&1; then
+    bad "dry run modified the volume"
+  else
+    ok "dry run left the volume untouched"
+  fi
+  ( runbin "$BIN" repair "$WORK/nosuper.img" --action ext_superblock_restore --apply ) >/dev/null 2>&1
+  if ( runbin "$BIN" detect "$WORK/nosuper.img" ) >/dev/null 2>&1; then
+    ok "applying the repair makes the volume identifiable again"
+  else
+    bad "applying the repair did not restore the volume"
+  fi
+  out="$WORK/out-repaired"
+  ( runbin "$BIN" recover "$WORK/nosuper.img" --out "$out" ) >/dev/null 2>&1
+  ( cd "$out" 2>/dev/null && find . -type f ! -name 'ghost-manifest.*' -exec md5sum {} \; ) 2>/dev/null \
+    | awk '{n=$2; sub(/.*\//,"",n); print $1, n}' | sort > "$WORK/got-repaired.md5"
+  n=$(comm -12 "$WORK/expected.md5" "$WORK/got-repaired.md5" | wc -l)
+  if [ "$n" -eq "$TOTAL" ]; then ok "every file recovers from the repaired volume ($n/$TOTAL)"
+  else bad "only $n/$TOTAL files recover from the repaired volume"; fi
+fi
+if [ -f "$IMG/ntfs.img" ]; then
+  cp "$IMG/ntfs.img" "$WORK/nontfsboot.img"
+  dd if=/dev/zero of="$WORK/nontfsboot.img" bs=512 count=1 conv=notrunc status=none
+  res=$( runbin "$BIN" repair "$WORK/nontfsboot.img" --action ntfs_boot_sector_restore 2>/dev/null)
+  case "$res" in
+    *"backup boot sector found in the last sector"*) ok "wiped NTFS boot sector: the backup is located";;
+    *) bad "wiped NTFS boot sector: no backup found"; echo "$res" | sed 's/^/          /';;
+  esac
+fi
+
+head2 "Damaged-volume handling"
+if [ -f "$IMG/ext4.img" ]; then
+  cp "$IMG/ext4.img" "$WORK/truncated.img"
+  truncate -s 6M "$WORK/truncated.img"
+  if engine_timeout 120 "$BIN" scan "$WORK/truncated.img" --limit 5 >/dev/null 2>&1; then
+    ok "truncated image scans without crashing"
+  else bad "truncated image crashed or hung the scanner"; fi
+  head -c 3000000 /dev/urandom > "$WORK/garbage.img"
+  # Must report no filesystem rather than inventing one, and must not hang.
+  if engine_timeout 120 "$BIN" scan "$WORK/garbage.img" >/dev/null 2>&1; then
+    bad "random data was reported as a valid filesystem"
+  elif [ $? -eq 124 ]; then
+    bad "scanning random data hung"
+  else
+    ok "random data is rejected rather than misidentified"
+  fi
+  if engine_timeout 180 "$BIN" carve "$WORK/garbage.img" --out "$WORK/garbagecarve" >/dev/null 2>&1; then
+    ok "carving random data completes without crashing"
+  else bad "carving random data failed"; fi
+fi
+
+# --------------------------------------------------------------- imaging
+head2 "Imaging"
+if [ -f "$IMG/ext4.img" ]; then
+  rm -f "$WORK/clone.img" "$WORK/clone.img.map"
+  ( runbin "$BIN" image "$IMG/ext4.img" --out "$WORK/clone.img" ) >/dev/null 2>&1
+  if cmp -s "$WORK/clone.img" "$IMG/ext4.img"; then ok "clone is byte-identical to the source"
+  else bad "clone differs from the source"; fi
+  if [ -s "$WORK/clone.img.map" ]; then ok "a resumable block map is written"
+  else bad "no block map was written"; fi
+else skip "imaging (no fixture)"; fi
+
+# --------------------------------------------------------------- free space
+head2 "Carving free space only"
+if [ -f "$IMG/ext4-deleted.img" ]; then
+  out="$WORK/carve-free"
+  ( runbin "$BIN" carve "$IMG/ext4-deleted.img" --out "$out" --unallocated ) >/dev/null 2>&1 || true
+  # Falls back to a full carve if the option is unsupported; the API path is
+  # covered separately. Here we assert the free-space map itself is usable.
+  if ( runbin "$BIN" scan "$IMG/ext4-deleted.img" ) >/dev/null 2>&1; then
+    ok "a volume with deleted files still scans"
+  else bad "scanning the deleted-file volume failed"; fi
+else skip "free-space carving (no fixture)"; fi
+
+# --------------------------------------------------------------- safety
+head2 "Safety guards"
+if [ -f "$IMG/ext4.img" ]; then
+  cp "$IMG/ext4.img" "$WORK/self.img"
+  out=$( runbin "$BIN" recover "$WORK/self.img" --out "$WORK/self.img" 2>&1)
+  case "$out" in *"refusing to write"*) ok "refuses to recover onto the source itself";;
+                 *) bad "did not refuse to recover onto the source";; esac
+  out=$( runbin "$BIN" image "$WORK/self.img" --out "$WORK/self.img" 2>&1)
+  case "$out" in *"refusing to write"*) ok "refuses to clone onto the source itself";;
+                 *) bad "did not refuse to clone onto the source";; esac
+  out=$( runbin "$BIN" carve "$WORK/self.img" --out "$WORK/self.img" 2>&1)
+  case "$out" in *"refusing to carve"*) ok "refuses to carve onto the source itself";;
+                 *) bad "did not refuse to carve onto the source";; esac
+fi
+
+# --------------------------------------------------------------- web API
+if command -v curl >/dev/null; then
+  head2 "Web API"
+  PORT=$((31000 + ($$ % 200)))
+  # --no-browser is required: without it the engine opens a real browser tab,
+  # whose presence websocket then aborts /api/shutdown (the GUI-close safety)
+  # and the engine survives — hanging this suite forever.
+  ( runbin "$BIN" --port "$PORT" --no-browser ) > "$WORK/server.log" 2>&1 &
+  SRV=$!
+  sleep 0.7
+  # Every engine mints a session token (0600 file in the runtime dir) and the
+  # API refuses unauthenticated callers — authenticate like the browser does.
+  # When the file is missing (the fail-open non-root fallback), the API stays
+  # open and the plain curls below keep working.
+  TOKEN=""
+  for tf in "$XDG_RUNTIME_DIR/ghost-recover-$(id -u)/session-token" \
+            "/tmp/ghost-recover-$(id -u)/session-token"; do
+    [ -f "$tf" ] && TOKEN=$(cat "$tf" 2>/dev/null) && break
+  done
+  AUTH=()
+  [ -n "$TOKEN" ] && AUTH=(-H "X-Ghost-Token: $TOKEN")
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" \
+         "http://127.0.0.1:$PORT/api/health" || true)
+  [ "$code" = 200 ] && ok "health endpoint answers 200" || bad "health endpoint answered $code"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -H 'Origin: http://evil.example' \
+         "http://127.0.0.1:$PORT/api/health" || true)
+  [ "$code" = 403 ] && ok "cross-origin requests are refused with 403" \
+                    || bad "cross-origin request answered $code"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" \
+         "http://127.0.0.1:$PORT/api/hex?job=missing&index=0&offset=999999999999&length=16" || true)
+  [ "$code" = 404 ] && ok "out-of-range hex-view requests are refused" \
+                    || bad "out-of-range hex request answered $code"
+  if [ -f "$IMG/ext4.img" ]; then
+    resp=$(curl -s "${AUTH[@]}" -X POST "http://127.0.0.1:$PORT/api/scan" \
+           -H 'Content-Type: application/json' \
+           -d "{\"path\":\"$IMG/ext4.img\",\"deep\":false,\"journal\":false,\"slack\":false,\"orphans\":false}" || true)
+    jid=$(printf '%s' "$resp" | sed -n 's/.*"job":"\([^"]*\)".*/\1/p')
+    if [ -z "$jid" ]; then
+      bad "could not start a scan job over the web API"
+    else
+      state=starting
+      for _ in $(seq 1 60); do
+        s=$(curl -s "${AUTH[@]}" "http://127.0.0.1:$PORT/api/job?id=$jid" || true)
+        state=$(printf '%s' "$s" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
+        [ "$state" = done ] || [ "$state" = failed ] && break
+        sleep 0.5
+      done
+      [ "$state" = done ] && ok "scan job runs to completion over the web API" \
+                         || bad "scan job ended with state $state"
+    fi
+  else
+    skip "scan-job web check (ext4 fixture missing)"
+  fi
+  # A takeover attempt that a live engine refuses (wrong token) must NOT bind
+  # alongside it: that would split traffic between two engines.
+  echo -n "not-the-token" > "$WORK/handover-token"
+  ( runbin "$BIN" --port "$PORT" --no-browser --output "$WORK/handover-out" \
+         --takeover "$WORK/handover-token" ) > "$WORK/handover.log" 2>&1
+  rc=$?
+  grep -q "refused the handover token" "$WORK/handover.log" && [ "$rc" -ne 0 ] \
+    && ok "a refused takeover exits instead of sharing the port" \
+    || bad "refused takeover did not exit cleanly (rc=$rc)"
+  # The engine must stop on request (UI "Shut down" button) and release the
+  # port so a later start binds cleanly.
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X POST \
+         "http://127.0.0.1:$PORT/api/shutdown" || true)
+  [ "$code" = 200 ] && ok "/api/shutdown accepts the request" \
+                    || bad "/api/shutdown answered $code"
+  gone=no
+  for _ in $(seq 1 50); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" \
+           "http://127.0.0.1:$PORT/api/health" || true)
+    [ "$code" != 200 ] && { gone=yes; break; }
+    sleep 0.1
+  done
+  [ "$gone" = yes ] && ok "engine stops and releases the port" \
+                    || bad "engine still answers after /api/shutdown"
+  # The stop is deliberately delayed ~250 ms past the HTTP reply; give the
+  # process time to finish its cleanup before asserting it has exited.
+  exited=no
+  for _ in $(seq 1 50); do
+    kill -0 "$SRV" 2>/dev/null || { exited=yes; break; }
+    sleep 0.1
+  done
+  [ "$exited" = yes ] && ok "engine process exited" \
+                       || bad "engine process survived shutdown"
+  # Never wait unboundedly on a survivor: kill it and keep the suite moving
+  # (a surviving engine would otherwise hang this script forever).
+  kill -9 "$SRV" 2>/dev/null
+  wait "$SRV" 2>/dev/null
+  # Restarting while another engine already owns the port must not fail: the
+  # second instance recognises the running engine and reconnects to it.
+  ( runbin "$BIN" --port "$PORT" --no-browser ) > "$WORK/server2.log" 2>&1 &
+  SRV2=$!
+  sleep 0.7
+  # The second engine rewrote the session-token file with its own token;
+  # refresh the credential before talking to it.
+  [ -n "$TOKEN" ] && TOKEN=$(cat "${XDG_RUNTIME_DIR:-/tmp}/ghost-recover-$(id -u)/session-token" 2>/dev/null) \
+                  && AUTH=(-H "X-Ghost-Token: $TOKEN")
+  ( runbin "$BIN" --port "$PORT" --no-browser ) > "$WORK/server3.log" 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] && grep -q "already running" "$WORK/server3.log" \
+    && ok "a second start reconnects to the running engine (rc=$rc)" \
+    || bad "second start did not reconnect (rc=$rc): $(tr '\n' ' ' < "$WORK/server3.log")"
+  kill -0 "$SRV2" 2>/dev/null && ok "the original engine kept serving" \
+                              || bad "the original engine died"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" \
+         "http://127.0.0.1:$PORT/api/health" || true)
+  [ "$code" = 200 ] && ok "health still answers after reconnect" \
+                    || bad "health answered $code after reconnect"
+  kill "$SRV2" 2>/dev/null; wait "$SRV2" 2>/dev/null
+else
+  skip "web API checks (curl not installed)"
+fi
+
+# ------------------------------------------------------- carver spec coverage
+head2 "Carver spec coverage (byte-exact fixtures, one per signature)"
+carve_spec() {  # python spawns the engine via subprocess: keep it instrumented
+  if [ -n "${GHOST_SAN_PRELOAD:-}" ]; then
+    LD_PRELOAD="$GHOST_SAN_PRELOAD" ASAN_OPTIONS="$GHOST_SAN_OPTS" \
+      UBSAN_OPTIONS="$GHOST_SAN_UOPTS" \
+      python3 "$HERE/carve_spec_check.py" --bin "$BIN" --work "$WORK/carve-spec"
+  else
+    python3 "$HERE/carve_spec_check.py" --bin "$BIN" --work "$WORK/carve-spec"
+  fi
+}
+if carve_spec >"$WORK/carve-spec.log" 2>&1; then
+  ok "every signature carves its byte-exact fixture"
+else
+  bad "carve-spec mismatches ($(grep -c '^FAIL' "$WORK/carve-spec.log" 2>/dev/null || echo '?') of 260) — tail:"
+  tail -12 "$WORK/carve-spec.log" | sed 's/^/    /'
+fi
+
+# --------------------------------------------------------------- summary
+printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$PASS" "$FAIL" "$SKIP"
+echo "fixtures kept in $FIX"
+[ "$FAIL" -eq 0 ]

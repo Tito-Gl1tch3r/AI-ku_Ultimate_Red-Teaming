@@ -1,0 +1,429 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import type { Agent, Provider } from "@agentgg/core";
+import {
+  completeRun,
+  createRunMeta,
+  fingerprint,
+  getOfficialAgentsDir,
+  upsertScanMeta,
+  writeRunMeta,
+  writeScanPlan,
+} from "@agentgg/core";
+import type { Command } from "commander";
+import { defaultAgentDirs, loadAllAgents } from "../agent-catalog.js";
+import { installOfficialAgents } from "../agents-install.js";
+import { loadOrSynthesizeConfig, resolveDetector } from "../llm.js";
+import { logError, logInfo, logWarn } from "../log.js";
+import { selectAgents } from "../precondition.js";
+import {
+  buildCredentialsFromOpts,
+  REGION_FLAG_HELP,
+  validateProviderFlags,
+} from "../providers/index.js";
+import { runRecon } from "../recon.js";
+import { runSmartExclude } from "../smart-exclude.js";
+import { resolveTemplates } from "../template.js";
+import { createUsageMeter, type UsageMeter } from "../usage-meter.js";
+import { DEFAULT_EXCLUDES, type WalkConfig } from "../walker.js";
+import { buildInvocation } from "./invocation.js";
+
+interface ReconOpts {
+  output?: string;
+  /** `--source-id`: see the twin option on `scan`. Recorded on the brief hash
+   *  and the plan so a later `scan` run at a different path still matches. */
+  sourceId?: string;
+  provider?: string;
+  apiKey?: string;
+  oauthToken?: string;
+  baseUrl?: string;
+  region?: string;
+  project?: string;
+  model?: string;
+  /** `--openrouter-routing`: see the twin option on `scan`. */
+  openrouterRouting?: string;
+  concurrency?: number;
+  template?: string[];
+  exclude?: string[];
+  only?: string[];
+  maxFileSize?: number; // KB
+  defaultExcludes?: boolean;
+  /**
+   * `--auto-exclude`: before recon, let the model pick non-runtime folders to
+   * skip and fold them into the walk, so recon + the precondition plan inherit
+   * them. On by default (Commander default `true`), matching `scan` so this
+   * dry-run faithfully previews what a scan would do; pass `--no-auto-exclude`
+   * to plan the whole tree. Chosen globs are recorded in plan.json (reasons
+   * under `--verbose`). The default lives on the CLI — a programmatic caller
+   * that leaves this unset gets the pass OFF (same as `scan`).
+   */
+  autoExclude?: boolean;
+  maxTurns?: number;
+  /** Re-run recon even when a cached brief exists for this output dir. */
+  reRecon?: boolean;
+  verbose?: boolean;
+}
+
+/**
+ * Stand-alone recon command — runs only the first two phases of a scan:
+ *
+ *   1. recon  — the high-level project brief (`state/recon.json`)
+ *   2. plan   — evaluate every selected agent's precondition and record
+ *               which are queued vs skipped (`state/plan.json`)
+ *
+ * No detection runs. This is the durable plan→run hand-off: a distributed
+ * runner can compute the plan here, then dispatch the queued agents
+ * elsewhere. Locally it's a cheap dry-run that shows what a `scan` with the
+ * same flags would actually execute — and because the recon brief is cached
+ * by `reconHash`, a follow-up `scan` against the same `--output` reuses this
+ * brief instead of paying for the survey twice.
+ */
+export async function runReconCommand(
+  rootArg: string,
+  opts: ReconOpts,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const root = resolve(rootArg);
+  const outDir = resolve(opts.output ?? "./scan-results/");
+  // Resume identity; see the same binding in `scan`. Defaults to the root.
+  const sourceId = opts.sourceId ?? root;
+
+  // Record the scanned root so a later `scan` / `revalidate` / `summary`
+  // against this output dir can resolve relative paths without retyping it.
+  upsertScanMeta(outDir, root);
+  const runMeta = createRunMeta({
+    type: "scan",
+    invocation: buildInvocation({ command: "recon" }),
+  });
+  writeRunMeta(outDir, runMeta);
+
+  const reconAbortController = new AbortController();
+  let runFinalized = false;
+  // Assigned once the detector is resolved below. Recon makes LLM calls (the
+  // survey + precondition gates), so it meters too; the handler flushes the
+  // token ledger on SIGTERM (Cloud Run Job cancel) before exit.
+  let usageMeter: UsageMeter | undefined;
+
+  // SIGINT (Ctrl+C) / SIGTERM handler: stamp the run as errored on disk.
+  // SIGTERM matters when this CLI runs inside a Cloud Run Job — cancel
+  // sends SIGTERM, and without this Node's default would exit silently,
+  // leaving the run sidecar stuck at `phase: "running"`.
+  const shutdownHandler = (signal: NodeJS.Signals) => {
+    if (!runFinalized) {
+      runFinalized = true;
+      try {
+        usageMeter?.flush();
+      } catch {
+        // metering must never block shutdown
+      }
+      try {
+        completeRun(outDir, runMeta.runId, "error", {});
+      } catch {
+        // best-effort
+      }
+      console.error("");
+      logError(`Interrupted (${signal}). Partial state persisted; re-run to resume.`);
+    }
+    process.exit(signal === "SIGTERM" ? 143 : 130);
+  };
+  process.on("SIGINT", shutdownHandler);
+  process.on("SIGTERM", shutdownHandler);
+
+  try {
+    const config = loadOrSynthesizeConfig(env, opts.provider);
+    const activeProvider = (opts.provider ?? config.provider) as Provider;
+    validateProviderFlags(activeProvider, opts);
+    const credentials = buildCredentialsFromOpts(opts);
+    const detector = resolveDetector(config, {
+      provider: opts.provider,
+      model: opts.model,
+      credentials,
+      verbose: opts.verbose,
+      openrouterRouting: opts.openrouterRouting,
+    });
+
+    // Token-usage metering — recon's survey + precondition gates are real LLM
+    // calls, so they're recorded too. Checkpoints to state/usage.json, flushed
+    // on shutdown + finalize. Seeded from any prior ledger in this dir.
+    usageMeter = createUsageMeter(outDir, detector.name);
+    detector.attachUsageMeter?.(usageMeter);
+
+    // Mirror `scan`: auto-install the official agent library on first use.
+    if (!existsSync(getOfficialAgentsDir(env))) {
+      logInfo("agentgg-agents are not installed, installing...");
+      try {
+        const { version, count } = await installOfficialAgents(env);
+        logInfo(
+          `Successfully installed agentgg-agents at ~/.agentgg/agentgg-agents (${count} agents, ${version})`,
+        );
+      } catch (err) {
+        logWarn(`Could not auto-install agents: ${(err as Error).message}`);
+      }
+    }
+
+    const catalog = loadAllAgents(env);
+    for (const e of catalog.errors) logWarn(e);
+
+    const officialAgentsDir = getOfficialAgentsDir(env);
+    const templateInputs = opts.template ?? [];
+    const defaultDirs = defaultAgentDirs(officialAgentsDir);
+    const selectedAgents: Agent[] =
+      templateInputs.length > 0
+        ? resolveTemplates(templateInputs, catalog.agents, officialAgentsDir)
+        : defaultDirs.length > 0
+          ? resolveTemplates(defaultDirs, catalog.agents, officialAgentsDir)
+          : catalog.agents;
+    if (selectedAgents.length === 0) {
+      throw new Error("No agents selected, nothing to plan.");
+    }
+
+    const project = fingerprint(root);
+
+    const cliExcludes = [...(opts.exclude ?? [])];
+    const includePatterns = opts.only ?? [];
+    const maxFileSizeBytes = (opts.maxFileSize ?? 500) * 1024;
+
+    // --auto-exclude: one LLM pass, BEFORE recon, that picks non-runtime
+    // folders to skip and folds them into the walk — so recon, the
+    // precondition census, and the persisted plan all inherit them. Advisory:
+    // a pass failure degrades to "no auto-excludes" rather than aborting.
+    // On by default (Commander default `true`), matching scan; --no-auto-exclude
+    // opts out. The chosen globs are written to plan.json so a distributed
+    // runner (e.g. the platform's agent workers) can replay them as --exclude
+    // without paying for the pass N times.
+    const smartExcludes: string[] = [];
+    if (opts.autoExclude) {
+      const baselineWalk =
+        opts.defaultExcludes === false ? [...cliExcludes] : [...DEFAULT_EXCLUDES, ...cliExcludes];
+      try {
+        const suggestions = await runSmartExclude({
+          rootDir: root,
+          detector,
+          excludePatterns: baselineWalk,
+          includePatterns,
+          maxFileSizeBytes,
+          signal: reconAbortController.signal,
+        });
+        for (const s of suggestions) smartExcludes.push(s.glob);
+        if (smartExcludes.length > 0) {
+          console.log(
+            `Auto-excluded ${smartExcludes.length} folder(s): ${smartExcludes.join(", ")}`,
+          );
+          if (opts.verbose) {
+            for (const s of suggestions) console.log(`    ${s.glob}: ${s.reason}`);
+          }
+        } else {
+          console.log("Auto-exclude: nothing to drop; planning the whole tree.");
+        }
+      } catch (err) {
+        logWarn(`Auto-exclude pass failed (continuing without it): ${(err as Error).message}`);
+      }
+    }
+
+    const excludePatterns = [...cliExcludes, ...smartExcludes];
+    const walkExcludes =
+      opts.defaultExcludes === false
+        ? [...excludePatterns]
+        : [...DEFAULT_EXCLUDES, ...excludePatterns];
+    const walkCfg: WalkConfig = {
+      excludePatterns: walkExcludes,
+      includePatterns,
+      maxFileSizeBytes,
+    };
+
+    console.log(`Recon + plan for ${root}`);
+    console.log(`Agents selected: ${selectedAgents.length}`);
+    console.log(`Provider: ${detector.name}`);
+    if (templateInputs.length > 0) {
+      console.log(`Template filter: ${templateInputs.join(", ")}`);
+    }
+    console.log("");
+
+    // -------- PHASE 1 — recon --------
+    console.log("[1/2] Recon: surveying the project...");
+    const recon = await runRecon({
+      rootDir: root,
+      outDir,
+      sourceId,
+      detector,
+      fingerprintTags: project.tags,
+      excludePatterns: walkExcludes,
+      includePatterns,
+      maxFileSizeKb: opts.maxFileSize ?? 500,
+      maxTurns: opts.maxTurns ?? 50,
+      force: opts.reRecon,
+      signal: reconAbortController.signal,
+      verbose: opts.verbose,
+    });
+    console.log(
+      `Recon: ${recon.languages.length > 0 ? recon.languages.join(", ") : "(languages unknown)"}${
+        recon.frameworks.length > 0 ? ` | ${recon.frameworks.join(", ")}` : ""
+      }`,
+    );
+    if (recon.summary) {
+      console.log("");
+      console.log(recon.summary);
+    }
+
+    // -------- PHASE 2 — precondition plan --------
+    console.log("\n[2/2] Preconditions: deciding which agents would run...");
+    const selection = await selectAgents(selectedAgents, {
+      rootDir: root,
+      walkCfg,
+      detector,
+      recon,
+      concurrency: opts.concurrency,
+      abortController: reconAbortController,
+      verbose: opts.verbose,
+    });
+    const queuedAgents = selection.queued;
+    const skippedCount = selection.decisions.length - queuedAgents.length;
+    try {
+      writeScanPlan(outDir, {
+        runId: runMeta.runId,
+        generatedAt: new Date().toISOString(),
+        reconHash: recon.reconHash,
+        rootPath: sourceId,
+        decisions: selection.decisions,
+        // Present (even if []) only when the pass ran, so a reader can tell
+        // "auto-exclude didn't run" from "ran, chose nothing".
+        autoExcludes: opts.autoExclude ? smartExcludes : undefined,
+      });
+    } catch (err) {
+      if (opts.verbose) logError(`plan: failed to write: ${(err as Error).message}`);
+    }
+    console.log(
+      `Preconditions: ${queuedAgents.length} queued, ${skippedCount} skipped → ${outDir}\\state\\plan.json`,
+    );
+    // The plan is the product of this command — always print the per-agent
+    // decisions, not just under --verbose (unlike scan, where they're noise
+    // ahead of the detection output).
+    for (const d of selection.decisions) {
+      console.log(`  ${d.queued ? "[queued] " : "[skipped]"} ${d.slug}: ${d.reason}`);
+    }
+
+    completeRun(outDir, runMeta.runId, "done", {});
+    usageMeter?.flush();
+    runFinalized = true;
+    process.off("SIGINT", shutdownHandler);
+    process.off("SIGTERM", shutdownHandler);
+
+    console.log(
+      `\nDone. ${queuedAgents.length} agent(s) queued. Run \`agentgg scan ${rootArg} -o ${
+        opts.output ?? "./scan-results/"
+      }\` to execute them (the recon brief is cached and will be reused).`,
+    );
+  } catch (err) {
+    if (!runFinalized) {
+      runFinalized = true;
+      try {
+        usageMeter?.flush();
+      } catch {
+        // metering must never mask the original error
+      }
+      try {
+        completeRun(outDir, runMeta.runId, "error", {});
+      } catch {
+        // best-effort
+      }
+    }
+    process.off("SIGINT", shutdownHandler);
+    process.off("SIGTERM", shutdownHandler);
+    throw err;
+  }
+}
+
+export function registerReconCommand(program: Command): void {
+  program
+    .command("recon")
+    .description(
+      "run only the recon survey + precondition planning for a codebase (writes recon.json + plan.json; no detection)",
+    )
+    .argument("<path>", "path to the codebase to survey")
+    .option("-o, --output <path>", "output directory for recon + plan state", "./scan-results/")
+    .option(
+      "--source-id <id>",
+      "stable identifier for the scanned source, used as the resume identity instead of the scan root. Pass the same value to `agentgg scan` so it reuses this brief and plan. Defaults to the absolute path of the scan root.",
+    )
+    .option(
+      "--provider <name>",
+      "LLM provider for this run: anthropic | openai | ollama | bedrock | vertex (overrides saved default)",
+    )
+    .option(
+      "--api-key <key>",
+      "One-shot API key (not persisted). Valid for: anthropic, openai. For Anthropic, also accepts an sk-ant-oat... OAuth token.",
+    )
+    .option(
+      "--oauth-token <token>",
+      "One-shot Anthropic OAuth token (sk-ant-oat...). Not persisted. Anthropic only.",
+    )
+    .option("--base-url <url>", "One-shot Ollama base URL (not persisted). Ollama only.")
+    .option("--region <name>", REGION_FLAG_HELP)
+    .option(
+      "--project <id>",
+      "GCP project ID for Vertex AI. Falls back to $GOOGLE_CLOUD_PROJECT / $GCLOUD_PROJECT. Vertex only.",
+    )
+    .option("--model <name>", "One-shot model override for the selected provider (not persisted)")
+    .option(
+      "--openrouter-routing <json|file>",
+      "OpenRouter provider-routing block, overriding OPENROUTER_* env for this run: inline JSON (must start with {) or a path to a .json file (avoids shell-quoting JSON on Windows). Invalid JSON aborts before any LLM call. OpenRouter only.",
+    )
+    .option(
+      "-t, --template <value>",
+      "Restrict planning to specific agents (slug, path to a .md file/dir, or a .txt list). Repeatable; comma/whitespace-separated values allowed within one -t. Defaults to the official base/ library.",
+      collect,
+      [] as string[],
+    )
+    .option("--concurrency <n>", "parallel precondition prompt gates", (v) => parseInt(v, 10), 5)
+    .option("--max-turns <n>", "Max tool-use turns for the recon survey (default 50).", (v) =>
+      parseInt(v, 10),
+    )
+    .option(
+      "--re-recon",
+      "Re-run the recon pass even if a cached brief exists for this output dir (default: reuse it when the project root + stack fingerprint are unchanged).",
+    )
+    .option(
+      "--exclude <pattern>",
+      "extra glob to exclude (repeatable; additive to walker defaults)",
+      collect,
+      [] as string[],
+    )
+    .option(
+      "--only <pattern>",
+      "restrict the file census to files matching at least one of these globs (repeatable)",
+      collect,
+      [] as string[],
+    )
+    .option(
+      "--max-file-size <kb>",
+      "skip files larger than this in KB (default 500)",
+      (v) => parseInt(v, 10),
+      500,
+    )
+    .option(
+      "--no-default-excludes",
+      "Don't apply the shared default exclude set (node_modules, .git, build dirs, lockfiles, binaries).",
+    )
+    .option(
+      "--auto-exclude",
+      "Before recon, let the model pick non-runtime folders (tests, fixtures, generated/vendored code, docs, sample data) to skip, folded into the walk so recon + the precondition plan inherit them. On by default (matches scan, so this dry-run previews what a scan would do); disable with --no-auto-exclude. The chosen globs are recorded in plan.json (reasons shown with --verbose).",
+      true,
+    )
+    .option(
+      "--no-auto-exclude",
+      "don't let the model pick folders to skip (auto-exclude runs by default); plan the whole tree except your explicit --exclude paths.",
+    )
+    .option("-v, --verbose", "verbose output")
+    .action(async (path: string, opts: ReconOpts) => {
+      try {
+        await runReconCommand(path, opts);
+      } catch (err) {
+        logError(`recon failed: ${err instanceof Error ? err.message : String(err)}`);
+        process.exitCode = 1;
+      }
+    });
+}
+
+function collect(value: string, prev: string[]): string[] {
+  return prev.concat([value]);
+}

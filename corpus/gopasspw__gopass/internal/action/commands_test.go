@@ -1,0 +1,106 @@
+package action
+
+import (
+	"testing"
+
+	"github.com/gopasspw/gopass/internal/config"
+	"github.com/gopasspw/gopass/pkg/ctxutil"
+	"github.com/gopasspw/gopass/tests/gptest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli/v3"
+)
+
+func testCommand(t *testing.T, cmd *cli.Command) {
+	t.Helper()
+
+	if len(cmd.Commands) < 1 {
+		assert.NotNil(t, cmd.Action, cmd.Name)
+	}
+
+	assert.NotEmpty(t, cmd.Usage, "Required usage for command %s", cmd.Name)
+	assert.NotEmpty(t, cmd.Description, "Required description for command %s", cmd.Name)
+
+	for _, flag := range cmd.Flags {
+		switch v := flag.(type) {
+		case *cli.StringFlag:
+			assert.NotContains(t, v.Name, ",")
+			assert.NotEmpty(t, v.Usage)
+		case *cli.BoolFlag:
+			assert.NotContains(t, v.Name, ",")
+			assert.NotEmpty(t, v.Usage)
+		}
+	}
+
+	for _, scmd := range cmd.Commands {
+		testCommand(t, scmd)
+	}
+}
+
+func TestCommands(t *testing.T) {
+	u := gptest.NewUnitTester(t)
+
+	ctx := config.NewContextInMemory()
+	ctx = ctxutil.WithInteractive(ctx, false)
+	act, err := newMock(ctx, u.StoreDir(""))
+	require.NoError(t, err)
+	require.NotNil(t, act)
+
+	for _, cmd := range act.GetCommands() {
+		t.Run(cmd.Name, func(t *testing.T) {
+			testCommand(t, cmd)
+		})
+	}
+}
+
+func TestHiddenPullPushCommands(t *testing.T) {
+	u := gptest.NewUnitTester(t)
+
+	ctx := config.NewContextInMemory()
+	ctx = ctxutil.WithAlwaysYes(ctx, true)
+	ctx = ctxutil.WithInteractive(ctx, false)
+
+	act, err := newMock(ctx, u.StoreDir(""))
+	require.NoError(t, err)
+	require.NotNil(t, act)
+	ctx = act.cfg.WithConfig(ctx)
+	require.NoError(t, act.RCSInit(ctx, gptest.CliCtxWithFlags(ctx, t, map[string]string{
+		"name":  "foobar",
+		"email": "foo.bar@example.org",
+	})))
+
+	tests := []struct {
+		name    string
+		wantErr bool
+	}{
+		{name: "pull", wantErr: true},
+		{name: "push"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := findCommand(act.GetCommands(), tc.name)
+			require.NotNil(t, cmd)
+			assert.True(t, cmd.Hidden)
+
+			err := cmd.Action(ctx, gptest.CliCtx(ctx, t))
+			if tc.wantErr {
+				require.Error(t, err)
+
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+}
+
+func findCommand(cmds []*cli.Command, name string) *cli.Command {
+	for _, cmd := range cmds {
+		if cmd.Name == name {
+			return cmd
+		}
+	}
+
+	return nil
+}

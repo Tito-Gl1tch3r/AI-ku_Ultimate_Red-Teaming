@@ -1,0 +1,1150 @@
+'use client';
+
+import { memo, useMemo, useState, useRef, useEffect, useCallback } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  Brain,
+  Send,
+  Sparkles,
+  Settings,
+  X,
+  Bot,
+  User,
+  AlertTriangle,
+  Shield,
+  ChevronDown,
+  Loader2,
+  Key,
+  Check,
+  Trash2,
+} from 'lucide-react';
+import type { IntelligenceContext } from '@/lib/ai-engine';
+
+/* ═══════════════════════════════════════════════════════════════
+   AEGIS — AI Intelligence Analyst Panel
+   Premium glass-panel chat interface for real-time intelligence
+   analysis powered by Gemini 2.0 Flash
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ─────────────────────────────────────────────────────────────
+   Interfaces
+   ───────────────────────────────────────────────────────────── */
+
+interface DashboardData {
+  earthquakes?: EarthquakeItem[];
+  news?: NewsItem[];
+  gdelt?: GdeltEvent[];
+  markets?: MarketData;
+  [key: string]: unknown;
+}
+
+interface EarthquakeItem {
+  id: string;
+  magnitude: number;
+  location: string;
+  lat: number;
+  lng: number;
+  depth: number;
+  time: string;
+  tsunami: boolean;
+  felt: number | null;
+  alert: string | null;
+}
+
+interface NewsItem {
+  id: string;
+  title: string;
+  description: string;
+  link: string;
+  published: string;
+  source: string;
+  risk_score: number;
+  coords: [number, number] | null;
+  machine_assessment: string | null;
+}
+
+interface GdeltEvent {
+  name?: string;
+  title: string;
+  type: string;
+  lat: number;
+  lng: number;
+  date: string;
+  source: string;
+  tone: number;
+  severity?: 'critical' | 'high' | 'elevated' | 'low';
+  theme?: string;
+  mentions?: number;
+}
+
+interface MarketData {
+  indices?: MarketIndex[];
+  commodities?: MarketCommodity[];
+}
+
+interface MarketIndex {
+  name: string;
+  value: number;
+  change: number;
+  changePercent: number;
+}
+
+interface MarketCommodity {
+  name: string;
+  price: number;
+  change: number;
+}
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'analyst';
+  content: string;
+  timestamp: string;
+  isError?: boolean;
+  sourceLabel?: string;
+  runtimeLabel?: string;
+}
+
+interface HermesStatusPayload {
+  available: boolean;
+  command: string | null;
+  runtime: 'hermes-cli' | 'aegis-fallback';
+  mode: 'hermes-live' | 'hybrid-fallback';
+  reason?: string;
+  detectedAt: string;
+}
+
+interface FusionDossier {
+  bluf: string;
+  riskLevel: 'CRITICAL' | 'HIGH' | 'ELEVATED' | 'LOW';
+  confidence: 'HIGH' | 'MODERATE' | 'LOW';
+  hotspots: string[];
+  priorityActions: string[];
+  watchlist: string[];
+}
+
+interface AiAnalystProps {
+  data: DashboardData;
+  hideMobileTrigger?: boolean;
+}
+
+type AnalystBridgeAction = 'open' | 'briefing' | 'fusion' | 'hermes';
+type AnalystMode = 'aegis' | 'hermes';
+
+/* ─────────────────────────────────────────────────────────────
+   Helpers
+   ───────────────────────────────────────────────────────────── */
+
+function generateId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function buildContext(data: DashboardData): IntelligenceContext {
+  const earthquakes = (data.earthquakes || []).slice(0, 20).map((eq) => ({
+    id: eq.id || generateId(),
+    magnitude: eq.magnitude,
+    location: eq.location,
+    latitude: eq.lat,
+    longitude: eq.lng,
+    depth: eq.depth,
+    timestamp: eq.time,
+    tsunami: eq.tsunami ?? false,
+    felt: eq.felt ?? null,
+    alert: eq.alert ?? null,
+  }));
+
+  const news = (data.news || []).slice(0, 15).map((item) => ({
+    id: item.id || generateId(),
+    title: item.title,
+    description: item.description || '',
+    link: item.link || '',
+    published: item.published,
+    source: item.source,
+    risk_score: item.risk_score,
+    coords: item.coords,
+    machine_assessment: item.machine_assessment,
+  }));
+
+  const threats = (data.gdelt || []).slice(0, 15).map((ev) => ({
+    id: generateId(),
+    type: ev.type || 'INCIDENT',
+    title: ev.title || ev.name || 'Global Incident',
+    description: `${ev.theme || 'Geopolitical Incident'} • ${ev.source || 'GDELT'}${ev.mentions ? ` • ${ev.mentions} mention${ev.mentions > 1 ? 's' : ''}` : ''}`,
+    severity: (ev.severity === 'critical' ? 'CRITICAL' : ev.severity === 'high' ? 'HIGH' : ev.severity === 'elevated' ? 'ELEVATED' : ev.severity === 'low' ? 'LOW' : (ev.tone < -5 ? 'CRITICAL' : ev.tone < -2 ? 'HIGH' : ev.tone < 0 ? 'ELEVATED' : 'LOW')) as
+      | 'CRITICAL'
+      | 'HIGH'
+      | 'ELEVATED'
+      | 'LOW',
+    region: ev.source || 'Unknown',
+    latitude: ev.lat,
+    longitude: ev.lng,
+    timestamp: ev.date,
+    source: ev.source || 'GDELT',
+  }));
+
+  return {
+    earthquakes,
+    news,
+    threats,
+    cyberAlerts: [],
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/** Render markdown-lite: bold, headers, bullet points */
+function renderMarkdown(text: string): string {
+  return text
+    .replace(/### (.+)/g, '<h4 class="text-[11px] font-bold text-[var(--gold-primary)] mt-3 mb-1 tracking-wider uppercase font-mono">$1</h4>')
+    .replace(/## (.+)/g, '<h3 class="text-[12px] font-bold text-[var(--gold-primary)] mt-3 mb-1.5 tracking-wider uppercase font-mono border-b border-[var(--border-secondary)] pb-1">$1</h3>')
+    .replace(/# (.+)/g, '<h2 class="text-[13px] font-bold text-[var(--gold-primary)] mt-3 mb-1.5 tracking-wider uppercase font-mono">$1</h2>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong class="text-[var(--text-heading)] font-semibold">$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em class="text-[var(--text-secondary)] italic">$1</em>')
+    .replace(/^- (.+)/gm, '<div class="flex items-start gap-1.5 ml-1 my-0.5"><span class="text-[var(--gold-dim)] mt-[3px] text-[8px]">◆</span><span>$1</span></div>')
+    .replace(/\n/g, '<br />');
+}
+
+function formatFusionDossier(dossier: FusionDossier): string {
+  const bullets = (items: string[]) => (items.length > 0 ? items.map((item) => `- ${item}`).join('\n') : '- None reported');
+  return `# WORLDWATCH FUSION DOSSIER
+## BLUF
+${dossier.bluf}
+
+## RISK LEVEL
+**${dossier.riskLevel}**
+
+## ASSESSMENT CONFIDENCE
+**${dossier.confidence}**
+
+## HOTSPOTS
+${bullets(dossier.hotspots)}
+
+## PRIORITY ACTIONS
+${bullets(dossier.priorityActions)}
+
+## WATCHLIST
+${bullets(dossier.watchlist)}`;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Component
+   ───────────────────────────────────────────────────────────── */
+
+function AiAnalyst({ data, hideMobileTrigger = false }: AiAnalystProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [inputText, setInputText] = useState('');
+  const [analystMode, setAnalystMode] = useState<AnalystMode>(() => {
+    if (typeof window === 'undefined') return 'aegis';
+    return (localStorage.getItem('aegis-analyst-mode') as AnalystMode) || 'aegis';
+  });
+
+  const [isLoading, setIsLoading] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [hermesStatus, setHermesStatus] = useState<HermesStatusPayload | null>(null);
+  const [hermesStatusLoading, setHermesStatusLoading] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    return localStorage.getItem('worldwatch-ai-key') || localStorage.getItem('aegis-gemini-key') || '';
+  });
+  const [keySaved, setKeySaved] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return Boolean(localStorage.getItem('worldwatch-ai-key') || localStorage.getItem('aegis-gemini-key'));
+  });
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const settingsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestAbortRef = useRef<AbortController | null>(null);
+  const intelligenceContext = useMemo(() => buildContext(data), [data]);
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // Focus input when opened
+  useEffect(() => {
+    if (focusTimerRef.current) clearTimeout(focusTimerRef.current);
+    if (isOpen && !showSettings) {
+      focusTimerRef.current = setTimeout(() => inputRef.current?.focus(), 300);
+    }
+    return () => {
+      if (focusTimerRef.current) clearTimeout(focusTimerRef.current);
+    };
+  }, [isOpen, showSettings]);
+
+  useEffect(() => {
+    return () => {
+      if (settingsTimerRef.current) clearTimeout(settingsTimerRef.current);
+      requestAbortRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem('aegis-analyst-mode', analystMode);
+  }, [analystMode]);
+
+  const getHeaders = useCallback((): Record<string, string> => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const savedKey = localStorage.getItem('worldwatch-ai-key') || localStorage.getItem('aegis-gemini-key');
+    if (savedKey) {
+      headers['x-gemini-key'] = savedKey;
+    }
+    return headers;
+  }, []);
+
+  const refreshHermesStatus = useCallback(async () => {
+    setHermesStatusLoading(true);
+    try {
+      const response = await fetch('/api/ai/hermes/status', { cache: 'no-store' });
+      const payload = await response.json() as HermesStatusPayload;
+      setHermesStatus(payload);
+    } catch {
+      setHermesStatus({
+        available: false,
+        command: null,
+        runtime: 'aegis-fallback',
+        mode: 'hybrid-fallback',
+        reason: 'Runtime inspection unavailable — fallback analysis remains active.',
+        detectedAt: new Date().toISOString(),
+      });
+    } finally {
+      setHermesStatusLoading(false);
+    }
+  }, []);
+
+  const handleSend = useCallback(async () => {
+    const query = inputText.trim();
+    if (!query || isLoading) return;
+
+    const userMsg: ChatMessage = {
+      id: generateId(),
+      role: 'user',
+      content: query,
+      timestamp: new Date().toISOString(),
+      sourceLabel: analystMode === 'hermes' ? 'HERMES OPS' : 'OPERATOR',
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    setInputText('');
+    setIsLoading(true);
+
+    try {
+      requestAbortRef.current?.abort();
+      const controller = new AbortController();
+      requestAbortRef.current = controller;
+      const endpoint = analystMode === 'hermes' ? '/api/ai/hermes' : '/api/ai/analyze';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ query, context: intelligenceContext }),
+        signal: controller.signal,
+      });
+
+      const json = await res.json();
+
+      if (!res.ok) {
+        const errorBody = json as { error: string; code: string; retryAfter?: number };
+        throw new Error(errorBody.error || `HTTP ${res.status}`);
+      }
+
+      const responseBody = json as {
+        analysis: string;
+        model: string;
+        timestamp: string;
+        mode?: 'hermes' | 'fallback';
+        runtime?: 'hermes-cli' | 'aegis-fallback';
+      };
+
+      const analystMsg: ChatMessage = {
+        id: generateId(),
+        role: 'analyst',
+        content: responseBody.analysis,
+        timestamp: responseBody.timestamp,
+        sourceLabel: analystMode === 'hermes' ? 'HERMES OPS' : 'WORLDWATCH ANALYST',
+        runtimeLabel: analystMode === 'hermes'
+          ? responseBody.runtime === 'hermes-cli'
+            ? 'LIVE HERMES RUNTIME'
+            : 'HYBRID FALLBACK'
+          : responseBody.model,
+      };
+      setMessages((prev) => [...prev, analystMsg]);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Analysis failed';
+      const errorMsg: ChatMessage = {
+        id: generateId(),
+        role: 'analyst',
+        content: `⚠ INTELLIGENCE ANALYSIS ERROR\n\n${message}`,
+        timestamp: new Date().toISOString(),
+        isError: true,
+      };
+      setMessages((prev) => [...prev, errorMsg]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [analystMode, intelligenceContext, inputText, isLoading, getHeaders]);
+
+  const handleBriefing = useCallback(async () => {
+    if (isLoading) return;
+
+    const userMsg: ChatMessage = {
+      id: generateId(),
+      role: 'user',
+      content: '📋 Generate full intelligence briefing from current operational data',
+      timestamp: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    setIsLoading(true);
+
+    try {
+      requestAbortRef.current?.abort();
+      const controller = new AbortController();
+      requestAbortRef.current = controller;
+      const res = await fetch('/api/ai/briefing', {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ context: intelligenceContext }),
+        signal: controller.signal,
+      });
+
+      const json = await res.json();
+
+      if (!res.ok) {
+        const errorBody = json as { error: string; code: string };
+        throw new Error(errorBody.error || `HTTP ${res.status}`);
+      }
+
+      const responseBody = json as { briefing: string; generatedAt: string };
+
+      const analystMsg: ChatMessage = {
+        id: generateId(),
+        role: 'analyst',
+        content: responseBody.briefing,
+        timestamp: responseBody.generatedAt,
+      };
+      setMessages((prev) => [...prev, analystMsg]);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Briefing generation failed';
+      const errorMsg: ChatMessage = {
+        id: generateId(),
+        role: 'analyst',
+        content: `⚠ BRIEFING GENERATION ERROR\n\n${message}`,
+        timestamp: new Date().toISOString(),
+        isError: true,
+      };
+      setMessages((prev) => [...prev, errorMsg]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [intelligenceContext, isLoading, getHeaders]);
+
+  const handleFusionDossier = useCallback(async () => {
+    if (isLoading) return;
+
+    const userMsg: ChatMessage = {
+      id: generateId(),
+      role: 'user',
+      content: '⚡ Generate AEGIS fusion dossier with hotspots, actions, and watchlist',
+      timestamp: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    setIsLoading(true);
+
+    try {
+      requestAbortRef.current?.abort();
+      const controller = new AbortController();
+      requestAbortRef.current = controller;
+      const res = await fetch('/api/ai/fusion', {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ context: intelligenceContext }),
+        signal: controller.signal,
+      });
+
+      const json = await res.json();
+
+      if (!res.ok) {
+        const errorBody = json as { error: string; code: string };
+        throw new Error(errorBody.error || `HTTP ${res.status}`);
+      }
+
+      const responseBody = json as { dossier: FusionDossier; generatedAt: string };
+      const analystMsg: ChatMessage = {
+        id: generateId(),
+        role: 'analyst',
+        content: formatFusionDossier(responseBody.dossier),
+        timestamp: responseBody.generatedAt,
+      };
+      setMessages((prev) => [...prev, analystMsg]);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Fusion dossier generation failed';
+      const errorMsg: ChatMessage = {
+        id: generateId(),
+        role: 'analyst',
+        content: `⚠ FUSION DOSSIER ERROR\n\n${message}`,
+        timestamp: new Date().toISOString(),
+        isError: true,
+      };
+      setMessages((prev) => [...prev, errorMsg]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [intelligenceContext, isLoading, getHeaders]);
+
+  const handleHermesSweep = useCallback(() => {
+    setAnalystMode('hermes');
+    void refreshHermesStatus();
+    setInputText('Run an autonomous command sweep over the live AEGIS feeds. Prioritize the strongest risk cluster, state the operator judgment, and propose the next autonomous moves in real time.');
+    setTimeout(() => inputRef.current?.focus(), 50);
+  }, [refreshHermesStatus]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleSend();
+      }
+    },
+    [handleSend]
+  );
+
+  const saveApiKey = useCallback(() => {
+    const key = apiKeyInput.trim();
+    if (key) {
+      localStorage.setItem('worldwatch-ai-key', key);
+      localStorage.removeItem('aegis-gemini-key');
+      setKeySaved(true);
+      if (settingsTimerRef.current) clearTimeout(settingsTimerRef.current);
+      settingsTimerRef.current = setTimeout(() => setShowSettings(false), 600);
+    }
+  }, [apiKeyInput]);
+
+  const clearApiKey = useCallback(() => {
+    localStorage.removeItem('worldwatch-ai-key');
+    localStorage.removeItem('aegis-gemini-key');
+    setApiKeyInput('');
+    setKeySaved(false);
+  }, []);
+
+  const clearMessages = useCallback(() => {
+    setMessages([]);
+  }, []);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const customEvent = event as CustomEvent<{ action?: AnalystBridgeAction }>;
+      const action = customEvent.detail?.action || 'open';
+
+      setIsOpen(true);
+      setShowSettings(false);
+
+      if (action === 'briefing') {
+        if (analystMode === 'hermes') void refreshHermesStatus();
+        void handleBriefing();
+        return;
+      }
+
+      if (action === 'fusion') {
+        if (analystMode === 'hermes') void refreshHermesStatus();
+        void handleFusionDossier();
+        return;
+      }
+
+      if (action === 'hermes') {
+        handleHermesSweep();
+        return;
+      }
+
+      if (analystMode === 'hermes') {
+        void refreshHermesStatus();
+      }
+    };
+
+    window.addEventListener('aegis:ai-analyst', handler as EventListener);
+    return () => {
+      window.removeEventListener('aegis:ai-analyst', handler as EventListener);
+    };
+  }, [analystMode, handleBriefing, handleFusionDossier, handleHermesSweep, refreshHermesStatus]);
+
+  /* ── Floating Trigger Button ── */
+  const triggerButton = (
+    <motion.button
+      initial={{ scale: 0, opacity: 0 }}
+      animate={{ scale: 1, opacity: 1 }}
+      transition={{ delay: 3, type: 'spring', stiffness: 200, damping: 15 }}
+      whileHover={{ scale: 1.1 }}
+      whileTap={{ scale: 0.95 }}
+      onClick={() => {
+        setIsOpen(true);
+        if (analystMode === 'hermes') void refreshHermesStatus();
+      }}
+      className={`fixed bottom-[90px] right-5 md:bottom-[6.25rem] md:right-6 z-[500] h-14 w-14 rounded-full items-center justify-center cursor-pointer border-0 ${hideMobileTrigger ? 'hidden md:flex' : 'flex'}`}
+      style={{
+        background: 'linear-gradient(135deg, rgba(212, 175, 55, 0.2) 0%, rgba(212, 175, 55, 0.08) 100%)',
+        border: '1px solid rgba(212, 175, 55, 0.4)',
+        boxShadow:
+          '0 0 30px rgba(212, 175, 55, 0.2), 0 0 60px rgba(212, 175, 55, 0.1), 0 4px 20px rgba(0, 0, 0, 0.5)',
+      }}
+      aria-label="Open AI Intelligence Analyst"
+    >
+      <Brain className="w-6 h-6 text-[var(--gold-primary)]" />
+      {/* Pulse rings */}
+      <div className="absolute inset-0 rounded-full animate-glow-pulse" />
+      <motion.div
+        className="absolute inset-[-4px] rounded-full border border-[var(--gold-primary)]"
+        animate={{ opacity: [0.3, 0.6, 0.3], scale: [1, 1.1, 1] }}
+        transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
+        style={{ opacity: 0.3 }}
+      />
+    </motion.button>
+  );
+
+  /* ── Panel ── */
+  return (
+    <>
+      {/* Trigger — only show when panel is closed */}
+      <AnimatePresence>{!isOpen && triggerButton}</AnimatePresence>
+
+      {/* Panel */}
+      <AnimatePresence>
+        {isOpen && (
+          <>
+            {/* Backdrop on mobile */}
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[600] md:hidden"
+              onClick={() => setIsOpen(false)}
+            />
+
+            {/* Main Panel */}
+            <motion.div
+              initial={{ opacity: 0, y: 40, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 40, scale: 0.95 }}
+              transition={{ type: 'spring', stiffness: 300, damping: 25 }}
+              className="fixed bottom-0 right-0 md:bottom-6 md:right-6 z-[700] w-full md:w-[440px] h-[85vh] md:h-[680px] md:max-h-[85vh] flex flex-col md:rounded-2xl overflow-hidden"
+              style={{
+                background: 'linear-gradient(180deg, rgba(8, 10, 20, 0.96) 0%, rgba(6, 6, 12, 0.98) 100%)',
+                border: '1px solid rgba(212, 175, 55, 0.2)',
+                boxShadow:
+                  '0 0 60px rgba(0, 0, 0, 0.8), 0 0 30px rgba(212, 175, 55, 0.08), 0 1px 0 rgba(212, 175, 55, 0.1) inset',
+                backdropFilter: 'blur(40px) saturate(1.5)',
+              }}
+            >
+              {/* ── Header ── */}
+              <div
+                className="relative flex items-center justify-between px-4 py-3 shrink-0"
+                style={{
+                  background: 'linear-gradient(90deg, rgba(212, 175, 55, 0.06) 0%, transparent 50%, rgba(0, 229, 255, 0.04) 100%)',
+                  borderBottom: '1px solid rgba(212, 175, 55, 0.15)',
+                }}
+              >
+                {/* Scan line accent */}
+                <motion.div
+                  className="absolute bottom-0 left-0 right-0 h-[1px]"
+                  style={{ background: 'linear-gradient(90deg, transparent, var(--gold-primary), transparent)' }}
+                  animate={{ opacity: [0.3, 0.7, 0.3] }}
+                  transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
+                />
+
+                <div className="flex items-center gap-2.5">
+                  <div className="relative">
+                    <Shield className="w-4.5 h-4.5 text-[var(--gold-primary)]" />
+                    <div className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-[var(--alert-green)] animate-aegis-pulse" />
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="hud-text text-[11px] text-[var(--text-heading)]">
+                      {analystMode === 'hermes' ? 'HERMES OPS' : 'WORLDWATCH ANALYST'}
+                    </span>
+                    <span className="text-[7px] font-mono tracking-[0.2em] text-[var(--text-muted)]">
+                      {analystMode === 'hermes'
+                        ? hermesStatusLoading
+                          ? 'INSPECTING RUNTIME'
+                          : hermesStatus?.available
+                            ? 'AUTONOMOUS COMMAND MODE • LIVE RUNTIME'
+                            : 'AUTONOMOUS COMMAND MODE • HYBRID FALLBACK'
+                        : 'LOCAL FREE MODE • BYOK OPTIONAL'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1 rounded-xl border border-white/8 bg-black/20 p-1">
+                  <button
+                    onClick={() => setAnalystMode('aegis')}
+                    className={`px-2.5 py-1 rounded-lg text-[8px] font-mono tracking-[0.16em] transition-colors ${analystMode === 'aegis' ? 'text-[var(--gold-primary)] bg-[rgba(212,175,55,0.12)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
+                  >
+                    AEGIS
+                  </button>
+                  <button
+                    onClick={() => {
+                      setAnalystMode('hermes');
+                      void refreshHermesStatus();
+                    }}
+                    className={`px-2.5 py-1 rounded-lg text-[8px] font-mono tracking-[0.16em] transition-colors ${analystMode === 'hermes' ? 'text-[var(--cyan-primary)] bg-[rgba(0,229,255,0.10)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
+                  >
+                    HERMES
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1">
+                  {messages.length > 0 && (
+                    <button
+                      onClick={clearMessages}
+                      className="p-1.5 rounded-lg hover:bg-[var(--hover-accent)] transition-colors group"
+                      title="Clear conversation"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 text-[var(--text-muted)] group-hover:text-[var(--alert-red)]" />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setShowSettings(!showSettings)}
+                    className="p-1.5 rounded-lg hover:bg-[var(--hover-accent)] transition-colors group"
+                    title="Settings"
+                  >
+                    <Settings
+                      className={`w-3.5 h-3.5 transition-colors ${
+                        showSettings ? 'text-[var(--gold-primary)]' : 'text-[var(--text-muted)] group-hover:text-[var(--text-primary)]'
+                      }`}
+                    />
+                  </button>
+                  <button
+                    onClick={() => setIsOpen(false)}
+                    className="p-1.5 rounded-lg hover:bg-[var(--hover-accent)] transition-colors group"
+                    title="Close"
+                  >
+                    <X className="w-3.5 h-3.5 text-[var(--text-muted)] group-hover:text-[var(--text-primary)]" />
+                  </button>
+                </div>
+              </div>
+
+              {/* ── Settings Panel ── */}
+              <AnimatePresence>
+                {showSettings && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="overflow-hidden shrink-0"
+                  >
+                    <div
+                      className="px-4 py-3 space-y-2.5"
+                      style={{
+                        background: 'rgba(212, 175, 55, 0.03)',
+                        borderBottom: '1px solid rgba(212, 175, 55, 0.1)',
+                      }}
+                    >
+                      {analystMode === 'hermes' && (
+                        <div className="rounded-xl border border-cyan-400/15 bg-cyan-400/6 px-3 py-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <div>
+                              <div className="text-[8px] font-mono uppercase tracking-[0.18em] text-cyan-200">Hermes runtime</div>
+                              <div className="mt-1 text-[10px] font-mono text-white">
+                                {hermesStatusLoading
+                                  ? 'Inspecting runtime…'
+                                  : hermesStatus?.available
+                                    ? `Live via ${hermesStatus.command ?? 'hermes'}`
+                                    : 'Hybrid fallback active'}
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => void refreshHermesStatus()}
+                              className="rounded-lg border border-cyan-300/20 bg-cyan-300/10 px-2 py-1 text-[8px] font-mono uppercase tracking-[0.16em] text-cyan-100"
+                              type="button"
+                            >
+                              Refresh
+                            </button>
+                          </div>
+                          {hermesStatus?.reason && (
+                            <p className="mt-2 text-[8px] font-mono leading-relaxed text-[var(--text-muted)]">
+                              {hermesStatus.reason}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2">
+                        <Key className="w-3 h-3 text-[var(--gold-dim)]" />
+                        <span className="hud-label" style={{ fontSize: '8px' }}>
+                          OPTIONAL USER AI KEY
+                        </span>
+                      </div>
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          value={apiKeyInput}
+                          onChange={(e) => {
+                            setApiKeyInput(e.target.value);
+                            setKeySaved(false);
+                          }}
+                          placeholder="AIza..."
+                          className="flex-1 bg-[var(--bg-tertiary)] border border-[var(--border-secondary)] rounded-lg px-3 py-2 text-[11px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--gold-dim)] transition-colors"
+                        />
+                        {apiKeyInput.trim() && (
+                          <>
+                            <button
+                              onClick={saveApiKey}
+                              className="px-3 rounded-lg text-[9px] font-mono tracking-wider transition-all"
+                              style={{
+                                background: keySaved ? 'rgba(0, 230, 118, 0.15)' : 'rgba(212, 175, 55, 0.1)',
+                                border: `1px solid ${keySaved ? 'rgba(0, 230, 118, 0.3)' : 'rgba(212, 175, 55, 0.2)'}`,
+                                color: keySaved ? 'var(--alert-green)' : 'var(--gold-primary)',
+                              }}
+                            >
+                              {keySaved ? <Check className="w-3 h-3" /> : 'SAVE'}
+                            </button>
+                            <button
+                              onClick={clearApiKey}
+                              className="px-2 rounded-lg text-[9px] font-mono tracking-wider transition-all hover:bg-red-500/10"
+                              style={{
+                                border: '1px solid rgba(255, 61, 61, 0.2)',
+                                color: 'var(--alert-red)',
+                              }}
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </>
+                        )}
+                      </div>
+                      <p className="text-[8px] font-mono text-[var(--text-muted)] leading-relaxed">
+                        AEGIS runs in free local mode by default. Add your own Gemini key only if you want higher-quality model output. Your key stays in this browser and is sent only with your own requests. Get a free key at{' '}
+                        <a
+                          href="https://aistudio.google.com/apikey"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-[var(--cyan-primary)] hover:underline"
+                        >
+                          aistudio.google.com
+                        </a>
+                      </p>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* ── Messages Area ── */}
+              <div className="flex-1 overflow-y-auto styled-scrollbar px-4 py-3 space-y-3">
+                {/* Empty state */}
+                {messages.length === 0 && !isLoading && (
+                  <div className="h-full flex flex-col items-center justify-center text-center px-6 gap-5">
+                    {/* Animated brain icon */}
+                    <div className="relative">
+                      <motion.div
+                        animate={{ rotate: [0, 360] }}
+                        transition={{ duration: 20, repeat: Infinity, ease: 'linear' }}
+                        className="absolute inset-[-10px] rounded-full border border-[var(--gold-primary)]"
+                        style={{ opacity: 0.15 }}
+                      />
+                      <motion.div
+                        animate={{ rotate: [0, -360] }}
+                        transition={{ duration: 14, repeat: Infinity, ease: 'linear' }}
+                        className="absolute inset-[-20px] rounded-full border border-[var(--cyan-primary)]"
+                        style={{ opacity: 0.08 }}
+                      />
+                      <div
+                        className="w-16 h-16 rounded-2xl flex items-center justify-center"
+                        style={{
+                          background: 'linear-gradient(135deg, rgba(212, 175, 55, 0.1) 0%, rgba(0, 229, 255, 0.05) 100%)',
+                          border: '1px solid rgba(212, 175, 55, 0.2)',
+                        }}
+                      >
+                        <Brain className="w-7 h-7 text-[var(--gold-primary)]" />
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <h3 className="hud-text text-[12px] text-[var(--text-heading)]">
+                        {analystMode === 'hermes' ? 'HERMES OPS READY' : 'AEGIS ANALYST READY'}
+                      </h3>
+                      <p className="text-[10px] font-mono text-[var(--text-muted)] leading-relaxed max-w-[280px]">
+                        {analystMode === 'hermes'
+                          ? 'Hermes can run autonomous operator sweeps over live AEGIS feeds, prioritize the strongest cluster, and recommend next moves in real time.'
+                          : 'I correlate live seismic, OSINT, risk, and cyber data to deliver operator-ready assessments.'}
+                      </p>
+                    </div>
+
+                    {/* Quick prompts */}
+                    <div className="w-full space-y-1.5">
+                      <span className="hud-label block text-center mb-2" style={{ fontSize: '7px' }}>
+                        {analystMode === 'hermes' ? 'AUTONOMOUS MISSIONS' : 'SUGGESTED QUERIES'}
+                      </span>
+                      {(
+                        analystMode === 'hermes'
+                          ? [
+                              'Run an autonomous command sweep over the live AEGIS feeds. Prioritize the strongest risk cluster, state the operator judgment, and propose the next autonomous moves in real time.',
+                              'Build a multi-domain operator brief with the highest-risk region, escalation path, and watchlist for the next 6 hours.',
+                              'Identify the single best next autonomous mission for AEGIS right now and justify it with feed evidence.',
+                            ]
+                          : [
+                              'What are the top 3 threats right now?',
+                              'Build a cross-domain escalation hypothesis from today\'s signals',
+                              'Assess cyber risks to critical infrastructure',
+                            ]
+                      ).map((prompt) => (
+                        <button
+                          key={prompt}
+                          onClick={() => {
+                            setInputText(prompt);
+                            setTimeout(() => inputRef.current?.focus(), 50);
+                          }}
+                          className="w-full text-left px-3 py-2 rounded-lg text-[10px] font-mono text-[var(--text-secondary)] transition-all hover:text-[var(--text-primary)] hover:bg-[var(--hover-accent)]"
+                          style={{
+                            border: '1px solid rgba(212, 175, 55, 0.08)',
+                          }}
+                        >
+                          <span className="text-[var(--gold-dim)] mr-1.5">›</span>
+                          {prompt}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Messages */}
+                {messages.map((msg) => (
+                  <motion.div
+                    key={msg.id}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.3 }}
+                    className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div
+                      className={`max-w-[90%] rounded-xl px-3.5 py-2.5 ${
+                        msg.role === 'user' ? 'rounded-br-sm' : 'rounded-bl-sm'
+                      }`}
+                      style={
+                        msg.role === 'user'
+                          ? {
+                              background: 'linear-gradient(135deg, rgba(0, 229, 255, 0.12) 0%, rgba(0, 229, 255, 0.06) 100%)',
+                              border: '1px solid rgba(0, 229, 255, 0.2)',
+                            }
+                          : msg.isError
+                          ? {
+                              background: 'linear-gradient(135deg, rgba(255, 61, 61, 0.1) 0%, rgba(255, 61, 61, 0.05) 100%)',
+                              border: '1px solid rgba(255, 61, 61, 0.2)',
+                            }
+                          : {
+                              background: 'linear-gradient(135deg, rgba(212, 175, 55, 0.08) 0%, rgba(212, 175, 55, 0.03) 100%)',
+                              border: '1px solid rgba(212, 175, 55, 0.12)',
+                            }
+                      }
+                    >
+                      {/* Message header */}
+                      <div className="flex items-center gap-1.5 mb-1.5">
+                        {msg.role === 'user' ? (
+                          <User className="w-3 h-3 text-[var(--cyan-primary)]" />
+                        ) : msg.isError ? (
+                          <AlertTriangle className="w-3 h-3 text-[var(--alert-red)]" />
+                        ) : (
+                          <Bot className="w-3 h-3 text-[var(--gold-primary)]" />
+                        )}
+                        <span
+                          className="text-[8px] font-mono tracking-[0.15em] uppercase"
+                          style={{
+                            color: msg.role === 'user'
+                              ? 'var(--cyan-primary)'
+                              : msg.isError
+                              ? 'var(--alert-red)'
+                              : 'var(--gold-primary)',
+                          }}
+                        >
+                          {msg.sourceLabel || (msg.role === 'user' ? 'OPERATOR' : analystMode === 'hermes' ? 'HERMES OPS' : 'WORLDWATCH ANALYST')}
+                        </span>
+                        {msg.runtimeLabel && (
+                          <span className="rounded-full border border-white/8 bg-black/20 px-1.5 py-0.5 text-[6px] font-mono tracking-[0.16em] text-[var(--text-muted)]">
+                            {msg.runtimeLabel}
+                          </span>
+                        )}
+                        <span className="text-[7px] font-mono text-[var(--text-muted)] ml-auto">
+                          {new Date(msg.timestamp).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </span>
+                      </div>
+
+                      {/* Message content */}
+                      {msg.role === 'analyst' && !msg.isError ? (
+                        <div
+                          className="text-[11px] font-mono text-[var(--text-primary)] leading-relaxed whitespace-pre-wrap break-words"
+                          dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+                        />
+                      ) : (
+                        <p className="text-[11px] font-mono text-[var(--text-primary)] leading-relaxed whitespace-pre-wrap break-words">
+                          {msg.content}
+                        </p>
+                      )}
+                    </div>
+                  </motion.div>
+                ))}
+
+                {/* Loading indicator */}
+                {isLoading && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="flex justify-start"
+                  >
+                    <div
+                      className="rounded-xl rounded-bl-sm px-4 py-3 flex items-center gap-2.5"
+                      style={{
+                        background: 'linear-gradient(135deg, rgba(212, 175, 55, 0.08) 0%, rgba(212, 175, 55, 0.03) 100%)',
+                        border: '1px solid rgba(212, 175, 55, 0.12)',
+                      }}
+                    >
+                      <Loader2 className="w-3.5 h-3.5 text-[var(--gold-primary)] animate-spin" />
+                      <div className="flex items-center gap-1">
+                        <span className="text-[9px] font-mono tracking-[0.15em] text-[var(--gold-primary)] uppercase">
+                          Analyzing intelligence
+                        </span>
+                        <motion.span
+                          animate={{ opacity: [0, 1, 0] }}
+                          transition={{ duration: 1.5, repeat: Infinity }}
+                          className="text-[var(--gold-primary)]"
+                        >
+                          ...
+                        </motion.span>
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+
+                <div ref={messagesEndRef} />
+              </div>
+
+              {/* ── Input Area ── */}
+              <div
+                className="shrink-0 px-3 py-2.5"
+                style={{
+                  borderTop: '1px solid rgba(212, 175, 55, 0.1)',
+                  background: 'rgba(6, 6, 12, 0.8)',
+                }}
+              >
+                {/* Quick action */}
+                <div className="flex gap-2 mb-2 flex-wrap">
+                  <button
+                    onClick={handleFusionDossier}
+                    disabled={isLoading}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[9px] font-mono tracking-[0.1em] uppercase transition-all disabled:opacity-40"
+                    style={{
+                      background: 'rgba(0, 229, 255, 0.08)',
+                      border: '1px solid rgba(0, 229, 255, 0.2)',
+                      color: 'var(--cyan-primary)',
+                    }}
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    FUSION DOSSIER
+                  </button>
+                  <button
+                    onClick={handleBriefing}
+                    disabled={isLoading}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[9px] font-mono tracking-[0.1em] uppercase transition-all disabled:opacity-40"
+                    style={{
+                      background: 'rgba(212, 175, 55, 0.08)',
+                      border: '1px solid rgba(212, 175, 55, 0.2)',
+                      color: 'var(--gold-primary)',
+                    }}
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    GENERATE BRIEFING
+                  </button>
+                  <button
+                    onClick={handleHermesSweep}
+                    disabled={isLoading}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[9px] font-mono tracking-[0.1em] uppercase transition-all disabled:opacity-40"
+                    style={{
+                      background: 'rgba(16, 185, 129, 0.10)',
+                      border: '1px solid rgba(16, 185, 129, 0.24)',
+                      color: '#A7F3D0',
+                    }}
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    HERMES SWEEP
+                  </button>
+
+                  <span className="flex items-center text-[7px] font-mono text-[var(--text-muted)] tracking-wider">
+                    <ChevronDown className="w-2.5 h-2.5 mr-0.5" />
+                    SHIFT+ENTER FOR NEWLINE
+                  </span>
+                </div>
+
+                {/* Input row */}
+                <div className="flex gap-2 items-end">
+                  <div
+                    className="flex-1 rounded-xl overflow-hidden transition-colors"
+                    style={{
+                      background: 'var(--bg-tertiary)',
+                      border: '1px solid rgba(212, 175, 55, 0.1)',
+                    }}
+                  >
+                    <textarea
+                      ref={inputRef}
+                      value={inputText}
+                      onChange={(e) => setInputText(e.target.value)}
+                      onKeyDown={handleKeyDown}
+                      placeholder={analystMode === 'hermes' ? 'Ask Hermes Ops for an autonomous mission...' : 'Ask AEGIS for a fusion assessment...'}
+                      rows={1}
+                      className="w-full bg-transparent px-3 py-2.5 text-[11px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none resize-none"
+                      style={{ maxHeight: '120px', minHeight: '36px' }}
+                      disabled={isLoading}
+                      onInput={(e) => {
+                        const target = e.target as HTMLTextAreaElement;
+                        target.style.height = 'auto';
+                        target.style.height = Math.min(target.scrollHeight, 120) + 'px';
+                      }}
+                    />
+                  </div>
+
+                  <motion.button
+                    whileHover={{ scale: 1.05 }}
+                    whileTap={{ scale: 0.95 }}
+                    onClick={handleSend}
+                    disabled={!inputText.trim() || isLoading}
+                    className="shrink-0 w-9 h-9 rounded-xl flex items-center justify-center transition-all disabled:opacity-30"
+                    style={{
+                      background:
+                        inputText.trim() && !isLoading
+                          ? 'linear-gradient(135deg, rgba(0, 229, 255, 0.2) 0%, rgba(0, 229, 255, 0.1) 100%)'
+                          : 'rgba(255, 255, 255, 0.03)',
+                      border: `1px solid ${
+                        inputText.trim() && !isLoading ? 'rgba(0, 229, 255, 0.3)' : 'rgba(255, 255, 255, 0.06)'
+                      }`,
+                    }}
+                  >
+                    <Send
+                      className="w-3.5 h-3.5"
+                      style={{
+                        color: inputText.trim() && !isLoading ? 'var(--cyan-primary)' : 'var(--text-muted)',
+                      }}
+                    />
+                  </motion.button>
+                </div>
+
+                {/* Footer */}
+                <div className="flex items-center justify-between mt-1.5 px-1 gap-2">
+                  <span className="text-[7px] font-mono text-[var(--text-muted)] tracking-wider">
+                    {analystMode === 'hermes'
+                      ? hermesStatus?.available
+                        ? '🤖 HERMES LIVE'
+                        : '🛡️ HERMES HYBRID'
+                      : keySaved
+                        ? '🔑 USER KEY ACTIVE'
+                        : '🆓 LOCAL FREE MODE'} • {messages.filter((m) => m.role === 'user').length} QUERIES
+                  </span>
+                  <span className="text-[7px] font-mono text-[var(--text-muted)] tracking-wider text-right">
+                    {analystMode === 'hermes' && hermesStatus?.command ? `${hermesStatus.command} • ` : ''}FEEDS: {(data.earthquakes?.length || 0) + (data.news?.length || 0) + (data.gdelt?.length || 0)} ITEMS
+                  </span>
+                </div>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+    </>
+  );
+}
+
+export default memo(AiAnalyst);

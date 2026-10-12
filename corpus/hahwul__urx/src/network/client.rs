@@ -1,0 +1,717 @@
+use anyhow::Result;
+use reqwest::{Client, StatusCode};
+use std::time::Duration;
+
+use super::RateLimiter;
+
+/// Common HTTP client configuration shared across providers and testers.
+///
+/// This struct centralizes the logic for building a `reqwest::Client` with
+/// proxy, timeout, TLS, and User-Agent settings so that every provider and
+/// tester does not have to duplicate the same builder code.
+#[derive(Debug, Clone)]
+pub struct HttpClientConfig {
+    /// Request timeout in seconds
+    pub timeout: u64,
+    /// Skip TLS certificate verification
+    pub insecure: bool,
+    /// Use a randomized User-Agent header
+    pub random_agent: bool,
+    /// Optional proxy URL (e.g. "http://proxy:8080")
+    pub proxy: Option<String>,
+    /// Optional proxy authentication in "username:password" format
+    pub proxy_auth: Option<String>,
+    /// `-H`/`--cookie`/`--user-agent`, for the components that talk to the
+    /// target. Empty everywhere else — see [`super::CustomHeaders`] for why
+    /// the archives never see them.
+    pub headers: super::CustomHeaders,
+}
+
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self {
+            timeout: 30,
+            insecure: false,
+            random_agent: false,
+            proxy: None,
+            proxy_auth: None,
+            headers: super::CustomHeaders::default(),
+        }
+    }
+}
+
+impl HttpClientConfig {
+    /// The same configuration with the user's `-H` headers removed.
+    ///
+    /// For the one shape of component that talks to *both* ends: the `robots`
+    /// and `sitemap` providers normally fetch from the target, so they carry
+    /// the headers, but under `--archived-discovery` the very same provider
+    /// reads those files out of the Wayback Machine instead. Sending the
+    /// target's session cookie there is the leak the whole scheme exists to
+    /// prevent, so the archive-facing request drops them.
+    pub fn without_headers(mut self) -> Self {
+        self.headers = super::CustomHeaders::default();
+        self
+    }
+
+    /// Build a `reqwest::Client` from this configuration.
+    ///
+    /// Redirects are followed (reqwest's default), which is what a provider
+    /// walking an archive index wants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the proxy URL is invalid or the client fails to build.
+    pub fn build_client(&self) -> Result<Client> {
+        self.build(true)
+    }
+
+    /// Build a client that reports redirects instead of following them.
+    ///
+    /// For a status *check* the redirect is the answer: following it reports
+    /// the status of a different URL than the one printed (`/old - 200 OK` when
+    /// `/old` actually answers 301), and it makes the documented
+    /// `--include-status 30x` unmatchable, because a 3xx never reaches the
+    /// filter. Not following also spares a redirect chain (or loop) per URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the proxy URL is invalid or the client fails to build.
+    pub fn build_client_no_redirect(&self) -> Result<Client> {
+        self.build(false)
+    }
+
+    fn build(&self, follow_redirects: bool) -> Result<Client> {
+        let mut builder = Client::builder().timeout(Duration::from_secs(self.timeout));
+
+        if !follow_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+
+        if self.insecure {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        // Always send a User-Agent. reqwest sends none by default, and several
+        // upstreams — notably the Wayback CDX API — answer a UA-less request
+        // with `400 Bad Request`, so an unset header was a silent, blanket
+        // source of provider failures. `--random-agent` rotates realistic
+        // browser strings; otherwise we send a polite, tool-identifying default.
+        let ua = if self.random_agent {
+            crate::network::random_user_agent()
+        } else {
+            crate::network::default_user_agent()
+        };
+        builder = builder.user_agent(ua);
+
+        // Applied after the User-Agent, so an explicit `--user-agent` (or a
+        // `-H "User-Agent: …"`) replaces the one chosen just above rather than
+        // being replaced by it. reqwest's `default_headers` inserts per name,
+        // so this is a plain overwrite.
+        if let Some(headers) = self.headers.map() {
+            builder = builder.default_headers(headers.clone());
+        }
+
+        if let Some(proxy_url) = &self.proxy {
+            let mut proxy = reqwest::Proxy::all(proxy_url)?;
+
+            if let Some(auth) = &self.proxy_auth {
+                // A colon cannot appear in the username, but it can appear in
+                // the password. Split once so `user:p:a:ss` reaches the proxy
+                // intact instead of silently becoming `user:p`.
+                let (username, password) = auth.split_once(':').unwrap_or((auth, ""));
+                proxy = proxy.basic_auth(username, password);
+            }
+
+            builder = builder.proxy(proxy);
+        }
+
+        Ok(builder.build()?)
+    }
+}
+
+/// Parse a `Retry-After` response header into a sleep duration so a throttled
+/// request waits as long as the server asked before retrying. Only the
+/// delta-seconds form (the common API case, e.g. `Retry-After: 30`) is honored;
+/// the HTTP-date form returns `None` and the caller falls back to its normal
+/// back-off. The value is capped so a hostile or absurd header can't stall a run.
+pub fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    const MAX_RETRY_AFTER_SECS: u64 = 60;
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)))
+}
+
+/// Ceiling on a single response body buffered by [`get_with_retry`].
+///
+/// Every provider that walks a CDX index goes through `get_with_retry`, and each
+/// of those requests is already bounded server-side (a 50k-row Wayback page, one
+/// Common Crawl block, one OTX page of 500 records) — a legitimate body is single
+/// -digit megabytes. This limit exists for the case where the remote does *not*
+/// honour that bound: a hostile, misconfigured, or hijacked index answering with
+/// an endless stream would otherwise be buffered in full, in memory, once per
+/// concurrent domain.
+pub const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Read a response body, stopping after `max` bytes.
+///
+/// Reads incrementally via `chunk()` rather than buffering the whole body, so an
+/// endpoint that streams gigabytes — by accident or on purpose — can't exhaust
+/// memory before any parsing happens. Every caller that fetches a document from
+/// a host urx does not control should go through this.
+pub async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<String> {
+    let buf = read_bytes_capped(resp, max).await?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// [`read_body_capped`] without the UTF-8 decode: the bytes as served, for a
+/// caller that keeps them.
+pub async fn read_bytes_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        let remaining = max.saturating_sub(buf.len());
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Whether an HTTP status is worth another attempt.
+///
+/// Server errors and explicit throttling are transient. The rest of the 4xx
+/// range is a deterministic "no" and retrying it only wastes requests and
+/// wall-clock: a 404 from a CDX index is how those APIs say "this domain has no
+/// captures", so re-asking three times with back-off turns an instant miss into
+/// a multi-second one — per domain, per provider.
+fn is_retryable_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+}
+
+/// Send a request with retry and linear back-off.
+///
+/// `retries` is the number of **additional** attempts after the first failure
+/// (i.e. total attempts = 1 + retries). `request` is called once per attempt,
+/// so a caller can rotate API keys between attempts, and `limiter` is acquired
+/// before each one. Transport errors, body-read errors, statuses `retry`
+/// accepts, and 2xx bodies `parse` rejects are retried after 500ms, 1000ms,
+/// 1500ms, … — or after the `Retry-After` a retried response named. Any other
+/// status is final: `parse` gets it with an empty body, and its answer ends the
+/// loop.
+///
+/// # Errors
+///
+/// `Failed after N attempts: <last error>` once the loop gives up.
+pub async fn send_with_retry<T>(
+    retries: u32,
+    limiter: Option<&RateLimiter>,
+    retry: impl Fn(StatusCode) -> bool,
+    mut request: impl FnMut() -> reqwest::RequestBuilder,
+    parse: impl Fn(StatusCode, String) -> Result<T>,
+) -> Result<T> {
+    let mut last_error = anyhow::anyhow!("no attempt made");
+    // Server-dictated wait for the *next* attempt, when it sent one.
+    let mut next_delay: Option<Duration> = None;
+    let mut attempts: u32 = 0;
+
+    for attempt in 0..=retries {
+        if attempt > 0 {
+            let delay = next_delay
+                .take()
+                .unwrap_or_else(|| Duration::from_millis(500 * attempt as u64));
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(rl) = limiter {
+            rl.acquire().await;
+        }
+        attempts += 1;
+
+        let response = match request().send().await {
+            Ok(response) => response,
+            Err(e) => {
+                last_error = e.into();
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            if retry(status) {
+                last_error = anyhow::anyhow!("HTTP error: {status}");
+                next_delay = retry_after_delay(response.headers());
+                continue;
+            }
+            match parse(status, String::new()) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    last_error = e;
+                    break;
+                }
+            }
+        }
+        // Capped rather than `response.text()`: none of these hosts is one
+        // urx controls, so an unbounded body must not be buffered in full.
+        match read_body_capped(response, MAX_RESPONSE_BYTES)
+            .await
+            .and_then(|body| parse(status, body))
+        {
+            Ok(v) => return Ok(v),
+            Err(e) => last_error = e,
+        }
+    }
+
+    let noun = if attempts == 1 { "attempt" } else { "attempts" };
+    Err(anyhow::anyhow!(
+        "Failed after {attempts} {noun}: {last_error}"
+    ))
+}
+
+/// GET `url` through [`send_with_retry`], retrying only
+/// [`is_retryable_status`], and return the body.
+///
+/// # Errors
+///
+/// Returns the last encountered error if all attempts are exhausted.
+pub async fn get_with_retry(client: &Client, url: &str, max_retries: u32) -> Result<String> {
+    send_with_retry(
+        max_retries,
+        None,
+        is_retryable_status,
+        || client.get(url),
+        |status, body| {
+            anyhow::ensure!(status.is_success(), "HTTP error: {status}");
+            Ok(body)
+        },
+    )
+    .await
+}
+
+/// Network settings a provider or tester applies to its own requests.
+#[derive(Debug, Clone)]
+pub struct NetConfig {
+    /// Proxy, timeout, TLS and User-Agent for the client.
+    pub http: HttpClientConfig,
+    /// Additional attempts after a failed request.
+    pub retries: u32,
+    /// Paces requests; `None` means unthrottled.
+    pub rate_limit: Option<RateLimiter>,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        Self {
+            http: HttpClientConfig::default(),
+            retries: 3,
+            rate_limit: None,
+        }
+    }
+}
+
+impl NetConfig {
+    /// The defaults, with a different request timeout.
+    pub fn with_timeout(timeout: u64) -> Self {
+        Self {
+            http: HttpClientConfig {
+                timeout,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retry_after_delay_parses_seconds() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_retry_after_delay_caps_large_values() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("100000"));
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_retry_after_delay_ignores_http_date_and_missing() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let empty = HeaderMap::new();
+        assert_eq!(retry_after_delay(&empty), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after_delay(&headers), None);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = HttpClientConfig::default();
+        assert_eq!(config.timeout, 30);
+        assert!(!config.insecure);
+        assert!(!config.random_agent);
+        assert!(config.proxy.is_none());
+        assert!(config.proxy_auth.is_none());
+    }
+
+    #[test]
+    fn test_build_client_default() {
+        let config = HttpClientConfig::default();
+        let client = config.build_client();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_insecure() {
+        let config = HttpClientConfig {
+            headers: crate::network::CustomHeaders::default(),
+            insecure: true,
+            ..Default::default()
+        };
+        let client = config.build_client();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_random_agent() {
+        let config = HttpClientConfig {
+            headers: crate::network::CustomHeaders::default(),
+            random_agent: true,
+            ..Default::default()
+        };
+        let client = config.build_client();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_with_proxy() {
+        let config = HttpClientConfig {
+            headers: crate::network::CustomHeaders::default(),
+            proxy: Some("http://127.0.0.1:8080".to_string()),
+            proxy_auth: Some("user:pass".to_string()),
+            ..Default::default()
+        };
+        let client = config.build_client();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_with_proxy_no_auth() {
+        let config = HttpClientConfig {
+            headers: crate::network::CustomHeaders::default(),
+            proxy: Some("http://127.0.0.1:8080".to_string()),
+            ..Default::default()
+        };
+        let client = config.build_client();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_with_custom_timeout() {
+        let config = HttpClientConfig {
+            headers: crate::network::CustomHeaders::default(),
+            timeout: 120,
+            ..Default::default()
+        };
+        let client = config.build_client();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_all_options() {
+        let config = HttpClientConfig {
+            headers: crate::network::CustomHeaders::default(),
+            timeout: 60,
+            insecure: true,
+            random_agent: true,
+            proxy: Some("http://127.0.0.1:8080".to_string()),
+            proxy_auth: Some("admin:secret".to_string()),
+        };
+        let client = config.build_client();
+        assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_redirect_policy_differs_between_the_two_builders() {
+        // Providers need the redirect followed to reach the document; a status
+        // check needs the redirect itself, or `--include-status 30x` can never
+        // match and the reported status belongs to another URL.
+        let mut server = mockito::Server::new_async().await;
+        let _redirect = server
+            .mock("GET", "/redir")
+            .with_status(302)
+            .with_header("location", "/final")
+            .create_async()
+            .await;
+        let _final_page = server
+            .mock("GET", "/final")
+            .with_status(200)
+            .with_body("arrived")
+            .create_async()
+            .await;
+
+        let config = HttpClientConfig::default();
+        let url = format!("{}/redir", server.url());
+
+        let followed = config
+            .build_client()
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(followed.status(), 200);
+
+        let reported = config
+            .build_client_no_redirect()
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reported.status(), 302);
+    }
+
+    #[tokio::test]
+    async fn proxy_auth_preserves_colons_in_the_password() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let config = HttpClientConfig {
+            proxy: Some(format!("http://{address}")),
+            proxy_auth: Some("user:pass:word".into()),
+            ..Default::default()
+        };
+        let response = config
+            .build_client()
+            .unwrap()
+            .get("http://example.invalid/resource")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let request = proxy.await.unwrap();
+        let authorization = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("proxy-authorization")
+                .then_some(value.trim())
+        });
+        assert!(
+            authorization == Some("Basic dXNlcjpwYXNzOndvcmQ="),
+            "proxy did not receive the full user:password credential: {request:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_success_first_try() {
+        let mut mock_server = mockito::Server::new_async().await;
+        let _m = mock_server
+            .mock("GET", "/test")
+            .with_status(200)
+            .with_body("success")
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/test", mock_server.url());
+        let result = get_with_retry(&client, &url, 3).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "success");
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_success_after_retry() {
+        let mut mock_server = mockito::Server::new_async().await;
+
+        // First attempt fails with 500
+        let _m1 = mock_server
+            .mock("GET", "/test")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Second attempt succeeds
+        let _m2 = mock_server
+            .mock("GET", "/test")
+            .with_status(200)
+            .with_body("success")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/test", mock_server.url());
+
+        // We expect it to succeed eventually
+        let result = get_with_retry(&client, &url, 3).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "success");
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_failure_max_retries() {
+        let mut mock_server = mockito::Server::new_async().await;
+
+        // Always fail. expects 2 calls (initial + 1 retry)
+        let _m = mock_server
+            .mock("GET", "/test")
+            .with_status(500)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/test", mock_server.url());
+
+        // Max retries = 1. Total attempts = 2.
+        let result = get_with_retry(&client, &url, 1).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Failed after 2 attempts"));
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_does_not_retry_client_errors() {
+        let mut mock_server = mockito::Server::new_async().await;
+
+        // A 404 is a definitive answer (for CDX indexes it means "no captures"),
+        // so it must cost exactly one request no matter how many retries were
+        // configured.
+        let m = mock_server
+            .mock("GET", "/missing")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/missing", mock_server.url());
+        let err = get_with_retry(&client, &url, 5).await.unwrap_err();
+
+        assert!(err.to_string().contains("Failed after 1 attempt"), "{err}");
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_retries_throttling() {
+        let mut mock_server = mockito::Server::new_async().await;
+
+        // 429 is transient, and the Retry-After the server names is what we
+        // wait — capped, so a hostile value can't stall the run.
+        let throttled = mock_server
+            .mock("GET", "/slow")
+            .with_status(429)
+            .with_header("retry-after", "0")
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = mock_server
+            .mock("GET", "/slow")
+            .with_status(200)
+            .with_body("done")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/slow", mock_server.url());
+        assert_eq!(get_with_retry(&client, &url, 2).await.unwrap(), "done");
+        throttled.assert();
+        ok.assert();
+    }
+
+    #[tokio::test]
+    async fn test_read_body_capped_stops_at_limit() {
+        let mut mock_server = mockito::Server::new_async().await;
+        let _m = mock_server
+            .mock("GET", "/big")
+            .with_status(200)
+            .with_body("x".repeat(10_000))
+            .create_async()
+            .await;
+
+        let resp = Client::new()
+            .get(format!("{}/big", mock_server.url()))
+            .send()
+            .await
+            .unwrap();
+        let body = read_body_capped(resp, 128).await.unwrap();
+        assert_eq!(body.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_returns_whole_body_under_cap() {
+        // get_with_retry reads through the capped path; a normal-sized body must
+        // still come back byte-for-byte (including non-ASCII, which the chunked
+        // read must not split incorrectly).
+        let mut mock_server = mockito::Server::new_async().await;
+        let payload = format!("{}\nsegunda linha — ção\n", "https://example.com/a");
+        let _m = mock_server
+            .mock("GET", "/body")
+            .with_status(200)
+            .with_body(&payload)
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/body", mock_server.url());
+        assert_eq!(get_with_retry(&client, &url, 0).await.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_connection_error() {
+        // Use a reserved port (0) which typically causes a connection error immediately
+        let client = Client::new();
+        let url = "http://127.0.0.1:0";
+
+        let result = get_with_retry(&client, url, 1).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Failed after 2 attempts"));
+    }
+}

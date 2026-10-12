@@ -1,0 +1,467 @@
+use super::MainWindow;
+use crate::graphics::{GraphicsBuilder, PhysicalDevice};
+use crate::profile::{CpuModel, DisplayResolution, Profile};
+use config::ProductId;
+use serde_bytes::ByteBuf;
+use slint::{
+    ComponentHandle, Model, ModelNotify, ModelRc, ModelTracker, SharedString, StandardListViewItem,
+    ToSharedString, VecModel, Weak,
+};
+use std::any::Any;
+use std::cell::{Cell, RefCell, RefMut};
+use std::num::NonZero;
+use std::rc::Rc;
+use thiserror::Error;
+
+/// Implementation of [`Model`] for [`PhysicalDevice`].
+pub struct DeviceModel<G>(Rc<G>);
+
+impl<G: GraphicsBuilder> DeviceModel<G> {
+    pub fn new(g: Rc<G>) -> Self {
+        Self(g)
+    }
+
+    pub fn position(&self, id: &[u8]) -> Option<i32> {
+        self.0
+            .physical_devices()
+            .iter()
+            .position(move |d| d.id() == id)
+            .map(|i| i.try_into().unwrap())
+    }
+
+    pub fn get(&self, i: i32) -> Option<&impl PhysicalDevice> {
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| self.0.physical_devices().get(i))
+    }
+}
+
+impl<G: GraphicsBuilder> Model for DeviceModel<G> {
+    type Data = SharedString;
+
+    fn row_count(&self) -> usize {
+        self.0.physical_devices().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        self.0
+            .physical_devices()
+            .get(row)
+            .map(|d| SharedString::from(d.name()))
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Implementation of [`Model`] for [`DisplayResolution`].
+pub struct ResolutionModel([DisplayResolution; 3]);
+
+impl ResolutionModel {
+    pub fn position(&self, v: DisplayResolution) -> Option<i32> {
+        self.0
+            .iter()
+            .position(move |i| *i == v)
+            .map(|v| v.try_into().unwrap())
+    }
+
+    pub fn get(&self, i: i32) -> Option<DisplayResolution> {
+        usize::try_from(i).ok().and_then(|i| self.0.get(i)).copied()
+    }
+}
+
+impl Default for ResolutionModel {
+    fn default() -> Self {
+        Self([
+            DisplayResolution::Hd,
+            DisplayResolution::FullHd,
+            DisplayResolution::UltraHd,
+        ])
+    }
+}
+
+impl Model for ResolutionModel {
+    type Data = SharedString;
+
+    fn row_count(&self) -> usize {
+        self.0.len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        self.0.get(row).map(|v| v.to_string().into())
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Implementation of [`Model`] for [`CpuModel`].
+pub struct CpuList([CpuModel; 3]);
+
+impl CpuList {
+    pub fn position(&self, v: CpuModel) -> Option<i32> {
+        self.0
+            .iter()
+            .position(move |i| *i == v)
+            .map(|v| v.try_into().unwrap())
+    }
+
+    pub fn get(&self, i: i32) -> Option<CpuModel> {
+        usize::try_from(i).ok().and_then(|i| self.0.get(i)).copied()
+    }
+}
+
+impl Default for CpuList {
+    fn default() -> Self {
+        Self([CpuModel::Host, CpuModel::Pro, CpuModel::ProWithHost])
+    }
+}
+
+impl Model for CpuList {
+    type Data = SharedString;
+
+    fn row_count(&self) -> usize {
+        self.0.len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        self.0.get(row).map(|v| v.to_shared_string())
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Implementation of [`Model`] for [`ProductId`].
+pub struct ProductList([ProductId; 4]);
+
+impl ProductList {
+    pub fn position(&self, v: ProductId) -> Option<i32> {
+        self.0
+            .iter()
+            .position(move |i| *i == v)
+            .map(|v| v.try_into().unwrap())
+    }
+
+    pub fn get(&self, i: i32) -> Option<ProductId> {
+        usize::try_from(i).ok().and_then(|i| self.0.get(i)).copied()
+    }
+}
+
+impl Default for ProductList {
+    fn default() -> Self {
+        Self([
+            ProductId::DEVKIT,
+            ProductId::TESTKIT,
+            ProductId::USA,
+            ProductId::SOUTH_ASIA,
+        ])
+    }
+}
+
+impl Model for ProductList {
+    type Data = SharedString;
+
+    fn row_count(&self) -> usize {
+        self.0.len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        self.0.get(row).map(|v| v.to_shared_string())
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Implementation of [`Model`] for [`Profile`].
+pub struct ProfileModel<G> {
+    window: Weak<MainWindow>,
+    selected: Cell<Option<usize>>,
+    profiles: RefCell<Vec<Profile>>,
+    devices: Rc<DeviceModel<G>>,
+    resolutions: Rc<ResolutionModel>,
+    cpus: Rc<CpuList>,
+    products: Rc<ProductList>,
+    environments: Rc<EnvironmentList>,
+    noti: ModelNotify,
+}
+
+impl<G: GraphicsBuilder> ProfileModel<G> {
+    pub fn new(
+        window: &MainWindow,
+        profiles: Vec<Profile>,
+        devices: Rc<DeviceModel<G>>,
+        resolutions: Rc<ResolutionModel>,
+        cpus: Rc<CpuList>,
+        products: Rc<ProductList>,
+    ) -> Self {
+        let environments = Rc::new(EnvironmentList::default());
+
+        window.set_environments(ModelRc::from(environments.clone()));
+
+        Self {
+            window: window.as_weak(),
+            selected: Cell::new(None),
+            profiles: RefCell::new(profiles),
+            devices,
+            resolutions,
+            cpus,
+            products,
+            environments,
+            noti: ModelNotify::default(),
+        }
+    }
+
+    /// # Panics
+    /// If `row` is not valid.
+    pub fn select(&self, row: usize) {
+        // Do nothing if no window.
+        let dst = match self.window.upgrade() {
+            Some(v) => v,
+            None => return,
+        };
+
+        // Load profile.
+        let profiles = self.profiles.borrow();
+        let p = &profiles[row];
+
+        dst.set_selected_device(self.devices.position(&p.display_device).unwrap_or(0));
+        dst.set_selected_resolution(self.resolutions.position(p.display_resolution).unwrap());
+        dst.set_selected_cpu(self.cpus.position(p.cpu_model).unwrap());
+        dst.set_cpu_count(p.kernel_config.cpu_count.get().try_into().unwrap());
+        dst.set_debug_address(p.debug_addr.to_shared_string());
+        dst.set_selected_idps_product(
+            self.products
+                .position(p.kernel_config.idps.product)
+                .unwrap(),
+        );
+        dst.set_idps_sub_product(slint::format!("{:#x}", p.kernel_config.idps.prodsub));
+        dst.set_idps_serial(hex::encode(p.kernel_config.idps.serial).into());
+
+        self.environments.reset(p);
+        self.selected.set(Some(row));
+    }
+
+    pub fn update(&self) -> Result<RefMut<'_, Profile>, ProfileError> {
+        let row = self.selected.get().ok_or(ProfileError::NoSelectedProfile)?;
+        let src = self.window.upgrade().ok_or(ProfileError::NoWindow)?;
+        let mut profiles = self.profiles.borrow_mut();
+        let p = &mut profiles[row];
+        let debug_addr = src
+            .get_debug_address()
+            .parse()
+            .map_err(|_| ProfileError::InvalidDebugAddress)?;
+        let idps_prodsub = src.get_idps_sub_product();
+        let idps_prodsub = match idps_prodsub.strip_prefix("0x") {
+            Some(v) => {
+                u16::from_str_radix(v, 16).map_err(|_| ProfileError::InvalidIdpsSubProduct)?
+            }
+            None => idps_prodsub
+                .parse()
+                .map_err(|_| ProfileError::InvalidIdpsSubProduct)?,
+        };
+        let mut idps_serial = [0; 8];
+        let environments = src.get_environments();
+        let environments = environments
+            .iter()
+            .map(|e| (e.row_data(0).unwrap().text, e.row_data(1).unwrap().text));
+
+        if hex::decode_to_slice(src.get_idps_serial(), &mut idps_serial).is_err() {
+            return Err(ProfileError::InvalidIdpsSerial);
+        }
+
+        p.display_device = ByteBuf::from(self.devices.get(src.get_selected_device()).unwrap().id());
+        p.display_resolution = self.resolutions.get(src.get_selected_resolution()).unwrap();
+        p.cpu_model = self.cpus.get(src.get_selected_cpu()).unwrap();
+        p.kernel_config.cpu_count = src
+            .get_cpu_count()
+            .try_into()
+            .ok()
+            .and_then(NonZero::new)
+            .unwrap();
+        p.debug_addr = debug_addr;
+        p.kernel_config.idps.product = self.products.get(src.get_selected_idps_product()).unwrap();
+        p.kernel_config.idps.prodsub = idps_prodsub;
+        p.kernel_config.idps.serial = idps_serial;
+        p.kernel_config.clear_env();
+        p.kernel_config.extend_env(environments);
+
+        Ok(RefMut::map(profiles, move |v| &mut v[row]))
+    }
+
+    pub fn into_inner(self) -> Vec<Profile> {
+        self.profiles.into_inner()
+    }
+}
+
+impl<G> ProfileModel<G> {
+    /// # Panics
+    /// If `row` is not valid.
+    pub fn get_env(&self, row: usize) -> (SharedString, SharedString) {
+        let row = self.environments.row_data(row).unwrap();
+        let name = row.row_data(0).unwrap();
+        let value = row.row_data(1).unwrap();
+
+        (name.text, value.text)
+    }
+
+    pub fn push(&self, pf: Profile) -> i32 {
+        let mut profiles = self.profiles.borrow_mut();
+        let index = profiles.len();
+
+        profiles.push(pf);
+        self.noti.row_added(index, profiles.len());
+
+        index.try_into().unwrap()
+    }
+
+    pub fn environments(&self) -> &EnvironmentList {
+        &self.environments
+    }
+}
+
+impl<G: 'static> Model for ProfileModel<G> {
+    type Data = SharedString;
+
+    fn row_count(&self) -> usize {
+        self.profiles.borrow().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        self.profiles
+            .borrow()
+            .get(row)
+            .map(|p| p.name.to_shared_string())
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.noti
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Implementation of [`Model`] for environment variables.
+#[derive(Default)]
+pub struct EnvironmentList {
+    list: RefCell<Vec<ModelRc<StandardListViewItem>>>,
+    notify: ModelNotify,
+}
+
+impl EnvironmentList {
+    pub fn push(&self, name: impl Into<SharedString>, value: impl Into<SharedString>) {
+        let mut list = self.list.borrow_mut();
+        let index = list.len();
+
+        list.push(ModelRc::new(VecModel::from(vec![
+            StandardListViewItem::from(name.into()),
+            StandardListViewItem::from(value.into()),
+        ])));
+
+        self.notify.row_added(index, 1);
+    }
+
+    pub fn set(&self, row: usize, name: impl Into<SharedString>, value: impl Into<SharedString>) {
+        self.set_row_data(
+            row,
+            ModelRc::new(VecModel::from(vec![
+                StandardListViewItem::from(name.into()),
+                StandardListViewItem::from(value.into()),
+            ])),
+        );
+    }
+
+    /// # Panics
+    /// If `row` is not valid.
+    pub fn remove(&self, row: usize) {
+        self.list.borrow_mut().remove(row);
+        self.notify.row_removed(row, 1);
+    }
+
+    fn reset(&self, p: &Profile) {
+        let mut list = self.list.borrow_mut();
+
+        list.clear();
+
+        for (k, v) in p.kernel_config.env() {
+            list.push(ModelRc::new(VecModel::from(vec![
+                StandardListViewItem::from(k),
+                StandardListViewItem::from(v),
+            ])));
+        }
+
+        self.notify.reset();
+    }
+}
+
+impl Model for EnvironmentList {
+    type Data = ModelRc<StandardListViewItem>;
+
+    fn row_count(&self) -> usize {
+        self.list.borrow().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        self.list.borrow().get(row).cloned()
+    }
+
+    fn set_row_data(&self, row: usize, data: Self::Data) {
+        let mut list = self.list.borrow_mut();
+
+        list[row] = data;
+
+        drop(list);
+
+        self.notify.row_changed(row);
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.notify
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Represents an error when [`ProfileModel::update()`] fails.
+#[derive(Debug, Error)]
+pub enum ProfileError {
+    #[error("no profile is selected")]
+    NoSelectedProfile,
+
+    #[error("no window to load data")]
+    NoWindow,
+
+    #[error("invalid debug address")]
+    InvalidDebugAddress,
+
+    #[error("invalid IDPS sub-product")]
+    InvalidIdpsSubProduct,
+
+    #[error("invalid IDPS serial")]
+    InvalidIdpsSerial,
+}

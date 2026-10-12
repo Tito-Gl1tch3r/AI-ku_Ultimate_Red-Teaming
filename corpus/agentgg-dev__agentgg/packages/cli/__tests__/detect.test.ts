@@ -1,0 +1,450 @@
+import { Agent } from "@agentgg/core";
+import { MockLanguageModelV1 } from "ai/test";
+import { describe, expect, it } from "vitest";
+import { buildAgentPrompt, buildPreconditionPrompt, hydrateFinding } from "../src/detect.js";
+import { MultiProviderDetector } from "../src/detectors/multi-provider.js";
+
+function makeAgent(slug = "sql-injection"): Agent {
+  return {
+    slug,
+    name: "SQL Injection",
+    description: "x",
+    version: "0.1.0",
+    noiseTier: "normal",
+    where: {
+      extensions: ["ts"],
+      filePatterns: [],
+      excludePatterns: [],
+      useDefaultExcludes: true,
+      preFilter: [],
+      maxFilesPerBatch: 5,
+      maxTurnsPerBatch: 50,
+    },
+    references: ["CWE-89"],
+    prompt: "You are looking for SQL injection. Report any string-concatenated queries.",
+  };
+}
+
+/**
+ * Build a mock language model that returns a fixed JSON object from
+ * `doGenerate`. The AI SDK's `generateObject` path consumes the `text`
+ * field when `defaultObjectGenerationMode` is "json" and parses it
+ * against the caller's schema.
+ */
+function mockModelReturning(payload: unknown): MockLanguageModelV1 {
+  return new MockLanguageModelV1({
+    defaultObjectGenerationMode: "json",
+    doGenerate: async () => ({
+      rawCall: { rawPrompt: null, rawSettings: {} },
+      finishReason: "stop",
+      usage: { promptTokens: 10, completionTokens: 10 },
+      text: JSON.stringify(payload),
+    }),
+  });
+}
+
+describe("buildAgentPrompt", () => {
+  const candidates = [{ filePath: "src/login.ts", content: "const x = 1;", hits: [] }];
+
+  it("includes the agent's prompt body verbatim", () => {
+    const agent = makeAgent();
+    const out = buildAgentPrompt({ excludePatterns: [], agent, candidates });
+    expect(out).toContain(agent.prompt);
+  });
+
+  it("includes each candidate's file path and content in a fenced code block", () => {
+    const out = buildAgentPrompt({ excludePatterns: [], agent: makeAgent(), candidates });
+    expect(out).toContain("src/login.ts");
+    expect(out).toContain("```typescript");
+    expect(out).toContain("const x = 1;");
+  });
+
+  it("renders a multi-line anchor as a range and a single-line one as a point", () => {
+    // A semgrep match spans the whole handler; a regex hit is one line.
+    const out = buildAgentPrompt({
+      excludePatterns: [],
+      agent: makeAgent(),
+      candidates: [
+        {
+          filePath: "src/api/users.ts",
+          content: "a",
+          hits: [
+            { line: 3, endLine: 10, label: "handler", snippet: "export async function GET(" },
+            { line: 12, label: "id param", snippet: "req.params.id" },
+          ],
+        },
+      ],
+    });
+    expect(out).toContain("- L3-10 [handler]:");
+    expect(out).toContain("- L12 [id param]:");
+  });
+
+  it("describes the available tools (Read, Glob, and Grep)", () => {
+    const out = buildAgentPrompt({ excludePatterns: [], agent: makeAgent(), candidates });
+    expect(out).toContain("Read, Glob, and Grep");
+  });
+
+  it("warns the model against fabricating findings", () => {
+    const out = buildAgentPrompt({ excludePatterns: [], agent: makeAgent(), candidates });
+    expect(out).toContain("Do NOT invent findings");
+  });
+
+  it("prepends the recon brief when provided, omits it otherwise", () => {
+    const withRecon = buildAgentPrompt({
+      excludePatterns: [],
+      agent: makeAgent(),
+      candidates,
+      recon: "## Project recon\nA small JS service.",
+    });
+    expect(withRecon).toContain("## Project recon");
+
+    const without = buildAgentPrompt({ excludePatterns: [], agent: makeAgent(), candidates });
+    expect(without).not.toContain("## Project recon");
+  });
+});
+
+describe("buildPreconditionPrompt", () => {
+  it("includes the agent name, description, and the relevance condition", () => {
+    const out = buildPreconditionPrompt({
+      agentName: "SQL Injection",
+      agentDescription: "finds string-concatenated SQL",
+      conditionPrompt: "Run only if the project talks to a SQL database.",
+    });
+    expect(out).toContain("SQL Injection");
+    expect(out).toContain("finds string-concatenated SQL");
+    expect(out).toContain("Run only if the project talks to a SQL database.");
+  });
+
+  it("injects the recon brief when provided", () => {
+    const out = buildPreconditionPrompt({
+      agentName: "x",
+      agentDescription: "y",
+      conditionPrompt: "z",
+      recon: "## Project recon\nUses Postgres.",
+    });
+    expect(out).toContain("## Project recon");
+  });
+});
+
+describe("hydrateFinding", () => {
+  const agent = makeAgent();
+
+  it("stamps id, agentSlug, filePath, and notifications onto the partial", () => {
+    const f = hydrateFinding(
+      {
+        title: "SQLi in login handler",
+        vulnSlug: "sql-injection",
+        summary: "concatenated SQL",
+        details: "Line 12 concatenates...",
+        poc: "curl ...",
+        impact: "any unauthenticated user can read users",
+        references: [],
+        confidence: 0.9,
+      },
+      agent,
+      "src/login.ts",
+    );
+    expect(f.agentSlug).toBe("sql-injection");
+    expect(f.filePath).toBe("src/login.ts");
+    expect(f.id).toHaveLength(12);
+    expect(f.notifications).toEqual([]);
+    expect(f.severity).toBeUndefined();
+    expect(f.summary).toBe("concatenated SQL");
+    expect(f.poc).toContain("curl");
+    expect(f.impact).toContain("unauthenticated");
+  });
+
+  it("produces the same id for the same (agent, file, title, lineRange)", () => {
+    const partial = {
+      title: "X",
+      vulnSlug: "sql-injection",
+      summary: "s",
+      details: "d",
+      poc: "p",
+      impact: "i",
+      references: [],
+      confidence: 0.5,
+      lineRange: [10, 20] as [number, number],
+    };
+    const a = hydrateFinding(partial, agent, "src/a.ts");
+    const b = hydrateFinding(partial, agent, "src/a.ts");
+    expect(a.id).toBe(b.id);
+  });
+
+  it("produces a different id when the title changes", () => {
+    const base = {
+      vulnSlug: "sql-injection",
+      summary: "s",
+      details: "d",
+      poc: "p",
+      impact: "i",
+      references: [],
+      confidence: 0.5,
+    };
+    const a = hydrateFinding({ ...base, title: "X" }, agent, "src/a.ts");
+    const b = hydrateFinding({ ...base, title: "Y" }, agent, "src/a.ts");
+    expect(a.id).not.toBe(b.id);
+  });
+});
+
+describe("MultiProviderDetector", () => {
+  const agent = makeAgent();
+
+  it("has a backend name", () => {
+    const detector = new MultiProviderDetector(
+      "anthropic-api",
+      mockModelReturning({ findings: [] }),
+    );
+    expect(detector.name).toBe("anthropic-api");
+  });
+
+  it("returns hydrated Findings produced by the model via runAgent", async () => {
+    const model = mockModelReturning({
+      findings: [
+        {
+          title: "SQLi in login",
+          vulnSlug: "sql-injection",
+          summary:
+            "Login handler concatenates request body into SQL, allowing arbitrary DB access.",
+          details:
+            "Line 12 builds the query via string concatenation:\n```\ndb.query('SELECT * FROM users WHERE id=' + req.params.id)\n```",
+          poc: "curl -X GET '/users/1%20OR%201%3D1'",
+          impact: "Any unauthenticated request can read or modify the users table.",
+          references: ["CWE-89"],
+          confidence: 0.9,
+          lineRange: [12, 12],
+          filePath: null,
+          agentSlug: null,
+        },
+      ],
+    });
+    const detector = new MultiProviderDetector("anthropic-api", model);
+    const findings = await detector.runAgent({
+      agent,
+      rootDir: "/tmp/whatever",
+      candidates: [{ filePath: "src/login.ts", content: "const x = 1;", hits: [] }],
+      excludePatterns: [],
+      maxFileSizeKb: 500,
+      maxTurns: 30,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].agentSlug).toBe("sql-injection");
+    // filePath falls back to the candidate path when the model returns null.
+    expect(findings[0].filePath).toBe("src/login.ts");
+    expect(findings[0].title).toBe("SQLi in login");
+    expect(findings[0].id).toHaveLength(12);
+    expect(findings[0].summary).toContain("Login handler");
+    expect(findings[0].poc).toContain("curl");
+  });
+
+  it("returns [] when the model reports no findings", async () => {
+    const detector = new MultiProviderDetector("openai", mockModelReturning({ findings: [] }));
+    const findings = await detector.runAgent({
+      agent,
+      rootDir: "/tmp/whatever",
+      candidates: [{ filePath: "src/safe.ts", content: "const x = 1;", hits: [] }],
+      excludePatterns: [],
+      maxFileSizeKb: 500,
+      maxTurns: 30,
+    });
+    expect(findings).toEqual([]);
+  });
+});
+
+describe("buildAgentPrompt anchor enrichment", () => {
+  const taintHit = {
+    line: 9,
+    label: "Request input reaches a shell or eval sink with no escaping.",
+    snippet: "const out = execSync(cmd);",
+    metadata: { cwe: "CWE-78", confidence: "MEDIUM" },
+    taint: [
+      { kind: "source" as const, line: 7, code: "req.query" },
+      { kind: "through" as const, line: 8, code: "cmd" },
+      { kind: "sink" as const, line: 9, code: "execSync(cmd)" },
+    ],
+  };
+  const withHits = (hits: unknown[]) => [{ filePath: "src/api.ts", content: "a", hits } as never];
+
+  it("renders the taint path as source, intermediates, then sink", () => {
+    const out = buildAgentPrompt({
+      excludePatterns: [],
+      agent: makeAgent(),
+      candidates: withHits([taintHit]),
+    });
+    expect(out).toContain("taint: L7 `req.query` → L8 `cmd` → L9 `execSync(cmd)`");
+  });
+
+  it("renders an elided marker with no line prefix and no backticks", () => {
+    // It is neither a location nor code. Printing `L99 ...` would name a
+    // real but unrelated line, which is worse than naming none.
+    const out = buildAgentPrompt({
+      excludePatterns: [],
+      agent: makeAgent(),
+      candidates: withHits([
+        {
+          ...taintHit,
+          taint: [
+            { kind: "source" as const, line: 7, code: "req.query" },
+            { kind: "elided" as const, line: 8, code: "4 steps omitted" },
+            { kind: "sink" as const, line: 9, code: "execSync(cmd)" },
+          ],
+        },
+      ]),
+    });
+    expect(out).toContain("taint: L7 `req.query` → (4 steps omitted) → L9 `execSync(cmd)`");
+    expect(out).not.toContain("L8 `4 steps omitted`");
+  });
+
+  it("renders allow-listed metadata beside the label", () => {
+    const out = buildAgentPrompt({
+      excludePatterns: [],
+      agent: makeAgent(),
+      candidates: withHits([taintHit]),
+    });
+    expect(out).toContain("(CWE-78, confidence MEDIUM):");
+  });
+
+  it("renders the rule message on its own line when it differs from the label", () => {
+    const out = buildAgentPrompt({
+      excludePatterns: [],
+      agent: makeAgent(),
+      candidates: withHits([{ ...taintHit, label: "Shell sink", message: "Input reaches exec." }]),
+    });
+    expect(out).toContain("[Shell sink]");
+    expect(out).toContain("why: Input reaches exec.");
+  });
+
+  it("explains the taint format once, in the prompt that carries a path", () => {
+    const out = buildAgentPrompt({
+      excludePatterns: [],
+      agent: makeAgent(),
+      candidates: withHits([taintHit]),
+    });
+    expect(out).toContain("shows the dataflow the scanner traced");
+  });
+
+  it("leaves a regex-only prompt byte-identical, legend included", () => {
+    // The other agents declare no semgrep rule. Their prompt must not move.
+    const plain = withHits([{ line: 4, label: "exec(", snippet: "exec(cmd)" }]);
+    const out = buildAgentPrompt({ excludePatterns: [], agent: makeAgent(), candidates: plain });
+    expect(out).toContain("  - L4 [exec(]: exec(cmd)");
+    expect(out).not.toContain("taint:");
+    expect(out).not.toContain("why:");
+    expect(out).not.toContain("shows the dataflow the scanner traced");
+  });
+});
+
+describe("buildAgentPrompt with no candidates", () => {
+  const agent = Agent.parse({
+    slug: "example-slug",
+    name: "Example",
+    description: "One line.",
+    prompt: "AGENT BODY MARKER",
+  });
+
+  it("emits the scope block instead of the candidate block", () => {
+    const prompt = buildAgentPrompt({ excludePatterns: [], agent, candidates: [] });
+    expect(prompt).toContain("## Your scope");
+    expect(prompt).not.toContain("## Candidate files");
+  });
+
+  it("keeps the agent body, the tools block, and the reporting block", () => {
+    const prompt = buildAgentPrompt({ excludePatterns: [], agent, candidates: [] });
+    expect(prompt).toContain("AGENT BODY MARKER");
+    expect(prompt).toContain("## Your tools");
+    expect(prompt).toContain("## Reporting");
+  });
+
+  it("tells the model to search on its own detection criteria", () => {
+    const prompt = buildAgentPrompt({ excludePatterns: [], agent, candidates: [] });
+    expect(prompt).toContain("Grep for the concrete syntax your detection criteria name");
+  });
+
+  it("still carries the recon brief and the diff patch", () => {
+    const prompt = buildAgentPrompt({
+      excludePatterns: [],
+      agent,
+      candidates: [],
+      recon: "RECON BRIEF MARKER",
+      diff: { commit: "abc123", patch: "PATCH MARKER" },
+    });
+    expect(prompt).toContain("RECON BRIEF MARKER");
+    expect(prompt).toContain("PATCH MARKER");
+    expect(prompt).toContain("abc123");
+  });
+
+  it("names the excluded paths in the scope block", () => {
+    // The only bound this agent's traversal gets on the Claude Agent SDK path,
+    // whose native tools take no exclude filter.
+    const prompt = buildAgentPrompt({
+      agent,
+      candidates: [],
+      excludePatterns: ["node_modules/**", ".git/**"],
+    });
+    expect(prompt).toContain("Skip anything matching these patterns");
+    expect(prompt).toContain("  - node_modules/**");
+    expect(prompt).toContain("  - .git/**");
+  });
+
+  it("omits the exclude guidance when there is nothing to exclude", () => {
+    const prompt = buildAgentPrompt({ agent, candidates: [], excludePatterns: [] });
+    expect(prompt).not.toContain("Skip anything matching these patterns");
+  });
+});
+
+describe("buildAgentPrompt with candidates is unchanged", () => {
+  // Regression guard for every shipped agent: a prompt built from candidate
+  // files must be byte-identical to what it was before an agent could declare
+  // no file scope.
+  it("emits the candidate block and no scope block", () => {
+    const agent = Agent.parse({
+      slug: "example-slug",
+      name: "Example",
+      description: "One line.",
+      prompt: "AGENT BODY MARKER",
+      where: { extensions: ["ts"] },
+    });
+    const prompt = buildAgentPrompt({
+      excludePatterns: [],
+      agent,
+      candidates: [
+        {
+          filePath: "src/a.ts",
+          content: "const a = 1;\n",
+          hits: [{ line: 1, label: "t", snippet: "const a = 1;" }],
+        },
+      ],
+    });
+    expect(prompt).toContain("## Candidate files");
+    expect(prompt).toContain("Do NOT re-discover the\ncandidate set");
+    expect(prompt).not.toContain("## Your scope");
+  });
+
+  it("is byte-identical whether or not excludePatterns are supplied", () => {
+    // Excludes render in the scope block only. A seeded agent is told not to
+    // re-discover its candidate set, so it has no traversal to bound and its
+    // prompt must not move by one byte.
+    const agent = Agent.parse({
+      slug: "example-slug",
+      name: "Example",
+      description: "One line.",
+      prompt: "AGENT BODY MARKER",
+      where: { extensions: ["ts"] },
+    });
+    const candidates = [
+      {
+        filePath: "src/a.ts",
+        content: "const a = 1;\n",
+        hits: [{ line: 1, label: "t", snippet: "const a = 1;" }],
+      },
+    ];
+    const withExcludes = buildAgentPrompt({
+      agent,
+      candidates,
+      excludePatterns: ["node_modules/**", ".git/**", "dist/**"],
+    });
+    const without = buildAgentPrompt({ agent, candidates, excludePatterns: [] });
+    expect(withExcludes).toBe(without);
+    expect(withExcludes).not.toContain("node_modules");
+  });
+});

@@ -1,0 +1,325 @@
+use super::{FsConfig, Mode, VPathBuf, Vnode};
+use crate::arnd;
+use crate::errno::Errno;
+use crate::ucred::{Gid, Ucred, Uid};
+use bitflags::bitflags;
+use macros::EnumConversions;
+use param::Param;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::fmt::Formatter;
+use std::fmt::{Debug, Display, Error};
+use std::hash::Hash;
+use std::hint::unreachable_unchecked;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
+use thiserror::Error;
+
+/// A collection of [`Mount`].
+#[derive(Debug)]
+pub(super) struct Mounts(Vec<Arc<Mount>>);
+
+impl Mounts {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn push(&mut self, mut m: Mount) -> Arc<Mount> {
+        self.set_id(&mut m);
+
+        let m = Arc::new(m);
+        self.0.push(m.clone());
+        m
+    }
+
+    pub fn remove(&mut self, m: &Arc<Mount>) {
+        let i = self.0.iter().position(|i| Arc::ptr_eq(i, m)).unwrap();
+        self.0.remove(i);
+    }
+
+    pub fn swap(&mut self, a: usize, b: usize) {
+        self.0.swap(a, b);
+    }
+
+    pub fn root(&self) -> &Arc<Mount> {
+        self.0.first().unwrap()
+    }
+
+    /// See `vfs_getnewfsid` on the PS4 for a reference.
+    fn set_id(&self, m: &mut Mount) {
+        let mut base = MOUNT_ID.lock().unwrap();
+        let v2 = m.config.ty;
+        let mut v1 = ((*base as u32) << 8) | (*base as u32) | ((v2 << 24) | 0xff00);
+
+        loop {
+            *base = base.wrapping_add(1);
+
+            if !self
+                .0
+                .iter()
+                .any(|m| m.stats.id[0] == v1 && m.stats.id[1] == v2)
+            {
+                m.stats.id[0] = v1;
+                m.stats.id[1] = v2;
+                return;
+            }
+
+            v1 = ((v2 << 24) | 0xff00) | (*base as u32) | ((*base as u32) << 8);
+        }
+    }
+}
+
+/// An implementation of `mount` structure on the PS4.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct Mount {
+    config: &'static FsConfig,          // mnt_vfc
+    gen: i32,                           // mnt_gen
+    fs: Arc<dyn Filesystem>,            // mnt_data
+    cred: Arc<Ucred>,                   // mnt_cred
+    parent: RwLock<Option<Arc<Vnode>>>, // mnt_vnodecovered
+    flags: MountFlags,                  // mnt_flag
+    hashseed: u32,                      // mnt_hashseed
+    stats: FsStats,                     // mnt_stat
+}
+
+impl Mount {
+    /// See `vfs_mount_alloc` on the PS4 for a reference.
+    pub(super) fn new(
+        config: &'static FsConfig,
+        cred: &Arc<Ucred>,
+        source: MountSource,
+        path: VPathBuf,
+        parent: Option<Arc<Vnode>>,
+        flags: MountFlags,
+        fs: impl Filesystem + 'static,
+    ) -> Self {
+        let owner = cred.effective_uid();
+
+        Self {
+            config,
+            gen: 1,
+            fs: Arc::new(fs),
+            cred: cred.clone(),
+            parent: RwLock::new(parent),
+            flags,
+            hashseed: {
+                let mut buf = [0u8; 4];
+                arnd::rand_bytes(&mut buf);
+
+                u32::from_ne_bytes(buf)
+            },
+            stats: FsStats {
+                ty: config.ty,
+                id: [0; 2],
+                owner,
+                source,
+                path,
+            },
+        }
+    }
+
+    pub fn config(&self) -> &'static FsConfig {
+        self.config
+    }
+
+    pub fn flags(&self) -> MountFlags {
+        self.flags
+    }
+
+    pub fn hashseed(&self) -> u32 {
+        self.hashseed
+    }
+
+    pub fn parent_mut(&self) -> RwLockWriteGuard<Option<Arc<Vnode>>> {
+        self.parent.write().unwrap()
+    }
+
+    pub fn root(self: &Arc<Self>) -> Result<Arc<Vnode>, Box<dyn Errno>> {
+        self.fs.clone().root(self)
+    }
+
+    pub fn stats(&self) -> &FsStats {
+        &self.stats
+    }
+}
+
+/// An implementation of `vfsops` structure.
+///
+/// Our version is a bit different from FreeBSD. We moved `vfs_mount` into `vfsconf` and we merge it
+/// with `mnt_data`.
+pub(super) trait Filesystem: Debug + Send + Sync {
+    fn root(self: Arc<Self>, mnt: &Arc<Mount>) -> Result<Arc<Vnode>, Box<dyn Errno>>; // vfs_root
+}
+
+bitflags! {
+    /// Flags for [`Mount`].
+    #[derive(Debug, Clone, Copy)]
+    pub struct MountFlags: u64 {
+        const MNT_RDONLY = 0x0000000000000001;
+        const MNT_NOSUID = 0x0000000000000008;
+
+        /// Mount is local (e.g. not a remote FS like NFS).
+        const MNT_LOCAL = 0x0000000000001000;
+
+        const MNT_ROOTFS = 0x0000000000004000;
+        const MNT_USER = 0x0000000000008000;
+        const MNT_UPDATE = 0x0000000000010000;
+    }
+}
+
+pub struct MountOpts(HashMap<&'static str, MountOpt>);
+
+impl MountOpts {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    pub fn insert(&mut self, k: &'static str, v: impl Into<MountOpt>) {
+        self.0.insert(k, v.into());
+    }
+
+    pub fn retain(&mut self, mut f: impl FnMut(&str, &mut MountOpt) -> bool) {
+        self.0.retain(|k, v| f(k, v));
+    }
+
+    /// Returns `None` if the mount option is not present, Some(Err) if it is present but of a
+    /// different type, and Some(Ok) if it is present and of the correct type.
+    pub fn try_remove<T, E>(&mut self, name: &'static str) -> Option<Result<T, MountOptError>>
+    where
+        T: TryFrom<MountOpt, Error = E>,
+        E: Into<MountOpt>,
+    {
+        let opt = self.0.remove(name)?;
+        let res =
+            TryInto::<T>::try_into(opt).map_err(|opt| MountOptError::new::<T>(name, opt.into()));
+
+        Some(res)
+    }
+
+    /// # Panics
+    /// Panics if the mount option is present, but of a different type.
+    pub fn remove<T, E>(&mut self, name: &'static str) -> Option<T>
+    where
+        T: TryFrom<MountOpt, Error = E>,
+        E: Into<MountOpt>,
+    {
+        self.try_remove(name).map(Result::unwrap)
+    }
+
+    /// # Panics
+    /// Panics if the mount option is present, but of a different type.
+    pub fn remove_or<T>(&mut self, name: &'static str, fallback: T) -> T
+    where
+        T: TryFrom<MountOpt, Error = MountOpt>,
+    {
+        self.remove(name).unwrap_or(fallback)
+    }
+
+    /// # Panics
+    /// Panics if the mount option is present, but of a different type.
+    pub fn remove_or_else<T>(&mut self, name: &'static str, fallback: impl FnOnce() -> T) -> T
+    where
+        T: TryFrom<MountOpt, Error = MountOpt>,
+    {
+        self.remove(name).unwrap_or_else(fallback)
+    }
+}
+
+#[derive(Debug, EnumConversions)]
+pub enum MountOpt {
+    Bool(bool),
+    I32(i32),
+    U64(u64),
+    Usize(usize),
+    Str(Box<str>),
+    VPath(VPathBuf),
+    Path(PathBuf),
+    Param(Arc<Param>),
+    Gid(Gid),
+    Uid(Uid),
+    Mode(Mode),
+}
+
+impl MountOpt {
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+impl From<&str> for MountOpt {
+    fn from(v: &str) -> Self {
+        Self::Str(v.into())
+    }
+}
+
+impl From<String> for MountOpt {
+    fn from(v: String) -> Self {
+        Self::Str(v.into_boxed_str())
+    }
+}
+
+impl From<Infallible> for MountOpt {
+    fn from(_: Infallible) -> Self {
+        // SAFETY: Infallible type guarantee it value will never be constructed, which imply this
+        // method cannot be called because it required the value of Infallible.
+        unsafe { unreachable_unchecked() }
+    }
+}
+
+#[derive(Debug, Error)]
+pub struct MountOptError {
+    optname: &'static str,
+    expected: &'static str,
+    got: MountOpt,
+}
+
+impl Display for MountOptError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(
+            f,
+            "mount opt \"{}\" is of wrong type: expected {}, got: {:?}",
+            self.optname, self.expected, self.got
+        )
+    }
+}
+
+impl MountOptError {
+    pub fn new<T>(optname: &'static str, got: MountOpt) -> Self {
+        Self {
+            optname,
+            expected: std::any::type_name::<T>(),
+            got,
+        }
+    }
+}
+
+/// An implementation of `statfs` structure.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct FsStats {
+    ty: u32,             // f_type
+    id: [u32; 2],        // f_fsid
+    owner: Uid,          // f_owner
+    source: MountSource, // f_mntfromname
+    path: VPathBuf,      // f_mntonname
+}
+
+impl FsStats {
+    pub fn id(&self) -> [u32; 2] {
+        self.id
+    }
+}
+
+/// Source of each mount.
+#[derive(Debug)]
+pub enum MountSource {
+    Driver(Cow<'static, str>),
+    Path(VPathBuf),
+}
+
+static MOUNT_ID: Mutex<u16> = Mutex::new(0); // mntid_base + mntid_mtx

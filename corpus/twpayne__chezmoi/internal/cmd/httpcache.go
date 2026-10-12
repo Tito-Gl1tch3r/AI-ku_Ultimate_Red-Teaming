@@ -1,0 +1,65 @@
+package cmd
+
+import (
+	"io/fs"
+	"net/url"
+	"runtime"
+	"sync"
+
+	"github.com/bartventer/httpcache/store"
+	"github.com/bartventer/httpcache/store/driver"
+	"github.com/bartventer/httpcache/store/fscache"
+)
+
+const httpCacheScheme = "httpcache"
+
+// httpCache implements [github.com/bartventer/httpcache/store/driver.Conn]. It
+// exists to give precise control over the cache directory location, which is
+// not available with fscache.
+type httpCache struct {
+	open func() (driver.Conn, error)
+}
+
+// Delete implements [github.com/bartventer/httpcache/store/driver.Conn.Delete].
+func (c *httpCache) Delete(key string) error {
+	conn, err := c.open()
+	if err != nil {
+		return err
+	}
+	return conn.Delete(key)
+}
+
+// Get implements [github.com/bartventer/httpcache/store/driver.Conn.Get].
+func (c *httpCache) Get(key string) ([]byte, error) {
+	conn, err := c.open()
+	if err != nil {
+		return nil, err
+	}
+	return conn.Get(key)
+}
+
+// Set implements [github.com/bartventer/httpcache/store/driver.Conn.Set].
+func (c *httpCache) Set(key string, entry []byte) error {
+	conn, err := c.open()
+	if err != nil {
+		return err
+	}
+	return conn.Set(key, entry)
+}
+
+func init() {
+	store.Register(httpCacheScheme, driver.DriverFunc(func(u *url.URL) (driver.Conn, error) {
+		umask := fs.FileMode(0o077)
+		if runtime.GOOS == "windows" {
+			umask = fs.FileMode(0)
+		}
+		open := sync.OnceValues(func() (driver.Conn, error) {
+			return fscache.Open(httpCacheScheme,
+				fscache.WithBaseDir(u.Path),
+				fscache.WithUpdateMTime(true),
+				fscache.WithUmask(umask),
+			)
+		})
+		return &httpCache{open: open}, nil
+	}))
+}

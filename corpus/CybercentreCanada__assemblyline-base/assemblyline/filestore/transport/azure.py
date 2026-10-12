@@ -1,0 +1,244 @@
+import logging
+import os
+import time
+from io import BytesIO
+from typing import Iterable, Optional
+
+from azure.core.exceptions import (
+    ClientAuthenticationError,
+    DecodeError,
+    ODataV4Error,
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+    ResourceNotModifiedError,
+    ServiceRequestError,
+    TooManyRedirectsError,
+)
+from azure.core.pipeline.transport import HttpResponse
+from azure.identity import (
+    ClientSecretCredential,
+    DefaultAzureCredential,
+    WorkloadIdentityCredential,
+)
+from azure.storage.blob import BlobServiceClient
+
+from assemblyline.common import chunk
+from assemblyline.common.exceptions import ChainAll
+from assemblyline.filestore.transport.base import Transport, TransportException
+
+"""
+This class assumes a flat file structure in the Azure storage blob.
+"""
+
+
+@ChainAll(TransportException)
+class TransportAzure(Transport):
+
+    def __init__(self, base=None, access_key=None, tenant_id=None, client_id=None, client_secret=None,
+                 host=None, connection_attempts=None, allow_directory_access=False, use_default_credentials=False,
+                 initalize_container=True, read_only=False, port=None):
+        self.log = logging.getLogger('assemblyline.transport.azure')
+        self.read_only = False
+        self.connection_attempts: Optional[int] = connection_attempts
+        self.allow_directory_access = allow_directory_access
+
+        # Get URL
+        self.host = host
+        self.endpoint_url = f"https://{self.host}"
+        if port:
+            self.endpoint_url += ":" + str(port)
+
+        # Get container and base_path
+        parts = base.strip("/").split("/", 1)
+        self.blob_container = parts[0]
+        if len(parts) > 1:
+            self.base_path = parts[1]
+        else:
+            self.base_path = None
+
+        # Get credentials
+        if use_default_credentials:
+            if (tenant_id and client_id) and (not client_secret):
+                self.credential = WorkloadIdentityCredential(tenant_id=tenant_id,
+                                                             client_id=client_id)
+            else:
+                # Service accounts will by default create the enviromental variables, and use them as params
+                self.credential = DefaultAzureCredential()
+        elif access_key:
+            self.credential = access_key
+        elif tenant_id and client_id and client_secret:
+            self.credential = ClientSecretCredential(tenant_id=tenant_id,
+                                                     client_id=client_id,
+                                                     client_secret=client_secret)
+        else:
+            self.credential = None
+
+        # Clients
+        self.service_client = BlobServiceClient(account_url=self.endpoint_url, credential=self.credential)
+        self.container_client = self.service_client.get_container_client(self.blob_container)
+
+        # Init
+        if initalize_container:
+            try:
+                self.with_retries(self.container_client.get_container_properties)
+            except TransportException as e:
+                if not isinstance(e.cause, ResourceNotFoundError):
+                    raise
+                if not read_only:
+                    # Attempt to initialize the container if it doesn't exist if the transport is writable
+                    try:
+                        self.with_retries(self.container_client.create_container)
+                    except TransportException as error:
+                        if not isinstance(error.cause, ResourceNotFoundError):
+                            raise
+                        self.log.info('Failed to create container, we\'re most likely in read only mode')
+                        read_only = True
+
+        def azure_normalize(path):
+            # flatten path to just the basename
+            if not allow_directory_access:
+                path = os.path.basename(path)
+
+            if self.base_path:
+                return os.path.join(self.base_path, path)
+            else:
+                return path
+
+        super(TransportAzure, self).__init__(normalize=azure_normalize, read_only=read_only)
+
+    def __str__(self):
+        return f"azure://{self.host}/{self.blob_container}/"
+
+    def with_retries(self, func, *args, **kwargs):
+        retries = 0
+        while self.connection_attempts is None or retries <= self.connection_attempts:
+            try:
+                ret_val = func(*args, **kwargs)
+
+                if retries:
+                    self.log.info('Reconnected to Azure transport!')
+
+                return ret_val
+
+            except (ServiceRequestError, DecodeError, ResourceExistsError, ResourceNotFoundError,
+                    ClientAuthenticationError, ResourceModifiedError, ResourceNotModifiedError,
+                    TooManyRedirectsError, ODataV4Error):
+                # These errors will be wrapped by TransportException
+                raise
+
+            except Exception as e:
+                self.log.warning(f"Could not run {func}, No connection to Azure transport "
+                                 f"{os.path.join(self.endpoint_url, self.blob_container)}, retrying... "
+                                 f"[{e.__class__.__name__}: {str(e)}]")
+                time.sleep(0.25)
+                retries += 1
+        raise ConnectionError(f"Couldn't reach the requested azure endpoint {self.endpoint_url} inside retry limit")
+
+    def delete(self, path):
+        if self.read_only:
+            raise TransportException("READ ONLY TRANSPORT: Method not allowed")
+
+        key = self.normalize(path)
+        blob_client = self.service_client.get_blob_client(self.blob_container, key)
+        try:
+            self.with_retries(blob_client.delete_blob)
+        except TransportException as error:
+            # If its already not found, then consider it deleted.
+            if not isinstance(error.cause, ResourceNotFoundError):
+                raise
+
+    def delete_batch_chunk_size(self) -> int:
+        return 256
+
+    def delete_batch(self, file_list: Iterable[str]):
+        """Deletes a batch of files."""
+        keys = [self.normalize(path) for path in file_list]
+        for key_chunk in chunk.chunk(keys, 256):
+            responses: Iterable[HttpResponse] = self.with_retries(
+                self.container_client.delete_blobs, *key_chunk, raise_on_any_failure=False
+            )
+            for response in responses:
+                if response.status_code == 404:
+                    continue
+                response.raise_for_status()
+
+    def exists(self, path):
+        key = self.normalize(path)
+        blob_client = self.service_client.get_blob_client(self.blob_container, key)
+        try:
+            blob_client.get_blob_properties()
+        except ResourceNotFoundError:
+            return False
+
+        return True
+
+    def makedirs(self, path):
+        # Does not need to do anything as azurestorage blob has a flat layout.
+        pass
+
+    # File based functions
+    def download(self, src_path, dst_path):
+        key = self.normalize(src_path)
+        dir_path = os.path.dirname(dst_path)
+
+        # create dst_path if it doesn't exist
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+
+        # download the key from azure
+        with open(dst_path, "wb") as my_blob:
+            blob_client = self.service_client.get_blob_client(self.blob_container, key)
+            blob_data = self.with_retries(blob_client.download_blob)
+            blob_data.readinto(my_blob)
+
+    def upload(self, src_path, dst_path):
+        if self.read_only:
+            raise TransportException("READ ONLY TRANSPORT: Method not allowed")
+
+        key = self.normalize(dst_path)
+
+        # if file exists already, it will be overwritten
+        with open(src_path, "rb") as data:
+            blob_client = self.service_client.get_blob_client(self.blob_container, key)
+            try:
+                self.with_retries(blob_client.upload_blob, data, overwrite=True)
+            except TransportException as error:
+                if not isinstance(error.cause, ResourceExistsError):
+                    raise
+
+    # Buffer based functions
+    def get(self, path: str) -> bytes:
+        key = self.normalize(path)
+        my_blob = BytesIO()
+
+        blob_client = self.service_client.get_blob_client(self.blob_container, key)
+        try:
+            blob_data = self.with_retries(blob_client.download_blob)
+        except TransportException as e:
+            if not isinstance(e.cause, ResourceNotFoundError):
+                raise
+            else:
+                raise FileNotFoundError(f"{path} does not exists.")
+        blob_data.readinto(my_blob)
+        return my_blob.getvalue()
+
+    def put(self, dst_path, content):
+        if self.read_only:
+            raise TransportException("READ ONLY TRANSPORT: Method not allowed")
+
+        key = self.normalize(dst_path)
+        if isinstance(content, str):
+            content = content.encode('utf-8')
+
+        with BytesIO(content) as file_io:
+            blob_client = self.service_client.get_blob_client(self.blob_container, key)
+            try:
+                self.with_retries(blob_client.upload_blob, file_io, overwrite=True)
+            except TransportException as error:
+                if not isinstance(error.cause, ResourceExistsError):
+                    raise
+
+    def list(self, prefix: Optional[str] = None) -> Iterable[str]:
+        for blob in self.container_client.list_blobs(name_starts_with=prefix):
+            yield blob['name']

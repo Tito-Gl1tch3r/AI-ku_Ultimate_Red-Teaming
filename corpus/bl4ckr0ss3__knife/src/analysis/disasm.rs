@@ -1,0 +1,134 @@
+//! Disassembly: iced-x86 for x86/x64, the bundled AArch64 decoder for
+//! ARM64. Other architectures are reported as unsupported rather than
+//! guessed at.
+
+use crate::analysis::aarch64;
+use crate::model::{Arch, Binary};
+use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
+
+pub struct Insn {
+    pub addr: u64,
+    pub bytes: Vec<u8>,
+    pub text: String,
+}
+
+/// A lossless rendering of the instruction, whatever the platform.
+fn fmt_x86(insn: &Instruction) -> String {
+    let mut fmt = IntelFormatter::new();
+    fmt.options_mut().set_uppercase_hex(false);
+    fmt.options_mut().set_hex_prefix("0x");
+    fmt.options_mut().set_hex_suffix("");
+    fmt.options_mut().set_space_after_operand_separator(true);
+    let mut s = String::new();
+    fmt.format(insn, &mut s);
+    s
+}
+
+/// Map a virtual address (PE RVA / ELF VA) to a file offset via the sections.
+pub fn vaddr_to_off(bin: &Binary, vaddr: u64) -> Option<u64> {
+    for s in &bin.sections {
+        let span = s.vsize.max(s.file_size);
+        if s.vaddr != 0 && vaddr >= s.vaddr && vaddr < s.vaddr + span {
+            let delta = vaddr - s.vaddr;
+            // Only the file-backed part of a section maps to bytes; sections are
+            // clamped to the file at parse time, so this offset is in bounds.
+            return (delta < s.file_size).then_some(s.file_off + delta);
+        }
+    }
+    None
+}
+
+/// Resolve where execution starts, as a (file_offset, virtual_address) pair.
+pub fn entry_location(bin: &Binary, bytes: &[u8]) -> Option<(u64, u64)> {
+    // PE: entry is an RVA, virtual address is image_base + entry.
+    // ELF: entry is already a VA.
+    let (off, va) = match bin.format {
+        crate::model::Format::Pe => (vaddr_to_off(bin, bin.entry)?, bin.image_base + bin.entry),
+        crate::model::Format::Elf => (vaddr_to_off(bin, bin.entry)?, bin.entry),
+        _ => {
+            // Mach-O and friends: try as a vaddr, then fall back to a raw offset.
+            if let Some(o) = vaddr_to_off(bin, bin.entry) {
+                (o, bin.entry)
+            } else if bin.entry < bytes.len() as u64 {
+                (bin.entry, bin.entry)
+            } else {
+                return None;
+            }
+        }
+    };
+    if off < bytes.len() as u64 {
+        Some((off, va))
+    } else {
+        None
+    }
+}
+
+pub fn supported(arch: Arch) -> bool {
+    arch.is_x86() || arch == Arch::Aarch64
+}
+
+/// Whether the passes that *lift* instructions can run on this architecture.
+///
+/// Deliberately narrower than `supported`. Disassembly covers AArch64, but the
+/// decompiler, the bug audit and the driver pass all decode with `iced_x86`
+/// regardless of the target — so on an AArch64 image they read four-byte ARM
+/// words as x86, and what they produce is not a poorer answer but a fictional
+/// one: statements about `rax` on a machine that has no `rax`. Anything that
+/// lifts asks this question, not the other one.
+pub fn lifting_supported(arch: Arch) -> bool {
+    arch.is_x86()
+}
+
+/// Disassemble up to `count` instructions from `file_off`, presenting addresses
+/// as if the code were loaded at `va`.
+pub fn disassemble(
+    bytes: &[u8],
+    file_off: u64,
+    va: u64,
+    bits: u32,
+    arch: Arch,
+    count: usize,
+) -> Vec<Insn> {
+    let start = file_off as usize;
+    if start >= bytes.len() {
+        return Vec::new();
+    }
+    let code = &bytes[start..];
+
+    if arch == Arch::Aarch64 {
+        let mut out = Vec::with_capacity(count);
+        let mut ip = va;
+        let mut pos = 0usize;
+        while out.len() < count && pos + 4 <= code.len() {
+            let Some(w) = aarch64::decode(&code[pos..], ip) else {
+                break;
+            };
+            out.push(Insn {
+                addr: w.addr,
+                bytes: code[pos..pos + w.len].to_vec(),
+                text: w.text,
+            });
+            pos += w.len;
+            ip += w.len as u64;
+        }
+        return out;
+    }
+
+    let mut decoder = Decoder::with_ip(bits, code, va, DecoderOptions::NONE);
+    let mut out = Vec::with_capacity(count);
+    let mut insn = Instruction::default();
+    while out.len() < count && decoder.can_decode() {
+        decoder.decode_out(&mut insn);
+
+        let lo = (insn.ip() - va) as usize;
+        let hi = lo + insn.len();
+        let raw = code.get(lo..hi).unwrap_or(&[]).to_vec();
+
+        out.push(Insn {
+            addr: insn.ip(),
+            bytes: raw,
+            text: fmt_x86(&insn),
+        });
+    }
+    out
+}

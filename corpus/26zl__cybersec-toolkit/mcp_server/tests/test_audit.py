@@ -1,0 +1,811 @@
+"""Tests for mcp_server.audit — JSON audit logging with rotation."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import logging.handlers
+import os
+import stat
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from mcp_server.audit import (
+    _redact_script_code,
+    get_audit_logger,
+    log_blocked,
+    log_execution,
+    log_pipeline_start,
+    log_script_execution,
+    log_server_start,
+    log_tool_call,
+    log_tool_result,
+    log_validation,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_logger(tmp_path: Path):
+    """Reset the module-level logger so each test gets a fresh one writing to tmp."""
+    import mcp_server.audit as mod
+
+    # Reset cached logger. getLogger() hands back the same object, so drop handlers
+    # left by an earlier import or the new logger keeps writing to their files too.
+    stale = logging.getLogger("cybersec_mcp.audit")
+    for h in list(stale.handlers):
+        h.close()
+        stale.removeHandler(h)
+    mod._logger = None
+    log_file = tmp_path / "audit.log"
+    mod._AUDIT_LOG_PATH = log_file
+    # The hash chain is process-global; reset it so each test starts at genesis.
+    mod._chain_prev = mod.CHAIN_GENESIS
+    mod._chain_seq = 0
+    yield
+    # Clean up handlers to avoid ResourceWarning
+    if mod._logger is not None:
+        for h in list(mod._logger.handlers):
+            h.close()
+            mod._logger.removeHandler(h)
+    mod._logger = None
+
+
+class TestHashChain:
+    """Records are chained so an edited or dropped record is detectable."""
+
+    def test_records_carry_chain_fields(self, tmp_path: Path) -> None:
+        import mcp_server.audit as mod
+
+        log_tool_call("guided_assessment", {"target": "10.0.0.1"})
+        record = json.loads(mod._AUDIT_LOG_PATH.read_text().strip())
+        assert isinstance(record["chain"], str) and len(record["chain"]) == 32
+        assert isinstance(record["seq"], int)
+        assert isinstance(record["prev"], str) and len(record["prev"]) == 64
+
+    def test_each_record_links_to_the_previous_one(self, tmp_path: Path) -> None:
+        import mcp_server.audit as mod
+
+        for tool in ("guided_assessment", "run_tool", "run_pipeline"):
+            log_tool_call(tool, {"tool": tool})
+
+        lines = mod._AUDIT_LOG_PATH.read_text().splitlines()
+        assert len(lines) == 3
+        expected_prev = mod.CHAIN_GENESIS
+        for index, line in enumerate(lines):
+            record = json.loads(line)
+            assert record["seq"] == index + 1
+            assert record["prev"] == expected_prev
+            # Each link folds the record's own prev into its serialized line.
+            expected_prev = mod.chain_link(record["prev"], line)
+
+    def test_one_chain_id_per_process(self, tmp_path: Path) -> None:
+        import mcp_server.audit as mod
+
+        log_tool_call("run_tool", {})
+        log_tool_call("run_tool", {})
+        chains = {json.loads(line)["chain"] for line in mod._AUDIT_LOG_PATH.read_text().splitlines()}
+        assert len(chains) == 1
+
+    def test_verifier_script_shares_the_chain_computation(self) -> None:
+        """scripts/verify_audit_chain.py keeps a stdlib-only copy; drift breaks verification."""
+        import importlib.util
+
+        import mcp_server.audit as mod
+
+        script = Path(__file__).resolve().parents[2] / "scripts" / "verify_audit_chain.py"
+        spec = importlib.util.spec_from_file_location("verify_audit_chain", script)
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+
+        assert verifier.CHAIN_GENESIS == mod.CHAIN_GENESIS
+        for previous, line in ((mod.CHAIN_GENESIS, '{"a": 1}'), ("ab" * 32, '{"b": "æ"}')):
+            assert verifier.chain_link(previous, line) == mod.chain_link(previous, line)
+
+    def test_unencodable_client_input_keeps_the_chain_intact(self, tmp_path: Path) -> None:
+        """A lone surrogate is valid JSON from a client but cannot be UTF-8 encoded."""
+        import importlib.util
+
+        import mcp_server.audit as mod
+
+        log_tool_call("run_tool", {"args": "\ud800"})
+        log_tool_call("run_tool", {"args": "ok"})
+
+        script = Path(__file__).resolve().parents[2] / "scripts" / "verify_audit_chain.py"
+        spec = importlib.util.spec_from_file_location("verify_audit_chain", script)
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        problems, stats = verifier.verify(mod._AUDIT_LOG_PATH.read_text().splitlines())
+        assert problems == [] and stats["records"] == 2
+
+
+class TestGetAuditLogger:
+    def test_default_path_uses_xdg_state_home(self, tmp_path: Path, monkeypatch) -> None:
+        import mcp_server.audit as mod
+
+        monkeypatch.delenv("CYBERSEC_MCP_AUDIT_LOG", raising=False)
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        assert mod._default_audit_log_path() == tmp_path / "cybersec-tools-mcp" / "audit.log"
+
+    def test_explicit_audit_path_wins(self, tmp_path: Path, monkeypatch) -> None:
+        import mcp_server.audit as mod
+
+        configured = tmp_path / "custom.jsonl"
+        monkeypatch.setenv("CYBERSEC_MCP_AUDIT_LOG", str(configured))
+        assert mod._default_audit_log_path() == configured
+
+    def test_returns_logger(self, tmp_path: Path) -> None:
+        logger = get_audit_logger()
+        assert isinstance(logger, logging.Logger)
+        assert logger.name == "cybersec_mcp.audit"
+
+    def test_has_rotating_handler(self, tmp_path: Path) -> None:
+        logger = get_audit_logger()
+        handlers = [h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)]
+        assert len(handlers) == 1
+        assert handlers[0].maxBytes == 5 * 1024 * 1024
+        assert handlers[0].backupCount == 3
+
+    @staticmethod
+    def _mirror_handlers(logger: logging.Logger) -> list[logging.Handler]:
+        import mcp_server.audit as mod
+
+        return [h for h in logger.handlers if isinstance(h.formatter, mod._TaggedMirrorFormatter)]
+
+    def test_no_stderr_mirror_by_default(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("CYBERSEC_MCP_AUDIT_STREAM", raising=False)
+        assert self._mirror_handlers(get_audit_logger()) == []
+
+    def test_audit_stream_mirrors_tagged_records_to_stderr(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        """A sandboxed server's file sink dies with the VM; the host reads this mirror."""
+        import mcp_server.audit as mod
+
+        key = bytes(range(32))
+        monkeypatch.setattr(mod, "_STREAM_KEY", key)
+        monkeypatch.setenv("CYBERSEC_MCP_AUDIT_STREAM", "1")
+        log_tool_call("guided_assessment", {"target": "10.0.0.1"})
+
+        mirrored = [line for line in capsys.readouterr().err.splitlines() if line.startswith(mod.AUDIT_STREAM_PREFIX)]
+        assert len(mirrored) == 1
+        tag, _, line = mirrored[0][len(mod.AUDIT_STREAM_PREFIX) :].partition(" ")
+        # The host launcher persists the record only when this tag verifies under its session key.
+        assert tag == hmac.new(key, line.encode(), hashlib.sha256).hexdigest()
+        record = json.loads(line)
+        assert record["event"] == "tool_call"
+        assert record["tool"] == "guided_assessment"
+        # The mirrored record is the in-sandbox file line verbatim, so the hash chain survives the trip.
+        assert line == mod._AUDIT_LOG_PATH.read_text().strip()
+
+    def test_audit_stream_needs_the_session_key(self, tmp_path: Path, monkeypatch) -> None:
+        """The host refuses untagged records, so without a key nothing is mirrored."""
+        import mcp_server.audit as mod
+
+        monkeypatch.setattr(mod, "_STREAM_KEY", None)
+        monkeypatch.setenv("CYBERSEC_MCP_AUDIT_STREAM", "1")
+        with pytest.warns(RuntimeWarning, match=mod.AUDIT_KEY_ENV):
+            logger = get_audit_logger()
+        assert self._mirror_handlers(logger) == []
+
+    def test_audit_stream_does_not_double_write_on_stderr_fallback(self, tmp_path: Path, monkeypatch) -> None:
+        import mcp_server.audit as mod
+
+        monkeypatch.setattr(mod, "_STREAM_KEY", bytes(32))
+        monkeypatch.setenv("CYBERSEC_MCP_AUDIT_STREAM", "1")
+        mod._AUDIT_LOG_PATH = tmp_path / "unwritable" / "audit.log"
+        (tmp_path / "unwritable").write_text("not a directory")
+
+        with pytest.warns(RuntimeWarning):
+            logger = get_audit_logger()
+        assert self._mirror_handlers(logger) == []
+
+    def test_singleton(self, tmp_path: Path) -> None:
+        a = get_audit_logger()
+        b = get_audit_logger()
+        assert a is b
+
+
+class TestStreamKey:
+    """The mirror key reaches the server process alone: not its children, not /proc."""
+
+    def test_key_is_consumed_from_the_environment(self, monkeypatch) -> None:
+        import mcp_server.audit as mod
+
+        monkeypatch.setattr(mod, "_make_undumpable", lambda: None)
+        monkeypatch.setenv(mod.AUDIT_KEY_ENV, "ab" * 32)
+        assert mod._take_stream_key() == bytes.fromhex("ab" * 32)
+        assert mod.AUDIT_KEY_ENV not in os.environ
+
+    @pytest.mark.parametrize("raw", ["", "not-hex", "ab" * 16])
+    def test_unusable_key_is_refused_and_still_consumed(self, monkeypatch, raw: str) -> None:
+        import mcp_server.audit as mod
+
+        monkeypatch.setattr(mod, "_make_undumpable", lambda: None)
+        monkeypatch.setenv(mod.AUDIT_KEY_ENV, raw)
+        assert mod._take_stream_key() is None
+        assert mod.AUDIT_KEY_ENV not in os.environ
+
+    def test_children_of_the_server_cannot_recover_the_key(self, tmp_path: Path) -> None:
+        """A fresh interpreter, because the key is taken at import and prctl is process-wide."""
+        probe = textwrap.dedent(
+            """
+            import ctypes, os, subprocess, sys
+            from mcp_server import audit
+            from mcp_server.security import _child_env
+
+            assert audit._STREAM_KEY == bytes.fromhex("ab" * 32)
+            assert audit.AUDIT_KEY_ENV not in os.environ
+            assert audit.AUDIT_KEY_ENV not in _child_env()
+            inherited = subprocess.run(["env"], capture_output=True, text=True, check=True).stdout
+            assert audit.AUDIT_KEY_ENV not in inherited
+            if sys.platform.startswith("linux"):
+                assert ctypes.CDLL(None).prctl(3, 0, 0, 0, 0) == 0  # PR_GET_DUMPABLE
+                if os.geteuid() != 0:
+                    leaked = subprocess.run(["cat", f"/proc/{os.getpid()}/environ"], capture_output=True)
+                    assert leaked.returncode != 0 and b"ab" * 32 not in leaked.stdout
+            """
+        )
+        env = {
+            **os.environ,
+            "CYBERSEC_MCP_AUDIT_KEY": "ab" * 32,
+            "CYBERSEC_MCP_AUDIT_LOG": str(tmp_path / "audit.log"),
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=Path(__file__).resolve().parents[2],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+
+
+class TestLogExecution:
+    def test_writes_json_line(self, tmp_path: Path) -> None:
+        log_execution(
+            tool_name="nmap",
+            args="-sV 10.0.0.1",
+            host="localhost",
+            exit_code=0,
+            command="nmap -sV 10.0.0.1",
+        )
+        log_file = tmp_path / "audit.log"
+        lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["tool"] == "nmap"
+        assert entry["args"] == "-sV 10.0.0.1"
+        assert entry["host"] == "localhost"
+        assert entry["exit_code"] == 0
+        assert entry["remote"] is False
+        assert entry["command"] == "nmap -sV 10.0.0.1"
+        assert "ts" in entry
+
+    def test_remote_flag(self, tmp_path: Path) -> None:
+        log_execution(
+            tool_name="gobuster",
+            args="dir -u http://10.0.0.1",
+            host="kali-vm",
+            exit_code=0,
+            command="gobuster dir -u http://10.0.0.1",
+            remote=True,
+        )
+        log_file = tmp_path / "audit.log"
+        entry = json.loads(log_file.read_text(encoding="utf-8").strip())
+        assert entry["remote"] is True
+        assert entry["host"] == "kali-vm"
+
+    def test_multiple_entries(self, tmp_path: Path) -> None:
+        for i in range(3):
+            log_execution(tool_name=f"tool{i}", args="", exit_code=i, command=f"tool{i}")
+        log_file = tmp_path / "audit.log"
+        lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 3
+
+
+class TestLogServerStart:
+    def test_records_sandbox_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CYBERSEC_SANDBOX_MODE", "kata")
+        log_server_start()
+        entry = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").strip())
+        assert entry["event"] == "server_start"
+        assert entry["sandbox"] == "kata"
+
+    def test_sandbox_mode_defaults_to_unknown(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CYBERSEC_SANDBOX_MODE", raising=False)
+        log_server_start()
+        entry = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").strip())
+        assert entry["sandbox"] == "unknown"
+
+
+class TestLogToolResult:
+    def test_error_free_text_is_redacted(self, tmp_path: Path) -> None:
+        # An exception string surfaced by a tool can carry a credential; the
+        # free-text error field must be redacted before it hits the audit log.
+        log_tool_result(
+            tool_name="manage_remote_hosts",
+            call_id="1",
+            success=False,
+            duration_ms=1.0,
+            error="connection failed: PGPASSWORD=hunter2 rejected",
+        )
+        entry = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").strip())
+        assert "hunter2" not in entry["error"]
+        assert "[REDACTED]" in entry["error"]
+
+    def test_summary_free_text_is_redacted(self, tmp_path: Path) -> None:
+        log_tool_result(
+            tool_name="run_tool",
+            call_id="2",
+            success=True,
+            duration_ms=1.0,
+            summary="ok --password s3cr3tvalue",
+        )
+        entry = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").strip())
+        assert "s3cr3tvalue" not in entry["summary"]
+
+    def test_benign_summary_unchanged(self, tmp_path: Path) -> None:
+        log_tool_result("manage_remote_hosts", "3", True, 1.0, summary="list: 5 hosts")
+        entry = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").strip())
+        assert entry["summary"] == "list: 5 hosts"
+
+
+class TestLogBlocked:
+    def test_log_blocked_writes_json(self, tmp_path: Path) -> None:
+        log_blocked(
+            tool_name="nmap",
+            args="-sV 8.8.8.8",
+            reason="Blocked by policy: target not in private range",
+        )
+        log_file = tmp_path / "audit.log"
+        lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["event"] == "blocked"
+        assert entry["tool"] == "nmap"
+        assert entry["args"] == "-sV 8.8.8.8"
+        assert entry["remote"] is False
+        assert "ts" in entry
+
+    def test_log_blocked_contains_reason(self, tmp_path: Path) -> None:
+        log_blocked(
+            tool_name="sqlmap",
+            args="--os-shell",
+            reason="sqlmap: OS shell access",
+            host="kali-vm",
+            remote=True,
+        )
+        log_file = tmp_path / "audit.log"
+        entry = json.loads(log_file.read_text(encoding="utf-8").strip())
+        assert entry["reason"] == "sqlmap: OS shell access"
+        assert entry["host"] == "kali-vm"
+        assert entry["remote"] is True
+
+    def test_log_blocked_redacts_reason(self, tmp_path: Path) -> None:
+        log_blocked(
+            tool_name="curl",
+            args="blocked input",
+            reason="parse failed for token=synthetic-credential-123",
+        )
+        entry = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").strip())
+        assert "synthetic-credential-123" not in entry["reason"]
+        assert "[REDACTED]" in entry["reason"]
+
+
+class TestLogValidation:
+    def test_validation_detail_is_redacted(self, tmp_path: Path) -> None:
+        log_validation(
+            tool_name="curl",
+            step="failed",
+            passed=False,
+            detail="invalid input with password=synthetic-credential-456",
+        )
+        entry = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").strip())
+        assert "synthetic-credential-456" not in entry["detail"]
+        assert "[REDACTED]" in entry["detail"]
+
+
+class TestGenericCredentialFlagRedaction:
+    """Credential-bearing long flags the specific rules miss (--api-token,
+    --client-secret) must still be redacted; --author must not be."""
+
+    def test_uncommon_credential_flags_redacted(self) -> None:
+        from mcp_server.audit import _redact_sensitive
+
+        for flag in (
+            "--api-token=synthetic-777",
+            "--client-secret synthetic-777",
+            "--access-token=synthetic-777",
+            "--auth-token synthetic-777",
+        ):
+            out = _redact_sensitive(flag)
+            assert "synthetic-777" not in out
+            assert "[REDACTED]" in out
+
+    def test_author_flag_not_redacted(self) -> None:
+        from mcp_server.audit import _redact_sensitive
+
+        assert _redact_sensitive("--author Jane") == "--author Jane"
+
+
+class TestAuditCrashSafety:
+    def test_missing_parent_is_created_securely(self, tmp_path: Path) -> None:
+        """A normal user-state path is created instead of disabling audit."""
+        import mcp_server.audit as mod
+
+        mod._logger = None
+        mod._AUDIT_LOG_PATH = tmp_path / "no_such_dir" / "sub" / "audit.log"
+        logger = get_audit_logger()
+        handlers = [h for h in logger.handlers if isinstance(h, logging.handlers.RotatingFileHandler)]
+        assert len(handlers) == 1
+        assert mod._AUDIT_LOG_PATH.parent.is_dir()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes not applicable on Windows")
+    def test_configured_log_leaves_an_existing_directory_alone(self, tmp_path: Path, monkeypatch) -> None:
+        import mcp_server.audit as mod
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        os.chmod(shared, 0o755)
+        monkeypatch.setenv("CYBERSEC_MCP_AUDIT_LOG", str(shared / "audit.log"))
+        mod._logger = None
+        mod._AUDIT_LOG_PATH = shared / "audit.log"
+        get_audit_logger()
+        assert stat.S_IMODE(os.stat(shared).st_mode) == 0o755
+
+    def test_unwritable_log_warns_and_uses_stderr(self, tmp_path: Path, monkeypatch) -> None:
+        import mcp_server.audit as mod
+
+        def fail_handler(*args, **kwargs):
+            raise OSError("unwritable")
+
+        mod._logger = None
+        mod._AUDIT_LOG_PATH = tmp_path / "audit.log"
+        monkeypatch.setattr(mod, "_SecureRotatingFileHandler", fail_handler)
+        with pytest.warns(RuntimeWarning, match="Audit file logging unavailable"):
+            logger = get_audit_logger()
+        stream_handlers = [
+            h
+            for h in logger.handlers
+            if isinstance(h, logging.StreamHandler)
+            and not isinstance(h, logging.handlers.RotatingFileHandler)
+            and getattr(h, "stream", None) is sys.stderr
+        ]
+        assert len(stream_handlers) == 1
+
+    def test_required_audit_fails_closed(self, tmp_path: Path, monkeypatch) -> None:
+        import mcp_server.audit as mod
+
+        def fail_handler(*args, **kwargs):
+            raise OSError("unwritable")
+
+        mod._logger = None
+        mod._AUDIT_LOG_PATH = tmp_path / "audit.log"
+        monkeypatch.setenv("CYBERSEC_MCP_AUDIT_REQUIRED", "1")
+        monkeypatch.setattr(mod, "_SecureRotatingFileHandler", fail_handler)
+        with pytest.raises(RuntimeError, match="Audit file logging unavailable"):
+            get_audit_logger()
+
+    def test_log_execution_never_raises_on_write_error(self, tmp_path: Path) -> None:
+        """log_execution must not crash even if the handler raises."""
+        # Normal logger first, then make the file unwritable
+        log_execution(tool_name="test", args="", exit_code=0, command="test")
+        log_file = tmp_path / "audit.log"
+        assert log_file.exists()
+        # Should not raise
+        log_execution(tool_name="test2", args="", exit_code=0, command="test2")
+
+
+class TestRedactScriptCode:
+    """Script content is redacted before being written to the audit log."""
+
+    @staticmethod
+    def _openai_key(suffix: str = "abc123def456ghi789jklmno") -> str:
+        # Build shaped-like-real fake tokens at runtime so Gitleaks does not flag
+        # the test source while the audit redactor still sees realistic input.
+        return "sk" + "-" + suffix
+
+    @staticmethod
+    def _github_pat(suffix: str = "1234567890abcdefghij") -> str:
+        return "gh" + "p_" + suffix
+
+    @staticmethod
+    def _bearer(value: str = "xyz123abc") -> str:
+        return "Authorization" + ": " + "Bearer" + " " + value
+
+    def test_python_api_key_assignment_redacted(self) -> None:
+        secret = self._openai_key()
+        code = f'API_KEY = "{secret}"\nprint(API_KEY)'
+        redacted = _redact_script_code(code)
+        assert secret not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_bash_password_export_redacted(self) -> None:
+        code = 'export PASSWORD="hunter2"\ncurl -u admin:$PASSWORD http://10.0.0.1/'
+        redacted = _redact_script_code(code)
+        assert "hunter2" not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_json_token_field_redacted(self) -> None:
+        secret = self._github_pat()
+        code = '{"token": "' + secret + '"}'
+        redacted = _redact_script_code(code)
+        assert secret not in redacted
+
+    def test_github_pat_outside_assignment_redacted(self) -> None:
+        """Known high-entropy token formats caught even without credential-named var."""
+        secret = self._github_pat("abcdefghij1234567890abcdefg")
+        code = f'headers["X-Auth"] = "{secret}"'
+        redacted = _redact_script_code(code)
+        assert secret not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_openai_key_redacted(self) -> None:
+        secret = "sk" + "-proj-" + "abcdefghijklmnopqrstuvwxyz"
+        code = f"client.api_key = '{secret}'"
+        redacted = _redact_script_code(code)
+        assert secret not in redacted
+
+    def test_jwt_redacted(self) -> None:
+        header = "eyJ" + "hbGciOiJIUzI1NiJ9"
+        payload = "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0"
+        signature = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        jwt = ".".join((header, payload, signature))
+        code = f'auth = "{jwt}"'
+        redacted = _redact_script_code(code)
+        assert header not in redacted
+
+    def test_http_authorization_header_redacted(self) -> None:
+        secret = "xyz123abc"
+        code = 'req = requests.get(url, headers={"' + self._bearer(secret).replace(": ", '": "') + '"})'
+        redacted = _redact_script_code(code)
+        assert secret not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_benign_code_preserved(self) -> None:
+        """Code without secrets should pass through untouched (aside from whitespace)."""
+        code = "for i in range(10):\n    print(i * 2)\n"
+        redacted = _redact_script_code(code)
+        assert redacted == code
+
+    def test_basic_auth_flag_redacted(self) -> None:
+        """curl/wget -u user:pass must not leak to the audit log."""
+        redacted = _redact_script_code("-u admin:s3cret http://10.0.0.1")
+        assert "s3cret" not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_inline_password_flag_redacted(self) -> None:
+        """mysql -pSECRET (no space) must be redacted."""
+        redacted = _redact_script_code("mysql -h 10.0.0.1 -pMyP4ss -u root")
+        assert "MyP4ss" not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_numeric_port_flag_preserved(self) -> None:
+        """Pure-numeric -p ports must stay readable (not a credential)."""
+        redacted = _redact_script_code("nmap -p80 -p3306 10.0.0.1")
+        assert "-p80" in redacted
+        assert "-p3306" in redacted
+
+    def test_nmap_port_range_preserved(self) -> None:
+        """nmap port specs ('-p80,443', '-p-', '-pU:53,T:80') must NOT be mangled."""
+        redacted = _redact_script_code("nmap -p80,443 -p- -pU:53,T:80 10.0.0.1")
+        assert "-p80,443" in redacted
+        assert "-p-" in redacted
+        assert "-pU:53,T:80" in redacted
+        assert "[REDACTED]" not in redacted
+
+    def test_nmap_separated_port_preserved(self) -> None:
+        """nmap '-p 80' (separated, no credential tool) must stay readable."""
+        redacted = _redact_script_code("nmap -p 80 10.0.0.1")
+        assert "-p 80" in redacted
+        assert "[REDACTED]" not in redacted
+
+    def test_sshpass_separated_password_redacted(self) -> None:
+        """sshpass -p <pw> uses the separated form and must be redacted."""
+        redacted = _redact_script_code("sshpass -p mypassword ssh user@10.0.0.1")
+        assert "mypassword" not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_hydra_separated_password_redacted(self) -> None:
+        """hydra -l u -p secretpass host must not leak the password."""
+        redacted = _redact_script_code("hydra -l u -p secretpass 10.0.0.1")
+        assert "secretpass" not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_medusa_separated_password_redacted(self) -> None:
+        redacted = _redact_script_code("medusa -h 10.0.0.1 -u admin -p Sup3rSecret -M ssh")
+        assert "Sup3rSecret" not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_ncrack_separated_password_redacted(self) -> None:
+        redacted = _redact_script_code("ncrack --user root -p hunter22 10.0.0.1:22")
+        assert "hunter22" not in redacted
+        assert "[REDACTED]" in redacted
+
+    @pytest.mark.parametrize(
+        "var,secret",
+        [
+            ("PGPASSWORD", "pgsecret123"),
+            ("MYSQL_PWD", "hunter2"),
+            ("MARIADB_PASSWORD", "mariasecret"),
+            ("REDISCLI_AUTH", "redistoken"),
+            ("MONGODB_PASSWORD", "mongopw"),
+        ],
+    )
+    def test_db_password_env_var_redacted(self, var: str, secret: str) -> None:
+        """DB/cache password env-vars carry the secret directly in the value."""
+        redacted = _redact_script_code(f"{var}={secret} client --connect 10.0.0.1")
+        assert secret not in redacted
+        assert "[REDACTED]" in redacted
+        assert var in redacted  # var name preserved for context
+
+    def test_db_password_env_var_redacted_in_sensitive_path(self) -> None:
+        """The CLI-only _redact_sensitive path covers the env-vars too."""
+        from mcp_server.audit import _redact_sensitive
+
+        redacted = _redact_sensitive("MYSQL_PWD=hunter2 mysql -u root")
+        assert "hunter2" not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_double_dash_password_flag_not_mangled_by_short_p_rule(self) -> None:
+        """The short '-p' DB rule must not fire inside '--password'."""
+        redacted = _redact_script_code("--password hunter2")
+        # The flag name stays intact; only the value is redacted.
+        assert "--password" in redacted
+        assert "hunter2" not in redacted
+
+    def test_prose_token_word_not_eaten(self) -> None:
+        """A bare 'token'/'password' word in prose (no separator) must survive."""
+        assert _redact_script_code("the token is rotated") == "the token is rotated"
+        assert _redact_script_code("the password was changed") == "the password was changed"
+
+    def test_no_stray_bracket_and_idempotent(self) -> None:
+        """Re-running the redactor must not leave a stray ']' or double-redact."""
+        for code in (
+            f'API_KEY = "{self._openai_key("abc123def456ghi789jkl")}"',
+            '{"token": "' + self._github_pat() + '"}',
+            'curl -H "' + self._bearer("xyz123abcdef") + '"',
+            "mysql -pS3cr3tPass",
+        ):
+            once = _redact_script_code(code)
+            twice = _redact_script_code(once)
+            assert once == twice, f"not idempotent: {code!r} -> {once!r} -> {twice!r}"
+            assert "[REDACTED]]" not in once
+
+    def test_aws_access_key_id_redacted(self) -> None:
+        """Standalone AWS access key IDs (AKIA.../ASIA...) must be redacted."""
+        for code in (
+            "aws_key = AKIAIOSFODNN7EXAMPLE",
+            "export AWS_ID=ASIAYYYYYYYYYYYYYYYY",
+            "role AROAEXAMPLE123456EXX printed",  # AROA + 16 chars = valid ID shape
+        ):
+            redacted = _redact_script_code(code)
+            assert "[REDACTED]" in redacted, code
+        # The 20-char IDs must not survive verbatim.
+        assert "AKIAIOSFODNN7EXAMPLE" not in _redact_script_code("AKIAIOSFODNN7EXAMPLE")
+
+    def test_url_query_apikey_redacted(self) -> None:
+        secret = self._openai_key("abc123def4567890")
+        redacted = _redact_script_code(f"http://t/?api_key={secret}")
+        assert secret not in redacted
+        assert "[REDACTED]" in redacted
+
+    def test_url_userinfo_redacted(self) -> None:
+        value = "https://synthetic-user:synthetic-password@internal.example/path"
+        redacted = _redact_script_code(value)
+        assert "synthetic-user" not in redacted
+        assert "synthetic-password" not in redacted
+        assert redacted == "https://[REDACTED]@internal.example/path"
+
+    def test_log_script_execution_omits_body_and_hashes(self, tmp_path: Path) -> None:
+        """log_script_execution must NOT persist the script body — only an
+        irreversible SHA256 + length of the original. A secret in the code can
+        then never reach the log even if best-effort redaction would miss it."""
+        import hashlib
+
+        secret = self._openai_key("verysecret123456789")
+        original = f'API_KEY = "{secret}"\nprint("hello")'
+        log_script_execution(language="python", code=original, script_file="/tmp/x.py")
+        log_file = tmp_path / "audit.log"
+        line = log_file.read_text().strip().splitlines()[-1]
+        entry = json.loads(line)
+
+        assert entry["event"] == "script"
+        # Body omitted; the secret never appears anywhere in the log line.
+        assert entry["code"] == "[OMITTED]"
+        assert secret not in line
+        # Integrity: SHA256 matches the original so operators can match a
+        # suspected script against an exact incident body.
+        assert entry["code_sha256"] == hashlib.sha256(original.encode("utf-8")).hexdigest()
+        assert entry["code_len"] == len(original)
+
+
+class TestLogToolCallRedaction:
+    """The tool_call audit event must not persist the script body either."""
+
+    def test_code_param_omitted_in_tool_call(self, tmp_path: Path) -> None:
+        secret = TestRedactScriptCode._openai_key("abcdefghijklmnop1234567890")
+        log_tool_call(
+            "run_script",
+            {"language": "python", "code": f'API_KEY = "{secret}"\nimport os'},
+        )
+        log_file = tmp_path / "audit.log"
+        line = log_file.read_text(encoding="utf-8").strip().splitlines()[-1]
+        entry = json.loads(line)
+        assert entry["event"] == "tool_call"
+        assert entry["params"]["code"] == "[OMITTED]"
+        assert secret not in line
+
+    def test_args_assignment_secret_redacted_in_tool_call(self, tmp_path: Path) -> None:
+        """args/command must use the strong script-code redactor (assignment-form secrets)."""
+        log_tool_call(
+            "run_tool",
+            {"tool_name": "curl", "args": "--data client_secret=topsecretvalue123"},
+        )
+        log_file = tmp_path / "audit.log"
+        entry = json.loads(log_file.read_text(encoding="utf-8").strip().splitlines()[-1])
+        assert "topsecretvalue123" not in entry["params"]["args"]
+        assert "[REDACTED]" in entry["params"]["args"]
+
+    def test_steps_args_redacted_in_tool_call(self, tmp_path: Path) -> None:
+        """Nested pipeline step args carry creds the code/args/command branches miss."""
+        header = TestRedactScriptCode._bearer("leakytoken9999")
+        log_tool_call(
+            "run_pipeline",
+            {"steps": [{"tool": "curl", "args": f'-H "{header}"'}]},
+        )
+        log_file = tmp_path / "audit.log"
+        entry = json.loads(log_file.read_text(encoding="utf-8").strip().splitlines()[-1])
+        serialized = json.dumps(entry)
+        assert "leakytoken9999" not in serialized
+        assert "[REDACTED]" in entry["params"]["steps"][0]["args"]
+        # tool name preserved for correlation
+        assert entry["params"]["steps"][0]["tool"] == "curl"
+
+    def test_generic_string_param_is_redacted(self, tmp_path: Path) -> None:
+        log_tool_call(
+            "guided_assessment",
+            {"target": "https://internal.example/?token=synthetic-credential-789"},
+        )
+        entry = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").strip())
+        target = entry["params"]["target"]
+        assert "synthetic-credential-789" not in target
+        assert "[REDACTED]" in target
+
+
+class TestLogPipelineStartRedaction:
+    """log_pipeline_start runs before sanitization and must redact each step's args."""
+
+    def test_pipeline_step_args_redacted(self, tmp_path: Path) -> None:
+        log_pipeline_start(
+            [
+                {"tool": "curl", "args": "-u admin:s3cretpw http://10.0.0.1"},
+                {"tool": "grep", "args": "flag"},
+            ],
+            timeout=30,
+        )
+        log_file = tmp_path / "audit.log"
+        entry = json.loads(log_file.read_text(encoding="utf-8").strip().splitlines()[-1])
+        assert entry["event"] == "pipeline_start"
+        joined = " ".join(entry["steps"])
+        assert "s3cretpw" not in joined
+        assert "[REDACTED]" in joined
+        # Non-secret args still readable
+        assert "grep(flag)" in joined
+
+
+class TestAuditLogPermissions:
+    """The audit log must be created owner-only (0600) — it holds sensitive runtime data."""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes not applicable on Windows")
+    def test_audit_log_is_owner_only(self, tmp_path: Path) -> None:
+        log_execution(tool_name="nmap", args="-sV 10.0.0.1", exit_code=0, command="nmap -sV 10.0.0.1")
+        log_file = tmp_path / "audit.log"
+        assert log_file.exists()
+        mode = stat.S_IMODE(os.stat(log_file).st_mode)
+        assert mode == 0o600, f"audit.log mode is {oct(mode)}, expected 0o600"

@@ -1,0 +1,1822 @@
+#!/usr/bin/env bash
+
+# by Lee Baird (@discoverscripts)
+
+# Check for root
+if [ $EUID -eq 0 ]; then
+    echo
+    echo -e "${YELLOW}[!] This script cannot be ran as root.${NC}"
+    echo
+    exit 1
+fi
+
+PASSIVE_MODE="${1:-}"
+
+f_terminate(){
+    OUTPUT_DIR=$HOME/data/cancelled-$(date +%H:%M)
+    echo
+    echo "[!] Terminating."
+    echo
+    echo -e "${YELLOW}Saving data to $OUTPUT_DIR.${NC}"
+
+    cd "$DISCOVER" || exit
+    mv "$HOME"/data/"$DOMAIN" "$OUTPUT_DIR" 2>/dev/null
+    mv names emails hosts hudsonrock*.json hudsonrock.txt private-ips private-subs public-ips records squatting subdomains tmp* whois* z* doc pdf ppt txt xls "$OUTPUT_DIR" 2>/dev/null
+
+    echo
+    echo "[*] Saving complete."
+    echo
+    exit 1
+}
+
+# Catch process termination
+trap f_terminate SIGHUP SIGINT SIGTERM
+
+clear
+f_banner
+
+echo -e "${BLUE}PASSIVE RECON${NC}"
+echo
+echo -e "${BLUE}Uses Amass, ARIN, DNSRecon, dnstwist, Metasploit, subfinder,${NC}"
+echo -e "${BLUE}sublist3r, Shodan CTL, theHarvester, Whois, and multiple websites.${NC}"
+echo
+echo -e "${BLUE}[*] Acquire API keys for maximum results with theHarvester.${NC}"
+echo -e "${BLUE}[*] Add keys to $HOME/.theHarvester/api-keys.yaml${NC}"
+echo
+f_company_domain
+
+f_sed_replacement_escape(){
+    printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
+}
+
+if [ "$PASSIVE_MODE" != "98" ] && [ "$PASSIVE_MODE" != "99" ]; then
+COMPANY_SED=$(f_sed_replacement_escape "$COMPANY")
+DOMAIN_SED=$(f_sed_replacement_escape "$DOMAIN")
+DATESTAMP_SED=$(f_sed_replacement_escape "$DATESTAMP")
+COMPANYURL_SED=$(f_sed_replacement_escape "$COMPANYURL")
+cp -R "$DISCOVER"/report/ "$HOME"/data/"$DOMAIN"
+mkdir -p "$HOME"/data/"$DOMAIN"/tools
+sed -i "s|#COMPANY#|$COMPANY_SED|" "$HOME"/data/"$DOMAIN"/index.htm
+sed -i "s|#DOMAIN#|$DOMAIN_SED|" "$HOME"/data/"$DOMAIN"/index.htm
+sed -i "s|#DATE#|$DATESTAMP_SED|" "$HOME"/data/"$DOMAIN"/index.htm
+sed -i "s|#COMPANY#|$COMPANY_SED|" "$HOME"/data/"$DOMAIN"/pages/summary.htm
+sed -i "s|#DOMAIN#|$DOMAIN_SED|" "$HOME"/data/"$DOMAIN"/pages/summary.htm
+sed -i "s|COMPANYURL|$COMPANYURL_SED|" "$HOME"/data/"$DOMAIN"/pages/summary.htm
+sed -i "s|#COMPANY#|$COMPANY_SED|" "$HOME"/data/"$DOMAIN"/pages/passive.htm
+sed -i "s|#DOMAIN#|$DOMAIN_SED|" "$HOME"/data/"$DOMAIN"/pages/passive.htm
+sed -i "s|#COMPANY#|$COMPANY_SED|" "$HOME"/data/"$DOMAIN"/pages/active.htm
+sed -i "s|#DOMAIN#|$DOMAIN_SED|" "$HOME"/data/"$DOMAIN"/pages/active.htm
+
+echo
+echo "$MEDIUM"
+echo
+fi
+
+###############################################################################################################################
+
+# Number of tests
+COUNT=1
+# theHarvester split: README "API key" column. No → free list; Required or
+# Optional → API list. Must match old/test-theHarvester.sh and SOURCE_SPECS.
+sources_no_api=(apis-guru arquivo baidu certspotter commoncrawl crt-name crtsh duckduckgo gitlab haveibeenpwned hudsonrock otx rapiddns robtex shodanct shodanInternetDB sourcegraph subdomainapi subdomaincenter subdomainfinderc99 thc urlscan waybackarchive yahoo)
+sources_api=(bevigil brave bufferoverun builtwith censys criminalip dehashed dnsdb dnsdumpster dymo fofa fullhunt github-code hackertarget hibpverified hunter hunterhow intelx jsmon leakix leaklookup mojeek netlas onyphe pentesttools projectdiscovery rocketreach securityscorecard securityTrails sherlockeye shodan tomba virustotal whoisxml windvane zoomeye)
+# 16 non-harvester COUNT++ steps (amass through social) + every source above.
+TOTAL=$((16 + ${#sources_no_api[@]} + ${#sources_api[@]}))
+
+###############################################################################################################################
+
+f_amass() {
+    echo "Amass                    ($COUNT/$TOTAL)"
+    ((COUNT++))
+    amass enum -passive -d "$DOMAIN" | sed 's/www\.//g' | sort -u > zamass
+    echo
+}
+
+###############################################################################################################################
+
+f_arin() {
+    echo "ARIN"
+    echo "    Email                ($COUNT/$TOTAL)"
+    ((COUNT++))
+
+    if ! curl -ks "https://whois.arin.net/rest/pocs;domain=$DOMAIN" -o tmp.xml; then
+        echo "[!] Failed to fetch ARIN data"
+        rm tmp.xml 2>/dev/null
+    fi
+
+    if ! grep -q 'No Search Results' tmp.xml; then
+        xmllint --format tmp.xml | grep 'handle' | cut -d '>' -f2 | cut -d '<' -f1 | sort -u > zurls
+        xmllint --format tmp.xml | grep 'handle' | cut -d '"' -f2 | sort -u > zhandles
+
+        while read -r LINE; do
+            curl -ks "$LINE" > tmp2.xml
+            xml_grep 'email' tmp2.xml --text_only >> tmp 2>/dev/null
+        done < zurls
+
+        if [ -s tmp ]; then
+            grep -Eiv "(_|error)" tmp | tr '[:upper:]' '[:lower:]' | grep "$DOMAIN" | sort -u > zarin-emails
+        fi
+    fi
+
+    rm tmp* zurls 2>/dev/null
+
+    echo "    Names                ($COUNT/$TOTAL)"
+    ((COUNT++))
+
+    if [ -f zhandles ]; then
+        : > tmp-pocs
+        while read -r LINE; do
+            {
+                curl -ks "https://whois.arin.net/rest/poc/$LINE.txt"
+                printf '\n---POC---\n'
+            } >> tmp-pocs
+        done < zhandles
+
+        if [ -s tmp-pocs ]; then
+            COMPANY_FILTER="$COMPANY" python3 - tmp-pocs zarin-contacts.tsv zarin-names <<'PY'
+import os
+import re
+import sys
+
+poc_blob = open(sys.argv[1]).read()
+out_tsv = sys.argv[2]
+out_names = sys.argv[3]
+company_filter = os.environ.get("COMPANY_FILTER", "")
+
+skip_re = re.compile(
+    r"(@|abuse|center|domainnames|helpdesk|hostmaster|network|support|technical|telecom)",
+    re.I,
+)
+if company_filter:
+    skip_re = re.compile(
+        rf"(@|abuse|center|domainnames|helpdesk|hostmaster|network|support|technical|telecom|{re.escape(company_filter)})",
+        re.I,
+    )
+
+def title_case_name(last_first):
+    last_first = last_first.strip()
+    if not last_first:
+        return ""
+    parts = [p.strip() for p in last_first.split(",", 1)]
+    if len(parts) == 2:
+        last, first = parts
+        name = f"{first} {last}"
+    else:
+        name = last_first
+    return " ".join(word[:1].upper() + word[1:].lower() if word else "" for word in name.split())
+
+def pick_office_phone(block):
+    phones = []
+    for line in block.splitlines():
+        if not line.startswith("Phone:"):
+            continue
+        value = line.split(":", 1)[1].strip()
+        if "(Office)" in value:
+            return re.sub(r"\s*\(Office\)\s*$", "", value).strip()
+        phones.append(re.sub(r"\s*\([^)]+\)\s*$", "", value).strip())
+    return phones[0] if phones else ""
+
+rows = []
+plain_names = []
+seen = set()
+
+for block in poc_blob.split("---POC---"):
+    name_raw = company = phone = ""
+    for line in block.splitlines():
+        if line.startswith("Name:"):
+            name_raw = line.split(":", 1)[1].strip()
+        elif line.startswith("Company:"):
+            company = line.split(":", 1)[1].strip()
+    if not name_raw or skip_re.search(name_raw):
+        continue
+    name = title_case_name(name_raw)
+    if not name:
+        continue
+    phone = pick_office_phone(block)
+    key = name.lower()
+    if key in seen:
+        continue
+    seen.add(key)
+    rows.append((name, company, phone))
+    plain_names.append(name)
+
+rows.sort(key=lambda row: row[0].lower())
+plain_names.sort(key=str.lower)
+
+with open(out_tsv, "w") as handle:
+    for name, company, phone in rows:
+        handle.write(f"{name}\t{company}\t{phone}\n")
+
+with open(out_names, "w") as handle:
+    handle.write("\n".join(plain_names) + ("\n" if plain_names else ""))
+PY
+        fi
+    fi
+
+    rm tmp* tmp-pocs zhandles 2>/dev/null
+    echo
+}
+
+###############################################################################################################################
+
+f_dnsrecon() {
+    echo "DNSRecon                 ($COUNT/$TOTAL)"
+    ((COUNT++))
+    local DNSRECON=''
+
+    if [ -x /opt/dnsrecon-venv/bin/dnsrecon ] && /opt/dnsrecon-venv/bin/dnsrecon --version >/dev/null 2>&1; then
+        DNSRECON=/opt/dnsrecon-venv/bin/dnsrecon
+    elif command -v dnsrecon >/dev/null 2>&1 && dnsrecon --version >/dev/null 2>&1; then
+        DNSRECON=$(command -v dnsrecon)
+    fi
+
+    if [ -n "$DNSRECON" ]; then
+        "$DNSRECON" -d "$DOMAIN" -n 8.8.8.8 -t std > tmp 2>&1
+        grep -Eiv '(all queries will|bind version|completed|could not|dnskeys|dnssec|error|enumeration for|it is resolving|nsec |nsec3|performing|records|recursion|starting enumeration|txt |wildcard resolution)' tmp | sed -E 's/^.*INFO[[:space:]]+//; s/\[\*\]//g; s/\[+\]//g; s/^[ \t]*//' | grep -Eiv '^$' | column -t | sort -u | sed 's/[ \t]*$//' > records
+        grep -i 'TXT' tmp | sed -E 's/^.*INFO[[:space:]]+//; s/\[\*\]//g; s/\[+\]//g; s/^[ \t]*//' | sort -u | sed 's/[ \t]*$//' >> records
+    else
+        echo -e "${YELLOW}[!] dnsrecon is unavailable (broken on Python 3.13+). Run Discover update to install a compatible version.${NC}"
+        : > records
+    fi
+
+    rm tmp 2>/dev/null
+    echo
+}
+
+###############################################################################################################################
+
+f_dnstwist() {
+    echo "dnstwist                 ($COUNT/$TOTAL)"
+    ((COUNT++))
+    dnstwist --registered -f csv "$DOMAIN" > tmp
+    awk -F',' '
+    NR==1 || $1 == "*original" { next }
+    $6 == "" || $6 == "!ServFail" { next }
+    {
+        ip = ($3 != "" && $3 != "!ServFail") ? $3 : ""
+        ns = "NS:" $6
+        mx = ($5 != "" && $5 != "!ServFail") ? "MX:" $5 : ""
+        printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, ip, ns, mx
+    }' tmp > squatting
+    rm tmp 2>/dev/null
+    echo
+}
+
+###############################################################################################################################
+
+f_hudsonrock() {
+    echo "Hudson Rock              ($COUNT/$TOTAL)"
+    ((COUNT++))
+
+    local API_URL TMPFILE
+    API_URL="https://cavalier.hudsonrock.com/api/json/v2/osint-tools/search-by-domain?domain=${DOMAIN}"
+    TMPFILE=$(mktemp)
+
+    if ! curl -fsS "$API_URL" -o "$TMPFILE"; then
+        echo -e "${YELLOW}[!] Hudson Rock request failed.${NC}"
+        rm -f "$TMPFILE"
+        echo
+        return
+    fi
+
+    cp "$TMPFILE" "hudsonrock-${DOMAIN}.json"
+
+    if python3 - "$TMPFILE" "$DOMAIN" zhudsonrock1 <<'PY' > hudsonrock.txt
+import json
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+path = Path(sys.argv[1])
+domain = sys.argv[2]
+subdomain_file = Path(sys.argv[3])
+
+try:
+    doc = json.loads(path.read_text())
+except json.JSONDecodeError as exc:
+    print(f"[!] Invalid JSON: {exc}")
+    sys.exit(1)
+
+def section(title):
+    print()
+    print(title)
+    print("=" * 66)
+
+def unique_urls(rows):
+    urls = set()
+    for row in rows:
+        url = row.get("url", "").lower()
+        if not url or url.endswith("/") or "=" in url:
+            continue
+        urls.add(url)
+    return sorted(urls)
+
+def split_urls(urls):
+    hosts = set()
+    full_urls = []
+    for url in urls:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host:
+            hosts.add(host)
+        if url.count("/") > 2:
+            full_urls.append(url)
+    return sorted(full_urls), sorted(hosts)
+
+def print_url_rows(urls):
+    if not urls:
+        print("(none)")
+        return
+    for url in urls:
+        print(url)
+
+def cap(text):
+    text = text.replace("_", " ")
+    return text[:1].upper() + text[1:] if text else text
+
+LABEL_WIDTH = 26
+VALUE_WIDTH = 6
+PCT_WIDTH = 6
+
+def print_row(label, value):
+    print(f"{cap(label):<{LABEL_WIDTH}} {value}")
+
+def print_password_stat(label, qty, perc):
+    pct = f"{round(float(perc), 1):.1f}%"
+    print(f"{cap(label):<{LABEL_WIDTH}} {qty:<{VALUE_WIDTH}} {pct:>{PCT_WIDTH}}")
+
+section(f"Hudson Rock OSINT: {domain}")
+
+summary = {
+    "total records": doc.get("total"),
+    "employees": doc.get("employees"),
+    "users": doc.get("users"),
+    "third parties": doc.get("third_parties"),
+    "total urls": doc.get("totalUrls"),
+    "last employee compromised": doc.get("last_employee_compromised"),
+    "last user compromised": doc.get("last_user_compromised"),
+}
+for label, value in summary.items():
+    print_row(label, value)
+
+for label, key in (("Employee passwords", "employeePasswords"), ("User passwords", "userPasswords")):
+    block = doc.get(key)
+    if not block:
+        continue
+    section(label)
+    print_row("total passwords", block.get("totalPass"))
+    for strength in ("too_weak", "weak", "medium", "strong"):
+        item = block.get(strength) or {}
+        print_password_stat(strength, item.get("qty", 0), item.get("perc", 0))
+
+data = doc.get("data") or {}
+url_rows = (
+    (data.get("employees_urls") or [])
+    + (data.get("clients_urls") or [])
+    + (data.get("all_urls") or [])
+)
+
+urls, subdomains = split_urls(unique_urls(url_rows))
+
+section(f"URLs ({len(urls)})")
+print_url_rows(urls)
+
+subdomain_file.write_text("\n".join(subdomains) + ("\n" if subdomains else ""))
+
+print()
+PY
+    then
+        cat hudsonrock.txt
+    else
+        echo -e "${YELLOW}[!] Hudson Rock parse failed.${NC}"
+        rm -f hudsonrock.txt zhudsonrock1 "hudsonrock-${DOMAIN}.json"
+    fi
+
+    rm -f "$TMPFILE"
+    echo
+}
+
+###############################################################################################################################
+
+f_intodns() {
+    echo "intodns.com              ($COUNT/$TOTAL)"
+    ((COUNT++))
+    wget -q http://www.intodns.com/"$DOMAIN" -O tmp
+    # shellcheck disable=SC2002
+    cat tmp | sed '1,32d; s/<table width="99%" cellspacing="1" class="tabular">/<center><table width="85%" cellspacing="1" class="tabular"><\/center>/g; s/Test name/Test/g; s/ <a href="feedback\/?KeepThis=true&amp;TB_iframe=true&amp;height=300&amp;width=240" title="intoDNS feedback" class="thickbox feedback">send feedback<\/a>//g; s/ background-color: #ffffff;//; s/<center><table width="85%" cellspacing="1" class="tabular"><\/center>/<table class="inc-dns-config table">/; s/<td class="icon">/<td class="inc-table-cell-status">/g; s/<tr class="info">/<tr>/g' | grep -Eiv '(processed in|ua-2900375-1|urchintracker|script|work in progress)' | sed '/footer/I,+3 d; /google-analytics/I,+5 d' > tmp2
+    cat tmp2 >> "$HOME"/data/"$DOMAIN"/pages/config.htm
+
+    sed -i 's|/static/images/error.gif|\.\./assets/images/icons/fail.png|g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's|/static/images/fail.gif|\.\./assets/images/icons/fail.png|g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's|/static/images/info.gif|\.\./assets/images/icons/info.png|g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's|/static/images/pass.gif|\.\./assets/images/icons/pass.png|g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's|/static/images/warn.gif|\.\./assets/images/icons/warn.png|g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's|\.\.\.\.|\.\.|g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's/<table border="4">/<table class="inc-dns-config table">/g; s/<table class="table table-bordered">/<table class="inc-dns-config table">/g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    grep -q 'inc-dns-config' "$HOME"/data/"$DOMAIN"/pages/config.htm || \
+        sed -i '0,/<thead>/{s/<thead>/    <table class="inc-dns-config table">\n<thead>/}' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's/.*<\/table>.*/&\n<br>\n<br>/' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i '/Math\.random/I,+6 d' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's/I could use the nameservers/The nameservers/g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    sed -i 's/below to performe/below can perform/g; s/ERROR: //g; s/FAIL: //g; s/I did not detect/Unable to detect/g; s/I have not found/Unable to find/g; s/It may be that I am wrong but the chances of that are low.//g; s/Good.//g; s/Ok. //g; s/OK. //g; s/Oh well, //g; s/This can be ok if you know what you are doing.//g; s/That is NOT OK//g; s/That is not so ok//g; s/The reverse (PTR) record://g; s/the same ip./the same IP./g; s/The SOA record is://g; s/WARNING: //g; s/You have/There are/g; s/you have/there are/g; s/use on having/use in having/g; s/You must be/Be/g; s/Your/The/g; s/your/the/g' "$HOME"/data/"$DOMAIN"/pages/config.htm
+    echo
+    rm tmp* 2>/dev/null
+}
+
+###############################################################################################################################
+
+f_metasploit() {
+    echo "Metasploit               ($COUNT/$TOTAL)"
+    ((COUNT++))
+    msfconsole -q -x "use auxiliary/gather/search_email_collector; set DOMAIN $DOMAIN; run; exit y" > tmp 2>/dev/null
+    grep @"$DOMAIN" tmp | awk '{print $2}' | tr '[:upper:]' '[:lower:]' | sort -u > zmsf
+    [ ! -s zmsf ] && rm -f zmsf
+    rm -f tmp
+    echo
+}
+
+###############################################################################################################################
+
+f_subfinder() {
+    echo "subfinder                ($COUNT/$TOTAL)"
+    ((COUNT++))
+    subfinder -d "$DOMAIN" -silent | sort -u > zsubfinder
+    echo
+}
+
+###############################################################################################################################
+
+f_sublist3r() {
+    echo "sublist3r                ($COUNT/$TOTAL)"
+    ((COUNT++))
+    sublist3r -d "$DOMAIN" > tmp 2>/dev/null
+    sed 's/\x1B\[[0-9;]*m//g' tmp | sed '/^ /d' | grep -Eiv '(!|enumerating|enumeration|searching|total unique)' | tr '[:upper:]' '[:lower:]' | sort -u > zsublist3r
+    echo
+    rm tmp 2>/dev/null
+}
+
+###############################################################################################################################
+
+# Free Shodan Certificate Transparency hostnames (no SHODAN_API_KEY).
+# https://ctl.shodan.io/api/v1/domain/{domain}/hostnames
+f_shodan_ctl() {
+    echo "Shodan CTL               ($COUNT/$TOTAL)"
+    ((COUNT++))
+
+    local out="zshodanctl"
+    local err_file
+    err_file=$(mktemp)
+
+    # Fail soft: timeout / non-200 / bad JSON must not stop passive.
+    if ! python3 - "$DOMAIN" "$out" 2>"$err_file" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+domain = sys.argv[1].strip().lower().strip(".")
+out_path = sys.argv[2]
+url = f"https://ctl.shodan.io/api/v1/domain/{domain}/hostnames"
+
+req = urllib.request.Request(
+    url,
+    headers={"User-Agent": "Discover-passive/1.0", "Accept": "application/json"},
+)
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+except urllib.error.HTTPError as exc:
+    print(f"HTTP {exc.code}", file=sys.stderr)
+    sys.exit(1)
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+
+try:
+    data = json.loads(raw.decode("utf-8", errors="replace"))
+except json.JSONDecodeError:
+    print("invalid JSON", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(data, list):
+    print("unexpected response shape", file=sys.stderr)
+    sys.exit(1)
+
+suffix = "." + domain
+hosts = set()
+for item in data:
+    if not isinstance(item, str):
+        continue
+    host = item.strip().lower().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        continue
+    if host == domain or host.endswith(suffix):
+        hosts.add(host)
+
+with open(out_path, "w", encoding="utf-8") as handle:
+    for host in sorted(hosts):
+        handle.write(host + "\n")
+print(len(hosts), file=sys.stderr)
+PY
+    then
+        _err=$(head -n 1 "$err_file" 2>/dev/null | tr -d '\r')
+
+        if [ -n "$_err" ]; then
+            echo "    [!] Shodan CTL failed (${_err}) — skipping."
+        else
+            echo "    [!] Shodan CTL failed — skipping."
+        fi
+
+        rm -f "$err_file" "$out" 2>/dev/null
+        echo
+        return 0
+    fi
+
+    _count=$(tail -n 1 "$err_file" 2>/dev/null | tr -d '\r')
+
+    if [[ "$_count" =~ ^[0-9]+$ ]]; then
+        echo "    [*] ${_count} hostname(s)."
+    fi
+
+    rm -f "$err_file" 2>/dev/null
+    unset _err _count
+    echo
+}
+
+###############################################################################################################################
+
+run_harvester() {
+    local source=$1
+    printf "    %-20s (%s/%s)\n" "${source}" "${COUNT}" "${TOTAL}"
+    theHarvester -d "$DOMAIN" -b "$source" -r 2>&1 | grep -Ev ' - INFO - ' | grep -Eiv '(!|\*|--|=|\[|\:\:|failed to detect|no response|retrying|searching|yaml)' | sed '/^$/d;/:$/d; /^AS/d; s|https://||g; s|www\.||g' | sort -u > "z${source}"
+    ((COUNT++))
+}
+
+find_theharvester_dir() {
+    local harvester_dir
+
+    if [ -d "$HOME/theHarvester" ]; then
+        printf '%s\n' "$HOME/theHarvester"
+        return 0
+    fi
+
+    harvester_dir=$(find "$HOME" -type d -name theHarvester 2>/dev/null | sort | head -n 1)
+
+    if [ -n "$harvester_dir" ]; then
+        printf '%s\n' "$harvester_dir"
+        return 0
+    fi
+
+    return 1
+}
+
+f_theharvester() {
+    local harvester_dir
+    local source
+
+    echo "theHarvester"
+
+    if ! harvester_dir=$(find_theharvester_dir); then
+        echo "    [!] theHarvester directory not found under $HOME."
+        echo
+        return 0
+    fi
+
+    cd "$harvester_dir" || return 1
+    uv sync --all-groups
+    source .venv/bin/activate
+
+    for source in "${sources_no_api[@]}"; do
+        run_harvester "$source"
+    done
+
+    mv z* "$DISCOVER" 2>/dev/null
+    deactivate
+    cd "$DISCOVER" || return 1
+    find . -type f -empty -delete
+    echo
+}
+
+f_theharvester_api() {
+    local harvester_dir
+    local source
+
+    echo "theHarvester (API)"
+    echo "    These sources use a provider API key (required or optional)."
+
+    if ! harvester_dir=$(find_theharvester_dir); then
+        echo "    [!] theHarvester directory not found under $HOME."
+        echo
+        return 0
+    fi
+
+    cd "$harvester_dir" || return 1
+    source .venv/bin/activate
+
+    for source in "${sources_api[@]}"; do
+        run_harvester "$source"
+    done
+
+    mv z* "$DISCOVER" 2>/dev/null
+    deactivate
+    cd "$DISCOVER" || return 1
+    find . -type f -empty -delete
+    echo
+}
+
+###############################################################################################################################
+
+f_whois_domain() {
+    echo "Whois"
+    echo "    Domain               ($COUNT/$TOTAL)"
+    ((COUNT++))
+    whois -H "$DOMAIN" > tmp 2>/dev/null
+    sed 's/^[ \t]*//' tmp > tmp2
+    grep -Eiv '(#|%|<a|=-=-=-=|;|access may|accuracy|additionally|affiliates|afilias except|and dns hosting|and limitations|any use of|at www.|be sure|at the end|by submitting|by the terms|can easily|circumstances|clientdeleteprohibited|clienttransferprohibited|clientupdateprohibited|com laude|commercial purposes|company may|compilation|complaint will|contact information|contact us|contacting|copy and paste|currently set|database|data contained|data presented|database|date of|details|dissemination|domaininfo ab|domain management|domain names in|domain status: ok|electronic processes|enable high|entirety|except as|existing|ext:|failure|facsimile|following terms|for commercial|for detailed|for information|for more|for the|get noticed|get a free|guarantee its|href|If you|in europe|in most|in obtaining|in the address|includes|including|information is|informational purposes|intellectual|is not|is providing|its systems|learn|legitimate|makes this|markmonitor|minimum|mining this|minute and|modify|must be sent|name cannot|namesbeyond|not to use|note:|notice|obtaining information about|of moniker|of this data|or hiding any|or otherwise support|other use of|please|policy|prior written|privacy is|problem reporting|professional and|prohibited without|promote your|protect the|protecting|public interest|queried|queries|receive|receiving|redacted for|register your|registrars|registration record|relevant|repackaging|request|reserves all rights|reserves the|responsible for|restricted to network|restrictions|see business|server at|solicitations|sponsorship|status|support questions|support the transmission|supporting|telephone, or facsimile|temporary|that apply to|that you will|the right|the data is|The fact that|the transmission|this listing|this feature|this information|this service is|to collect or|to entities|to report any|to suppress|to the systems|transmission of|trusted partner|united states|unlimited|unsolicited advertising|users may|version 6|via e-mail|visible|visit aboutus.org|visit|web-based|when you|while believed|will use this|with many different|with no guarantee|we reserve|whitelist|whois|you agree|You may not)' tmp2 > tmp3
+    sed '/^*/d' tmp3 > tmp4
+    sed '/^-/d' tmp4 > tmp5
+    sed '/^http/d' tmp5 > tmp6
+    sed '/^US/d' tmp6 > tmp7
+    sed 's/+1.//g' tmp7 > tmp8
+    awk '!d && NF {sub(/^[[:blank:]]*/,""); d=1} d' tmp8 > tmp9
+    sed 's/[ \t]*$//' tmp9 > tmp10
+    cat -s tmp10 > tmp11
+    grep -Eiv '(2:$|3:$|address.$|address........$|address.........$|ext.:$|fax:$|fax............$|fax.............$|province:$|server:$)' tmp11 > tmp12
+    sed -i '/^Domain Servers:/{n; /.*/d}' tmp12
+    awk '/^[[:space:]]*$/{p++;next} {for(i=0;i<p;i++){printf "\n"}; p=0; print}' tmp12 > tmp13
+    sed 's/: /:#####/g' tmp13 | column -s '#' -t | sed 's/[ \t]*$//' > whois-domain
+    rm tmp*
+}
+
+###############################################################################################################################
+
+f_whois_ip() {
+    echo "    IP                   ($COUNT/$TOTAL)"
+    ((COUNT++))
+    local DOMAINIP
+    DOMAINIP=$(dig +short "$DOMAIN" | head -1)
+    [ -n "$DOMAINIP" ] || return 0
+    whois "$DOMAINIP" > tmp
+    grep -Eiv '(#|%|comment|remarks)' tmp | sed '/./,$!d' > tmp2
+    sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' tmp2 > tmp3
+    cat -s tmp3 > tmp4
+    awk '{printf "%-25s %s\n", $1, $2}' tmp4 | sed 's/+1-//g' > whois-ip
+    rm tmp* 2>/dev/null
+
+    if [ ! -s whois-ip ]; then
+        rm -f whois-ip
+        return 0
+    fi
+
+    if grep -qiE '^no[[:space:]]+whois' whois-ip; then
+        rm -f whois-ip
+        return 0
+    fi
+
+    if ! grep -qiE '^(inetnum|inet6num|netrange|netname|orgname|organization|descr|org-name|cust-name|owner):' whois-ip; then
+        rm -f whois-ip
+    fi
+
+}
+
+###############################################################################################################################
+
+f_sec_people() {
+    echo "SEC Leadership           ($COUNT/$TOTAL)"
+    ((COUNT++))
+
+    mkdir -p "$HOME/data/$DOMAIN/tools"
+
+    if [ ! -f "$HOME/data/$DOMAIN/tools/sec-people-manual.tsv" ]; then
+        cat > "$HOME/data/$DOMAIN/tools/sec-people-manual.tsv" <<'EOF'
+# Manual SEC leadership — tab-separated: Name, Title, Phone
+# Example:
+# Robyn Denholm	Chair of the Board
+EOF
+    fi
+
+    python3 "$DISCOVER"/parsers/sec_people.py "$COMPANY" "$DOMAIN" "$HOME/data/$DOMAIN/tools" "$DISCOVER/zsec-people"
+    echo
+}
+
+###############################################################################################################################
+
+f_aggregate() {
+    cat z* | grep "\@$DOMAIN" | grep -v '[0-9]' | grep -Eiv "(_|,|'|firstname|lastname|test|www|xxx|zzz)" | sort -u > emails
+
+    python3 - "$DOMAIN" names <<'PY'
+import ast
+import csv
+import glob
+import os
+import re
+import sys
+
+domain = sys.argv[1]
+out_path = sys.argv[2]
+
+PHONE_TAIL_RE = re.compile(
+    r"(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}$"
+)
+TITLE_START_RE = re.compile(
+    r"^(VP|SVP|EVP|Director|President|Manager|Consultant|Lead|Chief|Senior|Associate|Head|Officer|Engineer|Analyst|Coordinator|Supervisor|Managing|Executive|Board|CFO|CEO|COO|CISO|CTO)",
+    re.I,
+)
+SKIP_RE = re.compile(
+    r"(@|:|\.|>|additionally|atlanta|boston|bufferoverun|captcha|detroit|exception|found character|google|integers|maryland|must be|north carolina|philadelphia|planning|postmaster|resolutions|search|substring|united|university|while scanning|failed to|no response|error message|an exception)",
+    re.I,
+)
+NAME_MC_RE = [
+    (re.compile(r"\bMacd\b", re.I), "MacD"),
+    (re.compile(r"\bMacn\b", re.I), "MacN"),
+    (re.compile(r"\bMca\b", re.I), "McA"),
+    (re.compile(r"\bMcb\b", re.I), "McB"),
+    (re.compile(r"\bMcc\b", re.I), "McC"),
+    (re.compile(r"\bMcd\b", re.I), "McD"),
+    (re.compile(r"\bMce\b", re.I), "McE"),
+    (re.compile(r"\bMcf\b", re.I), "McF"),
+    (re.compile(r"\bMcg\b", re.I), "McG"),
+    (re.compile(r"\bMch\b", re.I), "McH"),
+    (re.compile(r"\bMci\b", re.I), "McI"),
+    (re.compile(r"\bMcj\b", re.I), "McJ"),
+    (re.compile(r"\bMck\b", re.I), "McK"),
+    (re.compile(r"\bMcl\b", re.I), "McL"),
+    (re.compile(r"\bMcm\b", re.I), "McM"),
+    (re.compile(r"\bMcn\b", re.I), "McN"),
+    (re.compile(r"\bMcp\b", re.I), "McP"),
+    (re.compile(r"\bMcq\b", re.I), "McQ"),
+    (re.compile(r"\bMcs\b", re.I), "McS"),
+    (re.compile(r"\bMcv\b", re.I), "McV"),
+]
+
+
+def normalize_whitespace(value):
+    return " ".join(value.split()).strip()
+
+
+def normalize_name(name):
+    name = normalize_whitespace(name)
+    for pattern, replacement in NAME_MC_RE:
+        name = pattern.sub(replacement, name)
+    replacements = {
+        " And ": " and ",
+        " Av ": " AV ",
+        " It ": " IT ",
+        " Of ": " of ",
+        " Ui ": " UI ",
+        " Ux ": " UX ",
+    }
+    for old, new in replacements.items():
+        name = name.replace(old, new)
+    for token, repl in (("Dj", "DJ"), ("Jb", "JB"), ("Tj", "TJ"), ("iii", "III"), ("ii", "II")):
+        name = re.sub(rf"\b{token}\b", repl, name)
+    return name
+
+
+def merge_key(name):
+    return normalize_name(name).lower()
+
+
+def upsert(store, name, title="", phone=""):
+    name = normalize_name(name)
+    if not name or not re.search(r"[A-Za-z]{2,}", name) or SKIP_RE.search(name):
+        return
+    key = merge_key(name)
+    row = store.setdefault(key, {"name": name, "title": "", "phone": ""})
+    title = normalize_whitespace(title)
+    phone = normalize_whitespace(phone)
+    if title and (not row["title"] or len(title) > len(row["title"])):
+        row["title"] = title
+    if phone and not row["phone"]:
+        row["phone"] = phone
+
+
+def parse_dict_line(line):
+    try:
+        data = ast.literal_eval(line)
+    except (SyntaxError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    first = normalize_whitespace(str(data.get("firstname", "") or data.get("first_name", "")))
+    last = normalize_whitespace(str(data.get("lastname", "") or data.get("last_name", "")))
+    name = normalize_whitespace(f"{first} {last}".strip())
+    if not name:
+        name = normalize_whitespace(str(data.get("name", "")))
+    title = normalize_whitespace(
+        str(
+            data.get("job_title")
+            or data.get("title")
+            or data.get("role")
+            or data.get("department")
+            or ""
+        )
+    )
+    phone = normalize_whitespace(str(data.get("phone", "") or data.get("mobile", "")))
+    upsert(contacts, name, title, phone)
+
+
+def parse_spaced_columns(line):
+    match = re.match(r"^(.+?)\s{2,}(.+?)(?:\s{2,}(.+))?$", line)
+    if not match:
+        return False
+    name, middle, tail = match.group(1).strip(), match.group(2).strip(), (match.group(3) or "").strip()
+    title = middle
+    phone = ""
+    if tail and PHONE_TAIL_RE.search(tail):
+        phone = tail
+    elif PHONE_TAIL_RE.search(middle):
+        phone = middle
+        title = ""
+    upsert(contacts, name, title, phone)
+    return True
+
+
+def parse_freeform_line(line):
+    phone = ""
+    working = line
+    phone_match = re.search(r"\s{2,}((?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4})\s*$", working)
+    if phone_match:
+        phone = phone_match.group(1).strip()
+        working = working[: phone_match.start()].rstrip()
+
+    if re.search(r"\s{2,}", working):
+        parts = [part.strip() for part in re.split(r"\s{2,}", working) if part.strip()]
+        if len(parts) >= 2:
+            upsert(contacts, parts[0], " ".join(parts[1:]), phone)
+            return
+
+    title_match = TITLE_START_RE.search(working)
+    if title_match:
+        upsert(contacts, working[: title_match.start()].strip(), working[title_match.start() :].strip(), phone)
+        return
+
+    upsert(contacts, working, "", phone)
+
+
+contacts = {}
+
+for path in sorted(glob.glob("z*")):
+    if not os.path.isfile(path):
+        continue
+    with open(path, newline="") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("[*]") or line.startswith("---") or line.startswith("^"):
+                continue
+
+            if line.startswith("{") and line.endswith("}"):
+                parse_dict_line(line)
+                continue
+
+            if "\t" in line:
+                row = next(csv.reader([line], delimiter="\t"))
+                while len(row) < 3:
+                    row.append("")
+                name, title, phone = [cell.strip() for cell in row[:3]]
+                if name.lower() in {"name", "first_name", "last_name"}:
+                    continue
+                upsert(contacts, name, title, phone)
+                continue
+
+            if "|" in line and line.count("|") >= 2:
+                parts = [part.strip() for part in line.split("|")]
+                if parts[0].lower() in {"last_name", "first_name"}:
+                    continue
+                if len(parts) >= 3:
+                    last, first, title = parts[0], parts[1], parts[2]
+                    upsert(contacts, f"{first} {last}".strip(), title)
+                continue
+
+            if "@" in line or SKIP_RE.search(line):
+                continue
+
+            if parse_spaced_columns(line):
+                continue
+
+            if re.search(r"\d", line):
+                continue
+
+            parse_freeform_line(line)
+
+rows = sorted(contacts.values(), key=lambda row: row["name"].lower())
+with open(out_path, "w", newline="") as handle:
+    writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+    for row in rows:
+        writer.writerow([row["name"], row["title"], row["phone"]])
+PY
+
+    cat z* | awk -F: '{print $NF}' | grep -Eo '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | grep -Eiv '\b(0\.0\.0\.0|1\.1\.1\.1|1\.1\.1\.2|8\.8\.8\.8|127\.0\.0\.1|127\.0\.0\.53)\b|\.0$' | sort -u | sort -n -u -t . -k 1,1 -k 2,2 -k 3,3 -k 4,4 > hosts
+
+    while IFS= read -r IP; do
+        if [[ $IP =~ ^10\..* ]] || \
+           [[ $IP =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\..* ]] || \
+           [[ $IP =~ ^192\.168\..* ]]; then
+            echo "$IP" >> private-ips
+        else
+            echo "$IP" >> public-ips
+        fi
+    done < hosts
+
+    cat z* | grep -Eiv '(•|@|\+|;|::|,|>|//|\b1\.1\.1\.1\b|\b127\.0\.0\.53\b|failed to|no response|www)' | sed '/^[0-9]\|^\.\|^-/d' | sed '/\.$/d' | grep '\.' | sed 's/:/ /g' | column -t | tr '[:upper:]' '[:lower:]' | sort -u | awk '$2 ~ /[a-z]/ {next} NF==1{if(a) print l; a=$1; l=$0; next} $1==a{print; a=""; next} a{print l; a=""} 1; END{if(a) print l}' | sed 's/[ \t]*$//' > tmp
+
+    echo -e "${BLUE}[*] Resolving subdomains with no IPs using dig.${NC}"
+
+    local total current ip col1 col2
+    total=$(wc -l < tmp)
+    current=0
+    : > tmp2
+    while read -r col1 col2; do
+        ((current++))
+        echo -ne "\r    $current of $total"
+
+        if [ -z "$col2" ]; then
+            ip=$(dig +short "$col1" | grep -Eo '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | head -n 1)
+
+            if [ -n "$ip" ] && [ "$ip" != "1.1.1.1" ] && [ "$ip" != "127.0.0.53" ]; then
+                echo "$col1 $ip" >> tmp2
+            fi
+        else
+            echo "$col1 $col2" >> tmp2
+        fi
+    done < tmp
+    echo
+
+    awk '{print $1 "\t" $2}' tmp2 > subdomains
+    rm tmp tmp2 2>/dev/null
+
+    if [ -s subdomains ]; then
+        python3 "$DISCOVER/recon/subdomain-categorize.py" \
+            subdomains > subdomains.categorized
+        mv subdomains.categorized subdomains
+    fi
+
+    awk -F'[ \t]+' 'NF >= 2 && ($2 ~ /^10\./ || $2 ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./ || $2 ~ /^192\.168\./) { print }' subdomains > private-subs
+    rm tmp 2>/dev/null
+
+    cat z* | grep -Ei '\.(doc|docx)$' | sort -u > doc
+    cat z* | grep -Ei '\.(ppt|pptx)$' | sort -u > ppt
+    cat z* | grep -Ei '\.(xls|xlsx)$' | sort -u > xls
+    cat z* | grep -i '\.pdf$' | sort -u > pdf
+    cat z* | grep -i '\.txt$' | sort -u > txt
+
+    find . -type f -empty -delete
+}
+
+###############################################################################################################################
+
+f_passive_scan_date(){
+    local tools_dir="$HOME/data/$DOMAIN/tools"
+    local index_file="$HOME/data/$DOMAIN/index.htm"
+    local derived=""
+
+    derived=$(python3 - "$tools_dir" "$(pwd)" <<'PY'
+import sys
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+MARKERS = (
+    "zsubfinder",
+    "zshodanctl",
+    "zcrtsh",
+    "zcertspotter",
+    "zcommoncrawl",
+    "zduckduckgo",
+    "zgitlab",
+    "zhudsonrock",
+    "zmsf",
+    "zrapiddns",
+    "zrobtex",
+    "zsublist3r",
+    "zthc",
+    "zurlscan",
+    "zwaybackarchive",
+    "zwindvane",
+    "zarin-emails",
+    "zarin-names",
+    "whois-domain",
+    "whois-ip",
+    "records",
+)
+
+def marker_dates(*roots):
+    dates = []
+    for root in roots:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        for name in MARKERS:
+            path = root / name
+            if path.is_file():
+                dates.append(datetime.fromtimestamp(path.stat().st_mtime).date())
+    return dates
+
+tools_dir, cwd = sys.argv[1:3]
+dates = marker_dates(tools_dir, cwd)
+if not dates:
+    raise SystemExit(1)
+
+scan_day = Counter(dates).most_common(1)[0][0]
+print(scan_day.strftime("%m/%d/%Y"))
+PY
+) || true
+
+    if [ -n "$derived" ]; then
+        printf '%s' "$derived"
+        return 0
+    fi
+
+    if [ -f "$tools_dir/passive-scan-date" ]; then
+        cat "$tools_dir/passive-scan-date"
+        return 0
+    fi
+
+    if [ -f "$index_file" ]; then
+        python3 - "$index_file" <<'PY'
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+match = re.search(
+    r'<div class="inc-home-meta-item">\s*<span class="value">([^<]+)</span>',
+    text,
+)
+if not match:
+    raise SystemExit(1)
+
+parsed = datetime.strptime(match.group(1).strip(), "%B %d, %Y")
+print(parsed.strftime("%m/%d/%Y"))
+PY
+        return 0
+    fi
+
+    date +"%m/%d/%Y"
+}
+
+f_report_append_pre_page(){
+    local SRC="$1"
+    local PAGE="$2"
+
+    if [ -n "$SRC" ] && [ -f "$SRC" ]; then
+        cat "$SRC" >> "$PAGE"
+    else
+        echo "No data found." >> "$PAGE"
+    fi
+
+    {
+        echo "</pre>"
+        echo "    </div>"
+        echo "</div>"
+        echo
+        # Discover-hosted Export on Report → Passive only
+        case "$PAGE" in
+            *passive.htm)
+                echo '<script src="../assets/javascript/inc-report-export.js?v=5"></script>'
+                ;;
+        esac
+        echo "</body>"
+        echo "</html>"
+    } >> "$PAGE"
+}
+
+f_report_append_names_page(){
+    local PAGE="$1"
+
+    if [ -f names ] && [ -s names ]; then
+        python3 - names >> "$PAGE" <<'PY'
+import csv
+import html
+import sys
+
+lines = []
+with open(sys.argv[1], newline="") as handle:
+    for row in csv.reader(handle, delimiter="\t"):
+        while len(row) < 3:
+            row.append("")
+        name, title, phone = [cell.strip() for cell in row[:3]]
+        if not name:
+            continue
+        lines.append(
+            "                <tr>"
+            f"<td>{html.escape(name)}</td>"
+            f"<td>{html.escape(title)}</td>"
+            f"<td>{html.escape(phone)}</td>"
+            "</tr>"
+        )
+
+if not lines:
+    lines.append('                <tr><td colspan="3">No data found.</td></tr>')
+
+print("\n".join(lines))
+PY
+    else
+        echo '                <tr><td colspan="3">No data found.</td></tr>' >> "$PAGE"
+    fi
+
+    {
+        echo "            </tbody>"
+        echo "        </table>"
+        echo "    </div>"
+        echo "</div>"
+        echo
+        echo '<script src="../assets/javascript/inc-data-table.js"></script>'
+        echo "</body>"
+        echo "</html>"
+    } >> "$PAGE"
+}
+
+f_report_append_records_page(){
+    local PAGE="$1"
+
+    if [ -f records ] && [ -s records ]; then
+        python3 - records >> "$PAGE" <<'PY'
+import html
+import sys
+
+
+def parse_row(raw):
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    parts = raw.split()
+    if len(parts) < 3:
+        return None
+
+    rtype = parts[0].upper()
+    name = parts[1]
+
+    if rtype == "SRV" and len(parts) >= 5:
+        target, address, port = parts[2], parts[3], parts[4]
+        value = f"{target} → {address}:{port}"
+    else:
+        value = " ".join(parts[2:])
+
+    if not name or not value:
+        return None
+
+    return rtype, name, value
+
+
+def render_row(rtype, name, value):
+    row_class = ' class="inc-record-txt"' if rtype == "TXT" else ""
+    title = ""
+    if rtype == "TXT" and len(value) > 120:
+        title = f' title="{html.escape(value, quote=True)}"'
+
+    return (
+        f"                <tr{row_class}>"
+        f"<td>{html.escape(rtype)}</td>"
+        f"<td>{html.escape(name)}</td>"
+        f"<td{title}>{html.escape(value)}</td>"
+        "</tr>"
+    )
+
+
+path = sys.argv[1]
+lines = []
+with open(path, newline="") as handle:
+    for raw in handle:
+        parsed = parse_row(raw)
+        if not parsed:
+            continue
+        lines.append(render_row(*parsed))
+
+if not lines:
+    lines.append('                <tr><td colspan="3">No data found.</td></tr>')
+
+print("\n".join(lines))
+PY
+    else
+        echo '                <tr><td colspan="3">No data found.</td></tr>' >> "$PAGE"
+    fi
+
+    {
+        echo "            </tbody>"
+        echo "        </table>"
+        echo "    </div>"
+        echo "</div>"
+        echo
+        echo '<script src="../assets/javascript/inc-data-table.js"></script>'
+        echo "</body>"
+        echo "</html>"
+    } >> "$PAGE"
+}
+
+f_report_append_emails_page(){
+    local PAGE="$1"
+
+    if [ -f emails ] && [ -s emails ]; then
+        python3 - emails >> "$PAGE" <<'PY'
+import html
+import sys
+
+lines = []
+with open(sys.argv[1]) as handle:
+    for raw in handle:
+        email = raw.strip()
+        if not email:
+            continue
+        lines.append(
+            "                <tr>"
+            f"<td>{html.escape(email)}</td>"
+            "</tr>"
+        )
+
+if not lines:
+    lines.append('                <tr><td>No data found.</td></tr>')
+
+print("\n".join(lines))
+PY
+    else
+        echo '                <tr><td>No data found.</td></tr>' >> "$PAGE"
+    fi
+
+    {
+        echo "            </tbody>"
+        echo "        </table>"
+        echo "    </div>"
+        echo "</div>"
+        echo
+        echo '<script src="../assets/javascript/inc-data-table.js"></script>'
+        echo "</body>"
+        echo "</html>"
+    } >> "$PAGE"
+}
+
+f_report_append_squatting_page(){
+    local PAGE="$1"
+
+    if [ -f squatting ] && [ -s squatting ]; then
+        python3 - squatting >> "$PAGE" <<'PY'
+import csv
+import html
+import sys
+
+def parse_row(raw):
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    if "\t" in raw:
+        row = next(csv.reader([raw], delimiter="\t"))
+        while len(row) < 5:
+            row.append("")
+        fuzzer, domain, ipaddr, ns, mx = [cell.strip() for cell in row[:5]]
+    else:
+        parts = raw.split()
+        if len(parts) < 2:
+            return None
+        fuzzer, domain = parts[0], parts[1]
+        ipaddr = ns = mx = ""
+        for part in parts[2:]:
+            if part.startswith("NS:"):
+                ns = part
+            elif part.startswith("MX:"):
+                mx = part
+            elif not ipaddr:
+                ipaddr = part
+
+    if ipaddr.startswith("NS:"):
+        if not ns:
+            ns = ipaddr
+        ipaddr = ""
+    elif ipaddr.startswith("MX:"):
+        if not mx:
+            mx = ipaddr
+        ipaddr = ""
+
+    if not domain:
+        return None
+    return fuzzer, domain, ipaddr, ns, mx
+
+
+def format_fuzzer(value):
+    value = value.strip()
+    if not value:
+        return value
+    return value[0].upper() + value[1:]
+
+path = sys.argv[1]
+lines = []
+with open(path, newline="") as handle:
+    for raw in handle:
+        parsed = parse_row(raw)
+        if not parsed:
+            continue
+        fuzzer, domain, ipaddr, ns, mx = parsed
+        lines.append(
+            "                <tr>"
+            f"<td>{html.escape(format_fuzzer(fuzzer))}</td>"
+            f"<td>{html.escape(domain)}</td>"
+            f"<td>{html.escape(ipaddr)}</td>"
+            f"<td>{html.escape(ns)}</td>"
+            f"<td>{html.escape(mx)}</td>"
+            "</tr>"
+        )
+
+if not lines:
+    lines.append('                <tr><td colspan="5">No data found.</td></tr>')
+
+print("\n".join(lines))
+PY
+    else
+        echo '                <tr><td colspan="5">No data found.</td></tr>' >> "$PAGE"
+    fi
+
+    {
+        echo "            </tbody>"
+        echo "        </table>"
+        echo "    </div>"
+        echo "</div>"
+        echo
+        echo '<script src="../assets/javascript/inc-data-table.js"></script>'
+        echo "</body>"
+        echo "</html>"
+    } >> "$PAGE"
+}
+
+f_report_append_subdomains_page(){
+    local PAGE="$1"
+
+    python3 - "$PAGE" private-subs subdomains <<'PY'
+import csv
+import html
+import os
+import re
+import sys
+
+IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+
+def is_private_ip(ip):
+    if not IPV4_RE.match(ip):
+        return False
+    octets = [int(part) for part in ip.split(".")]
+    if octets[0] == 10:
+        return True
+    if octets[0] == 172 and 16 <= octets[1] <= 31:
+        return True
+    if octets[0] == 192 and octets[1] == 168:
+        return True
+    return False
+
+def parse_row(raw):
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    if "\t" in raw:
+        row = next(csv.reader([raw], delimiter="\t"))
+        while len(row) < 3:
+            row.append("")
+        subdomain, ipaddr, category = row[0].strip(), row[1].strip(), row[2].strip()
+    else:
+        parts = raw.split()
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0], "", ""
+        if IPV4_RE.match(parts[-1]):
+            subdomain, ipaddr = " ".join(parts[:-1]), parts[-1]
+            category = ""
+        else:
+            subdomain = parts[0]
+            ipaddr = parts[1] if len(parts) > 1 else ""
+            category = parts[2] if len(parts) > 2 else ""
+
+    if not subdomain:
+        return None
+    return subdomain, ipaddr, category
+
+def load_rows(path):
+    rows = []
+    if not path or not os.path.isfile(path):
+        return rows
+    with open(path, newline="") as handle:
+        for raw in handle:
+            parsed = parse_row(raw)
+            if parsed and parsed[1]:
+                rows.append(parsed)
+    return rows
+
+def build_table(rows, empty_message, ip_header="IP Address"):
+    lines = [
+        '        <table class="table table-bordered inc-data-table">',
+        "            <thead>",
+        "                <tr>",
+        '                    <th scope="col" class="inc-sortable">Subdomain</th>',
+        '                    <th scope="col" class="inc-sortable">Category</th>',
+        f'                    <th scope="col" class="inc-sortable">{html.escape(ip_header)}</th>',
+        "                </tr>",
+        "            </thead>",
+        "            <tbody>",
+    ]
+
+    if rows:
+        for subdomain, ipaddr, category in rows:
+            lines.append(
+                "                <tr>"
+                f"<td>{html.escape(subdomain)}</td>"
+                f"<td>{html.escape(category)}</td>"
+                f"<td>{html.escape(ipaddr)}</td>"
+                "</tr>"
+            )
+    else:
+        lines.append(f'                <tr><td colspan="3">{html.escape(empty_message)}</td></tr>')
+
+    lines.extend(
+        [
+            "            </tbody>",
+            "        </table>",
+        ]
+    )
+    return lines
+
+page_path, private_path, public_path = sys.argv[1:4]
+private_rows = load_rows(private_path)
+public_rows = [
+    row for row in load_rows(public_path) if not is_private_ip(row[1])
+]
+
+out = []
+if private_rows:
+    out.append('    <div class="inc-content-frame inc-content-frame--table">')
+    out.extend(build_table(private_rows, "No private subdomains found.", "Private IP Address"))
+    out.append("    </div>")
+
+if public_rows or not private_rows:
+    out.append('    <div class="inc-content-frame inc-content-frame--table">')
+    if public_rows:
+        out.extend(build_table(public_rows, "No data found."))
+    else:
+        out.extend(build_table([], "No data found."))
+    out.append("    </div>")
+
+with open(page_path, "a") as handle:
+    handle.write("\n".join(out) + "\n")
+PY
+
+    {
+        echo "    </div>"
+        echo "</div>"
+        echo
+        echo '<script src="../assets/javascript/inc-data-table.js"></script>'
+        echo "</body>"
+        echo "</html>"
+    } >> "$PAGE"
+}
+
+###############################################################################################################################
+
+f_company() {
+    echo "Company HQ               ($COUNT/$TOTAL)"
+    ((COUNT++))
+
+    mkdir -p "$HOME/data/$DOMAIN/tools"
+    python3 "$DISCOVER"/parsers/company.py "$COMPANY" "$DOMAIN" "$HOME/data/$DOMAIN/tools" "$HOME/data/$DOMAIN/pages/summary.htm"
+    echo
+}
+
+###############################################################################################################################
+
+f_social() {
+    echo "Social Media             ($COUNT/$TOTAL)"
+    ((COUNT++))
+
+    mkdir -p "$HOME/data/$DOMAIN/tools"
+
+    if [ ! -f "$HOME/data/$DOMAIN/tools/social-manual.tsv" ]; then
+        cat > "$HOME/data/$DOMAIN/tools/social-manual.tsv" <<'EOF'
+# Manual social profiles — tab-separated: Platform, URL
+# Use when the homepage is bot-blocked or a profile was missed.
+# Example:
+# facebook	https://www.facebook.com/example
+# Instagram	https://www.instagram.com/example
+# Linkedin	https://www.linkedin.com/company/example
+# X	https://x.com/example
+# YouTube	https://www.youtube.com/@example
+EOF
+    fi
+
+    python3 "$DISCOVER"/parsers/social.py "$DOMAIN" "$HOME/data/$DOMAIN/tools" "$HOME/data/$DOMAIN/pages/summary.htm"
+    echo
+}
+
+###############################################################################################################################
+
+f_report_heading(){
+    printf '<span class="inc-report-heading">%s</span>\n' "$1"
+}
+
+f_report_substitute_placeholders(){
+    local page="$1"
+    local index="$2"
+
+    [ -f "$page" ] || return 0
+    [ -f "$index" ] || return 0
+
+    python3 - "$page" "$index" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+page = Path(sys.argv[1])
+index = Path(sys.argv[2])
+text = index.read_text()
+
+
+def extract(label):
+    match = re.search(
+        rf'inc-home-meta-label">{label}</span>\s*<span class="value">([^<]*)</span>',
+        text,
+    )
+    return match.group(1).strip() if match else ""
+
+
+company = extract("Company")
+domain = extract("Domain")
+if not domain:
+    domain = index.parent.name
+
+content = page.read_text()
+content = content.replace("#COMPANY#", company)
+content = content.replace("#DOMAIN#", domain)
+page.write_text(content)
+PY
+}
+
+f_report() {
+    PASSIVE_DATE=$(f_passive_scan_date)
+    {
+        f_report_heading "Summary"
+        echo "$SMALL"
+    } > zreport
+    echo > tmp
+
+    if [ -f names ]; then
+    namecount=$(wc -l names | cut -d ' ' -f1)
+    echo "Names                 $namecount" >> zreport
+    f_report_heading "Names ($namecount)" >> tmp
+    echo "$SMALL" >> tmp
+    cat names >> tmp
+    echo >> tmp
+    f_report_append_names_page "$HOME"/data/"$DOMAIN"/pages/names.htm
+else
+    f_report_append_names_page "$HOME"/data/"$DOMAIN"/pages/names.htm
+fi
+
+if [ -f emails ]; then
+    emailcount=$(wc -l emails | cut -d ' ' -f1)
+    echo "Emails                $emailcount" >> zreport
+    f_report_heading "Emails ($emailcount)" >> tmp
+    echo "$SMALL" >> tmp
+    cat emails >> tmp
+    echo >> tmp
+    f_report_append_emails_page "$HOME"/data/"$DOMAIN"/pages/emails.htm
+else
+    f_report_append_emails_page "$HOME"/data/"$DOMAIN"/pages/emails.htm
+fi
+
+if [ -f records ]; then
+    recordcount=$(wc -l records | cut -d ' ' -f1)
+    echo "DNS Records           $recordcount" >> zreport
+    f_report_heading "DNS Records ($recordcount)" >> tmp
+    echo "$LARGE" >> tmp
+    cat records >> tmp
+    echo >> tmp
+    f_report_append_records_page "$HOME"/data/"$DOMAIN"/pages/records.htm
+else
+    f_report_append_records_page "$HOME"/data/"$DOMAIN"/pages/records.htm
+fi
+
+if [ -f squatting ]; then
+    squattingcount=$(wc -l squatting | cut -d ' ' -f1)
+    echo "Squatting             $squattingcount" >> zreport
+    f_report_heading "Squatting ($squattingcount)" >> tmp
+    echo "$LARGE" >> tmp
+    column -t -s $'\t' squatting >> tmp
+    echo >> tmp
+    f_report_append_squatting_page "$HOME"/data/"$DOMAIN"/pages/squatting.htm
+else
+    f_report_append_squatting_page "$HOME"/data/"$DOMAIN"/pages/squatting.htm
+fi
+
+if [ -f public-ips ]; then
+    publicipcount=$(wc -l public-ips | cut -d ' ' -f1)
+    echo "Hosts                 $publicipcount" >> zreport
+    f_report_heading "Hosts ($publicipcount)" >> tmp
+    echo "$LARGE" >> tmp
+    cat public-ips >> tmp
+    echo >> tmp
+    f_report_append_pre_page public-ips "$HOME"/data/"$DOMAIN"/pages/hosts.htm
+else
+    f_report_append_pre_page "" "$HOME"/data/"$DOMAIN"/pages/hosts.htm
+fi
+
+if [ -f private-subs ]; then
+    privatesubcount=$(wc -l private-subs | cut -d ' ' -f1)
+    echo "Private Subdomains    $privatesubcount" >> zreport
+    f_report_heading "Private Subdomains ($privatesubcount)" >> tmp
+    echo "$LARGE" >> tmp
+    column -t -s $'\t' private-subs >> tmp
+    echo >> tmp
+fi
+
+if [ -f subdomains ]; then
+    subcount=$(wc -l subdomains | cut -d ' ' -f1)
+    echo "Subdomains            $subcount" >> zreport
+    f_report_heading "Subdomains ($subcount)" >> tmp
+    echo "$LARGE" >> tmp
+    column -t -s $'\t' subdomains >> tmp
+    echo >> tmp
+fi
+
+f_report_append_subdomains_page "$HOME"/data/"$DOMAIN"/pages/subdomains.htm
+
+if [ -f xls ]; then
+    xlscount=$(wc -l xls | cut -d ' ' -f1)
+    echo "Excel                 $xlscount" >> zreport
+    f_report_heading "Excel Files ($xlscount)" >> tmp
+    echo "$LARGE" >> tmp
+    cat xls >> tmp
+    echo >> tmp
+    f_report_append_pre_page xls "$HOME"/data/"$DOMAIN"/pages/xls.htm
+else
+    f_report_append_pre_page "" "$HOME"/data/"$DOMAIN"/pages/xls.htm
+fi
+
+if [ -f pdf ]; then
+    pdfcount=$(wc -l pdf | cut -d ' ' -f1)
+    echo "PDF                   $pdfcount" >> zreport
+    f_report_heading "PDF Files ($pdfcount)" >> tmp
+    echo "$LARGE" >> tmp
+    cat pdf >> tmp
+    echo >> tmp
+    f_report_append_pre_page pdf "$HOME"/data/"$DOMAIN"/pages/pdf.htm
+else
+    f_report_append_pre_page "" "$HOME"/data/"$DOMAIN"/pages/pdf.htm
+fi
+
+if [ -f ppt ]; then
+    pptcount=$(wc -l ppt | cut -d ' ' -f1)
+    echo "PowerPoint            $pptcount" >> zreport
+    f_report_heading "PowerPoint Files ($pptcount)" >> tmp
+    echo "$LARGE" >> tmp
+    cat ppt >> tmp
+    echo >> tmp
+    f_report_append_pre_page ppt "$HOME"/data/"$DOMAIN"/pages/ppt.htm
+else
+    f_report_append_pre_page "" "$HOME"/data/"$DOMAIN"/pages/ppt.htm
+fi
+
+if [ -f txt ]; then
+    txtcount=$(wc -l txt | cut -d ' ' -f1)
+    echo "Text                  $txtcount" >> zreport
+    f_report_heading "Text Files ($txtcount)" >> tmp
+    echo "$LARGE" >> tmp
+    cat txt >> tmp
+    echo >> tmp
+    f_report_append_pre_page txt "$HOME"/data/"$DOMAIN"/pages/txt.htm
+else
+    f_report_append_pre_page "" "$HOME"/data/"$DOMAIN"/pages/txt.htm
+fi
+
+if [ -f doc ]; then
+    doccount=$(wc -l doc | cut -d ' ' -f1)
+    echo "Word                  $doccount" >> zreport
+    f_report_heading "Word Files ($doccount)" >> tmp
+    echo "$LARGE" >> tmp
+    cat doc >> tmp
+    echo >> tmp
+    f_report_append_pre_page doc "$HOME"/data/"$DOMAIN"/pages/doc.htm
+else
+    f_report_append_pre_page "" "$HOME"/data/"$DOMAIN"/pages/doc.htm
+fi
+
+cat tmp >> zreport
+
+if [ -f whois-domain ]; then
+    f_report_heading "Whois Domain" >> zreport
+    echo "$LARGE" >> zreport
+    cat whois-domain >> zreport
+    f_report_append_pre_page whois-domain "$HOME"/data/"$DOMAIN"/pages/whois-domain.htm
+else
+    f_report_append_pre_page "" "$HOME"/data/"$DOMAIN"/pages/whois-domain.htm
+fi
+
+if [ -f whois-ip ]; then
+    echo >> zreport
+    f_report_heading "Whois IP" >> zreport
+    echo "$LARGE" >> zreport
+    cat whois-ip >> zreport
+    f_report_append_pre_page whois-ip "$HOME"/data/"$DOMAIN"/pages/whois-ip.htm
+else
+    f_report_append_pre_page "" "$HOME"/data/"$DOMAIN"/pages/whois-ip.htm
+fi
+
+    f_report_append_pre_page zreport "$HOME"/data/"$DOMAIN"/pages/passive.htm
+
+    if [ -n "$PASSIVE_DATE" ]; then
+        PASSIVE_DATE_SED=$(f_sed_replacement_escape "$PASSIVE_DATE")
+        sed -i "s|#PASSIVE_SCAN_DATE#|$PASSIVE_DATE_SED|" "$HOME"/data/"$DOMAIN"/pages/passive.htm
+    fi
+
+    f_report_substitute_placeholders \
+        "$HOME/data/$DOMAIN/pages/passive.htm" \
+        "$HOME/data/$DOMAIN/index.htm"
+
+    mkdir -p "$HOME/data/$DOMAIN/tools"
+    echo "$PASSIVE_DATE" > "$HOME/data/$DOMAIN/tools/passive-scan-date"
+
+    # Homepage date = day recon finished (not only when the tree was created).
+    if [ -f "${DISCOVER:-}/recon/touch-report-date.py" ]; then
+        python3 "${DISCOVER}/recon/touch-report-date.py" "$HOME/data/$DOMAIN" >/dev/null 2>&1 || true
+    fi
+
+    rm tmp* zreport 2>/dev/null
+
+    mkdir -p "$HOME/data/$DOMAIN/tools"
+
+    if [ ! -f "$HOME/data/$DOMAIN/tools/names-manual.tsv" ]; then
+        cat > "$HOME/data/$DOMAIN/tools/names-manual.tsv" <<'EOF'
+# Manual contacts — tab-separated: Name, Title, Phone
+# Add one person per line, then run Audit → Import → Names (or import-names.sh).
+EOF
+    fi
+
+    if [ ! -f "$HOME/data/$DOMAIN/tools/subdomains-import.tsv" ]; then
+        cat > "$HOME/data/$DOMAIN/tools/subdomains-import.tsv" <<'EOF'
+# Manual subdomains — tab-separated: Subdomain, IP (IP optional)
+# Add one host per line, then run Audit → Import → Subdomains (or import-subdomains.sh).
+EOF
+    fi
+
+    if [ ! -f "$HOME/data/$DOMAIN/tools/social-manual.tsv" ]; then
+        cat > "$HOME/data/$DOMAIN/tools/social-manual.tsv" <<'EOF'
+# Manual social profiles — tab-separated: Platform, URL
+# Use when the homepage is bot-blocked or a profile was missed.
+EOF
+    fi
+
+    mv names emails hosts hudsonrock*.json hudsonrock.txt private-ips private-subs public-ips records social.tsv company.json sec-company-tickers.json sec-people.json homepage.html squatting subdomains tmp* whois* z* doc pdf ppt txt xls "$HOME/data/$DOMAIN/tools/" 2>/dev/null
+    cd "$PWD" || exit
+
+    # Engagement audit log + Audit page
+    if declare -F f_audit_log >/dev/null 2>&1; then
+        f_audit_log "$HOME/data/$DOMAIN" "Ran passive recon"
+    else
+        mkdir -p "$HOME/data/$DOMAIN/tools/audit" 2>/dev/null || true
+        ts=$(date -u +"%m/%d/%Y - %H:%M Z")
+        op=$(head -n 1 "${HOME}/.discover/operator-name" 2>/dev/null | tr -d '\r' | tr -cd "A-Za-z" | cut -c1-10)
+        [ -n "$op" ] || op=unknown
+        ip=$(curl -4 -fsS --connect-timeout 5 --max-time 10 http://ifconfig.me 2>/dev/null | tr -d '[:space:]')
+        [ -n "$ip" ] || ip=unknown
+        printf '%s | %s | %s | Ran passive recon.\n' "$ts" "$op" "$ip" >> "$HOME/data/$DOMAIN/tools/audit/log.txt" 2>/dev/null || true
+    fi
+
+    if [ -n "${DISCOVER:-}" ] && [ -f "$DISCOVER/recon/audit-build.py" ]; then
+        python3 "$DISCOVER/recon/audit-build.py" "$HOME/data/$DOMAIN" "$DISCOVER/report/pages/audit.htm" >/dev/null 2>&1 || true
+    fi
+
+    echo
+    echo "$MEDIUM"
+    echo
+    echo -e "Supporting data folder located at ${YELLOW}$HOME/data/$DOMAIN/${NC}\n"
+}
+
+###############################################################################################################################
+
+# Comment out functions for tools you don't want to run.
+
+case "$PASSIVE_MODE" in
+98) f_theharvester; echo; exit 0 ;;
+99) f_theharvester_api; echo; exit 0 ;;
+esac
+
+f_amass
+f_arin
+f_dnsrecon
+f_dnstwist
+f_hudsonrock
+f_intodns
+f_metasploit
+f_subfinder
+f_sublist3r
+f_shodan_ctl
+f_theharvester
+f_theharvester_api
+f_whois_domain
+f_whois_ip
+f_sec_people
+f_aggregate
+f_social
+f_company
+f_report
+exit 0

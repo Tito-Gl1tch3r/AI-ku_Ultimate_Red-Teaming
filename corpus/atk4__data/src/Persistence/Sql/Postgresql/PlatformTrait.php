@@ -1,0 +1,211 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Atk4\Data\Persistence\Sql\Postgresql;
+
+use Atk4\Data\Persistence\Sql\Connection;
+use Doctrine\DBAL\Schema\Column;
+use Doctrine\DBAL\Schema\Table;
+
+if (!Connection::isDbal3x()) {
+    trait PlatformTraitTrait
+    {
+        #[\Override]
+        public function convertBooleansToDatabaseValue($item): mixed
+        {
+            return $this->_convertBooleansToDatabaseValue($item);
+        }
+    }
+} else {
+    trait PlatformTraitTrait
+    {
+        #[\Override]
+        public function convertBooleansToDatabaseValue($item)
+        {
+            return $this->_convertBooleansToDatabaseValue($item);
+        }
+    }
+}
+
+trait PlatformTrait
+{
+    use PlatformTraitTrait;
+
+    // standard PostgreSQL character types are case sensitive, unify the behavior with other databases
+    // with custom case insensitive types
+
+    /**
+     * @return list<string>
+     */
+    private function getCreateCaseInsensitiveDomainsSql(): array
+    {
+        $sqls = [];
+
+        $sqls[] = 'DO' . "\n"
+            . '$$' . "\n"
+            . 'BEGIN' . "\n"
+            . '    IF to_regtype(\'citext\') IS NULL THEN' . "\n"
+            . '        CREATE EXTENSION citext;' . "\n"
+            . '    END IF;' . "\n"
+            . implode("\n", array_map(static function (string $domain): string {
+                return '    IF to_regtype(\'' . $domain . '\') IS NULL THEN' . "\n"
+                    . '        CREATE DOMAIN ' . $domain . ' AS citext;' . "\n"
+                    . '    END IF;';
+            }, ['atk4__cichar', 'atk4__civarchar'])) . "\n"
+            . 'END' . "\n"
+            . '$$';
+
+        return $sqls;
+    }
+
+    protected function getCharTypeDeclarationSQLSnippet($length): string
+    {
+        return 'ATK4__CICHAR';
+    }
+
+    /**
+     * @param bool $fixed
+     */
+    #[\Override]
+    protected function getVarcharTypeDeclarationSQLSnippet($length, $fixed = false): string
+    {
+        return $fixed
+            ? $this->getCharTypeDeclarationSQLSnippet($length)
+            : 'ATK4__CIVARCHAR';
+    }
+
+    #[\Override]
+    public function getClobTypeDeclarationSQL(array $column): string
+    {
+        return 'CITEXT';
+    }
+
+    #[\Override]
+    protected function initializeDoctrineTypeMappings(): void
+    {
+        parent::initializeDoctrineTypeMappings();
+
+        $this->doctrineTypeMapping['atk4__cichar'] = 'string';
+        $this->doctrineTypeMapping['atk4__civarchar'] = 'string';
+
+        // https://github.com/doctrine/dbal/pull/5495
+        $this->doctrineTypeMapping['citext'] = 'text';
+    }
+
+    #[\Override]
+    public function getCurrentDatabaseExpression(bool $includeSchema = false): string
+    {
+        if ($includeSchema) {
+            return 'CONCAT(CURRENT_DATABASE(), \'.\', CURRENT_SCHEMA())';
+        }
+
+        return parent::getCurrentDatabaseExpression();
+    }
+
+    /**
+     * @param mixed $item
+     *
+     * @return mixed
+     */
+    protected function _convertBooleansToDatabaseValue($item)
+    {
+        return $item;
+    }
+
+    // PostgreSQL DBAL platform uses SERIAL column type for autoincrement which does not increment
+    // when a row with a not-null PK is inserted like Sqlite or MySQL does, unify the behavior
+
+    private function getPrimaryKeyColumn(Table $table): ?Column
+    {
+        if ($table->getPrimaryKey() === null) {
+            return null;
+        }
+
+        return $table->getColumn($table->getPrimaryKey()->getColumns()[0]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    protected function getCreateAutoincrementSql(Table $table, Column $pkColumn): array
+    {
+        $sqls = [];
+
+        $pkSeqName = $this->getIdentitySequenceName($table->getName(), $pkColumn->getName());
+
+        $sqls[] = (new Expression(
+            // else branch should be maybe (because of concurrency) put into after update trigger
+            // with pure nextval instead of setval with a loop like in Oracle trigger
+            str_replace('[pk_seq]', '\'' . $pkSeqName . '\'', <<<'EOF'
+                CREATE OR REPLACE FUNCTION {{trigger_func}}()
+                RETURNS trigger AS $$
+                DECLARE
+                    atk4__pk_seq_last__ {table}.{pk}%TYPE;
+                BEGIN
+                    IF (NEW.{pk} IS NULL) THEN
+                        NEW.{pk} := nextval([pk_seq]);
+                    ELSE
+                        SELECT COALESCE(last_value, 0) INTO atk4__pk_seq_last__ FROM {{pk_seq}};
+                        IF (atk4__pk_seq_last__ <= NEW.{pk}) THEN
+                            atk4__pk_seq_last__  := setval([pk_seq], NEW.{pk}, true);
+                        END IF;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql
+                EOF),
+            [
+                'table' => $table->getShortestName($table->getNamespaceName()), // TODO should be probably name /w schema, but it is not supported, get variable type differently
+                'pk' => $pkColumn->getName(),
+                'pk_seq' => $pkSeqName,
+                'trigger_func' => $table->getName() . '_AI_FUNC',
+            ]
+        ))->render()[0];
+
+        $sqls[] = (new Expression(
+            <<<'EOF'
+                CREATE TRIGGER {trigger}
+                    BEFORE INSERT OR UPDATE
+                    ON {{table}}
+                    FOR EACH ROW
+                EXECUTE PROCEDURE {{trigger_func}}()
+                EOF,
+            [
+                'table' => $table->getName(),
+                'trigger' => $table->getShortestName($table->getNamespaceName()) . '_AI_PK',
+                'trigger_func' => $table->getName() . '_AI_FUNC',
+            ]
+        ))->render()[0];
+
+        return $sqls;
+    }
+
+    /**
+     * @param 1|2 $createFlags
+     */
+    #[\Override]
+    public function getCreateTableSQL(Table $table, $createFlags = self::CREATE_INDEXES): array
+    {
+        $sqls = array_merge(
+            $this->getCreateCaseInsensitiveDomainsSql(),
+            parent::getCreateTableSQL($table, $createFlags)
+        );
+
+        $pkColumn = $this->getPrimaryKeyColumn($table);
+        if ($pkColumn !== null) {
+            $sqls = array_merge($sqls, $this->getCreateAutoincrementSql($table, $pkColumn));
+        }
+
+        return $sqls;
+    }
+
+    /**
+     * @param string $tableName
+     * @param string $columnName
+     */
+    public function getIdentitySequenceName($tableName, $columnName): string
+    {
+        return $tableName . '_' . $columnName . '_seq';
+    }
+}

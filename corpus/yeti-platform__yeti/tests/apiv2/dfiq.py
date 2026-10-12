@@ -1,0 +1,708 @@
+import io
+import json
+import logging
+import sys
+import unittest
+from zipfile import ZipFile
+
+from fastapi.testclient import TestClient
+
+from core import database_arango
+from core.schemas import dfiq
+from core.schemas.user import UserSensitive
+from core.web import webapp
+
+client = TestClient(webapp.app)
+
+
+class DFIQTest(unittest.TestCase):
+    def setUp(self) -> None:
+        logging.disable(sys.maxsize)
+        database_arango.db.connect(database="yeti_test")
+        database_arango.db.truncate()
+
+        user = UserSensitive(username="test", password="test", enabled=True).save()
+        apikey = user.create_api_key("default")
+        token_data = client.post(
+            "/api/v2/auth/api-token", headers={"x-yeti-apikey": apikey}
+        ).json()
+        client.headers = {"Authorization": "Bearer " + token_data["access_token"]}
+
+    def test_config(self) -> None:
+        dfiq.DFIQFacet(
+            name="mock_facet",
+            dfiq_id="F1005",
+            uuid="00000000-0000-4000-8000-000000000004",
+            dfiq_version="1.1.0",
+            description="desc",
+            parent_ids=[],
+            dfiq_yaml="mock",
+        ).save()
+
+        with open("tests/dfiq_test_data/Q1020.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/from_yaml",
+            json={
+                "dfiq_yaml": yaml_string,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+
+        response = client.get("/api/v2/dfiq/config")
+        data = response.json()
+
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["stage_types"], ["analysis", "collection"])
+        self.assertEqual(
+            data["step_types"],
+            ["ForensicArtifact", "opensearch-query", "opensearch-query-second"],
+        )
+
+    def test_new_dfiq_scenario(self) -> None:
+        with open("tests/dfiq_test_data/S1003.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/from_yaml",
+            json={
+                "dfiq_yaml": yaml_string,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertIsNotNone(data["id"])
+        self.assertIsNotNone(data["created"])
+        self.assertEqual(data["name"], "scenario1")
+        self.assertEqual(data["dfiq_id"], "S1003")
+        self.assertEqual(data["dfiq_version"], "1.1.0")
+        self.assertEqual(data["description"], "Long description 1\n")
+        self.assertEqual(data["type"], dfiq.DFIQType.scenario)
+        self.assertEqual(data["dfiq_tags"], ["Tag1", "Tag2", "Tag3"])
+
+    def test_get_dfiq_by_name(self) -> None:
+        with open("tests/dfiq_test_data/S1003.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/from_yaml",
+            json={
+                "dfiq_yaml": yaml_string,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+
+        response = client.get("/api/v2/dfiq/", params={"name": "scenario1"})
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["id"], data["id"])
+        self.assertEqual(data["name"], "scenario1")
+
+    def test_new_dfiq_facet(self) -> None:
+        scenario = dfiq.DFIQScenario(
+            name="mock_scenario",
+            dfiq_id="S1003",
+            uuid="00000000-0000-4000-8000-000000000003",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        with open("tests/dfiq_test_data/F1005.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/from_yaml",
+            json={
+                "dfiq_yaml": yaml_string,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertIsNotNone(data["id"])
+        self.assertIsNotNone(data["created"])
+        self.assertEqual(data["name"], "facet1")
+        self.assertEqual(data["dfiq_id"], "F1005")
+        self.assertEqual(data["dfiq_version"], "1.1.0")
+        self.assertEqual(data["description"], "Long description of facet1\n")
+        self.assertEqual(data["type"], dfiq.DFIQType.facet)
+        self.assertEqual(data["dfiq_tags"], ["Web Browser"])
+        self.assertEqual(data["parent_ids"], ["S1003"])
+
+        vertices, edges, total = scenario.neighbors()
+        self.assertEqual(len(vertices), 1)
+        self.assertEqual(vertices[f"dfiq/{data['id']}"].dfiq_id, "F1005")
+        self.assertEqual(edges[0][0].type, "facet")
+        self.assertEqual(edges[0][0].description, "Uses DFIQ facet")
+        self.assertEqual(total, 1)
+
+    def test_new_dfiq_question(self) -> None:
+        facet = dfiq.DFIQFacet(
+            name="mock_facet",
+            dfiq_id="F1005",
+            uuid="00000000-0000-4000-8000-000000000004",
+            dfiq_version="1.1.0",
+            description="desc",
+            parent_ids=["S1003"],
+            dfiq_yaml="mock",
+        ).save()
+
+        with open("tests/dfiq_test_data/Q1020.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/from_yaml",
+            json={
+                "dfiq_yaml": yaml_string,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertIsNotNone(data["id"])
+        self.assertIsNotNone(data["created"])
+        self.assertEqual(data["name"], "What is a question?")
+        self.assertEqual(data["dfiq_id"], "Q1020")
+        self.assertEqual(data["dfiq_version"], "1.1.0")
+        self.assertEqual(data["description"], None)
+        self.assertEqual(data["type"], dfiq.DFIQType.question)
+        self.assertEqual(data["dfiq_tags"], ["Web Browser"])
+        self.assertEqual(data["parent_ids"], ["F1005"])
+
+        vertices, edges, total = facet.neighbors()
+        self.assertEqual(len(vertices), 1)
+        self.assertEqual(vertices[f"dfiq/{data['id']}"].dfiq_id, "Q1020")
+        self.assertEqual(edges[0][0].type, "question")
+        self.assertEqual(edges[0][0].description, "Uses DFIQ question")
+        self.assertEqual(total, 1)
+
+    def test_delete_with_children_ref_uuid(self) -> None:
+        scenario = dfiq.DFIQScenario(
+            name="mock_scenario",
+            dfiq_id="S1003",
+            uuid="00000000-0000-4000-8000-000000000003",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        facet = dfiq.DFIQFacet(
+            name="mock_facet",
+            dfiq_id="F1005",
+            uuid="00000000-0000-4000-8000-000000000004",
+            dfiq_version="1.1.0",
+            description="desc",
+            parent_ids=["00000000-0000-4000-8000-000000000003"],
+            dfiq_yaml="mock",
+        ).save()
+
+        response = client.delete(f"/api/v2/dfiq/{scenario.id}")
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+
+        response = client.get(f"/api/v2/dfiq/{facet.id}")
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["parent_ids"], [])
+
+    def test_delete_with_children_ref_dfiqd(self) -> None:
+        scenario = dfiq.DFIQScenario(
+            name="mock_scenario",
+            dfiq_id="S1003",
+            uuid="00000000-0000-4000-8000-000000000003",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        facet = dfiq.DFIQFacet(
+            name="mock_facet",
+            dfiq_id="F1005",
+            uuid="00000000-0000-4000-8000-000000000004",
+            dfiq_version="1.1.0",
+            description="desc",
+            parent_ids=["S1003"],
+            dfiq_yaml="mock",
+        ).save()
+
+        response = client.delete(f"/api/v2/dfiq/{scenario.id}")
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+
+        response = client.get(f"/api/v2/dfiq/{facet.id}")
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["parent_ids"], [])
+
+    def test_dfiq_patch_yaml(self) -> None:
+        scenario = dfiq.DFIQScenario(
+            name="existing_scenario",
+            dfiq_id="S1003",
+            uuid="2ee16263-56f8-49a5-9b33-d1a2dd8b829c",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        with open("tests/dfiq_test_data/S1003.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.patch(
+            f"/api/v2/dfiq/{scenario.id}",
+            json={"dfiq_yaml": yaml_string},
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["dfiq_id"], "S1003")
+        self.assertEqual(data["uuid"], "2ee16263-56f8-49a5-9b33-d1a2dd8b829c")
+        # check that we have the description from the yaml
+        self.assertEqual(data["description"], "Long description 1\n")
+
+    def test_dfiq_patch_object(self):
+        question = dfiq.DFIQQuestion(
+            name="What is a question?",
+            uuid="bd46ce6e-c933-46e5-960c-36945aaef401",
+            dfiq_version="1.1.0",
+            description="desc",
+            parent_ids=[],
+            dfiq_yaml="mock",
+            approaches=[
+                dfiq.DFIQApproach(
+                    name="public_approach",
+                    description="desc",
+                    tags=["public"],
+                    steps=[
+                        dfiq.DFIQApproachStep(
+                            name="step1",
+                            description="desc",
+                            type="ForensicArtifact",
+                            stage="analysis",
+                        ),
+                        dfiq.DFIQApproachStep(
+                            name="step2",
+                            description="desc",
+                            type="opensearch-query",
+                            stage="collection",
+                        ),
+                    ],
+                ),
+                dfiq.DFIQApproach(
+                    name="internal_approach",
+                    description="desc",
+                    tags=["internal"],
+                    steps=[],
+                ),
+            ],
+        ).save()
+
+        question.description = "patched description"
+        question.approaches.append(
+            dfiq.DFIQApproach(
+                name="new_approach",
+                description="desc",
+                tags=["public"],
+                steps=[
+                    dfiq.DFIQApproachStep(
+                        name="step1",
+                        description="desc",
+                        type="opensearch-query",
+                        stage="collection",
+                        value="***",
+                    ),
+                ],
+            )
+        )
+
+        question_json = json.loads(question.model_dump_json())
+        response = client.patch(
+            f"/api/v2/dfiq/{question.id}",
+            json={"dfiq_object": question_json},
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["description"], "patched description")
+        self.assertEqual(len(data["approaches"]), 3)
+        self.assertEqual(data["approaches"][2]["name"], "new_approach")
+        self.assertEqual(len(data["approaches"][2]["steps"]), 1)
+        self.assertEqual(data["approaches"][2]["steps"][0]["type"], "opensearch-query")
+        self.assertEqual(data["approaches"][2]["steps"][0]["value"], "***")
+        self.assertNotIn("mock", data["dfiq_yaml"])
+
+    def test_dfiq_patch_updates_parents(self) -> None:
+        scenario1 = dfiq.DFIQScenario(
+            name="mock_scenario",
+            dfiq_id="S1003",
+            uuid="00000000-0000-4000-8000-000000000001",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        scenario2 = dfiq.DFIQScenario(
+            name="mock_scenario2",
+            dfiq_id="S1222",
+            uuid="00000000-0000-4000-8000-000000000002",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        facet = dfiq.DFIQFacet(
+            name="mock_facet",
+            dfiq_id="F1005",
+            uuid="00000000-0000-4000-8000-000000000004",
+            dfiq_version="1.1.0",
+            description="desc",
+            parent_ids=["S1003"],
+            dfiq_yaml="mock",
+        ).save()
+
+        facet.update_parents()
+
+        facet.parent_ids = ["S1222"]
+
+        response = client.patch(
+            f"/api/v2/dfiq/{facet.id}",
+            json={"dfiq_yaml": facet.to_yaml()},
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["parent_ids"], ["S1222"])
+        self.assertEqual(data["dfiq_id"], facet.dfiq_id)
+        self.assertEqual(data["id"], facet.id)
+
+        vertices, edges, total = scenario1.neighbors()
+        self.assertEqual(len(vertices), 0)
+        self.assertEqual(total, 0)
+
+        vertices, edges, total = scenario2.neighbors()
+        self.assertEqual(len(vertices), 1)
+        self.assertEqual(vertices[f"dfiq/{facet.id}"].dfiq_id, "F1005")
+        self.assertEqual(edges[0][0].type, "facet")
+        self.assertEqual(edges[0][0].description, "Uses DFIQ facet")
+        self.assertEqual(total, 1)
+
+    def test_dfiq_patch_prunes_parents(self) -> None:
+        scenario1 = dfiq.DFIQScenario(
+            name="mock_scenario",
+            dfiq_id="S1003",
+            uuid="00000000-0000-4000-8000-000000000001",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        scenario2 = dfiq.DFIQScenario(
+            name="mock_scenario2",
+            dfiq_id="S1222",
+            uuid="00000000-0000-4000-8000-000000000002",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        facet = dfiq.DFIQFacet(
+            name="mock_facet",
+            dfiq_id="F1005",
+            uuid="00000000-0000-4000-8000-000000000004",
+            dfiq_version="1.1.0",
+            description="desc",
+            parent_ids=["S1003"],
+            dfiq_yaml="mock",
+        ).save()
+
+        facet.update_parents()
+
+        facet.parent_ids = []
+
+        vertices, edges, total = scenario1.neighbors()
+        self.assertEqual(len(vertices), 1)
+        self.assertEqual(total, 1)
+
+        response = client.patch(
+            f"/api/v2/dfiq/{facet.id}",
+            json={"dfiq_yaml": facet.to_yaml()},
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["parent_ids"], [])
+        self.assertEqual(data["dfiq_id"], facet.dfiq_id)
+        self.assertEqual(data["id"], facet.id)
+
+        vertices, edges, total = scenario1.neighbors()
+        self.assertEqual(len(vertices), 0)
+        self.assertEqual(total, 0)
+
+        vertices, edges, total = scenario2.neighbors()
+        self.assertEqual(len(vertices), 0)
+        self.assertEqual(total, 0)
+
+    def test_dfiq_patch_question_updates_indicators(self) -> None:
+        dfiq.DFIQScenario(
+            name="mock_scenario",
+            uuid="00000000-0000-4000-8000-000000000003",
+            dfiq_id="S1003",
+            dfiq_version="1.1.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        dfiq.DFIQFacet(
+            name="mock_facet",
+            uuid="00000000-0000-4000-8000-000000000004",
+            dfiq_version="1.1.0",
+            dfiq_id="F1005",
+            description="desc",
+            parent_ids=["S1003"],
+            dfiq_yaml="mock",
+        ).save()
+
+        dfiq.DFIQQuestion(
+            name="What is a question?",
+            uuid="bd46ce6e-c933-46e5-960c-36945aaef401",
+            dfiq_version="1.1.0",
+            description="desc",
+            parent_ids=["F1005"],
+            dfiq_yaml="mock",
+            approaches=[],
+        ).save()
+
+        with open("tests/dfiq_test_data/Q1020_no_indicators.yaml", "r") as f:
+            yaml_string = f.read()
+        question = dfiq.DFIQQuestion.from_yaml(yaml_string).save()
+        question.update_parents()
+
+        vertices, edges, total = question.neighbors()
+        self.assertEqual(len(vertices), 1)
+        self.assertEqual(total, 1)
+
+        with open("tests/dfiq_test_data/Q1020.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.patch(
+            f"/api/v2/dfiq/{question.id}",
+            json={
+                "dfiq_yaml": yaml_string,
+                "update_indicators": False,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        vertices, edges, total = question.neighbors()
+        self.assertEqual(len(vertices), 1)
+        self.assertEqual(total, 1)
+
+        response = client.patch(
+            f"/api/v2/dfiq/{question.id}",
+            json={
+                "dfiq_yaml": yaml_string,
+                "update_indicators": True,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        vertices, edges, total = question.neighbors()
+        self.assertEqual(len(vertices), 3)
+        self.assertEqual(total, 3)
+
+    def test_wrong_parent(self) -> None:
+        with open("tests/dfiq_test_data/F1005.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/from_yaml",
+            json={
+                "dfiq_yaml": yaml_string,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 400, data)
+        self.assertEqual(data, {"detail": "Missing parent(s), provided ['S1003']"})
+        existing = dfiq.DFIQFacet.find(dfiq_id="F1005")
+        self.assertIsNone(existing)
+
+    def test_valid_dfiq_yaml(self) -> None:
+        with open("tests/dfiq_test_data/S1003.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/validate",
+            json={
+                "dfiq_yaml": yaml_string,
+                "check_id": True,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["valid"], True)
+
+        with open("tests/dfiq_test_data/F1005.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/validate",
+            json={
+                "dfiq_yaml": yaml_string,
+                "check_id": True,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["valid"], True)
+
+        with open("tests/dfiq_test_data/Q1020.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/validate",
+            json={
+                "dfiq_yaml": yaml_string,
+                "check_id": True,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data["valid"], True)
+
+    def test_standalone_question_creation(self):
+        with open("tests/dfiq_test_data/Q1020_no_parents.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/from_yaml",
+            json={
+                "dfiq_yaml": yaml_string,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertIsNotNone(data["id"])
+        self.assertEqual(data["parent_ids"], [])
+
+    def test_upload_dfiq_archive(self):
+        with open("tests/dfiq_test_data/dfiq_test_data.zip", "rb") as zip_archive:
+            response = client.post(
+                "/api/v2/dfiq/from_archive",
+                files={"archive": ("test_archive.zip", zip_archive, "application/zip")},
+            )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(data, {"total_added": 3})
+
+    def test_to_archive(self):
+        dfiq.DFIQScenario(
+            name="public_scenario",
+            uuid="00000000-0000-4000-8000-000000000005",
+            dfiq_id="S1003",
+            dfiq_version="1.0.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        dfiq.DFIQScenario(
+            name="private_scenario",
+            uuid="00000000-0000-4000-8000-000000000006",
+            dfiq_id="S0003",
+            dfiq_tags=["internal"],
+            dfiq_version="1.0.0",
+            description="desc",
+            dfiq_yaml="mock",
+        ).save()
+
+        dfiq.DFIQQuestion(
+            name="semi_private_question",
+            uuid="00000000-0000-4000-8000-000000000007",
+            dfiq_id="Q1020",
+            dfiq_version="1.0.0",
+            description="desc",
+            parent_ids=["F1005"],
+            dfiq_yaml="mock",
+            approaches=[
+                dfiq.DFIQApproach(
+                    name="public_approach",
+                    description="desc",
+                    tags=["public"],
+                ),
+                dfiq.DFIQApproach(
+                    name="internal_approach",
+                    description="desc",
+                    tags=["internal"],
+                ),
+            ],
+        ).save()
+
+        response = client.post("/api/v2/dfiq/to_archive", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/zip")
+        self.assertEqual(
+            response.headers["content-disposition"], 'attachment; filename="dfiq.zip"'
+        )
+
+        with ZipFile(io.BytesIO(response.content)) as archive:
+            files = archive.namelist()
+            self.assertEqual(len(files), 4)
+            self.assertIn(
+                "public/scenarios/00000000-0000-4000-8000-000000000005.yaml", files
+            )
+            self.assertIn(
+                "internal/scenarios/00000000-0000-4000-8000-000000000006.yaml", files
+            )
+            self.assertIn(
+                "public/questions/00000000-0000-4000-8000-000000000007.yaml", files
+            )
+            self.assertIn(
+                "internal/questions/00000000-0000-4000-8000-000000000007.yaml", files
+            )
+
+            with archive.open(
+                "public/scenarios/00000000-0000-4000-8000-000000000005.yaml"
+            ) as f:
+                content = f.read().decode("utf-8")
+                self.assertIn("public_scenario", content)
+            with archive.open(
+                "internal/scenarios/00000000-0000-4000-8000-000000000006.yaml"
+            ) as f:
+                content = f.read().decode("utf-8")
+                self.assertIn("private_scenario", content)
+            with archive.open(
+                "public/questions/00000000-0000-4000-8000-000000000007.yaml"
+            ) as f:
+                content = f.read().decode("utf-8")
+                self.assertIn("semi_private_question", content)
+                self.assertIn("public_approach", content)
+                self.assertNotIn("internal_approach", content)
+            with archive.open(
+                "internal/questions/00000000-0000-4000-8000-000000000007.yaml"
+            ) as f:
+                content = f.read().decode("utf-8")
+                self.assertIn("semi_private_question", content)
+                self.assertIn("public_approach", content)
+                self.assertIn("internal_approach", content)
+
+    def test_get_multiple(self):
+        with open("tests/dfiq_test_data/S1003.yaml", "r") as f:
+            yaml_string = f.read()
+
+        response = client.post(
+            "/api/v2/dfiq/from_yaml",
+            json={
+                "dfiq_yaml": yaml_string,
+            },
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+
+        # get/multiple queries the arangosearch dfiq_view, which is eventually
+        # consistent. Under TESTING the view query forces waitForSync, so no
+        # sleep is needed here (a 1s sleep was still racy on slower CI runners).
+        response = client.post(
+            "/api/v2/dfiq/get/multiple",
+            json={"names": ["scenario1"], "page": 0, "count": 10},
+        )
+        data = response.json()
+        self.assertEqual(response.status_code, 200, data)
+        self.assertEqual(len(data["dfiq"]), 1)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["dfiq"][0]["name"], "scenario1")
