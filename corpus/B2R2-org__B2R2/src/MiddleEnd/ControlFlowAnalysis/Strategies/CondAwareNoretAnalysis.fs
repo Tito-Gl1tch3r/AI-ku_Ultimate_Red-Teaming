@@ -1,0 +1,352 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.MiddleEnd.ControlFlowAnalysis.Strategies
+
+open System.Collections.Generic
+open System.Runtime.InteropServices
+open B2R2
+open B2R2.BinIR
+open B2R2.FrontEnd
+open B2R2.MiddleEnd.BinGraph
+open B2R2.MiddleEnd.ConcEval
+open B2R2.MiddleEnd.ControlFlowGraph
+open B2R2.MiddleEnd.ControlFlowAnalysis
+open B2R2.MiddleEnd.DataFlow
+open type UntouchedValueDomain.UntouchedTag
+
+/// This is a non-returning function identification strategy that can check
+/// conditionally non-returning functions. We currently support only those
+/// simple patterns that are handled by compilers, but we may have to extend
+/// this as the compilers evolve.
+type CondAwareNoretAnalysis([<Optional; DefaultParameterValue(true)>] strict) =
+  /// Default value used for unknown non-returning status.
+  let defaultStatus = if strict then NoRet else NotNoRet
+
+  let hasNoReturnFallThrough g (v: IVertex<LowUIRBasicBlock>) =
+    assert (v.VData.Internals.IsAbstract)
+    let succEdges = (g: IDiGraph<_, _>).GetSuccEdges v
+    match succEdges |> Array.tryExactlyOne with
+    | Some(e) -> e.Label = NoReturnFallThroughEdge
+    | None -> false
+
+  let meet a b =
+    match a, b with
+    | _ when a = b -> a
+    | UnknownNoRet, _ -> b
+    | _, UnknownNoRet -> a
+    | NotNoRet, _ -> a
+    | _, NotNoRet -> b
+    | NoRet, ConditionalNoRet _ -> b
+    | ConditionalNoRet _, NoRet -> a
+    | ConditionalNoRet n1, ConditionalNoRet n2 when n1 <> n2 -> NoRet
+    | _ -> Terminator.impossible ()
+
+  let tryGetValue (state: LowUIRSparseDataFlow.State<_>) v varKind =
+    let defs = state.PerVertexIncomingDefs[v]
+    match Map.tryFind varKind defs with
+    | Some defVp -> state.GetAbsValue defVp |> Some
+    | None -> None
+
+  let untouchedArgIndexX86FromIRCFG ctx frameDist pp state nth =
+    let argOff = uint64 <| frameDist - 4 * nth
+    let varKind = Memory <| Some(Constants.InitialStackPointer + argOff)
+    let absV = ctx.Vertices[pp]
+    match tryGetValue state absV varKind with
+    | Some(UntouchedValueDomain.Untouched(RegisterTag(StackLocal off))) ->
+      Some(-off / 4)
+    | _ ->
+      None
+
+  let regIdToArgNumX64 (hdl: BinHandle) rid =
+    [ 1 .. 6 ]
+    |> List.tryFind (fun nth ->
+      rid = hdl.Conventions.Calling.IntArgRegister(nth - 1))
+
+  let untouchedArgIndexX64FromIRCFG (hdl: BinHandle) ctx pp state nth =
+    let argRegId = hdl.Conventions.Calling.IntArgRegister(nth - 1)
+    let varKind = Regular argRegId
+    let absV = ctx.Vertices[pp]
+    match tryGetValue state absV varKind with
+    | Some(UntouchedValueDomain.Untouched(RegisterTag(Regular rid))) ->
+      regIdToArgNumX64 hdl rid
+    | _ ->
+      (* If no definition is found, this means the parameter register is
+         untouched, thus conditional no return. *)
+      Some nth
+
+  let hasCallFallthroughNode ctx pp =
+    assert (ctx.Vertices.ContainsKey pp)
+    let absV = ctx.Vertices[pp]
+    let succs = ctx.CFG.GetSuccs absV
+    not <| Seq.isEmpty succs
+
+  let collectReturningAbsPPs ctx =
+    ctx.IntraCallTable.Callees
+    |> Seq.fold (fun acc (KeyValue(cs, calleeKind)) ->
+      match calleeKind with
+      | RegularCallee callee ->
+        if ctx.FunctionAddress = callee then acc
+        else ProgramPoint(cs, callee, 0) :: acc
+      | IndirectCallees callees ->
+        Set.fold (fun acc c -> ProgramPoint(cs, c, 0) :: acc) acc callees
+      | _ ->
+        acc) []
+    |> List.filter (hasCallFallthroughNode ctx)
+
+  let tryGetConnectedArgumentFromIRCFG ctx state pp nth =
+    let callSite = (pp: ProgramPoint).CallSite |> Option.get
+    let isa = (ctx: CFGBuildingContext<_, _>).BinHandle.ISA
+    match ctx.IntraCallTable.TryGetFrameDistance callSite with
+    | true, frameDist when isa.IsX86 ->
+      untouchedArgIndexX86FromIRCFG ctx frameDist pp state nth
+    | true, _ when isa.IsX64 ->
+      untouchedArgIndexX64FromIRCFG ctx.BinHandle ctx pp state nth
+    | _ ->
+      None
+
+  let collectConditionalNoRetCallsFromIRCFG ctx (cfg: LowUIRCFG) state =
+    collectReturningAbsPPs ctx
+    |> List.choose (fun pp ->
+      let absV = ctx.Vertices[pp]
+      match absV.VData.Internals.AbstractContent.ReturningStatus with
+      | ConditionalNoRet nth ->
+        tryGetConnectedArgumentFromIRCFG ctx (state: Lazy<_>).Value pp nth
+        |> Option.bind (fun nth' -> Some(absV, nth'))
+      | NotNoRet | UnknownNoRet ->
+        None
+      | NoRet when hasNoReturnFallThrough cfg absV ->
+        None
+      | NoRet ->
+        Terminator.impossible ())
+
+  let untouchedArgIndexX86FromSSACFG dom frameDist absV state nth =
+    let argOff = frameDist - 4 * nth
+    let varKind = SSA.StackVar(32<rt>, argOff)
+    SSACFG.findReachingDef dom absV varKind
+    |> Option.bind (function
+      | SSA.Def(var, _) ->
+        match (state: SSASparseDataFlow.State<_>).GetRegValue var with
+        | UntouchedValueDomain.Untouched(RegisterTag(StackLocal off)) ->
+          Some(-off / 4)
+        | _ ->
+          None
+      | _ ->
+        None)
+
+  let untouchedArgIndexX64FromSSACFG hdl dom absV state nth =
+    let argReg = (hdl: BinHandle).Conventions.Calling.IntArgRegister(nth - 1)
+    let name = hdl.RegisterFactory.GetRegisterName argReg
+    let varKind = SSA.RegVar(64<rt>, argReg, name)
+    match SSACFG.findReachingDef dom absV varKind with
+    | Some(SSA.Def(var, _)) ->
+      match (state: SSASparseDataFlow.State<_>).GetRegValue var with
+      | UntouchedValueDomain.Untouched(RegisterTag(Regular rid)) ->
+        regIdToArgNumX64 hdl rid
+      | _ ->
+        None
+    | _ ->
+      (* If no definition is found, this means the parameter register is
+         untouched, thus conditional no return. *)
+      Some nth
+
+  let findSSAVertexByAddr (ssa: SSACFG) addr =
+    ssa.FindVertexBy(fun v ->
+      if v.VData.Internals.IsAbstract then false
+      else v.VData.Internals.Range.IsIncluding addr)
+
+  let tryGetConnectedArgumentFromSSACFG ctx (ssa: SSACFG) dom state pp nth =
+    let callSite = (pp: ProgramPoint).CallSite |> Option.get
+    let callSiteAddr = callSite.CallSiteAddress
+    let callerSSAV = findSSAVertexByAddr ssa callSiteAddr
+    let absSSAV = ssa.GetSuccs callerSSAV |> Seq.exactlyOne
+    let isa = (ctx: CFGBuildingContext<_, _>).BinHandle.ISA
+    match ctx.IntraCallTable.TryGetFrameDistance callSite with
+    | true, frameDist when isa.IsX86 ->
+      untouchedArgIndexX86FromSSACFG dom frameDist absSSAV state nth
+    | true, _ when isa.IsX64 ->
+      untouchedArgIndexX64FromSSACFG ctx.BinHandle dom absSSAV state nth
+    | _ ->
+      None
+
+  let getLazySSAState g (uva: SSAUntouchedValueAnalysis) =
+    lazy ((uva :> IDataFlowComputable<_, _, _>).Compute g |> ignore
+          uva.State)
+
+  let getLazyIRState g (uva: UntouchedValueAnalysis) =
+    lazy ((uva :> IDataFlowComputable<_, _, _>).Compute g |> ignore
+          uva.State)
+
+  let collectConditionalNoRetCallsFromSSACFG ctx ssaCFG dom =
+    let hdl = ctx.BinHandle
+    let state = SSAUntouchedValueAnalysis hdl |> getLazySSAState ssaCFG
+    collectReturningAbsPPs ctx
+    |> List.choose (fun pp ->
+      let absV = ctx.Vertices[pp]
+      match absV.VData.Internals.AbstractContent.ReturningStatus with
+      | ConditionalNoRet nth ->
+        tryGetConnectedArgumentFromSSACFG ctx ssaCFG dom state.Value pp nth
+        |> Option.bind (fun nth' -> Some(absV, nth'))
+      | NotNoRet | UnknownNoRet ->
+        None
+      | NoRet ->
+        Terminator.impossible ())
+
+  let tryFindCondNoRetDom (dom: IForwardDominance<_>) absVSet v =
+    dom.Dominators v
+    |> Seq.filter (fun v -> (absVSet: HashSet<_>).Contains v)
+    |> fun doms ->
+      if Seq.isEmpty doms then
+        None
+      else
+        (* When there are two or more conditionally returning (and dominating)
+           abstract vertices, we assume that they will be referring to the same
+           callee. *)
+        Some <| Seq.head doms
+
+  let getStatusFromDominators dom absVSet (argNumMap: Dictionary<_, _>) exit =
+    match tryFindCondNoRetDom dom absVSet exit with
+    | None -> NotNoRet
+    | Some dom -> ConditionalNoRet argNumMap[dom]
+
+  let isStackPointer ctx dst =
+    let regFactory = ctx.BinHandle.RegisterFactory
+    let rid = regFactory.StackPointer.Value
+    let rt = regFactory.GetRegType(rid)
+    let rname = regFactory.GetRegisterName(rid)
+    match dst with
+    | LowUIR.Var(Type = dstRT; RegisterID = dstId; Name = dstName) ->
+      dstRT = rt && dstId = rid && dstName = rname
+    | _ ->
+      false
+
+  /// Checks if the given exit vertex has a corrupted stack pointer value before
+  /// executing the return instruction. This means we cannot statically decide
+  /// whether the return instruction will jump to the caller or not.
+  let hasUndecidableReturnTarget ctx v =
+    let hdl = ctx.BinHandle
+    let st = CFGEvaluator.evalBlockFromScratch hdl v
+    let rid = hdl.RegisterFactory.StackPointer.Value
+    match st.TryGetReg(rid) with
+    | Def(_) ->
+      false
+    | _ ->
+#if CFGDEBUG
+      let blkAddr = v.VData.Internals.PPoint.Address
+      let fnAddr = ctx.FunctionAddress
+      dbglog ctx.ThreadID (nameof CondAwareNoretAnalysis)
+      <| $"[*] Undecidable return: {blkAddr:x} @ {fnAddr}"
+#endif
+      true
+
+  let analyze ctx condNoRetCalls =
+    let df = Dominance.CooperDominanceFrontier()
+    let dom = Dominance.LengauerTarjanDominance.create ctx.CFG df
+    let exits = ctx.CFG.Exits
+    let absVSet = HashSet(condNoRetCalls |> List.map fst)
+    let argNumMap = Dictionary(condNoRetCalls |> Seq.map KeyValuePair)
+    let mutable status = UnknownNoRet
+    let mutable i = 0
+    let updateStatus foundStatus = status <- meet status foundStatus
+    while i < exits.Length && status <> NotNoRet do
+      let v = exits[i]
+      i <- i + 1
+      let vData = v.VData :> ILowUIRBasicBlock
+      if not vData.IsAbstract then
+        if vData.LastInstruction.IsRET then
+          if hasUndecidableReturnTarget ctx v then updateStatus NoRet
+          else updateStatus (getStatusFromDominators dom absVSet argNumMap v)
+        elif vData.LastInstruction.IsIndirectBranch then
+          updateStatus NotNoRet
+        else
+          ()
+      else
+        match vData.AbstractContent.ReturningStatus with
+        | ConditionalNoRet _ ->
+          updateStatus NoRet
+        | NotNoRet ->
+          updateStatus (getStatusFromDominators dom absVSet argNumMap v)
+        | status ->
+          updateStatus status
+    status
+
+  (* Non-returning function identification for IR-based CFG. *)
+  interface ICFGAnalysis<unit -> unit> with
+    member _.Unwrap env =
+      let ctx = env.Context
+      fun () ->
+        let hdl = ctx.BinHandle
+        let g = ctx.CFG
+        let state = UntouchedValueAnalysis(hdl, g.Vertices) |> getLazyIRState g
+        let condNoRetCalls = collectConditionalNoRetCallsFromIRCFG ctx g state
+        match analyze ctx condNoRetCalls with
+        | UnknownNoRet -> ctx.NonReturningStatus <- defaultStatus
+        | status -> ctx.NonReturningStatus <- status
+#if CFGDEBUG
+        dbglog ctx.ThreadID (nameof CondAwareNoretAnalysis)
+        <| $"{ctx.FunctionAddress:x}: {ctx.NonReturningStatus}"
+#endif
+
+  (* Non-returning function identification for SSA-based CFG. *)
+  interface ICFGAnalysis<SSACFGWithDominance -> unit> with
+    member _.Unwrap env =
+      let ctx = env.Context
+      fun (r: SSACFGWithDominance) ->
+        let condNoRetCalls =
+          collectConditionalNoRetCallsFromSSACFG ctx r.Graph r.Dominance
+        match analyze ctx condNoRetCalls with
+        | UnknownNoRet -> ctx.NonReturningStatus <- defaultStatus
+        | status -> ctx.NonReturningStatus <- status
+#if CFGDEBUG
+        dbglog ctx.ThreadID (nameof CondAwareNoretAnalysis)
+        <| $"{ctx.FunctionAddress:x}: {ctx.NonReturningStatus} (w/ SSA)"
+#endif
+
+module CondAwareNoretAnalysis =
+  let private hasNonZeroOnX86 st nth =
+    let esp = Intel.Register.ESP |> Intel.Register.toRegID
+    match (st: ConcState).TryGetReg esp with
+    | Def esp ->
+      let p = esp + BitVector(4 * nth, 32<rt>)
+      let endian = Endian.Little
+      match Memory.read (p.ToUInt64()) endian 32<rt> st.Memory with
+      | Ok v -> not v.IsZero
+      | _ -> false
+    | _ ->
+      false
+
+  let private hasNonZeroOnX64 (hdl: BinHandle) st nth =
+    let reg = hdl.Conventions.Calling.IntArgRegister(nth - 1)
+    match (st: ConcState).TryGetReg reg with
+    | Def bv -> not bv.IsZero
+    | _ -> false
+
+  /// Locally analyze the given basic block and see if the `nth` parameter
+  /// (defined by the current ABI) is non-zero.
+  let hasNonZero (hdl: BinHandle) caller nth =
+    let st = CFGEvaluator.evalBlockFromScratch hdl caller
+    match hdl.ISA with
+    | X86 -> hasNonZeroOnX86 st nth
+    | X64 -> hasNonZeroOnX64 hdl st nth
+    | _ -> false

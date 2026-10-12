@@ -1,0 +1,285 @@
+/*
+ * Copyright 2025 Daytona Platforms Inc.
+ * Modified by BoxLite AI, 2025-2026
+ * SPDX-License-Identifier: AGPL-3.0
+ */
+
+import { LogoText } from '@/assets/Logo'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+import { BOXLITE_DOCS_URL, BOXLITE_SLACK_URL } from '@/constants/ExternalLinks'
+import { Theme, useTheme } from '@/contexts/ThemeContext'
+import { RoutePath } from '@/enums/RoutePath'
+import { useSelectedOrganization } from '@/hooks/useSelectedOrganization'
+import { markJustLoggedOut } from '@/lib/auth-session'
+import { ONBOARDING_OPEN_EVENT } from '@/lib/onboarding-progress'
+import { cn } from '@/lib/utils'
+import {
+  BookOpen,
+  Building2,
+  ChevronDown,
+  KeyRound,
+  LogOut,
+  MessageCircle,
+  Monitor,
+  MoonIcon,
+  MoreHorizontal,
+  SunIcon,
+} from '@/components/ui/icon'
+import { usePostHog } from 'posthog-js/react'
+import { useCallback } from 'react'
+import { useAuth } from 'react-oidc-context'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+
+interface SidebarProps {
+  isBannerVisible: boolean
+  version: string
+}
+
+interface NavItem {
+  icon?: React.ReactElement
+  label: string
+  path: RoutePath | string
+  onClick?: () => void
+}
+
+// Billing is one entry either way: the page shows the real surfaces where a billing
+// service is deployed and the placeholder otherwise. Which of those surfaces a member
+// may see is decided in the page, not here.
+const PRIMARY_NAV_ITEMS: NavItem[] = [
+  { label: 'Boxes', path: RoutePath.BOXES },
+  { label: 'Volumes', path: RoutePath.VOLUMES },
+  { label: 'Billing', path: RoutePath.BILLING },
+]
+
+const themeOptions: { value: Theme; label: string; icon: React.ReactElement }[] = [
+  { value: 'system', label: 'System', icon: <Monitor className="size-3.5" /> },
+  { value: 'light', label: 'Light', icon: <SunIcon className="size-3.5" /> },
+  { value: 'dark', label: 'Dark', icon: <MoonIcon className="size-3.5" /> },
+]
+
+function ThemeMenuItems({ theme, setTheme }: { theme: Theme; setTheme: (theme: Theme) => void }) {
+  return (
+    <div className="px-2 py-2">
+      <div className="px-1 pb-2 font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Theme</div>
+      <ToggleGroup
+        type="single"
+        value={theme}
+        onValueChange={(value) => {
+          if (value) setTheme(value as Theme)
+        }}
+        variant="outline"
+        size="sm"
+        className="grid w-full grid-cols-3 gap-0 border border-border"
+      >
+        {themeOptions.map((option) => (
+          <ToggleGroupItem
+            key={option.value}
+            value={option.value}
+            aria-label={`Use ${option.label.toLowerCase()} theme`}
+            className="h-9 justify-center gap-1.5 rounded-none border-0 border-r border-border text-xs text-muted-foreground transition-colors last:border-r-0 hover:text-foreground data-[state=on]:bg-card data-[state=on]:font-semibold data-[state=on]:text-foreground data-[state=on]:shadow-[inset_0_0_0_1px_hsl(var(--foreground)/0.45)]"
+          >
+            {option.icon}
+            <span>{option.label}</span>
+          </ToggleGroupItem>
+        ))}
+      </ToggleGroup>
+    </div>
+  )
+}
+
+/**
+ * Top navigation bar (ASCII/terminal restyle). Named `Sidebar` for import compatibility;
+ * it has always rendered as a top header. All data/command wiring is preserved — only the
+ * presentation matches the new design (Nav.dc): a single 60px monospace bar with bordered
+ * segments, a standalone organization switcher, and a profile menu.
+ */
+export function Sidebar({ isBannerVisible }: SidebarProps) {
+  const posthog = usePostHog()
+  const { theme, setTheme } = useTheme()
+  const { user, signoutRedirect } = useAuth()
+  const { pathname } = useLocation()
+  const navigate = useNavigate()
+  const { selectedOrganization } = useSelectedOrganization()
+
+  const primaryItems: NavItem[] = PRIMARY_NAV_ITEMS
+
+  const openOnboardingGuide = useCallback(() => {
+    const event = new Event(ONBOARDING_OPEN_EVENT, { cancelable: true })
+    window.dispatchEvent(event)
+
+    if (!event.defaultPrevented) {
+      navigate(`${RoutePath.BOXES}?onboarding=1`)
+    }
+  }, [navigate])
+
+  const handleSignOut = () => {
+    posthog?.reset()
+    markJustLoggedOut()
+    signoutRedirect()
+  }
+
+  const userName = user?.profile.name || user?.profile.email || 'Profile'
+  const initials =
+    userName
+      .split(/\s+/)
+      .map((w) => w[0])
+      .slice(0, 2)
+      .join('')
+      .toUpperCase() || 'U'
+
+  // One full-height nav cell. No edge of its own: the header is a continuous
+  // strip and a bright rule around one cell would cut it. The chosen cell is
+  // the surface that differs from the strip, and its label is the only one at
+  // full weight and full value.
+  //
+  // `bg-accent` used to carry this alone. It measures 1.18:1 against the
+  // header on the light theme, and it is also this console's hover tint, so
+  // "you are here" and "your pointer is here" were the same grey.
+  const navCellClass = (active: boolean, extra?: string) =>
+    cn(
+      'relative h-full items-center gap-2 px-[18px] text-[13px] transition-colors',
+      active ? 'bg-card font-semibold text-foreground' : 'font-medium text-muted-foreground hover:text-foreground',
+      extra,
+    )
+
+  return (
+    <header
+      className={cn(
+        'sticky z-40 flex h-[60px] items-stretch border-b border-border bg-background font-mono text-[13px]',
+        isBannerVisible ? 'top-16 md:top-12' : 'top-0',
+      )}
+    >
+      {/* brand */}
+      <Link
+        to={RoutePath.BOXES}
+        className="flex shrink-0 items-center border-r border-border px-[30px] text-foreground"
+        aria-label="BoxLite home"
+      >
+        <LogoText className="h-[26px] w-auto" />
+      </Link>
+
+      {/* primary nav */}
+      {primaryItems.map((item) => {
+        const active = pathname.startsWith(item.path)
+        return (
+          <Link key={item.label} to={item.path} className={navCellClass(active, 'hidden md:inline-flex')}>
+            {item.label}
+          </Link>
+        )
+      })}
+
+      <div className="flex-1" />
+
+      {/* api keys */}
+      <Link
+        to={RoutePath.KEYS}
+        className={navCellClass(pathname.startsWith(RoutePath.KEYS), 'hidden border-l border-border lg:inline-flex')}
+      >
+        <KeyRound className="size-3.5" />
+        API Keys
+      </Link>
+
+      {/* onboarding guide */}
+      <button
+        type="button"
+        onClick={openOnboardingGuide}
+        aria-label="Open onboarding guide"
+        className="hidden h-full items-center gap-2 border-l border-border px-[18px] text-[13px] font-medium text-muted-foreground transition-colors hover:text-foreground lg:inline-flex"
+      >
+        <BookOpen className="size-3.5" />
+        <span className="hidden sm:inline">Quickstart</span>
+      </button>
+
+      {/* profile menu (organization switcher tucked inside) */}
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          aria-label="Open profile menu"
+          className="inline-flex h-full items-center gap-2 border-l border-border px-4 text-[13px] font-medium text-foreground outline-none transition-colors hover:bg-card data-[state=open]:bg-card sm:px-5"
+        >
+          <span className="flex size-[23px] shrink-0 items-center justify-center overflow-hidden bg-brand text-[9px] font-extrabold text-white">
+            {user?.profile.picture ? (
+              <img src={user.profile.picture} alt={userName} className="h-full w-full object-cover" />
+            ) : (
+              initials
+            )}
+          </span>
+          <span className="hidden max-w-[140px] truncate xl:inline">{userName}</span>
+          <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="min-w-[18rem]">
+          <DropdownMenuLabel className="flex flex-col gap-0.5">
+            <span className="truncate text-[13px] font-semibold text-foreground">{userName}</span>
+            {user?.profile.email && user.profile.email !== userName && (
+              <span className="truncate font-mono text-[11px] font-normal text-muted-foreground">
+                {user.profile.email}
+              </span>
+            )}
+          </DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          <ThemeMenuItems theme={theme} setTheme={setTheme} />
+          <DropdownMenuSeparator />
+          {selectedOrganization && (
+            <DropdownMenuItem asChild className="cursor-pointer">
+              <Link to={RoutePath.SETTINGS}>
+                <Building2 className="size-4" />
+                Organization
+              </Link>
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem asChild className="cursor-pointer">
+            <a href={BOXLITE_DOCS_URL} target="_blank" rel="noopener noreferrer">
+              <BookOpen className="size-4" />
+              Docs
+            </a>
+          </DropdownMenuItem>
+          <DropdownMenuItem asChild className="cursor-pointer">
+            <a href={BOXLITE_SLACK_URL} target="_blank" rel="noopener noreferrer">
+              <MessageCircle className="size-4" />
+              Discord
+            </a>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem className="cursor-pointer" onClick={handleSignOut}>
+            <LogOut className="size-4" />
+            Sign out
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      {/* mobile: search + nav */}
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          aria-label="Open navigation menu"
+          className="inline-flex h-full items-center border-l border-border px-5 text-muted-foreground outline-none transition-colors hover:text-foreground lg:hidden"
+        >
+          <MoreHorizontal className="size-4" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="min-w-[14rem]">
+          {primaryItems.map((item) => (
+            <DropdownMenuItem key={item.label} asChild className="cursor-pointer">
+              <Link to={item.path}>{item.label}</Link>
+            </DropdownMenuItem>
+          ))}
+          <DropdownMenuItem asChild className="cursor-pointer">
+            <Link to={RoutePath.KEYS}>
+              <KeyRound className="size-4" />
+              API Keys
+            </Link>
+          </DropdownMenuItem>
+          <DropdownMenuItem className="cursor-pointer" onClick={openOnboardingGuide}>
+            <BookOpen className="size-4" />
+            Quickstart
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </header>
+  )
+}

@@ -1,0 +1,501 @@
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { Bot, FileUp, Network, Pencil, Plus, RefreshCw, ShieldAlert, Trash2, X } from "lucide-react";
+import type { HarnessNativeCapabilities, HarnessProfile, McpImportReport, McpServerProfile } from "../api/types";
+import { useCredentialVault, vaultUnavailableNote } from "../hooks/useCredentialVault";
+import { useWorkspace } from "../state/WorkspaceContext";
+import { DiagnosticErrorNotice, logCaughtDiagnostic } from "../diagnostics";
+import { announceSettingsSaved } from "./SettingsSaveFeedback";
+import { HostFolderPicker } from "./HostFolderPicker";
+import { ModalSurface, useConfirmation } from "./DialogSystem";
+import { McpImportDialog } from "./McpImportDialog";
+import { SurfaceNotice } from "./SurfacePrimitives";
+
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
+
+const approvalOptions = ["risk_based", "ask", "allow", "deny"] as const;
+
+// Matches McpServerProfile.description's limit in Core.
+const MCP_DESCRIPTION_MAX_CHARS = 500;
+
+function mcpNextStep(server: McpServerProfile): string | undefined {
+  if (server.transport === "stdio" && !server.trustedStdio) return "Trust this local program in Edit before probing.";
+  if (!server.enabled && !server.checkedAt) return "Probe to list its tools, then enable.";
+  return undefined;
+}
+
+function harnessRecovery(profile: HarnessProfile): string | undefined {
+  if (profile.authenticationState === "failed") return `Sign in with ${profile.kind === "grok_acp" ? "grok" : "codex"} on the Nebula host, then use Check.`;
+  switch (profile.lastTurnFailureReason) {
+    case "quota_exhausted": return "Provider balance exhausted. Restore balance or wait for reset before another turn.";
+    case "session_not_found": return "The provider session is missing. The saved transcript remains available; start a new conversation.";
+    case "rate_limited": return "The provider limited requests. Wait for its reset, then try a new turn.";
+    case "timeout": return "The harness timed out. Check its host runtime, then retry the failed turn.";
+    case "protocol_invalid": return "The harness response was invalid. Check its installed version before another turn.";
+    case "transport_closed": return "The harness connection closed. Use Check, then retry the failed turn after it reconnects.";
+    default: return undefined;
+  }
+}
+
+export function HarnessSettings() {
+  const confirm = useConfirmation();
+  const { api, coreState, engagement, previewMode } = useWorkspace();
+  const [kind, setKind] = useState<HarnessProfile["kind"]>("codex_app_server");
+  const [harnesses, setHarnesses] = useState<HarnessProfile[]>([]);
+  const [servers, setServers] = useState<McpServerProfile[]>([]);
+  const [harnessDialog, setHarnessDialog] = useState(false);
+  const [mcpDialog, setMcpDialog] = useState(false);
+  const [importDialog, setImportDialog] = useState(false);
+  const [importNotice, setImportNotice] = useState<{ title: string; detail?: string }>();
+  const [editingHarness, setEditingHarness] = useState<HarnessProfile>();
+  const [editingServer, setEditingServer] = useState<McpServerProfile>();
+  const [name, setName] = useState("");
+  const [connectionMode, setConnectionMode] = useState<HarnessProfile["connectionMode"]>("spawn");
+  const [transport, setTransport] = useState<HarnessProfile["transport"]>("stdio");
+  const [executable, setExecutable] = useState("");
+  const [homeDirectory, setHomeDirectory] = useState("");
+  const [endpoint, setEndpoint] = useState("");
+  const [model, setModel] = useState("");
+  const [permissionMode, setPermissionMode] = useState<HarnessProfile["permissionMode"]>("managed");
+  const [harnessAuthMode, setHarnessAuthMode] = useState<HarnessProfile["authMode"]>("existing_session");
+  const [harnessSecret, setHarnessSecret] = useState("");
+  const [harnessSessionCredential, setHarnessSessionCredential] = useState(false);
+  const vault = useCredentialVault();
+  const [harnessLocalOnly, setHarnessLocalOnly] = useState(false);
+  const [harnessSensitiveData, setHarnessSensitiveData] = useState(false);
+  const [harnessAutoShareToolResults, setHarnessAutoShareToolResults] = useState(false);
+  const [nativeWebSearch, setNativeWebSearch] = useState(false);
+  const [nativeBrowser, setNativeBrowser] = useState(false);
+  const [nativeComputerUse, setNativeComputerUse] = useState(false);
+  const [nativeImageGeneration, setNativeImageGeneration] = useState(false);
+  const [nativeSkills, setNativeSkills] = useState(false);
+  const [nativeSubagents, setNativeSubagents] = useState(false);
+  const [mcpName, setMcpName] = useState("");
+  const [mcpDescription, setMcpDescription] = useState("");
+  const [mcpTransport, setMcpTransport] = useState<McpServerProfile["transport"]>("stdio");
+  const [command, setCommand] = useState("");
+  const [argumentsText, setArgumentsText] = useState("");
+  const [url, setUrl] = useState("");
+  const [trusted, setTrusted] = useState(false);
+  const [required, setRequired] = useState(false);
+  const [defaultApproval, setDefaultApproval] = useState<McpServerProfile["defaultApproval"]>("risk_based");
+  const [mcpAuthMode, setMcpAuthMode] = useState<McpServerProfile["authMode"]>("none");
+  const [mcpSecret, setMcpSecret] = useState("");
+  const [mcpHeaderName, setMcpHeaderName] = useState("X-API-Key");
+  const [sessionCredential, setSessionCredential] = useState(false);
+  const [busy, setBusy] = useState<string>();
+  const [error, setError] = useState<string>();
+  const [deleteError, setDeleteError] = useState<{ id: string; message: string }>();
+
+  const [catalogError, setCatalogError] = useState<string>();
+  const reload = useCallback(async (isActive: () => boolean = () => true) => {
+    if (!api || coreState !== "online") return;
+    if (isActive()) setCatalogError(undefined);
+    const failures: string[] = [];
+    await Promise.all([
+      api.listHarnesses().then(next => { if (isActive()) setHarnesses(next); }).catch(loadError => {
+        void logCaughtDiagnostic("interface.harness_settings.catalog_failed", "The harness catalog could not be refreshed.", loadError, "harness_settings");
+        failures.push("Agent harnesses could not be refreshed.");
+        if (isActive()) setCatalogError(failures.join(" "));
+      }),
+      api.listMcpServers().then(next => { if (isActive()) setServers(next); }).catch(loadError => {
+        void logCaughtDiagnostic("interface.harness_settings.mcp_catalog_failed", "The MCP catalog could not be refreshed.", loadError, "harness_settings");
+        failures.push("MCP servers could not be refreshed. Agent harnesses remain available.");
+        if (isActive()) setCatalogError(failures.join(" "));
+      }),
+    ]);
+  }, [api, coreState]);
+  const removeHarness = async (profile: HarnessProfile) => {
+    if (!await confirm({
+      title: "Delete this harness?",
+      message: `“${profile.name}” will be removed from Settings. Conversations and missions that use it cannot start new turns until another harness is chosen.`,
+      confirmLabel: "Delete harness",
+      tone: "danger",
+    })) return;
+    setDeleteError(undefined);
+    setBusy(profile.id);
+    try {
+      await api?.deleteHarness(profile.id, profile.revision);
+      setHarnesses(current => current.filter(item => item.id !== profile.id));
+      await reload();
+      announceSettingsSaved(`Harness “${profile.name}” deleted.`);
+    } catch (actionError) {
+      void logCaughtDiagnostic("interface.harness_settings.caught_failure_07", "A handled interface operation failed.", actionError, "harness_settings");
+      const detail = actionError instanceof Error ? actionError.message : "Delete failed.";
+      setDeleteError({
+        id: profile.id,
+        message: detail.includes("still referenced by")
+          ? "Saved conversations or missions still use this harness. Remove those records before retrying, or disable the harness to stop new use."
+          : detail,
+      });
+    } finally {
+      setBusy(undefined);
+    }
+  };
+  const removeServer = async (server: McpServerProfile) => {
+    if (!await confirm({
+      title: "Delete this MCP server?",
+      message: `“${server.name}” will be removed from Settings. Agents and missions that select it lose its tools.`,
+      confirmLabel: "Delete MCP server",
+      tone: "danger",
+    })) return;
+    setBusy(server.id);
+    try {
+      await api?.deleteMcpServer(server.id, server.revision);
+      await reload();
+    } catch (actionError) {
+      void logCaughtDiagnostic("interface.harness_settings.caught_failure_09", "A handled interface operation failed.", actionError, "harness_settings");
+      setError(actionError instanceof Error ? actionError.message : "Delete failed.");
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
+  const checkSavedHarness = async (profile: HarnessProfile) => {
+    if (!api) return false;
+    setError(undefined);
+    const failures: string[] = [];
+    try {
+      await api.checkHarness(profile.id);
+    } catch (checkError) {
+      void logCaughtDiagnostic("interface.harness_settings.health_failed", "A saved harness could not be checked.", checkError, "harness_settings");
+      failures.push(`Health check failed: ${checkError instanceof Error ? checkError.message : "runtime unavailable"}`);
+    }
+    try {
+      // An unrelated MCP catalog failure must not hide a saved harness.
+      setHarnesses(await api.listHarnesses());
+    } catch (catalogError) {
+      void logCaughtDiagnostic("interface.harness_settings.catalog_failed", "The harness catalog could not be refreshed.", catalogError, "harness_settings");
+      failures.push(`Catalog refresh failed: ${catalogError instanceof Error ? catalogError.message : "catalog unavailable"}`);
+    }
+    if (failures.length) setError(`The profile is saved. ${failures.join(". ")}. Use Check to retry.`);
+    return failures.length === 0;
+  };
+
+  const testSavedHarness = async (profile: HarnessProfile) => {
+    if (!api) return;
+    setBusy(profile.id);
+    setError(undefined);
+    try {
+      await api.testHarnessTurn(profile.id);
+      setHarnesses(await api.listHarnesses());
+    } catch (failure) {
+      void logCaughtDiagnostic("interface.harness_settings.test_turn_failed", "A diagnostic harness turn failed.", failure, "harness_settings");
+      setError(failure instanceof Error ? failure.message : "Test turn failed.");
+      try {
+        setHarnesses(await api.listHarnesses());
+      } catch (reloadFailure) {
+        void logCaughtDiagnostic("interface.harness_settings.test_turn_reload_failed", "Harness status could not be refreshed after a failed diagnostic turn.", reloadFailure, "harness_settings");
+      }
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
+  useEffect(() => {
+    let active = true;
+    void reload(() => active);
+    return () => { active = false; };
+  }, [reload]);
+
+  const openHarness = (profile?: HarnessProfile, requestedKind: HarnessProfile["kind"] = "codex_app_server") => {
+    setEditingHarness(profile);
+    const nextKind = profile?.kind ?? requestedKind;
+    setKind(nextKind);
+    setName(profile?.name ?? "");
+    setConnectionMode(profile?.connectionMode ?? "spawn");
+    setTransport(profile?.transport ?? "stdio");
+    setExecutable(profile?.executable ?? "");
+    setEndpoint(profile?.endpoint ?? "");
+    setHomeDirectory(profile?.homeDirectory ?? "");
+    setModel(profile?.defaultModel ?? (nextKind === "grok_acp" ? "grok-build" : ""));
+    setPermissionMode(profile?.permissionMode ?? "managed");
+    setHarnessAuthMode(profile?.authMode ?? "existing_session");
+    setHarnessSecret("");
+    setHarnessSessionCredential(false);
+    setHarnessLocalOnly(profile?.localOnly ?? false);
+    setHarnessSensitiveData(profile?.permitsSensitiveData ?? false);
+    setHarnessAutoShareToolResults(profile?.autoShareToolResults ?? false);
+    setNativeWebSearch(profile?.nativeCapabilities.webSearch ?? false);
+    setNativeBrowser(profile?.nativeCapabilities.browser ?? false);
+    setNativeComputerUse(profile?.nativeCapabilities.computerUse ?? false);
+    setNativeImageGeneration(profile?.nativeCapabilities.imageGeneration ?? false);
+    setNativeSkills(profile?.nativeCapabilities.skills ?? true);
+    setNativeSubagents(profile?.nativeCapabilities.subagents ?? false);
+    setError(undefined);
+    setHarnessDialog(true);
+  };
+
+  const submitHarness = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!api) return;
+    setBusy(editingHarness?.id ?? "new-harness");
+    setError(undefined);
+    try {
+      let secretRef = editingHarness?.secretRef;
+      if (harnessAuthMode !== "existing_session" && harnessSecret) {
+        secretRef = (await api.createCredential(harnessSecret, harnessSessionCredential || !vault.available ? "session" : "vault")).reference;
+      }
+      if (harnessAuthMode !== "existing_session" && !secretRef) {
+        throw new Error("This authentication mode requires a write-only credential.");
+      }
+      const payload = {
+        name: name.trim(),
+        kind,
+        connection_mode: connectionMode,
+        transport,
+        executable: connectionMode === "spawn" && executable.trim() ? executable.trim() : null,
+        home_directory: connectionMode === "spawn" ? homeDirectory.trim() || null : null,
+        endpoint: connectionMode === "endpoint" ? endpoint.trim() : null,
+        auth_mode: harnessAuthMode,
+        secret_ref: harnessAuthMode === "existing_session" ? null : secretRef,
+        default_model: model.trim() || null,
+        permission_mode: permissionMode,
+        enabled: editingHarness?.enabled ?? true,
+        privacy: {
+          local_only: harnessLocalOnly,
+          permits_sensitive_data: harnessSensitiveData,
+          auto_share_tool_results: harnessSensitiveData && harnessAutoShareToolResults,
+        },
+        native_capabilities: {
+          workspace_access: "none",
+          shell: false,
+          web_search: nativeWebSearch,
+          web_fetch: false,
+          browser: kind === "codex_app_server" && nativeBrowser,
+          computer_use: kind === "codex_app_server" && nativeComputerUse,
+          image_generation: kind === "codex_app_server" && nativeImageGeneration,
+          skills: nativeSkills,
+          subagents: nativeSubagents,
+        },
+      };
+      const saved = editingHarness
+        ? await api.updateHarness(editingHarness.id, payload, editingHarness.revision)
+        : await api.createHarness(payload);
+      // Saving and checking are different operations. Publish the saved identity
+      // immediately so a failed check can never send the operator through Create.
+      setEditingHarness(saved);
+      setHarnesses(current => [...current.filter(profile => profile.id !== saved.id), saved]);
+      setHarnessDialog(false);
+      setBusy(saved.id);
+      if (await checkSavedHarness(saved)) announceSettingsSaved("Harness profile saved and checked.");
+    } catch (saveError) {
+      void logCaughtDiagnostic("interface.harness_settings.caught_failure_02", "A handled interface operation failed.", saveError, "harness_settings");
+      setError(saveError instanceof Error ? saveError.message : "Could not save the harness profile.");
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
+  const openMcp = (server?: McpServerProfile) => {
+    setEditingServer(server);
+    setMcpName(server?.name ?? "");
+    setMcpDescription(server?.description ?? "");
+    setMcpTransport(server?.transport ?? "stdio");
+    setCommand(server?.command ?? "");
+    setArgumentsText(server?.arguments.join("\n") ?? "");
+    setUrl(server?.url ?? "");
+    setTrusted(server?.trustedStdio ?? false);
+    setRequired(server?.required ?? false);
+    setDefaultApproval(server?.defaultApproval ?? "risk_based");
+    setMcpAuthMode(server?.authMode ?? "none");
+    setMcpSecret("");
+    setMcpHeaderName("X-API-Key");
+    setError(undefined);
+    setMcpDialog(true);
+  };
+
+  const submitMcp = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!api) return;
+    setBusy(editingServer?.id ?? "new-mcp");
+    setError(undefined);
+    const isStdio = mcpTransport === "stdio";
+    try {
+      let credentialRef: string | undefined;
+      if (!isStdio && mcpAuthMode !== "none" && mcpSecret) {
+        credentialRef = (await api.createCredential(mcpSecret, sessionCredential || !vault.available ? "session" : "vault")).reference;
+      }
+      if (!isStdio && mcpAuthMode !== "none" && !editingServer && !credentialRef) {
+        throw new Error("Bearer and header authentication require a write-only credential.");
+      }
+      const payload = {
+      name: mcpName.trim(),
+      description: mcpDescription.trim(),
+      transport: mcpTransport,
+      command: isStdio ? command.trim() : null,
+      arguments: isStdio ? argumentsText.split("\n").map((item) => item.trim()).filter(Boolean) : [],
+      url: isStdio ? null : url.trim(),
+      auth_mode: isStdio ? "none" : mcpAuthMode,
+      ...(isStdio || mcpAuthMode === "none" ? { bearer_secret_ref: null, header_secret_refs: {} } : {}),
+      ...(credentialRef && mcpAuthMode === "bearer" ? { bearer_secret_ref: credentialRef } : {}),
+      ...(credentialRef && mcpAuthMode === "bearer" ? { header_secret_refs: {} } : {}),
+      ...(credentialRef && mcpAuthMode === "headers" ? { bearer_secret_ref: null, header_secret_refs: { [mcpHeaderName.trim()]: credentialRef } } : {}),
+      // Edits keep the saved working directory, such as a fixed cwd from an imported file.
+      ...(editingServer ? {} : { cwd_policy: "workspace" }),
+      enabled: editingServer?.enabled ?? false,
+      required,
+      trusted_stdio: isStdio && trusted,
+      default_approval: defaultApproval,
+      };
+      if (editingServer) await api.updateMcpServer(editingServer.id, payload, editingServer.revision);
+      else await api.createMcpServer(payload);
+      await reload();
+      setMcpDialog(false);
+      announceSettingsSaved("MCP server settings updated.");
+    } catch (saveError) {
+      void logCaughtDiagnostic("interface.harness_settings.caught_failure_03", "A handled interface operation failed.", saveError, "harness_settings");
+      setError(saveError instanceof Error ? saveError.message : "Could not save the MCP server.");
+    } finally {
+      setBusy(undefined);
+    }
+  };
+
+  const finishImport = async (report: McpImportReport, sourceName: string) => {
+    setImportDialog(false);
+    const added = report.created + report.replaced;
+    const saved = added + report.updated;
+    const counts = [added ? `${added} added` : "", report.updated ? `${report.updated} updated` : ""].filter(Boolean).join(", ");
+    const waiting = report.entries.some((entry) => (entry.action === "create" || entry.action === "replace") && !entry.enabled);
+    const title = `Saved ${saved} server${saved === 1 ? "" : "s"} from ${sourceName} (${counts}).${waiting ? " Review and probe the new ones, then enable them." : ""}`;
+    const failed = report.entries.filter((entry) => entry.action === "invalid");
+    const problems = failed.length ? [`${failed.length} could not be imported: ${failed.map((entry) => `${entry.name ?? entry.sourceName} (${entry.error ?? "invalid"})`).join("; ")}.`] : [];
+    // Enabled servers need probed tools before agents can use them.
+    const probes = api ? report.entries.filter((entry) => entry.needsProbe && entry.profileId) : [];
+    setImportNotice({ title: probes.length ? `${title} Probing ${probes.length === 1 ? probes[0].name ?? probes[0].sourceName : `${probes.length} servers`}…` : title, detail: problems.join(" ") || undefined });
+    await reload();
+    if (!api || !probes.length) return;
+    const results = await Promise.allSettled(probes.map((entry) => api.probeMcpServer(entry.profileId as string, engagement?.id)));
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") return;
+      void logCaughtDiagnostic("interface.harness_settings.import_probe_failed", "An imported MCP server could not be probed.", result.reason, "harness_settings");
+      problems.push(`${probes[index].name ?? probes[index].sourceName} could not be probed: ${result.reason instanceof Error ? result.reason.message : "probe failed"}. It stays enabled; probe it again from its card.`);
+    });
+    const probed = results.filter((result) => result.status === "fulfilled").length;
+    setImportNotice({ title: probed ? `${title} Probed ${probed} server${probed === 1 ? "" : "s"}.` : title, detail: problems.join(" ") || undefined });
+    await reload();
+  };
+
+  const updateHarness = async (profile: HarnessProfile, changes: Record<string, unknown>) => {
+    if (!api) return;
+    setBusy(profile.id);
+    try {
+      await api.updateHarness(profile.id, changes, profile.revision);
+      await reload();
+    } catch (actionError) {
+      void logCaughtDiagnostic("interface.harness_settings.caught_failure_04", "A handled interface operation failed.", actionError, "harness_settings");
+      setError(actionError instanceof Error ? actionError.message : "Harness action failed.");
+    } finally { setBusy(undefined); }
+  };
+
+  const updateServer = async (server: McpServerProfile, changes: Record<string, unknown>) => {
+    if (!api) return;
+    setBusy(server.id);
+    try {
+      await api.updateMcpServer(server.id, changes, server.revision);
+      await reload();
+    } catch (actionError) {
+      void logCaughtDiagnostic("interface.harness_settings.caught_failure_05", "A handled interface operation failed.", actionError, "harness_settings");
+      setError(actionError instanceof Error ? actionError.message : "MCP server action failed.");
+    } finally { setBusy(undefined); }
+  };
+
+  const updateNativeCapabilities = (
+    profile: HarnessProfile,
+    changes: Partial<HarnessNativeCapabilities>,
+  ) => {
+    const capabilities = { ...profile.nativeCapabilities, ...changes };
+    return updateHarness(profile, {
+      native_capabilities: {
+        workspace_access: "none",
+        shell: false,
+        web_search: capabilities.webSearch,
+        web_fetch: false,
+        browser: profile.kind === "codex_app_server" && capabilities.browser,
+        computer_use: profile.kind === "codex_app_server" && capabilities.computerUse,
+        image_generation: profile.kind === "codex_app_server" && capabilities.imageGeneration,
+        skills: capabilities.skills,
+        subagents: capabilities.subagents,
+      },
+    });
+  };
+
+  const harnessModelOptions = [...new Set([
+    ...(editingHarness?.models ?? []),
+    ...(model ? [model] : []),
+  ])];
+
+  return <>
+    <section className="settings-section" id="harness-settings">
+      <div className="section-heading"><div><h2>Agent harnesses</h2><p>Add a named profile for each Codex or Grok account.</p></div><div className="integration-card-actions"><button className="button secondary" type="button" disabled={previewMode} onClick={() => openHarness(undefined, "grok_acp")}><Plus size={16} /> Add Grok</button><button className="button primary" type="button" disabled={previewMode} onClick={() => openHarness()}><Plus size={16} /> Add Codex</button></div></div>
+      {catalogError && <div role="status"><p>{catalogError}</p><button className="button quiet" type="button" onClick={() => void reload()}>Retry catalogs</button></div>}
+      {error && <DiagnosticErrorNotice error={error} fallback="The operation could not be completed." />}
+      {harnesses.length ? <div className="provider-grid">{harnesses.map((profile) => <article className="panel provider-card integration-card harness-settings-card" key={profile.id}>
+        <header className="integration-card-heading"><span className={`status-dot ${profile.enabled ? profile.healthy ? "healthy" : "warning" : "unavailable"}`} /><div><small>{profile.kind === "grok_acp" ? "Grok Build · ACP" : "Codex App Server"}</small><h3>{profile.name}</h3></div></header>
+        <p className="integration-card-summary">{profile.detail ?? `${profile.connectionMode} · ${profile.transport}${profile.transport === "websocket" ? " · experimental" : ""}`}</p>
+        <p className="integration-card-summary" role="status">Sign-in: {profile.authenticationState ?? "unverified"} · Session: {profile.sessionState ?? "unverified"} · Model turn: {profile.turnState ?? "unverified"}{profile.lastSuccessfulTurnAt ? ` · Last success ${new Date(profile.lastSuccessfulTurnAt).toLocaleString()}` : ""}{profile.lastTurnFailureReason ? ` · ${profile.lastTurnFailureReason.replaceAll("_", " ")}` : ""}</p>
+        {!!profile.exercisedCapabilities?.length && <p className="integration-card-summary">Verified in use: {profile.exercisedCapabilities.map(item => item.replaceAll("_", " ")).join(", ")}.</p>}
+        {harnessRecovery(profile) && <p role="alert" className="integration-card-summary">{harnessRecovery(profile)}</p>}
+        <dl className="integration-card-facts"><div><dt>Model</dt><dd>{profile.defaultModel ?? "Selected per session"}</dd></div><div><dt>Permissions</dt><dd>{profile.permissionMode === "unrestricted" ? "Unrestricted · Host mode only" : "Managed"}</dd></div><div><dt>Auth</dt><dd>{profile.authMode === "existing_session" ? "Existing local sign-in" : "Secret-backed · configured"}</dd></div><div><dt>Privacy</dt><dd>{profile.localOnly ? "Local runtime" : profile.permitsSensitiveData ? profile.autoShareToolResults ? "Cloud project data · tool results auto-shared" : "Cloud project data allowed" : "Text only"}</dd></div><div><dt>Version</dt><dd title={profile.version}>{profile.version ?? "Not checked"}</dd></div></dl>
+        <details className="provider-capability-policy">
+          <summary>Vendor-native capabilities</summary>
+          <p className="provider-dialog-note"><ShieldAlert size={14} /> Docker-mode projects use the pinned automation container at <code>/workspace</code>. Host-mode projects give enabled native tools the linked project folder.</p>
+          <label className="provider-consent"><input type="checkbox" checked={profile.nativeCapabilities.webSearch} disabled={busy === profile.id} onChange={(event) => void updateNativeCapabilities(profile, { webSearch: event.target.checked })} /><span><strong>Web search</strong><small>Vendor-hosted research, never target scanning.</small></span></label>
+          {profile.kind === "codex_app_server" && <><label className="provider-consent"><input type="checkbox" checked={profile.nativeCapabilities.browser} disabled={busy === profile.id} onChange={(event) => void updateNativeCapabilities(profile, { browser: event.target.checked })} /><span><strong>Browser</strong><small>Browser-driven research with action approvals.</small></span></label><label className="provider-consent"><input type="checkbox" checked={profile.nativeCapabilities.computerUse} disabled={busy === profile.id} onChange={(event) => void updateNativeCapabilities(profile, { computerUse: event.target.checked })} /><span><strong>Computer use</strong><small>Interactive vendor computer-use surface.</small></span></label><label className="provider-consent"><input type="checkbox" checked={profile.nativeCapabilities.imageGeneration} disabled={busy === profile.id} onChange={(event) => void updateNativeCapabilities(profile, { imageGeneration: event.target.checked })} /><span><strong>Image generation</strong><small>Vendor-hosted analyst image generation.</small></span></label></>}
+          <label className="provider-consent"><input type="checkbox" checked={profile.nativeCapabilities.skills} disabled={busy === profile.id} onChange={(event) => void updateNativeCapabilities(profile, { skills: event.target.checked })} /><span><strong>Installed skills</strong><small>Expose already-installed vendor skills.</small></span></label>
+          <label className="provider-consent"><input type="checkbox" checked={profile.nativeCapabilities.subagents} disabled={busy === profile.id} onChange={(event) => void updateNativeCapabilities(profile, { subagents: event.target.checked })} /><span><strong>Subagents</strong><small>Delegated analysis in the bounded session.</small></span></label>
+        </details>
+        <footer><button className="button quiet" type="button" disabled={busy === profile.id} onClick={() => { setBusy(profile.id); void checkSavedHarness(profile).finally(() => setBusy(undefined)); }}><RefreshCw className={busy === profile.id ? "spin" : undefined} size={14} /> Check</button><button className="button quiet" type="button" title="Runs a small real model turn and uses provider quota" disabled={busy === profile.id || !profile.enabled} onClick={() => void testSavedHarness(profile)}>Test turn</button><div className="integration-card-actions"><button className="icon-button subtle" aria-label={`Edit ${profile.name}`} title="Edit harness" type="button" onClick={() => openHarness(profile)}><Pencil size={14} /></button><button className="button quiet" type="button" disabled={busy === profile.id} onClick={() => void updateHarness(profile, { enabled: !profile.enabled })}>{profile.enabled ? "Disable" : "Enable"}</button><button className="icon-button subtle" aria-label={`Delete ${profile.name}`} title="Delete harness" type="button" disabled={busy === profile.id} onClick={() => void removeHarness(profile)}><Trash2 size={14} /></button></div></footer>
+        {busy === profile.id && <p role="status" className="integration-card-summary">Working on this harness…</p>}
+        {deleteError?.id === profile.id && <div role="alert" className="integration-card-summary"><p>{deleteError.message}</p><button className="button quiet" type="button" onClick={() => void removeHarness(profile)}>Retry delete</button></div>}
+      </article>)}</div> : <div className="empty-state compact"><Bot size={23} /><strong>No agent harnesses</strong><p>Add Codex App Server when you want vendor-managed sessions.</p></div>}
+    </section>
+    <section className="settings-section" id="mcp-settings" data-guide="mcp-settings">
+      <div className="section-heading"><div><h2>MCP servers</h2><p>Shared tools for agents and missions</p></div><div className="integration-card-actions"><button className="button secondary" type="button" disabled={previewMode} onClick={() => setImportDialog(true)}><FileUp size={16} /> Import</button><button className="button primary" type="button" disabled={previewMode} onClick={() => openMcp()}><Plus size={16} /> Add MCP server</button></div></div>
+      {importNotice && <SurfaceNotice title={importNotice.title} detail={importNotice.detail} severity={importNotice.detail ? "warning" : "informational"} dismissLabel="Dismiss import notice" onDismiss={() => setImportNotice(undefined)} />}
+      {servers.length ? <div className="provider-grid">{servers.map((server) => <article className="panel provider-card integration-card" key={server.id}>
+        <header className="integration-card-heading"><span className={`status-dot ${server.enabled ? server.checkedAt ? "healthy" : "warning" : "unavailable"}`} /><div><small>{server.transport === "stdio" ? server.trustedStdio ? "Trusted local program" : "Local program · not trusted" : "Streamable HTTP"}</small><h3>{server.name}</h3></div></header>
+        {server.description && <p className="mcp-server-description" title={server.description}>{server.description}</p>}
+        {server.transport === "stdio" && <p className="provider-dialog-note"><ShieldAlert size={14} /> Runs outside the automation-container boundary. Enable only after trusting this executable.</p>}
+        <p className="integration-card-summary">{server.detail ?? `${server.tools.length} discovered tool${server.tools.length === 1 ? "" : "s"} · ${server.defaultApproval.replace("_", " ")}`}</p>
+        {mcpNextStep(server) && <p className="integration-card-summary mcp-next-step">{mcpNextStep(server)}</p>}
+        {server.tools.length > 0 && <div className="mcp-tool-policies">{server.tools.map((tool) => <label key={tool.name}><span><strong>{tool.name}</strong><small>{tool.readOnly ? "read-only" : "write/unknown"}{tool.destructive ? " · destructive" : ""}{tool.openWorld ? " · open-world" : ""}</small></span><select aria-label={`${tool.name} approval policy`} value={tool.approval} onChange={(event) => void updateServer(server, { tool_overrides: { ...server.toolOverrides, [tool.name]: event.target.value } })}>{approvalOptions.map((option) => <option value={option} key={option}>{option.replace("_", " ")}</option>)}</select></label>)}</div>}
+        <footer><button className="button quiet" type="button" disabled={busy === server.id || (server.transport === "stdio" && !server.trustedStdio)} title={server.transport === "stdio" && !server.trustedStdio ? "Trust this local program in Edit first" : undefined} onClick={() => { setBusy(server.id); void api?.probeMcpServer(server.id, engagement?.id).then(() => reload()).catch((actionError) => { void logCaughtDiagnostic("interface.harness_settings.caught_failure_08", "A handled interface operation failed.", actionError, "harness_settings"); return setError(actionError instanceof Error ? actionError.message : "Probe failed."); }).finally(() => setBusy(undefined)); }}><RefreshCw className={busy === server.id ? "spin" : undefined} size={14} /> Probe</button><div className="integration-card-actions"><button className="icon-button subtle" aria-label={`Edit ${server.name}`} title="Edit MCP server" type="button" onClick={() => openMcp(server)}><Pencil size={14} /></button><button className="button quiet" type="button" disabled={busy === server.id || (server.transport === "stdio" && !server.trustedStdio)} onClick={() => void updateServer(server, { enabled: !server.enabled })}>{server.enabled ? "Disable" : "Enable"}</button><button className="icon-button subtle" aria-label={`Delete ${server.name}`} title="Delete MCP server" type="button" disabled={busy === server.id} onClick={() => void removeServer(server)}><Trash2 size={14} /></button></div></footer>
+      </article>)}</div> : <div className="empty-state compact"><Network size={23} /><strong>No MCP server profiles</strong><p>Add one, or import the mcp.json you already use with Claude Desktop, Cursor, or VS Code. Profiles are never launched until an explicit probe or selected agent runtime uses them.</p><button className="button secondary" type="button" disabled={previewMode} onClick={() => setImportDialog(true)}><FileUp size={16} /> Import from file</button></div>}
+    </section>
+    {harnessDialog && <ModalSurface as="form" className="provider-dialog resource-dialog" labelledBy="harness-dialog-title" onClose={() => { if (!busy) setHarnessDialog(false); }} onSubmit={(event) => void submitHarness(event)}>
+        <header><div><small>Agent harness</small><h2 id="harness-dialog-title">{editingHarness ? "Edit harness" : kind === "grok_acp" ? "Add Grok ACP" : "Add Codex"}</h2></div><button className="icon-button subtle" type="button" aria-label="Close harness dialog" onClick={() => setHarnessDialog(false)}><X size={17} /></button></header>
+        <label>Name<input required value={name} onChange={(event) => setName(event.target.value)} /></label>
+        <label>Harness<input value={kind === "grok_acp" ? "Grok Build · ACP stdio" : "Codex App Server"} disabled /></label>
+        {kind === "grok_acp" ? <>
+          <label>Connection<input value="Managed stdio process" disabled /></label>
+          <label>Absolute Grok executable path<input required value={executable} placeholder="/usr/local/bin/grok" onChange={(event) => setExecutable(event.target.value)} /></label>
+          <label>Authentication<input value="Cached Grok login (cached_token)" disabled /></label>
+
+        </> : <>
+          <label>Connection<select value={connectionMode} onChange={(event) => { const next = event.target.value as HarnessProfile["connectionMode"]; setConnectionMode(next); setTransport(next === "spawn" ? "stdio" : "unix"); setHarnessAuthMode("existing_session"); setHarnessSecret(""); }}><option value="spawn">Managed process</option><option value="endpoint">Pre-launched endpoint</option></select></label>
+          {connectionMode === "spawn" ? <label>Absolute executable path<input required value={executable} placeholder="/usr/local/bin/codex" onChange={(event) => setExecutable(event.target.value)} /></label> : <><label>Transport<select value={transport} onChange={(event) => setTransport(event.target.value as HarnessProfile["transport"])}><option value="unix">Unix socket</option><option value="websocket">Loopback WebSocket (experimental)</option></select></label><label>Endpoint<input required value={endpoint} placeholder={transport === "unix" ? "unix:///path/to/socket" : "ws://127.0.0.1:4500"} onChange={(event) => setEndpoint(event.target.value)} /></label></>}
+          <label>Authentication<select value={harnessAuthMode} onChange={(event) => { setHarnessAuthMode(event.target.value as HarnessProfile["authMode"]); setHarnessSecret(""); }}><option value="existing_session">Existing vendor sign-in</option><option value={connectionMode === "endpoint" ? "endpoint_bearer" : "secret_ref"}>{connectionMode === "endpoint" ? "Endpoint bearer token" : "API key credential"}</option></select></label>
+          {harnessAuthMode !== "existing_session" && <><label>{editingHarness?.secretRef ? "Replacement credential" : "Credential"}<input type="password" autoComplete="new-password" value={harnessSecret} placeholder={editingHarness?.secretRef ? "Leave blank to keep current authentication" : "Write-only secret"} onChange={(event) => setHarnessSecret(event.target.value)} /></label>{vault.available ? <label className="provider-consent"><input type="checkbox" checked={harnessSessionCredential} onChange={(event) => setHarnessSessionCredential(event.target.checked)} /><span><strong>Use for this session only</strong><small>Otherwise Core stores it in the operating-system credential vault.</small></span></label> : <p className="provider-dialog-note">{vaultUnavailableNote(vault.state, "credential")}</p>}</>}
+        </>}
+        {connectionMode === "spawn" && <details open={homeDirectory ? true : undefined}>
+          <summary>Account folder</summary>
+          <label>Account home folder<input value={homeDirectory} placeholder="Default host account" onChange={(event) => setHomeDirectory(event.target.value)} aria-describedby="harness-account-help" /></label>
+          <HostFolderPicker purpose="account" api={api} value={homeDirectory} onSelect={setHomeDirectory} />
+          <p id="harness-account-help" className="provider-dialog-note">Choose a separate folder on the Nebula host for each account. Leave blank to use the default host account. Once used by a chat, this folder cannot be changed; add another profile to switch accounts.</p>
+          {harnessAuthMode === "existing_session" && <><p className="provider-dialog-note">Sign in from a terminal on the Nebula host, then use Check:</p><pre style={{whiteSpace: "pre-wrap", overflowWrap: "anywhere"}}><code>{`${homeDirectory.trim() ? `${kind === "grok_acp" ? "GROK_HOME" : "CODEX_HOME"}=${shellQuote(homeDirectory.trim())} ` : `env -u ${kind === "grok_acp" ? "GROK_HOME" : "CODEX_HOME"} `}${shellQuote(executable.trim() || (kind === "grok_acp" ? "grok" : "codex"))}${kind === "codex_app_server" && homeDirectory.trim() ? ` -c 'cli_auth_credentials_store="file"'` : ""} login`}</code></pre></>}
+        </details>}
+        <label>Default model<select value={model} disabled={!harnessModelOptions.length} onChange={(event) => setModel(event.target.value)}><option value="">{harnessModelOptions.length ? "Automatic (harness default)" : "Discovered after saving"}</option>{harnessModelOptions.map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
+        <p className="provider-dialog-note">{harnessModelOptions.length ? "Choose a model reported by the harness, or use its automatic default." : "Saving runs a harness check and discovers available models and modes."}</p>
+        <label className="harness-permission-field">Harness permissions<select value={permissionMode} onChange={(event) => setPermissionMode(event.target.value as HarnessProfile["permissionMode"])}><option value="managed">Managed approvals</option><option value="unrestricted">Unrestricted host access</option></select></label>
+        <p className="provider-dialog-note">{permissionMode === "unrestricted" ? "Requires Host mode and project authorization Allow all. The vendor agent can access the host filesystem and network without tool approval prompts: Codex uses danger-full-access; Grok uses always-approve with its sandbox off. Docker-mode sessions stay contained. Operating-system and Mercury controls still apply." : "Nebula uses the project's approval policy and the vendor sandbox. Docker-mode sessions keep host tools disabled. New sessions freeze this choice."}</p>
+        <label className="provider-consent"><input type="checkbox" checked={harnessLocalOnly} onChange={(event) => setHarnessLocalOnly(event.target.checked)} /><span><strong>Model runtime is local</strong><small>Only enable when prompts and outputs do not leave this machine.</small></span></label>
+        <label className="provider-consent"><input type="checkbox" checked={harnessSensitiveData} onChange={(event) => { setHarnessSensitiveData(event.target.checked); if (!event.target.checked) setHarnessAutoShareToolResults(false); }} /><span><strong>Permit project/document data</strong><small>Allow bounded excerpts in knowledge-enabled requests. Local-only items remain blocked.</small></span></label>
+        {harnessSensitiveData && !harnessLocalOnly && <label className="provider-consent"><input type="checkbox" checked={harnessAutoShareToolResults} onChange={(event) => setHarnessAutoShareToolResults(event.target.checked)} /><span><strong>Share tool results without asking each turn</strong><small>Standing consent for bounded tool inputs and results. Canonical output stays local and risky calls still require approval.</small></span></label>}
+        <p className="provider-dialog-note">Optional web, skills, and subagent capabilities are frozen per session. Project execution mode controls whether native host tools can reach the linked folder.</p>
+        {error && <DiagnosticErrorNotice error={error} fallback="The operation could not be completed." compact />}
+        <footer><button className="button secondary" type="button" onClick={() => setHarnessDialog(false)}>Cancel</button><button className="button primary" type="submit" disabled={Boolean(busy) || !name.trim()}>{busy ? "Saving and checking…" : "Save harness"}</button></footer>
+    </ModalSurface>}
+    {importDialog && api && <McpImportDialog api={api} onClose={() => setImportDialog(false)} onImported={(report, sourceName) => void finishImport(report, sourceName)} />}
+    {mcpDialog && <ModalSurface as="form" className="provider-dialog resource-dialog" labelledBy="mcp-dialog-title" onClose={() => setMcpDialog(false)} onSubmit={(event) => void submitMcp(event)}><header><div><small>MCP registry</small><h2 id="mcp-dialog-title">{editingServer ? "Edit MCP server" : "Add MCP server"}</h2></div><button className="icon-button subtle" type="button" aria-label="Close MCP dialog" onClick={() => setMcpDialog(false)}><X size={17} /></button></header><label>Name<input required pattern="[A-Za-z0-9._-]+" value={mcpName} onChange={(event) => setMcpName(event.target.value)} /></label><div className="mcp-description-field"><label>Description<textarea rows={3} maxLength={MCP_DESCRIPTION_MAX_CHARS} value={mcpDescription} placeholder="Issue tracker for the web app: search, file, and close bugs." aria-describedby="mcp-description-hint" onChange={(event) => setMcpDescription(event.target.value)} /></label><small className="mcp-description-hint"><span id="mcp-description-hint">Optional. Tells Nebula what this server is for. Jev reads it when ranking servers, and the model sees it when this server's tools are suggested.</span><span>{mcpDescription.length}/{MCP_DESCRIPTION_MAX_CHARS}</span></small></div><label>Transport<select value={mcpTransport} onChange={(event) => setMcpTransport(event.target.value as McpServerProfile["transport"])}><option value="stdio">stdio</option><option value="streamable_http">Streamable HTTP</option></select></label>{mcpTransport === "stdio" ? <><label>Absolute command<input required value={command} placeholder="/usr/local/bin/my-mcp-server" onChange={(event) => setCommand(event.target.value)} /></label><label>Arguments<textarea rows={3} value={argumentsText} placeholder="One literal argument per line" onChange={(event) => setArgumentsText(event.target.value)} /></label><label className="provider-consent"><input type="checkbox" checked={trusted} onChange={(event) => setTrusted(event.target.checked)} /><span><strong>I trust this local program</strong><small>Probing or using it executes outside Nebula's automation-container boundary.</small></span></label></> : <><label>HTTPS endpoint<input required type="url" value={url} placeholder="https://mcp.example.com/mcp" onChange={(event) => setUrl(event.target.value)} /></label><label>Authentication<select value={mcpAuthMode} onChange={(event) => setMcpAuthMode(event.target.value as McpServerProfile["authMode"])}><option value="none">Unauthenticated</option><option value="bearer">Bearer token</option><option value="headers">Secret header</option></select></label>{mcpAuthMode !== "none" && <><label>{editingServer ? "Replacement credential" : "Credential"}<input type="password" autoComplete="new-password" value={mcpSecret} placeholder={editingServer ? "Leave blank to keep current authentication" : "Write-only secret"} onChange={(event) => setMcpSecret(event.target.value)} /></label>{mcpAuthMode === "headers" && <label>Header name<input required value={mcpHeaderName} onChange={(event) => setMcpHeaderName(event.target.value)} /></label>}{vault.available ? <label className="provider-consent"><input type="checkbox" checked={sessionCredential} onChange={(event) => setSessionCredential(event.target.checked)} /><span><strong>Use for this session only</strong><small>Otherwise Core stores it in the operating-system credential vault.</small></span></label> : <p className="provider-dialog-note">{vaultUnavailableNote(vault.state, "credential")}</p>}</>}</>}<label>Default approval<select value={defaultApproval} onChange={(event) => setDefaultApproval(event.target.value as McpServerProfile["defaultApproval"])}>{approvalOptions.map((option) => <option value={option} key={option}>{option.replace("_", " ")}</option>)}</select></label><label className="provider-consent"><input type="checkbox" checked={required} onChange={(event) => setRequired(event.target.checked)} /><span><strong>Required server</strong><small>Fail new sessions when this server cannot initialize.</small></span></label><p className="provider-dialog-note">OAuth and interactive elicitation are not supported in this release. Secret values are never returned after submission.</p>{error && <DiagnosticErrorNotice error={error} fallback="The operation could not be completed." compact />}<footer><button className="button secondary" type="button" onClick={() => setMcpDialog(false)}>Cancel</button><button className="button primary" type="submit" disabled={Boolean(busy) || !mcpName.trim()}>{busy ? "Saving…" : "Save MCP server"}</button></footer></ModalSurface>}
+  </>;
+}

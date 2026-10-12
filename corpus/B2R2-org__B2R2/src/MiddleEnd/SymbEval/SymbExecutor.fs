@@ -1,0 +1,727 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.MiddleEnd.SymbEval
+
+open System.Collections.Generic
+open System.Diagnostics
+open System.Threading
+open B2R2
+open B2R2.BinIR
+open B2R2.BinIR.LowUIR
+open B2R2.FrontEnd
+open B2R2.FrontEnd.BinLifter
+open B2R2.MiddleEnd.Executor
+
+type private SymbRunWorkItem =
+  { State: SymbState
+    Depth: int
+    Visits: Map<Addr, int>
+    CheckedPathCondLen: int }
+
+type private SymbRunContext =
+  { mutable ReachAnswers: SymbReachabilityAnswer list
+    mutable SatAnswers: SymbSatisfiabilityAnswer list
+    mutable StoppedStates: (SymbState * SymbStopReason) list
+    mutable PrunedStates: (SymbState * SymbPruneReason) list
+    mutable GeneratedStates: int
+    mutable StopExploration: bool
+    mutable RunTimeout: int option }
+with
+  static member Init() =
+    { ReachAnswers = []
+      SatAnswers = []
+      StoppedStates = []
+      PrunedStates = []
+      GeneratedStates = 0
+      StopExploration = false
+      RunTimeout = None }
+
+  member ctx.AddStopped st reason =
+    ctx.StoppedStates <- (st, reason) :: ctx.StoppedStates
+
+  member ctx.AddPruned st reason =
+    ctx.PrunedStates <- (st, reason) :: ctx.PrunedStates
+
+  member ctx.AddReachAnswer target st =
+    ctx.ReachAnswers <- { Target = target; State = st } :: ctx.ReachAnswers
+
+  member ctx.AddSatAnswer target st values =
+    ctx.SatAnswers <- { Target = target; State = st; Values = values }
+                      :: ctx.SatAnswers
+
+  member ctx.MarkStateGenerated() =
+    ctx.GeneratedStates <- ctx.GeneratedStates + 1
+
+  member ctx.Stop() = ctx.StopExploration <- true
+
+  member ctx.MarkTimeout timeout =
+    ctx.RunTimeout <- Some timeout
+    ctx.Stop()
+
+type private SymbQueryEvalResult =
+  | QueryReachable
+  | QuerySatisfiable of SolverValue list
+  | QueryUnsat of SymbPruneReason
+  | QueryUnknown of SymbStopReason
+
+type private SymbMatchedQuery =
+  | MatchedReachabilityQuery
+  | MatchedSatisfiabilityQuery
+
+type private SymbValueQuery =
+  SymbExpr list * SymbExpr list -> Result<SolverOutput, SymbEvalError>
+
+type private SymbSolverRunner =
+  { CheckSat: SymbExpr list -> Result<SolverStatus, SymbEvalError>
+    GetModels: SymbValueQuery }
+
+type private SymbInstructionAction =
+  | EvaluateInstruction
+  | SkipInstruction of SymbEvalSuccessor list
+  | StopBeforeInstruction of SymbStopReason
+
+/// What one run of the executor carries along: the solver it was given, the
+/// options it was asked for, the answers and counts it accumulates as it goes,
+/// and the states still waiting to be explored.
+type private SymbRunKit =
+  { Solver: SymbSolverRunner option
+    Opts: SymbRunOptions
+    Ctx: SymbRunContext
+    Worklist: Queue<SymbRunWorkItem> }
+
+/// Represents a symbolic executor over SymbEval's evaluation state.
+type SymbExecutor(hdl: BinHandle) =
+  let liftCache = LiftCache hdl
+  let defaultStateCreationOptions =
+    { Memory = BinSectionBackedMemory
+      Registers = [||] }
+
+  let createState = function
+    | EmptyMemory -> SymbState()
+    | PreinitializedMemory mem -> SymbState mem
+    | BinSectionBackedMemory -> SymbState(BinSectionSymbMemory hdl)
+
+  let initializeState start opts =
+    let st = createState opts.Memory
+    st.InitializeContext(start, opts.Registers)
+    st
+
+  let tryGetDirectTargetAddr (ins: IInstruction) =
+    match ins.DirectBranchTarget() with
+    | true, target -> Some target
+    | false, _ -> None
+
+  let tryGetConcreteReg rid (st: SymbState) =
+    match st.TryGetReg rid with
+    | ValueSome(Const bv) -> Some(bv.ToUInt64())
+    | _ -> None
+
+  let tryGetCallTargetAddr (ins: IInstruction) (st: SymbState) =
+    match tryGetDirectTargetAddr ins with
+    | Some target ->
+      Some target
+    | None ->
+      match hdl.ISA with
+      | MIPS ->
+        let rid = MIPS.Register.R25 |> MIPS.Register.toRegID
+        tryGetConcreteReg rid st
+      | _ ->
+        None
+
+  let isInternalTarget target = hdl.File.IsValidAddr target
+
+  let wordType = hdl.ISA.WordSize |> WordSize.toRegType
+
+  let syncPC (addr: Addr) (st: SymbState) =
+    st.SetReg(hdl.RegisterFactory.ProgramCounter,
+              SymbExpr.Const(BitVector(addr, wordType)))
+
+  let pushReturnAddress returnAddress (st: SymbState) =
+    let accessor = SymbStateAccessor(hdl, st)
+    accessor.TryPushToStack(accessor.WordValue returnAddress)
+    |> Result.map ignore
+
+  let popReturnAddress (st: SymbState) =
+    let accessor = SymbStateAccessor(hdl, st)
+    match accessor.TryPopFromStack() with
+    | Ok(Const ret) -> Ok(ret.ToUInt64())
+    | Ok expr -> Error(UnsupportedSymbolicAddress expr)
+    | Error e -> Error e
+
+  let finishHookState returnAddress (st: SymbState) =
+    match popReturnAddress st with
+    | Ok retAddr when retAddr = returnAddress ->
+      st.PC <- returnAddress
+      SymbEvalSuccessor.Continue st
+    | Ok retAddr ->
+      let msg = $"Hook returned to unexpected address {retAddr:x}."
+      SymbEvalSuccessor.EvalError(UnsupportedOperation msg)
+    | Error e ->
+      SymbEvalSuccessor.EvalError e
+
+  let dispatchCallHook callSite target returnAddress hook (st: SymbState) =
+    let hookState = st.Clone()
+    let ctx = CallContext.Create(hdl, callSite, target, returnAddress)
+    match pushReturnAddress returnAddress hookState with
+    | Error e ->
+      [ SymbEvalSuccessor.EvalError e ]
+    | Ok() ->
+      match hook ctx hookState with
+      | Error e -> [ SymbEvalSuccessor.EvalError e ]
+      | Ok states -> states |> List.map (finishHookState returnAddress)
+
+  let handleCallInstruction addr
+                            (ins: IInstruction)
+                            (opts: SymbRunOptions)
+                            (st: SymbState) =
+    if not ins.IsCall then
+      EvaluateInstruction
+    else
+      let target = tryGetCallTargetAddr ins st
+      match opts.Calls with
+      | CallPolicy.StopAtCalls ->
+        StopBeforeInstruction(SymbStopReason.StoppedAtCall(addr, target))
+      | CallPolicy.FollowDirectInternalCalls ->
+        match target with
+        | Some target when isInternalTarget target ->
+          EvaluateInstruction
+        | _ ->
+          let msg = "Cannot follow call without a concrete internal target."
+          SymbEvalSuccessor.EvalError(UnsupportedOperation msg)
+          |> List.singleton
+          |> SkipInstruction
+      | CallPolicy.UseCallHooks hooks ->
+        match target with
+        | Some target ->
+          match hooks.TryFind target with
+          | Some hook ->
+            let returnAddress = liftCache.FallThroughAddr(addr, ins.Length)
+            dispatchCallHook addr target returnAddress hook st
+            |> SkipInstruction
+          | None when isInternalTarget target ->
+            EvaluateInstruction
+          | None ->
+            let msg = $"No symbolic call hook for target {target:x}."
+            SymbEvalSuccessor.EvalError(UnsupportedOperation msg)
+            |> List.singleton
+            |> SkipInstruction
+        | None ->
+          let msg = "Cannot dispatch call hook without a concrete target."
+          SymbEvalSuccessor.EvalError(UnsupportedOperation msg)
+          |> List.singleton
+          |> SkipInstruction
+
+  let solverFailure failure = SolverFailure failure |> Error
+
+  let trySerialize fn =
+    try
+      fn () |> Ok with
+    | :? System.ArgumentException as ex ->
+      SolverSerializationFailure ex.Message |> solverFailure
+    | :? System.InvalidOperationException as ex ->
+      SolverSerializationFailure ex.Message |> solverFailure
+
+  let parseSolverStatus stdout =
+    match SolverOutputParser.parseStatus stdout with
+    | Ok status ->
+      Ok status
+    | Error(SolverFailure(SolverOutputParseFailure(msg, _))) ->
+      SolverOutputParseFailure(msg, stdout) |> solverFailure
+    | Error err ->
+      Error err
+
+  let checkSmt2 (solver: ISolver) pathCond =
+    trySerialize (fun () -> SMTLibSerializer.serializeAssertions pathCond [])
+    |> Result.bind solver.CheckSat
+    |> Result.bind parseSolverStatus
+
+  let getModelsSmt2 (solver: ISolver) (pathCond, values) =
+    SolverOutputParser.validate values
+    |> Result.bind (fun () ->
+      trySerialize (fun () ->
+        SMTLibSerializer.serializeAssertions pathCond values))
+    |> Result.bind (fun smt2 ->
+      solver.CheckSat smt2
+      |> Result.bind parseSolverStatus
+      |> Result.bind (function
+        | SolverStatus.Sat when List.isEmpty values ->
+          Ok { Status = SolverStatus.Sat; Values = [] }
+        | SolverStatus.Sat ->
+          solver.GetModels smt2
+          |> Result.bind (SolverOutputParser.extract values)
+        | SolverStatus.Unsat ->
+          Ok { Status = SolverStatus.Unsat; Values = [] }
+        | SolverStatus.Unknown ->
+          Ok { Status = SolverStatus.Unknown; Values = [] }))
+
+  let runSolver (ct: CancellationToken) operation input =
+    ct.ThrowIfCancellationRequested()
+    let result = operation input
+    ct.ThrowIfCancellationRequested()
+    result
+
+  let createSolver ct (opts: SymbRunOptions) =
+    match opts.Solver with
+    | NoSolver ->
+      None
+    | CustomSolver solver ->
+      Some
+        { CheckSat = runSolver ct (checkSmt2 solver)
+          GetModels = runSolver ct (getModelsSmt2 solver) }
+
+  let isRunTimeoutReached (stopwatch: Stopwatch) (opts: SymbRunOptions) =
+    match opts.RunTimeout with
+    | timeout when timeout > 0
+                && stopwatch.ElapsedMilliseconds >= int64 timeout ->
+      Some timeout
+    | _ ->
+      None
+
+  let isMaxDepthReached depth (opts: SymbRunOptions) =
+    match opts.MaxDepth with
+    | limit when limit > 0 && depth >= limit -> Some limit
+    | _ -> None
+
+  let isStateLimitReached count (opts: SymbRunOptions) =
+    match opts.MaxStates with
+    | limit when limit > 0 && count >= limit -> Some limit
+    | _ -> None
+
+  let tryGetVisitCount addr visits =
+    Map.tryFind addr visits |> Option.defaultValue 0
+
+  let tryUpdateVisitCount addr visits (opts: SymbRunOptions) =
+    let count = tryGetVisitCount addr visits
+    match opts.LoopBound with
+    | limit when limit > 0 && count >= limit -> Error limit
+    | _ -> Ok(Map.add addr (count + 1) visits)
+
+  let checkPathFeasibility (solver: SymbSolverRunner option)
+                           addr
+                           (opts: SymbRunOptions)
+                           (st: SymbState) =
+    if opts.PruneInfeasiblePaths then
+      match solver with
+      | Some solver ->
+        match solver.CheckSat st.PathCondition with
+        | Ok SolverStatus.Unsat -> Error(SymbPruneReason.InfeasiblePath addr)
+        | Ok SolverStatus.Sat | Ok SolverStatus.Unknown -> Ok()
+        | Error e -> Error(SymbPruneReason.SolverPruningFailed(addr, e))
+      | None ->
+        Ok()
+    else
+      Ok()
+
+  (* A state that stopped was neither shown to reach a target nor shown unable
+     to reach one, so every stop reason leaves the answer inconclusive; only a
+     pruned state can have died for a reason that settles it. *)
+  let makeUnknown stopped pruned =
+    let stoppedFailures = stopped |> List.map SymbRunFailure.Stopped
+    let prunedFailures =
+      pruned
+      |> List.filter (fun (_, reason: SymbPruneReason) -> reason.IsInconclusive)
+      |> List.map SymbRunFailure.Pruned
+    match stoppedFailures @ prunedFailures with
+    | [] -> None
+    | failures -> Some(SymbAnswer.Unknown(List.rev failures))
+
+  let answerReachability answers stopped pruned =
+    match List.rev answers with
+    | _ :: _ as answers ->
+      SymbAnswer.Reachable answers
+    | [] ->
+      match makeUnknown stopped pruned with
+      | Some answer -> answer
+      | None -> SymbAnswer.Unreachable
+
+  let answerSatisfiability answers stopped pruned =
+    match List.rev answers with
+    | _ :: _ as answers ->
+      SymbAnswer.Satisfiable answers
+    | [] ->
+      match makeUnknown stopped pruned with
+      | Some answer -> answer
+      | None -> SymbAnswer.Unsatisfiable
+
+  let makeAnswer (opts: SymbRunOptions) reachAnswers satAnswers stopped pruned =
+    match opts.Query with
+    | SymbQuery.ReachAddress _
+    | SymbQuery.ReachWhen _ ->
+      answerReachability reachAnswers stopped pruned
+    | SymbQuery.SatisfyAddress _
+    | SymbQuery.SatisfyWhen _ ->
+      answerSatisfiability satAnswers stopped pruned
+
+  let solveReachabilityQuery (solver: SymbSolverRunner option) addr pathCond =
+    match solver, pathCond with
+    | None, [] ->
+      QueryReachable
+    | None, _ ->
+      QueryUnknown(SymbStopReason.MissingSolverForQuery addr)
+    | Some solver, _ ->
+      match solver.CheckSat pathCond with
+      | Ok SolverStatus.Sat ->
+        QueryReachable
+      | Ok SolverStatus.Unsat ->
+        QueryUnsat(SymbPruneReason.InfeasiblePath addr)
+      | Ok SolverStatus.Unknown ->
+        let err = SolverFailure SolverReturnedUnknown
+        QueryUnknown(SymbStopReason.SolverQueryFailed(addr, err))
+      | Error e ->
+        QueryUnknown(SymbStopReason.SolverQueryFailed(addr, e))
+
+  let solveInputQuery (solver: SymbSolverRunner option) addr pathCond values =
+    match solver, pathCond, values with
+    | None, [], [] ->
+      QuerySatisfiable []
+    | None, _, _ ->
+      QueryUnknown(SymbStopReason.MissingSolverForQuery addr)
+    | Some solver, _, _ ->
+      match solver.GetModels(pathCond, values) with
+      | Ok output when output.Status = SolverStatus.Sat ->
+        QuerySatisfiable output.Values
+      | Ok output when output.Status = SolverStatus.Unsat ->
+        QueryUnsat(SymbPruneReason.InfeasiblePath addr)
+      | Ok _ ->
+        let err = SolverFailure SolverReturnedUnknown
+        QueryUnknown(SymbStopReason.SolverQueryFailed(addr, err))
+      | Error e ->
+        QueryUnknown(SymbStopReason.SolverQueryFailed(addr, e))
+
+  let makeStopPoint depth (st: SymbState) =
+    let instruction, statements =
+      match liftCache.TryLift st.PC with
+      | Ok lifted ->
+        let instruction = Some lifted.Instruction
+        instruction, lifted.Stmts
+      | Error _ ->
+        match liftCache.TryParse st.PC with
+        | Ok ins -> Some ins, [||]
+        | Error _ -> None, [||]
+    { Address = st.PC
+      InstructionCount = depth
+      Instruction = instruction
+      Statements = statements
+      State = st }
+
+  let tryFindAvoid depth (opts: SymbRunOptions) (st: SymbState) =
+    let point = makeStopPoint depth st
+    opts.AvoidConditions
+    |> List.tryPick (function
+      | SymbAvoidCondition.AvoidAddress addr when addr = point.Address ->
+        Some(SymbPruneReason.AvoidedAddress point.Address)
+      | SymbAvoidCondition.AvoidWhen pred when pred.Invoke point ->
+        Some(SymbPruneReason.AvoidedState point.Address)
+      | _ ->
+        None)
+
+  let tryMatchUserQuery (query: SymbQuery) (point: StopPoint<SymbState>) =
+    match query with
+    | SymbQuery.ReachAddress target when point.Address = target ->
+      Some MatchedReachabilityQuery
+    | SymbQuery.ReachAddress _ ->
+      None
+    | SymbQuery.ReachWhen pred when pred.Invoke point ->
+      Some MatchedReachabilityQuery
+    | SymbQuery.ReachWhen _ ->
+      None
+    | SymbQuery.SatisfyAddress target when point.Address = target ->
+      Some MatchedSatisfiabilityQuery
+    | SymbQuery.SatisfyAddress _ ->
+      None
+    | SymbQuery.SatisfyWhen pred when pred.Invoke point ->
+      Some MatchedSatisfiabilityQuery
+    | SymbQuery.SatisfyWhen _ ->
+      None
+
+  let solveMatchedUserQuery solver opts addr (st: SymbState) = function
+    | MatchedReachabilityQuery ->
+      solveReachabilityQuery solver addr st.PathCondition
+    | MatchedSatisfiabilityQuery ->
+      solveInputQuery solver addr st.PathCondition opts.QueryValues.QueryValues
+
+  let trySolveUserQueryAtState solver opts depth (st: SymbState) =
+    let point = makeStopPoint depth st
+    let addr = point.Address
+    tryMatchUserQuery opts.Query point
+    |> Option.map (solveMatchedUserQuery solver opts addr st)
+
+  let tryCheckDepthLimit opts item =
+    let addr = item.State.PC
+    match isMaxDepthReached item.Depth opts with
+    | Some limit ->
+      let reason = SymbStopReason.DepthLimitReached(addr, limit)
+      Error(SymbRunFailure.Stopped(item.State, reason))
+    | None ->
+      Ok item
+
+  let tryUpdateVisitCountForItem opts item =
+    let addr = item.State.PC
+    match tryUpdateVisitCount addr item.Visits opts with
+    | Error limit ->
+      let reason = SymbPruneReason.LoopBoundReached(addr, limit)
+      Error(SymbRunFailure.Pruned(item.State, reason))
+    | Ok visits ->
+      Ok visits
+
+  let evaluateInstruction (opts: SymbRunOptions) addr (st: SymbState) =
+    match liftCache.TryParse addr with
+    | Error _ ->
+      Error(SymbStopReason.InvalidInstructionAddress addr)
+    | Ok ins ->
+      match handleCallInstruction addr ins opts st with
+      | StopBeforeInstruction reason ->
+        Error reason
+      | SkipInstruction successors ->
+        Ok(false, successors)
+      | EvaluateInstruction ->
+        match liftCache.TryLift addr with
+        | Error _ ->
+          Error(SymbStopReason.InvalidInstructionAddress addr)
+        | Ok lifted ->
+          syncPC addr st
+          Ok(true, SymbStmtEvaluator.evalInstr st lifted.Stmts)
+
+  let tryStopOnRunTimeout stopwatch opts (worklist: Queue<_>) onTimeout () =
+    match isRunTimeoutReached stopwatch opts with
+    | Some timeout ->
+      let item = worklist.Peek()
+      onTimeout item timeout
+      None
+    | None ->
+      Some()
+
+  let tryDequeueNextItem (worklist: Queue<_>) = function
+    | Some() -> worklist.Dequeue() |> Some
+    | None -> None
+
+  let tryAnswerUserQuery solver opts onQuery = function
+    | Some item ->
+      let st = item.State
+      let addr = st.PC
+      match trySolveUserQueryAtState solver opts item.Depth st with
+      | Some result ->
+        onQuery addr st result
+        None
+      | None ->
+        Some item
+    | None ->
+      None
+
+  let tryStopOnDepthLimit opts onFailure = function
+    | Some item ->
+      match tryCheckDepthLimit opts item with
+      | Ok item ->
+        Some item
+      | Error failure ->
+        onFailure failure
+        None
+    | None ->
+      None
+
+  let tryStopOnLoopLimit opts onFailure = function
+    | Some item ->
+      match tryUpdateVisitCountForItem opts item with
+      | Ok visits ->
+        Some(item, visits)
+      | Error failure ->
+        onFailure failure
+        None
+    | None ->
+      None
+
+  let handleRunFailure addStopped addPruned stopExploration = function
+    | SymbRunFailure.Stopped(st,
+                             (SymbStopReason.StateLimitReached _ as reason)) ->
+      addStopped st reason
+      stopExploration ()
+    | SymbRunFailure.Stopped(st, reason) ->
+      addStopped st reason
+    | SymbRunFailure.Pruned(st, reason) ->
+      addPruned st reason
+
+  /// What an answered query means for the run: the answer is recorded, and
+  /// where the run wanted only one it stops there. A path the solver calls
+  /// unsatisfiable is pruned, and one it cannot decide is stopped.
+  let answerQuery (kit: SymbRunKit) addr (st: SymbState) = function
+    | QueryReachable ->
+      kit.Ctx.AddReachAnswer addr st
+      if kit.Opts.StopAtFirstAnswer then kit.Ctx.Stop() else ()
+    | QuerySatisfiable values ->
+      kit.Ctx.AddSatAnswer addr st values
+      if kit.Opts.StopAtFirstAnswer then kit.Ctx.Stop() else ()
+    | QueryUnsat reason ->
+      kit.Ctx.AddPruned st reason
+    | QueryUnknown reason ->
+      kit.Ctx.AddStopped st reason
+
+  /// Puts a state on the worklist unless something rules it out: it stands on
+  /// a path being avoided, the solver finds its path condition infeasible, or
+  /// the run has already generated as many states as it was allowed. The
+  /// feasibility check costs a solver call, so it is made only where the path
+  /// condition has actually grown since it was last checked.
+  let enqueueState (kit: SymbRunKit) checkedPathCondLen depth visits st =
+    let addr = (st: SymbState).PC
+    if kit.Ctx.StopExploration then
+      ()
+    else
+      match tryFindAvoid depth kit.Opts st with
+      | Some reason ->
+        kit.Ctx.AddPruned st reason
+      | None ->
+        let pathCondLen = List.length st.PathCondition
+        let shouldCheck =
+          kit.Opts.PruneInfeasiblePaths
+          && pathCondLen > checkedPathCondLen
+        let pruning =
+          if shouldCheck then checkPathFeasibility kit.Solver addr kit.Opts st
+          else Ok()
+        match pruning with
+        | Error reason ->
+          kit.Ctx.AddPruned st reason
+        | Ok() ->
+          match isStateLimitReached kit.Ctx.GeneratedStates kit.Opts with
+          | Some limit ->
+            kit.Ctx.AddStopped st (SymbStopReason.StateLimitReached limit)
+            kit.Ctx.Stop()
+          | None ->
+            kit.Worklist.Enqueue
+              { State = st
+                Depth = depth
+                Visits = visits
+                CheckedPathCondLen =
+                  if shouldCheck then pathCondLen else checkedPathCondLen }
+            kit.Ctx.MarkStateGenerated()
+
+  /// Where one successor of an instruction goes: a plain one carries on a step
+  /// deeper, a fork puts both sides on the worklist, and one that stopped or
+  /// failed is recorded against the address it stopped at.
+  ///
+  /// A failed evaluation has no successor state to record, so it is charged to
+  /// `callerState` -- the state handed to `run`, before it was cloned and moved
+  /// to the starting address. That state is not the one the exploration began
+  /// from and its PC is whatever the caller left it at; what it does offer is
+  /// that nothing here mutates it, where the run's own initial state is
+  /// advanced in place as the first path is walked.
+  let handleSuccessor kit callerState addr item visits successor =
+    let condLen = (item: SymbRunWorkItem).CheckedPathCondLen
+    let depth = item.Depth + 1
+    match successor with
+    | SymbEvalSuccessor.Continue st ->
+      enqueueState kit condLen depth visits st
+    | SymbEvalSuccessor.Fork(trueState, falseState) ->
+      enqueueState kit condLen depth visits trueState
+      enqueueState kit condLen depth visits falseState
+    | SymbEvalSuccessor.StoppedAtSideEffect(st, eff) ->
+      let reason = SymbStopReason.StoppedAtSideEffect(addr, eff)
+      (kit: SymbRunKit).Ctx.AddStopped st reason
+    | SymbEvalSuccessor.EvalError e ->
+      let reason = SymbStopReason.EvaluationError(addr, e)
+      kit.Ctx.AddStopped callerState reason
+
+  /// One instruction taken off the worklist: evaluate it and route each
+  /// successor, or record why it could not be evaluated at all. Nothing to do
+  /// means an earlier step in the pipeline has already answered for this item.
+  /// `callerState` is only passed through, for `handleSuccessor` to charge an
+  /// evaluation failure to.
+  let handleInstruction kit callerState = function
+    | None ->
+      ()
+    | Some(item: SymbRunWorkItem, visits) ->
+      let st = item.State
+      let addr = st.PC
+      match evaluateInstruction (kit: SymbRunKit).Opts addr st with
+      | Error reason ->
+        kit.Ctx.AddStopped st reason
+      | Ok(_, successors) ->
+        successors
+        |> List.iter (handleSuccessor kit callerState addr item visits)
+
+  let run (ct: CancellationToken) start (st: SymbState) (opts: SymbRunOptions) =
+    ct.ThrowIfCancellationRequested()
+    liftCache.WarmUp opts.WarmUpRanges
+    ct.ThrowIfCancellationRequested()
+    let worklist = Queue<SymbRunWorkItem>()
+    let stopwatch = Stopwatch.StartNew()
+    let solver = createSolver ct opts
+    let ctx = SymbRunContext.Init()
+    let kit =
+      { Solver = solver; Opts = opts; Ctx = ctx; Worklist = worklist }
+    let initialState = st.Clone()
+    initialState.PC <- start
+    let handleRunTimeout item timeout =
+      ctx.AddStopped item.State (SymbStopReason.RunTimeoutReached timeout)
+      ctx.MarkTimeout timeout
+    let handleFailure = handleRunFailure ctx.AddStopped ctx.AddPruned ctx.Stop
+    enqueueState kit 0 0 Map.empty initialState
+    while worklist.Count > 0 && not ctx.StopExploration do
+      ct.ThrowIfCancellationRequested()
+      ()
+      |> tryStopOnRunTimeout stopwatch opts worklist handleRunTimeout
+      |> tryDequeueNextItem worklist
+      |> tryAnswerUserQuery solver opts (answerQuery kit)
+      |> tryStopOnDepthLimit opts handleFailure
+      |> tryStopOnLoopLimit opts handleFailure
+      |> handleInstruction kit st
+    let answer =
+      makeAnswer opts
+                 ctx.ReachAnswers
+                 ctx.SatAnswers
+                 ctx.StoppedStates
+                 ctx.PrunedStates
+    { Answer = answer
+      StopReasons = List.rev ctx.StoppedStates
+      PruneReasons = List.rev ctx.PrunedStates
+      StateCount = ctx.GeneratedStates
+      Timeout = ctx.RunTimeout }
+
+  member _.CreateState() = initializeState 0UL defaultStateCreationOptions
+
+  member _.CreateState options = initializeState 0UL options
+
+  member _.Run(start, state, options) =
+    run CancellationToken.None start state options
+
+  /// Runs symbolic execution while observing the given cancellation token.
+  member _.Run(start, state, options, ct) =
+    run ct start state options
+
+  member _.Run(start, state, calls, query: SymbQueryRequest, solver) =
+    let options =
+      { SymbRunOptions.Default(query, solver) with
+          Calls = calls }
+    run CancellationToken.None start state options
+
+  interface IExecutor<SymbState,
+                      IMemory<SymbExpr>,
+                      SymbExpr,
+                      SymbRunOptions,
+                      SymbRunResult> with
+
+    member this.CreateState() = this.CreateState()
+
+    member this.CreateState options = this.CreateState options
+
+    member this.Run(start, state, options) = this.Run(start, state, options)

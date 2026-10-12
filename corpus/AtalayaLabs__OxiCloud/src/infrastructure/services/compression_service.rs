@@ -1,0 +1,391 @@
+use bytes::Bytes;
+use flate2::Compression;
+use flate2::bufread::GzDecoder;
+use flate2::read::GzEncoder as GzEncoderRead;
+use flate2::write::GzEncoder as GzEncoderWrite;
+use futures::{Stream, StreamExt};
+use std::io;
+use std::io::{Read, Write};
+use tokio_util::io::{ReaderStream, StreamReader};
+use tracing::error;
+
+use crate::application::ports::compression_ports::{
+    CompressionLevel as PortCompressionLevel, CompressionPort,
+};
+use crate::domain::errors::DomainError;
+
+/// Compression level for files
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionLevel {
+    /// No compression (transfer only)
+    None = 0,
+    /// Fast compression with lower ratio
+    Fast = 1,
+    /// Balanced compression (default)
+    Default = 6,
+    /// Maximum compression (slower)
+    Best = 9,
+}
+
+impl From<CompressionLevel> for Compression {
+    fn from(level: CompressionLevel) -> Self {
+        match level {
+            CompressionLevel::None => Compression::none(),
+            CompressionLevel::Fast => Compression::fast(),
+            CompressionLevel::Default => Compression::default(),
+            CompressionLevel::Best => Compression::best(),
+        }
+    }
+}
+
+/// Size threshold to decide whether to compress or not
+const COMPRESSION_SIZE_THRESHOLD: u64 = 1024 * 50; // 50KB
+
+/// Interface for compression services
+pub trait CompressionService: Send + Sync {
+    /// Compresses data in memory
+    async fn compress_data(&self, data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>>;
+
+    /// Decompresses data in memory
+    async fn decompress_data(&self, compressed_data: &[u8]) -> io::Result<Vec<u8>>;
+
+    /// Compresses a data stream
+    fn compress_stream<S>(
+        &self,
+        stream: S,
+        level: CompressionLevel,
+    ) -> impl Stream<Item = io::Result<Bytes>> + Send
+    where
+        S: Stream<Item = io::Result<Bytes>> + Send + 'static + Unpin;
+
+    /// Decompresses a data stream
+    fn decompress_stream<S>(
+        &self,
+        compressed_stream: S,
+    ) -> impl Stream<Item = io::Result<Bytes>> + Send
+    where
+        S: Stream<Item = io::Result<Bytes>> + Send + 'static + Unpin;
+
+    /// Determines whether a file should be compressed based on its MIME type and size
+    fn should_compress(&self, mime_type: &str, size: u64) -> bool;
+}
+
+/// Gzip compression service implementation
+pub struct GzipCompressionService;
+
+impl Default for GzipCompressionService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GzipCompressionService {
+    /// Creates a new service instance
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl CompressionService for GzipCompressionService {
+    /// Compresses data in memory using Gzip
+    async fn compress_data(&self, data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {
+        let data_owned = data.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let mut encoder = GzEncoderRead::new(&data_owned[..], level.into());
+            let mut compressed = Vec::new();
+            encoder.read_to_end(&mut compressed)?;
+            Ok(compressed)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            error!("Compression task error: {}", e);
+            Err(io::Error::other(e.to_string()))
+        })
+    }
+
+    /// Decompresses data in memory
+    async fn decompress_data(&self, compressed_data: &[u8]) -> io::Result<Vec<u8>> {
+        let data = compressed_data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut decoder = GzDecoder::new(&data[..]);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            Ok(decompressed)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            error!("Decompression task error: {}", e);
+            Err(io::Error::other(e.to_string()))
+        })
+    }
+
+    /// Compresses a byte stream using true streaming — constant memory usage.
+    ///
+    /// Uses a `GzEncoder<Vec<u8>>` as a write sink. For each input chunk,
+    /// the encoder is fed the bytes and any compressed output that has
+    /// accumulated in its internal buffer is drained and yielded immediately.
+    /// Memory usage: ~128 KB (64 KB input + gzip internal buffers).
+    fn compress_stream<S>(
+        &self,
+        stream: S,
+        level: CompressionLevel,
+    ) -> impl Stream<Item = io::Result<Bytes>> + Send
+    where
+        S: Stream<Item = io::Result<Bytes>> + Send + 'static + Unpin,
+    {
+        let compression: Compression = level.into();
+
+        Box::pin(async_stream::stream! {
+            let mut encoder = GzEncoderWrite::new(Vec::new(), compression);
+            let mut stream = Box::pin(stream);
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(bytes) => {
+                        // Write input bytes into the gzip encoder
+                        if let Err(e) = encoder.write_all(&bytes) {
+                            yield Err(e);
+                            return;
+                        }
+
+                        // Drain whatever compressed output is available
+                        let buf = encoder.get_mut();
+                        if !buf.is_empty() {
+                            let compressed = std::mem::take(buf);
+                            yield Ok(Bytes::from(compressed));
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            }
+
+            // Finalize the gzip stream (writes remaining data + gzip footer)
+            match encoder.finish() {
+                Ok(remaining) => {
+                    if !remaining.is_empty() {
+                        yield Ok(Bytes::from(remaining));
+                    }
+                }
+                Err(e) => {
+                    yield Err(e);
+                }
+            }
+        })
+    }
+
+    /// Decompresses a byte stream using true streaming — constant memory usage.
+    ///
+    /// Uses `async-compression` to wrap the incoming compressed stream as an
+    /// `AsyncBufRead`, then pipes it through a `GzipDecoder` that produces
+    /// decompressed bytes on-the-fly.
+    ///
+    /// Memory usage: ~128 KB constant (64 KB read buffer + 64 KB output chunks),
+    /// independent of the total file size.
+    fn decompress_stream<S>(
+        &self,
+        compressed_stream: S,
+    ) -> impl Stream<Item = io::Result<Bytes>> + Send
+    where
+        S: Stream<Item = io::Result<Bytes>> + Send + 'static + Unpin,
+    {
+        // Stream<Bytes> → AsyncRead → BufReader → GzipDecoder → Stream<Bytes>
+        let reader = StreamReader::new(compressed_stream);
+        let buf_reader = tokio::io::BufReader::with_capacity(64 * 1024, reader);
+        let decoder = async_compression::tokio::bufread::GzipDecoder::new(buf_reader);
+        ReaderStream::with_capacity(decoder, 64 * 1024)
+    }
+
+    /// Determines whether a file should be compressed based on its MIME type and size
+    fn should_compress(&self, mime_type: &str, size: u64) -> bool {
+        // Do not compress very small files (overhead)
+        if size < COMPRESSION_SIZE_THRESHOLD {
+            return false;
+        }
+
+        // Do not compress already compressed files
+        if mime_type.starts_with("image/")
+            && !mime_type.contains("svg")
+            && !mime_type.contains("bmp")
+        {
+            return false;
+        }
+
+        if mime_type.starts_with("audio/")
+            || mime_type.starts_with("video/")
+            || mime_type.contains("zip")
+            || mime_type.contains("gzip")
+            || mime_type.contains("compressed")
+            || mime_type.contains("7z")
+            || mime_type.contains("rar")
+            || mime_type.contains("bz2")
+            || mime_type.contains("xz")
+            || mime_type.contains("jpg")
+            || mime_type.contains("jpeg")
+            || mime_type.contains("png")
+            || mime_type.contains("gif")
+            || mime_type.contains("webp")
+            || mime_type.contains("mp3")
+            || mime_type.contains("mp4")
+            || mime_type.contains("ogg")
+            || mime_type.contains("webm")
+        {
+            return false;
+        }
+
+        // Compress text files, documents, and other compressible types
+        true
+    }
+}
+
+// ─── Port implementation ─────────────────────────────────────────────────────
+
+/// Convert application-layer CompressionLevel to infrastructure CompressionLevel.
+impl From<PortCompressionLevel> for CompressionLevel {
+    fn from(level: PortCompressionLevel) -> Self {
+        match level {
+            PortCompressionLevel::None => CompressionLevel::None,
+            PortCompressionLevel::Fast => CompressionLevel::Fast,
+            PortCompressionLevel::Default => CompressionLevel::Default,
+            PortCompressionLevel::Best => CompressionLevel::Best,
+        }
+    }
+}
+
+impl CompressionPort for GzipCompressionService {
+    async fn compress_data(
+        &self,
+        data: &[u8],
+        level: PortCompressionLevel,
+    ) -> Result<Vec<u8>, DomainError> {
+        CompressionService::compress_data(self, data, level.into())
+            .await
+            .map_err(DomainError::from)
+    }
+
+    async fn decompress_data(&self, compressed_data: &[u8]) -> Result<Vec<u8>, DomainError> {
+        CompressionService::decompress_data(self, compressed_data)
+            .await
+            .map_err(DomainError::from)
+    }
+
+    fn should_compress(&self, mime_type: &str, size: u64) -> bool {
+        CompressionService::should_compress(self, mime_type, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::TryStreamExt;
+
+    #[tokio::test]
+    async fn test_compress_decompress_data() {
+        let service = GzipCompressionService::new();
+
+        // Test data
+        let data = "Hello, world! ".repeat(1000).into_bytes();
+
+        // Compress
+        let compressed =
+            CompressionService::compress_data(&service, &data, CompressionLevel::Default)
+                .await
+                .unwrap();
+
+        // Verify that compression reduces the size
+        assert!(compressed.len() < data.len());
+
+        // Decompress
+        let decompressed = CompressionService::decompress_data(&service, &compressed)
+            .await
+            .unwrap();
+
+        // Verify that the original data is recovered correctly
+        assert_eq!(decompressed, data);
+    }
+
+    #[tokio::test]
+    async fn test_compress_decompress_stream() {
+        let service = GzipCompressionService::new();
+
+        // Create test data
+        let chunks = vec![
+            Ok(Bytes::from("Hello, ")),
+            Ok(Bytes::from("world! ")),
+            Ok(Bytes::from("This is a test of streaming compression.")),
+        ];
+
+        // Convert to stream
+        let input_stream = futures::stream::iter(chunks);
+
+        // Compress the stream
+        let compressed_stream = service.compress_stream(input_stream, CompressionLevel::Default);
+
+        // Collect the compressed bytes
+        let compressed_bytes = compressed_stream
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .unwrap();
+
+        // Decompress the data
+        let decompressed = CompressionService::decompress_data(&service, &compressed_bytes)
+            .await
+            .unwrap();
+
+        // Verify result
+        let expected = "Hello, world! This is a test of streaming compression.";
+        assert_eq!(String::from_utf8(decompressed).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_should_compress() {
+        let service = GzipCompressionService::new();
+
+        // Cases that should not be compressed
+        assert!(!CompressionService::should_compress(
+            &service,
+            "image/jpeg",
+            100 * 1024
+        ));
+        assert!(!CompressionService::should_compress(
+            &service,
+            "video/mp4",
+            10 * 1024 * 1024
+        ));
+        assert!(!CompressionService::should_compress(
+            &service,
+            "application/zip",
+            5 * 1024 * 1024
+        ));
+
+        // Cases that should be compressed
+        assert!(CompressionService::should_compress(
+            &service,
+            "text/html",
+            100 * 1024
+        ));
+        assert!(CompressionService::should_compress(
+            &service,
+            "application/json",
+            200 * 1024
+        ));
+        assert!(CompressionService::should_compress(
+            &service,
+            "text/plain",
+            1024 * 1024
+        ));
+
+        // Small files should not be compressed regardless of type
+        assert!(!CompressionService::should_compress(
+            &service,
+            "text/html",
+            10 * 1024
+        ));
+    }
+}

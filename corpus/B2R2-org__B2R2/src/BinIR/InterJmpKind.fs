@@ -1,0 +1,79 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.BinIR
+
+/// Represents the kind of an InterJmp (inter-instruction jump) statement, such
+/// as a call, return, etc. A jump statement can combine these flags when it has
+/// multiple properties.
+[<System.Flags>]
+type InterJmpKind =
+  /// The base case, i.e., a simple jump instruction.
+  | Base = 0
+  /// A call to a function.
+  | IsCall = 1
+  /// A return from a function.
+  | IsRet = 2
+  /// An exit, which will terminate the process.
+  | IsExit = 4
+  /// A branch instruction that modifies the operation mode from Thumb to ARM.
+  | SwitchToARM = 8
+  /// A branch instruction that modifies the operation mode from ARM to Thumb.
+  | SwitchToThumb = 16
+  /// Sentinel for a statement that is not a jump instruction. This is only
+  /// useful in special cases such as when representing a delay slot of MIPS,
+  /// and should never be used in other cases.
+  | NotAJmp = 32
+  /// A branch instruction that modifies the operation mode from MIPS to
+  /// microMIPS.
+  | SwitchToMicroMIPS = 64
+  /// A branch instruction that modifies the operation mode from microMIPS or
+  /// MIPS16e to MIPS.
+  | SwitchToMIPS = 128
+  /// A branch instruction that modifies the operation mode from MIPS to
+  /// MIPS16e.
+  | SwitchToMIPS16 = 256
+
+/// <summary>
+/// Provides functions to access <see cref='T:B2R2.BinIR.InterJmpKind'/>.
+/// </summary>
+[<RequireQualifiedAccess>]
+module InterJmpKind =
+
+  /// <summary>
+  /// Retrieves the string representation of the inter-jump kind.
+  /// </summary>
+  [<CompiledName "ToString">]
+  let toString = function
+    | InterJmpKind.Base -> "Base"
+    | InterJmpKind.IsCall -> "IsCall"
+    | InterJmpKind.IsRet -> "IsRet"
+    | InterJmpKind.IsExit -> "IsExit"
+    | InterJmpKind.SwitchToARM -> "SwitchToARM"
+    | InterJmpKind.SwitchToThumb -> "SwitchToThumb"
+    | InterJmpKind.NotAJmp -> "NotAJmp"
+    | InterJmpKind.SwitchToMicroMIPS -> "SwitchToMicroMIPS"
+    | InterJmpKind.SwitchToMIPS -> "SwitchToMIPS"
+    | InterJmpKind.SwitchToMIPS16 -> "SwitchToMIPS16"
+    | _ -> raise IllegalASTTypeException

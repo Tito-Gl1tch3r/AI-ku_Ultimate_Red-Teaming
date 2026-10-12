@@ -1,0 +1,69 @@
+import { BookOpen, FileSearch, LayoutDashboard, ListTodo, Network, Sparkles } from "lucide-react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { projectRoot, projectSurface } from "../resourceRoutes";
+import { AssetsPage } from "./AssetsPage";
+import { EvidencePage } from "./EvidencePage";
+import { KnowledgePage } from "./KnowledgePage";
+import { OverviewPage } from "./OverviewPage";
+import { ResultsPage } from "./ResultsPage";
+import { WorkPage } from "./WorkPage";
+
+type ProjectView = "overview" | "work" | "assets" | "evidence" | "sources" | "results";
+
+const projectViews = [
+  { id: "overview" as const, label: "Overview", icon: LayoutDashboard },
+  { id: "work" as const, label: "Work", icon: ListTodo },
+  { id: "assets" as const, label: "Assets", icon: Network },
+  { id: "evidence" as const, label: "Evidence", icon: FileSearch },
+  { id: "sources" as const, label: "Sources", icon: BookOpen },
+  { id: "results" as const, label: "Results", icon: Sparkles },
+];
+
+function isProjectView(value: string | null): value is ProjectView {
+  return projectViews.some((item) => item.id === value);
+}
+
+export function ProjectPage({ canonicalView }: { canonicalView?: ProjectView }) {
+  const navigate = useNavigate();
+  const { projectId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requested = searchParams.get("view");
+  const view: ProjectView = canonicalView ?? (isProjectView(requested) ? requested : "overview");
+
+  const selectView = (next: ProjectView) => {
+    if (projectId) {
+      navigate(next === "overview" ? projectRoot(projectId) : projectSurface(projectId, next));
+      return;
+    }
+    const params = new URLSearchParams(searchParams);
+    params.set("view", next);
+    if (next !== "sources") params.delete("source");
+    if (next !== "evidence") params.delete("id");
+    setSearchParams(params, { replace: true });
+  };
+
+  return (
+    <div className="project-workspace">
+      <nav className="project-tabs project-sections" aria-label="Project sections">
+        {projectViews.map(({ id, label, icon: Icon }) => (
+          <button
+            className={view === id ? "active" : undefined}
+            type="button"
+            aria-current={view === id ? "page" : undefined}
+            onClick={() => selectView(id)}
+            key={id}
+          >
+            <Icon size={16} aria-hidden="true" />
+            {label}
+          </button>
+        ))}
+      </nav>
+      {view === "overview" ? <OverviewPage /> : null}
+      {view === "work" ? <WorkPage /> : null}
+      {view === "assets" ? <AssetsPage /> : null}
+      {view === "evidence" ? <EvidencePage /> : null}
+      {view === "sources" ? <KnowledgePage /> : null}
+      {view === "results" ? <ResultsPage /> : null}
+    </div>
+  );
+}

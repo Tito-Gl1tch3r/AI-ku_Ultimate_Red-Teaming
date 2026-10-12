@@ -1,0 +1,2591 @@
+"""Session-scoped Bash automation in a digest-pinned OCI environment.
+
+The model-visible contract is intentionally fixed: ``run_command`` starts a
+Bash process and ``process_io`` observes or controls it. Executables inside the
+runtime are ordinary PATH entries; they are never represented as installable
+Nebula tools.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import platform
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import tempfile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Literal
+from uuid import NAMESPACE_URL, uuid4, uuid5
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .artifacts import ArtifactStore
+from .diagnostics import create_diagnostic_task, record_caught_exception
+from .domain import (
+    Approval,
+    ApprovalStatus,
+    Artifact,
+    AutomationApprovalPolicy,
+    AutomationNetworkMode,
+    AutomationProjectPolicy,
+    AutomationSession,
+    AutomationSessionStatus,
+    CommandExecution,
+    CommandExecutionStatus,
+    Engagement,
+    RiskClass,
+    RunnerIsolation,
+    RunnerProfile as StoredRunnerProfile,
+    ScopePolicy,
+    VpnProfile,
+    ToolCallOrigin,
+    WorkspaceChange,
+    utc_now,
+)
+from .redaction import redact_text
+from .sandbox import (
+    ContainerEgressController,
+    ContainerRuntimeType,
+    ContainerSandboxRunner,
+    EgressLease,
+    EgressRule,
+    RunnerIsolationMode,
+    RunnerPlatform,
+    RunnerProfile,
+    SandboxContainerUser,
+    SandboxExecutionKind,
+    SandboxLimits,
+    SandboxNetwork,
+    SandboxRequest,
+    SandboxRootFilesystem,
+    SandboxUnavailable,
+    SandboxWorkspaceAccess,
+    _runtime_environment,
+)
+from .storage import ConflictError, CorruptRecordError, NebulaStore, NotFoundError
+from .credentials import CredentialStore
+
+
+MAX_COMMAND_CHARACTERS = 200_000
+MAX_PROCESS_INPUT_BYTES = 1_048_576
+MAX_POLL_BYTES = 32_768
+MAX_CAPTURE_BYTES = 100 * 1024 * 1024
+# How long stream capture may lag a finished process before it is abandoned
+# (a detached descendant can hold the pipes open indefinitely).
+DRAIN_SETTLE_SECONDS = 5.0
+HOST_EXIT_POLL_SECONDS = 0.25
+HOST_PIPE_RELEASE_SECONDS = 2.0
+# Per-command capture directories: ``<process uuid4>-<mkdtemp suffix>``.
+_CAPTURE_DIRECTORY_NAME = re.compile(
+    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}-[a-z0-9_]{8}"
+)
+_IMAGE_PATTERN = re.compile(
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?"
+    r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+@sha256:[0-9a-f]{64}"
+)
+
+
+class AutomationRuntimeError(RuntimeError):
+    """Base class for safe automation runtime failures."""
+
+
+class AutomationRuntimeUnavailable(AutomationRuntimeError):
+    """The pinned local runtime cannot currently be used."""
+
+
+class AutomationPolicyDenied(AutomationRuntimeError):
+    """A hard project or sandbox boundary denied the request."""
+
+
+class CommandApprovalRequired(AutomationRuntimeError):
+    def __init__(self, approval: Approval) -> None:
+        super().__init__("command execution requires operator approval")
+        self.approval = approval
+
+
+class RunCommandRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: str = Field(min_length=1, max_length=MAX_COMMAND_CHARACTERS)
+    cwd: str = Field(default=".", min_length=1, max_length=4_096)
+    timeout_ms: int | None = Field(default=None, ge=1_000, le=86_400_000)
+    background: bool = False
+    network: AutomationNetworkMode = AutomationNetworkMode.NONE
+
+    @field_validator("command")
+    @classmethod
+    def command_has_no_nul(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("command cannot contain NUL bytes")
+        return value
+
+    @field_validator("cwd")
+    @classmethod
+    def cwd_has_no_nul(cls, value: str) -> str:
+        path = Path(value)
+        if "\x00" in value:
+            raise ValueError("cwd cannot contain NUL bytes")
+        return path.as_posix() or "."
+
+
+class ProcessIORequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["poll", "write", "terminate"] = "poll"
+    input: str | None = Field(default=None, max_length=MAX_PROCESS_INPUT_BYTES)
+    max_bytes: int = Field(default=MAX_POLL_BYTES, ge=1, le=MAX_POLL_BYTES)
+
+    @model_validator(mode="after")
+    def input_matches_action(self) -> "ProcessIORequest":
+        if self.action == "write" and self.input is None:
+            raise ValueError("write requires input")
+        if self.action != "write" and self.input is not None:
+            raise ValueError("input is only accepted by write")
+        return self
+
+
+class CommandResult(BaseModel):
+    schema_: Literal["nebula.command-result/v1"] = Field(
+        default="nebula.command-result/v1", alias="schema"
+    )
+    session_id: str
+    process_id: str
+    execution_id: str
+    status: CommandExecutionStatus
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    output_truncated: bool = False
+    stdout_artifact_id: str | None = None
+    stderr_artifact_id: str | None = None
+    redacted_stdout_artifact_id: str | None = None
+    redacted_stderr_artifact_id: str | None = None
+    workspace_changes: list[WorkspaceChange] = Field(default_factory=list)
+    network_granted: bool = False
+    untrusted_data: bool = True
+    results_url: str | None = None
+    results_api_key: str | None = None
+    chat_session_id: str | None = None
+    chat_turn_id: str | None = None
+    tool_call_id: str | None = None
+
+
+MAX_RESULTS_STDOUT_CHARACTERS = 64 * 1024
+MAX_RESULTS_OUTPUT_BYTES = 64 * 1024
+# The largest JSON body a valid results POST can need: the summary, stdout
+# and output at their limits, with room for JSON escaping.
+MAX_PROCESS_RESULTS_BODY_BYTES = 1024 * 1024
+
+
+class ProcessResultsRequest(BaseModel):
+    """What a background command POSTs to its results URL."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["complete", "failed"] = "complete"
+    summary: str | None = Field(default=None, max_length=1_000)
+    exit_code: int | None = Field(default=None, ge=0, le=255)
+    output: dict[str, Any] = Field(default_factory=dict)
+    stdout: str = Field(default="", max_length=MAX_RESULTS_STDOUT_CHARACTERS)
+
+    @field_validator("output")
+    @classmethod
+    def _bounded_output(cls, value: dict[str, Any]) -> dict[str, Any]:
+        size = len(
+            json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), default=str
+            ).encode("utf-8")
+        )
+        if size > MAX_RESULTS_OUTPUT_BYTES:
+            raise ValueError(
+                f"output is {size} bytes of JSON; the limit is "
+                f"{MAX_RESULTS_OUTPUT_BYTES}. Write larger results to a file in "
+                "the workspace and name it in output."
+            )
+        return value
+
+
+class ProcessResultsAccepted(BaseModel):
+    """The results webhook's acknowledgement.
+
+    It confirms what Core recorded without echoing the process record back;
+    a command that prints the response then keeps only this in its stdout.
+    """
+
+    accepted: Literal[True] = True
+    process_id: str
+    status: CommandExecutionStatus
+    exit_code: int | None = None
+
+
+class AutomationRuntimeInfo(BaseModel):
+    configured: bool
+    ready: bool
+    image: str | None = None
+    digest: str | None = None
+    runner_profile_id: str | None = None
+    detail: str
+    inventory: list[dict[str, str]] = Field(default_factory=list)
+
+
+class RuntimeBackendProcess(ABC):
+    stdout: asyncio.StreamReader
+    stderr: asyncio.StreamReader
+
+    @abstractmethod
+    async def write(self, data: bytes) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def wait(self) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def terminate(self) -> None:
+        raise NotImplementedError
+
+
+class RuntimeBackendSession(ABC):
+    @property
+    @abstractmethod
+    def network_enabled(self) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def enable_network(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def run(
+        self,
+        process_id: str,
+        command: str,
+        cwd: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> RuntimeBackendProcess:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def close(self) -> None:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class SessionLaunch:
+    session_id: str
+    runner: ContainerSandboxRunner
+    image: str
+    workspace: Path
+    limits: SandboxLimits
+    egress_rules: tuple[EgressRule, ...] = ()
+    egress_domains: tuple[str, ...] = ()
+    egress_ports: tuple[int, ...] = ()
+    resolv_conf: Path | None = None
+    network_granted: bool = False
+    workspace_access: SandboxWorkspaceAccess = SandboxWorkspaceAccess.WRITE
+    container_user: SandboxContainerUser = SandboxContainerUser.NON_ROOT
+    loopback_only: bool = False
+    vpn_config: str | None = None
+
+
+class _ContainerProcess(RuntimeBackendProcess):
+    def __init__(
+        self,
+        *,
+        process: asyncio.subprocess.Process,
+        session: "ContainerRuntimeSession",
+        process_id: str,
+        pid_file: str,
+    ) -> None:
+        if process.stdout is None or process.stderr is None:
+            raise AutomationRuntimeUnavailable(
+                "container process streams are unavailable"
+            )
+        self.process = process
+        self.stdout = process.stdout
+        self.stderr = process.stderr
+        self.session = session
+        self.process_id = process_id
+        self.pid_file = pid_file
+
+    async def write(self, data: bytes) -> None:
+        if self.process.stdin is None or self.process.returncode is not None:
+            raise AutomationRuntimeError("process stdin is closed")
+        self.process.stdin.write(data)
+        await self.process.stdin.drain()
+
+    async def wait(self) -> int:
+        return int(await self.process.wait())
+
+    async def terminate(self) -> None:
+        await self.session._signal_process(self.pid_file, "TERM")
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            # diagnostic-expected: TERM escalation to KILL is bounded cleanup control flow.
+            await self.session._signal_process(self.pid_file, "KILL")
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                # diagnostic-expected: the final local kill is the verified fallback.
+                if self.process.returncode is None:
+                    self.process.kill()
+                    await self.process.wait()
+
+
+class HostRuntimeProcess(RuntimeBackendProcess):
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self.process = process
+        assert process.stdout is not None and process.stderr is not None
+        self.stdout = process.stdout
+        self.stderr = process.stderr
+        self._exit_waiter: asyncio.Task[int] | None = None
+
+    async def write(self, data: bytes) -> None:
+        if self.process.stdin is None or self.process.returncode is not None:
+            raise AutomationRuntimeError("process stdin is closed")
+        self.process.stdin.write(data)
+        await self.process.stdin.drain()
+
+    def _signal(self, value: int) -> None:
+        try:
+            os.killpg(self.process.pid, value)
+        except ProcessLookupError:
+            # diagnostic-expected: the supervised process group already exited.
+            pass
+
+    def _exit_task(self) -> asyncio.Task[int]:
+        if self._exit_waiter is None:
+            self._exit_waiter = create_diagnostic_task(
+                self.process.wait(),
+                feature="runtime",
+                event_code="runtime.host_process_exit",
+                failure_message="Host process exit supervision stopped unexpectedly.",
+            )
+        return self._exit_waiter
+
+    async def _await_exit(self) -> int:
+        """Return the exit code once the child itself has exited.
+
+        ``Process.wait()`` only resolves after every stdio pipe has closed, so a
+        detached descendant (``setsid nohup daemon &``) that inherited stdout or
+        stderr keeps it pending long after bash exited. Watch the exit status
+        as well so a foreground command, ``terminate`` and session close return.
+        """
+
+        waiter = self._exit_task()
+        while self.process.returncode is None:
+            await asyncio.wait({waiter}, timeout=HOST_EXIT_POLL_SECONDS)
+        return int(self.process.returncode)
+
+    async def _release_pipes(self) -> None:
+        """Close stdio pipes a detached descendant kept open after exit."""
+
+        waiter = self._exit_task()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(waiter), timeout=HOST_PIPE_RELEASE_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            # diagnostic-expected: a detached descendant still holds the pipes.
+            pass
+        transport = getattr(self.process, "_transport", None)
+        if transport is None:
+            return
+        transport.close()
+        await asyncio.wait({waiter}, timeout=HOST_PIPE_RELEASE_SECONDS)
+
+    async def wait(self) -> int:
+        code = await self._await_exit()
+        self._signal(signal.SIGKILL)
+        await self._release_pipes()
+        return code
+
+    async def terminate(self) -> None:
+        self._signal(signal.SIGTERM)
+        try:
+            await asyncio.wait_for(self._await_exit(), timeout=2)
+        except asyncio.TimeoutError:
+            # diagnostic-expected: bounded escalation for a supervised host process.
+            self._signal(signal.SIGKILL)
+            await self._await_exit()
+        self._signal(signal.SIGKILL)
+
+
+class HostRuntimeSession(RuntimeBackendSession):
+    """Explicitly opted-in execution as Core's OS user, without OCI isolation."""
+
+    def __init__(self, workspace: Path) -> None:
+        if os.name != "posix" or not Path("/bin/bash").is_file():
+            raise AutomationRuntimeUnavailable(
+                "Host mode requires a POSIX host with /bin/bash"
+            )
+        self.workspace = workspace
+        self._closed = False
+        self.processes: list[HostRuntimeProcess] = []
+
+    @property
+    def network_enabled(self) -> bool:
+        return True
+
+    async def enable_network(self) -> None:
+        return None
+
+    async def run(
+        self,
+        process_id: str,
+        command: str,
+        cwd: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> RuntimeBackendProcess:
+        if self._closed:
+            raise AutomationRuntimeUnavailable("host session is closed")
+        directory = Path(cwd).expanduser()
+        if not directory.is_absolute():
+            directory = self.workspace / directory
+        directory = directory.resolve(strict=True)
+        if not directory.is_dir():
+            raise AutomationRuntimeUnavailable(
+                "command working directory is not a directory"
+            )
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key in {"HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR"}
+        }
+        environment.update(extra_env or {})
+        process = await asyncio.create_subprocess_exec(
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            command,
+            cwd=str(directory),
+            env=environment,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        backend = HostRuntimeProcess(process)
+        self.processes.append(backend)
+        return backend
+
+    async def close(self) -> None:
+        self._closed = True
+        for process in self.processes:
+            if process.process.returncode is None:
+                await process.terminate()
+
+
+class ContainerRuntimeSession(RuntimeBackendSession):
+    """A persistent, non-PTY OCI container used only through argv APIs."""
+
+    _PROCESS_WRAPPER = (
+        "import os,sys;"
+        "pid=os.getpid();"
+        "os.setpgid(0,0) if os.getpgrp()!=pid else None;"
+        "open(sys.argv[1],'w',encoding='ascii').write(str(os.getpgrp()));"
+        "os.execv('/bin/bash',['/bin/bash','--noprofile','--norc','-c',sys.argv[2]])"
+    )
+
+    def __init__(
+        self,
+        *,
+        runner: ContainerSandboxRunner,
+        container_name: str,
+        lease: EgressLease | None,
+    ) -> None:
+        self.runner = runner
+        self.container_name = container_name
+        self.lease = lease
+        self._closed = False
+
+    @staticmethod
+    def name_for_session(session_id: str) -> str:
+        return "nebula-runtime-" + re.sub(r"[^a-z0-9]", "", session_id.lower())[:40]
+
+    @classmethod
+    async def start(cls, launch: SessionLaunch) -> "ContainerRuntimeSession":
+        healthy, detail = await launch.runner.available()
+        if not healthy:
+            raise AutomationRuntimeUnavailable(detail)
+        has_boundary = bool(launch.egress_rules or launch.egress_domains)
+        if launch.loopback_only and has_boundary:
+            raise AutomationRuntimeUnavailable(
+                "loopback-only sessions cannot request an egress boundary"
+            )
+        network = SandboxNetwork.SCOPED if has_boundary else SandboxNetwork.NONE
+        request = SandboxRequest(
+            image=launch.image,
+            trusted_local_image=True,
+            command=[
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                "while :; do sleep 3600 & wait $!; done",
+            ],
+            workspace=launch.workspace,
+            workspace_access=launch.workspace_access,
+            network=network,
+            execution_kind=(
+                SandboxExecutionKind.NETWORK_TOOL
+                if has_boundary
+                else SandboxExecutionKind.LOCAL_TOOL
+            ),
+            container_user=launch.container_user,
+            root_filesystem=SandboxRootFilesystem.READ_ONLY,
+            egress_rules=list(launch.egress_rules),
+            egress_domains=list(launch.egress_domains),
+            egress_ports=list(launch.egress_ports),
+            resolv_conf=launch.resolv_conf,
+            start_egress_disabled=bool(has_boundary and not launch.network_granted),
+            environment={
+                "HOME": "/tmp",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "TERM": "dumb",
+            },
+            limits=launch.limits,
+        )
+        workspace = launch.runner._validate(request)
+        container_name = cls.name_for_session(launch.session_id)
+        lease: EgressLease | None = None
+        if has_boundary:
+            if not launch.runner.egress_controller.certified:
+                raise AutomationRuntimeUnavailable(
+                    "project networking requires the certified egress helper"
+                )
+            lease = await launch.runner.egress_controller.acquire(
+                runtime_argv=launch.runner._runtime_argv(),
+                runtime_environment=_runtime_environment(),
+                request=request,
+                container_name=container_name,
+                seccomp_profile=(
+                    launch.runner.profile.seccomp_profile
+                    if launch.runner.profile is not None
+                    else None
+                ),
+                vpn_config=launch.vpn_config,
+            )
+        elif launch.loopback_only:
+            # The prepared runtime image is digest-pinned and its loopback helper
+            # was verified before this session was admitted. Use that same image
+            # as the namespace owner so offline DAP does not depend on project
+            # egress configuration.
+            controller = ContainerEgressController(helper_image=launch.image)
+            lease = await controller.acquire_loopback(
+                runtime_argv=launch.runner._runtime_argv(),
+                runtime_environment=_runtime_environment(),
+                container_name=container_name,
+                seccomp_profile=(
+                    launch.runner.profile.seccomp_profile
+                    if launch.runner.profile is not None
+                    else None
+                ),
+            )
+        try:
+            argv = launch.runner._argv(
+                request,
+                workspace,
+                container_name=container_name,
+                network_mode=lease.network_mode if lease is not None else None,
+            )
+            run_index = argv.index("run")
+            argv.insert(run_index + 1, "--detach")
+            # A detached container monitor may inherit the Podman client's pipe
+            # descriptors. Capture output in files so startup waits for the
+            # client process, not EOF from the long-lived container.
+            with (
+                tempfile.TemporaryFile() as stdout_file,
+                tempfile.TemporaryFile() as stderr_file,
+            ):
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    env=_runtime_environment(),
+                    start_new_session=True,
+                )
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=60)
+                except asyncio.TimeoutError as exc:
+                    if process.returncode is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            # diagnostic-expected: the runtime client exited between the check and signal.
+                            pass
+                    await process.wait()
+                    raise AutomationRuntimeUnavailable(
+                        "container runtime operation timed out"
+                    ) from exc
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read(2_000_000)
+                stderr = stderr_file.read(2_000_000)
+            if process.returncode != 0:
+                detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+                raise AutomationRuntimeUnavailable(
+                    "could not start automation container: "
+                    + (detail or str(process.returncode))[:1_000]
+                )
+        except BaseException:
+            await launch.runner._force_remove(container_name)
+            if lease is not None:
+                await lease.close()
+            raise
+        return cls(runner=launch.runner, container_name=container_name, lease=lease)
+
+    @property
+    def network_enabled(self) -> bool:
+        return self.lease is not None and self.lease.enabled
+
+    async def enable_network(self) -> None:
+        if self.lease is None:
+            raise AutomationPolicyDenied(
+                "project-scoped networking is unavailable for this frozen session"
+            )
+        await self.lease.enable()
+
+    async def run(
+        self,
+        process_id: str,
+        command: str,
+        cwd: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> RuntimeBackendProcess:
+        if self._closed:
+            raise AutomationRuntimeUnavailable("automation session is closed")
+        wrapped = command
+        if extra_env:
+            exports = "; ".join(
+                f"export {key}={shlex.quote(value)}" for key, value in extra_env.items()
+            )
+            wrapped = f"{exports}; {command}"
+        pid_file = f"/tmp/nebula-process-{process_id}.pid"
+        argv = [
+            *self.runner._runtime_argv(),
+            "exec",
+            "--interactive",
+            f"--workdir=/workspace/{cwd}" if cwd != "." else "--workdir=/workspace",
+            self.container_name,
+            "/usr/bin/python3",
+            "-c",
+            self._PROCESS_WRAPPER,
+            pid_file,
+            wrapped,
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_runtime_environment(),
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise AutomationRuntimeUnavailable(
+                f"could not start command process: {exc}"
+            ) from exc
+        return _ContainerProcess(
+            process=process,
+            session=self,
+            process_id=process_id,
+            pid_file=pid_file,
+        )
+
+    async def _signal_process(self, pid_file: str, signal_name: str) -> None:
+        read = await asyncio.create_subprocess_exec(
+            *self.runner._runtime_argv(),
+            "exec",
+            self.container_name,
+            "/bin/cat",
+            pid_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=_runtime_environment(),
+        )
+        stdout, _ = await _communicate(read, timeout=5)
+        if read.returncode != 0:
+            return
+        value = stdout.decode("ascii", errors="ignore").strip()
+        if not value.isdigit() or int(value) < 2:
+            return
+        send = await asyncio.create_subprocess_exec(
+            *self.runner._runtime_argv(),
+            "exec",
+            self.container_name,
+            "/usr/bin/kill",
+            f"-{signal_name}",
+            "--",
+            f"-{value}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=_runtime_environment(),
+        )
+        try:
+            await asyncio.wait_for(send.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            # diagnostic-expected: helper shutdown escalates after the bounded wait.
+            send.kill()
+            await send.wait()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.runner._force_remove(self.container_name)
+        finally:
+            if self.lease is not None:
+                await self.lease.close()
+                self.lease = None
+
+
+@dataclass
+class _Capture:
+    path: Path
+    observed: int = 0
+    retained: int = 0
+    truncated: bool = False
+
+    async def drain(self, stream: asyncio.StreamReader) -> None:
+        with self.path.open("wb") as output:
+            while True:
+                chunk = await stream.read(64 * 1024)
+                if not chunk:
+                    break
+                self.observed += len(chunk)
+                remaining = max(0, MAX_CAPTURE_BYTES - self.retained)
+                if remaining:
+                    kept = chunk[:remaining]
+                    output.write(kept)
+                    output.flush()
+                    self.retained += len(kept)
+                if len(chunk) > remaining:
+                    self.truncated = True
+            output.flush()
+            os.fsync(output.fileno())
+
+
+@dataclass
+class _ManagedProcess:
+    execution: CommandExecution
+    backend: RuntimeBackendProcess
+    stdout: _Capture
+    stderr: _Capture
+    capture_directory: Path | None = None
+    stdout_offset: int = 0
+    stderr_offset: int = 0
+    forced_status: CommandExecutionStatus | None = None
+    drain_tasks: tuple[asyncio.Task[None], asyncio.Task[None]] | None = None
+    final_task: asyncio.Task[CommandExecution] | None = None
+    finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass
+class _ManagedSession:
+    entity: AutomationSession
+    policy: AutomationProjectPolicy
+    scope: ScopePolicy | None
+    backend: RuntimeBackendSession
+    workspace: Path
+    processes: dict[str, _ManagedProcess] = field(default_factory=dict)
+    used_approval_ids: set[str] = field(default_factory=set)
+    scope_expiry_task: asyncio.Task[None] | None = None
+
+
+SessionFactory = Callable[[SessionLaunch], Awaitable[RuntimeBackendSession]]
+RuntimeResolver = Callable[[str], Awaitable[Any]]
+CachedRuntimeProvider = Callable[[], dict[str, Any] | None]
+ProcessTerminalObserver = Callable[[str], object]
+
+
+def resolve_callback_origin(*, host: str, port: int, tls: bool = False) -> str:
+    """Public Core origin tools use to POST background results over LAN."""
+
+    configured = (os.getenv("NEBULA_CALLBACK_ORIGIN") or "").rstrip("/")
+    if configured:
+        return configured
+    bind = host.strip()
+    if bind in {"0.0.0.0", "::", "[::]"}:
+        bind = _first_lan_ipv4() or "127.0.0.1"
+    if ":" in bind and not bind.startswith("["):
+        bind = f"[{bind}]"
+    scheme = "https" if tls else "http"
+    return f"{scheme}://{bind}:{port}"
+
+
+def _first_lan_ipv4() -> str | None:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("1.1.1.1", 80))
+        address = probe.getsockname()[0]
+    except (
+        OSError
+    ):  # diagnostic-expected: no routable LAN address; callers fall back to loopback
+        return None
+    finally:
+        probe.close()
+    if address.startswith("127."):
+        return None
+    return address
+
+
+class AutomationRuntimeManager:
+    """Own runtime sessions, approvals, process I/O, and immutable output."""
+
+    def __init__(
+        self,
+        *,
+        store: NebulaStore,
+        artifact_store: ArtifactStore,
+        data_root: str | Path,
+        workspace_resolver: Callable[[str], Path],
+        runtime_image: str | None = None,
+        runtime_resolver: RuntimeResolver | None = None,
+        cached_runtime_provider: CachedRuntimeProvider | None = None,
+        session_factory: SessionFactory | None = None,
+        credential_store: CredentialStore | None = None,
+        callback_origin: str | None = None,
+        process_terminal_observer: ProcessTerminalObserver | None = None,
+    ) -> None:
+        if runtime_image is None and runtime_resolver is None:
+            raise ValueError("automation runtime requires an image or Kali resolver")
+        if (
+            runtime_image is not None
+            and _IMAGE_PATTERN.fullmatch(runtime_image) is None
+        ):
+            raise ValueError(
+                "automation runtime image must be repository@sha256:digest"
+            )
+        self.store = store
+        self.artifact_store = artifact_store
+        self.data_root = Path(data_root).expanduser().resolve()
+        self.workspace_resolver = workspace_resolver
+        self.runtime_image = runtime_image or ""
+        self.runtime_digest = runtime_image.rsplit("@", 1)[1] if runtime_image else ""
+        self.runtime_resolver = runtime_resolver
+        self.cached_runtime_provider = cached_runtime_provider
+        self.session_factory = session_factory or ContainerRuntimeSession.start
+        self.credential_store = credential_store
+        self.callback_origin = (
+            callback_origin or os.getenv("NEBULA_CALLBACK_ORIGIN") or ""
+        ).rstrip("/")
+        self.process_terminal_observer = process_terminal_observer
+        self.capture_root = self.data_root / "automation-runtime" / "captures"
+        self.capture_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.capture_root.chmod(0o700)
+        self._sessions: dict[str, _ManagedSession] = {}
+        self._owner_sessions: dict[tuple[str, str, str], str] = {}
+        self._processes: dict[str, _ManagedProcess] = {}
+        self._session_lock = asyncio.Lock()
+        self._inventory: list[dict[str, str]] = []
+        self._prepared_runner_profile_id: str | None = None
+        self._prepared_runner_profile_revision: int | None = None
+        # Set once Core begins stopping. Processes it tears down then end as
+        # INTERRUPTED, the state a crash leaves after the next startup, and
+        # their owners are not woken mid-teardown: the next boot reconciles
+        # both cases through the same path.
+        self._stopping = False
+        self._refresh_cached_runtime()
+
+    def bind_process_terminal_observer(
+        self, observer: ProcessTerminalObserver | None
+    ) -> None:
+        """Notify an owner after a durable background process becomes terminal."""
+
+        self.process_terminal_observer = observer
+
+    @property
+    def binary_inventory(self) -> tuple[dict[str, str], ...]:
+        return tuple(dict(item) for item in self._inventory)
+
+    def _refresh_cached_runtime(self) -> bool:
+        if self.cached_runtime_provider is None:
+            return bool(self.runtime_image)
+        cached = self.cached_runtime_provider()
+        if cached is None:
+            return False
+        image = cached.get("image")
+        digest = cached.get("digest")
+        inventory = cached.get("inventory")
+        if (
+            not isinstance(image, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", image) is None
+            or digest != image
+            or not isinstance(inventory, list)
+        ):
+            return False
+        self.runtime_image = image
+        self.runtime_digest = digest
+        self._prepared_runner_profile_id = (
+            str(cached.get("runner_profile_id") or "") or None
+        )
+        revision = cached.get("runner_profile_revision")
+        self._prepared_runner_profile_revision = (
+            revision if isinstance(revision, int) else None
+        )
+        self._inventory = [
+            {str(key): str(value) for key, value in item.items()}
+            for item in inventory
+            if isinstance(item, dict)
+        ]
+        return True
+
+    async def startup(self) -> None:
+        # Only readable records: one unreadable row must not keep Core from
+        # starting and settling the others.
+        active_sessions = list(
+            self.store.iter_readable_entities(
+                AutomationSession,
+                {
+                    "status": [
+                        AutomationSessionStatus.STARTING.value,
+                        AutomationSessionStatus.READY.value,
+                        AutomationSessionStatus.CLOSING.value,
+                    ]
+                },
+            )
+        )
+        cleanup_limit = asyncio.Semaphore(8)
+
+        async def cleanup(session: AutomationSession) -> str:
+            async with cleanup_limit:
+                return await self._cleanup_orphan_session(session)
+
+        cleanup_details = await asyncio.gather(
+            *(cleanup(item) for item in active_sessions)
+        )
+        for session, cleanup_detail in zip(
+            active_sessions, cleanup_details, strict=True
+        ):
+            self.store.update(
+                AutomationSession,
+                session.id,
+                {
+                    "status": AutomationSessionStatus.INTERRUPTED,
+                    "completed_at": utc_now(),
+                    "failure_detail": cleanup_detail,
+                },
+                expected_revision=session.revision,
+            )
+
+        for execution in self.store.iter_readable_entities(
+            CommandExecution,
+            {
+                "status": [
+                    CommandExecutionStatus.RUNNING.value,
+                    CommandExecutionStatus.WAITING_APPROVAL.value,
+                ]
+            },
+        ):
+            self.store.update(
+                CommandExecution,
+                execution.id,
+                {
+                    "status": CommandExecutionStatus.INTERRUPTED,
+                    "completed_at": utc_now(),
+                    "error": "Core restarted before the process completed",
+                },
+                expected_revision=execution.revision,
+            )
+        await asyncio.to_thread(self._sweep_stale_captures)
+
+    def _sweep_stale_captures(self) -> int:
+        """Remove per-command capture directories left by a previous Core."""
+
+        live = {
+            process.capture_directory
+            for process in self._processes.values()
+            if process.capture_directory is not None
+        }
+        removed = 0
+        try:
+            entries = list(self.capture_root.iterdir())
+        except OSError as caught_error:
+            record_caught_exception(
+                "runtime",
+                "runtime.capture_sweep_failed",
+                "The command capture root could not be listed.",
+                caught_error,
+                stage="capture-cleanup",
+            )
+            return 0
+        for entry in entries:
+            if (
+                entry in live
+                or not _CAPTURE_DIRECTORY_NAME.fullmatch(entry.name)
+                or entry.is_symlink()
+                or not entry.is_dir()
+            ):
+                continue
+            try:
+                shutil.rmtree(entry)
+            except OSError as caught_error:
+                record_caught_exception(
+                    "runtime",
+                    "runtime.capture_cleanup_failed",
+                    "A stale command capture directory could not be removed.",
+                    caught_error,
+                    stage="capture-cleanup",
+                )
+                continue
+            removed += 1
+        return removed
+
+    def _discard_capture(self, process: _ManagedProcess) -> None:
+        """Delete a command's capture directory once nothing reads it."""
+
+        directory = process.capture_directory
+        if directory is None:
+            return
+        process.capture_directory = None
+        try:
+            shutil.rmtree(directory)
+        except FileNotFoundError:
+            # diagnostic-expected: the capture directory was already gone.
+            return
+        except OSError as caught_error:
+            record_caught_exception(
+                "runtime",
+                "runtime.capture_cleanup_failed",
+                "A command capture directory could not be removed.",
+                caught_error,
+                stage="capture-cleanup",
+            )
+
+    async def _cleanup_orphan_session(self, session: AutomationSession) -> str:
+        try:
+            profile = self.store.get(StoredRunnerProfile, session.runner_profile_id)
+        except NotFoundError:
+            # diagnostic-expected: deleted runner state is returned to startup recovery.
+            return "Core restarted; runtime teardown skipped because its runner was removed"
+        except CorruptRecordError:
+            # diagnostic-expected: the store recorded the unreadable runner; startup still settles this session.
+            return "Core restarted; runtime teardown skipped because its runner record is unreadable"
+        if profile.revision != session.runner_profile_revision:
+            return "Core restarted; runtime teardown skipped because its runner changed"
+        try:
+            runner = self._runner(profile, helper_image=session.runtime_image)
+            healthy, detail = await runner.available()
+            if not healthy:
+                return (
+                    "Core restarted; runtime teardown skipped because its runner "
+                    f"could not be re-verified: {detail[:2_000]}"
+                )
+            container_name = ContainerRuntimeSession.name_for_session(session.id)
+            await runner._force_remove(container_name)
+            await runner._force_remove(f"{container_name}-egress")
+        except Exception as exc:
+            # diagnostic-expected: orphan cleanup detail is durably returned to reconciliation.
+            return f"Core restarted; runtime teardown failed: {str(exc)[:2_000]}"
+        return "Core restarted; detached runtime teardown requested"
+
+    def begin_stopping(self) -> None:
+        """Mark Core as stopping before any component starts tearing down.
+
+        Owners cancel their work before this runtime's own shutdown runs; a
+        command stopped from then on is interrupted by Core, not cancelled.
+        """
+
+        self._stopping = True
+
+    def _stop_status(self) -> CommandExecutionStatus:
+        """How a command Core terminates ends: interrupted while Core stops.
+
+        Core stopping is not a decision about the command; it takes the state
+        a crash leaves after the next startup. Otherwise the caller or the
+        operator chose to stop it.
+        """
+
+        return (
+            CommandExecutionStatus.INTERRUPTED
+            if self._stopping
+            else CommandExecutionStatus.CANCELLED
+        )
+
+    async def shutdown(self) -> None:
+        self.begin_stopping()
+        await asyncio.gather(
+            *(self.close_session(session_id) for session_id in list(self._sessions)),
+            return_exceptions=True,
+        )
+
+    def project_policy(self, engagement_id: str) -> AutomationProjectPolicy:
+        self.store.get(Engagement, engagement_id)
+        policy_id = str(
+            uuid5(NAMESPACE_URL, f"nebula:automation-policy:{engagement_id}")
+        )
+        try:
+            return self.store.get(AutomationProjectPolicy, policy_id)
+        except NotFoundError:
+            # diagnostic-expected: first access creates the deterministic default policy.
+            try:
+                return self.store.create(
+                    AutomationProjectPolicy(
+                        id=policy_id,
+                        engagement_id=engagement_id,
+                    )
+                )
+            except ConflictError:
+                # diagnostic-expected: a concurrent creator won; read its durable value.
+                return self.store.get(AutomationProjectPolicy, policy_id)
+
+    def update_project_policy(
+        self,
+        engagement_id: str,
+        *,
+        approval_policy: AutomationApprovalPolicy,
+        network_enabled: bool,
+        runner_profile_id: str | None,
+        vpn_profile_id: str | None = None,
+        max_timeout_ms: int,
+        expected_revision: int | None = None,
+        execution_mode: Literal["docker", "host"] | None = None,
+        host_access_acknowledged: bool = False,
+    ) -> AutomationProjectPolicy:
+        current = self.project_policy(engagement_id)
+        selected_mode = execution_mode or current.execution_mode
+        if selected_mode == "host" and not (
+            host_access_acknowledged
+            or current.host_access_acknowledged
+            and current.execution_mode == "host"
+        ):
+            raise AutomationPolicyDenied(
+                "Acknowledge host filesystem and network access before enabling Host mode"
+            )
+        if selected_mode == "host" and (
+            os.name != "posix" or not Path("/bin/bash").is_file()
+        ):
+            raise AutomationRuntimeUnavailable(
+                "Host mode requires a POSIX host with /bin/bash"
+            )
+        if selected_mode == "docker" and runner_profile_id is not None:
+            runner = self.store.get(StoredRunnerProfile, runner_profile_id)
+            if not runner.enabled or not runner.healthy:
+                raise AutomationRuntimeUnavailable(
+                    "selected runner is not verified healthy"
+                )
+        if selected_mode == "docker" and vpn_profile_id is not None:
+            if not network_enabled:
+                raise AutomationRuntimeUnavailable(
+                    "enable project networking before selecting a VPN profile"
+                )
+            vpn = self.store.get(VpnProfile, vpn_profile_id)
+            if (
+                self.credential_store is None
+                or not self.credential_store.status(vpn.secret_ref).available
+            ):
+                raise AutomationRuntimeUnavailable(
+                    "selected VPN profile is unavailable"
+                )
+        return self.store.update(
+            AutomationProjectPolicy,
+            current.id,
+            {
+                "approval_policy": approval_policy,
+                "execution_mode": selected_mode,
+                "host_access_acknowledged": selected_mode == "host",
+                "network_enabled": network_enabled,
+                "runner_profile_id": runner_profile_id,
+                "vpn_profile_id": vpn_profile_id,
+                "max_timeout_ms": max_timeout_ms,
+            },
+            expected_revision=expected_revision or current.revision,
+        )
+
+    def project_runtime_digest(self, engagement_id: str) -> str:
+        if self.project_policy(engagement_id).execution_mode == "host":
+            identity = (
+                f"host-v1:{platform.node()}:{platform.system()}:{os.getuid()}:/bin/bash"
+            )
+            return "sha256:" + hashlib.sha256(identity.encode()).hexdigest()
+        return self.runtime_digest
+
+    async def runtime_info(
+        self, *, engagement_id: str | None = None
+    ) -> AutomationRuntimeInfo:
+        if (
+            engagement_id
+            and self.project_policy(engagement_id).execution_mode == "host"
+        ):
+            ready = os.name == "posix" and Path("/bin/bash").is_file()
+            return AutomationRuntimeInfo(
+                configured=True,
+                ready=ready,
+                digest=self.project_runtime_digest(engagement_id),
+                runner_profile_id="host",
+                detail="Host mode: commands run as the Core OS user with host filesystem and network access"
+                if ready
+                else "Host mode requires POSIX and /bin/bash",
+            )
+        prepared = self._refresh_cached_runtime()
+        profiles = [
+            item
+            for item in self.store.list_entities(StoredRunnerProfile, limit=1_000)
+            if item.enabled and item.healthy
+        ]
+        if not profiles:
+            return AutomationRuntimeInfo(
+                configured=True,
+                ready=False,
+                image=self.runtime_image or None,
+                digest=self.runtime_digest or None,
+                detail="no verified healthy container runner is configured",
+            )
+        profile = next(
+            (
+                item
+                for item in profiles
+                if item.id == self._prepared_runner_profile_id
+                and item.revision == self._prepared_runner_profile_revision
+            ),
+            sorted(profiles, key=lambda item: (item.created_at, item.id))[0],
+        )
+        if not prepared:
+            return AutomationRuntimeInfo(
+                configured=True,
+                ready=False,
+                image=self.runtime_image or None,
+                digest=self.runtime_digest or None,
+                runner_profile_id=profile.id,
+                detail="the existing Kali headless runtime has not been prepared",
+                inventory=list(self._inventory),
+            )
+        runner = self._runner(profile)
+        healthy, detail = await runner.available()
+        return AutomationRuntimeInfo(
+            configured=True,
+            ready=healthy and prepared,
+            image=self.runtime_image or None,
+            digest=self.runtime_digest or None,
+            runner_profile_id=profile.id,
+            detail=(
+                detail
+                if not healthy
+                else "verified prepared Kali headless image is ready"
+                if prepared
+                else "the existing Kali headless runtime has not been prepared"
+            ),
+            inventory=list(self._inventory),
+        )
+
+    async def prepare(self) -> AutomationRuntimeInfo:
+        if self.runtime_resolver is not None:
+            # Only the oldest project is needed to resolve the shared image.
+            engagements = self.store.list_entities(Engagement, limit=1)
+            if not engagements:
+                return AutomationRuntimeInfo(
+                    configured=True,
+                    ready=False,
+                    detail="create a project before preparing the Kali runtime",
+                )
+            resolution = await self.runtime_resolver(engagements[0].id)
+            image = resolution.image
+            self.runtime_image = image.resolved_reference
+            self.runtime_digest = image.digest
+            self._prepared_runner_profile_id = resolution.profile.id
+            self._prepared_runner_profile_revision = resolution.profile.revision
+            self._inventory = [
+                {"name": name, "path": path, "version": version}
+                for name, path, version in image.binary_inventory
+            ]
+            return AutomationRuntimeInfo(
+                configured=True,
+                ready=True,
+                image=self.runtime_image,
+                digest=self.runtime_digest,
+                runner_profile_id=resolution.profile.id,
+                detail=image.detail,
+                inventory=list(self._inventory),
+            )
+        info = await self.runtime_info()
+        if not info.ready or info.runner_profile_id is None:
+            return info
+        profile = self.store.get(StoredRunnerProfile, info.runner_profile_id)
+        runner = self._runner(profile)
+        stdout, stderr, code = await runner._capture(
+            "image", "inspect", self.runtime_image, "--format", "{{json .}}"
+        )
+        if code != 0:
+            process = await asyncio.create_subprocess_exec(
+                *runner._runtime_argv(),
+                "pull",
+                self.runtime_image,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_runtime_environment(),
+                start_new_session=True,
+            )
+            try:
+                pulled_stdout, pulled_stderr = await _communicate(
+                    process, timeout=1_800
+                )
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+                raise
+            if process.returncode != 0:
+                detail = (pulled_stderr or pulled_stdout).decode(
+                    "utf-8", errors="replace"
+                )
+                return info.model_copy(
+                    update={
+                        "ready": False,
+                        "detail": "pinned automation image preparation failed: "
+                        + (detail.strip() or str(process.returncode))[:1_000],
+                    }
+                )
+            stdout, stderr, code = await runner._capture(
+                "image", "inspect", self.runtime_image, "--format", "{{json .}}"
+            )
+            if code != 0:
+                return info.model_copy(
+                    update={
+                        "ready": False,
+                        "detail": "pinned image could not be verified after preparation: "
+                        + (stderr or stdout or str(code))[:1_000],
+                    }
+                )
+        request = SandboxRequest(
+            image=self.runtime_image,
+            command=["/bin/cat", "/opt/nebula/runtime-inventory.json"],
+            workspace=self.data_root,
+            workspace_access=SandboxWorkspaceAccess.NONE,
+            limits=SandboxLimits(timeout_seconds=30, output_bytes=2_000_000),
+        )
+        try:
+            result = await runner.run(request)
+            payload = json.loads(result.stdout)
+            inventory = payload.get("binaries", []) if isinstance(payload, dict) else []
+            if not isinstance(inventory, list):
+                raise ValueError("runtime inventory binaries must be an array")
+            self._inventory = [
+                {str(key): str(value) for key, value in item.items()}
+                for item in inventory
+                if isinstance(item, dict)
+            ][:10_000]
+        except (ValueError, json.JSONDecodeError, SandboxUnavailable) as exc:
+            # diagnostic-expected: readiness reports the verified inventory failure to callers.
+            return info.model_copy(
+                update={
+                    "ready": False,
+                    "detail": f"runtime inventory verification failed: {exc}",
+                }
+            )
+        return info.model_copy(
+            update={
+                "ready": True,
+                "detail": "pinned runtime verified",
+                "inventory": self._inventory,
+            }
+        )
+
+    async def session(
+        self,
+        *,
+        engagement_id: str,
+        owner_kind: Literal["chat", "mission", "harness", "api"],
+        owner_id: str,
+    ) -> AutomationSession:
+        managed = await self._get_or_create_session(
+            engagement_id=engagement_id, owner_kind=owner_kind, owner_id=owner_id
+        )
+        return managed.entity
+
+    async def run_command(
+        self,
+        *,
+        engagement_id: str,
+        owner_kind: Literal["chat", "mission", "harness", "api"],
+        owner_id: str,
+        request: RunCommandRequest,
+        approval: Approval | None = None,
+        requested_by: str = "agent",
+        tool_call_id: str | None = None,
+        chat_session_id: str | None = None,
+        chat_turn_id: str | None = None,
+        expected_execution_mode: Literal["docker", "host"] | None = None,
+    ) -> CommandResult:
+        managed = await self._get_or_create_session(
+            engagement_id=engagement_id, owner_kind=owner_kind, owner_id=owner_id
+        )
+        if (
+            expected_execution_mode
+            and managed.policy.execution_mode != expected_execution_mode
+        ):
+            raise AutomationPolicyDenied(
+                "Project execution mode changed; start a new session"
+            )
+        if managed.policy.execution_mode == "host":
+            request = request.model_copy(update={"network": AutomationNetworkMode.HOST})
+        else:
+            path = Path(request.cwd)
+            if path.is_absolute() or ".." in path.parts:
+                raise AutomationPolicyDenied(
+                    "Docker cwd must remain inside the project workspace"
+                )
+        timeout_ms = min(
+            request.timeout_ms or managed.policy.max_timeout_ms,
+            managed.policy.max_timeout_ms,
+        )
+        self._validate_network_request(managed, request.network)
+        needs_approval = (
+            managed.policy.approval_policy == AutomationApprovalPolicy.ALWAYS
+        )
+        if (
+            managed.policy.approval_policy == AutomationApprovalPolicy.ON_BOUNDARY
+            and request.network == AutomationNetworkMode.PROJECT_SCOPE
+            and not managed.entity.network_granted
+        ):
+            needs_approval = True
+        if managed.scope is not None and managed.scope.bypass_permissions:
+            needs_approval = False
+        if needs_approval:
+            approval = self._authorize_or_request(
+                managed,
+                request,
+                approval=approval,
+                requested_by=requested_by,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                tool_call_id=tool_call_id,
+            )
+        elif approval is not None:
+            raise AutomationPolicyDenied(
+                "an approval was supplied for an automatic command"
+            )
+        if (
+            request.network == AutomationNetworkMode.PROJECT_SCOPE
+            and not managed.entity.network_granted
+        ):
+            await managed.backend.enable_network()
+            managed.entity = self.store.update(
+                AutomationSession,
+                managed.entity.id,
+                {"network_granted": True},
+                expected_revision=managed.entity.revision,
+            )
+        process_id = str(uuid4())
+        results_api_key = secrets.token_urlsafe(32) if request.background else None
+        results_url = (
+            f"{self.callback_origin}/api/v1/automation-processes/{process_id}/results"
+            if request.background and self.callback_origin
+            else None
+        )
+        execution = CommandExecution(
+            id=self._execution_id(process_id),
+            engagement_id=engagement_id,
+            session_id=managed.entity.id,
+            process_id=process_id,
+            command=request.command,
+            command_sha256=hashlib.sha256(request.command.encode()).hexdigest(),
+            cwd=request.cwd,
+            network=request.network,
+            background=request.background,
+            runtime_digest=managed.entity.runtime_digest,
+            policy_revision=managed.policy.revision,
+            scope_policy_revision=managed.scope.revision if managed.scope else None,
+            metadata={
+                "execution_mode": managed.policy.execution_mode,
+                "owner_kind": owner_kind,
+                "owner_id": owner_id,
+                "tool_call_id": tool_call_id,
+                "chat_session_id": chat_session_id,
+                "chat_turn_id": chat_turn_id,
+                "approval_id": approval.id if approval is not None else None,
+                "timeout_ms": timeout_ms,
+                **(
+                    {
+                        "results_url": results_url,
+                        "results_key_sha256": hashlib.sha256(
+                            results_api_key.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    if results_url and results_api_key
+                    else {}
+                ),
+            },
+        )
+        execution = self.store.create(execution)
+        extra_env = (
+            {
+                "NEBULA_RESULTS_URL": results_url,
+                "NEBULA_RESULTS_KEY": results_api_key,
+                "NEBULA_PROCESS_ID": process_id,
+                **({"NEBULA_TOOL_CALL_ID": tool_call_id} if tool_call_id else {}),
+            }
+            if results_url and results_api_key
+            else None
+        )
+        try:
+            backend = await managed.backend.run(
+                process_id, request.command, request.cwd, extra_env=extra_env
+            )
+        except Exception as exc:
+            self.store.update(
+                CommandExecution,
+                execution.id,
+                {
+                    "status": CommandExecutionStatus.FAILED,
+                    "completed_at": utc_now(),
+                    "error": str(exc)[:4_000],
+                },
+                expected_revision=execution.revision,
+            )
+            raise
+        directory = Path(
+            tempfile.mkdtemp(prefix=f"{process_id}-", dir=self.capture_root)
+        )
+        process = _ManagedProcess(
+            execution=execution,
+            backend=backend,
+            stdout=_Capture(directory / "stdout"),
+            stderr=_Capture(directory / "stderr"),
+            capture_directory=directory,
+        )
+        process.drain_tasks = (
+            create_diagnostic_task(
+                process.stdout.drain(backend.stdout),
+                feature="runtime",
+                event_code="runtime.stdout_drain",
+                failure_message="Command stdout capture stopped unexpectedly.",
+            ),
+            create_diagnostic_task(
+                process.stderr.drain(backend.stderr),
+                feature="runtime",
+                event_code="runtime.stderr_drain",
+                failure_message="Command stderr capture stopped unexpectedly.",
+            ),
+        )
+        process.final_task = create_diagnostic_task(
+            self._finalize_process(process),
+            feature="runtime",
+            event_code="runtime.process_finalize",
+            failure_message="Command finalization stopped unexpectedly.",
+        )
+        managed.processes[process_id] = process
+        self._processes[process_id] = process
+        create_diagnostic_task(
+            self._timeout_process(process, timeout_ms / 1_000),
+            feature="runtime",
+            event_code="runtime.process_timeout",
+            failure_message="Command timeout supervision stopped unexpectedly.",
+        )
+        if request.background:
+            return self._result(
+                managed,
+                process,
+                stdout="",
+                stderr="",
+                results_url=results_url,
+                results_api_key=results_api_key,
+                tool_call_id=tool_call_id,
+                chat_session_id=chat_session_id,
+                chat_turn_id=chat_turn_id,
+            )
+        try:
+            # Shielded: cancelling the caller must not cancel finalization,
+            # which would leave the process running with no timeout either.
+            await asyncio.shield(process.final_task)
+        except asyncio.CancelledError:
+            # The caller stopped waiting (an operator Stop, a turn that
+            # ended, or Core stopping). A foreground command has no one left
+            # to read its result, so it stops too.
+            if not process.final_task.done():
+                process.forced_status = self._stop_status()
+                await asyncio.shield(process.backend.terminate())
+            raise
+        return await self._poll(managed, process, MAX_POLL_BYTES)
+
+    def accept_results(
+        self, process_id: str, api_key: str, request: ProcessResultsRequest
+    ) -> CommandExecution:
+        """Complete a background command from a LAN results webhook."""
+
+        execution = self.store.get(CommandExecution, self._execution_id(process_id))
+        expected = execution.metadata.get("results_key_sha256")
+        provided = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        if not isinstance(expected, str) or not hmac.compare_digest(expected, provided):
+            raise AutomationPolicyDenied("invalid results API key")
+        if execution.metadata.get("results_received"):
+            effective_exit = (
+                request.exit_code
+                if request.exit_code is not None
+                else (0 if request.status == "complete" else 1)
+            )
+            recorded_status = (
+                "complete"
+                if execution.status == CommandExecutionStatus.COMPLETED
+                else "failed"
+            )
+            if (
+                recorded_status == request.status
+                and execution.exit_code == effective_exit
+                and execution.metadata.get("results_summary") == request.summary
+                and (execution.metadata.get("results_output") or {}) == request.output
+                and (execution.metadata.get("results_stdout") or "")
+                == request.stdout[: 64 * 1024]
+            ):
+                return execution
+            raise ConflictError(
+                "different results were already recorded for this process"
+            )
+        if execution.status not in {
+            CommandExecutionStatus.RUNNING,
+            CommandExecutionStatus.INTERRUPTED,
+        }:
+            raise ConflictError(
+                f"process cannot accept results from {execution.status.value}"
+            )
+        status = (
+            CommandExecutionStatus.COMPLETED
+            if request.status == "complete"
+            else CommandExecutionStatus.FAILED
+        )
+        posted = self._callback_artifacts(execution, request)
+        with self.store.transaction() as transaction:
+            # The posted output and the execution that points at it commit
+            # together, so a receipt never names an artifact that is missing.
+            transaction.add_all([artifact for _, artifact in posted])
+            return transaction.update(
+                CommandExecution,
+                execution.id,
+                {
+                    "status": status,
+                    "completed_at": utc_now(),
+                    "exit_code": request.exit_code
+                    if request.exit_code is not None
+                    else (0 if request.status == "complete" else 1),
+                    "error": None
+                    if request.status == "complete"
+                    else (request.summary or "callback reported failure"),
+                    # The posted stdout and output live in their artifacts;
+                    # the record keeps only what its receipt needs, so it
+                    # stays small wherever it is listed.
+                    "metadata": {
+                        **execution.metadata,
+                        "results_received": True,
+                        "results_summary": request.summary,
+                        **{
+                            f"results_{kind}_artifact_id": artifact.id
+                            for kind, artifact in posted
+                        },
+                    },
+                },
+                expected_revision=execution.revision,
+            )
+
+    def _callback_artifacts(
+        self, execution: CommandExecution, request: ProcessResultsRequest
+    ) -> list[tuple[Literal["stdout", "output"], Artifact]]:
+        """Keep a callback's posted output as evidence the model reads on demand.
+
+        Like captured process output it never enters model context whole: the
+        receipt names these artifacts and ``tool_output`` returns bounded,
+        redacted excerpts. They carry the command's tool call so the same
+        ownership check authorizes them.
+        """
+
+        metadata = {
+            "command_execution_id": execution.id,
+            "process_id": execution.process_id,
+            "tool_call_id": execution.metadata.get("tool_call_id"),
+            "callback": True,
+        }
+        posted: list[tuple[Literal["stdout", "output"], Artifact]] = []
+        if request.stdout:
+            data = request.stdout.encode("utf-8")
+            posted.append(
+                (
+                    "stdout",
+                    self.artifact_store.put_bytes(
+                        data,
+                        engagement_id=execution.engagement_id,
+                        filename=f"command-{execution.id}.results-stdout.txt",
+                        media_type="text/plain",
+                        source="automation-runtime-callback",
+                        metadata={
+                            **metadata,
+                            "kind": "stdout",
+                            "searchable": b"\x00" not in data[:8192],
+                        },
+                    ),
+                )
+            )
+        if request.output:
+            posted.append(
+                (
+                    "output",
+                    self.artifact_store.put_bytes(
+                        json.dumps(
+                            request.output,
+                            ensure_ascii=False,
+                            indent=2,
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8"),
+                        engagement_id=execution.engagement_id,
+                        filename=f"command-{execution.id}.results-output.json",
+                        media_type="application/json",
+                        source="automation-runtime-callback",
+                        metadata={**metadata, "kind": "parsed", "searchable": True},
+                    ),
+                )
+            )
+        return posted
+
+    async def process_io(
+        self,
+        process_id: str,
+        request: ProcessIORequest,
+        *,
+        engagement_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> CommandResult:
+        process = self._processes.get(process_id)
+        if process is None:
+            execution = self.store.get(CommandExecution, self._execution_id(process_id))
+            if engagement_id is not None and execution.engagement_id != engagement_id:
+                raise AutomationPolicyDenied("command process is unavailable")
+            if owner_id is not None and execution.metadata.get("owner_id") != owner_id:
+                raise AutomationPolicyDenied("command process is unavailable")
+            session = self.store.get(AutomationSession, execution.session_id)
+            return CommandResult(
+                session_id=session.id,
+                process_id=process_id,
+                execution_id=execution.id,
+                status=execution.status,
+                exit_code=execution.exit_code,
+                stdout_artifact_id=execution.stdout_artifact_id,
+                stderr_artifact_id=execution.stderr_artifact_id,
+                redacted_stdout_artifact_id=execution.redacted_stdout_artifact_id,
+                redacted_stderr_artifact_id=execution.redacted_stderr_artifact_id,
+                workspace_changes=execution.workspace_changes,
+                output_truncated=execution.stdout_truncated
+                or execution.stderr_truncated,
+                network_granted=session.network_granted,
+            )
+        managed = self._sessions.get(process.execution.session_id)
+        if managed is None:
+            raise AutomationRuntimeUnavailable("automation session is unavailable")
+        if (
+            engagement_id is not None
+            and process.execution.engagement_id != engagement_id
+        ):
+            raise AutomationPolicyDenied("command process is unavailable")
+        if (
+            owner_id is not None
+            and process.execution.metadata.get("owner_id") != owner_id
+        ):
+            raise AutomationPolicyDenied("command process is unavailable")
+        if request.action == "write":
+            assert request.input is not None
+            data = request.input.encode("utf-8")
+            if len(data) > MAX_PROCESS_INPUT_BYTES:
+                raise AutomationRuntimeError("process input exceeds 1048576 bytes")
+            await process.backend.write(data)
+        elif request.action == "terminate":
+            process.forced_status = CommandExecutionStatus.CANCELLED
+            await process.backend.terminate()
+            if process.final_task is not None:
+                # Shielded so a cancelled caller cannot cancel the finalizer
+                # and leave the terminated command recorded as running.
+                await asyncio.shield(process.final_task)
+        return await self._poll(managed, process, request.max_bytes)
+
+    def list_processes(self, session_id: str) -> list[CommandExecution]:
+        session = self.store.get(AutomationSession, session_id)
+        # Filtered in SQL within the session's project, oldest first, so the
+        # read does not load every command Core has ever run.
+        return self.store.find_entities(
+            CommandExecution,
+            {"session_id": session_id},
+            engagement_id=session.engagement_id,
+        )
+
+    async def close_session(self, session_id: str) -> AutomationSession:
+        managed = self._sessions.get(session_id)
+        if managed is None:
+            return self.store.get(AutomationSession, session_id)
+        current_task = asyncio.current_task()
+        if (
+            managed.scope_expiry_task is not None
+            and managed.scope_expiry_task is not current_task
+        ):
+            managed.scope_expiry_task.cancel()
+        if managed.entity.status == AutomationSessionStatus.READY:
+            managed.entity = self.store.update(
+                AutomationSession,
+                session_id,
+                {"status": AutomationSessionStatus.CLOSING},
+                expected_revision=managed.entity.revision,
+            )
+        for process in list(managed.processes.values()):
+            if process.final_task is not None and not process.final_task.done():
+                process.forced_status = self._stop_status()
+                await process.backend.terminate()
+        await asyncio.gather(
+            *(
+                process.final_task
+                for process in managed.processes.values()
+                if process.final_task is not None
+            ),
+            return_exceptions=True,
+        )
+        await managed.backend.close()
+        managed.entity = self.store.get(AutomationSession, session_id)
+        if managed.entity.status != AutomationSessionStatus.CLOSED:
+            managed.entity = self.store.update(
+                AutomationSession,
+                session_id,
+                {
+                    "status": AutomationSessionStatus.CLOSED,
+                    "completed_at": utc_now(),
+                },
+                expected_revision=managed.entity.revision,
+            )
+        self._sessions.pop(session_id, None)
+        self._owner_sessions.pop(
+            (
+                managed.entity.engagement_id,
+                managed.entity.owner_kind,
+                managed.entity.owner_id,
+            ),
+            None,
+        )
+        for process_id, process in managed.processes.items():
+            self._processes.pop(process_id, None)
+            self._discard_capture(process)
+        return managed.entity
+
+    async def _expire_session_at_scope_boundary(
+        self, session_id: str, expires_at: datetime
+    ) -> None:
+        delay = max(0.0, (expires_at - utc_now()).total_seconds())
+        try:
+            await asyncio.sleep(delay)
+            if session_id in self._sessions:
+                await self.close_session(session_id)
+        except asyncio.CancelledError:
+            # diagnostic-expected: session shutdown cancels the scope-expiry timer.
+            return
+
+    async def _get_or_create_session(
+        self, *, engagement_id: str, owner_kind: str, owner_id: str
+    ) -> _ManagedSession:
+        key = (engagement_id, owner_kind, owner_id)
+        async with self._session_lock:
+            existing_id = self._owner_sessions.get(key)
+            if existing_id is not None and existing_id in self._sessions:
+                return self._sessions[existing_id]
+            engagement = self.store.get(Engagement, engagement_id)
+            policy = self.project_policy(engagement_id)
+            if policy.execution_mode == "host":
+                if not policy.host_access_acknowledged:
+                    raise AutomationPolicyDenied(
+                        "Host access has not been acknowledged"
+                    )
+                workspace = (
+                    self.workspace_resolver(engagement_id)
+                    .expanduser()
+                    .resolve(strict=True)
+                )
+                if not workspace.is_dir():
+                    raise AutomationRuntimeUnavailable(
+                        "project workspace is unavailable"
+                    )
+                scope = (
+                    self.store.get(ScopePolicy, engagement.scope_policy_id)
+                    if engagement.scope_policy_id
+                    else None
+                )
+                backend: RuntimeBackendSession = HostRuntimeSession(workspace)
+                entity = self.store.create(
+                    AutomationSession(
+                        engagement_id=engagement_id,
+                        owner_kind=owner_kind,
+                        owner_id=owner_id,
+                        execution_mode="host",
+                        runtime_image="host:/bin/bash",
+                        runtime_digest=self.project_runtime_digest(engagement_id),
+                        runner_profile_id="host",
+                        runner_profile_revision=1,
+                        policy_id=policy.id,
+                        policy_revision=policy.revision,
+                        scope_policy_id=scope.id if scope else None,
+                        scope_policy_revision=scope.revision if scope else None,
+                        status=AutomationSessionStatus.READY,
+                        network_granted=True,
+                        metadata={
+                            "network_boundary": "host_os",
+                            "workspace": str(workspace),
+                        },
+                    )
+                )
+                managed = _ManagedSession(
+                    entity=entity,
+                    policy=policy,
+                    scope=scope,
+                    backend=backend,
+                    workspace=workspace,
+                )
+                self._sessions[entity.id] = managed
+                self._owner_sessions[key] = entity.id
+                if (
+                    scope is not None
+                    and scope.not_after is not None
+                    and not scope.bypass_permissions
+                ):
+                    managed.scope_expiry_task = create_diagnostic_task(
+                        self._expire_session_at_scope_boundary(
+                            entity.id, scope.not_after
+                        ),
+                        feature="runtime",
+                        event_code="runtime.scope_expiry",
+                        failure_message="Scope-expiry supervision stopped unexpectedly.",
+                    )
+                return managed
+            profile = self._select_runner(policy)
+            if not self.runtime_image or not self.runtime_digest:
+                raise AutomationRuntimeUnavailable(
+                    "prepare the existing Kali headless runtime before starting an agent session"
+                )
+            if (
+                self._prepared_runner_profile_id is not None
+                and profile.id != self._prepared_runner_profile_id
+            ):
+                raise AutomationRuntimeUnavailable(
+                    "the selected runner does not own the prepared Kali runtime"
+                )
+            workspace = (
+                self.workspace_resolver(engagement_id).expanduser().resolve(strict=True)
+            )
+            if not workspace.is_dir():
+                raise AutomationRuntimeUnavailable("project workspace is unavailable")
+            scope = (
+                self.store.get(ScopePolicy, engagement.scope_policy_id)
+                if engagement.scope_policy_id is not None
+                else None
+            )
+            rules, domains = self._network_boundary(policy, scope)
+            vpn: VpnProfile | None = None
+            vpn_config = None
+            if policy.vpn_profile_id is not None:
+                if self.credential_store is None:
+                    raise AutomationRuntimeUnavailable(
+                        "VPN secret storage is unavailable"
+                    )
+                vpn = self.store.get(VpnProfile, policy.vpn_profile_id)
+                vpn_config = self.credential_store.resolve(
+                    vpn.secret_ref
+                ).get_secret_value()
+            has_network_boundary = bool(rules or domains)
+            session = AutomationSession(
+                engagement_id=engagement_id,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                runtime_image=self.runtime_image,
+                runtime_digest=self.runtime_digest,
+                runner_profile_id=profile.id,
+                runner_profile_revision=profile.revision,
+                policy_id=policy.id,
+                policy_revision=policy.revision,
+                scope_policy_id=scope.id if scope is not None else None,
+                scope_policy_revision=scope.revision if scope is not None else None,
+                vpn_profile_id=vpn.id if vpn is not None else None,
+                vpn_profile_revision=vpn.revision if vpn is not None else None,
+                # Even an automatic project never receives egress until a
+                # command explicitly asks for project_scope.
+                network_granted=False,
+            )
+            session = self.store.create(session)
+            resolver_file: Path | None = None
+            if domains:
+                resolver_directory = self.capture_root / session.id
+                resolver_directory.mkdir(mode=0o700)
+                resolver_file = resolver_directory / "resolv.conf"
+                resolver_file.write_text(
+                    "nameserver 127.0.0.53\noptions attempts:1 timeout:2\n",
+                    encoding="ascii",
+                )
+                # The file contains only the loopback resolver address and must
+                # be readable by the non-root process inside the container.
+                resolver_file.chmod(0o644)
+            try:
+                backend = await self.session_factory(
+                    SessionLaunch(
+                        session_id=session.id,
+                        runner=self._runner(profile, workspace=workspace),
+                        image=self.runtime_image,
+                        workspace=workspace,
+                        limits=SandboxLimits(
+                            timeout_seconds=max(1, policy.max_timeout_ms // 1_000)
+                        ),
+                        egress_rules=tuple(rules),
+                        egress_domains=tuple(domains),
+                        egress_ports=tuple(scope.allowed_ports)
+                        if scope is not None and domains
+                        else (),
+                        resolv_conf=resolver_file,
+                        network_granted=session.network_granted,
+                        vpn_config=vpn_config,
+                    )
+                )
+            except Exception as exc:
+                self.store.update(
+                    AutomationSession,
+                    session.id,
+                    {
+                        "status": AutomationSessionStatus.FAILED,
+                        "completed_at": utc_now(),
+                        "failure_detail": str(exc)[:4_000],
+                    },
+                    expected_revision=session.revision,
+                )
+                raise
+            session = self.store.update(
+                AutomationSession,
+                session.id,
+                {"status": AutomationSessionStatus.READY},
+                expected_revision=session.revision,
+            )
+            managed = _ManagedSession(
+                entity=session,
+                policy=policy,
+                scope=scope,
+                backend=backend,
+                workspace=workspace,
+            )
+            self._sessions[session.id] = managed
+            self._owner_sessions[key] = session.id
+            if (
+                scope is not None
+                and scope.not_after is not None
+                and not scope.bypass_permissions
+                and has_network_boundary
+            ):
+                managed.scope_expiry_task = create_diagnostic_task(
+                    self._expire_session_at_scope_boundary(session.id, scope.not_after),
+                    feature="runtime",
+                    event_code="runtime.scope_expiry",
+                    failure_message="Scope-expiry supervision stopped unexpectedly.",
+                )
+            return managed
+
+    def _select_runner(self, policy: AutomationProjectPolicy) -> StoredRunnerProfile:
+        if policy.runner_profile_id is not None:
+            profile = self.store.get(StoredRunnerProfile, policy.runner_profile_id)
+            if profile.enabled and profile.healthy:
+                return profile
+            raise AutomationRuntimeUnavailable(
+                "selected runner is not verified healthy"
+            )
+        profiles = [
+            item
+            for item in self.store.list_entities(StoredRunnerProfile, limit=1_000)
+            if item.enabled and item.healthy
+        ]
+        if not profiles:
+            raise AutomationRuntimeUnavailable(
+                "no verified healthy container runner is configured"
+            )
+        return sorted(profiles, key=lambda item: (item.created_at, item.id))[0]
+
+    def _runner(
+        self,
+        stored: StoredRunnerProfile,
+        *,
+        helper_image: str | None = None,
+        workspace: Path | None = None,
+    ) -> ContainerSandboxRunner:
+        platform = (
+            RunnerPlatform.LINUX
+            if stored.isolation == RunnerIsolation.ROOTLESS
+            else RunnerPlatform.MACOS
+        )
+        if stored.isolation == RunnerIsolation.ROOTLESS:
+            isolation = RunnerIsolationMode.LINUX_ROOTLESS
+            machine = None
+        elif stored.isolation == RunnerIsolation.PODMAN_MACHINE:
+            isolation = RunnerIsolationMode.PODMAN_MACHINE
+            machine = stored.context or "podman-machine-default"
+        else:
+            isolation = RunnerIsolationMode.DOCKER_DESKTOP_VM
+            machine = None
+        profile = RunnerProfile(
+            runtime_type=ContainerRuntimeType(stored.runtime.value),
+            executable=Path(stored.executable),
+            platform=platform,
+            isolation_mode=isolation,
+            context=stored.context,
+            socket=stored.socket
+            if stored.isolation == RunnerIsolation.ROOTLESS
+            else None,
+            machine_name=machine,
+            seccomp_profile=Path(stored.seccomp_profile)
+            if stored.seccomp_profile
+            else None,
+        )
+        workspace_roots = [self.data_root]
+        if workspace is not None:
+            resolved_workspace = workspace.expanduser().resolve(strict=True)
+            if not resolved_workspace.is_dir():
+                raise AutomationRuntimeUnavailable(
+                    "configured project workspace is not a directory"
+                )
+            if resolved_workspace not in workspace_roots:
+                workspace_roots.append(resolved_workspace)
+        return ContainerSandboxRunner(
+            profile=profile,
+            egress_controller=ContainerEgressController(
+                helper_image=helper_image or self.runtime_image
+            ),
+            workspace_roots=workspace_roots,
+        )
+
+    @staticmethod
+    def _network_boundary(
+        policy: AutomationProjectPolicy, scope: ScopePolicy | None
+    ) -> tuple[list[EgressRule], list[str]]:
+        if not policy.network_enabled or scope is None:
+            return [], []
+        if scope.allow_all_targets or scope.bypass_permissions:
+            return [
+                EgressRule(address="0.0.0.0/0", all_ports=True),
+                EgressRule(address="::/0", all_ports=True),
+            ], []
+        ports = scope.allowed_ports
+        rules = [
+            EgressRule(address=value, ports=ports, all_ports=not ports)
+            for value in scope.allowed_cidrs
+        ]
+        return _dedupe_rules(rules), list(scope.allowed_domains)
+
+    @staticmethod
+    def _validate_network_request(
+        managed: _ManagedSession, network: AutomationNetworkMode
+    ) -> None:
+        if managed.policy.execution_mode == "host":
+            if (
+                managed.scope
+                and not managed.scope.bypass_permissions
+                and managed.scope.not_before
+                and managed.scope.not_before > utc_now()
+            ):
+                raise AutomationPolicyDenied("project scope is not active yet")
+            if (
+                managed.scope
+                and not managed.scope.bypass_permissions
+                and managed.scope.not_after
+                and managed.scope.not_after <= utc_now()
+            ):
+                raise AutomationPolicyDenied("project scope has expired")
+            if network != AutomationNetworkMode.HOST:
+                raise AutomationPolicyDenied(
+                    "Host mode uses the host OS network boundary"
+                )
+            return
+        if network == AutomationNetworkMode.HOST:
+            raise AutomationPolicyDenied(
+                "Host networking is unavailable in Docker mode"
+            )
+        if network == AutomationNetworkMode.NONE:
+            return
+        if not managed.policy.network_enabled:
+            raise AutomationPolicyDenied("project networking is disabled")
+        if managed.scope is None:
+            raise AutomationPolicyDenied("project has no scope policy")
+        if managed.scope.bypass_permissions:
+            return
+        if managed.scope.not_before and managed.scope.not_before > utc_now():
+            raise AutomationPolicyDenied("project scope is not active yet")
+        if managed.scope.not_after and managed.scope.not_after <= utc_now():
+            raise AutomationPolicyDenied("project scope has expired")
+        if (
+            not managed.scope.allow_all_targets
+            and not managed.scope.allowed_cidrs
+            and not managed.scope.allowed_domains
+        ):
+            if managed.scope.allowed_urls:
+                raise AutomationPolicyDenied(
+                    "URL-only scope cannot authorize arbitrary shell networking"
+                )
+            raise AutomationPolicyDenied("project scope has no network destinations")
+        if managed.backend.network_enabled:
+            return
+
+    def _authorize_or_request(
+        self,
+        managed: _ManagedSession,
+        request: RunCommandRequest,
+        *,
+        approval: Approval | None,
+        requested_by: str,
+        owner_kind: str,
+        owner_id: str,
+        tool_call_id: str | None,
+    ) -> Approval:
+        exact_request = {
+            "tool_name": "run_command",
+            "arguments": request.model_dump(mode="json"),
+            "session_id": managed.entity.id,
+            "runtime_digest": managed.entity.runtime_digest,
+            "policy_revision": managed.policy.revision,
+            "argument_editing": False,
+        }
+        if approval is None:
+            created = Approval(
+                engagement_id=managed.entity.engagement_id,
+                run_id=owner_id,
+                origin=(
+                    ToolCallOrigin.CHAT
+                    if owner_kind == "chat"
+                    else ToolCallOrigin.MISSION
+                ),
+                chat_session_id=owner_id if owner_kind == "chat" else None,
+                tool_call_id=tool_call_id,
+                risk_class=RiskClass.WORKSPACE_WRITE,
+                exact_request=exact_request,
+                expected_effects=[
+                    "Run a Bash command as the Core OS user with host filesystem and network access"
+                    if managed.policy.execution_mode == "host"
+                    else "Run an arbitrary Bash command in the project automation container"
+                ],
+                policy_rationale=(
+                    "the project requires approval for every command"
+                    if managed.policy.approval_policy == AutomationApprovalPolicy.ALWAYS
+                    else "the command requests the project network boundary"
+                ),
+                requested_by=requested_by,
+            )
+            created = self.store.create(created)
+            raise CommandApprovalRequired(created)
+        durable = self.store.get(Approval, approval.id)
+        if (
+            durable.exact_request != exact_request
+            or durable.engagement_id != managed.entity.engagement_id
+        ):
+            raise AutomationPolicyDenied("approval does not match this exact command")
+        if (
+            durable.id in managed.used_approval_ids
+            or self.store.has_entity_with_metadata(
+                CommandExecution, "approval_id", durable.id
+            )
+        ):
+            raise AutomationPolicyDenied("approval has already been consumed")
+        if durable.status == ApprovalStatus.PENDING:
+            raise CommandApprovalRequired(durable)
+        if durable.status not in {ApprovalStatus.APPROVED, ApprovalStatus.EDITED}:
+            raise AutomationPolicyDenied(f"approval was {durable.status.value}")
+        if not durable.decided_by or durable.decided_at is None:
+            raise AutomationPolicyDenied("approval is missing its operator decision")
+        if durable.status == ApprovalStatus.EDITED:
+            raise AutomationPolicyDenied(
+                "command approvals cannot edit arbitrary shell text"
+            )
+        managed.used_approval_ids.add(durable.id)
+        return durable
+
+    async def _timeout_process(self, process: _ManagedProcess, seconds: float) -> None:
+        if process.final_task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(process.final_task), timeout=seconds)
+        except asyncio.TimeoutError:
+            # diagnostic-expected: the supervised deadline deliberately terminalizes the process.
+            process.forced_status = CommandExecutionStatus.TIMED_OUT
+            await process.backend.terminate()
+
+    async def _finalize_process(self, process: _ManagedProcess) -> CommandExecution:
+        async with process.finalize_lock:
+            exit_code = await process.backend.wait()
+            if process.drain_tasks is not None:
+                await self._settle_drains(process.drain_tasks)
+            status = process.forced_status or (
+                CommandExecutionStatus.COMPLETED
+                if exit_code == 0
+                else CommandExecutionStatus.FAILED
+            )
+            metadata = {
+                "command_execution_id": process.execution.id,
+                "process_id": process.execution.process_id,
+                "tool_call_id": process.execution.metadata.get("tool_call_id"),
+            }
+            stdout, redacted_stdout = await self._store_stream_artifacts(
+                process.stdout.path,
+                engagement_id=process.execution.engagement_id,
+                filename=f"command-{process.execution.id}.stdout",
+                kind="stdout",
+                metadata=metadata,
+            )
+            stderr, redacted_stderr = await self._store_stream_artifacts(
+                process.stderr.path,
+                engagement_id=process.execution.engagement_id,
+                filename=f"command-{process.execution.id}.stderr",
+                kind="stderr",
+                metadata=metadata,
+            )
+            current = self.store.get(CommandExecution, process.execution.id)
+            if current.metadata.get("results_received"):
+                # The callback already settled the outcome and woke the
+                # owner; the process's own output still joins the record so
+                # process_io and receipts find it as for any command.
+                process.execution = self.store.update(
+                    CommandExecution,
+                    current.id,
+                    {
+                        "stdout_artifact_id": stdout.id,
+                        "stderr_artifact_id": stderr.id,
+                        "redacted_stdout_artifact_id": redacted_stdout.id,
+                        "redacted_stderr_artifact_id": redacted_stderr.id,
+                        "observed_stdout_bytes": process.stdout.observed,
+                        "observed_stderr_bytes": process.stderr.observed,
+                        "stdout_truncated": process.stdout.truncated,
+                        "stderr_truncated": process.stderr.truncated,
+                    },
+                    expected_revision=current.revision,
+                )
+                return process.execution
+            process.execution = self.store.update(
+                CommandExecution,
+                current.id,
+                {
+                    "status": status,
+                    "completed_at": utc_now(),
+                    "exit_code": exit_code,
+                    "stdout_artifact_id": stdout.id,
+                    "stderr_artifact_id": stderr.id,
+                    "redacted_stdout_artifact_id": redacted_stdout.id,
+                    "redacted_stderr_artifact_id": redacted_stderr.id,
+                    "observed_stdout_bytes": process.stdout.observed,
+                    "observed_stderr_bytes": process.stderr.observed,
+                    "stdout_truncated": process.stdout.truncated,
+                    "stderr_truncated": process.stderr.truncated,
+                    "error": (
+                        "command timed out"
+                        if status == CommandExecutionStatus.TIMED_OUT
+                        else "command was cancelled"
+                        if status == CommandExecutionStatus.CANCELLED
+                        else "Core stopped before the process completed"
+                        if status == CommandExecutionStatus.INTERRUPTED
+                        else None
+                    ),
+                },
+                expected_revision=current.revision,
+            )
+            if (
+                process.execution.background
+                and self.process_terminal_observer
+                and status != CommandExecutionStatus.INTERRUPTED
+            ):
+                try:
+                    self.process_terminal_observer(process.execution.process_id)
+                except Exception as exc:
+                    record_caught_exception(
+                        "runtime",
+                        "runtime.background_process_owner_notify_failed",
+                        "A terminal background process could not notify its durable owner; reconciliation will retry.",
+                        exc,
+                        stage="process-finalize",
+                    )
+            return process.execution
+
+    @staticmethod
+    async def _settle_drains(
+        drain_tasks: tuple[asyncio.Task[None], asyncio.Task[None]],
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*drain_tasks), timeout=DRAIN_SETTLE_SECONDS
+            )
+        except asyncio.TimeoutError:
+            # diagnostic-expected: a detached descendant kept a pipe open; stop capturing.
+            for task in drain_tasks:
+                task.cancel()
+            await asyncio.gather(*drain_tasks, return_exceptions=True)
+
+    async def _store_stream_artifacts(
+        self,
+        path: Path,
+        *,
+        engagement_id: str,
+        filename: str,
+        kind: str,
+        metadata: dict[str, Any],
+    ) -> tuple[Artifact, Artifact]:
+        # Up to MAX_CAPTURE_BYTES per stream: read and redact it once, off the
+        # event loop, instead of three synchronous reads plus regex work on it.
+        binary, visible = await asyncio.to_thread(_redacted_stream_copy, path)
+        raw = self.artifact_store.put_file(
+            path,
+            engagement_id=engagement_id,
+            filename=filename,
+            media_type="application/octet-stream" if binary else "text/plain",
+            source="automation-runtime",
+            metadata={**metadata, "kind": kind, "searchable": not binary},
+        )
+        raw = self.store.create(raw)
+        if not binary and hashlib.sha256(visible).hexdigest() == raw.sha256:
+            # Redaction found nothing to remove (almost every stream, and every
+            # empty one): the captured bytes already are the redacted text, so
+            # the redacted reference names them rather than a second row.
+            return raw, raw
+        redacted = self.artifact_store.put_bytes(
+            visible,
+            engagement_id=engagement_id,
+            filename=f"{filename}.redacted.txt",
+            media_type="text/plain",
+            source="automation-runtime-redaction",
+            parent_artifact_id=raw.id,
+            metadata={**metadata, "kind": f"redacted_{kind}", "searchable": True},
+        )
+        redacted = self.store.create(redacted.model_copy(update={"redacted": True}))
+        return raw, redacted
+
+    async def _poll(
+        self, managed: _ManagedSession, process: _ManagedProcess, maximum: int
+    ) -> CommandResult:
+        await asyncio.sleep(0)
+        stdout, process.stdout_offset = _read_increment(
+            process.stdout.path, process.stdout_offset, maximum // 2
+        )
+        stderr, process.stderr_offset = _read_increment(
+            process.stderr.path, process.stderr_offset, maximum - len(stdout)
+        )
+        if process.final_task is not None and process.final_task.done():
+            process.execution = await process.final_task
+            if (
+                process.stdout_offset >= process.stdout.retained
+                and process.stderr_offset >= process.stderr.retained
+            ):
+                self._discard_capture(process)
+        return self._result(
+            managed,
+            process,
+            stdout=redact_text(stdout.decode("utf-8", errors="replace")),
+            stderr=redact_text(stderr.decode("utf-8", errors="replace")),
+        )
+
+    @staticmethod
+    def _result(
+        managed: _ManagedSession,
+        process: _ManagedProcess,
+        *,
+        stdout: str,
+        stderr: str,
+        results_url: str | None = None,
+        results_api_key: str | None = None,
+        tool_call_id: str | None = None,
+        chat_session_id: str | None = None,
+        chat_turn_id: str | None = None,
+    ) -> CommandResult:
+        execution = process.execution
+        return CommandResult(
+            session_id=managed.entity.id,
+            process_id=execution.process_id,
+            execution_id=execution.id,
+            status=execution.status,
+            exit_code=execution.exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            output_truncated=execution.stdout_truncated or execution.stderr_truncated,
+            stdout_artifact_id=execution.stdout_artifact_id,
+            stderr_artifact_id=execution.stderr_artifact_id,
+            redacted_stdout_artifact_id=execution.redacted_stdout_artifact_id,
+            redacted_stderr_artifact_id=execution.redacted_stderr_artifact_id,
+            workspace_changes=execution.workspace_changes,
+            network_granted=managed.entity.network_granted,
+            results_url=results_url or execution.metadata.get("results_url"),
+            results_api_key=results_api_key,
+            tool_call_id=tool_call_id or execution.metadata.get("tool_call_id"),
+            chat_session_id=chat_session_id
+            or execution.metadata.get("chat_session_id"),
+            chat_turn_id=chat_turn_id or execution.metadata.get("chat_turn_id"),
+        )
+
+    @staticmethod
+    def _execution_id(process_id: str) -> str:
+        return str(uuid5(NAMESPACE_URL, f"nebula:automation-execution:{process_id}"))
+
+
+async def _communicate(
+    process: asyncio.subprocess.Process, *, timeout: float
+) -> tuple[bytes, bytes]:
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                # diagnostic-expected: the child exited between the returncode check and signal.
+                pass
+        await process.wait()
+        raise AutomationRuntimeUnavailable("container runtime operation timed out")
+    return (stdout or b"")[:2_000_000], (stderr or b"")[:2_000_000]
+
+
+def _dedupe_rules(rules: list[EgressRule]) -> list[EgressRule]:
+    output: list[EgressRule] = []
+    seen: set[str] = set()
+    for rule in rules:
+        key = rule.model_dump_json()
+        if key not in seen:
+            seen.add(key)
+            output.append(rule)
+    return output
+
+
+def _redacted_stream_copy(path: Path) -> tuple[bool, bytes]:
+    """Read a captured stream once: NUL-sniff its head and redact the text."""
+
+    data = path.read_bytes()
+    binary = b"\x00" in data[:8_192]
+    return binary, redact_text(data.decode("utf-8", errors="replace")).encode()
+
+
+def _read_increment(path: Path, offset: int, maximum: int) -> tuple[bytes, int]:
+    if maximum <= 0 or not path.exists():
+        return b"", offset
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        data = stream.read(maximum)
+        return data, offset + len(data)
+
+
+__all__ = [
+    "AutomationPolicyDenied",
+    "AutomationRuntimeError",
+    "AutomationRuntimeInfo",
+    "AutomationRuntimeManager",
+    "AutomationRuntimeUnavailable",
+    "CommandApprovalRequired",
+    "CommandResult",
+    "ContainerRuntimeSession",
+    "ProcessIORequest",
+    "RunCommandRequest",
+    "RuntimeBackendProcess",
+    "RuntimeBackendSession",
+    "SessionLaunch",
+]

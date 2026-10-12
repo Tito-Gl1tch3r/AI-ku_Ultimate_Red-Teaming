@@ -1,0 +1,121 @@
+/*
+ * Copyright 2025 Daytona Platforms Inc.
+ * Modified by BoxLite AI, 2025-2026
+ * SPDX-License-Identifier: AGPL-3.0
+ */
+
+import React, { useState, useEffect, useMemo } from 'react'
+import { Region, UpdateRegion } from '@boxlite-ai/api-client'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+
+interface UpdateRegionDialogProps {
+  region: Region
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onUpdateRegion: (regionId: string, data: UpdateRegion) => Promise<boolean>
+  loading: boolean
+}
+
+export const UpdateRegionDialog: React.FC<UpdateRegionDialogProps> = ({
+  region,
+  open,
+  onOpenChange,
+  onUpdateRegion,
+  loading,
+}) => {
+  const [formData, setFormData] = useState({
+    proxyUrl: region.proxyUrl || '',
+  })
+
+  // Reset form when dialog opens with new region
+  useEffect(() => {
+    if (open) {
+      setFormData({
+        proxyUrl: region.proxyUrl || '',
+      })
+    }
+  }, [open, region])
+
+  const hasChanges = useMemo(() => {
+    return (formData.proxyUrl.trim() || null) !== (region.proxyUrl || null)
+  }, [formData, region])
+
+  const handleUpdate = async () => {
+    // Only include changed fields
+    const updateData: UpdateRegion = {}
+
+    const proxyUrlValue = formData.proxyUrl.trim() || null
+
+    if (proxyUrlValue !== (region.proxyUrl || null)) {
+      updateData.proxyUrl = proxyUrlValue
+    }
+
+    const success = await onUpdateRegion(region.id, updateData)
+    if (success) {
+      onOpenChange(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Update Region: {region.name}</DialogTitle>
+          <DialogDescription>Modify the URLs for this region.</DialogDescription>
+        </DialogHeader>
+
+        <form
+          id="update-region-form"
+          className="space-y-6 overflow-y-auto px-1 pb-1"
+          onSubmit={async (e) => {
+            e.preventDefault()
+            await handleUpdate()
+          }}
+        >
+          <div className="space-y-3">
+            <Label htmlFor="proxy-url">Proxy URL</Label>
+            <Input
+              id="proxy-url"
+              value={formData.proxyUrl}
+              onChange={(e) => {
+                setFormData((prev) => ({ ...prev, proxyUrl: e.target.value }))
+              }}
+              placeholder="https://proxy.example.com"
+            />
+            <p className="text-sm text-muted-foreground mt-1 pl-1">
+              (Optional) URL of the custom proxy for this region
+            </p>
+          </div>
+        </form>
+
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button type="button" variant="secondary">
+              Cancel
+            </Button>
+          </DialogClose>
+          {loading ? (
+            <Button type="button" variant="default" disabled>
+              Updating...
+            </Button>
+          ) : (
+            <Button type="submit" form="update-region-form" variant="default" disabled={loading || !hasChanges}>
+              Update
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}

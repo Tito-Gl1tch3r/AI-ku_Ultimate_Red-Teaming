@@ -1,0 +1,176 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2
+
+open System
+open System.Text
+open System.Globalization
+open System.Runtime.InteropServices
+
+/// <summary>
+/// Represents an array of bytes, often used to read raw binary data. This is
+/// just an alias for <c>byte[]</c>, but we define it here to provide several
+/// useful functions to deal with byte arrays in the <see
+/// cref='T:B2R2.ByteArrayModule'/> module.
+/// </summary>
+type ByteArray = byte[]
+
+/// <summary>
+/// Provides several useful functions to deal with byte arrays (i.e., <see
+/// cref='T:B2R2.ByteArray'/>).
+/// </summary>
+[<RequireQualifiedAccess>]
+module ByteArray =
+
+  /// Converts a hex string to a byte array. The input must not have a "0x"
+  /// prefix and must contain an even number of hex characters. If the length
+  /// is odd, the last character is silently ignored.
+  [<CompiledName "OfHexString">]
+  let ofHexString (s: string) =
+    Array.init (s.Length / 2) (fun i ->
+      Byte.Parse(s.AsSpan(i * 2, 2), NumberStyles.AllowHexSpecifier))
+
+  /// Reads int32 from the given byte array at the given offset.
+  [<CompiledName "ReadInt32">]
+  let readInt32 (bs: ByteArray) offset =
+    try
+      let span = ReadOnlySpan(bs, offset, 4)
+      MemoryMarshal.Read<int> span |> Ok
+    with :? ArgumentOutOfRangeException ->
+      Error ErrorCase.InvalidMemoryRead
+
+  /// Extracts a C-string (string that ends with a NULL char) from a
+  /// ReadOnlySpan. The string ends at the NULL char, or at the end of the span
+  /// when there is none. Each byte is taken as a character code, which is what
+  /// Latin-1 decoding does.
+  [<CompiledName "ExtractCStringFromSpan">]
+  let extractCStringFromSpan (span: ReadOnlySpan<byte>) offset =
+    if offset < 0 then
+      raise (IndexOutOfRangeException())
+    elif span.Length <= offset then
+      ""
+    else
+      let tail = span.Slice offset
+      let nul = tail.IndexOf 0uy
+      let length = if nul < 0 then tail.Length else nul
+      Encoding.Latin1.GetString(tail.Slice(0, length))
+
+  /// Extracts a C-string (string that ends with a NULL char) from a byte array.
+  [<CompiledName "ExtractCString">]
+  let extractCString (bytes: ByteArray) offset =
+    extractCStringFromSpan (ReadOnlySpan bytes) offset
+
+  let private makeDelta1 pattern patlen =
+    let delta1 = Array.create 256 patlen
+    let iter i x =
+      if i < patlen - 1 then delta1[int x] <- patlen - 1 - i else ()
+    Array.iteri iter pattern
+    delta1
+
+  let private isPrefix (pattern: ByteArray) patlen pos =
+    let slen = patlen - pos
+    let rec loop idx =
+      if idx < slen && pattern[idx] = pattern[pos + idx] then loop (idx + 1)
+      else idx
+    loop 0 = slen
+
+  let private getSuffixLength (pattern: ByteArray) patlen pos =
+    let rec loop idx =
+      if idx < pos && pattern[pos - idx] = pattern[patlen - 1 - idx] then
+        loop (idx + 1)
+      else
+        idx
+    loop 0
+
+  let private makeDelta2 (pattern: ByteArray) patlen =
+    let delta2 = Array.zeroCreate patlen
+    let mutable idx = patlen - 1
+    let mutable last = patlen - 1
+    while idx >= 0 do
+      if isPrefix pattern patlen (idx + 1) then last <- idx + 1 else ()
+      delta2[idx] <- last + patlen - 1 - idx
+      idx <- idx - 1
+    idx <- 0
+    while idx < patlen - 1 do
+      let slen = getSuffixLength pattern patlen idx
+      if pattern[idx - slen] <> pattern[patlen - 1 - slen] then
+        delta2[patlen - 1 - slen] <- patlen - 1 - idx + slen
+      else
+        ()
+      idx <- idx + 1
+    delta2
+
+  let rec private getMatch (pattern: ByteArray) (buf: ByteArray) (i, j) =
+    if j >= 0 && buf[i] = pattern[j] then getMatch pattern buf (i - 1, j - 1)
+    else struct (i, j)
+
+  let rec private searchOne i (buf: ByteArray) pattern (d1: int[]) (d2: int[]) =
+    if i < buf.Length then
+      let struct (i, j) = getMatch pattern buf (i, pattern.Length - 1)
+      if j < 0 then Some(i + 1)
+      else searchOne (i + max d1[int buf[i]] d2[j]) buf pattern d1 d2
+    else
+      None
+
+  let private makeDeltas pattern =
+    let patlen = Array.length pattern
+    struct (patlen, makeDelta1 pattern patlen, makeDelta2 pattern patlen)
+
+  let private bmSearch pattern buf =
+    let struct (patlen, delta1, delta2) = makeDeltas pattern
+    let rec searchAll idx ret =
+      match searchOne idx buf pattern delta1 delta2 with
+      | Some j -> searchAll (j + patlen) (j :: ret)
+      | None -> ret
+    searchAll (patlen - 1) []
+
+  /// <summary>
+  /// Finds and returns the absolute offsets of all positions in <c>buf</c>
+  /// where <c>pattern</c> occurs. The <c>offset</c> parameter is added to each
+  /// result to convert a buffer-relative index to an absolute address, which is
+  /// useful when <c>buf</c> is a slice of a larger address space.
+  /// </summary>
+  [<CompiledName "FindIdxs">]
+  let findIdxs offset pattern buf =
+    bmSearch pattern buf |> List.map (fun x -> uint64 x + offset)
+
+  /// Finds a matching byte position. If there is no match, this function will
+  /// return None.
+  [<CompiledName "TryFindIdx">]
+  let tryFindIdx offset pattern buf =
+    let struct (patlen, delta1, delta2) = makeDeltas pattern
+    searchOne (patlen - 1) buf pattern delta1 delta2
+    |> Option.map (fun idx -> uint64 idx + offset)
+
+  /// Converts a byte array to a hex string. Only the first 32 bytes are
+  /// converted to avoid producing a very long string in case of a large byte
+  /// array.
+  [<CompiledName "ToHexString">]
+  let toHexString (bs: ByteArray) =
+    let span = ReadOnlySpan(bs).Slice(0, min 32 bs.Length)
+    let sb = StringBuilder()
+    for b in span do sb.Append $"{b:x2}" |> ignore
+    if bs.Length > 32 then sb.Append "..." |> ignore else ()
+    sb.ToString()

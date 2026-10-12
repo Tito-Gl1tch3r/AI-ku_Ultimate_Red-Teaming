@@ -1,0 +1,3588 @@
+export type Identifier = string;
+
+export type ResourceKind =
+  | "project" | "conversation" | "note" | "source" | "library_item"
+  | "workspace_file" | "asset" | "evidence" | "finding" | "report"
+  | "terminal_session" | "terminal_command" | "browser_session" | "browser_tab"
+  | "browser_assessment" | "browser_exchange" | "mission" | "execution"
+  | "approval" | "receipt" | "artifact";
+
+export interface ResourceRef {
+  projectId?: Identifier;
+  kind: ResourceKind;
+  id: Identifier;
+  revision?: number;
+}
+
+export interface ResourceResolution {
+  ref: ResourceRef;
+  label: string;
+  state: "available" | "deleted" | "inaccessible" | "wrong_project";
+  actualProjectId?: Identifier;
+}
+
+export type RelationPredicate =
+  | "affects"
+  | "supports"
+  | "includes"
+  | "references"
+  | "produced_by"
+  | "derived_from";
+
+export interface ResourceRelation {
+  id: Identifier;
+  projectId: Identifier;
+  source: ResourceRef;
+  predicate: RelationPredicate;
+  target: ResourceRef;
+  attribution?: string;
+  provenance: Record<string, unknown>;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ActionDescriptor {
+  id: string;
+  acceptedResourceKinds: ResourceKind[];
+  resultKind?: ResourceKind;
+  authority: "ui" | "core" | "device";
+  requiredCapabilities: string[];
+  risk: "safe" | "mutating" | "risky";
+  confirmationPolicy: "none" | "mutation" | "always";
+  available: boolean;
+  disabledReason?: string;
+}
+
+export interface SearchResult {
+  ref: ResourceRef;
+  project: string;
+  label: string;
+  description: string;
+  snippet: string;
+  breadcrumb: string;
+  updatedAt: string;
+  score: number;
+  actions: ActionDescriptor[];
+}
+
+export interface SearchResponse {
+  items: SearchResult[];
+  nextCursor?: string;
+  partialIndex: boolean;
+}
+
+export interface HandoffEnvelope {
+  id: Identifier;
+  projectId: Identifier;
+  sourceRefs: ResourceRef[];
+  actionId: string;
+  targetRef?: ResourceRef;
+  originDeviceId: string;
+  sourceHashes: Record<string, string>;
+  sourceLabels: Record<string, string>;
+  transient: boolean;
+  status: "pending" | "consumed" | "cancelled" | "expired";
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  consumedAt?: string;
+  consumedByDeviceId?: string;
+  revision: number;
+}
+
+export interface HandoffResolution {
+  envelope: HandoffEnvelope;
+  sources: Array<{
+    ref: ResourceRef;
+    state: "available" | "changed" | "deleted" | "origin_required";
+    label: string;
+  }>;
+  recovery: "ready" | "resume_origin" | "preserve_or_recapture";
+}
+
+export interface Page<T> {
+  items: T[];
+  total: number;
+  nextCursor?: string;
+}
+
+export interface EngagementSummary {
+  id: Identifier;
+  name: string;
+  description: string;
+  clientName?: string;
+  status: "draft" | "active" | "paused" | "complete" | "archived";
+  tags: string[];
+  workEnabled: boolean;
+  parentEngagementId?: string;
+  workspacePath?: string;
+  createdAt: string;
+  updatedAt: string;
+  scopeAssetCount: number;
+  assistantDefaults?: AssistantDefaults;
+}
+
+export interface AssistantDefaults {
+  backend: "provider" | "harness" | null;
+  providerId: string | null;
+  harnessId: string | null;
+  model: string | null;
+  reasoningEffort: ReasoningEffort | null;
+  harnessReasoningEffort: string | null;
+  harnessServiceTier: string | null;
+  harnessMode: string | null;
+  mcpServerIds: string[];
+  hookIds: string[];
+  allowSubagents: boolean;
+  subagentProviderId: string | null;
+  subagentHarnessId: string | null;
+  subagentModel: string | null;
+  maxActiveSubagents: number | null;
+  subagentReasoningEffort: ReasoningEffort | null;
+  allowAgentMessaging: boolean;
+}
+
+export interface EngagementCreateRequest {
+  name: string;
+  description?: string;
+  clientName?: string;
+  status?: EngagementSummary["status"];
+  tags?: string[];
+  workspacePath?: string;
+}
+
+export interface AgentRunSummary {
+  id: Identifier;
+  revision?: number;
+  engagementId: Identifier;
+  title: string;
+  status:
+    | "queued"
+    | "planning"
+    | "running"
+    | "waiting_approval"
+    | "paused"
+    | "failed"
+    | "interrupted"
+    | "complete"
+    | "cancelled"
+    | "cancelling";
+  startedAt?: string;
+  updatedAt: string;
+  completedTasks: number;
+  totalTasks: number;
+  spentUsd?: number;
+  backend?: "native" | "harness";
+  harnessProfileId?: Identifier;
+  harnessSessionId?: Identifier;
+  model?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
+  objective?: string;
+  finalSummary?: string;
+  supervisorChatSessionId?: Identifier;
+  retryOfRunId?: Identifier;
+  remoteMcpConfirmed?: boolean;
+  scheduledFor?: string;
+  repeatIntervalSeconds?: number;
+  stages?: Array<{ title: string; objective: string }>;
+  restartRecovery?: {
+    required: boolean;
+    automatic?: boolean;
+    state?: string;
+    reason?: string;
+    unresolvedToolCallIds: Identifier[];
+    effects: Array<{
+      toolCallId: Identifier;
+      toolName: string;
+      riskClass: string;
+      statusAtRestart: string;
+    }>;
+  };
+}
+
+export interface MissionCreateRequest {
+  engagementId: Identifier;
+  name: string;
+  objective: string;
+  backend?: "native" | "harness";
+  providerId?: Identifier;
+  harnessProfileId?: Identifier;
+  harnessSessionId?: Identifier;
+  mcpServerIds?: Identifier[];
+  allowSubagents?: boolean;
+  subagentProviderId?: Identifier;
+  subagentModel?: string;
+  model?: string;
+  harnessReasoningEffort?: string;
+  harnessServiceTier?: string;
+  stages?: Array<{ title: string; objective: string }>;
+  scheduledFor?: string;
+  repeatIntervalSeconds?: number;
+  maxDurationSeconds?: number | null;
+  maxTokens?: number | null;
+  maxCostUsd?: number | null;
+  maxRetries?: number;
+  maxToolCalls?: number | null;
+  maxArtifactQueries?: number | null;
+  maxConcurrency?: number;
+  allowCloudToolResults?: boolean;
+  browserAutonomy?: {
+    sessionId: Identifier;
+    targets: string[];
+    allowedRiskClasses?: string[];
+    credentialRefs?: string[];
+    durationSeconds?: number;
+    maxCommands?: number;
+    maxRequests?: number;
+    maxBodyBytes?: number;
+  };
+}
+
+export interface AutomationRuntimeInfo {
+  configured: boolean;
+  ready: boolean;
+  image?: string;
+  digest?: string;
+  runnerProfileId?: Identifier;
+  detail: string;
+  inventory: Array<{ name: string; version: string; path: string }>;
+}
+
+export interface AutomationProjectPolicy {
+  executionMode?: "docker" | "host";
+  hostAccessAcknowledged?: boolean;
+  id: Identifier;
+  engagementId: Identifier;
+  approvalPolicy: "always" | "on_boundary" | "never";
+  networkEnabled: boolean;
+  runnerProfileId?: Identifier;
+  vpnProfileId?: Identifier;
+  maxTimeoutMs: number;
+  revision: number;
+}
+
+export interface VpnProfile {
+  id: Identifier;
+  name: string;
+  filename: string;
+  remoteHost: string;
+  remotePort: number;
+  protocol: "udp" | "tcp";
+  fingerprint: string;
+  requiresCredentials: boolean;
+  available: boolean;
+  revision: number;
+}
+
+export interface ToolArtifactReference {
+  artifactId: Identifier;
+  kind:
+    | "stdout"
+    | "stderr"
+    | "parsed"
+    | "receipt"
+    | "mcp_content"
+    | "generated_file";
+  filename?: string;
+  mediaType: string;
+  byteCount: number;
+  observedByteCount: number;
+  sha256: string;
+  searchable: boolean;
+  truncated: boolean;
+}
+
+export interface ToolOutputLine {
+  line: number;
+  text: string;
+  lineTruncated?: boolean;
+}
+
+export interface ToolOutputSearchResult {
+  matches: Array<{
+    artifactId: Identifier;
+    filename?: string;
+    line: number;
+    context: ToolOutputLine[];
+  }>;
+  truncated: boolean;
+  continuationCursor?: string;
+  skipped: Array<{ artifactId: Identifier; reason: string }>;
+}
+
+export interface ToolOutputReadResult {
+  artifactId: Identifier;
+  filename?: string;
+  searchable: boolean;
+  lines: ToolOutputLine[];
+  truncated: boolean;
+  continuationStartingLine?: number;
+}
+
+export type RunnerRuntime = "podman" | "docker";
+export type RunnerIsolation =
+  | "rootless"
+  | "podman_machine"
+  | "docker_desktop_vm"
+  | "unverified";
+
+export interface RunnerProfile {
+  id: Identifier;
+  name: string;
+  runtimeType: RunnerRuntime;
+  executable: string;
+  context?: string;
+  socket?: string;
+  platform: string;
+  isolationMode: RunnerIsolation;
+  state: "ready" | "degraded" | "unavailable" | "unchecked";
+  lastCheckedAt?: string;
+  detail?: string;
+  seccompProfile?: string;
+  revision: number;
+}
+
+export interface RunnerProfileUpdateRequest {
+  name: string;
+  runtimeType: RunnerRuntime;
+  executable: string;
+  context?: string;
+  socket?: string;
+  platform: string;
+  isolationMode: Exclude<RunnerIsolation, "unverified">;
+  seccompProfile?: string;
+  expectedRevision?: number;
+}
+
+export interface EngagementScopePolicy {
+  id?: Identifier;
+  engagementId: Identifier;
+  allowedCidrs: string[];
+  allowedDomains: string[];
+  allowedUrls: string[];
+  allowedPorts: number[];
+  allowAllTargets: boolean;
+  bypassPermissions?: boolean;
+  notBefore?: string;
+  notAfter?: string;
+  prohibitedActions: string[];
+  localOnly: boolean;
+  /** Opt-in: send redacted operator messages, selected skills and tool names to TypeSafe Jev. */
+  toolSuggestions: boolean;
+  /** Connected-source tools load on demand (Core default); off sends only a chat's ticked MCP servers. */
+  onDemandTools?: boolean;
+  /** Opt-in: let the agent research the public web through the local search runtime. */
+  webSearch: boolean;
+  /** Opt-in: permit search queries that name an in-scope host, address or range. */
+  webSearchDisclosesScope: boolean;
+  /** Runtime names of connected-source tools kept in every request. */
+  alwaysLoadedTools: string[];
+  maxConcurrency: number;
+  grants: MissionGrant[];
+  revision: number;
+}
+
+/** One connected-source tool an operator can keep loaded, as Core names it. */
+export interface ScopeToolCandidate {
+  name: string;
+  serverId: Identifier;
+  serverName: string;
+  toolName: string;
+  description: string;
+}
+
+export interface MissionGrant {
+  riskClasses: string[];
+  toolNames: string[];
+  targets: string[];
+  grantedAt: string;
+  expiresAt: string;
+  grantedBy: string;
+}
+
+export interface EngagementScopeUpdateRequest
+  extends Omit<
+    EngagementScopePolicy,
+    | "engagementId"
+    | "revision"
+    | "toolSuggestions"
+    | "webSearch"
+    | "webSearchDisclosesScope"
+    | "alwaysLoadedTools"
+  > {
+  expectedRevision: number;
+  /** Omitted keeps the stored value. */
+  toolSuggestions?: boolean;
+  /** Omitted keeps the stored value. */
+  webSearch?: boolean;
+  /** Omitted keeps the stored value. */
+  webSearchDisclosesScope?: boolean;
+  /** Omitted keeps the stored value. */
+  alwaysLoadedTools?: string[];
+}
+
+export type WebSearchEngine =
+  | "duckduckgo"
+  | "brave"
+  | "wikipedia"
+  | "stackexchange"
+  | "github";
+
+export type WebSearchRuntimeState =
+  | "absent"
+  | "stopped"
+  | "starting"
+  | "ready"
+  | "failed";
+
+export interface WebSearchTest {
+  testedAt: string;
+  ok: boolean;
+  latencyMs?: number;
+  enginesAnswered: string[];
+  error?: string;
+}
+
+/** The local metasearch runtime. It holds no account and no key. */
+export interface WebSearchRuntime {
+  runtimeAvailable: boolean;
+  runtimeDetail: string;
+  containerState: WebSearchRuntimeState;
+  imageDigest?: string;
+  port?: number;
+  engines: WebSearchEngine[];
+  lastTest?: WebSearchTest;
+  lastDetail?: string;
+  projectsUsing: number;
+}
+
+/** One ranked public-web hit lifted into a tool receipt. */
+export interface WebResultObservation {
+  kind: "web_result";
+  rank: number;
+  title: string;
+  url: string;
+  snippet: string;
+  engine?: string;
+  publishedAt?: string;
+}
+
+export interface TypeSafeKeyTest {
+  testedAt: string;
+  ok: boolean;
+  latencyMs?: number;
+  model?: string;
+  error?: string;
+}
+
+export interface TypeSafeIntegration {
+  source?: "vault" | "session" | "environment";
+  available: boolean;
+  vaultAvailable: boolean;
+  /** A vault can exist and still be locked, which no save can write to. */
+  vaultState: VaultState;
+  lastTest?: TypeSafeKeyTest;
+  projectsUsing: number;
+}
+
+export type VaultState = "available" | "locked" | "unavailable";
+
+export interface CredentialVaultStatus {
+  state: VaultState;
+  available: boolean;
+}
+
+/** Per-turn Jev summary; probabilities stay in Core's turn record. */
+export interface ToolSuggestionSummary {
+  status: "suggested" | "no_tool_needed" | "unavailable";
+  preloaded: string[];
+  suggested: string[];
+  used: string[];
+  loadedByModel: string[];
+  unloadedCount: number;
+  onDemandCount: number;
+  model?: string;
+  latencyMs?: number;
+  error?: string;
+}
+
+export type BrowserCaptureMode = "metadata" | "headers" | "bodies";
+export type BrowserScopeState = "in_scope" | "out_of_scope" | "inactive" | "unconfigured" | "unknown";
+
+export interface SecurityBrowserIdentity {
+  id: Identifier;
+  name: string;
+  description: string;
+  color: string;
+  storagePartition: string;
+  ephemeral: boolean;
+  isDefault: boolean;
+  revokedAt?: string;
+  revision: number;
+}
+
+export interface SecurityBrowserTab {
+  id: Identifier;
+  url?: string;
+  title: string;
+  position: number;
+  lastScopeState: BrowserScopeState;
+  lastScopeRevision?: number;
+}
+
+export interface SecurityBrowserSession {
+  id: Identifier;
+  name: string;
+  identityId: Identifier;
+  status: "active" | "paused" | "closed";
+  captureMode: BrowserCaptureMode;
+  proxyEnabled: boolean;
+  proxyTrustAcknowledged: boolean;
+  tabs: SecurityBrowserTab[];
+  activeTabId?: Identifier;
+  upstreamProxyEnabled: boolean;
+  upstreamProxyUrl?: string;
+  upstreamProxyCredentialRef?: string;
+  interceptionEnabled: boolean;
+  deviceOwner?: string;
+  lastSeenAt: string;
+  revision: number;
+}
+
+export interface SecurityBrowserExchange {
+  id: Identifier;
+  sessionId: Identifier;
+  tabId: Identifier;
+  identityId: Identifier;
+  method: string;
+  url: string;
+  protocol: "http/1.0" | "http/1.1" | "h2" | "h3" | "websocket" | "unknown";
+  statusCode?: number;
+  requestHeaders: Record<string, string>;
+  responseHeaders: Record<string, string>;
+  requestBodyArtifactId?: Identifier;
+  responseBodyArtifactId?: Identifier;
+  requestBytes?: number;
+  responseBytes?: number;
+  durationMs?: number;
+  scopeState: Exclude<BrowserScopeState, "unknown">;
+  scopePolicyRevision: number;
+  startedAt: string;
+  completedAt?: string;
+  replayOfExchangeId?: Identifier;
+  error?: string;
+  blocked?: boolean;
+  truncated: boolean;
+}
+
+export interface SecurityBrowserWebSocketFrame {
+  id: Identifier;
+  sessionId: Identifier;
+  exchangeId: Identifier;
+  direction: "client" | "server";
+  opcode: "text" | "binary" | "ping" | "pong" | "close";
+  payloadPreview: string;
+  payloadSha256: string;
+  payloadBytes: number;
+  observedAt: string;
+  truncated: boolean;
+}
+
+export interface SecurityBrowserAction {
+  id: Identifier;
+  sessionId: Identifier;
+  tabId: Identifier;
+  identityId: Identifier;
+  kind: "navigate" | "click" | "fill" | "select" | "press" | "extract" | "screenshot" | "replay";
+  status: "proposed" | "approved" | "executing" | "complete" | "failed" | "rejected" | "expired";
+  locator: Record<string, string>;
+  arguments: Record<string, unknown>;
+  proposal: string;
+  proposedBy: string;
+  pageUrl: string;
+  scopePolicyRevision: number;
+  actionSha256: string;
+  approvedBy?: string;
+  approvedAt?: string;
+  expiresAt: string;
+  completedAt?: string;
+  result: Record<string, unknown>;
+  evidenceIds: Identifier[];
+  error?: string;
+  revision: number;
+}
+
+export interface SecurityBrowserAutomationLease {
+  id: Identifier;
+  revision: number;
+  engagementId: Identifier;
+  runId: Identifier;
+  sessionId: Identifier;
+  identityId: Identifier;
+  scopePolicyId: Identifier;
+  scopePolicyRevision: number;
+  targetUrls: string[];
+  allowedRiskClasses: string[];
+  credentialRefs: string[];
+  maxCommands: number;
+  maxRequests: number;
+  maxBodyBytes: number;
+  commandsUsed: number;
+  requestsUsed: number;
+  status: "active" | "paused" | "revoked" | "expired" | "complete" | "failed";
+  expiresAt: string;
+  lastHeartbeatAt: string;
+  stopReason?: string;
+}
+
+export interface SecurityBrowserCommand {
+  id: Identifier;
+  revision: number;
+  engagementId: Identifier;
+  runId: Identifier;
+  leaseId: Identifier;
+  sessionId: Identifier;
+  tabId: Identifier;
+  kind: string;
+  arguments: Record<string, unknown>;
+  expectedPageUrl?: string;
+  status: "queued" | "claimed" | "complete" | "failed" | "expired" | "cancelled";
+  claimedByDeviceId?: Identifier;
+  claimToken?: string;
+  expiresAt: string;
+  result: Record<string, unknown>;
+  evidenceIds: Identifier[];
+  error?: string;
+}
+
+export interface SecurityBrowserProxyRule {
+  id: Identifier;
+  revision: number;
+  engagementId: Identifier;
+  runId: Identifier;
+  leaseId: Identifier;
+  sessionId: Identifier;
+  match: Record<string, unknown>;
+  action: Record<string, unknown>;
+  priority: number;
+  enabled: boolean;
+  expiresAt: string;
+  disabledReason?: string;
+}
+
+export interface SecurityBrowserAutomationStatus {
+  leases: SecurityBrowserAutomationLease[];
+  commands: SecurityBrowserCommand[];
+  rules: SecurityBrowserProxyRule[];
+}
+
+export interface SecurityBrowserHandoff {
+  id: Identifier;
+  sessionId: Identifier;
+  requestedByDeviceId: Identifier;
+  command: "navigate" | "focus_tab";
+  tabId?: Identifier;
+  url?: string;
+  status: "queued" | "claimed" | "complete" | "failed" | "cancelled" | "expired";
+  expiresAt: string;
+  claimedByDeviceId?: Identifier;
+  error?: string;
+  revision: number;
+}
+
+export interface SecurityBrowserWorkspace {
+  identities: SecurityBrowserIdentity[];
+  sessions: SecurityBrowserSession[];
+  traffic: SecurityBrowserExchange[];
+  frames: SecurityBrowserWebSocketFrame[];
+  actions: SecurityBrowserAction[];
+  handoffs: SecurityBrowserHandoff[];
+}
+
+export type SecurityBrowserAssessmentProfile = "explore" | "standard" | "deep" | "api" | "validation";
+export type SecurityBrowserAssessmentStatus = "draft" | "ready" | "running" | "waiting_operator" | "paused" | "stopping" | "stopped" | "complete" | "failed" | "revoked";
+
+export interface SecurityBrowserEngineCapability {
+  adapter: string;
+  displayName: string;
+  contractVersion: string;
+  state: "ready" | "degraded" | "preparing" | "unavailable";
+  installedVersion?: string;
+  digest?: string;
+  actions: string[];
+  protocols: string[];
+  checkFamilies: string[];
+  unavailabilityReason?: string;
+  recoveryAction?: string;
+  desktopOnly: boolean;
+}
+
+export interface SecurityBrowserAssessmentBudget {
+  maxRequests: number;
+  maxActions: number;
+  maxDurationSeconds: number;
+  maxConcurrency: number;
+  requestsUsed: number;
+  actionsUsed: number;
+}
+
+export interface SecurityBrowserAssessmentCoverage {
+  discoveredUrls: number;
+  visitedUrls: number;
+  analyzedExchanges: number;
+  discoveredForms: number;
+  discoveredApis: number;
+  websocketChannels: number;
+}
+
+export interface SecurityBrowserAssessment {
+  id: Identifier;
+  revision: number;
+  engagementId: Identifier;
+  name: string;
+  objective: string;
+  profile: SecurityBrowserAssessmentProfile;
+  sessionId: Identifier;
+  identityIds: Identifier[];
+  primaryIdentityId: Identifier;
+  targetUrls: string[];
+  scopePolicyId: Identifier;
+  scopePolicyRevision: number;
+  riskClasses: string[];
+  validationGrantId?: Identifier;
+  status: SecurityBrowserAssessmentStatus;
+  phase: "preflight" | "discovery" | "crawl" | "passive_audit" | "active_audit" | "validation" | "reporting" | "complete";
+  progress: number;
+  budget: SecurityBrowserAssessmentBudget;
+  coverage: SecurityBrowserAssessmentCoverage;
+  engines: SecurityBrowserEngineCapability[];
+  evidenceIds: Identifier[];
+  candidateIds: Identifier[];
+  activeStepId?: Identifier;
+  controlOwner: "nebula" | "operator";
+  pauseReason?: string;
+  failure?: string;
+  recoveryAction?: string;
+  startedAt?: string;
+  completedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SecurityBrowserAssessmentStep {
+  id: Identifier;
+  revision: number;
+  assessmentId: Identifier;
+  sequence: number;
+  title: string;
+  intent: string;
+  capability: string;
+  target: string;
+  status: "queued" | "running" | "waiting_operator" | "complete" | "failed" | "cancelled";
+  retryClassification: "safe_before_side_effect" | "never" | "operator_review";
+  traceIds: Identifier[];
+  evidenceIds: Identifier[];
+  error?: string;
+  recoveryAction?: string;
+}
+
+export interface SecurityBrowserScanProfile {
+  id: SecurityBrowserAssessmentProfile;
+  name: string;
+  summary: string;
+  riskClasses: string[];
+  requiredAdapters: string[];
+  defaultBudget: SecurityBrowserAssessmentBudget;
+  validationLocked: boolean;
+}
+
+export interface SecurityBrowserIssueCandidate {
+  id: Identifier;
+  revision: number;
+  assessmentId: Identifier;
+  ruleId: string;
+  checkFamily: string;
+  title: string;
+  cwe?: string;
+  targetUrl: string;
+  insertionPoint?: string;
+  severity: "info" | "low" | "medium" | "high" | "critical";
+  confidence: "tentative" | "firm" | "certain";
+  evidenceIds: Identifier[];
+  validationStatus: "unvalidated" | "queued" | "validating" | "confirmed" | "rejected" | "inconclusive";
+  validationGrantId?: Identifier;
+  promotedFindingId?: Identifier;
+}
+
+export interface SecurityBrowserValidationGrant {
+  id: Identifier;
+  revision: number;
+  assessmentId: Identifier;
+  candidateId: Identifier;
+  targetUrl: string;
+  technique: string;
+  maxRequests: number;
+  requestsUsed: number;
+  durationSeconds: number;
+  expiresAt: string;
+  status: "active" | "revoked" | "expired" | "consumed";
+}
+
+export interface SecurityBrowserAssessmentWorkspace {
+  assessments: SecurityBrowserAssessment[];
+  steps: SecurityBrowserAssessmentStep[];
+  profiles: SecurityBrowserScanProfile[];
+  engines: SecurityBrowserEngineCapability[];
+  candidates: SecurityBrowserIssueCandidate[];
+  validationGrants: SecurityBrowserValidationGrant[];
+}
+
+export interface SecurityBrowserSiteNode {
+  id: Identifier;
+  revision: number;
+  sessionId: Identifier;
+  identityId: Identifier;
+  url: string;
+  method: string;
+  kind: "page" | "api" | "form" | "resource" | "websocket";
+  discoverySource: "browser" | "proxy" | "crawl" | "repeater" | "intruder" | "har" | "automation";
+  statusCode?: number;
+  parameterNames: string[];
+  contentType?: string;
+  lastExchangeId?: Identifier;
+  evidenceIds: Identifier[];
+  firstSeenAt: string;
+  lastSeenAt: string;
+}
+
+export interface SecurityBrowserIntercept {
+  id: Identifier;
+  revision: number;
+  sessionId: Identifier;
+  tabId: Identifier;
+  transactionId: string;
+  phase: "request" | "response";
+  method: string;
+  url: string;
+  statusCode?: number;
+  headers: Array<[string, string]>;
+  editedMethod?: string;
+  editedUrl?: string;
+  editedHeaders: Array<[string, string]>;
+  state: "paused" | "forwarded" | "dropped" | "interrupted" | "expired";
+  expiresAt: string;
+  error?: string;
+}
+
+export interface SecurityBrowserCrawlJob {
+  id: Identifier;
+  revision: number;
+  sessionId: Identifier;
+  identityId: Identifier;
+  startUrl: string;
+  state: "draft" | "queued" | "running" | "paused" | "complete" | "cancelled" | "failed";
+  maxDepth: number;
+  maxRequests: number;
+  maxConcurrency: number;
+  maxDurationSeconds: number;
+  maxBodyBytes: number;
+  requestsCompleted: number;
+  nodesDiscovered: number;
+  checkpoint: number;
+  frontier: Array<[string, number]>;
+  visitedUrls: string[];
+  error?: string;
+}
+
+export interface SecurityBrowserRepeaterTab {
+  id: Identifier;
+  revision: number;
+  sessionId: Identifier;
+  identityId: Identifier;
+  name: string;
+  group: string;
+  notes: string;
+  protocol: "http" | "websocket";
+  method: string;
+  url: string;
+  headers: Array<[string, string]>;
+  bodyTemplate: string;
+  sourceExchangeId?: Identifier;
+  historyExchangeIds: Identifier[];
+  evidenceIds: Identifier[];
+  state: "draft" | "queued" | "running" | "ready" | "cancelled" | "failed";
+  requestCount: number;
+  error?: string;
+}
+
+export interface SecurityBrowserRepeaterResult {
+  id: Identifier;
+  revision: number;
+  tabId: Identifier;
+  sequence: number;
+  exchangeId?: Identifier;
+  statusCode?: number;
+  responseHeaders: Array<[string, string]>;
+  responseBytes?: number;
+  durationMs?: number;
+  responseBodyArtifactId?: Identifier;
+  error?: string;
+  createdAt: string;
+}
+
+export interface SecurityBrowserAttack {
+  id: Identifier;
+  revision: number;
+  sessionId: Identifier;
+  identityId: Identifier;
+  name: string;
+  strategy: "sniper" | "battering_ram" | "pitchfork" | "cluster_bomb";
+  method: string;
+  urlTemplate: string;
+  headersTemplate: Array<[string, string]>;
+  bodyTemplate: string;
+  positions: string[];
+  payloadSets: Array<Record<string, unknown>>;
+  transforms: string[];
+  state: "draft" | "queued" | "running" | "paused" | "complete" | "cancelled" | "failed";
+  maxRequests: number;
+  maxConcurrency: number;
+  requestsPerSecond: number;
+  requestCount: number;
+  errorCount: number;
+  error?: string;
+  payloadSource?: SecurityBrowserPayloadSource;
+}
+
+export interface SecurityBrowserPayloadSource {
+  kind: "manual" | "upload" | "assistant" | "script";
+  displayName: string;
+  sha256?: string;
+  valueCount: number;
+  promptVersion?: string;
+  model?: string;
+  providerProfileId?: Identifier;
+}
+
+export interface SecurityBrowserAttackResult {
+  id: Identifier;
+  attackId: Identifier;
+  sequence: number;
+  payloads: string[];
+  exchangeId?: Identifier;
+  statusCode?: number;
+  responseBytes?: number;
+  durationMs?: number;
+  error?: string;
+  evidenceIds: Identifier[];
+}
+
+export interface SecurityBrowserTokenAnalysis {
+  id: Identifier;
+  sessionId: Identifier;
+  name: string;
+  sampleCount: number;
+  tokenLengthMin: number;
+  tokenLengthMax: number;
+  uniqueCount: number;
+  collisionCount: number;
+  shannonBitsPerCharacter: number;
+  characterFrequencies: Record<string, number>;
+}
+
+export interface SecurityBrowserResearchWorkspace {
+  siteNodes: SecurityBrowserSiteNode[];
+  crawlJobs: SecurityBrowserCrawlJob[];
+  intercepts: SecurityBrowserIntercept[];
+  repeaterTabs: SecurityBrowserRepeaterTab[];
+  repeaterResults: SecurityBrowserRepeaterResult[];
+  attacks: SecurityBrowserAttack[];
+  attackResults: SecurityBrowserAttackResult[];
+  tokenAnalyses: SecurityBrowserTokenAnalysis[];
+}
+
+export interface ScopeImportCandidate {
+  id: Identifier;
+  targetType: "cidr" | "domain" | "url";
+  classification: "allowed" | "excluded" | "ambiguous";
+  rawValue: string;
+  normalizedValue?: string;
+  sourceLocation: string;
+  sourceExcerpt: string;
+  warnings: string[];
+}
+
+export interface ScopeImportProvenance {
+  backendKind?: "provider" | "harness";
+  providerProfileId: Identifier;
+  harnessProfileId?: Identifier;
+  model: string;
+  promptVersion: string;
+  sourceSha256: string;
+  generatedAt: string;
+  providerRequestIds: string[];
+}
+
+export interface ScopeImport {
+  id: Identifier;
+  engagementId: Identifier;
+  artifactId: Identifier;
+  filename: string;
+  sourceType: string;
+  sourceSha256: string;
+  baseScopeRevision: number;
+  status: "generating" | "ready" | "applied" | "discarded" | "failed";
+  candidates: ScopeImportCandidate[];
+  warnings: string[];
+  provenance?: ScopeImportProvenance;
+  usage: ChatUsage;
+  errorDetail?: string;
+  appliedCandidateIds: string[];
+  appliedScopePolicyId?: string;
+  appliedScopeRevision?: number;
+  revision: number;
+}
+
+export interface ScopeImportCreateRequest {
+  engagementId: Identifier;
+  backendKind?: "provider" | "harness";
+  providerId?: Identifier;
+  harnessProfileId?: Identifier;
+  model: string;
+  filename: string;
+  mediaType?: string;
+  contentBase64: string;
+  cloudConfirmed: boolean;
+}
+
+export interface ScopeImportApplyResult {
+  scope: EngagementScopePolicy;
+  scopeImport: ScopeImport;
+}
+
+export interface RunStopRequest {
+  reason?: string;
+}
+
+export type ApprovalDecision = "approve" | "reject" | "stop";
+
+export interface ApprovalSummary {
+  id: Identifier;
+  runId: Identifier;
+  engagementId: Identifier;
+  origin?: "mission" | "chat";
+  status: "pending" | "approved" | "rejected" | "expired" | "cancelled";
+  risk: "passive" | "active" | "credentialed" | "exploit" | "destructive";
+  toolName: string;
+  agentName: string;
+  target: string;
+  rationale: string;
+  expectedEffects: string;
+  arguments: Record<string, unknown>;
+  command?: string[];
+  image?: string;
+  runtimeDigest?: string;
+  credentialClass?: string;
+  expiresAt?: string;
+  createdAt: string;
+  argumentEditing?: boolean;
+}
+
+export interface ApprovalDecisionRequest {
+  decision: ApprovalDecision;
+  reason?: string;
+  editedArguments?: Record<string, unknown>;
+}
+
+export interface AssetSummary {
+  id: Identifier;
+  engagementId: Identifier;
+  displayName: string;
+  kind: "host" | "domain" | "url" | "cloud" | "repository" | "other";
+  address?: string;
+  hostname?: string;
+  criticality: "critical" | "high" | "medium" | "low" | "info";
+  exposure: "external" | "internal" | "unknown";
+  tags: string[];
+  serviceCount?: number;
+  findingCount?: number;
+  lastSeenAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AssetCreateRequest {
+  engagementId: Identifier;
+  name: string;
+  kind: AssetSummary["kind"];
+  address?: string;
+  hostname?: string;
+  criticality?: AssetSummary["criticality"];
+  exposure?: AssetSummary["exposure"];
+  tags?: string[];
+}
+
+export type FindingStatus =
+  | "candidate"
+  | "validated"
+  | "confirmed"
+  | "accepted_risk"
+  | "false_positive"
+  | "remediated"
+  | "retest_passed"
+  | "retest_failed";
+
+export interface FindingSummary {
+  id: Identifier;
+  engagementId: Identifier;
+  title: string;
+  description: string;
+  severity: "critical" | "high" | "medium" | "low" | "info";
+  severityRationale: string;
+  status: FindingStatus;
+  assetIds: string[];
+  evidenceIds: string[];
+  affectedAssetCount: number;
+  evidenceCount: number;
+  cveIds: string[];
+  cweIds: string[];
+  verifierId?: string;
+  verifiedAt?: string;
+  updatedAt: string;
+  revision: number;
+}
+
+export interface FindingCreateRequest {
+  engagementId: Identifier;
+  title: string;
+  description?: string;
+  severity: FindingSummary["severity"];
+  severityRationale?: string;
+  assetIds?: Identifier[];
+  evidenceIds?: Identifier[];
+  cveIds?: string[];
+  cweIds?: string[];
+  sourceRunId?: Identifier;
+}
+
+export interface FindingUpdateRequest {
+  title?: string;
+  description?: string;
+  severity?: FindingSummary["severity"];
+  severityRationale?: string;
+  assetIds?: Identifier[];
+  cveIds?: string[];
+  cweIds?: string[];
+  status?: FindingStatus;
+  evidenceIds?: Identifier[];
+  verifierId?: Identifier;
+  verifiedAt?: string;
+  expectedRevision: number;
+}
+
+export interface ReportSummary {
+  id: Identifier;
+  engagementId: Identifier;
+  title: string;
+  status: string;
+  executiveSummary: string;
+  findingIds: string[];
+  observationIds: string[];
+  noteTransforms: ReportNoteTransform[];
+  artifactIds: string[];
+  executiveSummaryProvenance?: AIWritingProvenance;
+  signedOffBy?: string;
+  signedOffAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
+}
+
+export interface ReportCreateRequest {
+  engagementId: Identifier;
+  title: string;
+  status?: string;
+  executiveSummary?: string;
+  findingIds?: string[];
+  observationIds?: string[];
+  noteTransforms?: ReportNoteTransform[];
+  sourceRunId?: Identifier;
+}
+
+export interface ReportUpdateRequest {
+  title?: string;
+  status?: string;
+  executiveSummary?: string;
+  findingIds?: string[];
+  observationIds?: string[];
+  noteTransforms?: ReportNoteTransform[];
+  executiveSummaryProvenance?: AIWritingProvenance | null;
+  expectedRevision: number;
+}
+
+export interface AIWritingProvenance {
+  backendKind?: "provider" | "harness";
+  providerProfileId: Identifier;
+  harnessProfileId?: Identifier;
+  model: string;
+  promptVersion: string;
+  sourceSha256: string;
+  instruction: string;
+  generatedAt: string;
+  providerRequestId?: string;
+}
+
+export interface ReportNoteTransform {
+  observationId: Identifier;
+  sourceRevision: number;
+  title: string;
+  body: string;
+  provenance: AIWritingProvenance;
+}
+
+export interface WritingTransformRequest {
+  engagementId: Identifier;
+  backendKind?: "provider" | "harness";
+  providerId?: Identifier;
+  harnessProfileId?: Identifier;
+  model: string;
+  purpose: "note" | "report_summary" | "report_section" | "code_suggestion";
+  instruction: string;
+  sourceText: string;
+  cloudConfirmed?: boolean;
+}
+
+export interface WritingTransformResponse {
+  content: string;
+  provenance: AIWritingProvenance;
+  usage: ChatUsage;
+}
+
+export interface CodeCompletionItem {
+  label: string;
+  type?: string;
+  detail?: string;
+}
+
+export interface ObservationSummary {
+  id: Identifier;
+  engagementId: Identifier;
+  observationType: string;
+  title: string;
+  body: string;
+  assetIds: Identifier[];
+  serviceIds: Identifier[];
+  evidenceIds: Identifier[];
+  source?: string;
+  confidence: number;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
+}
+
+export interface ObservationCreateRequest {
+  engagementId: Identifier;
+  observationType?: string;
+  title: string;
+  body?: string;
+  assetIds?: Identifier[];
+  serviceIds?: Identifier[];
+  evidenceIds?: Identifier[];
+  source?: string;
+  confidence?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ObservationUpdateRequest {
+  title?: string;
+  body?: string;
+  assetIds?: Identifier[];
+  serviceIds?: Identifier[];
+  evidenceIds?: Identifier[];
+  confidence?: number;
+  metadata?: Record<string, unknown>;
+  expectedRevision: number;
+}
+
+export interface ObservationReportDependency {
+  id: Identifier;
+  title: string;
+  status: "draft" | "review" | "final";
+}
+
+export interface ObservationDependencies {
+  observationId: Identifier;
+  deletable: boolean;
+  reports: ObservationReportDependency[];
+}
+
+export interface ReportRender {
+  id: Identifier;
+  engagementId: Identifier;
+  reportId: Identifier;
+  reportRevision: number;
+  inputFingerprint: string;
+  templateVersion: string;
+  rendererVersion: string;
+  status: "queued" | "rendering" | "completed" | "failed" | "interrupted";
+  warnings: string[];
+  generatedAt?: string;
+  errorDetail?: string;
+  revision: number;
+}
+
+export interface PotentialFindingDraft {
+  title: string;
+  rationale: string;
+}
+
+export interface GeneratedDraftContent {
+  title: string;
+  summary: string;
+  observations: string[];
+  potentialFindings: PotentialFindingDraft[];
+  evidenceIds: Identifier[];
+  nextStep?: {
+    title: string;
+    rationale: string;
+    command: string;
+    language: ExecutionLanguage;
+    networkTarget?: string;
+    networkPorts: number[];
+  };
+}
+
+export interface PostToolAssistantConfig {
+  suggestNextSteps: boolean;
+  takeNotes: boolean;
+  providerId?: Identifier;
+  backendKind: "provider" | "harness";
+  harnessProfileId?: Identifier;
+  model?: string;
+  cloudConfirmed: boolean;
+}
+
+export interface GeneratedDraft {
+  id: Identifier;
+  engagementId: Identifier;
+  executionId: Identifier;
+  providerProfileId: Identifier;
+  model: string;
+  promptVersion: string;
+  contextFingerprint: string;
+  status: "generating" | "ready" | "accepted" | "rejected" | "failed";
+  content?: GeneratedDraftContent;
+  observationId?: Identifier;
+  providerRequestId?: string;
+  errorDetail?: string;
+  metadata: Record<string, unknown>;
+  revision: number;
+}
+
+export interface ExecutionChatAttachment {
+  sessionId: Identifier;
+  contextFingerprint: string;
+  categories: string[];
+}
+
+export interface EvidenceSummary {
+  id: Identifier;
+  engagementId: Identifier;
+  evidenceType: string;
+  title: string;
+  description: string;
+  artifactId?: Identifier;
+  findingId?: Identifier;
+  executionId?: Identifier;
+  assetIds: Identifier[];
+  sha256?: string;
+  capturedAt: string;
+  capturedBy?: string;
+  sourceVersion?: string;
+  createdAt: string;
+  updatedAt: string;
+  metadata: {
+    filename?: string;
+    mediaType?: string;
+    size?: number;
+    source?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface EvidenceUploadRequest {
+  engagementId: Identifier;
+  filename: string;
+  title: string;
+  evidenceType: string;
+  contentBase64: string;
+  mediaType?: string;
+  description?: string;
+  source?: string;
+  findingId?: Identifier;
+  assetIds?: Identifier[];
+  capturedBy?: string;
+  sourceVersion?: string;
+  parentArtifactId?: Identifier;
+  sourceContext?: Record<string, unknown>;
+  editRecipe?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface OperatorProfile {
+  id: Identifier;
+  displayName: string;
+  email?: string;
+  role?: string;
+  active: boolean;
+  activatedAt?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
+}
+
+export interface OperatorProfileCreateRequest {
+  displayName: string;
+  email?: string;
+  role?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface OperatorProfileUpdateRequest {
+  displayName?: string;
+  email?: string;
+  role?: string;
+  metadata?: Record<string, unknown>;
+  expectedRevision?: number;
+}
+
+export interface ModelDescriptor {
+  id: string;
+  name: string;
+  description: string | null;
+  canonicalSlug: string | null;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
+  inputModalities: string[];
+  outputModalities: string[];
+  supportedParameters: string[];
+  pricing: Record<string, string>;
+  expirationDate?: string | null;
+}
+
+export interface ProviderHealth {
+  id: Identifier;
+  revision: number;
+  name: string;
+  providerType: string;
+  kind: "commercial" | "local" | "gateway";
+  local: boolean;
+  state: "healthy" | "degraded" | "offline" | "unconfigured" | "unchecked";
+  enabled: boolean;
+  endpoint?: string;
+  models: string[];
+  availableModels?: string[];
+  modelDescriptors?: ModelDescriptor[];
+  modelAllowlist: string[];
+  defaultModel?: string;
+  effectiveDefaultModel?: string;
+  credentialEnv?: string;
+  credentialRef?: string;
+  permitsSensitiveData: boolean;
+  /** Standing consent: send tool results without the per-turn prompt. */
+  autoShareToolResults: boolean;
+  retention?: string;
+  residency: string[];
+  options: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  modelCount: number;
+  latencyMs?: number;
+  privacy: "local_only" | "regional" | "cloud";
+  lastCheckedAt?: string;
+  capabilities: string[];
+  capabilityVerifications?: Record<string, ProviderCapabilityVerification>;
+  message?: string;
+}
+
+export interface ProviderCapabilityVerification {
+  model: string;
+  status: "verified" | "failed";
+  checkedAt: string;
+  contractVersion: string;
+  failureDetail?: string;
+}
+
+export interface ProviderRuntimeHealth {
+  providerId: Identifier;
+  healthy: boolean;
+  models: string[];
+  modelDescriptors?: ModelDescriptor[];
+  /** Discovered models outside the provider's model allowlist. */
+  unlistedModels: string[];
+  unlistedModelDescriptors?: ModelDescriptor[];
+  detail?: string;
+  credentialVerified?: boolean;
+  catalogSource?: string;
+  keyExpiresAt?: string;
+  keyLimitRemaining?: number;
+  providerRevision?: number;
+}
+
+/** One OpenRouter upstream provider; locations are ISO country codes, display-only. */
+export interface UpstreamProviderOption {
+  slug: string;
+  name: string;
+  headquarters?: string;
+  datacenters?: string[];
+}
+
+export interface ProviderCatalogEntry {
+  flavor: string;
+  adapter: string;
+  displayName: string;
+  local: boolean;
+  defaultBaseUrl?: string;
+  suggestedKeyEnv?: string;
+  supportTier: "native" | "standard" | "compatible" | "gateway";
+  notes?: string;
+}
+
+export interface LocalProviderDetection {
+  flavor: string;
+  displayName: string;
+  endpoint: string;
+  models: string[];
+}
+
+export interface SkillCatalogInfo {
+  projectRoot: string;
+  managedRoot: string;
+}
+
+export interface ProviderCreateRequest {
+  name: string;
+  providerType: string;
+  endpoint?: string;
+  local: boolean;
+  defaultModel?: string;
+  modelAllowlist?: string[];
+  credentialEnv?: string;
+  credentialRef?: string;
+  permitsSensitiveData?: boolean;
+  autoShareToolResults?: boolean;
+  options?: Record<string, unknown>;
+}
+
+export interface ProviderUpdateRequest {
+  name: string;
+  providerType: string;
+  endpoint?: string;
+  local: boolean;
+  defaultModel?: string;
+  modelAllowlist: string[];
+  credentialEnv?: string;
+  credentialRef?: string;
+  permitsSensitiveData: boolean;
+  autoShareToolResults: boolean;
+  retention?: string;
+  residency: string[];
+  options?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  expectedRevision: number;
+}
+
+export type ChatRole = "user" | "assistant" | "system";
+
+export interface ChatMessage {
+  id?: Identifier;
+  role: ChatRole;
+  content: string;
+  reasoning?: string;
+  contentBlocks?: ChatContentBlock[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface ChatContentBlock {
+  type: "text" | "code" | "image" | "artifact" | "citation" | "activity";
+  text?: string;
+  language?: string;
+  artifactId?: Identifier;
+  mediaType?: string;
+  alt?: string;
+  activityId?: Identifier;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PairedDevice {
+  id: Identifier;
+  name: string;
+  createdAt: string;
+  lastUsedAt: string;
+  idleExpiresAt: string;
+  absoluteExpiresAt: string;
+  current: boolean;
+  platform?: string;
+  appVersion?: string;
+  capabilities?: string[];
+  ownershipClaims?: ResourceRef[];
+  heartbeatAt?: string;
+  healthy?: boolean;
+}
+
+export interface DeviceCapabilitySnapshot {
+  platform: string;
+  appVersion: string;
+  capabilities: string[];
+  ownershipClaims: ResourceRef[];
+  heartbeatAt?: string;
+  expectedRevision?: number;
+}
+
+export type ActionIntentStatus =
+  | "queued" | "claimed" | "prepared" | "committed" | "succeeded" | "failed"
+  | "compensating" | "compensated" | "reconcile_required" | "cancelled" | "expired";
+
+export interface ActionIntent {
+  id: Identifier;
+  projectId: Identifier;
+  resources: ResourceRef[];
+  actionId: string;
+  requester: string;
+  eligibleDeviceIds: Identifier[];
+  selectedDeviceId?: Identifier;
+  idempotencyKey: string;
+  expectedRevisions: Record<string, number>;
+  logicalLeaseKey: string;
+  leaseExpiresAt?: string;
+  status: ActionIntentStatus;
+  expiresAt: string;
+  preparedAt?: string;
+  committedAt?: string;
+  receipt?: Record<string, unknown>;
+  resultRefs: ResourceRef[];
+  error?: string;
+  coreMutationCommitted: boolean;
+  revision: number;
+}
+
+export interface ChatContextAttachment {
+  sourceKind: string;
+  sourceId?: Identifier;
+  sourceLabel: string;
+  text: string;
+  sha256: string;
+  truncated: boolean;
+}
+
+export interface ChatCitation {
+  sourceId: Identifier;
+  name: string;
+  citation?: string;
+  artifactId?: Identifier;
+  chunkId: string;
+  page?: number;
+  excerpt: string;
+}
+
+export interface ChatUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface HarnessDetailedUsage extends ChatUsage {
+  cachedInputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  reasoningTokens: number;
+  costUsd: number;
+  durationMs?: number;
+  apiDurationMs?: number;
+  turnCount: number;
+  contextUsedTokens?: number;
+  contextLimitTokens?: number;
+  modelUsage: Record<string, Record<string, unknown>>;
+  rateLimit: Record<string, unknown>;
+}
+
+export type HarnessActivityItemKind =
+  | "reasoning"
+  | "plan"
+  | "command"
+  | "file_change"
+  | "tool"
+  | "web_search"
+  | "browser"
+  | "image"
+  | "skill"
+  | "subagent"
+  | "hook"
+  | "review"
+  | "compaction"
+  | "mode"
+  | "goal";
+
+export interface HarnessPlanEntry {
+  id: string;
+  title: string;
+  status: "pending" | "in_progress" | "completed" | "blocked";
+}
+
+export interface HarnessGoalSnapshot {
+  objective: string;
+  status: "pending" | "running" | "complete" | "blocked" | "failed" | "paused" | "usage_limited" | "budget_limited";
+  progress?: number;
+  currentStep?: string;
+  elapsedMs?: number;
+  tokenBudget?: number;
+  tokensUsed?: number;
+  childAgents: number;
+}
+
+export interface HarnessActivityEvent {
+  schemaVersion: "nebula.harness-activity/v1" | "nebula.harness-activity/v2";
+  id?: Identifier;
+  sequence?: number;
+  type: string;
+  vendor?: "codex_app_server" | "claude_agent_sdk" | "grok_acp";
+  harnessSessionId?: Identifier;
+  harnessTurnId?: Identifier;
+  externalSessionId?: string;
+  externalTurnId?: string;
+  itemId?: string;
+  parentItemId?: string;
+  itemKind?: HarnessActivityItemKind;
+  itemStatus?: string;
+  title?: string;
+  summary?: string;
+  serverId?: string;
+  toolName?: string;
+  stream?: string;
+  delta?: string;
+  message?: string;
+  usage?: ChatUsage;
+  detailedUsage?: HarnessDetailedUsage;
+  artifactIds: Identifier[];
+  payload: Record<string, unknown>;
+  occurredAt?: string;
+  mode?: string;
+  plan?: HarnessPlanEntry[];
+  goal?: HarnessGoalSnapshot;
+}
+
+export interface HarnessActivityEventPage {
+  events: HarnessActivityEvent[];
+  nextSequence: number;
+}
+
+export interface HarnessTurnDetail {
+  id: Identifier;
+  status:
+    | "queued"
+    | "running"
+    | "waiting_approval"
+    | "complete"
+    | "failed"
+    | "cancelled"
+    | "interrupted";
+  origin: "chat" | "mission";
+  harnessSessionId: Identifier;
+  chatSessionId?: Identifier;
+  runId?: Identifier;
+  error?: string;
+  retryOfTurnId?: Identifier;
+}
+
+export interface ChatCompletionRequest {
+  controlAssistant?: boolean;
+  backend?: "provider" | "harness";
+  providerId?: Identifier;
+  harnessProfileId?: Identifier;
+  harnessSessionId?: Identifier;
+  mcpServerIds?: Identifier[];
+  /** Omitted: every enabled SSH environment; [] limits commands to Core. */
+  sshEnvironmentIds?: Identifier[];
+  hookIds?: Identifier[];
+  engagementId?: Identifier;
+  sessionId?: Identifier;
+  goalId?: Identifier;
+  skill?: HarnessSkillInvocation;
+  model?: string;
+  messages: ChatMessage[];
+  contextAttachments?: ChatContextAttachment[];
+  maxOutputTokens?: number;
+  temperature?: number;
+  includeKnowledge?: boolean;
+  allowCloudKnowledge?: boolean;
+  toolsEnabled?: boolean;
+  maxArtifactQueries?: number | null;
+  allowCloudToolResults?: boolean;
+  harnessMode?: string;
+  harnessReasoningEffort?: string;
+  harnessServiceTier?: string;
+  harnessCyberAccessProgram?: "automatic" | "standard" | "daybreakBlue" | "daybreakRed";
+  harnessSkill?: HarnessSkillInvocation;
+  /** Provider-side reasoning level; absent leaves the model's own default. */
+  reasoningEffort?: ReasoningEffort;
+  /**
+   * Let this turn delegate work to parallel subagents: on the same model in a
+   * provider chat, on subagentProviderId/subagentModel in a harness chat.
+   */
+  allowSubagents?: boolean;
+  /** Force every new child to this level; absent lets the delegating model choose. */
+  subagentReasoningEffort?: ReasoningEffort;
+  /** Let this independent main agent discover and message opted-in project peers. */
+  allowAgentMessaging?: boolean;
+  /** Harness chats: the provider profile their subagents run on. */
+  subagentProviderId?: Identifier;
+  /** Harness chats: the configured harness their subagents run on. */
+  subagentHarnessId?: Identifier;
+  /** Harness chats: the provider model their subagents run on. */
+  subagentModel?: string;
+  /** How many subagents may run at once; absent means no limit. */
+  maxActiveSubagents?: number;
+  /**
+   * Harness chats: the Subagents choice this turn cannot use yet because its
+   * model is still being verified. Core remembers it on the conversation, so
+   * a new chat keeps the box checked.
+   */
+  pendingProviderSubagent?: PendingProviderSubagent;
+  runtimeSwitchConfirmation?: string;
+}
+
+export interface PendingProviderSubagent {
+  providerId: Identifier;
+  harnessId?: Identifier;
+  model: string;
+  /** How many subagents may run at once; absent means no limit. */
+  maxActive?: number;
+  reasoningEffort?: ReasoningEffort;
+}
+
+export interface ChatRuntimeSwitchPreflight {
+  sessionId: Identifier;
+  sessionRevision: number;
+  currentProviderId: Identifier;
+  currentModel: string;
+  targetProviderId: Identifier;
+  targetModel: string;
+  compatible: boolean;
+  requiresCompactionConfirmation: boolean;
+  confirmationToken?: string;
+  reason?: string;
+  /** Names the refusal, so a caller can act on it without reading the prose. */
+  reasonCode?: string;
+  estimatedActiveInputTokens: number;
+  targetContextWindow?: number;
+  targetInputTokens?: number;
+  targetMaxOutputTokens?: number;
+  metadataRevision?: string;
+}
+
+/** Reasoning levels Nebula can ask a provider for, lowest spend first past none. */
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export const REASONING_EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+
+export interface ChatGoal {
+  id: Identifier;
+  engagementId: Identifier;
+  sessionId: Identifier;
+  objective: string;
+  completionCriteria: string[];
+  plan: string[];
+  currentStep: number;
+  status: "draft" | "running" | "paused" | "blocked" | "completed" | "cancelled";
+  tokenBudget?: number;
+  timeBudgetSeconds?: number;
+  stepBudget?: number;
+  childBudget?: number;
+  /** Active seconds Core has banked. A running goal is still accruing more. */
+  elapsedSeconds: number;
+  /** When the current active stretch began, while the goal is running. */
+  activeSince?: string;
+  childrenStarted: number;
+  usage: ChatUsage;
+  linkedTurnIds: Identifier[];
+  blockedReason?: string;
+  completionSummary?: string;
+  completionEvidence: Array<Record<string, unknown>>;
+  skillSnapshots: Array<HarnessSkillSummary & { sha256: string }>;
+  parentGoalId?: Identifier;
+  childSessionIds?: Identifier[];
+  revision: number;
+}
+
+export interface ChatCompletionResponse {
+  turnId?: Identifier;
+  sessionId?: Identifier;
+  backend?: "provider" | "harness";
+  providerId?: Identifier;
+  harnessProfileId?: Identifier;
+  harnessSessionId?: Identifier;
+  harnessTurnId?: Identifier;
+  model: string;
+  message: ChatMessage;
+  usage: ChatUsage;
+  contextUsage?: ChatUsage;
+  /** How long the turn took, and how much of that waited on an approval. */
+  elapsedMs?: number;
+  approvalWaitMs?: number;
+  finishReason?: string;
+  providerRequestId?: string;
+  citations: ChatCitation[];
+  toolSuggestions?: ToolSuggestionSummary;
+  /** UTF-16 boundary between saved routing prose and the final answer. */
+  progressPrefixUtf16Length?: number;
+}
+
+export interface ContextSourceReference {
+  sourceKind: string;
+  sourceId: Identifier;
+  sequence?: number;
+}
+
+export interface ContextMemoryItem {
+  text: string;
+  sources: ContextSourceReference[];
+}
+
+export interface ContextMemory {
+  objective?: string;
+  summary: string;
+  /** Operator requests, in order and close to verbatim. Empty from older Cores. */
+  userRequests: ContextMemoryItem[];
+  /** Where the work stands and the next step. Empty from older Cores. */
+  currentState: ContextMemoryItem[];
+  confirmedFacts: ContextMemoryItem[];
+  decisions: ContextMemoryItem[];
+  constraints: ContextMemoryItem[];
+  /** Approaches tried and their outcomes. Empty from older Cores. */
+  attempts: ContextMemoryItem[];
+  corrections: ContextMemoryItem[];
+  /** Exact paths, URLs, hosts, commands and IDs. Empty from older Cores. */
+  references: ContextMemoryItem[];
+  openQuestions: ContextMemoryItem[];
+  evidenceIds: Identifier[];
+  artifactIds: Identifier[];
+}
+
+/**
+ * How much of a ready snapshot the compactor model produced: every item
+ * (`complete`), the model's memory minus items that failed validation
+ * (`salvaged`), or a deterministic extract of requests and identifiers
+ * because the model's summary could not be used (`degraded`).
+ */
+export type ContextSnapshotQuality = "complete" | "salvaged" | "degraded";
+
+export type ContextWindowLimit = "model" | "configured" | "route" | "fallback";
+/** What sizes the working context: the window's own limit, or the working ceiling. */
+export type ContextBindingLimit = ContextWindowLimit | "ceiling";
+
+/** The notes the assistant keeps for a conversation with its notes tool. */
+export interface ContextWorkingNotes {
+  content: string;
+  revision: number;
+  updatedAt: string;
+  turnId?: Identifier;
+}
+
+export interface ContextSnapshot {
+  id: Identifier;
+  ownerType: "chat_session" | "agent_run";
+  ownerId: Identifier;
+  version: number;
+  status: "ready" | "failed";
+  compactedThrough: number;
+  memory?: ContextMemory;
+  sourceReferences: ContextSourceReference[];
+  providerId: Identifier;
+  model: string;
+  promptVersion: string;
+  usage: ChatUsage;
+  costUsd: number;
+  error?: string;
+  /** `complete` when an older Core does not report it. */
+  quality: ContextSnapshotQuality;
+  /** Memory items removed because they failed validation. */
+  droppedItems: number;
+  createdAt: string;
+}
+
+export interface ContextStatus {
+  ownerType: "chat_session" | "agent_run";
+  ownerId: Identifier;
+  status: "not_needed" | "ready" | "stale" | "failed" | "runtime_managed";
+  contextWindow: number;
+  maxOutputTokens: number;
+  targetInputTokens: number;
+  compactedInputTarget?: number;
+  capacitySource?: "model_catalog" | "known_model" | "configured" | "fallback" | "runtime";
+  capacityEstimated?: boolean;
+  metadataRevision?: string;
+  routeLimitsRequired: boolean;
+  routeLimitsVerified: boolean;
+  eligibleRouteCount?: number;
+  routeContextWindow?: number;
+  routeInputLimit?: number;
+  /**
+   * Which limit sizes the working context: the one that set `contextWindow`
+   * (the model's own window, the profile's configured window, the smallest
+   * usable provider route, or the safe floor), or `ceiling` when the working
+   * ceiling holds the target below the share of a larger window. Absent for a
+   * runtime-managed context or from an older Core.
+   */
+  bindingLimit?: ContextBindingLimit;
+  /** Which limit set `contextWindow`, including when the working ceiling binds. */
+  windowLimit?: ContextWindowLimit;
+  /** Input the request may use before Core's target fraction applies. */
+  inputCapacity?: number;
+  /** True when a published input limit, not window less reply, set `inputCapacity`. */
+  inputLimitBinds: boolean;
+  estimatedInputTokens: number;
+  /** Factor learned from provider-reported usage and applied to the estimate. */
+  estimateCalibration?: number;
+  lastProviderRequest?: ProviderRequestInput;
+  compactedThrough: number;
+  sourceReferences: ContextSourceReference[];
+  compactionUsage: ChatUsage;
+  compactionCostUsd: number;
+  snapshot?: ContextSnapshot;
+  /** Quality of the served snapshot; absent without one or from an older Core. */
+  quality?: ContextSnapshotQuality;
+  /** Absent until the assistant first writes notes, or from an older Core. */
+  workingNotes?: ContextWorkingNotes;
+}
+
+export interface ProviderRequestInput {
+  instructions: number;
+  conversation: number;
+  toolSchemas: number;
+  toolResults: number;
+  other: number;
+  estimatedTotal: number;
+  reportedInputTokens?: number;
+  /** The part of `reportedInputTokens` the provider served from its prompt cache. */
+  reportedCachedInputTokens?: number;
+  attempt: number;
+}
+
+export type ChatStreamEvent =
+  | { type: "connection"; state: "connected" | "reconnecting" }
+  | {
+      type: "queued";
+      turnId: Identifier;
+      queuedAt: string;
+      queuePosition?: number;
+      capacityLane: "direct" | "background";
+      detail: string;
+    }
+  | {
+      type: "admitted";
+      turnId: Identifier;
+      admittedAt: string;
+      capacityLane: "direct" | "background";
+    }
+  | {
+      type: "started";
+      providerId?: Identifier;
+      harnessProfileId?: Identifier;
+      harnessSessionId?: Identifier;
+      harnessTurnId?: Identifier;
+      model: string;
+      sessionId?: Identifier;
+      turnId?: Identifier;
+    }
+  | {
+      type: "delta" | "message_delta";
+      providerId?: Identifier;
+      harnessSessionId?: Identifier;
+      model: string;
+      delta: string;
+      turnId?: Identifier;
+    }
+  | {
+      type: "reasoning_delta";
+      providerId?: Identifier;
+      model: string;
+      delta: string;
+      turnId?: Identifier;
+    }
+  | {
+      type: "tool_started";
+      turnId: Identifier;
+      toolCallId: Identifier;
+      capability: string;
+      displayName?: string;
+      arguments: Record<string, unknown>;
+      step: number;
+    }
+  | {
+      type: "tool_completed";
+      turnId: Identifier;
+      toolCallId: Identifier;
+      capability: string;
+      displayName?: string;
+      status: string;
+      summary: string;
+      evidenceIds: Identifier[];
+      resultArtifactId?: Identifier;
+      artifacts: ToolArtifactReference[];
+      receipt?: Record<string, unknown>;
+      step: number;
+    }
+  | {
+      type: "approval_required";
+      turnId: Identifier;
+      toolCallId: Identifier;
+      approval: Record<string, unknown>;
+    }
+  | {
+      type: "callback_required";
+      turnId: Identifier;
+      toolCallId: Identifier;
+      processId?: Identifier;
+      resultsUrl?: string;
+      /** What the turn waits for, when Core said: a command's results or subagent reports. */
+      waitKind?: ChatWaitKind;
+      subagentIds?: Identifier[];
+      summary: string;
+    }
+  /** Core resumed this turn in a new runtime that replays it from its first frame. */
+  | { type: "restarted"; turnId?: Identifier }
+  | {
+      type: "status";
+      phase: string;
+      detail: string;
+      harnessSessionId?: Identifier;
+      harnessTurnId?: Identifier;
+      previousSessionId?: Identifier;
+    }
+  | ({
+      type:
+        | "turn_status"
+        | "item_upsert"
+        | "output_delta"
+        | "approval"
+        | "interaction"
+        | "checkpoint"
+        | "notice";
+    } & HarnessActivityEvent)
+  | {
+      type:
+        | "item_started"
+        | "item_completed"
+        | "usage"
+        | "interrupted"
+        | "completed";
+      harnessSessionId?: Identifier;
+      harnessTurnId?: Identifier;
+      payload?: Record<string, unknown>;
+    }
+  | ({ type: "done" } & ChatCompletionResponse)
+  /** Core stopped the turn (from this or another viewer); the stream ended cleanly. */
+  | { type: "cancelled"; turnId?: Identifier; detail: string }
+  | { type: "error"; detail: string };
+
+/** The turn that blocks a conversation, as a waiting poll reads it. */
+export interface PendingChatTurnStatus {
+  id: Identifier;
+  status: ChatTurn["status"];
+  revision: number;
+}
+
+export interface ChatTurn {
+  id: Identifier;
+  sessionId: Identifier;
+  /** When Core accepted the turn; the transcript counts up from here. */
+  startedAt?: string;
+  revision: number;
+  status:
+    | "queued"
+    | "routing"
+    | "waiting_approval"
+    | "waiting_callback"
+    | "finalizing"
+    | "complete"
+    | "failed"
+    | "cancelled"
+    | "interrupted";
+  queuedAt?: string;
+  admittedAt?: string;
+  queuePosition?: number;
+  capacityLane?: "direct" | "background";
+  /** Saved partial output while a provider turn is paused. */
+  content: string;
+  reasoning: string;
+  approvalId?: Identifier;
+  harnessTurnId?: Identifier;
+  toolCallIds: Identifier[];
+  toolCalls?: ChatTurnToolCall[];
+  error?: string;
+  recoveryBlocked: boolean;
+  unresolvedToolCallIds: Identifier[];
+  unresolvedHookExecutionIds: Identifier[];
+  resultsUrl?: string;
+  processId?: Identifier;
+  /** What a waiting_callback turn waits for, and the wait's own status line. */
+  waitKind?: ChatWaitKind;
+  waitSummary?: string;
+  subagentIds: Identifier[];
+  /** Whether Core resumes this interrupted turn by itself; otherwise the operator stops it. */
+  recoverable: boolean;
+}
+
+export interface ChatTurnToolCall {
+  toolCallId: Identifier;
+  capability: string;
+  displayName?: string;
+  status: string;
+  arguments: Record<string, unknown>;
+  summary?: string;
+}
+
+/** A paused turn waits for a background command, its subagents, or (as a subagent) its supervisor's reply. */
+export type ChatWaitKind = "process" | "subagents" | "reply";
+
+export interface NativeHookDescriptor {
+  id: Identifier;
+  source: "project";
+  path: string;
+  manifest: {
+    version: 1;
+    name: string;
+    description: string;
+    events: string[];
+    timeoutSeconds: number;
+    sideEffects: "none" | "workspace" | "external";
+    failurePolicy: "continue" | "block";
+  };
+}
+
+export interface NativeHookExecution {
+  id: Identifier;
+  hookId: Identifier;
+  eventName: string;
+  status: "running" | "complete" | "failed" | "timed_out" | "interrupted" | "reconciled";
+  sideEffects: "none" | "workspace" | "external";
+  startedAt: string;
+  completedAt?: string;
+  error?: string;
+  lateOutcomeStatus?: "complete" | "failed" | "timed_out";
+  lateOutcomeExitCode?: number;
+  reconciliation?: Record<string, unknown>;
+}
+
+export interface ChatSessionSummary {
+  id: Identifier;
+  engagementId: Identifier;
+  title: string;
+  initialTitleState?: "pending" | "generated" | "failed" | "operator";
+  messageCount?: number;
+  backend: "provider" | "harness";
+  providerId?: Identifier;
+  harnessProfileId?: Identifier;
+  harnessSessionId?: Identifier;
+  parentSessionId?: Identifier;
+  /** Core marks delegated subagent sessions separately from ordinary branches. */
+  isSubagent?: boolean;
+  /** Core marks side chats separately from ordinary transcript branches. */
+  isSideChat?: boolean;
+  isControlAssistant?: boolean;
+  inheritedMessageCount?: number;
+  forkedFromMessageId?: Identifier;
+  model?: string;
+  toolsEnabled: boolean;
+  mcpServerIds: Identifier[];
+  hookIds: Identifier[];
+  /** The reasoning level this conversation was last sent with, if any. */
+  reasoningEffort?: ReasoningEffort;
+  /** Whether this conversation last ran with delegation available. */
+  allowSubagents?: boolean;
+  /** Whether this main conversation can discover and message project peers. */
+  allowAgentMessaging?: boolean;
+  /** Harness chats: the provider model their subagents last ran on. */
+  subagentProviderId?: Identifier;
+  subagentHarnessId?: Identifier;
+  subagentModel?: string;
+  subagentReasoningEffort?: ReasoningEffort;
+  /** The operator's running-at-once subagent limit; absent means no limit. */
+  subagentLimit?: number;
+  archivedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
+}
+
+export interface ChatSessionActivity {
+  sessionId: Identifier;
+  state: "working" | "waiting" | "idle";
+  turnId?: Identifier;
+}
+
+export interface HarnessProfile {
+  id: Identifier;
+  name: string;
+  // Claude remains a wire-compatible legacy value but is not a provided harness.
+  kind: "codex_app_server" | "claude_agent_sdk" | "grok_acp";
+  connectionMode: "spawn" | "endpoint";
+  transport: "stdio" | "unix" | "websocket";
+  executable?: string;
+  homeDirectory?: string;
+  endpoint?: string;
+  authMode: "existing_session" | "secret_ref" | "endpoint_bearer";
+  secretRef?: string;
+  defaultModel?: string;
+  permissionMode: "managed" | "unrestricted";
+  models: string[];
+  modelOptions?: HarnessModelOptions[];
+  enabled: boolean;
+  localOnly: boolean;
+  permitsSensitiveData: boolean;
+  /** Standing consent: send tool results without the per-turn prompt. */
+  autoShareToolResults: boolean;
+  nativeCapabilities: HarnessNativeCapabilities;
+  healthy?: boolean;
+  authenticationState?: "verified" | "failed" | "unverified";
+  sessionState?: "verified" | "failed" | "unverified";
+  turnState?: "verified" | "failed" | "unverified";
+  lastSuccessfulTurnAt?: string;
+  lastTurnFailureReason?: string;
+  exercisedCapabilities?: string[];
+  version?: string;
+  detail?: string;
+  capabilities?: HarnessCapabilities;
+  revision: number;
+}
+
+export interface HarnessRuntimeOption {
+  id: string;
+  label: string;
+  description: string;
+}
+
+export interface HarnessModelOptions {
+  model: string;
+  imageInput?: boolean;
+  reasoningEfforts: HarnessRuntimeOption[];
+  defaultReasoningEffort?: string;
+  serviceTiers: HarnessRuntimeOption[];
+  defaultServiceTier?: string;
+  cyberAccessPrograms?: Array<"standard" | "daybreakBlue" | "daybreakRed">;
+}
+
+export interface HarnessCapabilities {
+  activityReplay: boolean;
+  reasoningSummaries: boolean;
+  plans: boolean;
+  planningMode: boolean;
+  goalMonitoring: boolean;
+  skillInvocation: boolean;
+  modes: string[];
+  liveCommandOutput: boolean;
+  fileDiffs: boolean;
+  detailedUsage: boolean;
+  interactions: boolean;
+  hooks: boolean;
+  subagentActivity: boolean;
+  subagentControl: boolean;
+  checkpointRewind: boolean;
+  steering: boolean;
+  interruption: boolean;
+}
+
+export interface HarnessSkillInvocation {
+  name: string;
+  path: string;
+}
+
+export interface HarnessSkillSummary extends HarnessSkillInvocation {
+  source: "project" | "installed";
+  root?: string;
+}
+
+export interface HarnessInteraction {
+  id: Identifier;
+  harnessTurnId: Identifier;
+  status: "pending" | "answered" | "declined" | "cancelled" | "expired";
+  kind: "user_input" | "mcp_elicitation";
+  prompt: string;
+  questions: Record<string, unknown>[];
+  responseSchema: Record<string, unknown>;
+  containsSecret: boolean;
+  createdAt: string;
+}
+
+export interface HarnessNativeCapabilities {
+  workspaceAccess: "none" | "read" | "write";
+  shell: boolean;
+  webSearch: boolean;
+  webFetch: boolean;
+  browser: boolean;
+  computerUse: boolean;
+  imageGeneration: boolean;
+  skills: boolean;
+  subagents: boolean;
+}
+
+export interface McpToolProfile {
+  name: string;
+  description: string;
+  readOnly: boolean;
+  destructive: boolean;
+  openWorld: boolean;
+  credentialed?: boolean;
+  approval: "risk_based" | "allow" | "ask" | "deny";
+}
+
+export type SshEnvironmentApproval = "ask" | "allow";
+export type SshProbeStatus = "reachable" | "unreachable" | "auth_failed" | "host_key_untrusted" | "error";
+
+export interface SshEnvironmentProbe {
+  status: SshProbeStatus;
+  latencyMs?: number;
+  system: string;
+  osVersion: string;
+  arch: string;
+  model: string;
+  tools: string[];
+  passwordlessSudo?: boolean;
+  detail: string;
+  checkedAt: string;
+}
+
+/** Nebula's saved settings for one Host alias in the Core's ~/.ssh/config. */
+export interface SshEnvironment {
+  id: string;
+  revision: number;
+  alias: string;
+  displayName: string;
+  label: string;
+  enabled: boolean;
+  notes: string;
+  workingDirectory?: string;
+  commandApproval: SshEnvironmentApproval;
+  lastProbe?: SshEnvironmentProbe;
+}
+
+export interface SshEnvironmentHost {
+  alias: string;
+  aliases: string[];
+  comment: string;
+  source?: string;
+  line?: number;
+  inConfig: boolean;
+  resolved?: { hostname: string; user: string; port: number; identityFiles: string[]; options: Record<string, string> };
+  resolveError?: string;
+  environment?: SshEnvironment;
+}
+
+export interface SshEnvironmentDiscovery {
+  configPath: string;
+  configExists: boolean;
+  sshAvailable: boolean;
+  filesRead: string[];
+  skippedPatterns: string[];
+  skippedMatchBlocks: number;
+  errors: string[];
+  hosts: SshEnvironmentHost[];
+  readAt: string;
+}
+
+export interface SshEnvironmentSettingsChange {
+  displayName?: string;
+  enabled?: boolean;
+  notes?: string;
+  workingDirectory?: string;
+  commandApproval?: SshEnvironmentApproval;
+}
+
+export interface McpServerProfile {
+  id: Identifier;
+  name: string;
+  /** What the server is for, in the operator's words. */
+  description?: string;
+  transport: "stdio" | "streamable_http";
+  command?: string;
+  arguments: string[];
+  url?: string;
+  authMode: "none" | "bearer" | "headers";
+  enabled: boolean;
+  required: boolean;
+  trustedStdio: boolean;
+  defaultApproval: "risk_based" | "allow" | "ask" | "deny";
+  toolOverrides: Record<string, "risk_based" | "allow" | "ask" | "deny">;
+  tools: McpToolProfile[];
+  checkedAt?: string;
+  detail?: string;
+  revision: number;
+}
+
+export interface McpImportSecret {
+  target: string;
+  source: "environment" | "vault" | "session";
+  reference?: string;
+}
+
+export interface McpImportChange {
+  field: string;
+  before?: string;
+  after?: string;
+}
+
+export interface McpImportEntry {
+  sourceName: string;
+  name?: string;
+  action: "create" | "update" | "unchanged" | "replace" | "skip" | "invalid";
+  transport?: McpServerProfile["transport"];
+  command?: string;
+  arguments: string[];
+  url?: string;
+  profileId?: string;
+  secrets: McpImportSecret[];
+  /** Settings that differ from the saved server, for an update. */
+  changes: McpImportChange[];
+  /** Whether the server is enabled once saved. */
+  enabled: boolean;
+  defaultApproval?: McpServerProfile["defaultApproval"];
+  /** A local program saved disabled until it is trusted. */
+  needsTrust: boolean;
+  /** Enabled once saved but not probed yet. */
+  needsProbe: boolean;
+  warnings: string[];
+  error?: string;
+}
+
+export interface McpImportReport {
+  dryRun: boolean;
+  entries: McpImportEntry[];
+  created: number;
+  updated: number;
+  unchanged: number;
+  replaced: number;
+  skipped: number;
+  invalid: number;
+}
+
+export interface HarnessSessionSummary {
+  id: Identifier;
+  engagementId: Identifier;
+  harnessProfileId: Identifier;
+  displayName: string;
+  model: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
+  cyberAccessProgram?: "standard" | "daybreakBlue" | "daybreakRed";
+  status:
+    | "starting"
+    | "idle"
+    | "running"
+    | "waiting_approval"
+    | "closed"
+    | "failed"
+    | "interrupted";
+  mcpServerIds: Identifier[];
+  lastActivityAt: string;
+}
+
+export interface ExternalHarnessSessionSummary {
+  externalSessionId: string;
+  displayName: string;
+  model?: string;
+  updatedAt?: string;
+  internalSessionId?: string;
+}
+
+export interface HarnessCommand {
+  name: string;
+  description: string;
+  hint: string;
+  source: "native" | "nebula";
+}
+
+export interface HarnessSessionActivity {
+  commands?: HarnessCommand[];
+  commandsDiscovered?: boolean;
+  sessionId: Identifier;
+  sessionStatus: HarnessSessionSummary["status"];
+  busy: boolean;
+  live: boolean;
+  turnId?: Identifier;
+  turnStatus?:
+    | "queued"
+    | "running"
+    | "waiting_approval"
+    | "complete"
+    | "failed"
+    | "cancelled"
+    | "interrupted";
+  turnOrigin?: "chat" | "mission";
+  lastTurnId?: Identifier;
+  lastTurnStatus?: HarnessSessionActivity["turnStatus"];
+  lastTurnOrigin?: "chat" | "mission";
+  startedAt?: string;
+  lastActivityAt: string;
+  detail: string;
+  mode?: string;
+  plan?: HarnessPlanEntry[];
+  goal?: HarnessGoalSnapshot;
+}
+
+export interface ChatSessionRenameRequest {
+  title: string;
+  expectedRevision?: number;
+}
+
+export interface ChatSessionAssistantSettingsRequest {
+  // Omitted selections are left as they are; the effort alone can change
+  // while a response runs.
+  mcpServerIds?: Identifier[];
+  hookIds?: Identifier[];
+  reasoningEffort?: ReasoningEffort;
+  useModelReasoningDefault?: boolean;
+  allowSubagents?: boolean;
+  allowAgentMessaging?: boolean;
+  maxActiveSubagents?: number | null;
+  subagentProviderId?: Identifier;
+  subagentHarnessId?: Identifier;
+  subagentModel?: string;
+  subagentReasoningEffort?: ReasoningEffort | null;
+  expectedRevision?: number;
+}
+
+export interface PersistedChatMessage extends ChatMessage {
+  id: Identifier;
+  engagementId: Identifier;
+  sessionId: Identifier;
+  sequence: number;
+  sourceMessageId?: Identifier;
+  providerId?: Identifier;
+  model?: string;
+  usage?: ChatUsage;
+  /** How long the turn took, and how much of that waited on an approval. */
+  elapsedMs?: number;
+  approvalWaitMs?: number;
+  finishReason?: string;
+  providerRequestId?: string;
+  citations: ChatCitation[];
+  contextAttachments: ChatContextAttachment[];
+  harnessTurnId?: Identifier;
+  /** Set on the note Core saves for a provider turn that failed or stopped without an answer. */
+  outcomeTurnId?: Identifier;
+  toolResults?: ChatToolResult[];
+  toolSuggestions?: ToolSuggestionSummary;
+  /** Set when an in-place edit replaced this turn; it stays readable but leaves the conversation. */
+  replacedAt?: string;
+  /** Groups every message replaced by the same edit. */
+  replacedGroupId?: Identifier;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatSessionRewind {
+  session: ChatSessionSummary;
+  messages: PersistedChatMessage[];
+  replaced: PersistedChatMessage[];
+}
+
+export interface ChatToolResult {
+  toolCallId: Identifier;
+  capability: string;
+  /** Readable identity Core records for a brokered MCP call. */
+  displayName?: string;
+  status: string;
+  summary?: string;
+  evidenceIds: Identifier[];
+  resultArtifactId?: Identifier;
+  receipt: Record<string, unknown>;
+}
+
+export interface KnowledgeSource {
+  id: Identifier;
+  engagementId: Identifier;
+  name: string;
+  sourceType: string;
+  artifactId?: Identifier;
+  status: string;
+  citation?: string;
+  documentCount: number;
+  createdAt: string;
+  updatedAt: string;
+  metadata: {
+    filename?: string;
+    mediaType?: string;
+    size?: number;
+    sha256?: string;
+    chunkCount?: number;
+    indexedAt?: string;
+    origin?: string;
+    sourceUrl?: string;
+    fetchedAt?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface LibraryItem {
+  id: Identifier;
+  name: string;
+  sourceType: string;
+  artifactId?: Identifier;
+  status: string;
+  citation?: string;
+  documentCount: number;
+  createdAt: string;
+  updatedAt: string;
+  metadata: {
+    filename?: string;
+    mediaType?: string;
+    size?: number;
+    sha256?: string;
+    chunkCount?: number;
+    indexedAt?: string;
+    scope?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface LibraryIngestRequest {
+  filename: string;
+  mediaType?: string;
+  contentBase64: string;
+}
+
+export interface KnowledgeIngestRequest {
+  engagementId: Identifier;
+  filename: string;
+  mediaType?: string;
+  contentBase64: string;
+}
+
+export interface KnowledgeUrlIngestRequest {
+  engagementId: Identifier;
+  url: string;
+}
+
+export type KnowledgeModelState = "disabled" | "required" | "downloading" | "preparing" | "ready" | "error";
+
+export interface KnowledgeRerankerStatus {
+  state: KnowledgeModelState;
+  model: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  detail?: string;
+}
+
+export interface KnowledgeIndexStatus {
+  backend: string;
+  state: KnowledgeModelState;
+  model: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  detail?: string;
+  /** The local relevance model that filters retrieved knowledge, when Core runs one. */
+  reranker?: KnowledgeRerankerStatus;
+}
+
+export interface HealthResponse {
+  status: "ok" | "degraded";
+  version: string;
+  commit?: string;
+  mode: "local" | "team";
+  runner: "ready" | "unavailable" | "degraded";
+  containerTerminal: "configured" | "unavailable";
+  diagnosticsDegraded?: boolean;
+  browserDiagnosticIngress: "enabled" | "disabled";
+}
+
+export interface RunnerCandidate {
+  candidateId?: Identifier;
+  runnerProfileId?: Identifier;
+  source: "configured" | "detected";
+  name: string;
+  runtime: "podman" | "docker";
+  executable: string;
+  context?: string;
+  platform: "linux/amd64" | "linux/arm64";
+  isolation: "rootless" | "podman_machine" | "docker_desktop_vm";
+  healthy: boolean;
+  detail?: string;
+}
+
+export interface SetupImagePreparation {
+  phase:
+    | "not_started"
+    | "queued"
+    | "resolving_runtime"
+    | "preparing_image"
+    | "ready"
+    | "cancelling"
+    | "cancelled"
+    | "error";
+  operationId?: Identifier;
+  projectId?: Identifier;
+  progressPercent?: number;
+  progressIndeterminate: boolean;
+  canCancel: boolean;
+  canRetry: boolean;
+  imageDigest?: string;
+  startedAt?: string;
+  completedAt?: string;
+  detail?: string;
+}
+
+export interface SetupStatus {
+  applicationStage:
+    | "starting_core"
+    | "migrating"
+    | "loading_project"
+    | "detecting_runner"
+    | "preparing_image"
+    | "loading_workspace"
+    | "ready"
+    | "degraded"
+    | "failed";
+  stageDetail: string;
+  stageStartedAt?: string;
+  retryable: boolean;
+  recoveryActions: Array<{ id: string; label: string; destination?: string }>;
+  core: {
+    status: "ready" | "degraded" | "error";
+    detail?: string;
+  };
+  scratchProjectId?: Identifier;
+  terminal: {
+    status:
+      | "detecting_runner"
+      | "needs_runner"
+      | "preparing_image"
+      | "ready"
+      | "disabled"
+      | "error";
+    runnerProfileId?: Identifier;
+    candidates: RunnerCandidate[];
+    imagePreparation: SetupImagePreparation;
+    detail?: string;
+  };
+  assistant: {
+    status: "needs_model" | "configured" | "error";
+    providerProfileId?: Identifier;
+    detail?: string;
+  };
+}
+
+export interface SetupControlResponse {
+  operation:
+    | "runner_selection"
+    | "image_preparation"
+    | "image_preparation_retry"
+    | "image_preparation_cancellation";
+  accepted: boolean;
+  idempotent: boolean;
+  operationId?: Identifier;
+  setup: SetupStatus;
+}
+
+export interface CredentialStatus {
+  reference: string;
+  persistence: "environment" | "systemd" | "vault" | "session";
+  available: boolean;
+  state:
+    | "available"
+    | "locked"
+    | "missing"
+    | "backend_unavailable"
+    | "session_expired"
+    | "environment_missing"
+    | "service_credential_missing";
+}
+
+export type ExecutionLanguage = "bash" | "sh" | "python";
+export type ExecutionStatus =
+  | "queued"
+  | "running"
+  | "cancelling"
+  | "completed"
+  | "denied"
+  | "timed_out"
+  | "cancelled"
+  | "failed"
+  | "interrupted";
+
+export interface ExecutionOrigin {
+  kind: "assistant_message" | "rerun" | "selection";
+  messageId?: Identifier;
+  blockOrdinal?: number;
+  blockSha256?: string;
+  selectionStartByte?: number;
+  selectionEndByte?: number;
+  executionId?: Identifier;
+  sourceKind?: string;
+  sourceId?: Identifier;
+  sourceLabel?: string;
+  sourceSha256?: string;
+}
+
+export interface ExecutionNetworkRequest {
+  mode: "none" | "scoped" | "unrestricted";
+  target?: string;
+  ports: number[];
+}
+
+export interface ExecutionRequest {
+  engagementId: Identifier;
+  language: string;
+  source: string;
+  origin: ExecutionOrigin;
+  network: ExecutionNetworkRequest;
+}
+
+export interface ExecutionRuntimeSnapshot {
+  language: ExecutionLanguage;
+  interpreter: string;
+  arguments: string[];
+  runtimeDigest: string;
+  image: string;
+  runnerProfileId: Identifier;
+  runnerProfileRevision: number;
+  runnerRuntime: "docker" | "podman";
+  runnerIsolation: string;
+  runnerExecutable: string;
+  runnerPlatform: string;
+  runnerContext?: string;
+  runnerSocket?: string;
+}
+
+export interface ExecutionNetworkSnapshot {
+  mode: "none" | "scoped" | "unrestricted";
+  target?: string;
+  ports: number[];
+  resolvedAddresses: string[];
+  scopePolicyId?: Identifier;
+  scopePolicyRevision?: number;
+}
+
+export interface ExecutionLimits {
+  cpuCount: number;
+  memoryMb: number;
+  pids: number;
+  timeoutSeconds: number;
+  outputBytesPerStream: number;
+}
+
+export interface ExecutionPreflight {
+  allowed: boolean;
+  errorCode?: string;
+  detail: string;
+  canonicalLanguage?: ExecutionLanguage;
+  sourceSha256?: string;
+  runtime?: ExecutionRuntimeSnapshot;
+  network?: ExecutionNetworkSnapshot;
+  limits: ExecutionLimits;
+  workspace: "/workspace";
+  policyRule?: string;
+  previewFingerprint?: string;
+  previewToken?: string;
+  expiresAt?: string;
+}
+
+export interface ExecutionCapability {
+  language: ExecutionLanguage;
+  aliases: string[];
+  offline: boolean;
+  scopedNetwork: boolean;
+  unrestrictedNetwork: boolean;
+  detail?: string;
+}
+
+export interface ExecutionCapabilities {
+  engagementId: Identifier;
+  ready: boolean;
+  runtimes: ExecutionCapability[];
+  limits: ExecutionLimits;
+  workspace: "/workspace";
+}
+
+export interface ContainerTerminalRequest {
+  engagementId: Identifier;
+  columns: number;
+  rows: number;
+  publishedPorts?: ContainerTerminalPublishedPort[];
+}
+
+export interface ContainerTerminalPublishedPort {
+  port: number;
+  protocol: "tcp" | "udp";
+}
+
+export interface ContainerTerminalRuntimeSnapshot {
+  sourceImage: string;
+  baseImage: string;
+  baseImageDigest: string;
+  image: string;
+  imageDigest: string;
+  installedPackages: string[];
+  interpreter: string;
+  arguments: string[];
+  runnerProfileId: Identifier;
+  runnerProfileRevision: number;
+  runnerRuntime: "docker" | "podman";
+  runnerIsolation: string;
+  runnerExecutable: string;
+  runnerPlatform: string;
+  runnerContext?: string;
+}
+
+export interface ContainerTerminalNetworkSnapshot {
+  mode: "unrestricted" | "vpn";
+  runtimeNetwork: "bridge" | "private_namespace";
+  vpnProfileId?: Identifier;
+  vpnProfileRevision?: number;
+  vpnProfileName?: string;
+  publishedPorts: ContainerTerminalPublishedPort[];
+}
+
+export interface ContainerTerminalSecuritySnapshot {
+  containerUser: "root";
+  rootFilesystem: "writable";
+  linuxCapabilities: string[];
+  noNewPrivileges: boolean;
+  hostNetwork: boolean;
+  runtimeSocket: boolean;
+  hostShell: boolean;
+}
+
+export interface ContainerTerminalCapabilities {
+  engagementId: Identifier;
+  ready: boolean;
+  detail?: string;
+  errorCode?: string;
+  workspaceEntries?: number;
+  workspaceMaxEntries?: number;
+  sourceImage: string;
+  installedPackages: string[];
+  network: ContainerTerminalNetworkSnapshot;
+  security: ContainerTerminalSecuritySnapshot;
+  workspace: "/workspace";
+  limits: ExecutionLimits;
+  idleTimeoutSeconds: number;
+  freshContainer: true;
+}
+
+export interface ContainerTerminalPreflight {
+  allowed: boolean;
+  errorCode?: string;
+  detail: string;
+  runtime?: ContainerTerminalRuntimeSnapshot;
+  network: ContainerTerminalNetworkSnapshot;
+  security: ContainerTerminalSecuritySnapshot;
+  limits: ExecutionLimits;
+  workspace: "/workspace";
+  policyRule?: string;
+  previewFingerprint?: string;
+  previewToken?: string;
+  expiresAt?: string;
+  idleTimeoutSeconds: number;
+  freshContainer: true;
+}
+
+export interface ContainerTerminalSession {
+  sessionId: Identifier;
+  createdAt: string;
+  websocketTicket: string;
+  ticketExpiresAt: string;
+  websocketPath: string;
+  reconnectGraceSeconds: number;
+  replayMaxBytes: number;
+  lastSequence: number;
+}
+
+export interface ContainerTerminalRecovery {
+  active: boolean;
+  session?: ContainerTerminalSession;
+  runtime?: ContainerTerminalRuntimeSnapshot;
+  network?: ContainerTerminalNetworkSnapshot;
+}
+
+export interface ContainerTerminalRecoveredSession {
+  session: ContainerTerminalSession;
+  runtime: ContainerTerminalRuntimeSnapshot;
+  network: ContainerTerminalNetworkSnapshot;
+}
+
+export interface ContainerTerminalRecoveryList {
+  sessions: ContainerTerminalRecoveredSession[];
+}
+
+export interface ContainerTerminalCapacity {
+  activeSessions: number;
+  availableSessions: number;
+  maxActiveSessions: number;
+}
+
+export interface ContainerTerminalPublicIpStatus {
+  address: string;
+  observedAt: string;
+  stale: boolean;
+}
+
+export interface TerminalCommandRecord {
+  id: Identifier;
+  engagementId: Identifier;
+  sessionId: Identifier;
+  operatorId?: Identifier;
+  shellSequence?: string;
+  command: string;
+  commandSha256?: string;
+  cwd: string;
+  status:
+    | "completed"
+    | "interrupted"
+    | "framing_lost"
+    | "capture_failed"
+    | "legacy_metadata_only";
+  exitCode?: number;
+  startedAt?: string;
+  completedAt?: string;
+  occurredAt: string;
+  rawOutputAvailable: boolean;
+  redactedOutputAvailable: boolean;
+  observedOutputBytes: number;
+  capturedOutputBytes: number;
+  outputSha256?: string;
+  outputTruncated: boolean;
+  outputPreview: string;
+  captureError?: string;
+  captureDecision:
+    | "selected_tool"
+    | "not_selected"
+    | "classification_failed"
+    | "capture_failed"
+    | "legacy_all_commands"
+    | "legacy_metadata_only";
+  matchedTools: string[];
+  recordingPolicyRevision?: number;
+  runtimeImageDigest?: string;
+}
+
+export interface TerminalCommandPage {
+  records: TerminalCommandRecord[];
+  total: number;
+  offset: number;
+  limit: number;
+  nextOffset?: number;
+}
+
+export interface TerminalCommandHistoryStatus {
+  engagementId: Identifier;
+  enabled: boolean;
+  captureMode: "selected_tools";
+  recordCount: number;
+  recordedOutputCount: number;
+  metadataOnlyCount: number;
+  classificationFailureCount: number;
+  degradedCount: number;
+  truncatedCount: number;
+  auditGapCount: number;
+  capturedOutputBytes: number;
+  retentionDays?: number;
+  maxRecords?: number;
+  oldestRecordedAt?: string;
+  newestRecordedAt?: string;
+}
+
+export interface TerminalRecordingTools {
+  engagementId: Identifier;
+  inventoryStatus: "verified" | "unavailable";
+  runtimeImageDigest?: string;
+  manifestSha256?: string;
+  defaultTools: string[];
+  customTools: string[];
+  disabledTools: string[];
+  effectiveTools: string[];
+  revision: number;
+  updatedAt?: string;
+}
+
+export interface WorkspaceChange {
+  path: string;
+  change: "added" | "modified" | "deleted";
+  size?: number;
+}
+
+export interface OperatorExecution {
+  id: Identifier;
+  engagementId: Identifier;
+  operatorId: Identifier;
+  origin: ExecutionOrigin;
+  language: ExecutionLanguage;
+  sourceSha256: string;
+  sourceArtifactId: Identifier;
+  sourcePreview: string;
+  runtime: ExecutionRuntimeSnapshot;
+  network: ExecutionNetworkSnapshot;
+  limits: ExecutionLimits;
+  workspace: "/workspace";
+  policyDecision: string;
+  status: ExecutionStatus;
+  errorCode?: string;
+  errorDetail?: string;
+  queuedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  exitCode?: number;
+  outputTruncated: boolean;
+  evidenceId?: Identifier;
+  workspaceChanges: WorkspaceChange[];
+}
+
+export interface ExecutionOutputPage {
+  text: string;
+  totalBytes: number;
+  nextOffset: number;
+}
+
+export interface WorkspaceEntry {
+  path: string;
+  name: string;
+  kind: "file" | "directory" | "symlink" | "other";
+  size: number;
+  modifiedAt: string;
+}
+
+export interface WorkspaceListing {
+  engagementId: Identifier;
+  path: string;
+  entries: WorkspaceEntry[];
+  offset: number;
+  nextOffset?: number;
+  total: number;
+}
+
+export interface WorkspaceSearchMatch {
+  path: string;
+  kind: "path" | "directory" | "content";
+  line?: number;
+  column?: number;
+  preview: string;
+}
+
+export interface WorkspaceSearchResult {
+  engagementId: Identifier;
+  query: string;
+  mode: "files" | "text";
+  matches: WorkspaceSearchMatch[];
+  scannedFiles: number;
+  truncated: boolean;
+}
+
+export interface WorkspaceTask {
+  id: string;
+  label: string;
+  command: string;
+  kind: "test" | "build" | "run" | "lint" | "custom";
+  source: "package.json" | "Makefile" | "pytest" | "go.mod" | "Cargo.toml" | ".vscode/tasks.json";
+  detail: string;
+  path?: string;
+  supported: boolean;
+  unsupportedReason?: string;
+}
+
+export interface WorkspaceTaskList {
+  engagementId: Identifier;
+  tasks: WorkspaceTask[];
+  scannedEntries: number;
+  truncated: boolean;
+}
+
+export interface WorkspaceDebugConfiguration {
+  id: string;
+  name: string;
+  path?: string;
+  arguments: string[];
+  source: ".vscode/launch.json";
+  detail: string;
+  supported: boolean;
+  unsupportedReason?: string;
+}
+
+export interface WorkspaceDebugConfigurationList {
+  engagementId: Identifier;
+  activePath: string;
+  configurations: WorkspaceDebugConfiguration[];
+  truncated: boolean;
+}
+
+export interface DebugSessionStart {
+  sessionId: string;
+  websocketPath: string;
+  websocketTicket: string;
+  protocol: "nebula.debug.v1";
+  path: string;
+  sourceSha256: string;
+  imageDigest: string;
+  workspaceAccess: "read-only";
+  network: "none";
+  expiresAt: string;
+}
+
+export type SourceControlFileStatus =
+  | "unmodified"
+  | "modified"
+  | "added"
+  | "deleted"
+  | "renamed"
+  | "copied"
+  | "unmerged"
+  | "untracked"
+  | "ignored"
+  | "unknown";
+
+export interface SourceControlFile {
+  path: string;
+  indexStatus: SourceControlFileStatus;
+  worktreeStatus: SourceControlFileStatus;
+  originalPath?: string;
+}
+
+export interface SourceControlStatus {
+  engagementId: Identifier;
+  state: "ready" | "not_repository" | "unavailable";
+  branch?: string;
+  head?: string;
+  files: SourceControlFile[];
+  truncated: boolean;
+  detail: string;
+}
+
+export interface SourceControlDiff {
+  engagementId: Identifier;
+  path: string;
+  staged: boolean;
+  text: string;
+  truncated: boolean;
+  head?: string;
+}
+
+export interface WorkspacePreview {
+  engagementId: Identifier;
+  path: string;
+  text: string;
+  bytesReturned: number;
+  truncated: boolean;
+  previewSha256: string;
+}
+
+export interface WorkspaceResetResult {
+  engagementId: Identifier;
+  removedEntries: number;
+}
+
+export interface WorkspaceResetStatus {
+  engagementId: Identifier;
+  canReset: boolean;
+  activeTerminalCount: number;
+  activeExecutionCount: number;
+  reasonCode?: "workspace_busy" | "linked_workspace";
+  detail: string;
+}
+
+export interface WorkspaceUploadResult {
+  engagementId: Identifier;
+  path: string;
+  size: number;
+  sha256: string;
+  overwritten: boolean;
+}
+
+export type RunEventKind =
+  | "run.created"
+  | "run.queued"
+  | "run.started"
+  | "run.planned"
+  | "run.progress"
+  | "run.waiting_approval"
+  | "run.stop_requested"
+  | "run.completed"
+  | "run.failed"
+  | "run.cancelled"
+  | "run.status_changed"
+  | "stage.completed"
+  | "task.created"
+  | "task.started"
+  | "task.turn_completed"
+  | "task.continuing"
+  | "task.completed"
+  | "task.verified"
+  | "task.verification_failed"
+  | "task.blocked"
+  | "task.retry_scheduled"
+  | "task.failed"
+  | "task.cancelled"
+  | "task.status_changed"
+  | "agent.message"
+  | "tool.requested"
+  | "tool.started"
+  | "tool.completed"
+  | "tool.failed"
+  | "approval.requested"
+  | "approval.resolved"
+  | "finding.created"
+  | "finding.updated"
+  | "evidence.created"
+  | "system.notice"
+  | `harness.${string}`;
+
+export interface RunEvent<T = Record<string, unknown>> {
+  sequence: number;
+  id: Identifier;
+  kind: RunEventKind;
+  engagementId?: Identifier;
+  runId?: Identifier;
+  actor?: string;
+  occurredAt: string;
+  summary: string;
+  payload: T;
+}
+
+export interface EventCursor {
+  after: number;
+  engagementId?: Identifier;
+  runId?: Identifier;
+}
+
+export type GuideProgressStatus = "in_progress" | "completed" | "dismissed";
+
+/** One operator's progress through an in-app guide, owned by Core. */
+export interface GuideProgress {
+  guideId: string;
+  status: GuideProgressStatus;
+  stepIndex: number;
+  revision: number;
+  completedAt?: string;
+  updatedAt: string;
+}
+
+export interface ProjectInstructionsStatus {
+  filename: string;
+  present: boolean;
+  sizeBytes: number;
+  truncated: boolean;
+  limitBytes: number;
+  error?: string;
+}
+
+export type GuideStarterKind = "hook" | "skill" | "agents_md";
+
+export interface GuideStarterFiles {
+  kind: GuideStarterKind;
+  paths: string[];
+}
+
+/** Shape facts Core reports about a published result, before it is opened. */
+export interface StructuredResultStats {
+  byteSize: number;
+  nodeCount: number;
+  maxDepth: number;
+  rootType: "object" | "array" | "string" | "number" | "boolean" | "null";
+  topLevelCount: number;
+}
+
+/** A list row: enough to recognise a result without carrying its payload. */
+export interface StructuredResultSummary {
+  id: string;
+  projectId: string;
+  title: string;
+  summary: string;
+  producer: string;
+  origin: "agent" | "tool" | "operator" | "api";
+  labels: string[];
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
+  stats: StructuredResultStats;
+  hasHints: boolean;
+  preview: { key: string; value: unknown; truncated: boolean }[];
+  /** Stable key for a series of snapshots; a goal's identity when in goal mode. */
+  stream?: string;
+  /** What an operator reads for that series, e.g. the goal's objective. */
+  streamLabel?: string;
+  sequence: number;
+  chatSessionId?: string;
+  toolCallId?: string;
+}
+
+/** One published result, with the authoritative value and optional hints. */
+export interface StructuredResultRecord extends StructuredResultSummary {
+  /** Exactly what the producer published. */
+  result: unknown;
+  /** Optional presentation advice, kept separate from the result. */
+  hints?: unknown;
+}
+
+/** How Core reports one delegated child conversation. */
+export type ChatSubagentStatus =
+  | "running"
+  | "waiting_approval"
+  | "recovering"
+  | "completed"
+  | "failed"
+  | "stopped"
+  | "interrupted";
+
+export interface ChatSubagentStep {
+  tool: string;
+  detail: string;
+  status: string;
+}
+
+export interface ChatSubagentApproval {
+  id: Identifier;
+  status: string;
+  tool: string;
+  detail: string;
+  riskClass?: string;
+  rationale?: string;
+}
+
+export interface ChatSubagentView {
+  id: Identifier;
+  name: string;
+  task: string;
+  status: ChatSubagentStatus;
+  parentSessionId: Identifier;
+  parentTurnId: Identifier;
+  /** The runtime of the conversation that delegated this child. */
+  parentBackend: "provider" | "harness";
+  childSessionId: Identifier;
+  childTurnId?: Identifier;
+  /** The provider model the child runs on. */
+  providerProfileId?: Identifier;
+  harnessProfileId?: Identifier;
+  model?: string;
+  /** Choices the supervising agent made for this child. Missing means inherited defaults. */
+  capabilities?: {
+    toolNames?: string[];
+    mcpServerIds?: string[];
+    hookIds?: string[];
+    includeKnowledge?: boolean;
+    commandRuntime?: boolean;
+    allowSubagents?: boolean;
+    maxActiveSubagents?: number | null;
+    skills?: { name: string; path: string }[];
+  };
+  stepCount: number;
+  /** The last few tool steps Core kept for the operator, newest last. */
+  recentSteps: ChatSubagentStep[];
+  approval?: ChatSubagentApproval;
+  usage: ChatUsage;
+  startedAt: string;
+  finishedAt?: string;
+  elapsedSeconds: number;
+  result: string;
+  error?: string;
+  resultMessageId?: Identifier;
+}

@@ -1,0 +1,486 @@
+import { IconAction } from "./IconAction";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, MessageSquareQuote, NotebookPen, Plus, RefreshCw, Save, Sparkles, Trash2 } from "lucide-react";
+import type { ApiClient } from "../api/client";
+import type {
+  ObservationCreateRequest,
+  ObservationSummary,
+  ObservationUpdateRequest,
+  HarnessProfile,
+  ProviderHealth,
+  ObservationDependencies,
+} from "../api/types";
+import { useConfirmation } from "./DialogSystem";
+import { AIWritingDialog } from "./AIWritingDialog";
+import type { SelectionActionDraft } from "./selection";
+import { DiagnosticErrorNotice, logCaughtDiagnostic } from "../diagnostics";
+import { aiRuntimeOptions } from "./aiRuntimes";
+import { LoadingSurface, StandardEmptyState } from "./SurfacePrimitives";
+
+interface LinkOption {
+  id: string;
+  label: string;
+}
+
+interface NotesPanelProps {
+  api: ApiClient;
+  engagementId: string;
+  initialNotes?: ObservationSummary[];
+  initialNotesReady?: boolean;
+  panelSessionKey?: string;
+
+  evidenceOptions?: LinkOption[];
+  assetOptions?: LinkOption[];
+  providers?: ProviderHealth[];
+  harnesses?: HarnessProfile[];
+  initialDraft?: SelectionActionDraft;
+  onInitialDraftConsumed?: () => void;
+  createObservation?: (request: ObservationCreateRequest) => Promise<ObservationSummary>;
+  updateObservation?: (id: string, request: ObservationUpdateRequest) => Promise<ObservationSummary>;
+  deleteObservation?: (id: string, expectedRevision: number) => Promise<void>;
+  onAskNebula?: (context: {
+    text: string;
+    sourceKind: "note";
+    sourceId?: string;
+    sourceLabel: string;
+  }) => void;
+}
+
+const blank = {
+  title: "",
+  body: "",
+  evidenceIds: [] as string[],
+  assetIds: [] as string[],
+  metadata: {} as Record<string, unknown>,
+};
+
+const NoteBodyEditor = memo(function NoteBodyEditor({ body, onChange }: { body: string; onChange: (body: string) => void }) {
+  const [value, setValue] = useState(body);
+  useEffect(() => setValue(body), [body]);
+  return <label>Markdown<textarea aria-label="Note body" rows={18} value={value} placeholder="Capture observations, test ideas, or conclusions…" onChange={(event) => {
+    setValue(event.target.value);
+    onChange(event.target.value);
+  }} /></label>;
+});
+interface NotePanelState {
+  selectedId?: string;
+  creating: boolean;
+  draft: typeof blank;
+  syncedNoteKey?: string;
+}
+
+// Saved notes live in Core for the project. Draft and selection stay with a chat.
+const notePanelStates = new Map<string, NotePanelState>();
+
+export function adoptNotePanelState(from: string, to: string) {
+  if (from === to || !notePanelStates.has(from) || notePanelStates.has(to)) return;
+  notePanelStates.set(to, notePanelStates.get(from)!);
+  notePanelStates.delete(from);
+}
+
+
+export function NotesPanel({
+  api,
+  engagementId,
+  initialNotes = [],
+  initialNotesReady = false,
+  panelSessionKey,
+
+  evidenceOptions = [],
+  assetOptions = [],
+  providers = [],
+  harnesses = [],
+  initialDraft,
+  onInitialDraftConsumed,
+  createObservation,
+  updateObservation,
+  deleteObservation,
+  onAskNebula,
+}: NotesPanelProps) {
+  const confirm = useConfirmation();
+  const cachedNotesReady = initialNotesReady;
+  const [notes, setNotes] = useState<ObservationSummary[]>(() => cachedNotesReady
+    ? initialNotes.filter((note) => note.engagementId === engagementId && (note.observationType === "note" || note.observationType === "ai_tool_note"))
+    : []);
+  const restoredPanel = panelSessionKey ? notePanelStates.get(panelSessionKey) : undefined;
+  const [selectedId, setSelectedId] = useState<string | undefined>(restoredPanel?.selectedId ?? notes[0]?.id);
+  const [creating, setCreating] = useState(restoredPanel?.creating ?? false);
+  const [draft, setDraft] = useState(restoredPanel?.draft ?? (notes[0] ? {
+    title: notes[0].title, body: notes[0].body, evidenceIds: notes[0].evidenceIds,
+    assetIds: notes[0].assetIds, metadata: notes[0].metadata,
+  } : blank));
+  const draftBodyRef = useRef(draft.body);
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const savedSnapshotRef = useRef(JSON.stringify(draft));
+  const autosaveTimerRef = useRef<number | undefined>(undefined);
+  const saveRef = useRef<() => Promise<boolean>>(async () => false);
+  const [saveStatus, setSaveStatus] = useState<"saved" | "unsaved" | "saving" | "failed">("saved");
+  const queueAutosave = useCallback(() => {
+    window.clearTimeout(autosaveTimerRef.current);
+    setSaveStatus("unsaved");
+    autosaveTimerRef.current = window.setTimeout(() => void saveRef.current(), 700);
+  }, []);
+  const [hasBody, setHasBody] = useState(Boolean(draft.body.trim()));
+  const onBodyChange = useCallback((body: string) => {
+    draftBodyRef.current = body;
+    if (panelSessionKey) {
+      const panel = notePanelStates.get(panelSessionKey);
+      if (panel) notePanelStates.set(panelSessionKey, { ...panel, draft: { ...panel.draft, body } });
+    }
+    setHasBody((current) => current === Boolean(body.trim()) ? current : Boolean(body.trim()));
+    queueAutosave();
+  }, [panelSessionKey, queueAutosave]);
+  const [loading, setLoading] = useState(!cachedNotesReady);
+
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [error, setError] = useState<string>();
+  const [writingOpen, setWritingOpen] = useState(false);
+  const [deleteBlocker, setDeleteBlocker] = useState<ObservationDependencies>();
+  const consumedInitialDraftRef = useRef<SelectionActionDraft | undefined>(undefined);
+  const capturedNoteRef = useRef<ObservationSummary | undefined>(undefined);
+  const creatingRef = useRef(false);
+  creatingRef.current = creating;
+  const syncedNoteRef = useRef<string | undefined>(restoredPanel?.syncedNoteKey);
+  useEffect(() => () => {
+    if (autosaveTimerRef.current !== undefined) {
+      window.clearTimeout(autosaveTimerRef.current);
+      void saveRef.current();
+    }
+  }, []);
+  useEffect(() => {
+    if (!panelSessionKey) return;
+    if (!notePanelStates.has(panelSessionKey) && notePanelStates.size >= 64) notePanelStates.delete(notePanelStates.keys().next().value!);
+    notePanelStates.set(panelSessionKey, { selectedId, creating, draft: { ...draft, body: draftBodyRef.current }, syncedNoteKey: syncedNoteRef.current });
+  }, [panelSessionKey, selectedId, creating, draft]);
+  const createNote = useCallback(
+    (request: ObservationCreateRequest) => createObservation ? createObservation(request) : api.createObservation(request),
+    [api, createObservation],
+  );
+  const updateNote = useCallback(
+    (id: string, request: ObservationUpdateRequest) => updateObservation ? updateObservation(id, request) : api.updateObservation(id, request),
+    [api, updateObservation],
+  );
+  const deleteNote = useCallback(
+    (id: string, expectedRevision: number) => deleteObservation ? deleteObservation(id, expectedRevision) : api.deleteObservation(id, expectedRevision),
+    [api, deleteObservation],
+  );
+
+  const selected = useMemo(
+    () => notes.find((note) => note.id === selectedId),
+    [notes, selectedId],
+  );
+  const writingRuntimes = useMemo(
+    () => aiRuntimeOptions(providers, harnesses),
+    [harnesses, providers],
+  );
+
+  useEffect(() => setDeleteBlocker(undefined), [selectedId]);
+
+  const load = useCallback(async (signal?: AbortSignal) => {
+    setLoading(true);
+    setError(undefined);
+    try {
+      const response = await api.listObservations(engagementId, signal);
+      const next = response.items.filter((item) => item.observationType === "note" || item.observationType === "ai_tool_note");
+      const captured = capturedNoteRef.current;
+      const merged = captured && !next.some((item) => item.id === captured.id) ? [captured, ...next] : next;
+      setNotes(merged);
+      // A reload must not steal the selection from a note that is being created.
+      setSelectedId((current) => creatingRef.current || (current && merged.some((item) => item.id === current))
+        ? current
+        : merged[0]?.id);
+    } catch (loadError) {
+      void logCaughtDiagnostic("interface.notes_panel.caught_failure_01", "A handled interface operation failed.", loadError, "notes_panel");
+      if (!signal?.aborted) {
+        setError(loadError instanceof Error ? loadError.message : "Could not load notes.");
+      }
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  }, [api, engagementId]);
+
+  useEffect(() => {
+    if (initialNotesReady) return;
+    const controller = new AbortController();
+    void load(controller.signal);
+    return () => controller.abort();
+  }, [initialNotesReady, load]);
+
+  useEffect(() => {
+    if (!cachedNotesReady) return;
+    const next = initialNotes.filter((note) => note.engagementId === engagementId && (note.observationType === "note" || note.observationType === "ai_tool_note"));
+    setNotes(next);
+    setSelectedId((current) => creatingRef.current || (current && next.some((note) => note.id === current)) ? current : next[0]?.id);
+    setLoading(false);
+  }, [cachedNotesReady, initialNotes, engagementId]);
+
+  useEffect(() => {
+    if (creating || initialDraft) {
+      syncedNoteRef.current = undefined;
+      return;
+    }
+    if (!selected) {
+      syncedNoteRef.current = undefined;
+      draftBodyRef.current = "";
+      setHasBody(false);
+      setDraft(blank);
+      return;
+    }
+    // A reload returns a new object for the same saved note; only a different
+    // note or a new revision may replace the operator's unsaved edits.
+    const key = `${selected.id}:${selected.revision}`;
+    if (syncedNoteRef.current === key) return;
+    syncedNoteRef.current = key;
+    draftBodyRef.current = selected.body;
+    savedSnapshotRef.current = JSON.stringify({ title: selected.title, body: selected.body, evidenceIds: selected.evidenceIds, assetIds: selected.assetIds, metadata: selected.metadata });
+    setSaveStatus("saved");
+    setHasBody(Boolean(selected.body.trim()));
+    setDraft({
+      title: selected.title,
+      body: selected.body,
+      evidenceIds: selected.evidenceIds,
+      assetIds: selected.assetIds,
+      metadata: selected.metadata,
+    });
+  }, [creating, initialDraft, selected]);
+
+  useEffect(() => {
+    if (!initialDraft || consumedInitialDraftRef.current === initialDraft) return;
+    consumedInitialDraftRef.current = initialDraft;
+    const label = initialDraft.source.label.trim() || "selected text";
+    setCreating(true);
+    setSelectedId(undefined);
+    const nextDraft = {
+      title: `Note from ${label}`.slice(0, 500),
+      body: initialDraft.text,
+      evidenceIds: [],
+      assetIds: [],
+      metadata: {
+        selection_source: {
+          kind: initialDraft.source.kind,
+          id: initialDraft.source.id,
+          label: initialDraft.source.label,
+          truncated: initialDraft.truncated,
+          original_length: initialDraft.originalLength,
+        },
+      },
+    };
+    setDraft(nextDraft);
+    draftBodyRef.current = nextDraft.body;
+    setHasBody(Boolean(nextDraft.body.trim()));
+    setError(undefined);
+    onInitialDraftConsumed?.();
+    setSaving(true);
+    void createNote({
+      engagementId,
+      observationType: "note",
+      title: nextDraft.title,
+      body: nextDraft.body,
+      source: "selection-note",
+      metadata: nextDraft.metadata,
+    }).then((created) => {
+      capturedNoteRef.current = created;
+      setNotes((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+      setSelectedId(created.id);
+      setCreating(false);
+    }).catch((saveError: unknown) => {
+      void logCaughtDiagnostic("interface.notes_panel.selection_capture_failed", "A selected-text note could not be saved.", saveError, "notes_panel");
+      setError(saveError instanceof Error ? saveError.message : "Could not save the selected text as a note.");
+    }).finally(() => setSaving(false));
+  }, [createNote, engagementId, initialDraft, onInitialDraftConsumed]);
+
+  const startNote = async () => {
+    if (savingRef.current || ((saveStatus === "unsaved" || saveStatus === "failed") && !(await saveRef.current()))) return;
+    if (JSON.stringify({ ...draftRef.current, body: draftBodyRef.current }) !== savedSnapshotRef.current) return;
+    window.clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = undefined;
+    creatingRef.current = true;
+    setCreating(true);
+    setSelectedId(undefined);
+    setDraft(blank);
+    draftBodyRef.current = "";
+    savedSnapshotRef.current = JSON.stringify(blank);
+    setSaveStatus("saved");
+    setHasBody(false);
+    setError(undefined);
+  };
+
+  const save = async (): Promise<boolean> => {
+    window.clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = undefined;
+    const current = draftRef.current;
+    if (!current.title.trim() || savingRef.current) return false;
+    const bodyAtSave = draftBodyRef.current;
+    const snapshot = JSON.stringify({ ...current, body: bodyAtSave });
+    if (snapshot === savedSnapshotRef.current && saveStatus !== "failed") return true;
+    savingRef.current = true;
+    setSaving(true);
+    setSaveStatus("saving");
+    setError(undefined);
+    try {
+      if (creating || !selected) {
+        const created = await createNote({
+          engagementId,
+          observationType: "note",
+          title: current.title,
+          body: bodyAtSave,
+          evidenceIds: current.evidenceIds,
+          assetIds: current.assetIds,
+          source: "operator-note",
+          metadata: current.metadata,
+        });
+        syncedNoteRef.current = `${created.id}:${created.revision}`;
+        setDraft((latest) => ({ ...latest, body: draftBodyRef.current }));
+        setNotes((current) => [created, ...current]);
+        setSelectedId(created.id);
+        setCreating(false);
+      } else {
+        const updated = await updateNote(selected.id, {
+          title: current.title,
+          body: bodyAtSave,
+          evidenceIds: current.evidenceIds,
+          assetIds: current.assetIds,
+          metadata: current.metadata,
+          expectedRevision: selected.revision,
+        });
+        syncedNoteRef.current = `${updated.id}:${updated.revision}`;
+        setNotes((current) => current.map((item) => item.id === updated.id ? updated : item));
+      }
+      savedSnapshotRef.current = snapshot;
+      if (JSON.stringify({ ...draftRef.current, body: draftBodyRef.current }) === snapshot) setSaveStatus("saved");
+      else queueAutosave();
+      return true;
+    } catch (saveError) {
+      void logCaughtDiagnostic("interface.notes_panel.caught_failure_02", "A handled interface operation failed.", saveError, "notes_panel");
+      setError(saveError instanceof Error ? saveError.message : "Could not save the note.");
+      setSaveStatus("failed");
+      return false;
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  };
+  saveRef.current = save;
+
+  const selectNote = async (id: string) => {
+    if (savingRef.current) return;
+    if ((saveStatus === "unsaved" || saveStatus === "failed") && !(await save())) return;
+    if (JSON.stringify({ ...draftRef.current, body: draftBodyRef.current }) !== savedSnapshotRef.current) return;
+    creatingRef.current = false;
+    setCreating(false);
+    setSelectedId(id);
+  };
+
+  const remove = async () => {
+    if (!selected) return;
+    setError(undefined);
+    setDeleteBlocker(undefined);
+    try {
+      const dependencies = await api.observationDependencies(selected.id);
+      if (!dependencies.deletable) {
+        setDeleteBlocker(dependencies);
+        return;
+      }
+    } catch (dependencyError) {
+      void logCaughtDiagnostic("interface.notes_panel.dependencies_failed", "Note dependencies could not be checked.", dependencyError, "notes_panel");
+      setError(dependencyError instanceof Error ? dependencyError.message : "Could not check whether this note is used by a report.");
+      return;
+    }
+    const approved = await confirm({
+      title: "Delete this note?",
+      message: "This removes the mutable note. Linked immutable evidence is retained.",
+      confirmLabel: "Delete note",
+      tone: "danger",
+    });
+    if (!approved) return;
+    try {
+      await deleteNote(selected.id, selected.revision);
+      if (capturedNoteRef.current?.id === selected.id) capturedNoteRef.current = undefined;
+      const next = notes.filter((item) => item.id !== selected.id);
+      setNotes(next);
+      setSelectedId(next[0]?.id);
+    } catch (deleteError) {
+      void logCaughtDiagnostic("interface.notes_panel.caught_failure_03", "A handled interface operation failed.", deleteError, "notes_panel");
+      setError(deleteError instanceof Error ? deleteError.message : "Could not delete the note.");
+    }
+  };
+
+  const toggleLink = (field: "evidenceIds" | "assetIds", id: string) => {
+    setDraft((current) => ({
+      ...current,
+      [field]: current[field].includes(id)
+        ? current[field].filter((value) => value !== id)
+        : [...current[field], id],
+    }));
+    queueAutosave();
+  };
+
+  return (
+    <div className="notes-panel">
+      <aside className="notes-list" aria-label="Project notes">
+        <header>
+          <strong>Notes</strong>
+          <div>
+            <button className="button quiet square" type="button" aria-label="Refresh notes" disabled={loading} onClick={() => void load()}><RefreshCw className={loading ? "spin" : undefined} size={14} /></button>
+            <button className="button quiet square" type="button" aria-label="Create note" disabled={saving} onClick={() => void startNote()}><Plus size={15} /></button>
+          </div>
+        </header>
+        {notes.map((note) => <button type="button" className={note.id === selectedId ? "active" : undefined} key={note.id} disabled={saving} onClick={() => void selectNote(note.id)}><strong>{note.title}</strong><small>{note.observationType === "ai_tool_note" ? "AI-generated · " : ""}{new Date(note.updatedAt).toLocaleString()}</small></button>)}
+        {loading && notes.length > 0 && <p className="notes-load-status" role="status">Refreshing notes…</p>}
+        {!notes.length && !loading && <p>No notes yet.</p>}
+      </aside>
+      <section className={`note-editor${creating || selected ? "" : " is-empty"}`} aria-label={creating ? "New note" : selected ? `Edit ${selected.title}` : "Note editor"}>
+        {error && <DiagnosticErrorNotice error={error} fallback="The operation could not be completed." compact />}
+        {deleteBlocker && <div className="callout note-dependency-blocker" role="alert"><AlertTriangle size={18} /><div><strong>This note is retained by {deleteBlocker.reports.length === 1 ? "a report" : "reports"}</strong><p>{deleteBlocker.reports.some((report) => report.status === "final") ? `Final report ${deleteBlocker.reports.filter((report) => report.status === "final").map((report) => `“${report.title}”`).join(", ")} is immutable, so Nebula retains this source note to protect its lineage.` : `Remove this note from ${deleteBlocker.reports.map((report) => `“${report.title}”`).join(", ")} before deleting it.`}</p></div><a className="button secondary" href="/reports">Open Reports</a></div>}
+        {(creating || selected) ? <>
+          <header>
+            <input aria-label="Note title" value={draft.title} placeholder="Note title" maxLength={500} onChange={(event) => { setDraft((current) => ({ ...current, title: event.target.value })); queueAutosave(); }} />
+            <div>
+              {selected && <IconAction icon={Trash2} label="Delete" title="Delete note" onClick={() => void remove()} />}
+              <button className="button quiet" type="button" disabled={!hasBody || !writingRuntimes.length} onClick={() => setWritingOpen(true)}><Sparkles size={14} /> Transform with AI</button>
+              <button className="button quiet" type="button" disabled={!hasBody || !onAskNebula} onClick={() => onAskNebula?.({ text: draftBodyRef.current, sourceKind: "note", sourceId: selected?.id, sourceLabel: draft.title || "Untitled note" })}><MessageSquareQuote size={14} /> Ask Nebula</button>
+              <span className="note-save-status" role="status" aria-live="polite">{saving ? "Saving…" : saveStatus === "failed" ? "Save failed" : saveStatus === "unsaved" ? "Unsaved changes" : "Saved"}</span>
+              <button className="button primary" type="button" disabled={saving || !draft.title.trim() || saveStatus === "saved"} onClick={() => void save()}><Save size={14} /> {saveStatus === "failed" ? "Retry save" : "Save"}</button>
+            </div>
+          </header>
+          <div className="note-editor-body">
+            <NoteBodyEditor key={creating ? "new" : selected?.id} body={draft.body} onChange={onBodyChange} />
+          </div>
+          {(evidenceOptions.length > 0 || assetOptions.length > 0) && <details><summary>Links · {draft.evidenceIds.length} evidence · {draft.assetIds.length} assets</summary>
+            {evidenceOptions.map((option) => <label key={option.id}><input type="checkbox" checked={draft.evidenceIds.includes(option.id)} onChange={() => toggleLink("evidenceIds", option.id)} /> {option.label}</label>)}
+            {assetOptions.map((option) => <label key={option.id}><input type="checkbox" checked={draft.assetIds.includes(option.id)} onChange={() => toggleLink("assetIds", option.id)} /> {option.label}</label>)}
+          </details>}
+        </> : <div className="note-initial-state">
+          {loading ? <LoadingSurface label="Loading saved notes" /> : <StandardEmptyState className="note-empty-state" icon={<NotebookPen size={24} aria-hidden="true" />} title="Start a project note" explanation="Capture working thoughts in Markdown. Preserve exact files and screenshots as Evidence." />}
+          <button className="button primary" type="button" onClick={() => void startNote()}><Plus size={14} /> New note</button>
+        </div>}
+      </section>
+      {writingOpen && <AIWritingDialog
+        api={api}
+        engagementId={engagementId}
+        providers={providers}
+        harnesses={harnesses}
+        purpose="note"
+        title="Transform note with AI"
+        description="Tell Nebula how to organize or rewrite this note. The generated text remains editable and is not persisted until you save the note."
+        sourceLabel={draft.title || "Untitled note"}
+        sourceText={draftBodyRef.current}
+        initialInstruction="Turn this into a concise analyst note. Preserve exact observations, separate hypotheses, and keep useful technical details."
+        onClose={() => setWritingOpen(false)}
+        onApply={(result) => {
+          draftBodyRef.current = result.content;
+          queueAutosave();
+          setHasBody(Boolean(result.content.trim()));
+          setDraft((current) => ({
+            ...current,
+            body: result.content,
+            metadata: { ...current.metadata, ai_writing: result.provenance },
+          }));
+          setWritingOpen(false);
+        }}
+      />}
+    </div>
+  );
+}

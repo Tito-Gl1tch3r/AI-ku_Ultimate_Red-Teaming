@@ -1,0 +1,1212 @@
+/**
+ * API wire types — ported from static/js/core/types.js.
+ *
+ * This is the legacy, hand-ported subset used by endpoint modules that have not
+ * migrated to the Hey API client yet. New generated types and SDK functions
+ * live in `./generated`; refresh them from the Rust OpenAPI with
+ * `just api-client`.
+ */
+
+// `import type`, not a value import: `endpoints/grants.ts` already pulls
+// `ItemType` from this file, so a value import would close a runtime
+// cycle. Type-only imports are erased entirely, leaving nothing to cycle.
+import type { Grant } from './endpoints/grants';
+
+export type ItemType = 'file' | 'folder';
+
+export interface LightItem {
+	id: string;
+	name: string;
+	type: ItemType;
+	parentId: string;
+}
+
+export interface FolderItem {
+	category: string;
+	created_at: number;
+	icon_class: string;
+	icon_special_class: string;
+	id: string;
+	is_root: boolean;
+	modified_at: number;
+	name: string;
+	// §14 provenance — who originally created the folder. `null` when
+	// the creating user has since been deleted (backend FK is
+	// `ON DELETE SET NULL`), or when the folder is returned to a
+	// share recipient that lost provenance via
+	// `FolderDto::without_hierarchy_info`. The canonical "owner"
+	// signal on the Files browser / Favorites / Shared surfaces
+	// (replaced the retired `owner_id` field in D7).
+	created_by: string | null;
+	// §14 provenance — who last touched the folder (rename / move /
+	// metadata change). The canonical "who touched this recently"
+	// signal on the Recent surface.
+	updated_by: string | null;
+	parent_id: string | null;
+	path: string;
+	etag: string;
+	/**
+	 * The drive this folder belongs to (post-D0 ownership pivot per
+	 * `docs/plan/drive.md` §3). Populated by the backend `FolderDto`
+	 * on every response; the field was left out of the TS type until
+	 * a caller needed it. Used by `/files` to resolve the current
+	 * drive for the read-only banner without depending on the URL's
+	 * leading segment being a drive-root folder id.
+	 */
+	drive_id: string;
+	/**
+	 * Caller-scoped: `true` when the requesting user has favorited
+	 * this folder. Always present on the wire — never null, never
+	 * absent — per the backend enrichment contract. `ResourceList`
+	 * renders the fav-star chip natively from this field.
+	 */
+	is_favorite: boolean;
+	/**
+	 * Resource-scoped: `true` when the folder has any
+	 * `storage.role_grants` entry (link share via `subject_type =
+	 * 'token'`, user grant, group grant, any role). "Someone was
+	 * given access to this beyond drive membership." Always present
+	 * on the wire.
+	 */
+	is_shared: boolean;
+}
+
+export interface FileItem {
+	category: string;
+	created_at: number;
+	icon_class: string;
+	icon_special_class: string;
+	id: string;
+	mime_type: string;
+	modified_at: number;
+	name: string;
+	// §14 provenance — see FolderItem for semantics. Replaced the
+	// retired `owner_id` field in D7.
+	created_by: string | null;
+	updated_by: string | null;
+	folder_id: string;
+	path: string;
+	size: number;
+	size_formatted: string;
+	/**
+	 * Deprecated — `sort_date` moved to the item-level envelope on
+	 * `/api/photos/resources` (§1 of
+	 * `docs/plan/photos-resources-migration.md`). The field was only
+	 * ever populated by the legacy `/api/photos` route, which §4
+	 * removed. Kept optional so test fixtures that still spell
+	 * `sort_date: 0` compile unchanged; delete it the next time this
+	 * interface is touched for an unrelated reason.
+	 */
+	sort_date?: number;
+	etag: string;
+	content_hash: string;
+	/** See `FolderItem.is_favorite` — same wire contract. */
+	is_favorite: boolean;
+	/** See `FolderItem.is_shared` — same wire contract. */
+	is_shared: boolean;
+	/** Search-only: plain-text fragment around a content match. */
+	snippet?: string;
+	/** Search-only: "name" or "content". */
+	match_source?: string;
+}
+
+export interface ShareItem {
+	access_count: number;
+	created_at: number;
+	created_by: string;
+	expires_at: number;
+	has_password: boolean;
+	id: string;
+	item_id: string;
+	item_name: string;
+	item_type: ItemType;
+	token: string | null;
+	url: string;
+}
+
+export interface CreateShare {
+	item_id: string;
+	item_name?: string | null;
+	item_type: ItemType;
+	password: string | null;
+	expires_at: number | null;
+}
+
+export interface UpdateShare {
+	password?: string | null;
+	expires_at?: number | null;
+}
+
+export interface FavoriteItem {
+	id: string;
+	user_id: string;
+	item_id: string;
+	item_type: ItemType;
+	created_at: number;
+	item_name: string | null;
+	item_size: number | null;
+	item_mime_type: string | null;
+	parent_id: string | null;
+	modified_at: number | null;
+	item_path: string;
+	icon_class: string;
+	icon_special_class: string;
+	category: string;
+	size_formatted: string;
+}
+
+export interface RecentItem {
+	id: string;
+	user_id: string;
+	item_id: string;
+	item_type: ItemType;
+	accessed_at: number;
+	item_name: string | null;
+	item_size: number | null;
+	item_mime_type: string | null;
+	parent_id: string | null;
+	item_path: string;
+	icon_class: string;
+	icon_special_class: string;
+	category: string;
+	size_formatted: string;
+}
+
+export interface TrashResourceItem {
+	resource_type: ItemType;
+	trashed_at: string;
+	deletion_date: string;
+	/**
+	 * Drive the trashed item belongs to (D2b). Enables client-side
+	 * group-by-drive in the `/trash` UI without resolving the drive from
+	 * `resource.drive_id` per row. The drive's display name resolves
+	 * against `drives.svelte` (the in-memory store already populated by
+	 * the sidebar picker / config pages — no extra round-trip).
+	 */
+	drive_id: string;
+	resource: FileItem | FolderItem;
+}
+
+export interface TrashResourcesResponse {
+	items: TrashResourceItem[];
+	next_cursor?: string;
+}
+
+export type Role = 'user' | 'admin';
+
+// ─────────────────────────────────────────────────────────────────────────
+// Three-layer user family — mirrors src/application/dtos/user_dto.rs.
+// See docs/plan/userdto-refactor.md.
+//
+// `PublicUser`  — public identity. Every authenticated caller may see it.
+//                 Returned by /api/users/{id}, share responses, group
+//                 members, magic-link invitees, recipient enrichment.
+// `FullUser`    — `{ user: PublicUser, ...admin+self extras }`. Returned
+//                 as Vec by /api/admin/users; embedded in `SelfUser`.
+// `SelfUser`    — `{ full: FullUser, ...self-only extras }`. Returned by
+//                 /api/auth/me and by every auth response.
+//
+// Adding a field? Decide by audience:
+//   * Any authenticated caller may see it about another user → PublicUser.
+//   * Only admin (about another user) AND self (about self) → FullUser.
+//   * Only self about themselves → SelfUser.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Public identity — 9 fields visible to any authenticated caller. */
+export interface PublicUser {
+	id: string;
+	username?: string;
+	email: string;
+	role: string;
+	image?: string | null;
+	is_external: boolean;
+	given_name?: string;
+	family_name?: string;
+	/** Presence — TRUE when the server observed a request on any of this
+	 * user's non-revoked sessions within the last 5 min. Populated on
+	 * list endpoints; single-user public paths default to `false`.
+	 * Backwards-compat: missing on older backend builds → `false`. */
+	is_online?: boolean;
+}
+
+/** Full user record — public identity + all fields BOTH an admin (viewing
+ * another user) AND the subject themselves may see. Returned as `Vec` by
+ * `/api/admin/users`; embedded in `SelfUser` for `/api/auth/me`. */
+export interface FullUser {
+	user: PublicUser;
+	/** IdP linkage. Load-bearing "is federated?" predicate:
+	 * `full.federation_kind === 'oidc'`. */
+	federation_kind?: 'oidc' | 'ocm' | 'magic_link';
+	/** Authority that minted the OIDC/OCM identity — issuer URL for OIDC,
+	 * peer domain for OCM. FE that wants a friendly label maps this
+	 * against `OidcProviders.issuer → provider_name`. */
+	federation_issuer?: string;
+	preferred_locale?: string;
+	email_verified_at?: string;
+	created_at: string;
+	updated_at: string;
+	last_login_at?: string | null;
+	active: boolean;
+	storage_quota_bytes: number;
+	storage_used_bytes: number;
+	/** TRUE when the account has a local Argon2id `password_hash` on file.
+	 * Distinct from `federation_kind`: an OIDC-linked account can ALSO
+	 * carry a local password (hybrid). */
+	has_password: boolean;
+	/** TRUE when the user has an OPAQUE envelope on file. Admin-visible
+	 * rollout signal — kept off `PublicUser` so directory endpoints don't
+	 * leak OPAQUE adoption. */
+	opaque_registered: boolean;
+	/** TRUE when the user has completed ≥1 OPAQUE login. Distinct from
+	 * `opaque_registered` — envelope-on-file vs successful-login. */
+	opaque_migrated: boolean;
+}
+
+/** Self view — everything the caller may see about themselves.
+ * Returned by `/api/auth/me` and every `AuthResponse` (login / refresh /
+ * OIDC callback / magic-link redemption ships this so the SPA's post-auth
+ * state matches its post-`/me` state with no UI race). */
+export interface SelfUser {
+	full: FullUser;
+	/** Opaque UI-preferences bag. Cross-device store for pure UI toggles
+	 * (view mode, sidebar collapse, hide-dotfiles, …). Server never
+	 * inspects contents; the SPA defines the keys (see
+	 * `lib/stores/preferences.svelte.ts`). Always an object on the wire
+	 * — empty bag is `{}`, never `null`. PATCH via `/api/auth/me/profile`
+	 * shallow-merges; setting a key to `null` removes it. */
+	ui_preferences: Record<string, unknown>;
+	/** Whether the user wants share-notification emails. */
+	notify_on_share: boolean;
+	/** Session-scoped: my current session is DPoP-bound. SPA reads this
+	 * on `session.load()` to skip a redundant `/api/auth/dpop/bind` call
+	 * (409 `already_bound` otherwise, noisy in the audit stream). */
+	is_dpop_bound: boolean;
+	/** Admin-set temp-password gate — SPA nav guard blocks everything
+	 * but /change-password until this flips back. Cleared by a successful
+	 * `POST /api/auth/change-password`. */
+	force_password_change: boolean;
+	/** Caller-scoped: can I edit my own avatar? `false` for OIDC users
+	 * whose avatar comes from the IdP. Only meaningful when caller ==
+	 * subject; nonsense on any other DTO. */
+	can_edit_image: boolean;
+}
+
+/** Backwards-compat alias while migrating call-sites. Prefer `PublicUser`
+ * for public-identity contexts (sharee, group member, invitee) or
+ * `SelfUser` when reading `/api/auth/me`. Delete once no consumers reference
+ * the bare `User` name. */
+export type User = PublicUser;
+
+export interface AdminUsersPage {
+	total: number;
+	users: FullUser[];
+}
+
+export interface AuthResponse {
+	user: SelfUser;
+	access_token: string;
+	refresh_token: string;
+	token_type: string;
+	expires_in: number;
+	/**
+	 * Mirrors `auth.users.force_password_change_at_next_login` — set
+	 * TRUE by the admin password-reset flow (see backend
+	 * `OpaquePgRepository::clear_registration`) so admin-picked
+	 * passwords stay temporary until the user changes them. When true,
+	 * the SPA's post-login handler must route to `/settings/security`
+	 * (or the equivalent change-password surface) instead of the
+	 * user's home. Cleared server-side by a successful
+	 * `POST /api/auth/change-password`.
+	 *
+	 * Optional on the wire because the backend `#[serde(default)]`s
+	 * to `false` — older clients / non-login endpoints hitting this
+	 * type won't nil-deref.
+	 */
+	force_password_change?: boolean;
+}
+
+/**
+ * Sort dimension for `GET /api/search`. Wire-matches the backend's
+ * `SearchResourcesQuery.order_by` — 5 canonical values, direction is
+ * a separate `reverse` boolean (the `_desc` suffix pattern was
+ * retired 2026-07-26; `date` was renamed to the more explicit
+ * `updated_at` alongside the new `created_at`).
+ */
+export type SortBy = 'relevance' | 'name' | 'size' | 'updated_at' | 'created_at';
+
+/**
+ * Per-item search metadata inline on every hit in the normalized
+ * `/api/search` envelope. Mirrors backend `SearchMeta` — see
+ * `application/dtos/search_dto.rs`.
+ */
+export interface SearchMeta {
+	/** Relevance in [0, 1]; the higher the better. */
+	score: number;
+	/** Optional HTML-safe excerpt when the match fired via content index. */
+	snippet?: string;
+	/** Where the match fired. */
+	via?: 'name' | 'content' | 'path';
+}
+
+/**
+ * Single hit in the `/api/search` envelope. `resource_type` disambiguates
+ * `resource`'s union so the shared `ResourceList` component can render it
+ * exactly like a folders/favorites/recent/trash row.
+ */
+export interface SearchResourceItem {
+	resource_type: ItemType;
+	resource: FileItem | FolderItem;
+	meta: SearchMeta;
+}
+
+/**
+ * Wire response of `GET /api/search`. Same envelope shape as the other
+ * "resources" listing endpoints (`items[]` + optional `next_cursor`),
+ * plus two search-specific top-level fields: `query_time_ms` (health
+ * signal for admins, "Found N in Xms" for users) and `total` (approximate,
+ * caller-visible; never leaks a count for rows the caller can't see).
+ */
+export interface SearchResourcesResponse {
+	items: SearchResourceItem[];
+	next_cursor?: string;
+	query_time_ms: number;
+	total?: number;
+}
+
+export type DriveKind = 'personal' | 'shared';
+
+/**
+ * Full role set from `storage.grant_role` — every value that can appear
+ * on a `role_grants` row regardless of `resource_type` (drive, folder,
+ * file, playlist, calendar, address_book, …). Use this for folder-level
+ * and file-level `caller_role` fields where all five values are valid.
+ * Matches `RoleDto` in the backend.
+ */
+export type GrantRole = 'owner' | 'editor' | 'contributor' | 'commenter' | 'viewer';
+
+/**
+ * Role assignable at DRIVE scope — a strict subset of `GrantRole`.
+ * Drives only meaningfully take the three management-ladder tiers:
+ * - `owner`  — full control (rename, delete, quota, membership).
+ * - `editor` — can create/modify content anywhere in the drive.
+ * - `viewer` — read-only access to the whole drive.
+ *
+ * `contributor` (create-in-folder-without-touching-siblings) and
+ * `commenter` (react without modifying) are folder/file-scope
+ * semantics: they describe fine-grained access to a specific item,
+ * not to a whole drive. Grants of those roles happen at folder or
+ * file scope via a separate `role_grants` row, not at the drive
+ * boundary. Do NOT widen this type without a matching backend
+ * check — the DB ENUM permits all 5 today, so the constraint is
+ * conventional.
+ *
+ * Use `GrantRole` for folder/file-level `caller_role` fields.
+ */
+export type DriveRole = 'owner' | 'editor' | 'viewer';
+
+/** Subject of a grant. Mirrors `SubjectDto`. */
+export type SubjectKind = 'user' | 'group' | 'token';
+export interface DriveMemberSubject {
+	type: SubjectKind;
+	id: string;
+}
+
+/**
+ * One row from `GET /api/drives`. Mirrors `DriveDto` in
+ * `src/application/dtos/drive_dto.rs`. `default_for_user` is the caller's
+ * id when present, `null`/undefined otherwise — used to pick the default
+ * personal drive without hard-coding name conventions.
+ *
+ * `caller_role` is the strongest role the calling user holds on this drive
+ * (direct + group-mediated, collapsed). Drives the permission-aware UI
+ * gating on `/config/drive/<id>` and similar pages. `undefined` in
+ * contexts where the caller is the granter rather than a member (e.g.
+ * outgoing-grants listing).
+ */
+export interface Drive {
+	id: string;
+	name: string;
+	kind: DriveKind;
+	default_for_user?: string | null;
+	root_folder_id: string;
+	quota_bytes?: number | null;
+	used_bytes: number;
+	/**
+	 * Drive policies — raw JSONB bag from the backend. Unknown keys are
+	 * preserved verbatim. For the typed view used by the admin policy
+	 * editor, see [`DrivePolicies`].
+	 */
+	policies: Record<string, unknown>;
+	created_at: string;
+	updated_at: string;
+	caller_role?: DriveRole | null;
+}
+
+/**
+ * Typed mirror of the known drive policy keys. Every field defaults to
+ * `false` (= "opted out" for the `include_in_*` keys, "allowed" for the
+ * `forbid_*` keys). The wire shape returned by
+ * `PATCH /api/drives/{id}/policies` carries every known key; the request
+ * body uses [`DrivePoliciesPartial`] so unsupplied keys aren't disturbed
+ * (the backend uses a JSONB `||` merge — see
+ * `drive_pg_repository.rs::update_policies`).
+ *
+ * See `docs/plan/drive.md` §8 for the `forbid_*` gates and §15 for the
+ * `include_in_*_index` scope flags.
+ */
+export interface DrivePolicies {
+	forbid_sharing: boolean;
+	forbid_external_sharing: boolean;
+	forbid_public_links: boolean;
+	forbid_cross_drive_move: boolean;
+	forbid_owner_role_change: boolean;
+	/**
+	 * §15 opt-in for `/api/photos` timeline scope. Default personal drives
+	 * are created with `true`; non-default drives (secondary personals,
+	 * shared) start `false` and opt in via the admin policy modal.
+	 */
+	include_in_photo_index: boolean;
+	/**
+	 * §15 opt-in for the Music library surface (currently playlists;
+	 * future `/api/music/tracks` library view will read this too).
+	 * Symmetric shape to `include_in_photo_index`.
+	 */
+	include_in_music_index: boolean;
+	/**
+	 * Full freeze / legal-hold. When `true`, every mutation on resources
+	 * in the drive is refused — user-initiated AND background alike (the
+	 * trash-retention purge SQL filter excludes read-only drives). Only
+	 * `Read` passes. Admins can un-freeze via the admin-only policy PATCH.
+	 * See `docs/plan/drive.md` §8 (`read_only`).
+	 */
+	read_only: boolean;
+	/**
+	 * Longest a public link in this drive may live, in days. `null` means
+	 * no cap — the LAXEST value, since a link that never expires is
+	 * permitted. Enforced at link creation; links that already outlive a
+	 * newly-set cap keep working and are surfaced by
+	 * `drive_policies_consistency`.
+	 *
+	 * The only non-boolean policy. Note the expiry it constrains lives on
+	 * the token's role grant, not on the share row.
+	 */
+	max_public_link_days: number | null;
+	/**
+	 * Public links in this drive must carry a password. Enforced at link
+	 * creation; existing password-less links keep working and are reported
+	 * by the compliance scan.
+	 */
+	require_public_link_password: boolean;
+}
+
+/**
+ * Body shape for the admin policy editor — every key optional so omitting
+ * a field leaves that policy untouched (the backend uses a JSONB merge).
+ */
+export type DrivePoliciesPartial = Partial<DrivePolicies>;
+
+/**
+ * What changing a per-kind default WOULD do, from
+ * `PUT /api/admin/drive-policies/defaults/{kind}?dry_run=true`.
+ */
+export interface PolicyDefaultsImpact {
+	/** Drives that would end up laxer than the new default — they override it. */
+	drives_weaker_than_default: number;
+	/** Drives whose effective policy the change actually moves. */
+	drives_affected: number;
+	by_knob: { knob: string; follows: number; overrides: number }[];
+	/** The drives behind `drives_weaker_than_default`, named. */
+	weaker_drives: PolicyDrift[];
+}
+
+/**
+ * One drive that is laxer than its kind's default, on the named knobs.
+ *
+ * Returned live by `GET /api/admin/drive-policies/drift`, and by the
+ * dry-run preview for a candidate default — the same shape from both,
+ * because it is the same comparison against a different target.
+ */
+export interface PolicyDrift {
+	id: string;
+	name: string | null;
+	kind: DriveKind;
+	knobs: string[];
+}
+
+/**
+ * Request body for `POST /api/drives` (D3a). Mirrors `CreateDriveDto` in
+ * `src/interfaces/api/handlers/drive_handler.rs`. `kind: 'personal'` is a
+ * recognised wire shape but returns 501 today (the authz model + quota
+ * source for secondary personals are still open product questions).
+ */
+export interface CreateDriveBody {
+	kind: DriveKind;
+	name: string;
+	owner: DriveMemberSubject;
+	quota_bytes?: number | null;
+}
+
+/**
+ * One row from `GET /api/drives/{id}/members`. Mirrors `GrantDto` in
+ * `src/application/dtos/grant_dto.rs` — the shape is the same as any
+ * other role-grant; drive membership just constrains `resource.type` to
+ * `"drive"`.
+ */
+export interface DriveMember {
+	id: string;
+	subject: DriveMemberSubject;
+	resource: { type: 'drive'; id: string };
+	role: DriveRole;
+	granted_by: string;
+	granted_at: string;
+	expires_at?: string | null;
+}
+
+// ─── Folder ancestors (breadcrumb endpoint) ──────────────────────────────
+// Wire shape of `GET /api/folders/{id}/ancestors`. Mirrors the backend
+// `FolderAncestorsDto` — see `src/application/dtos/folder_dto.rs`. One
+// round-trip returns the whole caller-visible parent chain plus an
+// `access_source` telling the breadcrumb component which root icon /
+// tooltip to render.
+
+export interface FolderAncestor {
+	id: string;
+	name: string;
+	/** `null` on the drive-root ancestor. */
+	parent_id: string | null;
+	/**
+	 * Drive the folder belongs to (always populated — every folder has a
+	 * drive_id post-D0). Lets `/files` derive `currentFolderDriveId` from
+	 * the ancestors response instead of firing an extra
+	 * `GET /api/folders/{id}` on load. Same value across every entry in
+	 * `ancestors` (all folders in a chain live in one drive).
+	 */
+	drive_id: string;
+}
+
+/**
+ * How the caller reached the topmost accessible ancestor.
+ * - `drive` — via drive membership (own personal, secondary personal, or
+ *   shared drive). `drive` field carries the drive's id/name/kind for
+ *   the root icon.
+ * - `direct_share` — via a folder-level `role_grants` row (share).
+ *   `subject` may name the grantee (self or a group) once subject
+ *   enrichment lands; MVP leaves it null.
+ * - `token` — reserved for public-link callers. Not emitted today.
+ */
+export type AccessSourceKind = 'drive' | 'direct_share' | 'token';
+
+export interface AccessSourceDrive {
+	id: string;
+	name: string;
+	kind: DriveKind;
+}
+
+export interface AccessSourceSubject {
+	kind: 'user' | 'group';
+	id: string;
+	/** Nullable in MVP (subject enrichment deferred). */
+	name?: string | null;
+}
+
+export interface AccessSource {
+	kind: AccessSourceKind;
+	/** Populated when `kind === 'drive'`. */
+	drive?: AccessSourceDrive;
+	/**
+	 * SHARER — the user who created the grant that gave the caller
+	 * access at the boundary (`role_grants.granted_by`). Kind is always
+	 * `'user'` today (a group can't perform an action), but the type
+	 * stays open in case a future model permits it. Null when the
+	 * boundary can't be resolved to a single grant (e.g. `token`).
+	 */
+	subject?: AccessSourceSubject;
+	/**
+	 * Caller's role via the boundary grant (`role_grants.role` on the
+	 * same row that carries `granted_by`). Lets the FE render permission-
+	 * aware affordances at the ancestor scope. Reflects the boundary grant
+	 * only — aggregate effective role via other channels may be stronger.
+	 * Null on `token` access.
+	 *
+	 * Typed as `GrantRole` (not `DriveRole`): the boundary can be a
+	 * folder-level share where all five role_grant values are valid,
+	 * not just the drive-scoped subset.
+	 */
+	caller_role?: GrantRole | null;
+}
+
+/**
+ * Response envelope of `GET /api/folders/{id}/ancestors`. `ancestors`
+ * is root-first, leaf-last (length ≥ 1). `access_source` describes
+ * the boundary at element 0 (drive root or share boundary).
+ */
+export interface FolderAncestorsResponse {
+	ancestors: FolderAncestor[];
+	access_source: AccessSource;
+	/**
+	 * Every grant that reaches the leaf — its own, each visible
+	 * ancestor's, and the drive's.
+	 *
+	 * Present ONLY when fetched via `getFolderAncestorsWithGrants()`
+	 * (`?include_grants=true`); `undefined` on the breadcrumb's plain
+	 * call. Each entry's `resource` names where it sits, so:
+	 *
+	 *   - `resource.id === leafId`            → direct
+	 *   - `resource.type === 'folder'`, other → inherited; resolve the
+	 *                                           folder name from `ancestors`
+	 *   - `resource.type === 'drive'`         → from the drive
+	 */
+	effective_grants?: Grant[];
+	/**
+	 * Public links reaching the leaf, from the same walk. Separate from
+	 * `effective_grants` because a link is not a subject — no name to
+	 * resolve, no role to change, nobody to notify.
+	 *
+	 * Same presence rule: only via `getFolderAncestorsWithGrants()`.
+	 */
+	effective_links?: EffectiveLink[];
+}
+
+/** A public link on an ancestor folder or the drive. */
+export interface EffectiveLink {
+	/** Token grant id — stable list key. */
+	grant_id: string;
+	/** `storage.shares.id`. */
+	share_id: string;
+	/** Operator-given name; absent when the link was never named. */
+	name?: string;
+	has_password: boolean;
+	/** Where the link lives. Resolve a folder's name from `ancestors`. */
+	resource: { type: 'file' | 'folder' | 'drive'; id: string };
+	expires_at?: string | null;
+}
+
+// ─── Job registry (Part 1 + Part 2) ────────────────────────────────────────
+//
+// Maps `src/infrastructure/scheduler/*` DTOs 1:1. See
+// `docs/plan/job-registry.md` for the backend contract; the shapes below
+// are what the `/api/admin/jobs*` endpoints emit.
+
+/**
+ * `JobOutcome` — the uniform outcome the scheduler logs and stores for
+ * every job dispatch. Serialised with `#[serde(tag = "outcome")]` so the
+ * discriminant is the `outcome` field, not the object key.
+ */
+export type JobOutcome =
+	| { outcome: 'ok'; count: number; extra?: JobOutcomeExtra }
+	| { outcome: 'err'; message: string };
+
+/**
+ * The parts of a job outcome's free-form `extra` the panel reads.
+ *
+ * Deliberately narrow — most keys are per-job counters nothing generic
+ * should switch on. These three describe the RUN's shape rather than
+ * its work, and the panel has to render them:
+ *
+ * A run that stopped because the backend was unreachable reports
+ * `outcome: 'ok'` — it did not fail, it paused and can be resumed. Read
+ * alone that renders as a green "ok" pill, which is exactly wrong: a
+ * paused `backend_migration` still holds `migration_readonly` and is
+ * refusing writes application-wide. `retryable` is what lets the row
+ * say so.
+ */
+export interface JobOutcomeExtra {
+	/** The run stopped at its cursor and can be resumed. */
+	paused?: boolean;
+	/** It stopped because the ENVIRONMENT failed, not because an
+	 *  operator asked — `reason` says what. */
+	retryable?: boolean;
+	reason?: string;
+	[key: string]: unknown;
+}
+
+/**
+ * `JobSummary` — one row per registered job in `GET /api/admin/jobs`.
+ * Cadence + last-run bookkeeping. `interval_ms` / `next_run_at` are
+ * `undefined` on on-demand jobs (serde skips `Option::None`).
+ */
+/**
+ * Enough info about a paused recoverable run for the admin panel to
+ * render "Resume (scanned/total)" on the job row without opening the
+ * drawer. Absent when no `Paused` row exists for this job. `total`
+ * is absent when the tenant didn't seed a countable subject —
+ * fallback UI is just "Resume".
+ */
+export interface PausedRunBrief {
+	id: string;
+	scanned: number;
+	total?: number;
+}
+
+/**
+ * When a job changes state — `RecoverableJobHandler::mutates()` on the
+ * backend. Three values rather than a boolean because the interesting
+ * case is conditional: a job can be read-only by default and destructive
+ * under `?repair=true`.
+ *
+ * - `never` — read-only under every flag. Render a read-only badge; no
+ *   confirmation needed to trigger.
+ * - `always` — changes state on a plain run. Confirm before triggering.
+ * - `on_repair_only` — safe to trigger; confirm only when the repair
+ *   toggle is on.
+ */
+export type Mutates = 'never' | 'always' | 'on_repair_only';
+
+/** Wire type of a declared job parameter — `JobParamType` on the backend. */
+export type JobParamType = 'boolean' | 'string' | 'number';
+
+/**
+ * One run parameter a job accepts, declared by the handler itself
+ * (`JobHandler::parameters()`).
+ *
+ * This is how the panel knows which knobs a job actually reads. It used
+ * to guess: `deep` came from a hardcoded name allowlist here, so a job
+ * gaining a deep mode needed a frontend release, and a job losing one
+ * left a button that silently did nothing. `force` was offered on every
+ * job whether or not it was read.
+ *
+ * `default` is the value the run uses when the parameter is omitted —
+ * `null` for a string with no default.
+ */
+export interface JobParam {
+	name: string;
+	type: JobParamType;
+	default: boolean | number | string | null;
+	/** The job's own wording for THIS parameter, for the control's
+	 *  tooltip. Absent when the handler left it blank. */
+	description?: string;
+}
+
+/** Values for one trigger, keyed by declared parameter name. */
+export type JobParamValues = Record<string, boolean | number | string>;
+
+export interface JobSummary {
+	name: string;
+	/** One or two sentences on what the job does, in English, authored
+	 *  next to the handler. Absent for jobs that haven't declared one —
+	 *  omit the line rather than rendering an empty block. */
+	description?: string;
+	mutates: Mutates;
+	/** Present iff `?repair=true` does something beyond a default run;
+	 *  describes what it ADDS. Presence is what gates the repair toggle;
+	 *  the text is the confirmation copy. Independent of `mutates` — the
+	 *  thumbnail import jobs are `always` AND repair-capable. */
+	repair_description?: string;
+	/** What this job accepts on a trigger. Absent — not `[]` — when the
+	 *  job takes none, so "render no controls" is the natural default. */
+	parameters?: JobParam[];
+	interval_ms?: number;
+	next_run_at?: string;
+	last_run_at?: string;
+	last_outcome?: JobOutcome;
+	running: boolean;
+	/**
+	 * `true` iff the job persists runs + findings to
+	 * `jobs.recoverable_runs`. Consumed by the admin panel to decide
+	 * whether the row is expandable (drawer with run history +
+	 * findings) and to gate the retention/purge action — replaces
+	 * the pre-K3 name-based allowlist that missed newly-added
+	 * recoverable tenants (`backend_rotate` shipped first without a
+	 * row-expand until this flag was added).
+	 */
+	recoverable: boolean;
+	/** Populated iff a `Paused` row exists in `jobs.recoverable_runs`
+	 *  for this job. Distinct from `running` — a paused run is
+	 *  resumable via the same trigger endpoint. */
+	paused_run?: PausedRunBrief;
+	/** Status of this job's most recent run row (recoverable jobs only).
+	 *
+	 *  **Prefer this over `last_outcome` wherever they could disagree.**
+	 *  `last_outcome` is the backend's in-memory record of the last
+	 *  dispatch, so anything that changes a run row without running the
+	 *  handler leaves it stale — cancelling a Paused run is a direct SQL
+	 *  flip, and the panel went on rendering the pause it replaced. */
+	last_run_status?: RunStatus;
+	/** Findings of the most recent run, counted per severity, read from
+	 *  `jobs.run_findings` (recoverable jobs only).
+	 *
+	 *  **Prefer this over `last_outcome.extra.severity_counts`**, for the
+	 *  same reason as `last_run_status`: the outcome is in-memory, so a
+	 *  restart erased the counts and a completed run that found data loss
+	 *  rendered as a neutral "—". Findings are rows, so this survives.
+	 *
+	 *  Absent = no run row. `{}` = a run that found nothing — the good
+	 *  news, and a different fact. Severity keys are open (the column is
+	 *  TEXT), so unknown keys must degrade rather than throw. */
+	last_run_severity_counts?: Record<string, number>;
+	/** Why the most recent run stopped, read from the run row —
+	 *  `backend_unavailable`, `backend_timeout`, `job_failed`,
+	 *  `server_restart`.
+	 *
+	 *  **The outcome pill must not read "ok" while this is set.** A
+	 *  retryable pause reports `outcome: "ok"` on the wire — correctly,
+	 *  since the run did not fail and a Resume continues it — so taking
+	 *  that at face value rendered a green "ok" for a job that gave up
+	 *  because its backend was unreachable.
+	 *
+	 *  Absent means a clean run *or* a pause an operator asked for;
+	 *  neither should look alarming, which is why presence is the
+	 *  signal rather than `status === "Paused"`. */
+	last_run_error_reason?: string;
+	/** Present when this job has no cadence of its own but a scheduled
+	 *  job runs it — a `*_consistency` detector swept by
+	 *  `consistency_batch`. Without it the row renders "on-demand",
+	 *  which is false in the default configuration. */
+	scheduled_via?: { job: string; interval_ms: number };
+	/** Present iff `OXICLOUD_STARTUP_JOBS` names this job — the flags it
+	 *  is dispatched with at every boot. Worth showing: a job configured
+	 *  with `repair: true` deletes on every restart, and the row would
+	 *  otherwise suggest that only happens when someone clicks Run. */
+	startup?: StartupTrigger;
+}
+
+/**
+ * Parameters a job configured in `OXICLOUD_STARTUP_JOBS` runs with,
+ * keyed by declared name.
+ *
+ * A map for the same reason `JobSummary.parameters` is one: the four
+ * fixed fields it replaced meant a job growing a parameter silently
+ * dropped it from the "at boot" pill.
+ */
+export interface StartupTrigger {
+	params?: JobParamValues;
+}
+
+/**
+ * `RunStatus` values allowed in `jobs.recoverable_runs.status`. The
+ * non-terminal set (Running / Paused / CancelRequested) is what the
+ * DB's `one_active_run_per_job` partial unique index scopes.
+ */
+export type RunStatus =
+	| 'Running'
+	| 'Paused'
+	| 'CancelRequested'
+	| 'Completed'
+	| 'Failed'
+	| 'Cancelled';
+
+/**
+ * `RunSummary` — one row per recoverable-job run from
+ * `GET /api/admin/jobs/{name}/runs`. Terminal + non-terminal rows both
+ * appear. `stats` / `params` are opaque JSON — job-specific shape;
+ * consumers should key off `job_name` to decide what to render.
+ * `cursor_hex` is present only when the run has advanced past the
+ * initial state (paused mid-scan is the typical case).
+ */
+export interface RunSummary {
+	id: string;
+	job_name: string;
+	status: RunStatus;
+	started_at: string;
+	last_progress_at: string;
+	completed_at?: string;
+	stats: Record<string, unknown>;
+	params: Record<string, unknown>;
+	cursor_hex?: string;
+	error_message?: string;
+	/** Stable key for why the run stopped — `backend_unavailable`,
+	 *  `backend_timeout`, `job_failed`, `server_restart`.
+	 *
+	 *  Switch on this, never on `error_message`, which is prose and free
+	 *  to be reworded. Absent on an operator pause, which is how a
+	 *  human-stopped run is told apart from one the environment stopped:
+	 *  both are `Paused` in `status`. */
+	error_reason?: string;
+	/** Populated when the tenant reported a countable subject at run
+	 *  start (`RecoverableJobHandler::count_total`). Absent when the
+	 *  tenant can't count — the UI hides the progress bar and falls
+	 *  back to raw `scanned_count`. */
+	progress?: RunProgress;
+}
+
+/**
+ * Confidence level of a `RunProgress` fraction. Wire lowercase per
+ * the `#[serde(rename_all = "lowercase")]` on the Rust enum.
+ *
+ * - `count` — `scanned_count / total_rows` where `total_rows` came
+ *   from a definitive `COUNT(*)` on the subject table.
+ * - `approximate` — proxy-derived total (e.g. `storage_consistency`
+ *   using DB blob count as a stand-in for backend object count).
+ *   Fraction can legitimately exceed 1.0 at run end — the deviation
+ *   quantifies the drift the check is looking for.
+ */
+export type ProgressKind = 'count' | 'approximate';
+
+export interface RunProgress {
+	fraction: number;
+	kind: ProgressKind;
+	scanned: number;
+	total: number;
+}
+
+/**
+ * `Finding` — one row from `GET /api/admin/jobs/{name}/runs/{id}/findings`.
+ * Persisted by consistency tenants via `store.record_finding()`. Consumers
+ * key off `kind` to know the shape of `detail` (per-tenant JSON — e.g.
+ * `stale_used_bytes` carries `{cached, actual, delta}`; `missing_blob`
+ * carries `{blob_hash}`; …).
+ */
+export interface Finding {
+	id: string;
+	run_id: string;
+	kind: string;
+	severity: string;
+	resource_id?: string;
+	detail: Record<string, unknown>;
+	created_at: string;
+}
+
+/**
+ * Admin sessions-panel row shape. Backend: `SessionSummaryDto` in
+ * `src/application/dtos/session_dto.rs`. Deliberately narrower than
+ * the DB row — the refresh token is never serialised, and the full
+ * DPoP thumbprint is truncated to an 8-char prefix so admins viewing
+ * other users' sessions can't exfiltrate the full binding fingerprint.
+ */
+export interface SessionSummary {
+	id: string;
+	user_id: string;
+	created_at: string;
+	expires_at: string;
+	/** Wall-clock (RFC 3339) of the last authenticated request the
+	 *  server observed on this session. Trails the true value by at
+	 *  most the tracker's flush interval (30 s) on a running server;
+	 *  converges after graceful shutdown. Populates the "last seen X
+	 *  ago" tooltip on the presence dot. */
+	last_seen_at: string;
+	ip_address: string | null;
+	user_agent: string | null;
+	is_bound: boolean;
+	dpop_jkt_prefix: string | null;
+	is_revoked: boolean;
+	is_active: boolean;
+	/** Presence signal — `true` when the server observed a request on
+	 *  this session within the last 5 minutes AND the row is `is_active`
+	 *  (never `true` on revoked / expired rows). Renders as a filled
+	 *  green dot in the Status column; `false` on an otherwise-active
+	 *  row renders as an outlined idle dot with a "last seen X ago"
+	 *  tooltip. Distinct from `is_active`: that's a lifecycle signal,
+	 *  this is a presence signal. Derived server-side against the
+	 *  same window that drives `oxicloud_sessions_online[_users]`. */
+	is_online: boolean;
+	/** How this session was minted. `unknown` covers pre-migration
+	 *  rows and any origin the SPA doesn't yet render. Server enum
+	 *  is populated at INSERT (see `Session::new`) and copied on
+	 *  refresh. Snake_case wire values map to the labels rendered
+	 *  in the admin table. */
+	origin: 'password' | 'opaque' | 'magic_link' | 'oidc' | 'device' | 'unknown';
+	/** `true` when this row IS the admin's currently-active session —
+	 *  compared server-side by `dpop_jkt`. Panel uses this to warn
+	 *  before revoking ("this will log you out"). Always `false` when
+	 *  the admin's own session is unbound. */
+	is_current: boolean;
+}
+
+/** Wire response of `GET /api/admin/sessions`. */
+export interface AdminSessionsPage {
+	sessions: SessionSummary[];
+	limit: number;
+	offset: number;
+	/** Access-token TTL in seconds — from `OXICLOUD_ACCESS_TOKEN_EXPIRY_SECS`
+	 *  server-side. The panel surfaces this in a "revoke takes effect within
+	 *  {N} seconds" notice because revoking flips the DB row (breaks refresh)
+	 *  but any in-flight JWT stays valid until its `exp`. */
+	access_token_expiry_secs: number;
+}
+
+// ── /api/config — public server-configuration discovery ────────────────────
+
+/** Boolean matrix of enabled optional subsystems. Mirrors the server's
+ *  `FeaturesConfig`; adding a field is additive (clients ignore unknown
+ *  fields, no field is ever repurposed — same discipline as JSON-RPC
+ *  error codes on the message bus). */
+export interface ServerFeatures {
+	/** Message bus over WebSocket. When `false`, `/api/rt/ws` and
+	 *  `/api/rt/ticket` are unmounted server-side — clients skip WS setup
+	 *  entirely (see `$lib/message-bus/client.svelte.ts`). */
+	message_bus: boolean;
+	trash: boolean;
+	search: boolean;
+	sharing: boolean;
+	// NOTE: `quotas` was intentionally NOT exposed — see the Rust
+	// `FeaturesDto` doc for why (dormant server flag with zero
+	// consumers). Add it back once it actually gates FE-visible
+	// behavior.
+	music: boolean;
+	places: boolean;
+	faces: boolean;
+	video_thumbnails: boolean;
+	external_mounts: boolean;
+	/** Collaborative `.md` editing (Yjs CRDT over the message-bus WS).
+	 *  When `false`, the FE hides the "New markdown" menu entry and
+	 *  falls back to the plain `.md` viewer. Requires `message_bus`. */
+	markdown_collab: boolean;
+}
+
+/** One row in `ServerStatus.migration` / `ServerStatus.rotation` — a
+ *  server-side long-running operation surfacing its progress to the SPA
+ *  banner. Same JSON shape both fields share. */
+export interface ServerStatusProgress {
+	/** Short target name (e.g. `"backend_migration"`, `"rotation_v2"`). */
+	target: string;
+	migrated: number;
+	total: number;
+	/** Integer 0-100. */
+	percent: number;
+}
+
+/** Live server-status snapshot. Same shape and field names as the
+ *  `X-Server-Status` header stamped on every response — the boot fetch
+ *  from `/api/config` and the per-request header both share this wire
+ *  vocabulary. Field-level absence means "nothing running"; the client
+ *  can safely assume `readonly === false && !migration && !rotation` is
+ *  the normal case. */
+export interface ServerStatus {
+	readonly: boolean;
+	migration?: ServerStatusProgress;
+	rotation?: ServerStatusProgress;
+	/** Public-safe projection of the backend write-lock holder. When
+	 *  `readonly === true` AND the gate is actually held, this names
+	 *  the variant (`"migration" | "backup" | "rotation" | "external"`)
+	 *  and carries a server-formatted one-liner safe to render raw.
+	 *  The full typed holder (admin_id, expires_at, label text,
+	 *  source/target entry names) stays admin-only on
+	 *  `/api/admin/storage/write-lock`. */
+	holder?: ServerStatusHolder;
+	/** Short hash of the operator-authored banner list. Carried on
+	 *  the `X-Server-Status` header on every API response; the FE
+	 *  version-diff pattern refetches `/api/config` on change to
+	 *  pick up the full `banners` list. Absent when no banners are
+	 *  live. */
+	banners_version?: string;
+	/** Full public-filtered banner list — only populated on
+	 *  `/api/config.server_status` (boot hydration + explicit
+	 *  refetch), never on the `X-Server-Status` response header. */
+	banners?: OpsBanner[];
+}
+
+/** One operator-authored banner. Severity drives the visual
+ *  variant (warning / notification). `body` holds raw markdown
+ *  per locale; the FE picks the viewer's preferred_locale with
+ *  `en` as the hard-coded fallback. */
+export interface OpsBanner {
+	id: string;
+	severity: 'warning' | 'notification';
+	body: Record<string, string>;
+	/** `undefined` when effective immediately. `Some(ISO 8601)`
+	 *  when the operator scheduled the banner for a future time —
+	 *  the server-side filter hides it on the public wire until
+	 *  that time arrives, so a value here means "visible soon".
+	 *  Admin surface shows it regardless. */
+	starts_at?: string;
+	/** `undefined` → stays until the operator deletes it.
+	 *  `Some(ISO 8601)` → auto-hides from the public wire once
+	 *  reached, and the periodic `ops_banner_expiry` job removes
+	 *  it from storage on its next tick (every ~10 min). Admin
+	 *  surface still shows it until the job sweeps so the operator
+	 *  can see "I posted a banner that expired an hour ago". */
+	expires_at?: string;
+	created_by: string;
+	created_at: string;
+}
+
+/** See [`ServerStatus.holder`]. */
+export interface ServerStatusHolder {
+	kind: 'migration' | 'backup' | 'rotation' | 'external';
+	display: string;
+}
+
+/** OPAQUE deployment mode, mirrored from `OXICLOUD_AUTH_OPAQUE_MODE`.
+ *  Login should NOT branch on this — use the per-user lookup at
+ *  `POST /api/auth/opaque/login/lookup` instead. Exposed for future
+ *  consumers (admin status indicators, OPAQUE-native setup). */
+export type OpaqueMode = 'off' | 'migrate' | 'opaque_only';
+
+/** Auth-related tunables the SPA needs to gate submit locally.
+ *  Mirrored from `AuthConfig` on the server; extends over time —
+ *  clients ignore unknown fields, and no field is ever repurposed
+ *  (same discipline as JSON-RPC error codes on the message bus). */
+export interface ServerAuth {
+	/** Minimum password length (UTF-8 bytes) enforced by every
+	 *  server-side password-bearing endpoint. The SPA gates submit on
+	 *  the same value so users see the failure instantly. See
+	 *  AtalayaLabs/OxiCloud#677. */
+	min_password_length: number;
+	/** OPAQUE server-wide mode. See [`OpaqueMode`] for callers. */
+	opaque_mode: OpaqueMode;
+}
+
+/** Response of `GET /api/config`. Public, unauthenticated. */
+export interface ServerConfig {
+	version: string;
+	features: ServerFeatures;
+	auth: ServerAuth;
+	server_status: ServerStatus;
+}
+
+// ─── Notifications (Slice E) ─────────────────────────────────────
+// Row shape mirrors `application/dtos` output of the Rust backend.
+// `payload` stays a raw JSON object (`Record<string, unknown>`) —
+// per-kind decoding is a UI concern (kind-specific components read
+// what they need from the blob). Adding a new kind server-side does
+// NOT churn this file; the FE renders a generic bell row for any
+// unknown kind.
+export interface Notification {
+	id: string;
+	kind: string;
+	payload: Record<string, unknown>;
+	created_at: string;
+	/** `null` = unread. */
+	read_at: string | null;
+}
+
+export interface NotificationListResponse {
+	items: Notification[];
+	unread_count: number;
+}
+
+export interface UnreadCountResponse {
+	unread_count: number;
+}
+
+export interface MarkAllReadResponse {
+	marked: number;
+}
+
+/** Canonical kind slugs — mirror `domain::entities::notification::kind`. */
+export const NOTIFICATION_KIND = {
+	SHARE_GRANTED: 'share_granted',
+	NEW_LOGIN_FROM_NEW_DEVICE: 'new_login_from_new_device',
+	JOB_COMPLETED_FOR_YOU: 'job_completed_for_you',
+	STORAGE_QUOTA_THRESHOLD: 'storage_quota_threshold'
+} as const;
+
+/**
+ * Payload shape for `share_granted` notifications — hand-mirror of
+ * `crate::domain::entities::notification::SharegrantedPayload`.
+ * `#[derive(ToSchema)]` on the Rust struct makes it authoritative;
+ * this interface is a projection for FE type-narrowing until the
+ * codebase adopts `openapi-typescript` for the REST surface.
+ *
+ * See `docs/plan/templated-messages.md § Making payloads a real
+ * Rust struct` for the rationale — OpenAPI owns the payload; the
+ * bus event is a pure poke.
+ */
+export interface SharegrantedPayload {
+	granter_id: string;
+	resource_type: string;
+	resource_id: string;
+	resource_name?: string;
+	/** Storage path for `folder` / `file` kinds only. `undefined`
+	 *  for drive / calendar / address_book / playlist. */
+	resource_path?: string;
+	/** FE-navigation hint for kinds whose `resource_id` isn't itself
+	 *  a folder id. Populated for `drive` (the drive's root folder
+	 *  id — the FE routes to `/files/{navigate_folder_id}` because
+	 *  drives don't have a browsable URL of their own). Absent for
+	 *  folder (uses `resource_id` directly), file (routes to
+	 *  `/shared-with-me?file=`), and non-browsable kinds. */
+	navigate_folder_id?: string;
+	role: string;
+	expires_at?: string;
+}

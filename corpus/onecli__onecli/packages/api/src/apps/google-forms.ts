@@ -1,0 +1,50 @@
+import type { AppDefinition } from "./types";
+import {
+  buildGoogleAuthUrl,
+  exchangeGoogleCode,
+  googleConfigFields,
+} from "./oauth/google";
+
+export const googleForms: AppDefinition = {
+  id: "google-forms",
+  setupGuideUrl: "https://onecli.sh/docs/integrations/google-forms",
+  name: "Google Forms",
+  apiDocsUrl:
+    "https://developers.google.com/workspace/forms/api/reference/rest",
+  icon: "/icons/google-forms.svg",
+  description: "Read, create, and edit forms and responses.",
+  connectionMethod: {
+    type: "oauth",
+    defaultScopes: [
+      "openid",
+      "email",
+      "profile",
+      "https://www.googleapis.com/auth/forms.body",
+    ],
+    permissions: [
+      {
+        scope: "https://www.googleapis.com/auth/forms.body",
+        name: "Forms",
+        description: "Read, create, and edit forms and responses",
+        access: "write",
+      },
+      {
+        scope: "https://www.googleapis.com/auth/userinfo.email",
+        name: "Email address",
+        description: "View your email address",
+        access: "read",
+      },
+      {
+        scope: "https://www.googleapis.com/auth/userinfo.profile",
+        name: "Profile",
+        description: "Name and profile picture",
+        access: "read",
+      },
+    ],
+    buildAuthUrl: buildGoogleAuthUrl,
+    exchangeCode: exchangeGoogleCode,
+  },
+  configurable: {
+    fields: googleConfigFields,
+  },
+};

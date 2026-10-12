@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Auth context extraction, KB merge/score, session seeding, and option override inference."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from interfaces.command_system.builtin.agent.agent_constants import (
+    AUTH_PATH_MARKERS,
+    LOGIN_PATH_PRIORITY,
+    SESSION_COOKIE_NAME_MARKERS,
+)
+from interfaces.command_system.builtin.agent.auth_strategies import (
+    AuthOverrideBuildContext,
+    compose_auth_option_overrides,
+    infer_bruteforce_field_overrides,
+)
+from interfaces.command_system.builtin.agent.crawler_intelligence import bruteforce_attempt_cap
+from interfaces.command_system.builtin.agent.identity_intel import write_agent_wordlist
+from interfaces.command_system.builtin.agent.run_store import AgentPathService, _safe_component
+from interfaces.command_system.builtin.agent.state import AgentState
+
+
+class AuthContextOperations:
+    """Dedicated auth logic (keeps :class:`AgentWorkflowCore` slimmer)."""
+
+    def __init__(self, normalize_relative_path: Callable[[Any], str]) -> None:
+        self._normalize_relative_path = normalize_relative_path
+
+    def sanitize_cookie_map(self, raw: Any) -> Dict[str, str]:
+        if not isinstance(raw, dict):
+            return {}
+        cookies: Dict[str, str] = {}
+        for key, value in list(raw.items())[:20]:
+            name = str(key or "").strip()
+            cookie_value = str(value or "").strip()
+            if not name or not cookie_value:
+                continue
+            cookies[name[:80]] = cookie_value[:512]
+        return cookies
+
+    def _parse_cookie_header(self, raw: Any) -> Dict[str, str]:
+        header = str(raw or "").strip()
+        if not header:
+            return {}
+        cookies: Dict[str, str] = {}
+        for chunk in header.split(";"):
+            part = str(chunk or "").strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = str(name or "").strip()
+            value = str(value or "").strip()
+            if not name or not value:
+                continue
+            cookies[name[:80]] = value[:512]
+        return cookies
+
+    def extract_auth_context_from_details(
+        self, module_path: str, details: Any
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(details, dict):
+            return None
+
+        username = str(details.get("authenticated_as") or details.get("username") or "").strip()
+        password = str(details.get("password") or details.get("authenticated_password") or "").strip()
+        login_path = self._normalize_relative_path(details.get("login_path") or details.get("path"))
+        final_url = str(details.get("post_login_final_url") or "").strip()
+        final_path = self._normalize_relative_path(
+            details.get("post_login_final_path") or final_url
+        )
+        snippet = str(details.get("post_login_snippet") or "")[:12000]
+        cookies = self.sanitize_cookie_map(
+            details.get("session_cookies") or details.get("cookies")
+        )
+
+        if not any((username, password, login_path, final_url, final_path, snippet, cookies)):
+            return None
+
+        # A login URL alone is reconnaissance, not "credentials obtained". Treating it as auth
+        # context incorrectly set risk_signals.credentials_obtained and halted the scan campaign
+        # before bruteforce, XSS, PHP fingerprinting, etc.
+        authenticated_as = str(details.get("authenticated_as") or "").strip()
+        has_user_password = bool(username and password)
+        has_identity = bool(authenticated_as)
+        has_post_login_evidence = bool(snippet or final_url or final_path)
+        has_session_material = bool(cookies) or bool(str(details.get("cookie_header") or "").strip())
+        if (
+            not has_user_password
+            and not has_identity
+            and not has_post_login_evidence
+            and not has_session_material
+        ):
+            return None
+
+        return {
+            "source_module": str(module_path or "")[:200],
+            "username": username,
+            "password": password,
+            "login_path": login_path,
+            "final_url": final_url[:512],
+            "final_path": final_path,
+            "post_login_snippet": snippet,
+            "cookies": cookies,
+            "cookie_header": str(details.get("cookie_header") or "").strip()[:4000],
+            "username_field": str(details.get("username_field") or "").strip()[:120],
+            "password_field": str(details.get("password_field") or "").strip()[:120],
+            "extra_fields": str(details.get("extra_fields") or "").strip()[:1024],
+        }
+
+    def score_auth_context(self, context: Optional[Dict[str, Any]]) -> int:
+        if not isinstance(context, dict):
+            return 0
+        score = 0
+        if context.get("username"):
+            score += 2
+        if context.get("password"):
+            score += 2
+        if context.get("login_path"):
+            score += 1
+        if context.get("final_path"):
+            score += 1
+        if context.get("post_login_snippet"):
+            score += 1
+        cookies = context.get("cookies") or {}
+        if isinstance(cookies, dict) and cookies:
+            score += 3
+        if context.get("cookie_header"):
+            score += 1
+        return score
+
+    def auth_context_signature(self, context: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(context, dict):
+            return ""
+        password = str(context.get("password", "")).strip()
+        if password and not password.startswith("vault:"):
+            password = hashlib.sha256(password.encode("utf-8")).hexdigest()[:12]
+        return "|".join([
+            str(context.get("username", "")).strip().lower(),
+            password,
+            str(context.get("login_path", "")).strip().lower(),
+            str(context.get("final_path", "")).strip().lower(),
+        ])
+
+    def merge_auth_context(
+        self,
+        knowledge_base: Any,
+        candidate: Optional[Dict[str, Any]],
+        *,
+        state: Any = None,
+    ) -> None:
+        if not isinstance(knowledge_base, dict) or not isinstance(candidate, dict):
+            return
+
+        vault = None
+        if state is not None or isinstance(knowledge_base, dict):
+            from interfaces.command_system.builtin.agent.credential_vault import (
+                get_credential_vault,
+                scrub_plaintext_secrets_in_kb,
+                sync_vault_index_to_kb,
+                vault_sensitive_fields,
+            )
+
+            vault = get_credential_vault(
+                state=state,
+                kb=knowledge_base,
+                framework=getattr(state, "framework", None),
+            )
+            candidate = dict(candidate)
+            vault_sensitive_fields(candidate, vault, source=str(candidate.get("source_module") or "auth"))
+
+        existing_store = []
+        for row in knowledge_base.get("credential_store", []) or []:
+            if isinstance(row, dict):
+                existing_store.append(dict(row))
+
+        signature = self.auth_context_signature(candidate)
+        merged = None
+        for idx, row in enumerate(existing_store):
+            if signature and self.auth_context_signature(row) == signature:
+                merged = dict(row)
+                merged.update({k: v for k, v in candidate.items() if v})
+                existing_store[idx] = merged
+                break
+
+        if merged is None:
+            existing_store.append(dict(candidate))
+            merged = existing_store[-1]
+
+        existing_store.sort(key=self.score_auth_context, reverse=True)
+        knowledge_base["credential_store"] = existing_store[:6]
+
+        current = knowledge_base.get("active_auth_context", {})
+        if self.score_auth_context(merged) >= self.score_auth_context(current):
+            knowledge_base["active_auth_context"] = merged
+
+        if vault is not None:
+            scrub_plaintext_secrets_in_kb(knowledge_base, vault)
+            sync_vault_index_to_kb(knowledge_base, vault)
+            from core.vault.agent_bridge import capture_discovered_credentials, sync_agent_vault_context
+
+            capture_discovered_credentials(
+                knowledge_base,
+                state=state,
+                framework=getattr(state, "framework", None),
+            )
+            sync_agent_vault_context(
+                knowledge_base,
+                state=state,
+                framework=getattr(state, "framework", None),
+            )
+
+    def get_active_auth_context(self, knowledge_base: Any) -> Dict[str, Any]:
+        kb = knowledge_base if isinstance(knowledge_base, dict) else {}
+        active = kb.get("active_auth_context", {})
+        if isinstance(active, dict) and active:
+            return dict(active)
+        for row in kb.get("credential_store", []) or []:
+            if isinstance(row, dict) and row:
+                return dict(row)
+        return {}
+
+    def _collect_login_path_candidates(self, knowledge_base: Any) -> List[str]:
+        kb = knowledge_base if isinstance(knowledge_base, dict) else {}
+        candidates: List[str] = []
+
+        auth_context = self.get_active_auth_context(kb)
+        for raw in (
+            auth_context.get("login_path"),
+            auth_context.get("final_path"),
+        ):
+            candidate = self._normalize_relative_path(raw)
+            if candidate.startswith("/"):
+                candidates.append(candidate.split("?", 1)[0])
+
+        for raw in kb.get("login_paths", []):
+            if isinstance(raw, str) and raw.startswith("/"):
+                candidates.append(raw.split("?", 1)[0])
+
+        for raw in kb.get("discovered_endpoints", []):
+            if not isinstance(raw, str):
+                continue
+            candidate = raw.split("?", 1)[0]
+            low = candidate.lower()
+            if candidate.startswith("/") and any(token in low for token in AUTH_PATH_MARKERS):
+                candidates.append(candidate)
+
+        unique: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            normalized = str(candidate or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            unique.append(normalized)
+            seen.add(normalized)
+        return unique
+
+    def _build_path_inference_context(self, knowledge_base: Any) -> Dict[str, Any]:
+        kb = knowledge_base if isinstance(knowledge_base, dict) else {}
+        auth_context = self.get_active_auth_context(kb)
+        login_path = str(auth_context.get("login_path") or "").strip()
+        if not login_path:
+            login_path = self.select_best_login_path(kb)
+
+        final_path = str(auth_context.get("final_path") or "").strip()
+        if not final_path:
+            milestone = kb.get("auth_milestone", {}) if isinstance(kb.get("auth_milestone", {}), dict) else {}
+            final_path = self._normalize_relative_path(milestone.get("landing_path"))
+
+        return {
+            "username": str(auth_context.get("username") or "").strip(),
+            "password": str(auth_context.get("password") or "").strip(),
+            "login_path": login_path,
+            "final_path": final_path,
+            "session_cookie": self.extract_preferred_session_cookie(auth_context),
+            "auth_context": auth_context,
+            "login_candidates": self._collect_login_path_candidates(kb),
+        }
+
+    def extract_preferred_session_cookie(self, auth_context: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(auth_context, dict):
+            return ""
+        cookies = auth_context.get("cookies") or {}
+        if isinstance(cookies, dict):
+            for name, value in cookies.items():
+                low = str(name).lower()
+                if any(marker in low for marker in SESSION_COOKIE_NAME_MARKERS):
+                    return str(value)
+            for _, value in cookies.items():
+                if value:
+                    return str(value)
+        return str(auth_context.get("cookie_header") or "").strip()
+
+    def seed_http_session_from_auth(
+        self, module_instance: Any, state: AgentState, auth_context: Any = None
+    ) -> None:
+        from interfaces.command_system.builtin.agent.credential_vault import (
+            get_credential_vault,
+            is_vault_handle,
+        )
+
+        context = auth_context if isinstance(auth_context, dict) else self.get_active_auth_context(
+            state.knowledge_base
+        )
+        if not context:
+            return
+        vault = get_credential_vault(
+            state=state,
+            kb=state.knowledge_base,
+            framework=getattr(state, "framework", None),
+        )
+        cookies = context.get("cookies") or {}
+        merged_cookies = self.sanitize_cookie_map(cookies)
+        for name, value in list(merged_cookies.items()):
+            if is_vault_handle(value):
+                merged_cookies[name] = str(vault.resolve(value) or "")
+        cookie_header = str(context.get("cookie_header") or "").strip()
+        if is_vault_handle(cookie_header):
+            cookie_header = str(vault.resolve(cookie_header) or "")
+        has_cookie_jar = bool(
+            hasattr(module_instance, "session")
+            and getattr(module_instance, "session", None) is not None
+            and hasattr(getattr(module_instance, "session", None), "cookies")
+        )
+
+        if cookie_header and has_cookie_jar:
+            for name, value in self._parse_cookie_header(cookie_header).items():
+                merged_cookies.setdefault(name, value)
+
+        if merged_cookies and hasattr(module_instance, "set_cookie"):
+            if hasattr(module_instance, "remove_header"):
+                try:
+                    module_instance.remove_header("Cookie")
+                except Exception:
+                    pass
+            for name, value in merged_cookies.items():
+                try:
+                    module_instance.set_cookie(str(name), str(value))
+                except Exception:
+                    continue
+
+        if cookie_header and hasattr(module_instance, "set_header") and not has_cookie_jar:
+            try:
+                module_instance.set_header("Cookie", cookie_header)
+            except Exception:
+                pass
+
+    def infer_auth_option_overrides(
+        self, module_instance: Any, module_path: str, state: AgentState
+    ) -> Dict[str, Any]:
+        inference_context = self._build_path_inference_context(state.knowledge_base)
+        auth_context = inference_context.get("auth_context") or {}
+        login_path = str(inference_context.get("login_path") or "").strip()
+        final_path = str(inference_context.get("final_path") or "").strip()
+        session_cookie = str(inference_context.get("session_cookie") or "").strip()
+        username = str(inference_context.get("username") or "").strip()
+        password = str(inference_context.get("password") or "").strip()
+
+        if not any((auth_context, login_path, final_path, session_cookie, username, password)):
+            return {}
+        ctx = AuthOverrideBuildContext(
+            module_instance=module_instance,
+            module_path=str(module_path or ""),
+            auth_context=auth_context,
+            username=username,
+            password=password,
+            login_path=login_path,
+            final_path=final_path,
+            session_cookie=session_cookie,
+        )
+        overrides = compose_auth_option_overrides(ctx)
+        from interfaces.command_system.builtin.agent.credential_vault import (
+            get_credential_vault,
+            is_vault_handle,
+            vault_sensitive_fields,
+        )
+
+        vault = get_credential_vault(
+            state,
+            framework=getattr(state, "framework", None),
+        )
+        safe_overrides: Dict[str, Any] = {}
+        for key, value in overrides.items():
+            if is_vault_handle(value):
+                safe_overrides[key] = value
+            elif str(key).lower() in {"password", "pass", "passwd", "token", "cookie", "session_cookie"}:
+                safe_overrides[key] = vault.store(value, kind=str(key).lower(), source=module_path)
+            else:
+                safe_overrides[key] = value
+        if isinstance(safe_overrides.get("cookies"), dict):
+            nested = dict(safe_overrides["cookies"])
+            vault_sensitive_fields({"cookies": nested}, vault, source=module_path)
+            safe_overrides["cookies"] = nested
+        return safe_overrides
+
+    def _dvwa_login_path_preference(self, knowledge_base: Any, candidates: List[str]) -> str:
+        """
+        Pick the real DVWA login surface.
+
+        Metasploitable-style indexes mention ``/dvwa/`` in HTML even when DVWA is
+        mounted at the web root (``/login.php``). Prefer a corroborated path:
+        - ``/dvwa/login.php`` only when endpoints actually live under ``/dvwa``
+        - otherwise ``/login.php`` / ``/login`` when present
+        """
+        kb = knowledge_base if isinstance(knowledge_base, dict) else {}
+        try:
+            dvwa_conf = float((kb.get("tech_confidence") or {}).get("dvwa", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            dvwa_conf = 0.0
+        hints = {str(h).lower() for h in (kb.get("tech_hints") or [])}
+        if dvwa_conf < 0.4 and "dvwa" not in hints:
+            return ""
+
+        norms = [str(c).split("?", 1)[0] for c in candidates if str(c).startswith("/")]
+        low_set = {c.lower() for c in norms}
+        endpoints = [
+            str(e).split("?", 1)[0].lower()
+            for e in (kb.get("discovered_endpoints") or [])
+            if str(e).startswith("/")
+        ]
+        # Corroborate /dvwa from real endpoints only — login_paths often contain
+        # invented "/dvwa/login.php" from HTML index mentions.
+        has_dvwa_prefix = any(
+            e == "/dvwa" or e.startswith("/dvwa/") for e in endpoints
+        )
+
+        if has_dvwa_prefix:
+            for preferred in ("/dvwa/login.php", "/dvwa/login", "/dvwa/"):
+                for candidate in norms:
+                    if candidate.lower() == preferred:
+                        return candidate
+            for candidate in norms:
+                if candidate.lower().startswith("/dvwa/") and "login" in candidate.lower():
+                    return candidate
+        for preferred in ("/login.php", "/login"):
+            if preferred in low_set:
+                for candidate in norms:
+                    if candidate.lower() == preferred:
+                        return candidate
+        return ""
+
+    def select_best_login_path(self, knowledge_base: Any) -> str:
+        kb = knowledge_base if isinstance(knowledge_base, dict) else {}
+        auth_context = self.get_active_auth_context(kb)
+        auth_login_path = str(auth_context.get("login_path") or "").strip()
+        if auth_login_path.startswith("/"):
+            return auth_login_path
+        candidates = self._collect_login_path_candidates(kb)
+        if not candidates:
+            return ""
+
+        endpoints = [
+            str(e).split("?", 1)[0].lower()
+            for e in (kb.get("discovered_endpoints") or [])
+            if str(e).startswith("/")
+        ]
+        has_dvwa_endpoint = any(e == "/dvwa" or e.startswith("/dvwa/") for e in endpoints)
+        if not has_dvwa_endpoint:
+            # Drop invented "/dvwa/…" login paths from HTML index noise.
+            candidates = [
+                c for c in candidates
+                if not str(c).lower().startswith("/dvwa/")
+            ]
+            if not candidates:
+                return ""
+
+        dvwa_pick = self._dvwa_login_path_preference(kb, candidates)
+        if dvwa_pick:
+            return dvwa_pick
+
+        # Prefer scoped app paths over root-level aliases when both exist
+        # (e.g. "/wordpress/wp-login.php" should beat a bare alias).
+        for preferred in LOGIN_PATH_PRIORITY:
+            scoped = [
+                candidate for candidate in candidates
+                if candidate != preferred and candidate.lower().endswith(preferred.lower())
+            ]
+            if scoped:
+                return sorted(scoped, key=lambda value: (len(value), value))[0]
+        for preferred in LOGIN_PATH_PRIORITY:
+            for candidate in candidates:
+                if candidate.lower() == preferred:
+                    return candidate
+        non_root = [c for c in set(candidates) if c not in ("/", "")]
+        if non_root:
+            return sorted(non_root, key=lambda value: (len(value), value))[0]
+        return sorted(set(candidates), key=lambda value: (len(value), value))[0]
+
+    def build_inferred_option_overrides(self, modules: Any, state: AgentState) -> Dict[str, Any]:
+        kb = state.knowledge_base
+        login_path = self.select_best_login_path(kb)
+        if not login_path:
+            return {}
+        overrides: Dict[str, Dict[str, Any]] = {}
+        bf_extras = infer_bruteforce_field_overrides(login_path)
+        persona_usernames = []
+        persona_passwords = []
+        expanded = bool(getattr(state, "expanded_surface", False)) or bool(
+            isinstance(kb, dict) and kb.get("expanded_surface")
+        )
+        if expanded and isinstance(kb, dict):
+            persona_usernames = list(kb.get("username_candidates") or [])
+            persona_passwords = list(kb.get("password_candidates") or [])
+        for module in modules or []:
+            path = str(module.get("path", "")).strip()
+            if not path:
+                continue
+            if path == "auxiliary/scanner/http/login_page_detector":
+                overrides[path] = {
+                    "custom_paths": login_path,
+                    "max_paths": 8,
+                }
+            elif path == "auxiliary/scanner/http/login/admin_login_bruteforce":
+                bf_opts: Dict[str, Any] = {
+                    "path": login_path,
+                    "max_attempts": bruteforce_attempt_cap(state),
+                    **bf_extras,
+                }
+                # DVWA lab default is admin/password — seed first attempt so we
+                # do not burn budget on admin:admin before password.
+                try:
+                    dvwa_conf = float((kb.get("tech_confidence") or {}).get("dvwa", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    dvwa_conf = 0.0
+                login_low = login_path.lower()
+                if dvwa_conf >= 0.4 or "dvwa" in login_low or login_low in {"/login.php", "/login"}:
+                    hints = {str(h).lower() for h in (kb.get("tech_hints") or [])}
+                    if dvwa_conf >= 0.4 or "dvwa" in hints or "dvwa" in login_low:
+                        bf_opts.setdefault("username", "admin")
+                        bf_opts.setdefault("password", "password")
+                        bf_opts.setdefault("extra_fields", "Login=Login")
+                        bf_opts["max_attempts"] = min(int(bf_opts.get("max_attempts") or 24), 8)
+                if persona_usernames or persona_passwords:
+                    ws = _safe_component(getattr(state, "workspace", "default") or "default")
+                    agent_home = Path(
+                        os.environ.get("KITTYSPLOIT_AGENT_HOME", "~/.kittysploit/agent")
+                    ).expanduser()
+                    paths = AgentPathService(base_dir=str(agent_home / ws))
+                    run_id = str(getattr(state, "run_id", "") or "").strip()
+                    run_dir = paths.run_dir(run_id) if run_id else paths.root / "scratch"
+                    users_file = write_agent_wordlist(
+                        run_dir, "persona_usernames.txt", persona_usernames
+                    )
+                    passwords_file = write_agent_wordlist(
+                        run_dir, "persona_passwords.txt", persona_passwords
+                    )
+                    if users_file:
+                        bf_opts["usernames_file"] = users_file
+                    if passwords_file:
+                        bf_opts["passwords_file"] = passwords_file
+                    attempt_cap = min(
+                        EXPANDED_SURFACE_BRUTEFORCE_MAX_ATTEMPTS,
+                        bruteforce_attempt_cap(
+                            state,
+                            persona_pairs=len(persona_usernames) * max(1, len(persona_passwords)),
+                        ),
+                    )
+                    bf_opts["max_attempts"] = attempt_cap
+                overrides[path] = bf_opts
+            elif "dvwa_sqli_shell" in path or path.endswith("/sqli_shell"):
+                # Never drop the agent into an interactive sql> REPL — confirm
+                # injection with a one-shot query, then continue toward OS shell.
+                overrides[path] = {
+                    "shell_sqli": False,
+                    "single_sql": "@@version",
+                }
+        return overrides

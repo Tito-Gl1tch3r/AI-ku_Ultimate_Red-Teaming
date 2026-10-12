@@ -1,0 +1,191 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.MiddleEnd.ControlFlowGraph
+
+open System.Collections.Immutable
+open B2R2
+open B2R2.FrontEnd.BinLifter
+open B2R2.BinIR
+open B2R2.BinIR.LowUIR
+
+/// Represents a basic block of an IR-level CFG.
+type LowUIRBasicBlock internal(pp, summary, liftedInss, lblMap) =
+  /// Dominating jump table.
+  let mutable domJT = None
+
+  let isTerminatingStmt stmt =
+    match stmt with
+    | Jmp _ | CJmp _ | InterJmp _ | InterCJmp _
+    | SideEffect(Effect = SysCall)
+    | SideEffect(Effect = Terminate)
+    | SideEffect(Effect = Interrupt _) -> true
+    | _ -> false
+
+  let rec isSemanticallyNop (stmts: Stmt[]) len idx =
+    if idx < len then
+      match stmts[idx] with
+      | ISMark _ | IEMark _ ->
+        isSemanticallyNop stmts len (idx + 1)
+      | Put(Dst = d; Src = s) when d = s ->
+        isSemanticallyNop stmts len (idx + 1)
+      | _ ->
+        false
+    else
+      true
+
+  /// Returns the `ILowUIRBasicBlock` interface to access the internal
+  /// representation of the basic block.
+  member inline this.Internals with get() = this :> ILowUIRBasicBlock
+
+  /// Gets the intra-instruction label information, which is a mapping from a
+  /// label to the corresponding program point.
+  member _.LabelMap
+    with get(): ImmutableDictionary<Label, ProgramPoint> = lblMap
+
+  /// Gets or sets the dominating jump table entry (tbl address and index),
+  /// which is a jump table entry that dominates this basic block. In other
+  /// words, this basic block is dominated by the indirect jump instruction
+  /// that uses this jump table entry. This property is None if there's no
+  /// such dominating jump table entry.
+  member _.DominatingJumpTableEntry
+    with get(): (Addr * int) option = domJT
+     and set(v) = domJT <- v
+
+  /// Creates a regular basic block out of the given lifted instructions.
+  static member CreateRegular(liftedInss, pp) =
+    LowUIRBasicBlock(pp, None, liftedInss, ImmutableDictionary.Empty)
+
+  /// Creates a regular basic block out of the given lifted instructions
+  /// and intra-instruction label map.
+  static member CreateRegular(liftedInss, pp, lblMap) =
+    LowUIRBasicBlock(pp, None, liftedInss, lblMap)
+
+  /// Creates an abstract basic block located at the given program point.
+  static member CreateAbstract(pp, summary) =
+    LowUIRBasicBlock(pp, Some summary, [||], ImmutableDictionary.Empty)
+
+  /// Cuts the basic block at the given address and returns the two new basic
+  /// blocks. This function does not modify the original basic block. We
+  /// assume that the given address is within the range of the basic block.
+  /// Otherwise, this function will raise an exception.
+  member this.Cut(cutPoint: Addr) =
+    if Option.isNone summary then
+      assert ((this :> IAddressable).Range.IsIncluding cutPoint)
+      let fstInstrs, sndInstrs =
+        liftedInss
+        |> Array.partition (fun ins -> ins.Original.Address < cutPoint)
+      let sndInstrs =
+        sndInstrs |> Array.map (fun ins -> { ins with BBLAddr = cutPoint })
+      let cutPPoint = ProgramPoint(cutPoint, 0)
+      (* Labels always come from the terminator of the last instruction, and
+         that instruction always lands in the latter block, so the whole map
+         belongs to the latter block and the former one needs no label. *)
+      assert (lblMap.Values |> Seq.forall (fun p -> p.Address >= cutPoint))
+      let fstBBL =
+        LowUIRBasicBlock.CreateRegular(fstInstrs, pp, ImmutableDictionary.Empty)
+      let sndBBL =
+        LowUIRBasicBlock.CreateRegular(sndInstrs, cutPPoint, lblMap)
+      fstBBL, sndBBL
+    else
+      raise AbstractBlockAccessException
+
+  override _.ToString() = $"{nameof LowUIRBasicBlock}({pp})"
+
+  interface ILowUIRBasicBlock with
+    member _.PPoint with get() = pp
+
+    member _.Range with get() =
+      if Option.isNone summary then
+        let lastIns = liftedInss[liftedInss.Length - 1].Original
+        let lastAddr = lastIns.Address + uint64 lastIns.Length
+        AddrRange.create pp.Address (lastAddr - 1UL)
+      else
+        AddrRange.singleton pp.Address
+
+    member _.IsAbstract with get() = Option.isSome summary
+
+    member _.AbstractContent with get() =
+      if Option.isNone summary then raise AbstractBlockAccessException
+      else summary.Value
+
+    member _.LiftedInstructions with get() = liftedInss
+
+    member _.StartsWithNop with get() =
+      let stmts = liftedInss[0].Stmts
+      isSemanticallyNop stmts stmts.Length 0
+
+    member _.Terminator with get() =
+      assert ((Option.isNone summary && not <| Array.isEmpty liftedInss)
+           || (Option.isSome summary &&
+               not <| Array.isEmpty summary.Value.Rundown))
+      let stmts =
+        if Option.isNone summary then
+          let stmts = liftedInss[liftedInss.Length - 1].Stmts
+          stmts[stmts.Length - 2..]
+        else
+          summary.Value.Rundown
+      stmts
+      |> Array.filter isTerminatingStmt
+      |> Array.tryExactlyOne
+      |> Option.defaultValue stmts[stmts.Length - 1]
+
+    member _.Instructions with get() =
+      liftedInss |> Array.map (fun liftedIns -> liftedIns.Original)
+
+    member _.LastInstruction with get() =
+      assert (not <| Array.isEmpty liftedInss)
+      liftedInss[liftedInss.Length - 1].Original
+
+    member _.Disassemblies with get() =
+      liftedInss
+      |> Array.map (fun liftedIns -> liftedIns.Original.Disasm())
+
+    member _.BlockAddress with get() = pp.Address
+
+    member _.LineAddrRanges with get() =
+      liftedInss
+      |> Array.map (fun liftedIns ->
+        let insAddr = liftedIns.Original.Address
+        let insEndAddr = insAddr + uint64 liftedIns.Original.Length - 1UL
+        AddrRange.create insAddr insEndAddr)
+
+    member _.Visualize() =
+      if Option.isNone summary then
+        liftedInss
+        |> Array.collect (fun liftedIns -> liftedIns.Stmts)
+        |> Array.map (fun stmt ->
+          [| { AsmWordKind = AsmWordKind.String
+               AsmWordValue = PrettyPrinter.ToString stmt } |])
+      else
+        [||]
+
+/// Represents a basic block containing a sequence of lifted LowUIR
+/// statements.
+and ILowUIRBasicBlock =
+  inherit IAddressable
+  inherit IAbstractable<LowUIR.Stmt>
+  inherit ILowUIRAccessible
+  inherit IInstructionAccessible
+  inherit IVisualizable

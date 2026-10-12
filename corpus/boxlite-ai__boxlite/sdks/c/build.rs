@@ -1,0 +1,30 @@
+use std::env;
+use std::path::PathBuf;
+
+fn main() {
+    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let output_file = PathBuf::from(&crate_dir).join("include").join("boxlite.h");
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,@rpath/libboxlite.dylib");
+    }
+
+    // Create include directory if it doesn't exist
+    std::fs::create_dir_all(output_file.parent().unwrap())
+        .expect("Failed to create include directory");
+
+    // Load cbindgen configuration from cbindgen.toml
+    let config_path = PathBuf::from(&crate_dir).join("cbindgen.toml");
+    let config = cbindgen::Config::from_file(&config_path).expect("Failed to load cbindgen.toml");
+
+    // Generate C header from the C SDK crate.
+    cbindgen::Builder::new()
+        .with_crate(&crate_dir)
+        .with_config(config)
+        .generate()
+        .expect("Unable to generate C bindings")
+        .write_to_file(&output_file);
+
+    println!("cargo:rerun-if-changed=src/");
+    println!("cargo:rerun-if-changed=cbindgen.toml");
+}

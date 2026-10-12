@@ -1,0 +1,62 @@
+import type { ResourceKind } from "./api/types";
+import { logCaughtDiagnostic } from "./diagnostics";
+
+export type ProjectSurface = "workbench" | "work" | "assets" | "evidence" | "sources" | "results" | "findings" | "reports";
+
+export const projectRoot = (projectId: string) => `/projects/${encodeURIComponent(projectId)}`;
+
+export function projectSurface(projectId: string, surface: ProjectSurface, resourceId?: string): string {
+  const base = `${projectRoot(projectId)}/${surface}`;
+  return resourceId ? `${base}/${encodeURIComponent(resourceId)}` : base;
+}
+
+export function resourcePath(projectId: string | undefined, kind: ResourceKind, id?: string): string {
+  if (kind === "library_item") return id ? `/library/${encodeURIComponent(id)}` : "/library";
+  if (!projectId) return "/";
+  if (kind === "project") return projectRoot(projectId);
+  if (kind === "browser_session" && id) return `${projectSurface(projectId, "workbench")}?browserSession=${encodeURIComponent(id)}`;
+  if (kind === "browser_tab" && id) {
+    const [browserSession, ...tabParts] = id.split("/");
+    const query = new URLSearchParams({ browserSession, tab: tabParts.join("/") });
+    return `${projectSurface(projectId, "workbench")}?${query}`;
+  }
+  if (kind === "terminal_session" && id) return `${projectSurface(projectId, "workbench")}?view=terminal&session=${encodeURIComponent(id)}`;
+  if (kind === "mission" && id) return `${projectSurface(projectId, "workbench")}?mission=${encodeURIComponent(id)}`;
+  const surface: Partial<Record<ResourceKind, ProjectSurface>> = {
+    asset: "assets", evidence: "evidence", source: "sources", finding: "findings",
+    report: "reports", conversation: "workbench",
+  };
+  const target = surface[kind] ?? "workbench";
+  if (kind === "conversation" && id) return `${projectSurface(projectId, target)}?view=chat&session=${encodeURIComponent(id)}`;
+  return projectSurface(projectId, target, id);
+}
+
+export function canonicalNavigationPath(legacyPath: string, projectId?: string): string {
+  if (legacyPath === "/settings" || legacyPath === "/library") return legacyPath;
+  if (legacyPath === "/work") return "/projects";
+  if (legacyPath === "/project/work") return projectId ? projectSurface(projectId, "work") : "/projects";
+  if (legacyPath === "/project" && !projectId) return "/projects";
+  if (!projectId) return legacyPath;
+  if (legacyPath === "/") return projectSurface(projectId, "workbench");
+  if (legacyPath === "/findings") return projectSurface(projectId, "findings");
+  if (legacyPath === "/reports") return projectSurface(projectId, "reports");
+  if (legacyPath === "/project") return projectRoot(projectId);
+  return legacyPath;
+}
+
+export function projectIdFromPath(pathname: string): string | undefined {
+  const match = /^\/projects\/([^/]+)(?:\/|$)/.exec(pathname);
+  if (!match) return undefined;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch (error) {
+    void logCaughtDiagnostic("interface.resource_route.invalid_project_id", "A canonical project route contained invalid URL encoding.", error, "resource-routing");
+    return match[1];
+  }
+}
+
+export function replaceProjectInPath(pathname: string, projectId: string): string {
+  return projectIdFromPath(pathname)
+    ? pathname.replace(/^\/projects\/[^/]+/, projectRoot(projectId))
+    : projectRoot(projectId);
+}

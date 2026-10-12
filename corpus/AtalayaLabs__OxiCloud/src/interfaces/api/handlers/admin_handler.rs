@@ -1,0 +1,4453 @@
+use axum::{
+    Router,
+    extract::{DefaultBodyLimit, Json, Multipart, Path, Query, State},
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{delete, get, post, put},
+};
+
+use crate::application::dtos::drive_dto::DriveDto;
+use crate::application::dtos::grant_dto::{GrantDto, RoleDto, SubjectDto, SubjectTypeDto};
+use crate::application::dtos::plugin_dto::{
+    PluginInfoDto, PluginLogEntryDto, PluginLogPageDto, PluginLogQueryDto, PluginRetentionDto,
+    SetEnabledDto,
+};
+use crate::application::dtos::settings_dto::{
+    AdminCreateUserDto, AdminResetPasswordDto, DashboardStatsDto, DriveKindUsageDto,
+    ListSessionsQueryDto, ListUsersQueryDto, MigrationStateDto, NotifyInfoDto, SaveOidcSettingsDto,
+    SaveStorageSettingsDto, SendSmtpTestDto, SmtpInfoDto, SmtpTestResultDto, StartMigrationDto,
+    TestOidcConnectionDto, TestStorageConnectionDto, TransferOwnershipDto, UpdateUserActiveDto,
+    UpdateUserQuotaDto, UpdateUserRoleDto, WebhookInfoDto,
+};
+use crate::application::dtos::user_dto::{FullUserDto, PublicUserDto};
+use crate::application::ports::authorization_ports::AuthorizationEngine;
+use crate::application::ports::plugin_ports::{LogQuery, PluginManagementPort, PluginMgmtError};
+// JobStoreProvider is used only by the storage-migration shims below,
+// but the compiler needs the trait in scope for method resolution on
+// the concrete `PgJobStoreProvider` that lives on `AppState`.
+use crate::common::di::AppState;
+use crate::domain::repositories::drive_repository::DriveRepository;
+use crate::domain::services::authorization::{Resource, Subject};
+use crate::infrastructure::scheduler::{JobStoreProvider, PausedRunBrief};
+use crate::interfaces::api::handlers::dedup_handler::{
+    admin_check_hash, get_stats, recalculate_stats,
+};
+use crate::interfaces::api::handlers::search_handler::clear_search_cache;
+use crate::interfaces::errors::AppError;
+use crate::interfaces::middleware::auth::AuthUser;
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// Response envelope for `GET /api/admin/users`. `users` is always
+/// `Vec<FullUserDto>` — same shape one row of `/me`'s embedded
+/// `full` block carries; the FE seeds `resolveUser` cache from
+/// `row.user` (kills the per-row `/api/users/{id}` fetch). See
+/// `docs/plan/userdto-refactor.md`.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct AdminUsersPageResponse {
+    users: Vec<FullUserDto>,
+    total: i64,
+    limit: i64,
+    offset: i64,
+}
+
+/// Admin API routes — all require admin role.
+///
+/// Takes an `AppState` reference so feature-flag gating at route-
+/// registration time is possible (external-mounts admin surface
+/// mirrors the `OXICLOUD_ENABLE_EXTERNAL_MOUNTS` flag; when the flag
+/// is off the runtime `MountRegistry` isn't loaded, so exposing the
+/// CRUD would let admins configure mounts that silently don't work).
+pub fn admin_routes(app_state: &Arc<AppState>) -> Router<Arc<AppState>> {
+    use super::admin_external_mounts as ext_mounts;
+    let mut router = Router::new();
+
+    // External file mounts — CRUD registered only when the feature
+    // is enabled server-side. Matches the pattern used for the
+    // message bus (`/api/rt/ws` unmounted when
+    // `OXICLOUD_MESSAGEBUS_ENABLE=false`): a disabled feature stays
+    // fully hidden from the admin panel too. Without this guard the
+    // admin panel would load, editor would save DB rows, but the
+    // runtime `MountRegistry` (gated by the same flag in
+    // `common/di.rs`) wouldn't load them — a silently-broken UX.
+    // FE mirrors via `serverConfig.features.external_mounts`.
+    if app_state.core.config.features.enable_external_mounts {
+        router = router
+            .route(
+                "/external-mounts",
+                get(ext_mounts::list_external_mounts).post(ext_mounts::create_external_mount),
+            )
+            .route(
+                "/external-mounts/{id}",
+                delete(ext_mounts::delete_external_mount),
+            );
+    }
+
+    router = router
+        // OIDC settings
+        .route("/settings/oidc", get(get_oidc_settings))
+        .route("/settings/oidc", put(save_oidc_settings))
+        .route("/settings/oidc/test", post(test_oidc_connection))
+        // Storage settings
+        .route("/settings/storage", get(get_storage_settings))
+        .route("/settings/storage", put(save_storage_settings))
+        .route("/settings/storage/test", post(test_storage_connection))
+        // Storage migration — thin shims over the recoverable-run
+        // engine (job_name = "backend_migration"). Retained under
+        // /storage/migration/* until the admin UI is rewired to
+        // /api/admin/jobs/backend_migration/*; both paths route to
+        // the same underlying JobRegistry dispatch. The old /complete
+        // endpoint is retired — a finished run is a Completed row,
+        // there's nothing to acknowledge.
+        .route("/storage/migration", get(get_migration_status))
+        .route("/storage/migration/start", post(start_migration))
+        .route("/storage/migration/pause", post(pause_migration))
+        .route("/storage/migration/resume", post(resume_migration))
+        // Backend write-lock (operator-driven External variant) —
+        // see the handler docs. GET inspects, POST acquires, DELETE
+        // releases any variant (admin escape hatch for stuck
+        // migrations).
+        .route(
+            "/storage/write-lock",
+            get(get_backend_write_lock)
+                .post(acquire_backend_write_lock)
+                .delete(release_backend_write_lock),
+        )
+        // Operator-driven banner messages — CRUD on the list +
+        // per-id update/delete. See the handler docs on each
+        // function.
+        .route("/banners", get(list_ops_banners).post(create_ops_banner))
+        .route(
+            "/banners/{id}",
+            axum::routing::put(update_ops_banner).delete(delete_ops_banner),
+        )
+        // K3 (storage-key-rotation): per-entry rotate trigger.
+        // Normalises every blob on the named entry to its head-pair
+        // format (legacy → v1, plaintext ↔ encrypted, old-key →
+        // new-key). No readonly mode; safe under normal traffic.
+        .route(
+            "/storage/entries/{name}/rotate",
+            post(trigger_backend_rotate),
+        )
+        // NOTE: /storage/migration/verify retired in slice 7 (see the
+        // comment near where `verify_migration` used to live). Use
+        // `POST /api/admin/jobs/blobs_consistency/trigger?storage=<name>`.
+        // Encryption key generation
+        .route(
+            "/settings/storage/generate-key",
+            post(generate_encryption_key),
+        )
+        // Dashboard / stats
+        .route("/dashboard", get(get_dashboard_stats))
+        // User management
+        .route("/users", get(list_users))
+        .route("/users", post(create_user))
+        .route("/users/{id}", get(get_user))
+        .route("/users/{id}", delete(delete_user))
+        // Session management (DPoP admin panel — see docs/plan/dpop.md
+        // Gate 10). List is global cross-user with `?user_id=` narrow;
+        // revoke sets `revoked=true` (row stays for audit).
+        .route("/sessions", get(list_sessions))
+        .route("/sessions/{id}", delete(revoke_session))
+        .route("/users/{id}/role", put(update_user_role))
+        .route("/users/{id}/active", put(update_user_active))
+        .route("/users/{id}/quota", put(update_user_quota))
+        .route("/users/{id}/password", put(reset_user_password))
+        .route(
+            "/users/{id}/promote-to-internal",
+            post(admin_promote_external_to_internal),
+        )
+        // Ownership transfer. Not under /users/{id} because it mutates TWO
+        // rows — the caller is demoted as the target is promoted — so it
+        // reads as an instance-level operation, not a user edit.
+        .route("/transfer-ownership", post(transfer_ownership))
+        // Registration control
+        .route("/settings/registration", put(set_registration_setting))
+        // Audio metadata
+        .route("/audio/metadata/reextract", post(reextract_audio_metadata))
+        // Image/video capture metadata (Photos timeline backfill)
+        .route("/photos/metadata/reextract", post(reextract_image_metadata))
+        // Plugin management
+        .route("/plugins", get(list_plugins))
+        // Install caps the request body at 32 MiB (overriding the global
+        // multi-GB upload limit) — a plugin bundle is small; the unpack also
+        // enforces a 64 MiB decompressed ceiling.
+        .route(
+            "/plugins",
+            post(install_plugin).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route("/plugins/{id}/enabled", put(set_plugin_enabled))
+        .route("/plugins/{id}", delete(delete_plugin))
+        // Plugin logs + per-plugin retention
+        .route("/plugins/{id}/logs", get(get_plugin_logs))
+        .route("/plugins/{id}/logs", delete(clear_plugin_logs))
+        .route("/plugins/{id}/logs/stream", get(stream_plugin_logs))
+        .route("/plugins/{id}/retention", get(get_plugin_retention))
+        .route("/plugins/{id}/retention", put(set_plugin_retention))
+        // Search — operator flush of the shared moka results cache
+        // (AuthZ audit #14, 2026-07-16). `invalidate_all()` semantics
+        // touch every tenant, so this is admin-only. Lived at
+        // `/api/search/cache` pre-2026-07-17; the URL now declares
+        // its admin intent up front.
+        .route("/search/cache", delete(clear_search_cache))
+        // Dedup — global storage stats + integrity recalculation
+        // (AuthZ audit #24 + #25, 2026-07-17). Both are operator-only
+        // observability / maintenance surfaces (blob-count-level data
+        // + verify_integrity sweep). Moved here from `/api/dedup/*`
+        // so the URL declares admin intent and the middleware layer
+        // enforces it — same pattern as `search/cache` above. The
+        // any-authenticated sibling routes (`/check-batch`,
+        // `/blob/{hash}`) stay at `/api/dedup/*`; `/check/{hash}` is
+        // split — the user-scoped sibling at `/api/dedup/check/{hash}`
+        // drops `ref_count` entirely and 404s when the caller holds no
+        // visible reference, while the admin shape below carries the
+        // global `ref_count` the accounting tests assert on
+        // (`refcount_same_content_rewrite.hurl`, `derived_blob_copy.hurl`).
+        // See §9b of `docs/plan/photos-resources-migration.md`.
+        .route("/dedup/check/{hash}", get(admin_check_hash))
+        .route("/dedup/stats", get(get_stats))
+        .route("/dedup/recalculate", post(recalculate_stats))
+        // Transcode effectiveness. Nothing exposed these before, so there
+        // was no way to tell a served-from-cache response from one that
+        // re-ran the decode + encode — not from the outside, and not from
+        // a test either.
+        .route("/transcode/stats", get(get_transcode_stats))
+        // SMTP diagnostics
+        .route("/smtp/info", get(get_smtp_info))
+        .route("/webhook/info", get(get_webhook_info))
+        .route("/smtp/test", post(send_smtp_test))
+        // Beside /smtp/test deliberately: both verify an outbound
+        // transport, and the panel presents them together.
+        .route("/webhook/test", post(send_webhook_test))
+        // Alerting, as opposed to the transports above: the severity
+        // floor and which channels are wired. Read-only — testing a
+        // channel is the transports' own job.
+        .route("/notify/info", get(get_notify_info))
+        // Test-only capture endpoint. The handler short-circuits to 404
+        // when `OXICLOUD_SMTP_MOCK` is off, so production deployments
+        // can route the path freely without leaking inboxes.
+        .route("/smtp/test/captured", get(get_captured_email))
+        // JobRegistry admin surface — production, always-on,
+        // audit-logged. See `docs/plan/job-registry.md` §Cross-cutting.
+        // Retired the `/internal/trigger-sweep|gc|grant-cleanup` shims
+        // that used to sit here (Stage 2 of the job-registry rollout).
+        //
+        // `/jobs` + `/jobs/{name}/trigger` cover every registered
+        // JobHandler (periodic + recoverable — recoverable ones slot
+        // in through `RecoverableAdapter`). The `/cancel` + `/runs`
+        // + `/runs/{id}` triplet is recoverable-only — hitting them
+        // on a stateless job silently gets an empty list / no-op
+        // cancel, since no rows in `jobs.recoverable_runs` match.
+        // See `docs/plan/job-registry.md` Part 2.
+        .route("/jobs", get(list_jobs))
+        .route("/jobs/{name}/trigger", post(trigger_job))
+        .route("/jobs/{name}/cancel", post(cancel_job))
+        .route("/jobs/{name}/pause", post(pause_job))
+        .route("/jobs/{name}/runs", get(list_job_runs))
+        .route("/jobs/{name}/runs/{id}", get(get_job_run))
+        .route(
+            "/jobs/{name}/runs/{id}/findings",
+            get(list_job_run_findings),
+        )
+        // Retention cleanup is the `job_runs_cleanup` job — nightly, and
+        // reachable on demand through the ordinary trigger route above.
+        // Its bespoke `/jobs/runs/purge` route was removed rather than
+        // kept as an alias: two ways to run one purge is how the two
+        // drift.
+        // Per-drive-kind default policies. Deliberately under `/api/admin`
+        // rather than beside the per-drive `PATCH /api/drives/{id}/policies`:
+        // this nest carries the `require_admin` router layer, so the guard is
+        // structural rather than a check each handler must remember. The
+        // per-drive endpoint keeps its documented handler-layer deviation.
+        .route(
+            "/drive-policies/defaults/{kind}",
+            get(get_drive_policy_defaults).put(set_drive_policy_defaults),
+        )
+        .route("/drive-policies/drift", get(get_drive_policy_drift))
+        // Drives — admin-wide view (distinct from `/api/drives` which
+        // is filtered to the caller's role grants).
+        .route("/drives", get(list_all_drives))
+        .route("/drives/{id}", delete(delete_drive_admin))
+        .route(
+            "/drives/{id}/members",
+            get(list_drive_members_admin).post(add_drive_member_admin),
+        )
+        .route(
+            "/drives/{id}/members/{kind}/{sid}",
+            axum::routing::patch(update_drive_member_admin).delete(remove_drive_member_admin),
+        );
+
+    router
+}
+
+// Every route under `/api/admin/*` is gated by the
+// `require_admin` middleware layer wired at the router nest point
+// (`routes.rs::admin_router`). Handlers no longer need an inline
+// guard call — the caller is guaranteed to be admin by construction.
+// Callers that need the caller's id read it from the `AuthUser`
+// extractor (`middleware::auth::AuthUser`), populated by the outer
+// `auth_middleware`.
+
+/// GET /api/admin/settings/oidc — get OIDC settings for the admin panel
+#[utoipa::path(
+    get,
+    path = "/api/admin/settings/oidc",
+    responses(
+        (status = 200, body = crate::application::dtos::settings_dto::OidcSettingsDto, description = "OIDC settings"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_oidc_settings(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let svc = state
+        .admin_settings_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Admin settings service not available"))?;
+
+    let settings = svc
+        .get_oidc_settings()
+        .await
+        .map_err(|e| AppError::internal_error(format!("Failed to load settings: {}", e)))?;
+
+    Ok(Json(settings))
+}
+
+/// PUT /api/admin/settings/oidc — save OIDC settings + hot-reload
+#[utoipa::path(
+    put,
+    path = "/api/admin/settings/oidc",
+    responses(
+        (status = 200, body = Object, description = "OIDC settings saved"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn save_oidc_settings(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(dto): Json<SaveOidcSettingsDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let user_id = auth_user.id;
+
+    let svc = state
+        .admin_settings_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Admin settings service not available"))?;
+
+    svc.save_oidc_settings(dto, user_id)
+        .await
+        .map_err(|e| AppError::internal_error(format!("Failed to save settings: {}", e)))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "OIDC settings saved and applied successfully"
+        })),
+    ))
+}
+
+/// POST /api/admin/settings/oidc/test — test OIDC discovery
+async fn test_oidc_connection(
+    State(state): State<Arc<AppState>>,
+    Json(dto): Json<TestOidcConnectionDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let svc = state
+        .admin_settings_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Admin settings service not available"))?;
+
+    let result = svc
+        .test_oidc_connection(dto)
+        .await
+        .map_err(|e| AppError::internal_error(format!("Connection test failed: {}", e)))?;
+
+    Ok(Json(result))
+}
+
+// ─────────────────────────────────────────────────────
+// Storage settings handlers
+// ─────────────────────────────────────────────────────
+
+/// GET /api/admin/settings/storage — get storage backend settings
+#[utoipa::path(
+    get,
+    path = "/api/admin/settings/storage",
+    responses(
+        (status = 200, body = crate::application::dtos::settings_dto::StorageSettingsDto, description = "Storage settings"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_storage_settings(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let svc = state
+        .storage_settings_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Storage settings service not available"))?;
+
+    let settings = svc
+        .get_storage_settings()
+        .await
+        .map_err(|e| AppError::internal_error(format!("Failed to load storage settings: {}", e)))?;
+
+    Ok(Json(settings))
+}
+
+/// PUT /api/admin/settings/storage — save storage backend settings
+#[utoipa::path(
+    put,
+    path = "/api/admin/settings/storage",
+    responses(
+        (status = 200, body = Object, description = "Storage settings saved"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn save_storage_settings(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(dto): Json<SaveStorageSettingsDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let user_id = auth_user.id;
+
+    let svc = state
+        .storage_settings_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Storage settings service not available"))?;
+
+    svc.save_storage_settings(dto, user_id)
+        .await
+        .map_err(|e| AppError::internal_error(format!("Failed to save storage settings: {}", e)))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "Storage settings saved successfully"
+        })),
+    ))
+}
+
+/// POST /api/admin/settings/storage/test — test storage backend connection
+async fn test_storage_connection(
+    State(state): State<Arc<AppState>>,
+    Json(dto): Json<TestStorageConnectionDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let svc = state
+        .storage_settings_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Storage settings service not available"))?;
+
+    let result = svc
+        .test_storage_connection(dto)
+        .await
+        .map_err(|e| AppError::internal_error(format!("Storage connection test failed: {}", e)))?;
+
+    Ok(Json(result))
+}
+
+// ─────────────────────────────────────────────────────
+// Storage migration handlers
+// ─────────────────────────────────────────────────────
+
+/// GET /api/admin/storage/migration — current migration progress.
+///
+/// Shim over the recoverable-run engine: reads the latest
+/// `backend_migration` run from `jobs.recoverable_runs` (via the
+/// `JobStoreProvider`) and projects it into the legacy
+/// `MigrationStateDto` shape the admin storage tab expects. When no
+/// run has ever been triggered the response is an empty "idle" DTO —
+/// same behaviour the old in-memory `MigrationState::default()`
+/// produced.
+#[utoipa::path(
+    get,
+    path = "/api/admin/storage/migration",
+    responses(
+        (status = 200, body = crate::application::dtos::settings_dto::MigrationStateDto, description = "Current migration status"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_migration_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::infrastructure::services::backend_migration_service::BACKEND_MIGRATION_JOB_NAME;
+
+    let provider = state.core.job_store_provider.clone();
+    let latest = provider
+        .list_runs(BACKEND_MIGRATION_JOB_NAME, 1)
+        .await
+        .map_err(AppError::from)?
+        .into_iter()
+        .next();
+
+    let Some(run) = latest else {
+        return Ok(Json(idle_migration_dto()));
+    };
+
+    // Failed blobs are stored as findings, kind = "migration_failed".
+    // Pull up to a reasonable ceiling — the DTO ships the full list,
+    // and the admin UI truncates its own display.
+    let findings = provider
+        .list_findings(run.id, 500, 0)
+        .await
+        .map_err(AppError::from)?;
+    let failed_blobs: Vec<String> = findings
+        .into_iter()
+        .filter(|f| f.kind == "migration_failed")
+        .filter_map(|f| {
+            f.detail
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    Ok(Json(run_to_migration_dto(&run, failed_blobs)))
+}
+
+/// POST /api/admin/storage/migration/start — begin background migration.
+///
+/// Shim that forwards to `JobRegistry::trigger("backend_migration",
+/// ...)`. `run_or_resume` (the RecoverableAdapter's inner dispatch)
+/// resumes a Paused run or starts a fresh one — one endpoint covers
+/// both. Exclusivity is enforced at the DB layer (the partial unique
+/// index on `jobs.recoverable_runs`), so a second concurrent trigger
+/// is a no-op that returns the existing run.
+///
+/// `StartMigrationDto.concurrency` is currently ignored — the
+/// recoverable copy loop runs sequentially. Kept in the DTO for
+/// wire-compat with the admin UI; will be honoured if a concurrency
+/// knob is added later.
+#[utoipa::path(
+    post,
+    path = "/api/admin/storage/migration/start",
+    responses(
+        (status = 200, body = Object, description = "Migration started"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn start_migration(
+    State(state): State<Arc<AppState>>,
+    Json(dto): Json<StartMigrationDto>,
+) -> Result<impl IntoResponse, AppError> {
+    // Validate at the HTTP layer (before spawning) so unknown / no-op
+    // targets get a synchronous 400 response instead of burning a
+    // failed run row. The handler's own checks are second-line
+    // defence for the resume path where args aren't repeated.
+    let entries = &state.core.config.storage_entries;
+    // Snapshot the active-name for the guard. Read lock held only
+    // for the clone.
+    let active = state
+        .core
+        .active_backend_name
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if entries.iter().all(|e| e.name != dto.target_name) {
+        let available = if entries.is_empty() {
+            "(none)".to_string()
+        } else {
+            entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return Err(AppError::bad_request(format!(
+            "unknown target entry `{}`. Available: [{available}]",
+            dto.target_name
+        )));
+    }
+    if dto.target_name == active {
+        return Err(AppError::bad_request(format!(
+            "target `{}` is the currently-active entry — pick a different entry to migrate to",
+            dto.target_name
+        )));
+    }
+    trigger_backend_migration(state, Some(dto.target_name)).await
+}
+
+/// POST /api/admin/storage/migration/pause — pause a running migration.
+///
+/// Shim over cooperative cancel: flips the run row's status to
+/// `CancelRequested`; the recoverable handler polls between batches
+/// and returns `Paused` at the next boundary. If nothing is running,
+/// returns 200 with `paused: false` — matches the "no-op is fine"
+/// contract of `/api/admin/jobs/{name}/cancel`.
+#[utoipa::path(
+    post,
+    path = "/api/admin/storage/migration/pause",
+    responses(
+        (status = 200, body = Object, description = "Pause signalled (or no-op)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn pause_migration(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::infrastructure::services::backend_migration_service::BACKEND_MIGRATION_JOB_NAME;
+
+    tracing::info!(
+        target: "audit",
+        event = "backend_migration.pause_requested",
+        "👮🏻‍♂️ Admin requested backend_migration pause"
+    );
+
+    let flipped = state
+        .core
+        .job_store_provider
+        .request_cancel(BACKEND_MIGRATION_JOB_NAME)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "paused":  flipped.is_some(),
+            "run_id":  flipped,
+            "message": if flipped.is_some() {
+                "Pause requested — handler will yield at the next batch boundary"
+            } else {
+                "No running migration to pause"
+            },
+        })),
+    ))
+}
+
+/// POST /api/admin/storage/migration/resume — resume a paused migration.
+///
+/// Same underlying trigger as `/start`: `run_or_resume` inspects the
+/// latest row and picks Fresh / Resume / AlreadyActive at dispatch
+/// time. Kept as a distinct endpoint for wire-compat.
+#[utoipa::path(
+    post,
+    path = "/api/admin/storage/migration/resume",
+    responses(
+        (status = 200, body = Object, description = "Migration resumed (or already running)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn resume_migration(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    // Resume path — no target_name in the body. The handler reads
+    // it from `params.target_name` stamped on the original Fresh
+    // open. Refuses gracefully via RunOutcome::Failed if there is
+    // no Paused row to resume.
+    trigger_backend_migration(state, None).await
+}
+
+// ─── Backend write-lock — operator-driven External acquire/release ─────────
+//
+// The typed-reason gate from
+// `application::services::backend_write_gate` covers four variants:
+// `Migration`, `Backup`, `Rotation` (held by the job that owns the
+// operation), and `External` (held by an operator who needs OxiCloud
+// to quiesce while they run restic / borg / a filesystem snapshot).
+// These three endpoints expose the External variant to the admin
+// UI — one GET to inspect the holder, one POST to acquire, one
+// DELETE to release.
+//
+// Why operator-release can clear ANY holder (not just External):
+// the operator is the last-resort escape hatch for a stuck
+// `backend_migration` whose job row cannot be cancelled. The
+// alternative was editing admin_settings by hand. Audit-logged with
+// the previous holder's kind so the trail survives operator-driven
+// clears.
+
+/// GET /api/admin/storage/write-lock — current holder, or `None`.
+///
+/// Public contract: the response is a stable
+/// [`BackendWriteLockStatusDto`] carrying `is_held` + an optional
+/// `holder` (typed reason). Called by the admin UI on every
+/// Storage-tab visit, and by hurl tests to assert pre/post state.
+#[utoipa::path(
+    get,
+    path = "/api/admin/storage/write-lock",
+    responses(
+        (status = 200, body = crate::application::dtos::settings_dto::BackendWriteLockStatusDto, description = "Current backend-write-lock holder"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_backend_write_lock(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let holder = state.backend_write_gate.held_by();
+    Ok(Json(
+        crate::application::dtos::settings_dto::BackendWriteLockStatusDto {
+            is_held: holder.is_some(),
+            holder,
+        },
+    ))
+}
+
+/// POST /api/admin/storage/write-lock — engage the External lock.
+///
+/// Takes a one-line label the UI surfaces alongside the lock icon
+/// (e.g., "nightly restic to NAS"). Fails with 409 if any OTHER
+/// holder is already engaged — operator must release the current
+/// hold first via DELETE, which is audit-logged.
+#[utoipa::path(
+    post,
+    path = "/api/admin/storage/write-lock",
+    request_body(
+        content = crate::application::dtos::settings_dto::AcquireExternalLockDto,
+        description = "Label + optional auto-expiry"
+    ),
+    responses(
+        (status = 200, body = crate::application::dtos::settings_dto::BackendWriteLockStatusDto, description = "External lock engaged"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 409, description = "Backend write-lock already held by another operation (migration/backup/rotation/external)")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn acquire_backend_write_lock(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(body): Json<crate::application::dtos::settings_dto::AcquireExternalLockDto>,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::application::services::backend_write_gate::{
+        BackendWriteLockReason, EXTERNAL_LOCK_MAX_HOLD,
+    };
+
+    // Clamp the expiry to [60s, 24h]. Zero would defeat the lock;
+    // a week-long default would wedge writes if the operator's
+    // cron script dies.
+    let max_secs = EXTERNAL_LOCK_MAX_HOLD.num_seconds().max(0) as u64;
+    let expires_in = body
+        .expires_in_seconds
+        .unwrap_or(max_secs)
+        .clamp(60, 24 * 3600);
+    let now = chrono::Utc::now();
+    let reason = BackendWriteLockReason::External {
+        admin_id: auth_user.id,
+        label: body.label.clone(),
+        acquired_at: now,
+        expires_at: now + chrono::Duration::seconds(expires_in as i64),
+    };
+
+    if let Err(current) = state.backend_write_gate.try_acquire(reason.clone()) {
+        tracing::info!(
+            target: "audit",
+            event = "backend_write_lock.acquire_rejected",
+            reason = "already_held",
+            caller_id = %auth_user.id,
+            current_holder = %current.0.kind(),
+            "👮🏻‍♂️ external lock refused — backend write-lock already held by {}",
+            current.0.kind()
+        );
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "backend write-lock is already held by {} — release it first",
+                current.0.kind()
+            ),
+            "Conflict",
+        ));
+    }
+
+    // Persist bool + typed holder for restart survival.
+    if let Some(pool) = state.db_pool.as_ref() {
+        if let Err(e) = crate::infrastructure::services::entry_backend::persist_migration_readonly(
+            pool.as_ref(),
+            true,
+        )
+        .await
+        {
+            // Roll back the in-memory gate so a crash doesn't leave
+            // writes refused for a lock we failed to persist. The
+            // operator sees a 500 and can retry.
+            state.backend_write_gate.release();
+            tracing::warn!(
+                target: "audit",
+                event = "backend_write_lock.persist_bool_failed",
+                caller_id = %auth_user.id,
+                error = %e,
+            );
+            return Err(AppError::internal_error(format!(
+                "could not persist readonly flag: {e}"
+            )));
+        }
+        if let Err(e) =
+            crate::infrastructure::services::entry_backend::persist_backend_write_lock_holder(
+                pool.as_ref(),
+                Some(&reason),
+            )
+            .await
+        {
+            // Bool is set so writes stay refused; just a less
+            // informative reason on restart. Log and continue.
+            tracing::warn!(
+                target: "audit",
+                event = "backend_write_lock.persist_holder_failed",
+                caller_id = %auth_user.id,
+                error = %e,
+                "external hold engaged but typed holder write failed; a restart would \
+                 reseed as Migration(legacy)"
+            );
+        }
+    }
+    state
+        .migration_readonly
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    broadcast_server_status_change(&state);
+    tracing::info!(
+        target: "audit",
+        event = "backend_write_lock.acquired",
+        reason = "external",
+        caller_id = %auth_user.id,
+        label = %body.label,
+        expires_in_seconds = expires_in,
+        "👮🏻‍♂️ external backend write-lock engaged"
+    );
+
+    Ok(Json(
+        crate::application::dtos::settings_dto::BackendWriteLockStatusDto {
+            is_held: true,
+            holder: Some(reason),
+        },
+    ))
+}
+
+/// DELETE /api/admin/storage/write-lock — release the lock,
+/// whatever variant currently holds it.
+///
+/// Clears both the typed holder and the legacy bool, so writes
+/// resume AND backend-writer jobs stop deferring on the next tick.
+/// Audit-logged with the previous holder's kind for the trail.
+#[utoipa::path(
+    delete,
+    path = "/api/admin/storage/write-lock",
+    responses(
+        (status = 200, body = crate::application::dtos::settings_dto::BackendWriteLockStatusDto, description = "Lock released (or was already free)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn release_backend_write_lock(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+) -> Result<impl IntoResponse, AppError> {
+    let previous = state.backend_write_gate.release();
+    state
+        .migration_readonly
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    if let Some(pool) = state.db_pool.as_ref() {
+        if let Err(e) = crate::infrastructure::services::entry_backend::persist_migration_readonly(
+            pool.as_ref(),
+            false,
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "audit",
+                event = "backend_write_lock.release_persist_bool_failed",
+                caller_id = %auth_user.id,
+                error = %e,
+                "in-memory release OK but the DB bool persist failed; a restart will \
+                 reseed the gate until admin_settings is corrected"
+            );
+        }
+        if let Err(e) =
+            crate::infrastructure::services::entry_backend::persist_backend_write_lock_holder(
+                pool.as_ref(),
+                None,
+            )
+            .await
+        {
+            // Audit — not just a trace. The bool is already cleared
+            // so the AuthZ fast path is free, but a stale typed row
+            // would come back on the next boot and reseed the gate.
+            // Operator needs to see this.
+            tracing::warn!(
+                target: "audit",
+                event = "backend_write_lock.release_persist_holder_failed",
+                caller_id = %auth_user.id,
+                error = %e,
+                "in-memory release OK and bool cleared, but typed holder DELETE failed; \
+                 the next boot would reseed the gate — operator must clear the row \
+                 manually (DELETE FROM auth.admin_settings WHERE key = \
+                 'storage.backend_write_lock_holder')"
+            );
+        }
+    }
+
+    broadcast_server_status_change(&state);
+    tracing::info!(
+        target: "audit",
+        event = "backend_write_lock.released",
+        caller_id = %auth_user.id,
+        previous_holder = ?previous.as_ref().map(|r| r.kind()),
+        "👮🏻‍♂️ backend write-lock released by admin"
+    );
+
+    Ok(Json(
+        crate::application::dtos::settings_dto::BackendWriteLockStatusDto {
+            is_held: false,
+            holder: None,
+        },
+    ))
+}
+
+// ─── Ops banners — operator-driven announcements ────────────────────────────
+//
+// CRUD surface for the `/admin/maintenance` banner editor. Audit-logged
+// on every mutation; the message bus broadcasts `OpsBannerChanged` on
+// `Topic::ServerStatus` so open client tabs refresh their banner store
+// within ~1s instead of on their next natural API call. The
+// version-diff fallback on X-Server-Status covers the WS-down /
+// reconnect-window cases.
+//
+// Note on ordering vs permissions: this surface is admin-only (gated
+// by the `/api/admin/*` middleware layer, not inline), and inputs are
+// validated by [`OpsBannerService`] against hard caps on count /
+// locale count / body size. 400s are mapped from service errors with
+// a stable `error_type` discriminator the SPA can switch on.
+
+/// GET /api/admin/banners — full list, including `starts_at > now`
+/// entries not yet visible to users. Admin inspects what they've
+/// scheduled; the public endpoint filters.
+#[utoipa::path(
+    get,
+    path = "/api/admin/banners",
+    responses(
+        (status = 200, body = Vec<crate::application::services::ops_banner_service::OpsBanner>, description = "Full admin-side banner list — includes scheduled-but-not-yet-visible entries"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn list_ops_banners(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok(Json(state.ops_banner_service.list_all()))
+}
+
+/// POST /api/admin/banners — create a new banner.
+#[utoipa::path(
+    post,
+    path = "/api/admin/banners",
+    request_body = crate::application::services::ops_banner_service::OpsBannerInput,
+    responses(
+        (status = 201, body = crate::application::services::ops_banner_service::OpsBanner, description = "Banner created"),
+        (status = 400, description = "Validation error (empty body, oversized body, invalid locale, …)"),
+        (status = 409, description = "Banner cap reached — delete one before creating another"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn create_ops_banner(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(input): Json<crate::application::services::ops_banner_service::OpsBannerInput>,
+) -> Result<impl IntoResponse, AppError> {
+    let banner = state
+        .ops_banner_service
+        .create(input, auth_user.id)
+        .await
+        .map_err(map_banner_error)?;
+    broadcast_server_status_change(&state);
+    tracing::info!(
+        target: "audit",
+        event = "ops_banner.created",
+        caller_id = %auth_user.id,
+        banner_id = %banner.id,
+        severity = ?banner.severity,
+        locales_count = banner.body.len(),
+        "👮🏻‍♂️ ops banner created"
+    );
+    Ok((StatusCode::CREATED, Json(banner)))
+}
+
+/// PUT /api/admin/banners/{id} — full-replacement update of
+/// severity/body/starts_at. `id` + `created_by` + `created_at` stay.
+#[utoipa::path(
+    put,
+    path = "/api/admin/banners/{id}",
+    params(("id" = String, Path, description = "Banner UUID")),
+    request_body = crate::application::services::ops_banner_service::OpsBannerInput,
+    responses(
+        (status = 200, body = crate::application::services::ops_banner_service::OpsBanner, description = "Banner updated"),
+        (status = 400, description = "Validation error"),
+        (status = 404, description = "Banner not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn update_ops_banner(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(input): Json<crate::application::services::ops_banner_service::OpsBannerInput>,
+) -> Result<impl IntoResponse, AppError> {
+    let uuid = Uuid::parse_str(&id).map_err(|_| {
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            "banner not found".to_string(),
+            "NotFound",
+        )
+    })?;
+    let banner = state
+        .ops_banner_service
+        .update(uuid, input)
+        .await
+        .map_err(map_banner_error)?;
+    broadcast_server_status_change(&state);
+    tracing::info!(
+        target: "audit",
+        event = "ops_banner.updated",
+        caller_id = %auth_user.id,
+        banner_id = %banner.id,
+        severity = ?banner.severity,
+        locales_count = banner.body.len(),
+        "👮🏻‍♂️ ops banner updated"
+    );
+    Ok(Json(banner))
+}
+
+/// DELETE /api/admin/banners/{id} — remove one banner.
+#[utoipa::path(
+    delete,
+    path = "/api/admin/banners/{id}",
+    params(("id" = String, Path, description = "Banner UUID")),
+    responses(
+        (status = 204, description = "Banner deleted"),
+        (status = 404, description = "Banner not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn delete_ops_banner(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let uuid = Uuid::parse_str(&id).map_err(|_| {
+        AppError::new(
+            StatusCode::NOT_FOUND,
+            "banner not found".to_string(),
+            "NotFound",
+        )
+    })?;
+    state
+        .ops_banner_service
+        .delete(uuid)
+        .await
+        .map_err(map_banner_error)?;
+    broadcast_server_status_change(&state);
+    tracing::info!(
+        target: "audit",
+        event = "ops_banner.deleted",
+        caller_id = %auth_user.id,
+        banner_id = %uuid,
+        "👮🏻‍♂️ ops banner deleted"
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Map a service-layer validation / IO error to an HTTP response.
+/// One place so every mutating endpoint uses the same discriminator
+/// strings — the FE switches on `error_type`.
+fn map_banner_error(
+    e: crate::application::services::ops_banner_service::OpsBannerError,
+) -> AppError {
+    use crate::application::services::ops_banner_service::OpsBannerError;
+    match e {
+        OpsBannerError::CapReached => {
+            AppError::new(StatusCode::CONFLICT, e.to_string(), "Conflict")
+        }
+        OpsBannerError::NotFound => AppError::new(StatusCode::NOT_FOUND, e.to_string(), "NotFound"),
+        OpsBannerError::EmptyBody
+        | OpsBannerError::TooManyLocales
+        | OpsBannerError::BodyTooLong { .. }
+        | OpsBannerError::InvalidLocale { .. }
+        | OpsBannerError::ExpiresBeforeStart => {
+            AppError::new(StatusCode::BAD_REQUEST, e.to_string(), "BadRequest")
+        }
+        OpsBannerError::Internal(msg) => AppError::internal_error(msg),
+    }
+}
+
+/// Publish the new `banners_version` on the server-status bus topic
+/// so every connected client refreshes. Silent no-op when the bus
+/// isn't configured (`OXICLOUD_MESSAGEBUS_ENABLE=false`) — the
+/// FE's X-Server-Status version-diff fallback covers it.
+/// Broadcast a `ServerStatusChanged` event on the WS message bus so
+/// every connected session refetches `/api/config` within ~1s. The
+/// `version` hash covers EVERY axis the server-status payload
+/// carries (readonly, holder, migration/rotation progress,
+/// banners), so a single call site is correct for ops banners,
+/// write-lock acquire/release, migration engage/release — any
+/// state transition the FE might care about.
+///
+/// WS-down / reconnect-window gracefully degrades to the X-Server-
+/// Status header-diff path (same code path), so this is purely a
+/// latency optimisation.
+fn broadcast_server_status_change(state: &Arc<AppState>) {
+    use crate::application::ports::message_bus_ports::{MessageBus, MessageBusEvent, Topic};
+    use crate::interfaces::middleware::server_status::compute_server_status_version;
+    let bus: &dyn MessageBus = state.bus.as_ref();
+    bus.publish(
+        &Topic::ServerStatus,
+        MessageBusEvent::ServerStatusChanged {
+            version: compute_server_status_version(state),
+        },
+    );
+}
+
+// verify_migration endpoint retired (slice 7 of
+// docs/plan/storage-multi-entry.md). It was a sample-based sanity
+// check against the currently-effective target backend; superseded
+// by `POST /api/admin/jobs/blobs_consistency/trigger?storage=<name>`
+// which does a full walk against ANY named entry (not just the
+// migration target), records structured findings per mismatch, and
+// integrates with the standard runs / cancel / findings admin
+// surface. Frontend "Verify integrity" button removed in the same
+// slice.
+
+/// Shared body for `start` / `resume` — both funnel through
+/// `run_or_resume` via `JobRegistry::trigger`. Detaches into a
+/// `tokio::spawn` so the HTTP response returns immediately — same
+/// rationale as `trigger_job` above (browser timeout mid-await would
+/// desync `current_run_start` from the actually-running task). The
+/// admin UI polls `GET /storage/migration` for progress; the trigger
+/// itself is fire-and-forget.
+async fn trigger_backend_migration(
+    state: Arc<AppState>,
+    target_name: Option<String>,
+) -> Result<axum::response::Response, AppError> {
+    use crate::infrastructure::scheduler::JobRunArgs;
+    use crate::infrastructure::services::backend_migration_service::BACKEND_MIGRATION_JOB_NAME;
+
+    tracing::info!(
+        target: "audit",
+        event = "backend_migration.trigger_requested",
+        target_name = target_name.as_deref().unwrap_or("<resume>"),
+        "👮🏻‍♂️ Admin triggered backend_migration"
+    );
+
+    let registry = state.core.job_registry.clone();
+    let args = match target_name {
+        Some(n) => JobRunArgs::with_string("storage", n),
+        None => JobRunArgs::default(),
+    };
+    tokio::spawn(async move {
+        registry.trigger(BACKEND_MIGRATION_JOB_NAME, &args).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "message": "Migration dispatched — poll GET /api/admin/storage/migration for status",
+            "detached": true,
+        })),
+    )
+        .into_response())
+}
+
+/// POST /api/admin/storage/entries/{name}/rotate — trigger the
+/// `backend_rotate` recoverable job on a specific entry.
+///
+/// Normalises every blob on `<name>` to the entry's head-pair
+/// format: legacy → v1, plaintext ↔ encrypted, old-key → new-key.
+/// See `docs/plan/storage-key-rotation.md` §"The rotation job".
+///
+/// Unlike migration, rotation does NOT engage read-only mode —
+/// rewrites happen in place under normal traffic. Concurrent user
+/// writes coexist safely.
+///
+/// The handler validates the entry name synchronously (400 on
+/// unknown entry); the actual walk detaches into a
+/// `tokio::spawn` so the HTTP call returns immediately.
+#[utoipa::path(
+    post,
+    path = "/api/admin/storage/entries/{name}/rotate",
+    responses(
+        (status = 202, description = "Rotation dispatched"),
+        (status = 400, description = "Unknown entry"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    params(
+        ("name" = String, Path, description = "Storage entry name to rotate")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn trigger_backend_rotate(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::infrastructure::scheduler::JobRunArgs;
+    use crate::infrastructure::services::backend_migration_service::BACKEND_MIGRATION_JOB_NAME;
+    use crate::infrastructure::services::backend_rotate_service::BACKEND_ROTATE_JOB_NAME;
+
+    // Synchronous entry-existence check — a bad name would fail the
+    // run anyway, but returning 400 here spares the operator an
+    // audit-log round-trip.
+    let entries = &state.core.config.storage_entries;
+    if entries.iter().all(|e| e.name != name) {
+        let available = if entries.is_empty() {
+            "(none)".to_string()
+        } else {
+            entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return Err(AppError::bad_request(format!(
+            "unknown storage entry `{name}`. Available: [{available}]"
+        )));
+    }
+
+    // Refuse on non-active entry. `storage.blobs` describes what's on
+    // the ACTIVE backend; walking it against a stale target produces a
+    // `rotation_failed` finding per missing blob (pure noise) and can't
+    // actually normalise anything the app reads. The right recipe for
+    // "normalise a different backend" is: migrate to it (blobs land in
+    // the head-pair's format on arrival — no rotation needed).
+    let active = state
+        .core
+        .active_backend_name
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if name != active {
+        return Err(AppError::bad_request(format!(
+            "backend_rotate refuses non-active entry `{name}` — the DB blob registry \
+             describes the active entry (`{active}`), so walking it against a stale \
+             target produces spurious `rotation_failed` findings. Activate `{name}` \
+             first via `Migrate & activate`, then rotate."
+        )));
+    }
+
+    // Concurrency guard per plan: at most one encryption-touching
+    // recoverable run at a time across the whole app. Rotation
+    // rewrites blobs in place; migration copies + swaps; running
+    // both simultaneously could interleave writes on the same
+    // hash. Cheap check — `list_runs` limit 1 with the status
+    // filter is an index scan.
+    let provider = state.core.job_store_provider.clone();
+    for job_name in [BACKEND_ROTATE_JOB_NAME, BACKEND_MIGRATION_JOB_NAME] {
+        let in_flight = provider
+            .list_runs(job_name, 5)
+            .await
+            .map_err(AppError::from)?
+            .into_iter()
+            .any(|r| {
+                matches!(
+                    r.status,
+                    crate::infrastructure::scheduler::RunStatus::Running
+                        | crate::infrastructure::scheduler::RunStatus::Paused
+                        | crate::infrastructure::scheduler::RunStatus::CancelRequested
+                )
+            });
+        if in_flight {
+            return Err(AppError::bad_request(format!(
+                "cannot start backend_rotate on `{name}` — `{job_name}` is already Running / \
+                 Paused / CancelRequested. Wait for it to finish (or cancel via \
+                 `POST /api/admin/jobs/{job_name}/cancel`)."
+            )));
+        }
+    }
+
+    tracing::info!(
+        target: "audit",
+        event = "backend_rotate.trigger_requested",
+        target_name = %name,
+        "👮🏻‍♂️ Admin triggered backend_rotate on `{name}`"
+    );
+
+    let registry = state.core.job_registry.clone();
+    let args = JobRunArgs::with_string("storage", name.clone());
+    tokio::spawn(async move {
+        registry.trigger(BACKEND_ROTATE_JOB_NAME, &args).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "message": format!("Rotation dispatched on `{name}` — poll GET /api/admin/jobs/{BACKEND_ROTATE_JOB_NAME} for progress"),
+            "detached": true,
+        })),
+    )
+        .into_response())
+}
+
+/// Idle-state DTO — no run has been triggered yet.
+fn idle_migration_dto() -> MigrationStateDto {
+    MigrationStateDto {
+        status: "idle".to_string(),
+        total_blobs: 0,
+        migrated_blobs: 0,
+        // `migrated_bytes` and `throughput_bytes_per_sec` are no
+        // longer tracked — the recoverable engine bumps
+        // `stats.scanned_count` (a blob-count aggregator), not a
+        // bytes counter. The admin UI keeps these fields for
+        // wire-compat; they read 0 / null.
+        migrated_bytes: 0,
+        failed_blobs: Vec::new(),
+        started_at: None,
+        completed_at: None,
+        throughput_bytes_per_sec: None,
+    }
+}
+
+/// Project a recoverable `RunSummary` into the admin UI's
+/// `MigrationStateDto`. Byte-counter fields are always 0 / None —
+/// see `idle_migration_dto`'s comment.
+fn run_to_migration_dto(
+    run: &crate::infrastructure::scheduler::RunSummary,
+    failed_blobs: Vec<String>,
+) -> MigrationStateDto {
+    use crate::infrastructure::scheduler::RunStatus;
+
+    // Fold CancelRequested into "paused" — from the admin UI's
+    // point of view a cancel-in-flight is the "waiting for the
+    // handler to yield" state. Same visual affordance as Paused.
+    let status = match run.status {
+        RunStatus::Running => "running",
+        RunStatus::Paused => "paused",
+        RunStatus::CancelRequested => "paused",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        // Cancelled is user-abandoned but terminal — same visual as
+        // failed for the migration status endpoint (both mean "not
+        // going to finish, look at findings/logs to know why").
+        RunStatus::Cancelled => "cancelled",
+    }
+    .to_string();
+
+    let (total_blobs, migrated_blobs) = match run.progress.as_ref() {
+        Some(p) => (p.total, p.scanned),
+        None => (
+            0,
+            run.stats
+                .get("scanned_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        ),
+    };
+
+    MigrationStateDto {
+        status,
+        total_blobs,
+        migrated_blobs,
+        migrated_bytes: 0,
+        failed_blobs,
+        started_at: Some(run.started_at.to_rfc3339()),
+        completed_at: run.completed_at.map(|d| d.to_rfc3339()),
+        throughput_bytes_per_sec: None,
+    }
+}
+
+/// POST /api/admin/settings/storage/generate-key — generate a random AES-256 key.
+#[utoipa::path(
+    post,
+    path = "/api/admin/settings/storage/generate-key",
+    responses(
+        (status = 200, body = Object, description = "Generated AES-256 key"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn generate_encryption_key() -> Result<impl IntoResponse, AppError> {
+    let key =
+        crate::infrastructure::services::encrypted_blob_backend::EncryptedBlobBackend::generate_key(
+        );
+    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
+    // Fingerprint uses the same colon-hex rendering as the boot log,
+    // the pair chain in admin/storage, and `oxicloud --fingerprint`.
+    // Ed can cross-reference it against `.env` after pasting the key
+    // in — if the fingerprints match, the key made it into the
+    // config intact.
+    let fingerprint =
+        crate::common::config::fingerprint_from_base64_key(&key_b64).unwrap_or_else(|_| {
+            // Should never happen — we JUST generated a 32-byte key
+            // and base64-encoded it — but if the fingerprint helper
+            // rejects, degrade gracefully rather than 500.
+            "—".to_string()
+        });
+
+    Ok(Json(serde_json::json!({
+        "key": key_b64,
+        "fingerprint": fingerprint,
+        "warning": "Store this key securely. If lost, encrypted data is IRRECOVERABLY LOST."
+    })))
+}
+
+// ============================================================================
+// Dashboard / Stats
+// ============================================================================
+
+/// GET /api/admin/dashboard — full dashboard statistics
+#[utoipa::path(
+    get,
+    path = "/api/admin/dashboard",
+    responses(
+        (status = 200, body = crate::application::dtos::settings_dto::DashboardStatsDto, description = "Dashboard statistics"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_dashboard_stats(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    let auth_app = &auth.auth_application_service;
+
+    // Get storage stats from repository (single efficient query)
+    let db_pool = state
+        .db_pool
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Database not available"))?;
+
+    // Use direct SQL for aggregated stats — more efficient than loading all users.
+    //
+    // Scope: internal users only (`is_external = false`). External
+    // accounts (grant-only magic-link / OCM recipients) have no
+    // storage envelope by construction (DB CHECK
+    // `users_external_no_storage`) and cannot be admin
+    // (`users_external_not_admin`), so they'd inflate `total_users`
+    // and `active_users` with rows that don't represent operational
+    // seats. The audit list (`/api/admin/users`) still shows every
+    // account; only the dashboard totals filter externals out.
+    let stats_row = sqlx::query(
+        r#"
+        SELECT
+            COUNT(*)::INT8 as total_users,
+            COUNT(*) FILTER (WHERE active = true)::INT8 as active_users,
+            COUNT(*) FILTER (WHERE role::text = 'admin')::INT8 as admin_users,
+            COUNT(*) FILTER (WHERE storage_quota_bytes > 0 AND storage_used_bytes > storage_quota_bytes * 0.8)::INT8 as users_over_80,
+            COUNT(*) FILTER (WHERE storage_quota_bytes > 0 AND storage_used_bytes > storage_quota_bytes)::INT8 as users_over_quota
+        FROM auth.users
+        WHERE is_external = false
+        "#
+    )
+    .fetch_one(db_pool.as_ref())
+    .await
+    .map_err(|e| AppError::internal_error(format!("Database query failed: {}", e)))?;
+
+    // External account count — distinct query (not FILTERed into
+    // `stats_row` above) because `stats_row` scopes to
+    // `is_external = false` for the operational-seat counts.
+    // Externals form their own population; the dashboard renders them
+    // as a separate stat card in the "User accounts" section.
+    let external_users: i64 =
+        sqlx::query_scalar(r#"SELECT COUNT(*)::INT8 FROM auth.users WHERE is_external = true"#)
+            .fetch_one(db_pool.as_ref())
+            .await
+            .map_err(|e| AppError::internal_error(format!("External user count failed: {}", e)))?;
+
+    // Live-activity counts — projection over auth.sessions, same
+    // `ONLINE_WINDOW` (5 min) the Prometheus gauges use so the
+    // dashboard number, admin-table green dot, and
+    // `oxicloud_sessions_online` scrape all agree by construction.
+    // Bound as `$1 = window_secs` via `make_interval(secs => $1)`
+    // to keep the single-source-of-truth pattern (no SQL literal
+    // for the window). Both queries hit the partial index
+    // `idx_sessions_last_seen_at WHERE revoked = FALSE` so per-run
+    // cost is ~μs even at tens of thousands of session rows.
+    let online_window_secs: f64 =
+        crate::application::dtos::session_dto::ONLINE_WINDOW.as_secs_f64();
+    let online_sessions: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::INT8 FROM auth.sessions
+        WHERE revoked = FALSE
+          AND last_seen_at > NOW() - make_interval(secs => $1)
+        "#,
+    )
+    .bind(online_window_secs)
+    .fetch_one(db_pool.as_ref())
+    .await
+    .map_err(|e| AppError::internal_error(format!("Online session count failed: {}", e)))?;
+    let online_users: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(DISTINCT user_id)::INT8 FROM auth.sessions
+        WHERE revoked = FALSE
+          AND last_seen_at > NOW() - make_interval(secs => $1)
+        "#,
+    )
+    .bind(online_window_secs)
+    .fetch_one(db_pool.as_ref())
+    .await
+    .map_err(|e| AppError::internal_error(format!("Online user count failed: {}", e)))?;
+
+    use sqlx::Row;
+
+    // Per-drive-kind quota panel:
+    //
+    //   - **Personal** rolls up via the user envelope
+    //     (`auth.users.storage_quota_bytes`; `= 0` means unlimited),
+    //     because personal drives inherit their cap from the user per
+    //     `docs/plan/drive.md`. The "N unlimited" here counts USERS
+    //     with unlimited envelope, not drives.
+    //   - **Shared** uses `storage.drives.quota_bytes` directly
+    //     (`IS NULL` means unlimited).
+    //
+    // Both rows sum `used_bytes` — for personal that's
+    // `auth.users.storage_used_bytes`, which is itself
+    // `SUM(drives.used_bytes) WHERE kind='personal'` per the sweep
+    // in `storage_usage_service.rs`. For shared it's the drive's own
+    // `used_bytes`. Trashed files are excluded from both — see
+    // `bug_trash_excluded_from_quota` for the known gap.
+    let personal_row = sqlx::query(
+        r#"
+        SELECT
+            COALESCE(SUM(storage_used_bytes)::INT8, 0) AS used_bytes,
+            COALESCE(SUM(storage_quota_bytes) FILTER (WHERE storage_quota_bytes > 0)::INT8, 0) AS capped_quota_bytes,
+            COUNT(*) FILTER (WHERE storage_quota_bytes = 0)::INT8 AS unlimited_count,
+            COUNT(*) FILTER (WHERE storage_quota_bytes > 0)::INT8 AS capped_count
+        FROM auth.users
+        WHERE is_external = false
+        "#,
+    )
+    .fetch_one(db_pool.as_ref())
+    .await
+    .map_err(|e| AppError::internal_error(format!("Personal-drive stats failed: {}", e)))?;
+
+    let shared_row = sqlx::query(
+        r#"
+        SELECT
+            COALESCE(SUM(used_bytes)::INT8, 0) AS used_bytes,
+            COALESCE(SUM(quota_bytes) FILTER (WHERE quota_bytes IS NOT NULL)::INT8, 0) AS capped_quota_bytes,
+            COUNT(*) FILTER (WHERE quota_bytes IS NULL)::INT8 AS unlimited_count,
+            COUNT(*) FILTER (WHERE quota_bytes IS NOT NULL)::INT8 AS capped_count
+        FROM storage.drives
+        WHERE kind::text = 'shared'
+        "#,
+    )
+    .fetch_one(db_pool.as_ref())
+    .await
+    .map_err(|e| AppError::internal_error(format!("Shared-drive stats failed: {}", e)))?;
+
+    let build_row = |kind: &str, row: sqlx::postgres::PgRow| DriveKindUsageDto {
+        kind: kind.to_string(),
+        used_bytes: row.get("used_bytes"),
+        // Only surface the cap when there's at least one capped drive
+        // — else the FE would render "0 / 0 (NaN%)" for a kind that's
+        // entirely unlimited.
+        capped_quota_bytes: {
+            let capped_count: i64 = row.get("capped_count");
+            if capped_count > 0 {
+                Some(row.get("capped_quota_bytes"))
+            } else {
+                None
+            }
+        },
+        unlimited_count: row.get("unlimited_count"),
+        capped_count: row.get("capped_count"),
+    };
+    let drive_usage = vec![
+        build_row("personal", personal_row),
+        build_row("shared", shared_row),
+    ];
+
+    // Backend physical stats (post-dedup, post-encryption) —
+    // rendered in the dashboard's "Backend Storage" card next to
+    // the user-quota panel. Same source `StorageSettingsDto` uses;
+    // cheap aggregate over `storage.blobs`.
+    let dedup_stats = state.core.blob_handler.get_stats().await;
+
+    let stats = DashboardStatsDto {
+        server_version: env!("OXICLOUD_VERSION").to_string(),
+        oidc_configured: auth_app.oidc_enabled(),
+        // Snapshot the current live-WS-session count. `Relaxed` because
+        // the counter itself uses `Relaxed`; slight staleness on the
+        // dashboard is fine — it's a UI gauge, not a control input.
+        active_ws_sessions: state
+            .active_ws_sessions
+            .load(std::sync::atomic::Ordering::Relaxed) as u64,
+        total_users: stats_row.get("total_users"),
+        active_users: stats_row.get("active_users"),
+        admin_users: stats_row.get("admin_users"),
+        external_users,
+        online_users,
+        online_sessions,
+        drive_usage,
+        users_over_80_percent: stats_row.get("users_over_80"),
+        users_over_quota: stats_row.get("users_over_quota"),
+        total_bytes_stored: Some(dedup_stats.total_bytes_stored as i64),
+        dedup_ratio: Some(dedup_stats.dedup_ratio),
+        registration_enabled: {
+            if let Some(svc) = state.admin_settings_service.as_ref() {
+                svc.get_registration_enabled().await
+            } else {
+                true // default: enabled
+            }
+        },
+        // Backend cache recommendation. Fires only when BOTH:
+        //   - the ACTIVE backend entry is non-local (every blob
+        //     read costs a remote RTT), AND
+        //   - the local-disk cache wrapper is NOT currently enabled
+        //     (`OXICLOUD_STORAGE_CACHE_ENABLED`).
+        //
+        // Looking up the active entry explicitly instead of reading
+        // `config.storage.backend`: in a multi-entry deployment (the
+        // common shape for OxiCloud post-storage-multi-entry) the
+        // top-level legacy `backend` field stays at its
+        // `StorageBackendType::Local` default while the real backend
+        // is one of the `storage_entries` selected via
+        // `active_backend_name` in `admin_settings`. The old check
+        // therefore reported "local" on every multi-entry S3
+        // deployment and the admin UI silently claimed "no cache
+        // needed" — exactly backwards. See
+        // `docs/architecture/caching.md` → "On-disk blob cache".
+        storage_cache_recommended: {
+            use crate::common::config::StorageBackendType;
+            let active = state.core.active_backend_name.read().unwrap().clone();
+            // Find the live entry; fall back to the legacy field
+            // ONLY if no entries were parsed (truly legacy
+            // single-backend deployments, no `OXICLOUD_STORAGE_ENTRIES`).
+            let remote = state
+                .core
+                .config
+                .storage_entries
+                .iter()
+                .find(|e| e.name == active)
+                .map(|e| !matches!(e.backend, StorageBackendType::Local))
+                .unwrap_or_else(|| {
+                    !matches!(state.core.config.storage.backend, StorageBackendType::Local)
+                });
+            remote && !state.core.config.storage.cache.enabled
+        },
+        // No notification sink configured — see
+        // [`compute_notification_sink_missing`] for the rule.
+        notification_sink_missing: compute_notification_sink_missing(
+            &state.core.config.jobs_notify.email_to,
+            state.core.config.smtp.is_enabled(),
+            state.core.config.webhook.url.as_deref(),
+        ),
+        // Live cache occupancy for the admin "Storage cache" card.
+        // Both snapshots are point-in-time; moka runs maintenance
+        // lazily, so the backend-cache side flushes pending tasks
+        // first in `CachedBlobBackend::stats()` while the content
+        // cache's weighted_size is close enough that a bare read
+        // suffices here.
+        content_cache: {
+            let s = state.core.file_content_cache.stats();
+            crate::application::dtos::settings_dto::ContentCacheInfoDto {
+                size_bytes: s.current_size_bytes as u64,
+                max_bytes: s.max_size_bytes as u64,
+                files: s.entries,
+            }
+        },
+        thumbnail_cache: {
+            let s = state.core.thumbnail_service.get_stats().await;
+            crate::application::dtos::settings_dto::ThumbnailCacheInfoDto {
+                size_bytes: s.cache_size_bytes as u64,
+                max_bytes: s.max_cache_bytes as u64,
+                thumbnails: s.cached_thumbnails as u64,
+            }
+        },
+        backend_cache: state.core.blob_cache.as_ref().map(|c| {
+            let s = c.stats();
+            crate::application::dtos::settings_dto::BackendCacheInfoDto {
+                size_bytes: s.size_bytes,
+                max_bytes: s.max_bytes,
+                chunks: s.entries,
+                cache_dir: s.cache_dir,
+            }
+        }),
+    };
+
+    Ok(Json(stats))
+}
+
+// ============================================================================
+// User Management
+// ============================================================================
+
+/// GET /api/admin/users?limit=50&offset=0 — list all users
+///
+/// Always returns `Vec<FullUserDto>` — the shape one row of the
+/// `/me` response's embedded `full` block carries. The former
+/// `?summary` toggle (flat `PublicUserDto` vs nested `FullUserDto`)
+/// has been retired: admin listing is low-volume and the FE always
+/// asked for the nested shape anyway, so the two-shape split served
+/// no caller and only invited jq-path bugs. See
+/// `docs/plan/userdto-refactor.md`.
+#[utoipa::path(
+    get,
+    path = "/api/admin/users",
+    params(
+        ("limit" = Option<i64>, Query, description = "Max users to return (default 100, max 500)"),
+        ("offset" = Option<i64>, Query, description = "Pagination offset")
+    ),
+    responses(
+        (status = 200, body = AdminUsersPageResponse, description = "List of users"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn list_users(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Query(query): Query<ListUsersQueryDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    let limit = query.limit.unwrap_or(100).min(500);
+    let offset = query.offset.unwrap_or(0);
+
+    // Admin surface must show *every* account for audit — grant-only
+    // magic-link / OCM recipients (is_external = true) included. The
+    // internal-only variant is used by system address book / sharee
+    // search, where surfacing externals would leak identities. See
+    // `auth_application_service::list_users` doc for the split.
+    let users = auth
+        .auth_application_service
+        .list_user_summaries_including_external_with_perms(
+            state.authorization.as_ref(),
+            auth_user.id,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(AppError::from)?;
+
+    let total = auth
+        .auth_application_service
+        .count_users_efficient()
+        .await
+        .unwrap_or(0);
+
+    Ok(Json(AdminUsersPageResponse {
+        users,
+        total,
+        limit,
+        offset,
+    }))
+}
+
+/// GET /api/admin/users/:id — get single user
+#[utoipa::path(
+    get,
+    path = "/api/admin/users/{id}",
+    params(("id" = String, Path, description = "User UUID")),
+    responses(
+        (status = 200, body = FullUserDto, description = "User details"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "User not found")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_user(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let id = Uuid::parse_str(&id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    let user = auth
+        .auth_application_service
+        .get_user_admin(id)
+        .await
+        .map_err(|e| AppError::not_found(format!("User not found: {}", e)))?;
+
+    Ok(Json(user))
+}
+
+/// DELETE /api/admin/users/:id — delete a user
+#[utoipa::path(
+    delete,
+    path = "/api/admin/users/{id}",
+    params(("id" = String, Path, description = "User UUID")),
+    responses(
+        (status = 200, body = Object, description = "User deleted"),
+        (status = 400, description = "Cannot delete own account"),
+        (status = 403, description = "Caller does not outrank the target"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+
+    let id = Uuid::parse_str(&id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    // Self-deletion, and deleting anyone this caller does not outrank, are
+    // both refused by `require_can_modify` inside the service — AGENTS.md
+    // keeps authorization out of handlers. `map_err` preserves the
+    // service's status instead of flattening every refusal to a 500.
+    auth.auth_application_service
+        .delete_user_admin(admin_id, id)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "User deleted successfully"
+        })),
+    ))
+}
+
+/// GET /api/admin/sessions?user_id=&include_revoked=&limit=&offset= — list sessions
+///
+/// Global cross-user listing by default. `user_id` narrows to one
+/// user; omit for cross-user. `include_revoked=true` opts into
+/// showing revoked / expired rows for forensics (default hides).
+/// Response is `{sessions, limit, offset}` — no total count (would
+/// require a second scan; the panel paginates on presence of
+/// exactly `limit` rows returned).
+#[utoipa::path(
+    get,
+    path = "/api/admin/sessions",
+    params(
+        ("user_id" = Option<String>, Query, description = "Narrow to one user (UUID); omit for cross-user"),
+        ("include_revoked" = Option<bool>, Query, description = "Include revoked + expired rows (default false — active only)"),
+        ("limit" = Option<i64>, Query, description = "Max rows to return (default 100, max 500)"),
+        ("offset" = Option<i64>, Query, description = "Pagination offset")
+    ),
+    responses(
+        (status = 200, body = Object, description = "List of sessions"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Query(query): Query<ListSessionsQueryDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    let limit = query.limit.unwrap_or(100).min(500);
+    let offset = query.offset.unwrap_or(0);
+    let include_revoked = query.include_revoked.unwrap_or(false);
+    let user_id_filter = match query.user_id.as_deref() {
+        Some(s) => Some(Uuid::parse_str(s).map_err(|_| AppError::bad_request("Invalid user_id"))?),
+        None => None,
+    };
+
+    // Pass the caller's DPoP thumbprint through the SessionCaller
+    // wrapper so the DTO can flag which row is the admin's own
+    // current session (`is_current = true`). Rendered as a "this
+    // is you" badge — prevents accidentally revoking the session
+    // the click came from. `None` when the admin is unbound (rare
+    // — legacy / migration-window sessions), in which case no row
+    // highlights.
+    let caller = crate::application::dtos::session_dto::SessionCaller {
+        id: auth_user.id,
+        dpop_jkt: auth_user.dpop_jkt.as_deref(),
+    };
+
+    let sessions = auth
+        .auth_application_service
+        .admin_list_sessions_with_perms(
+            state.authorization.as_ref(),
+            caller,
+            user_id_filter,
+            include_revoked,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(AppError::from)?;
+
+    // Also publish the current access-token TTL so the admin panel can
+    // render an honest "revoke takes effect within N seconds" warning
+    // above the table. Revoking a session flips the DB row (breaks the
+    // refresh path), but any in-flight JWT stays valid until its `exp`
+    // — which is `access_token_expiry_secs` from now. Showing this
+    // number keeps the UX honest instead of implying instant kill.
+    let access_token_expiry_secs = state.core.config.auth.access_token_expiry_secs;
+    Ok(Json(serde_json::json!({
+        "sessions": sessions,
+        "limit": limit,
+        "offset": offset,
+        "access_token_expiry_secs": access_token_expiry_secs,
+    })))
+}
+
+/// DELETE /api/admin/sessions/:id — revoke a session
+#[utoipa::path(
+    delete,
+    path = "/api/admin/sessions/{id}",
+    params(("id" = String, Path, description = "Session UUID")),
+    responses(
+        (status = 200, body = Object, description = "Session revoked"),
+        (status = 400, description = "Invalid UUID"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "Session not found")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn revoke_session(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let session_id = Uuid::parse_str(&id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    let caller = crate::application::dtos::session_dto::SessionCaller {
+        id: auth_user.id,
+        dpop_jkt: auth_user.dpop_jkt.as_deref(),
+    };
+    auth.auth_application_service
+        .admin_revoke_session_with_perms(state.authorization.as_ref(), caller, session_id)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "message": "Session revoked" })),
+    ))
+}
+
+/// PUT /api/admin/users/:id/role — change user role
+#[utoipa::path(
+    put,
+    path = "/api/admin/users/{id}/role",
+    params(("id" = String, Path, description = "User UUID")),
+    responses(
+        (status = 200, body = Object, description = "Role updated"),
+        (status = 400, description = "Cannot change own role, or the target is the server owner"),
+        (status = 403, description = "Caller does not outrank the target"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn update_user_role(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+    Json(dto): Json<UpdateUserRoleDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+
+    let id = Uuid::parse_str(&id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    // Changing your own role, and changing the role of anyone this caller
+    // does not outrank (including the server owner), are refused inside
+    // the service.
+    auth.auth_application_service
+        .change_user_role(admin_id, id, &dto.role)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": format!("User role updated to '{}'", dto.role)
+        })),
+    ))
+}
+
+/// PUT /api/admin/users/:id/active — activate/deactivate user
+#[utoipa::path(
+    put,
+    path = "/api/admin/users/{id}/active",
+    params(("id" = String, Path, description = "User UUID")),
+    responses(
+        (status = 200, body = Object, description = "User active status updated"),
+        (status = 400, description = "Cannot deactivate own account"),
+        (status = 403, description = "Caller does not outrank the target"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn update_user_active(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+    Json(dto): Json<UpdateUserActiveDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+
+    let id = Uuid::parse_str(&id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    // Self-deactivation (a lockout) and acting on anyone this caller does
+    // not outrank are both refused in the service. Self-*activation* stays
+    // permitted, as before — it is a no-op on the account you are already
+    // authenticated on.
+    auth.auth_application_service
+        .set_user_active(admin_id, id, dto.active)
+        .await
+        .map_err(AppError::from)?;
+
+    let status = if dto.active {
+        "activated"
+    } else {
+        "deactivated"
+    };
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": format!("User {}", status)
+        })),
+    ))
+}
+
+/// PUT /api/admin/users/:id/quota — update user storage quota
+#[utoipa::path(
+    put,
+    path = "/api/admin/users/{id}/quota",
+    params(("id" = String, Path, description = "User UUID")),
+    responses(
+        (status = 200, body = Object, description = "Quota updated"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required, and must outrank the target")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn update_user_quota(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+    Json(dto): Json<UpdateUserQuotaDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let id = Uuid::parse_str(&id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    // This handler previously took no caller at all, leaning entirely on
+    // the route middleware's "is an admin" check — which cannot express
+    // "may this admin act on THAT user". The service gate needs the
+    // caller, so extract it.
+    auth.auth_application_service
+        .update_user_quota(auth_user.id, id, dto.quota_bytes)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "User quota updated",
+            "quota_bytes": dto.quota_bytes,
+        })),
+    ))
+}
+
+// ============================================================================
+// Admin User Creation & Password Reset
+// ============================================================================
+
+/// POST /api/admin/users — create a new user (admin only)
+#[utoipa::path(
+    post,
+    path = "/api/admin/users",
+    responses(
+        (status = 201, body = FullUserDto, description = "User created"),
+        (status = 400, description = "Invalid user data"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required, and cannot create a role the caller does not outrank")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn create_user(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(dto): Json<AdminCreateUserDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    // The caller's own rank bounds the role they may create — an admin
+    // cannot mint a peer admin they would then be forbidden to manage.
+    let user = auth
+        .auth_application_service
+        .admin_create_user(auth_user.id, dto)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((StatusCode::CREATED, Json(user)))
+}
+
+/// PUT /api/admin/users/:id/password — reset a user's password (admin only)
+#[utoipa::path(
+    put,
+    path = "/api/admin/users/{id}/password",
+    params(("id" = String, Path, description = "User UUID")),
+    responses(
+        (status = 200, body = Object, description = "Password reset"),
+        (status = 400, description = "Invalid password"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required, and must outrank the target")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn reset_user_password(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+    Json(dto): Json<AdminResetPasswordDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let id = Uuid::parse_str(&id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    // Resetting a peer admin's password was the sharpest hole this gate
+    // closes: it is a full account takeover, and before #690 any admin
+    // could do it to any other admin — or to the server owner.
+    auth.auth_application_service
+        .admin_reset_password(auth_user.id, id, &dto.new_password)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "Password reset successfully"
+        })),
+    ))
+}
+
+/// POST /api/admin/transfer-ownership — hand the instance to another user.
+///
+/// Owner-only, and the only way the owner's own role ever changes: the
+/// generic role endpoint refuses `"owner"` in both directions. The swap is
+/// one transaction, so the instance is never briefly ownerless or briefly
+/// double-owned.
+#[utoipa::path(
+    post,
+    path = "/api/admin/transfer-ownership",
+    request_body = TransferOwnershipDto,
+    responses(
+        (status = 200, body = Object, description = "Ownership transferred"),
+        (status = 400, description = "Target cannot hold ownership, or is already the owner"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only the current owner may transfer ownership"),
+        (status = 404, description = "Target user not found"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn transfer_ownership(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(dto): Json<TransferOwnershipDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let new_owner_id =
+        Uuid::parse_str(&dto.new_owner_id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    auth.auth_application_service
+        .transfer_ownership(auth_user.id, new_owner_id)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "Ownership transferred",
+            "new_owner_id": new_owner_id,
+        })),
+    ))
+}
+
+/// POST /api/admin/users/{id}/promote-to-internal — flip an external
+/// (grant-only) account into a normal internal account, provisioning
+/// its personal drive on the way. The deployment MUST have magic-link
+/// login enabled (the admin doesn't set the user's password on their
+/// behalf, so the promoted user needs some way to log in). Refuses
+/// OIDC-linked users and users who are already internal.
+#[utoipa::path(
+    post,
+    path = "/api/admin/users/{id}/promote-to-internal",
+    params(("id" = String, Path, description = "Target user id")),
+    responses(
+        (status = 200, description = "User promoted", body = PublicUserDto),
+        (status = 400, description = "Magic-link login is disabled on this deployment"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required (or target is OIDC-linked)"),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "User is already internal"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn admin_promote_external_to_internal(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let target_id = Uuid::parse_str(&id).map_err(|_| AppError::bad_request("Invalid UUID"))?;
+
+    let auth = state
+        .auth_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Auth service not configured"))?;
+
+    let dto = auth
+        .auth_application_service
+        .admin_promote_external_to_internal(auth_user.id, target_id)
+        .await
+        .map_err(AppError::from)?;
+
+    Ok((StatusCode::OK, Json(dto)))
+}
+
+// ============================================================================
+// Registration Control
+// ============================================================================
+
+/// PUT /api/admin/settings/registration — enable/disable public registration
+#[utoipa::path(
+    put,
+    path = "/api/admin/settings/registration",
+    responses(
+        (status = 200, body = Object, description = "Registration setting updated"),
+        (status = 400, description = "Missing field"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required")
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn set_registration_setting(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+
+    let enabled = body
+        .get("registration_enabled")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                "Missing boolean field 'registration_enabled'",
+                "InvalidInput",
+            )
+        })?;
+
+    let svc = state
+        .admin_settings_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Admin settings service not available"))?;
+
+    svc.set_registration_enabled(enabled, admin_id)
+        .await
+        .map_err(|e| AppError::internal_error(format!("Failed to save setting: {}", e)))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": format!("Public registration {}", if enabled { "enabled" } else { "disabled" }),
+            "registration_enabled": enabled,
+        })),
+    ))
+}
+
+async fn reextract_audio_metadata(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let audio_service = state
+        .applications
+        .audio_metadata_service
+        .as_ref()
+        .ok_or_else(|| AppError::internal_error("Audio metadata service not available"))?;
+
+    let result = audio_service
+        .reextract_all_audio_metadata()
+        .await
+        .map_err(|e| {
+            AppError::internal_error(format!("Failed to re-extract audio metadata: {}", e))
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "message": "Audio metadata extraction complete",
+        "total": result.total,
+        "processed": result.processed,
+        "failed": result.failed,
+    })))
+}
+
+/// Backfill image/video capture dates (EXIF / container creation time) into
+/// `storage.file_metadata` for every existing media file, re-bucketing the
+/// Photos timeline by real capture date. Safe to re-run (idempotent upsert).
+async fn reextract_image_metadata(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let result = state
+        .applications
+        .media_metadata_service
+        .reextract_all_image_metadata()
+        .await
+        .map_err(|e| {
+            AppError::internal_error(format!("Failed to re-extract capture metadata: {}", e))
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "message": "Image/video capture-metadata extraction complete",
+        "total": result.total,
+        "processed": result.processed,
+        "failed": result.failed,
+    })))
+}
+
+// ─────────────────────────────────────────────────────
+// SMTP diagnostics
+// ─────────────────────────────────────────────────────
+//
+// The SMTP backend is configured exclusively via OXICLOUD_SMTP_* env
+// vars (see docs/config/env.md). The admin UI uses these two endpoints
+// purely for diagnostics:
+//   - `get_smtp_info` shows the current runtime config (read-only — no
+//     write endpoint exists; operators edit `.env` and restart).
+//   - `send_smtp_test` sends a hardcoded confirmation mail to a
+//     recipient supplied by the admin, returning the SMTP server's
+//     response so the operator can correlate it with their relay logs.
+
+/// GET /api/admin/webhook/info — read-only view of the running webhook
+/// config, beside SMTP on the admin Notifications page.
+///
+/// Reports the host but **never the full URL**: a Telegram endpoint carries
+/// the bot token in its path, and a Slack or Discord webhook URL *is* the
+/// credential. The host answers "does this point where I think it does"
+/// without putting a secret in a browser's network log.
+#[utoipa::path(
+    get,
+    path = "/api/admin/webhook/info",
+    responses(
+        (status = 200, description = "Current webhook settings", body = WebhookInfoDto),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_webhook_info(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let webhook = &state.core.config.webhook;
+    // Scheme + host only. Parsing can fail on a hand-written URL, in which
+    // case showing nothing beats showing the path by accident.
+    let host = webhook
+        .url
+        .as_deref()
+        .and_then(|u| url::Url::parse(u).ok())
+        .map(|u| match u.host_str() {
+            Some(h) => format!("{}://{}", u.scheme(), h),
+            None => u.scheme().to_string(),
+        })
+        .unwrap_or_default();
+    Ok((
+        StatusCode::OK,
+        Json(WebhookInfoDto {
+            // `webhook_sink` rather than the config alone: a URL that is set
+            // but unusable never becomes a sink, and the page should say
+            // "not enabled" rather than implying delivery works.
+            enabled: state.webhook_sink.is_some(),
+            format: format!("{:?}", webhook.format).to_lowercase(),
+            host,
+            target: webhook.target.clone().unwrap_or_default(),
+        }),
+    ))
+}
+
+/// GET /api/admin/smtp/info — read-only view of the running SMTP config.
+#[utoipa::path(
+    get,
+    path = "/api/admin/smtp/info",
+    responses(
+        (status = 200, description = "Current SMTP settings", body = SmtpInfoDto),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_smtp_info(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let smtp = &state.core.config.smtp;
+    let info = SmtpInfoDto {
+        enabled: smtp.is_enabled() && state.email_sender.is_some(),
+        host: smtp.host.clone(),
+        port: smtp.port,
+        tls: match smtp.tls {
+            crate::common::config::SmtpTlsMode::Starttls => "starttls".to_string(),
+            crate::common::config::SmtpTlsMode::Tls => "tls".to_string(),
+            crate::common::config::SmtpTlsMode::None => "none".to_string(),
+        },
+        from: smtp.from.clone(),
+        user_state: if smtp.user.is_empty() {
+            "<anon>"
+        } else {
+            "<set>"
+        },
+    };
+
+    Ok(Json(info))
+}
+
+/// GET /api/admin/smtp/test/captured?to=<email> — test-only inbox lookup.
+///
+/// Returns the most recently captured outbound message for `to` when
+/// `OXICLOUD_SMTP_MOCK=true`. In production / non-mock mode this
+/// returns 404 to keep the endpoint inert.
+async fn get_captured_email(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<CapturedEmailQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    if !state.core.config.smtp.mock {
+        return Err(AppError::not_found(
+            "Capture endpoint is only available when OXICLOUD_SMTP_MOCK=true",
+        ));
+    }
+
+    let recipient = params.to.trim();
+    if recipient.is_empty() {
+        return Err(AppError::bad_request("`to` query parameter is required"));
+    }
+
+    let Some(mock) = state.mock_email_sender.as_ref() else {
+        return Err(AppError::not_found(
+            "Mock sender is not active (set OXICLOUD_SMTP_MOCK=true)",
+        ));
+    };
+
+    match mock.last_for(recipient).await {
+        Some(captured) => Ok(Json((*captured).clone())),
+        None => Err(AppError::not_found(format!(
+            "No captured message for '{}'",
+            recipient
+        ))),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CapturedEmailQuery {
+    to: String,
+}
+
+/// POST /api/admin/smtp/test — send a diagnostic email to `dto.to`.
+///
+/// Returns 200 regardless of SMTP outcome; the body's `success` flag
+/// + `code`/`message` (or `error`) tell the frontend what to render.
+/// This keeps SMTP-level failures (4xx/5xx replies, connection
+/// timeouts) as ordinary diagnostic data rather than HTTP errors.
+#[utoipa::path(
+    post,
+    path = "/api/admin/smtp/test",
+    request_body = SendSmtpTestDto,
+    responses(
+        (status = 200, description = "Send attempt completed", body = SmtpTestResultDto),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 503, description = "SMTP not configured"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn send_smtp_test(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(dto): Json<SendSmtpTestDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+
+    let recipient = dto.to.trim().to_string();
+    if recipient.is_empty() {
+        return Err(AppError::bad_request("Recipient address is required"));
+    }
+
+    let sender = state.email_sender.as_ref().ok_or_else(|| {
+        AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SMTP is not configured (set OXICLOUD_SMTP_HOST in .env to enable)",
+            "ServiceUnavailable",
+        )
+    })?;
+
+    let message = crate::application::ports::email_sender::EmailMessage {
+        to: recipient.clone(),
+        subject: "OxiCloud SMTP test".to_string(),
+        text_body: format!(
+            "This is a diagnostic message sent from your OxiCloud instance.\n\
+             \n\
+             If you are reading this, your SMTP relay accepted the message — \
+             outbound email is wired up correctly.\n\
+             \n\
+             Triggered by admin user id {} on {}.\n",
+            admin_id,
+            chrono::Utc::now().to_rfc3339(),
+        ),
+        html_body: None,
+    };
+
+    tracing::info!(
+        target: "audit",
+        event = "smtp.test_send",
+        admin_id = %admin_id,
+        recipient = %recipient,
+    );
+
+    let result = match sender.send(message).await {
+        Ok(outcome) => {
+            tracing::info!(
+                target: "audit",
+                event = "smtp.test_send_ok",
+                admin_id = %admin_id,
+                recipient = %recipient,
+                code = outcome.code,
+                message = %outcome.message,
+            );
+            SmtpTestResultDto {
+                success: true,
+                code: Some(outcome.code),
+                message: Some(outcome.message),
+                error: None,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "audit",
+                event = "smtp.test_send_failed",
+                admin_id = %admin_id,
+                recipient = %recipient,
+                error = %e.message,
+            );
+            SmtpTestResultDto {
+                success: false,
+                code: None,
+                message: None,
+                error: Some(e.message),
+            }
+        }
+    };
+
+    Ok(Json(result))
+}
+
+// ---- Plugin management -----------------------------------------------------
+
+/// Resolve the plugin-management port, or 503 when plugins are compiled out or
+/// disabled via `OXICLOUD_ENABLE_PLUGINS`. The admin UI treats this 503 as the
+/// "plugins disabled" state rather than an error.
+fn plugin_mgmt(state: &AppState) -> Result<&Arc<dyn PluginManagementPort>, AppError> {
+    state.plugin_management.as_ref().ok_or_else(|| {
+        AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Plugins are disabled",
+            "PluginsDisabled",
+        )
+    })
+}
+
+/// Map a management-layer error to an HTTP error. NotFound → 404, IdExists →
+/// 409, Rejected → 400 (with the stable reason key in the message), Io → 500.
+fn map_mgmt_err(err: &PluginMgmtError) -> AppError {
+    match err {
+        PluginMgmtError::NotFound => AppError::not_found("Plugin not found"),
+        PluginMgmtError::IdExists => {
+            AppError::conflict("A plugin with this id is already installed")
+        }
+        PluginMgmtError::Rejected(reason) => AppError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Plugin rejected: {reason}"),
+            "PluginRejected",
+        ),
+        PluginMgmtError::Io(msg) => {
+            AppError::internal_error(format!("Plugin operation failed: {msg}"))
+        }
+    }
+}
+
+/// GET /api/admin/plugins — list installed plugins.
+pub async fn list_plugins(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let mgmt = plugin_mgmt(&state)?;
+    let plugins: Vec<PluginInfoDto> = mgmt.list().into_iter().map(PluginInfoDto::from).collect();
+    // `enabled` reports that the plugin *subsystem* is active (reaching here
+    // means it is — `plugin_mgmt` returns 503 otherwise, which the UI reads as
+    // the disabled state). Per-plugin enablement is each entry's own `enabled`.
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "enabled": true, "plugins": plugins })),
+    ))
+}
+
+/// PUT /api/admin/plugins/{id}/enabled — enable or disable a plugin.
+pub async fn set_plugin_enabled(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+    Json(dto): Json<SetEnabledDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    let mgmt = plugin_mgmt(&state)?;
+    mgmt.set_enabled(&id, dto.enabled)
+        .map_err(|e| map_mgmt_err(&e))?;
+
+    if dto.enabled {
+        tracing::info!(
+            target: "audit",
+            event = "plugin.enabled",
+            plugin_id = %id,
+            admin_id = %admin_id,
+            "👮🏻‍♂️ plugin enabled by admin"
+        );
+    } else {
+        tracing::info!(
+            target: "audit",
+            event = "plugin.disabled",
+            plugin_id = %id,
+            admin_id = %admin_id,
+            "👮🏻‍♂️ plugin disabled by admin"
+        );
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": if dto.enabled { "Plugin enabled" } else { "Plugin disabled" },
+            "id": id,
+            "enabled": dto.enabled,
+        })),
+    ))
+}
+
+/// POST /api/admin/plugins — install a plugin from a multipart body with a
+/// single `bundle` part: a `.zip` containing `plugin.toml` and its `.wasm`.
+pub async fn install_plugin(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    let mgmt = plugin_mgmt(&state)?;
+
+    let mut bundle: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad_request(format!("Invalid multipart body: {e}")))?
+    {
+        if field.name() == Some("bundle") {
+            bundle = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::bad_request(format!("Invalid bundle part: {e}")))?
+                    .to_vec(),
+            );
+        }
+    }
+
+    let bundle = match bundle {
+        Some(b) => b,
+        None => {
+            tracing::warn!(
+                target: "audit",
+                event = "plugin.install_rejected",
+                reason = "missing_part",
+                admin_id = %admin_id,
+                "👮🏻‍♂️ plugin install rejected: missing 'bundle' part"
+            );
+            return Err(AppError::bad_request("A 'bundle' (.zip) part is required"));
+        }
+    };
+
+    match mgmt.install_bundle(bundle) {
+        Ok(info) => {
+            tracing::info!(
+                target: "audit",
+                event = "plugin.installed",
+                plugin_id = %info.id,
+                admin_id = %admin_id,
+                "👮🏻‍♂️ plugin installed by admin"
+            );
+            Ok((StatusCode::CREATED, Json(PluginInfoDto::from(info))))
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "audit",
+                event = "plugin.install_rejected",
+                reason = e.reason(),
+                admin_id = %admin_id,
+                "👮🏻‍♂️ plugin install rejected"
+            );
+            Err(map_mgmt_err(&e))
+        }
+    }
+}
+
+/// DELETE /api/admin/plugins/{id} — uninstall a plugin and delete its files.
+pub async fn delete_plugin(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    let mgmt = plugin_mgmt(&state)?;
+    mgmt.remove(&id).map_err(|e| map_mgmt_err(&e))?;
+
+    tracing::info!(
+        target: "audit",
+        event = "plugin.removed",
+        plugin_id = %id,
+        admin_id = %admin_id,
+        "👮🏻‍♂️ plugin removed by admin"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "message": "Plugin removed", "id": id })),
+    ))
+}
+
+/// GET /api/admin/plugins/{id}/logs — a filtered, paginated page of a plugin's
+/// structured log entries (newest first).
+pub async fn get_plugin_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<PluginLogQueryDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let mgmt = plugin_mgmt(&state)?;
+
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0);
+    let page = mgmt
+        .read_logs(
+            &id,
+            LogQuery {
+                level: q.level,
+                search: q.search,
+                offset,
+                limit,
+            },
+        )
+        .await
+        .map_err(|e| map_mgmt_err(&e))?;
+
+    Ok(Json(PluginLogPageDto::from_page(page, limit, offset)))
+}
+
+/// DELETE /api/admin/plugins/{id}/logs — wipe a plugin's persisted logs.
+pub async fn clear_plugin_logs(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    let mgmt = plugin_mgmt(&state)?;
+    mgmt.clear_logs(&id).await.map_err(|e| map_mgmt_err(&e))?;
+
+    tracing::info!(
+        target: "audit",
+        event = "plugin.logs_cleared",
+        plugin_id = %id,
+        admin_id = %admin_id,
+        "👮🏻‍♂️ plugin logs cleared by admin"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "message": "Plugin logs cleared", "id": id })),
+    ))
+}
+
+/// GET /api/admin/plugins/{id}/logs/stream — Server-Sent Events live tail. Each
+/// `message` event carries one new log entry (JSON); a `lagged` event signals
+/// the client should resync after falling behind. Auth rides the access cookie,
+/// so `EventSource` works without setting headers.
+pub async fn stream_plugin_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
+
+    let mgmt = plugin_mgmt(&state)?;
+    if !mgmt.list().iter().any(|p| p.id == id) {
+        return Err(AppError::not_found("Plugin not found"));
+    }
+
+    let rx = mgmt.subscribe_logs();
+    let want = id;
+    let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
+        Ok(ev) if ev.plugin_id == want => {
+            let dto = PluginLogEntryDto::from(ev.entry);
+            let event = Event::default()
+                .json_data(&dto)
+                .unwrap_or_else(|_| Event::default().comment("serialize error"));
+            Some(Ok::<Event, std::convert::Infallible>(event))
+        }
+        Ok(_) => None,
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            Some(Ok(Event::default().event("lagged").data(n.to_string())))
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// GET /api/admin/plugins/{id}/retention — the plugin's effective retention.
+pub async fn get_plugin_retention(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let mgmt = plugin_mgmt(&state)?;
+    let settings = mgmt
+        .get_retention(&id)
+        .await
+        .map_err(|e| map_mgmt_err(&e))?;
+    Ok(Json(PluginRetentionDto::from(settings)))
+}
+
+/// PUT /api/admin/plugins/{id}/retention — set the plugin's retention policy.
+pub async fn set_plugin_retention(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(id): Path<String>,
+    Json(dto): Json<PluginRetentionDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    let mgmt = plugin_mgmt(&state)?;
+    mgmt.set_retention(&id, dto.into())
+        .await
+        .map_err(|e| map_mgmt_err(&e))?;
+
+    tracing::info!(
+        target: "audit",
+        event = "plugin.retention_updated",
+        plugin_id = %id,
+        admin_id = %admin_id,
+        retention_days = dto.retention_days,
+        max_bytes = dto.max_bytes,
+        "👮🏻‍♂️ plugin log retention updated by admin"
+    );
+
+    Ok((StatusCode::OK, Json(dto)))
+}
+
+/// Parse the `{kind}` path segment, refusing anything that is not a real
+/// drive kind rather than defaulting to one.
+fn parse_drive_kind(raw: &str) -> Result<crate::domain::entities::drive::DriveKind, AppError> {
+    crate::domain::entities::drive::DriveKind::parse(raw)
+        .ok_or_else(|| AppError::bad_request(format!("unknown drive kind `{raw}`")))
+}
+
+/// GET /api/admin/drive-policies/defaults/{kind}
+///
+/// The policy every new drive of this kind inherits, and that existing
+/// drives resolve against for every knob they have not overridden.
+#[utoipa::path(
+    get,
+    path = "/api/admin/drive-policies/defaults/{kind}",
+    params(("kind" = String, Path, description = "personal | shared")),
+    responses(
+        (status = 200, description = "Current defaults for this drive kind", body = crate::domain::entities::drive::DrivePolicies),
+        (status = 400, description = "Unknown drive kind"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_drive_policy_defaults(
+    State(state): State<Arc<AppState>>,
+    Path(kind): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let kind = parse_drive_kind(&kind)?;
+    let defaults = state.drive_policy_defaults_service.get(kind).await?;
+    Ok((StatusCode::OK, Json(defaults)))
+}
+
+/// GET /api/admin/drive-policies/drift
+///
+/// Drives that are currently laxer than their kind's default, across both
+/// kinds, computed live.
+///
+/// Deliberately NOT a consistency-job finding. It reads two small tables, so
+/// a page load can afford it — and being live is what makes it correct: a
+/// scan reports a completed run, so a drive the admin has just fixed stays
+/// on the list until someone re-scans. Here the row disappears as soon as
+/// the override is corrected.
+#[utoipa::path(
+    get,
+    path = "/api/admin/drive-policies/drift",
+    responses(
+        (status = 200, description = "Drives laxer than their kind's default", body = Vec<crate::application::services::drive_policy_defaults_service::WeakerDriveDto>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_drive_policy_drift(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::domain::entities::drive::DriveKind;
+    let mut out = Vec::new();
+    for kind in [DriveKind::Personal, DriveKind::Shared] {
+        out.extend(state.drive_policy_defaults_service.drift(kind).await?);
+    }
+    Ok((StatusCode::OK, Json(out)))
+}
+
+/// Query for [`set_drive_policy_defaults`].
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct SetPolicyDefaultsQuery {
+    /// When true, compute and return the impact WITHOUT saving.
+    ///
+    /// Send the literal `true` / `false`: `serde_urlencoded` refuses `1`,
+    /// `yes` and `on` outright and fails the whole query struct, so a
+    /// truthy-looking `?dry_run=1` is a 400 rather than a silent false.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// PUT /api/admin/drive-policies/defaults/{kind}
+///
+/// **Replaces** the bag rather than merging it. The per-drive PATCH merges
+/// so an admin can nudge one knob without restating the rest, but a default
+/// is a complete statement of posture for the kind — merging would leave no
+/// way to express "unset this knob", since a key could never be taken back
+/// out.
+///
+/// With `?dry_run=true` nothing is written and the response is the impact
+/// the change *would* have: how many drives follow it, how many override it
+/// and stay put, and how many end up laxer than the new default. That turns
+/// both compliance reports into a pre-commit check rather than an
+/// after-the-fact audit.
+///
+/// Refuses (400) rather than silently dropping a knob that cannot take
+/// effect — `read_only`, which is per-drive only, and knobs that do not
+/// apply to the kind. A setting stored where it does nothing is one the
+/// admin believes they made.
+#[utoipa::path(
+    put,
+    path = "/api/admin/drive-policies/defaults/{kind}",
+    params(("kind" = String, Path, description = "personal | shared"), SetPolicyDefaultsQuery),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, body = Object, description = "Stored defaults, or the impact preview when dry_run=true"),
+        (status = 400, description = "Unknown kind, unknown knob, or a knob that cannot be defaulted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn set_drive_policy_defaults(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(kind): Path<String>,
+    Query(q): Query<SetPolicyDefaultsQuery>,
+    Json(bag): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let kind = parse_drive_kind(&kind)?;
+
+    if q.dry_run {
+        let impact = state
+            .drive_policy_defaults_service
+            .preview(kind, &bag)
+            .await?;
+        return Ok((StatusCode::OK, Json(serde_json::json!(impact))));
+    }
+
+    let stored = state
+        .drive_policy_defaults_service
+        .set(auth_user.id, kind, bag)
+        .await?;
+    Ok((StatusCode::OK, Json(serde_json::json!(stored))))
+}
+
+/// GET /api/admin/drives — list every drive on the system, admin-only.
+///
+/// Distinct from `GET /api/drives`, which is the caller's own listing
+/// filtered through `role_grants`. An admin who creates a shared drive
+/// for someone else has no grant on it — but the admin panel still
+/// needs to see the drive (to audit, to manage, to delete). The admin
+/// guard at the handler edge is the access control; no role filtering
+/// happens in the repo (see `drive_repository::list_all`).
+///
+/// Returns rows ordered by display name. `caller_role` is omitted —
+/// the admin is not necessarily a drive member, so the field would be
+/// misleading here.
+#[utoipa::path(
+    get,
+    path = "/api/admin/drives",
+    responses(
+        (status = 200, description = "Every drive on the system", body = Vec<DriveDto>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn list_all_drives(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let drives = state
+        .drive_repo
+        .list_all()
+        .await
+        .map_err(|e| AppError::internal_error(format!("Failed to list drives: {e}")))?;
+    let dtos: Vec<DriveDto> = drives.into_iter().map(DriveDto::from).collect();
+    Ok((StatusCode::OK, Json(dtos)))
+}
+
+/// GET /api/admin/drives/{id}/members — list every role grant on a drive,
+/// admin-only.
+///
+/// Distinct from `GET /api/drives/{id}/members` which goes through
+/// `DriveManagementService::list_members` and requires `Permission::Read`
+/// on the drive. The admin who created the drive for someone else has
+/// no role on it, so the user-facing endpoint would 404 for them.
+///
+/// This endpoint reuses the engine's `list_grants_on_resource` directly
+/// — same query, same shape, just gated by the admin middleware instead
+/// of by `authz.require`. Returns the same `Vec<GrantDto>` so the
+/// frontend renders it through the existing grant types.
+#[utoipa::path(
+    get,
+    path = "/api/admin/drives/{id}/members",
+    params(("id" = Uuid, Path, description = "Drive UUID")),
+    responses(
+        (status = 200, description = "Role grants on the drive", body = Vec<GrantDto>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn list_drive_members_admin(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(drive_id): axum::extract::Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let grants = state
+        .authorization
+        .list_grants_on_resource(Resource::Drive(drive_id))
+        .await
+        .map_err(AppError::from)?;
+    let dtos: Vec<GrantDto> = grants.into_iter().map(GrantDto::from).collect();
+    Ok((StatusCode::OK, Json(dtos)))
+}
+
+/// Body for `POST /api/admin/drives/{id}/members` and
+/// `PATCH /api/admin/drives/{id}/members/{kind}/{sid}` — same wire shape
+/// as the user-facing endpoints, kept here so this handler doesn't pull
+/// in the regular drive-handler module's DTOs (which would create a
+/// circular feel between admin and user-facing surfaces).
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct AdminAddDriveMemberDto {
+    pub subject: SubjectDto,
+    pub role: RoleDto,
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct AdminUpdateDriveMemberDto {
+    pub role: RoleDto,
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn admin_parse_subject(kind: SubjectTypeDto, id: Uuid) -> Subject {
+    match kind {
+        SubjectTypeDto::User => Subject::User(id),
+        SubjectTypeDto::Group => Subject::Group(id),
+        SubjectTypeDto::Token => Subject::Token(id),
+    }
+}
+
+/// POST /api/admin/drives/{id}/members — add or refresh a member's role
+/// without holding `Manage` on the drive. Admin-only; bypasses the
+/// per-drive authz check via the `caller_is_admin = true` argument on
+/// `DriveManagementService::set_member_role`. Personal-drive guard and
+/// last-owner protection still apply.
+#[utoipa::path(
+    post,
+    path = "/api/admin/drives/{id}/members",
+    params(("id" = Uuid, Path, description = "Drive UUID")),
+    request_body = AdminAddDriveMemberDto,
+    responses(
+        (status = 201, description = "Member added", body = GrantDto),
+        (status = 400, description = "Validation error (e.g. last-owner constraint)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 405, description = "Personal drive — membership is immutable"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn add_drive_member_admin(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    axum::extract::Path(drive_id): axum::extract::Path<Uuid>,
+    Json(dto): Json<AdminAddDriveMemberDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    let subject = admin_parse_subject(dto.subject.kind, dto.subject.id);
+    let grant = state
+        .drive_management_service
+        .set_member_role(
+            admin_id,
+            true,
+            drive_id,
+            subject,
+            dto.role.into(),
+            dto.expires_at,
+        )
+        .await
+        .map_err(AppError::from)?;
+    Ok((StatusCode::CREATED, Json(GrantDto::from(grant))))
+}
+
+/// PATCH /api/admin/drives/{id}/members/{kind}/{sid} — change a member's
+/// role / expiry as an admin. Same admin-bypass shape as
+/// `add_drive_member_admin`.
+#[utoipa::path(
+    patch,
+    path = "/api/admin/drives/{id}/members/{kind}/{sid}",
+    params(
+        ("id" = Uuid, Path, description = "Drive UUID"),
+        ("kind" = String, Path, description = "Subject kind: user|group|token"),
+        ("sid" = Uuid, Path, description = "Subject UUID"),
+    ),
+    request_body = AdminUpdateDriveMemberDto,
+    responses(
+        (status = 200, description = "Member role updated", body = GrantDto),
+        (status = 400, description = "Validation error (e.g. last-owner demotion)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 405, description = "Personal drive — membership is immutable"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn update_drive_member_admin(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    axum::extract::Path((drive_id, kind, subject_id)): axum::extract::Path<(
+        Uuid,
+        SubjectTypeDto,
+        Uuid,
+    )>,
+    Json(dto): Json<AdminUpdateDriveMemberDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    let subject = admin_parse_subject(kind, subject_id);
+    let grant = state
+        .drive_management_service
+        .set_member_role(
+            admin_id,
+            true,
+            drive_id,
+            subject,
+            dto.role.into(),
+            dto.expires_at,
+        )
+        .await
+        .map_err(AppError::from)?;
+    Ok((StatusCode::OK, Json(GrantDto::from(grant))))
+}
+
+/// DELETE /api/admin/drives/{id}/members/{kind}/{sid} — remove a
+/// member as an admin. Bypasses `Manage`; keeps last-owner protection.
+#[utoipa::path(
+    delete,
+    path = "/api/admin/drives/{id}/members/{kind}/{sid}",
+    params(
+        ("id" = Uuid, Path, description = "Drive UUID"),
+        ("kind" = String, Path, description = "Subject kind: user|group|token"),
+        ("sid" = Uuid, Path, description = "Subject UUID"),
+    ),
+    responses(
+        (status = 204, description = "Member removed (or wasn't a member — idempotent)"),
+        (status = 400, description = "Last-owner protection — promote another member first"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 405, description = "Personal drive — membership is immutable"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn remove_drive_member_admin(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    axum::extract::Path((drive_id, kind, subject_id)): axum::extract::Path<(
+        Uuid,
+        SubjectTypeDto,
+        Uuid,
+    )>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    let subject = admin_parse_subject(kind, subject_id);
+    state
+        .drive_management_service
+        .remove_member(admin_id, true, drive_id, subject)
+        .await
+        .map_err(AppError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/admin/drives/{id}` — admin-only drive delete (D3b).
+///
+/// Same shape as the user-facing `DELETE /api/drives/{id}`, but
+/// bypasses the per-drive `Manage` check (the admin guard at the
+/// route edge is the access control). The remaining invariants —
+/// default Personal drive is undeletable, drive must be empty — still
+/// apply: an admin can't accidentally wipe a populated drive or the
+/// default home folder of any user. Audit emits
+/// `drive.deleted_via_admin` on success.
+#[utoipa::path(
+    delete,
+    path = "/api/admin/drives/{id}",
+    params(("id" = Uuid, Path, description = "Drive UUID")),
+    responses(
+        (status = 204, description = "Drive deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 405, description = "Default Personal drive — undeletable"),
+        (status = 409, description = "Drive is not empty"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn delete_drive_admin(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    axum::extract::Path(drive_id): axum::extract::Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let admin_id = auth_user.id;
+    state
+        .drive_management_service
+        .delete_drive(admin_id, true, drive_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─────────────────────────────────────────────────────
+// JobRegistry admin surface (`/api/admin/jobs/*`)
+// ─────────────────────────────────────────────────────
+
+/// `GET /api/admin/jobs` — enumerate every registered job with its
+/// interval, next-run/last-run timestamps, and last outcome.
+///
+/// Production endpoint, always on. Read-only, so no audit line —
+/// the standard admin-middleware auth check is enough.
+/// `GET /api/admin/transcode/stats` — WebP transcode effectiveness.
+///
+/// The four counters distinguish where a response came from, which is
+/// otherwise invisible: `transcodes` is work actually done, while
+/// `cache_hits` (in-memory, keyed by file id) and `disk_hits` (the
+/// durable content-keyed tier, plus the legacy local cache) are work
+/// avoided. A rising `transcodes` against a flat `disk_hits` means the
+/// derived tier is not being consulted — which is exactly the
+/// regression a migration can introduce silently.
+///
+/// `bytes_saved` counts only successful transcodes; images the encoder
+/// could not shrink contribute nothing to it and are remembered as
+/// negative rows instead.
+///
+/// Read-only, so no audit line — the admin middleware gate is enough.
+#[utoipa::path(
+    get,
+    path = "/api/admin/transcode/stats",
+    responses(
+        (status = 200, description = "Transcode statistics"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_transcode_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let s = state.core.image_transcode_service.get_stats().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "cache_hits":       s.cache_hits,
+            "disk_hits":        s.disk_hits,
+            "transcodes":       s.transcodes,
+            "bytes_saved":      s.bytes_saved,
+            "transcode_errors": s.transcode_errors,
+            // Decodes that produced something larger. Work done for no
+            // gain — the thing the stored negative verdict prevents
+            // repeating, and invisible before this counter existed.
+            "not_beneficial":   s.not_beneficial,
+        })),
+    )
+        .into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/jobs",
+    responses(
+        (status = 200, body = Object, description = "Jobs listed"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn list_jobs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut summary = state.core.job_registry.snapshot().await;
+
+    // Enrich with paused-run info for recoverable jobs so the admin
+    // panel can render "Resume (scanned/total)" on the row instead of
+    // just "Run". One indexed SELECT hits `jobs.recoverable_runs`
+    // (`one_active_run_per_job` partial UNIQUE keys the lookup);
+    // failures fall back to the pre-enrichment shape so the endpoint
+    // stays useful when the jobs DB is temporarily unreachable.
+    if let Some(pool) = state.db_pool.as_ref() {
+        // The LATEST run per job, whatever its status — not just the
+        // paused ones.
+        //
+        // `last_outcome` is in-memory, written when a dispatch finishes
+        // through the engine. Anything that changes a run row WITHOUT
+        // running the handler leaves it stale: cancelling a Paused run
+        // is a direct SQL flip to `Cancelled`, so the panel kept
+        // rendering the outcome of the run that pause belonged to — a
+        // cancelled job still showing "blocked".
+        //
+        // `DISTINCT ON` is safe as "the current run": the
+        // `one_active_run_per_job` partial unique index allows only one
+        // non-terminal row per job, and a resume reuses it rather than
+        // starting a new one, so a non-terminal row is always the newest.
+        /// `(job_name, status, run_id, started_at, scanned, total,
+        /// severity_counts, error_reason)` — the enrichment row shape,
+        /// named so the query's type stays legible.
+        type LatestRunRow = (
+            String,
+            String,
+            uuid::Uuid,
+            chrono::DateTime<chrono::Utc>,
+            Option<i64>,
+            Option<i64>,
+            sqlx::types::Json<std::collections::BTreeMap<String, u64>>,
+            Option<String>,
+        );
+        // The per-severity counts come from the findings themselves
+        // rather than from the run's `stats`, for the same reason
+        // `status` does: a run's outcome lives in memory and a restart
+        // empties it, while findings are rows. One correlated aggregate
+        // over `jobs.run_findings`, keyed by the run id the CTE already
+        // selected — not a round-trip per job.
+        let latest_rows: Vec<LatestRunRow> = sqlx::query_as(
+            r#"
+            WITH latest AS (
+                SELECT DISTINCT ON (job_name)
+                    job_name,
+                    status::TEXT AS status,
+                    id,
+                    started_at,
+                    (stats  ->> 'scanned_count')::BIGINT AS scanned,
+                    (params ->> 'total_rows')::BIGINT   AS total,
+                    error_reason
+                FROM jobs.recoverable_runs
+                ORDER BY job_name, started_at DESC
+            )
+            SELECT
+                l.job_name,
+                l.status,
+                l.id,
+                l.started_at,
+                l.scanned,
+                l.total,
+                COALESCE(
+                    (SELECT jsonb_object_agg(s.severity, s.n)
+                       FROM (SELECT severity, COUNT(*) AS n
+                               FROM jobs.run_findings
+                              WHERE run_id = l.id
+                              GROUP BY severity) s),
+                    '{}'::jsonb
+                ) AS severity_counts,
+                l.error_reason
+            FROM latest l
+            "#,
+        )
+        .fetch_all(pool.as_ref())
+        .await
+        .unwrap_or_else(|e| {
+            // Degrading to the pre-enrichment shape is the right call for a
+            // momentarily unreachable jobs DB. Doing it silently is not: the
+            // panel would simply stop showing findings, which looks exactly
+            // like having none. A malformed query here would hide every
+            // finding on every row, forever, with nothing to notice.
+            tracing::warn!(
+                target: "oxicloud::admin",
+                error = %e,
+                "job list enrichment failed — rows render without run status or finding counts",
+            );
+            Vec::new()
+        });
+
+        type LatestRun = (
+            String,
+            chrono::DateTime<chrono::Utc>,
+            PausedRunBrief,
+            std::collections::BTreeMap<String, u64>,
+            Option<String>,
+        );
+        let by_name: std::collections::HashMap<String, LatestRun> = latest_rows
+            .into_iter()
+            .map(
+                |(name, status, id, started_at, scanned, total, severities, error_reason)| {
+                    (
+                        name,
+                        (
+                            status,
+                            started_at,
+                            PausedRunBrief {
+                                id,
+                                scanned: scanned.unwrap_or(0).max(0) as u64,
+                                total: total.filter(|t| *t > 0).map(|t| t as u64),
+                            },
+                            severities.0,
+                            error_reason,
+                        ),
+                    )
+                },
+            )
+            .collect();
+
+        for job in summary.iter_mut() {
+            if !job.recoverable {
+                continue;
+            }
+            let Some((status, started_at, brief, severities, error_reason)) =
+                by_name.get(&job.name)
+            else {
+                continue;
+            };
+            // Always reported, so the panel can prefer the row's truth
+            // over the in-memory outcome rather than guessing which is
+            // fresher.
+            job.last_run_status = Some(status.clone());
+            // Always, including empty: `Some({})` says the run found
+            // nothing, which the panel renders as a clean green "ok".
+            // Omitting it there would be indistinguishable from "no run
+            // row", and a job that has never run must not read as clean.
+            job.last_run_severity_counts = Some(severities.clone());
+            // Why the run stopped, from the row rather than from the
+            // in-memory outcome. A retryable pause reports `ok` on the
+            // wire — correctly, since it did not fail and a Resume
+            // continues it — so without this the panel renders a green
+            // "ok" for a job that gave up because the backend vanished.
+            // `None` here means either a clean run or a pause an operator
+            // asked for, and neither should look alarming.
+            job.last_run_error_reason = error_reason.clone();
+            // Fill the timestamp too when memory has none.
+            //
+            // `last_outcome` and `last_run_at` are both in-memory, so a
+            // restart empties them and the row read "never" for a job
+            // with real runs in the DB — the opposite failure to the
+            // stale-outcome one, and just as misleading. The row is
+            // authoritative for "did this ever run"; memory only adds
+            // the richer outcome detail when it happens to be warm.
+            //
+            // Only when absent: a warm `last_run_at` describes the last
+            // DISPATCH, which for a non-recoverable tick is finer-grained
+            // than any run row.
+            if job.last_run_at.is_none() {
+                job.last_run_at = Some(*started_at);
+            }
+            if !job.running && status == "Paused" {
+                job.paused_run = Some(brief.clone());
+            }
+        }
+    }
+
+    // A detector swept by a scheduled `consistency_batch` has no
+    // interval of its own, so the row would read as manual-only while it
+    // actually runs weekly. Report what runs it instead.
+    //
+    // Membership comes from `is_batch_child`, the same predicate the
+    // batch dispatches by, so this cannot describe a grouping that no
+    // longer matches what runs.
+    if let Some(batch_interval) = summary
+        .iter()
+        .find(|j| j.name == crate::infrastructure::services::consistency_batch_service::CONSISTENCY_BATCH_JOB_NAME)
+        .and_then(|j| j.interval_ms)
+    {
+        for job in summary.iter_mut() {
+            if job.interval_ms.is_none()
+                && crate::infrastructure::services::consistency_batch_service::is_batch_child(
+                    &job.name,
+                )
+            {
+                job.scheduled_via = Some(crate::infrastructure::scheduler::ScheduledVia {
+                    job: crate::infrastructure::services::consistency_batch_service::CONSISTENCY_BATCH_JOB_NAME
+                        .to_string(),
+                    interval_ms: batch_interval,
+                });
+            }
+        }
+    }
+
+    // Mark the jobs `OXICLOUD_JOBS_STARTUP` dispatches at boot. Without
+    // this the panel is silently wrong about the most consequential thing
+    // on the row: a job configured with `repair=true` deletes files on
+    // every restart, and the row would suggest that only ever happens
+    // when someone clicks Run.
+    for job in summary.iter_mut() {
+        if let Some(configured) = state
+            .core
+            .config
+            .startup_jobs
+            .iter()
+            .find(|s| s.name == job.name)
+        {
+            // Config keeps these untyped; type them against the same
+            // declaration the job dispatches under. A parse failure is
+            // unreachable — `di.rs` panics at boot on exactly this input —
+            // so an empty map here means the config changed under a
+            // running server, and showing no parameters beats inventing
+            // them.
+            let declared = job.parameters;
+            job.startup = Some(crate::infrastructure::scheduler::StartupTrigger {
+                params: crate::infrastructure::scheduler::JobRunArgs::from_declared(
+                    declared,
+                    configured
+                        .raw_params
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str())),
+                )
+                .map(|a| a.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+                .unwrap_or_default(),
+            });
+        }
+    }
+
+    (StatusCode::OK, Json(summary)).into_response()
+}
+
+/// Query parameters for `POST /api/admin/jobs/{name}/trigger`.
+///
+/// `force=true` requests acceleration semantics from handlers that
+/// support it (dedup_gc → grace = 0, grant_cleanup → grace = 0).
+/// Silently ignored by handlers that don't (trash_cleanup,
+/// usage_reconcile).
+///
+/// `deep=true` opts into slow variants — `consistency_batch` fans it
+/// out to sub-jobs; `storage_consistency` (when implemented) will
+/// re-BLAKE3 each blob for bitrot detection. See `JobRunArgs.deep`.
+///
+/// `repair=true` opts into corrective action on the refcount
+/// consistency tenants (`blobs_consistency`, `manifests_consistency`,
+/// and `consistency_batch` which fans out to both). Default `false`
+/// preserves discovery-only. See `JobRunArgs.repair` for the
+/// content-safety and race-safety guarantees.
+/// Free-form trigger parameters, validated against the target job's
+/// declaration rather than against a fixed field list.
+///
+/// A plain `HashMap`, not a newtype over one: `serde_urlencoded` cannot
+/// deserialize a newtype struct at the top level, so wrapping it made
+/// axum's `Query` extractor reject **every** trigger with a 400 — even
+/// one with no query string at all — before the handler ran.
+///
+/// This replaced a struct naming `force` / `deep` / `storage` /
+/// `repair`, which meant every job advertised the same four whether it
+/// read them or not, and a fifth could not be added without editing it.
+/// Now the job says what it accepts and
+/// [`JobRunArgs::from_declared`] does the parsing, so an undeclared
+/// parameter is a 400 naming the real ones instead of a silent no-op.
+pub type TriggerJobQuery = std::collections::HashMap<String, String>;
+
+/// `POST /api/admin/jobs/{name}/trigger` — dispatch one run off-schedule.
+///
+/// Returns the job's `JobOutcome` inline. Idempotent under exclusivity:
+/// if the previous run is still in flight, the handler returns
+/// `Ok { count: 0, extra: { "skipped": "already_running" } }` rather
+/// than spawning a parallel dispatch.
+///
+/// Emits an audit line before dispatch — bulk-mutation side effects on
+/// operator command belong on the audit stream.
+#[utoipa::path(
+    post,
+    path = "/api/admin/jobs/{name}/trigger",
+    params(("name" = String, Path, description = "Registered job name")),
+    responses(
+        (status = 200, body = Object, description = "Dispatched; outcome inline"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "Job not registered"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn trigger_job(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<TriggerJobQuery>,
+) -> impl IntoResponse {
+    use crate::infrastructure::scheduler::JobRunArgs;
+
+    // Parse against the job's own declaration. Unknown job → 404 here
+    // rather than after dispatch, and an undeclared parameter → 400
+    // naming what the job does accept.
+    // Same body as the dispatch-time 404 below — `error` + `name`.
+    // Clients switch on `error`, so an early return with different
+    // wording would make "unknown job" mean two things depending on how
+    // far the request happened to get. This path only exists because the
+    // declaration has to be read BEFORE the query can be parsed.
+    let Some(declared) = state.core.job_registry.parameters_of(&name).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "job not registered",
+                "name": name,
+            })),
+        )
+            .into_response();
+    };
+    let args = match JobRunArgs::from_declared(
+        declared,
+        query.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    ) {
+        Ok(a) => a,
+        Err(reason) => {
+            // Audited: a rejected trigger is an operator action that did
+            // not happen, and the panel only shows the message.
+            tracing::info!(
+                target: "audit",
+                event = "job.trigger_rejected",
+                reason = "bad_parameters",
+                job = %name,
+                detail = %reason,
+                "👮🏻‍♂️ Admin trigger rejected for {name}: {reason}",
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response();
+        }
+    };
+
+    // Audit line BEFORE dispatch so an operator triggering something
+    // that then hangs still leaves a trail. Parameters are rendered from
+    // the parsed args rather than named individually, so a job growing
+    // one does not need this line edited — and cannot end up triggered
+    // with something the audit trail never recorded.
+    let params_desc = if args.is_empty() {
+        "none".to_string()
+    } else {
+        args.iter()
+            .filter_map(|(k, v)| v.to_param_string().map(|s| format!("{k}={s}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    tracing::info!(
+        target: "audit",
+        event = "job.trigger",
+        job = %name,
+        params = %params_desc,
+        "👮🏻‍♂️ Admin triggered job {name} ({params_desc})",
+    );
+
+    // Jobs that can run for hours (backend_migration, future
+    // reextract_*) are detached: `tokio::spawn` the trigger so the
+    // HTTP request returns immediately. Without this, browser HTTP
+    // timeouts drop the request future mid-await → the SemaphorePermit
+    // gets released while the spawned handler task keeps running →
+    // `current_run_start` goes stale → a second click enters the
+    // "already_running" short-circuit and CLEARS the in-memory state
+    // even though the original task is still copying blobs → the
+    // Cancel button hides because `job.running = false`. Detaching
+    // keeps the permit + `current_run_start` scoped to the actual
+    // handler-task lifetime.
+    //
+    // Fast-completing jobs (consistency checks, batch coordinator)
+    // stay inline so the operator sees the outcome envelope.
+    if is_detached_job(&name) {
+        let name_clone = name.clone();
+        let registry = state.core.job_registry.clone();
+        tokio::spawn(async move {
+            registry.trigger(&name_clone, &args).await;
+        });
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "ok": true,
+                "dispatched": true,
+                "detached": true,
+                "name": name,
+                "message": "Dispatched — poll /runs for status",
+            })),
+        )
+            .into_response();
+    }
+
+    match state.core.job_registry.trigger(&name, &args).await {
+        Some(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "outcome": outcome })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "job not registered",
+                "name": name,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Jobs that MUST be dispatched with `tokio::spawn` because they run
+/// long enough to outlast an HTTP request timeout. Kept as a small
+/// hardcoded allowlist (rather than a flag on `JobEntry`) until
+/// there's a second long-running tenant that justifies the plumbing.
+/// See the comment in `trigger_job` for why detach matters.
+fn is_detached_job(name: &str) -> bool {
+    matches!(name, "backend_migration")
+}
+
+/// `POST /api/admin/jobs/{name}/cancel` — cooperative cancel of the
+/// currently-running recoverable run for `{name}`.
+///
+/// Flips the row's `status` from `Running` → `CancelRequested`. The
+/// handler is responsible for polling `store.status()` between batches
+/// and returning `RunOutcome::Paused` at the next safe boundary; if it
+/// doesn't, the cancel is a no-op until the run completes naturally.
+///
+/// Returns 200 with the run_id when a Running row was flipped, 200 with
+/// `cancelled: false` when nothing was running (either no runs exist,
+/// or the latest is Paused / Completed / Failed / already CancelRequested).
+/// Never 404 on "no active run" — the job name is registered and the
+/// endpoint just reports the truth.
+#[utoipa::path(
+    post,
+    path = "/api/admin/jobs/{name}/cancel",
+    params(("name" = String, Path, description = "Registered job name")),
+    responses(
+        (status = 200, body = Object, description = "Cancel signalled (or no-op if nothing was running)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 500, description = "DB error"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn cancel_job(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use crate::infrastructure::scheduler::JobStoreProvider as _;
+    tracing::info!(
+        target: "audit",
+        event = "job.cancel_requested",
+        job = %name,
+        "👮🏻‍♂️ Admin requested TERMINAL cancel for job {}",
+        name,
+    );
+    // Terminal semantics: stamps `params.cancel_intent = "terminate"`
+    // when a Running / CancelRequested row is present so the engine
+    // upgrades the handler's yield to `Cancelled` instead of `Paused`.
+    // When the current row is `Paused` (no handler running), does a
+    // direct DB flip Paused → Cancelled. See
+    // `PgJobStoreProvider::request_terminal_cancel`.
+    match state
+        .core
+        .job_store_provider
+        .request_terminal_cancel(&name)
+        .await
+    {
+        Ok(Some(run_id)) => {
+            // Cancelling a PAUSED migration has to give writes back
+            // here, because nothing else will.
+            //
+            // A Running row re-enters the handler, which releases the
+            // gate itself at its next cancel poll. A Paused row does
+            // not: `request_terminal_cancel` flips it straight to
+            // Cancelled in SQL with no handler in the loop. That is the
+            // common case — a migration paused by an outage, holding
+            // `migration_readonly`, which an operator cancels precisely
+            // TO get writes back. Without this the app stayed read-only
+            // forever: the flag is persisted, so even a restart reloaded
+            // it, and the only escape was editing admin_settings by
+            // hand.
+            //
+            // Safe because cancel ends the run with no swap — the source
+            // is still the active backend, so there is nothing left for
+            // the freeze to protect. Releasing on PAUSE would not be
+            // safe; see `release_readonly_on_terminal_cancel`.
+            //
+            // Idempotent and harmless for every other job: the flag is
+            // only ever set by backend_migration, so clearing it when it
+            // is already false is a no-op.
+            if name == crate::infrastructure::services::backend_migration_service::BACKEND_MIGRATION_JOB_NAME
+                && state
+                    .migration_readonly
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Some(pool) = state.db_pool.as_ref() {
+                    if let Err(e) =
+                        crate::infrastructure::services::entry_backend::persist_migration_readonly(
+                            pool.as_ref(),
+                            false,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "oxicloud::migration",
+                            event = "storage.migration_readonly.release_persist_failed",
+                            run_id = %run_id,
+                            error = %e,
+                            "could not persist migration_readonly=false after cancelling a paused \
+                             migration; writes resume now but a restart will come up read-only"
+                        );
+                    }
+                    let _ = crate::infrastructure::services::entry_backend::persist_backend_write_lock_holder(
+                        pool.as_ref(),
+                        None,
+                    )
+                    .await;
+                }
+                state.backend_write_gate.release();
+                state
+                    .migration_readonly
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    target: "audit",
+                    event = "storage.migration_readonly.released",
+                    reason = "paused_migration_cancelled",
+                    run_id = %run_id,
+                    "🚧 migration_readonly released — writes resume, active backend unchanged"
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "cancelled": true,
+                    "run_id": run_id.to_string(),
+                    "note": "Running row → will land in Cancelled at next batch boundary; \
+                             Paused row → flipped to Cancelled immediately.",
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "cancelled": false,
+                "reason": "no non-terminal run for this job",
+            })),
+        )
+            .into_response(),
+        Err(e) => AppError::internal_error(format!("cancel failed: {e}")).into_response(),
+    }
+}
+
+/// `POST /api/admin/jobs/{name}/pause` — cooperative PAUSE of the
+/// currently-running recoverable run for `{name}`.
+///
+/// Same DB mechanism as the old cancel (Running → CancelRequested,
+/// handler yields to Paused), but no `cancel_intent` stamp so the
+/// engine writes `Paused`. Use this to interrupt a long-running
+/// job and resume it later; use `/cancel` to abandon it terminally.
+///
+/// Idempotent: if the row is already Paused, returns 200 with
+/// `paused: false, reason: "already_paused"`.
+#[utoipa::path(
+    post,
+    path = "/api/admin/jobs/{name}/pause",
+    params(("name" = String, Path, description = "Registered job name")),
+    responses(
+        (status = 200, body = Object, description = "Pause signalled (or no-op if nothing was running)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 500, description = "DB error"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn pause_job(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use crate::infrastructure::scheduler::JobStoreProvider as _;
+    tracing::info!(
+        target: "audit",
+        event = "job.pause_requested",
+        job = %name,
+        "👮🏻‍♂️ Admin requested pause for job {}",
+        name,
+    );
+    match state.core.job_store_provider.request_cancel(&name).await {
+        Ok(Some(run_id)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "paused": true,
+                "run_id": run_id.to_string(),
+                "note": "Handler will yield at the next batch boundary; row will land in Paused.",
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "paused": false,
+                "reason": "no running run for this job",
+            })),
+        )
+            .into_response(),
+        Err(e) => AppError::internal_error(format!("pause failed: {e}")).into_response(),
+    }
+}
+
+/// Query parameters for `GET /api/admin/jobs/{name}/runs`.
+#[derive(serde::Deserialize)]
+pub struct ListRunsQuery {
+    /// Cap on returned rows. Server-side clamps to 100 defensively.
+    #[serde(default = "default_runs_limit")]
+    pub limit: u32,
+}
+
+fn default_runs_limit() -> u32 {
+    20
+}
+
+/// `GET /api/admin/jobs/{name}/runs?limit=N` — history of recoverable
+/// runs for a registered job, newest first. Includes terminal +
+/// non-terminal rows.
+///
+/// Read-only, no audit line — standard admin-middleware auth is enough.
+#[utoipa::path(
+    get,
+    path = "/api/admin/jobs/{name}/runs",
+    params(
+        ("name" = String, Path, description = "Registered job name"),
+        ("limit" = Option<u32>, Query, description = "Max rows to return (default 20, capped at 100)"),
+    ),
+    responses(
+        (status = 200, body = Object, description = "Runs listed (may be empty)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 500, description = "DB error"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn list_job_runs(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ListRunsQuery>,
+) -> impl IntoResponse {
+    use crate::infrastructure::scheduler::JobStoreProvider as _;
+    let limit = query.limit.clamp(1, 100);
+    match state.core.job_store_provider.list_runs(&name, limit).await {
+        Ok(runs) => (StatusCode::OK, Json(runs)).into_response(),
+        Err(e) => AppError::internal_error(format!("list_runs failed: {e}")).into_response(),
+    }
+}
+
+/// `GET /api/admin/jobs/{name}/runs/{id}` — single-run detail.
+///
+/// Returns 404 when the id doesn't exist. `{name}` is not validated
+/// against the run's `job_name` — the id is globally unique — but
+/// keeping the name in the URL path lets operators build stable
+/// per-job history links without knowing individual run ids upfront.
+#[utoipa::path(
+    get,
+    path = "/api/admin/jobs/{name}/runs/{id}",
+    params(
+        ("name" = String, Path, description = "Registered job name"),
+        ("id" = String, Path, description = "Run UUID"),
+    ),
+    responses(
+        (status = 200, body = Object, description = "Run detail"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "Run not found"),
+        (status = 500, description = "DB error"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_job_run(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((_name, id)): axum::extract::Path<(String, uuid::Uuid)>,
+) -> impl IntoResponse {
+    use crate::infrastructure::scheduler::JobStoreProvider as _;
+    match state.core.job_store_provider.get_run_by_id(id).await {
+        Ok(Some(run)) => (StatusCode::OK, Json(run)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "run not found", "id": id.to_string() })),
+        )
+            .into_response(),
+        Err(e) => AppError::internal_error(format!("get_run failed: {e}")).into_response(),
+    }
+}
+
+/// Query parameters for `GET /api/admin/jobs/{name}/runs/{id}/findings`.
+#[derive(serde::Deserialize)]
+pub struct ListFindingsQuery {
+    /// Page size — server clamps to 500 defensively.
+    #[serde(default = "default_findings_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub offset: u32,
+}
+
+fn default_findings_limit() -> u32 {
+    100
+}
+
+/// `GET /api/admin/jobs/{name}/runs/{id}/findings?limit=N&offset=M` —
+/// paginated findings emitted by a specific run of a recoverable job.
+///
+/// 404 when the run id doesn't exist (anti-enum: caller knew the id
+/// somehow; we don't leak whether it was pruned vs never-existed).
+/// Read-only, no audit — standard admin-middleware auth is enough.
+///
+/// `{name}` is not validated against the run's `job_name` (the id is
+/// globally unique) but keeps the URL path consistent with the other
+/// per-run endpoints for stable per-job history links.
+#[utoipa::path(
+    get,
+    path = "/api/admin/jobs/{name}/runs/{id}/findings",
+    params(
+        ("name" = String, Path, description = "Registered job name"),
+        ("id" = String, Path, description = "Run UUID"),
+        ("limit" = Option<u32>, Query, description = "Max rows (default 100, capped at 500)"),
+        ("offset" = Option<u32>, Query, description = "Rows to skip (default 0)"),
+    ),
+    responses(
+        (status = 200, body = Object, description = "Findings listed (may be empty)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "Run not found"),
+        (status = 500, description = "DB error"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn list_job_run_findings(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((_name, id)): axum::extract::Path<(String, uuid::Uuid)>,
+    axum::extract::Query(query): axum::extract::Query<ListFindingsQuery>,
+) -> impl IntoResponse {
+    use crate::infrastructure::scheduler::JobStoreProvider as _;
+    // Existence check first — otherwise a paged listing of a
+    // nonexistent run returns 200 [] which is indistinguishable from
+    // "run exists, no findings" and breaks operator drill-down.
+    match state.core.job_store_provider.get_run_by_id(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "run not found", "id": id.to_string() })),
+            )
+                .into_response();
+        }
+        Err(e) => return AppError::internal_error(format!("get_run failed: {e}")).into_response(),
+    }
+    let limit = query.limit.clamp(1, 500);
+    match state
+        .core
+        .job_store_provider
+        .list_findings(id, limit, query.offset)
+        .await
+    {
+        Ok(findings) => (StatusCode::OK, Json(findings)).into_response(),
+        Err(e) => AppError::internal_error(format!("list_findings failed: {e}")).into_response(),
+    }
+}
+
+// `POST /api/admin/jobs/runs/purge` lived here, with its own query
+// struct and handler, both calling `purge_terminal_runs`. Removed when
+// `job_runs_cleanup` landed: the job runs the same purge on a nightly
+// schedule and through the ordinary trigger endpoint
+// (`POST /api/admin/jobs/job_runs_cleanup/trigger?retention_days=N`),
+// so the bespoke route was a second way to invoke one operation — and
+// the one without run history, without the mutating-job confirmation,
+// and without the declared-parameter validation every other job gets.
+
+/// Outcome of `POST /api/admin/webhook/test`.
+///
+/// `code` + `message` mirror `SmtpTestResultDto` so the admin panel can
+/// render both transports' diagnostics the same way.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct WebhookTestResultDto {
+    pub success: bool,
+    /// Transport name, so a future second sink is distinguishable.
+    pub sink: String,
+    /// HTTP status the receiver returned. Absent when nothing answered —
+    /// DNS failure, refused connection, timeout — which is itself the
+    /// diagnosis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<u16>,
+    /// The receiver's own response body, truncated — or the transport
+    /// error when there was no response. Usually the useful part: a bare
+    /// 403 does not distinguish a revoked token from a disabled channel,
+    /// and the body says which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `POST /api/admin/webhook/test` — POST a synthetic alert to the
+/// configured webhook.
+///
+/// Under `/webhook` rather than `/jobs`: the webhook is a transport, and
+/// job findings are its first consumer rather than its definition. What
+/// this verifies is the URL, the format and the credentials — not anything
+/// about jobs.
+///
+/// Same shape as `POST /api/admin/smtp/test`, and for the same reason: 200
+/// regardless of the transport's verdict, with the detail in the body. A
+/// webhook returning 404 is diagnostic data an operator needs to read, not
+/// an HTTP error for the panel to swallow.
+///
+/// The synthetic alert deliberately bypasses the severity threshold that
+/// gates real findings — testing with the default `data_loss` threshold
+/// would otherwise deliver nothing and read as a broken webhook.
+#[utoipa::path(
+    post,
+    path = "/api/admin/webhook/test",
+    responses(
+        (status = 200, description = "Delivery attempted", body = WebhookTestResultDto),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 503, description = "No webhook configured"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn send_webhook_test(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+) -> Result<impl IntoResponse, AppError> {
+    let sink = state.webhook_sink.clone().ok_or_else(|| {
+        AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No webhook is configured (set OXICLOUD_WEBHOOK_URL in .env to enable)",
+            "ServiceUnavailable",
+        )
+    })?;
+
+    tracing::info!(
+        target: "audit",
+        event = "webhook.test",
+        admin_id = %auth_user.id,
+        sink = sink.name(),
+    );
+
+    let alert = crate::infrastructure::scheduler::FindingNotifier::test_alert();
+    let report = sink.deliver_reporting(&alert).await;
+    if report.success {
+        tracing::info!(
+            target: "audit",
+            event = "webhook.test_ok",
+            admin_id = %auth_user.id,
+            sink = sink.name(),
+            code = ?report.code,
+        );
+    } else {
+        tracing::warn!(
+            target: "audit",
+            event = "webhook.test_failed",
+            admin_id = %auth_user.id,
+            sink = sink.name(),
+            code = ?report.code,
+            response = ?report.message,
+        );
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(WebhookTestResultDto {
+            success: report.success,
+            sink: sink.name().to_string(),
+            code: report.code,
+            message: report.message,
+        }),
+    ))
+}
+
+/// `GET /api/admin/notify/info` — the alerting policy, as the running
+/// process sees it.
+///
+/// Separate from `/smtp/info` and `/webhook/info`, which describe
+/// *transports*. This describes what gets sent: the severity floor, and
+/// which channels are actually wired. Worth its own endpoint because the
+/// floor was invisible in the panel until now — an operator could see a
+/// configured webhook, a healthy SMTP server, and still be told nothing,
+/// because the default threshold only admits `data_loss`.
+#[utoipa::path(
+    get,
+    path = "/api/admin/notify/info",
+    responses(
+        (status = 200, description = "Current alerting policy", body = NotifyInfoDto),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "admin"
+)]
+pub async fn get_notify_info(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::application::ports::notification_sink_ports::NotifyThreshold;
+
+    let notify = &state.core.config.jobs_notify;
+    // The built sinks rather than the config, deliberately — the same
+    // reason `/webhook/info` reports `webhook_sink.is_some()`: a setting
+    // that was present but unusable must not read as a working channel.
+    let mut sinks: Vec<String> = Vec::new();
+    if let Some(s) = state.webhook_sink.as_ref() {
+        sinks.push(s.name().to_string());
+    }
+    if let Some(s) = state.email_alert_sink.as_ref() {
+        sinks.push(s.name().to_string());
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(NotifyInfoDto {
+            min_severity: match notify.min_severity {
+                NotifyThreshold::None => "none".to_string(),
+                NotifyThreshold::AtLeast(s) => s.as_str().to_string(),
+            },
+            sinks,
+            // Operator addresses, on an admin-only endpoint, and the one
+            // thing an operator checking mail alerting needs to see — the
+            // same call `/webhook/info` makes for its target.
+            email_recipients: notify.email_to.clone(),
+        }),
+    ))
+}
+
+// No `POST /api/admin/notify/email/test` to go with this.
+//
+// It was written and then removed: the question it answers — "can my
+// configured recipients actually receive an alert?" — is already
+// answerable with what is here. `/notify/info` shows the addresses, and
+// `POST /api/admin/smtp/test` sends to one over the same transport with
+// the same From:, so the pair covers the diagnostic without a third
+// endpoint to keep consistent. The code path from a finding to a
+// delivered message is covered end-to-end by `tests/api/jobs_notify.hurl`
+// against the SMTP mock, which is a better test than a button an operator
+// has to think to press.
+
+/// `notification_sink_missing` rule for the dashboard DTO.
+///
+/// Returns `true` when both outbound paths are effectively
+/// unavailable:
+///
+/// * **Email path** — needs BOTH `OXICLOUD_JOBS_NOTIFY_EMAIL_TO`
+///   (non-empty recipients) AND SMTP configured
+///   (`OXICLOUD_SMTP_HOST`). Setting `JOBS_NOTIFY_EMAIL_TO` without
+///   SMTP leaves findings addressed to recipients but no transport
+///   to carry them, so the banner must still fire — treating that
+///   half-configured state as "sink exists" would silently drop
+///   every alert.
+/// * **Webhook path** — `OXICLOUD_WEBHOOK_URL` set.
+///
+/// Banner fires only when BOTH paths are unavailable. Either one
+/// configured silences it.
+///
+/// Lifted out of the inline DTO expression so the truth-table
+/// branches get covered by [`tests::notification_sink_missing_rule`]
+/// — the hurl suite pins only one combination (all-set / banner
+/// off) because hurl can't flip env vars on a running server.
+fn compute_notification_sink_missing(
+    email_to: &[String],
+    smtp_enabled: bool,
+    webhook_url: Option<&str>,
+) -> bool {
+    let email_path_available = !email_to.is_empty() && smtp_enabled;
+    let webhook_path_available = webhook_url.is_some();
+    !email_path_available && !webhook_path_available
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Truth table for the `notification_sink_missing` flag. The
+    /// banner must light up ONLY when both outbound paths are
+    /// effectively unavailable. Specifically:
+    ///   * `OXICLOUD_JOBS_NOTIFY_EMAIL_TO` without SMTP is NOT
+    ///     a usable email path — the common misconfig of
+    ///     "address set, SMTP forgotten" still fires the banner.
+    ///   * Either path fully configured silences it.
+    #[test]
+    fn notification_sink_missing_rule() {
+        let one_email = &["ops@example.com".to_string()][..];
+        let webhook = Some("https://hooks.example.com/x");
+
+        // Neither path configured → banner fires.
+        assert!(compute_notification_sink_missing(&[], false, None));
+
+        // Email path HALF-configured (recipients but no SMTP) is
+        // STILL "no sink" — mail would be addressed but never
+        // leave the server. Banner fires.
+        assert!(compute_notification_sink_missing(one_email, false, None));
+
+        // Email path HALF-configured the other way (SMTP up but
+        // nobody to mail) — also no sink.
+        assert!(compute_notification_sink_missing(&[], true, None));
+
+        // Email path FULLY configured → silenced.
+        assert!(!compute_notification_sink_missing(one_email, true, None));
+
+        // Webhook alone → silenced regardless of email state.
+        assert!(!compute_notification_sink_missing(&[], false, webhook));
+        assert!(!compute_notification_sink_missing(
+            one_email, false, webhook
+        ));
+        assert!(!compute_notification_sink_missing(&[], true, webhook));
+        assert!(!compute_notification_sink_missing(one_email, true, webhook));
+
+        // Multiple emails — any non-empty counts as "recipients
+        // present"; still needs SMTP to actually silence.
+        let two_emails = &["a@x".to_string(), "b@x".to_string()][..];
+        assert!(compute_notification_sink_missing(two_emails, false, None));
+        assert!(!compute_notification_sink_missing(two_emails, true, None));
+    }
+
+    /// The job-trigger query must extract from any URL shape, including
+    /// one with no query string at all.
+    ///
+    /// Regression: `TriggerJobQuery` was briefly a newtype over the map
+    /// (`struct TriggerJobQuery(HashMap<..>)`). `serde_urlencoded`
+    /// cannot deserialize a newtype struct at the top level, so axum's
+    /// `Query` extractor rejected EVERY trigger with a 400 before the
+    /// handler body ran — including bare `POST …/dedup_gc/trigger`. It
+    /// compiled, and it read as if the free-form parameters had been
+    /// rejected by validation, which sent the first diagnosis at the
+    /// wrong layer entirely.
+    #[test]
+    fn trigger_query_extracts_from_every_url_shape() {
+        fn parse(uri: &str) -> TriggerJobQuery {
+            axum::extract::Query::<TriggerJobQuery>::try_from_uri(&uri.parse().unwrap())
+                .unwrap_or_else(|e| panic!("extractor rejected `{uri}`: {e}"))
+                .0
+        }
+
+        assert!(parse("http://x/api/admin/jobs/dedup_gc/trigger").is_empty());
+        assert!(parse("http://x/api/admin/jobs/dedup_gc/trigger?").is_empty());
+
+        let one = parse("http://x/api/admin/jobs/dedup_gc/trigger?force=true");
+        assert_eq!(one.get("force").map(String::as_str), Some("true"));
+
+        let two = parse("http://x/t?deep=true&storage=s3_prod");
+        assert_eq!(two.get("deep").map(String::as_str), Some("true"));
+        assert_eq!(two.get("storage").map(String::as_str), Some("s3_prod"));
+
+        // Undeclared names must reach the handler rather than being
+        // dropped by the extractor — rejecting them, with a message
+        // naming the job's real parameters, is the handler's job.
+        let typo = parse("http://x/t?repare=true");
+        assert_eq!(typo.get("repare").map(String::as_str), Some("true"));
+    }
+}

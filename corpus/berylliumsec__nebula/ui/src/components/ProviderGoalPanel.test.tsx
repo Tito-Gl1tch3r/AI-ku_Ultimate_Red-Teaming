@@ -1,0 +1,396 @@
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { expect, it, vi } from "vitest";
+import { ApiError, type ApiClient } from "../api/client";
+import type { ChatGoal } from "../api/types";
+import { DialogProvider } from "./DialogSystem";
+import { activeSeconds, estimateLiveTokens, estimateTokensFromBytes, ProviderGoalPanel, utf8Length } from "./ProviderGoalPanel";
+
+const draft: ChatGoal = {
+  id: "goal", engagementId: "project", sessionId: "session",
+  objective: "Inspect safely", completionCriteria: ["Evidence retained"],
+  plan: ["Inspect"], currentStep: 0, status: "draft",
+  usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+  elapsedSeconds: 0, childrenStarted: 0,
+  linkedTurnIds: [], completionEvidence: [], skillSnapshots: [], revision: 1,
+};
+
+it("shows an explicitly estimated token total while a goal turn streams", () => {
+  const running: ChatGoal = {
+    ...draft,
+    status: "running",
+    usage: { inputTokens: 80, outputTokens: 20, totalTokens: 100 },
+  };
+  const view = render(<DialogProvider><ProviderGoalPanel
+    api={{} as ApiClient}
+    sessionId="session"
+    goal={running}
+    liveTokenEstimate={25}
+    onChange={vi.fn()}
+  /></DialogProvider>);
+
+  expect(screen.getByText("~125 tokens")).toHaveAttribute("title", expect.stringContaining("Estimated while this turn streams"));
+  view.rerender(<DialogProvider><ProviderGoalPanel api={{} as ApiClient} sessionId="session" goal={running} onChange={vi.fn()} /></DialogProvider>);
+  expect(screen.getByText("100 tokens")).not.toHaveAttribute("title");
+  expect(estimateLiveTokens("streaming response")).toBeGreaterThan(0);
+});
+
+it("counts streamed goal text incrementally with the same estimate as encoding it whole", () => {
+  const chunks = ["plain ascii ", "café ", "日本語 ", "emoji 🚀 ", "\u{1F9EA}", "lone \uD800 surrogate"];
+  let bytes = 0;
+  for (const chunk of chunks) {
+    bytes += utf8Length(chunk);
+    // Each chunk's length matches what the browser would encode.
+    expect(utf8Length(chunk)).toBe(new TextEncoder().encode(chunk).length);
+  }
+  expect(estimateTokensFromBytes(bytes)).toBe(estimateLiveTokens(chunks.join("")));
+  expect(estimateTokensFromBytes(0)).toBe(0);
+});
+
+it("collapses goal controls while keeping the objective and progress visible", () => {
+  render(<DialogProvider><ProviderGoalPanel api={{} as ApiClient} sessionId="session" goal={{ ...draft, status: "running" }} onChange={vi.fn()} /></DialogProvider>);
+  const collapse = screen.getByRole("button", { name: "Collapse goal controls" });
+  expect(document.querySelector(".chat-goal-heading strong")).toHaveTextContent("Inspect safely");
+  expect(screen.getByText("step 0")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Pause" })).toBeVisible();
+  expect(within(screen.getByRole("group", { name: "Set goal outcome" })).getByRole("button", { name: "Complete" })).toHaveClass("quiet");
+  fireEvent.click(collapse);
+  expect(screen.getByRole("button", { name: "Expand goal controls" })).toHaveAttribute("aria-expanded", "false");
+  expect(document.querySelector(".chat-goal-heading strong")).toHaveTextContent("Inspect safely");
+  expect(screen.queryByRole("button", { name: "Pause" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Expand goal controls" }));
+  expect(screen.getByRole("button", { name: "Pause" })).toBeVisible();
+});
+
+it("reveals the full saved goal and evidence gates from the session rail", async () => {
+  const goal = { ...draft, status: "running" as const, objective: "Investigate a long indexed-store memory-safety hypothesis", completionCriteria: ["Prove the writer reaches the store", "Verify the buffer capacity"], plan: ["Bind the writer", "Check the store"] };
+  const view = render(<DialogProvider><ProviderGoalPanel api={{} as ApiClient} sessionId="session" goal={goal} onChange={vi.fn()} /></DialogProvider>);
+  const details = screen.getByText("Objective and completion criteria").closest("details")!;
+  expect(details).not.toHaveAttribute("open");
+  view.rerender(<DialogProvider><ProviderGoalPanel api={{} as ApiClient} sessionId="session" goal={goal} showFullGoal onChange={vi.fn()} /></DialogProvider>);
+  await waitFor(() => expect(details).toHaveAttribute("open"));
+  expect(within(details).getByText(goal.objective)).toBeVisible();
+  expect(within(details).getByText("Prove the writer reaches the store")).toBeVisible();
+  expect(within(details).getByText("Check the store")).toBeVisible();
+});
+
+it("creates a durable draft from explicit objective and criteria", async () => {
+  const createChatGoal = vi.fn().mockResolvedValue(draft);
+  const onChange = vi.fn();
+  const api = { createChatGoal } as unknown as ApiClient;
+  render(<DialogProvider><ProviderGoalPanel api={api} sessionId="session" onChange={onChange} /></DialogProvider>);
+  fireEvent.click(screen.getByRole("button", { name: "Add goal" }));
+  fireEvent.change(screen.getByLabelText("Objective"), { target: { value: "Inspect safely" } });
+  fireEvent.change(screen.getByLabelText("Completion criteria"), { target: { value: "Evidence retained\nChecks pass" } });
+  fireEvent.change(screen.getByLabelText("Plan"), { target: { value: "Inspect\nValidate" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await waitFor(() => expect(createChatGoal).toHaveBeenCalledWith("session", {
+    objective: "Inspect safely",
+    completionCriteria: ["Evidence retained", "Checks pass"],
+    plan: ["Inspect", "Validate"],
+  }));
+  expect(onChange).toHaveBeenCalledWith(draft);
+});
+
+it("requires a 30 minute active time limit and saves it in seconds", async () => {
+  const createChatGoal = vi.fn().mockResolvedValue({ ...draft, timeBudgetSeconds: 1800 });
+  const api = { createChatGoal } as unknown as ApiClient;
+  render(<DialogProvider><ProviderGoalPanel api={api} sessionId="session" onChange={vi.fn()} /></DialogProvider>);
+  fireEvent.click(screen.getByRole("button", { name: "Add goal" }));
+  fireEvent.change(screen.getByLabelText("Objective"), { target: { value: "Finish on time" } });
+  fireEvent.change(screen.getByLabelText("Completion criteria"), { target: { value: "Clean handoff" } });
+  fireEvent.click(screen.getByText("Limits", { exact: true }));
+  const timeLimit = screen.getByLabelText("Active time limit (minutes, 30 minimum)");
+  fireEvent.change(timeLimit, { target: { value: "29" } });
+  expect(screen.getByRole("button", { name: "Save draft" })).toBeDisabled();
+  fireEvent.change(timeLimit, { target: { value: "30" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await waitFor(() => expect(createChatGoal).toHaveBeenCalledWith("session", {
+    objective: "Finish on time",
+    completionCriteria: ["Clean handoff"],
+    plan: [],
+    timeBudgetSeconds: 1800,
+  }));
+});
+
+it("shows the saved active time remaining", () => {
+  render(<DialogProvider><ProviderGoalPanel api={{} as ApiClient} sessionId="session" goal={{ ...draft, status: "paused", elapsedSeconds: 1200, timeBudgetSeconds: 1800 }} onChange={vi.fn()} /></DialogProvider>);
+  expect(screen.getByText("10m left")).toBeVisible();
+});
+
+it("creates the conversation with its goal before the first message", async () => {
+  const onCreate = vi.fn().mockResolvedValue(draft);
+  const onChange = vi.fn();
+  render(<DialogProvider><ProviderGoalPanel api={{} as ApiClient} onCreate={onCreate} onChange={onChange} /></DialogProvider>);
+
+  fireEvent.click(screen.getByRole("button", { name: "Add goal" }));
+  fireEvent.change(screen.getByLabelText("Objective"), { target: { value: "Start with a goal" } });
+  fireEvent.change(screen.getByLabelText("Completion criteria"), { target: { value: "First turn is linked" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+
+  await waitFor(() => expect(onCreate).toHaveBeenCalledWith({
+    objective: "Start with a goal",
+    completionCriteria: ["First turn is linked"],
+    plan: [],
+  }));
+  expect(onChange).toHaveBeenCalledWith(draft);
+});
+
+it.each(["draft", "running"] as const)("edits goal content while %s", async status => {
+  const current = { ...draft, status, revision: status === "draft" ? 1 : 4 };
+  const updated = {
+    ...current,
+    objective: "Revised objective",
+    completionCriteria: ["Revised criterion", "Visible after refresh"],
+    plan: ["Continue"],
+    stepBudget: 5,
+    revision: current.revision + 1,
+  };
+  const updateChatGoal = vi.fn().mockResolvedValue(updated);
+  const onChange = vi.fn();
+  render(<DialogProvider><ProviderGoalPanel api={{ updateChatGoal } as unknown as ApiClient} sessionId="session" goal={current} onChange={onChange} /></DialogProvider>);
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit goal" }));
+  fireEvent.change(screen.getByLabelText("Objective"), { target: { value: "Revised objective" } });
+  fireEvent.change(screen.getByLabelText("Completion criteria"), { target: { value: "Revised criterion\nVisible after refresh" } });
+  fireEvent.change(screen.getByLabelText("Plan"), { target: { value: "Continue" } });
+  fireEvent.click(screen.getByText("Limits", { exact: true }));
+  fireEvent.change(screen.getByLabelText("Step budget"), { target: { value: "5" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  await waitFor(() => expect(updateChatGoal).toHaveBeenCalledWith("session", {
+    expectedRevision: current.revision,
+    objective: "Revised objective",
+    completionCriteria: ["Revised criterion", "Visible after refresh"],
+    plan: ["Continue"],
+    stepBudget: 5,
+  }));
+  expect(onChange).toHaveBeenCalledWith(updated);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Save changes" })).not.toBeInTheDocument());
+});
+
+it("keeps an edit draft when Core reports a newer goal revision", async () => {
+  const conflict = new ApiError("goal changed", 409);
+  const latest = { ...draft, objective: "Changed elsewhere", revision: 3 };
+  const updateChatGoal = vi.fn().mockRejectedValue(conflict);
+  const onChange = vi.fn();
+  render(<DialogProvider><ProviderGoalPanel api={{ updateChatGoal, getChatGoal: vi.fn().mockResolvedValue(latest) } as unknown as ApiClient} sessionId="session" goal={draft} onChange={onChange} /></DialogProvider>);
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit goal" }));
+  fireEvent.change(screen.getByLabelText("Objective"), { target: { value: "Keep my draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Your draft is still here");
+  expect(screen.getByLabelText("Objective")).toHaveValue("Keep my draft");
+  expect(onChange).toHaveBeenCalledWith(latest);
+});
+
+it("retries a running edit when only goal progress advanced", async () => {
+  const running = { ...draft, status: "running" as const, revision: 2 };
+  const advanced = { ...running, currentStep: 2, revision: 5 };
+  const saved = { ...advanced, objective: "Refined while active", revision: 6 };
+  const updateChatGoal = vi.fn()
+    .mockRejectedValueOnce(new ApiError("goal changed", 409))
+    .mockResolvedValueOnce(saved);
+  const onChange = vi.fn();
+  render(<DialogProvider><ProviderGoalPanel api={{ updateChatGoal, getChatGoal: vi.fn().mockResolvedValue(advanced) } as unknown as ApiClient} sessionId="session" goal={running} onChange={onChange} /></DialogProvider>);
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit goal" }));
+  fireEvent.change(screen.getByLabelText("Objective"), { target: { value: "Refined while active" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  await waitFor(() => expect(updateChatGoal).toHaveBeenCalledTimes(2));
+  expect(updateChatGoal.mock.calls[1][1]).toMatchObject({ expectedRevision: 5, objective: "Refined while active" });
+  expect(onChange).toHaveBeenLastCalledWith(saved);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("records explicit blocked and completed outcomes", async () => {
+  const running: ChatGoal = { ...draft, status: "running", revision: 2 };
+  const blocked: ChatGoal = { ...running, status: "blocked", blockedReason: "No new evidence", revision: 3 };
+  const writeChatGoal = vi.fn().mockResolvedValueOnce(blocked).mockResolvedValueOnce({
+    ...running,
+    status: "completed",
+    completionSummary: "Checks passed.",
+    completionEvidence: [{ kind: "operator_confirmation", detail: "Focused tests passed" }],
+    revision: 4,
+  });
+  const onChange = vi.fn();
+  const getChatGoal = vi.fn()
+    .mockResolvedValueOnce(running)
+    .mockResolvedValueOnce({ ...running, revision: 3 });
+  const api = { getChatGoal, writeChatGoal } as unknown as ApiClient;
+  const view = render(<DialogProvider><ProviderGoalPanel api={api} sessionId="session" goal={running} onChange={onChange} /></DialogProvider>);
+
+  fireEvent.click(screen.getByRole("button", { name: "Block" }));
+  fireEvent.change(screen.getByLabelText("Blocked reason"), { target: { value: "No new evidence" } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm blocked" }));
+  await waitFor(() => expect(writeChatGoal).toHaveBeenCalledWith("session", {
+    expectedRevision: 2, action: "block", reason: "No new evidence",
+  }));
+
+  view.rerender(<DialogProvider><ProviderGoalPanel api={api} sessionId="session" goal={{ ...running, revision: 3 }} onChange={onChange} /></DialogProvider>);
+  fireEvent.click(screen.getByRole("button", { name: "Complete" }));
+  fireEvent.change(screen.getByLabelText("Completion summary"), { target: { value: "Checks passed." } });
+  fireEvent.change(screen.getByLabelText("Completion evidence"), { target: { value: "Focused tests passed" } });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm complete" }));
+  await waitFor(() => expect(writeChatGoal).toHaveBeenLastCalledWith("session", {
+    expectedRevision: 3,
+    action: "complete",
+    completionSummary: "Checks passed.",
+    completionEvidence: [{ kind: "operator_confirmation", detail: "Focused tests passed" }],
+  }));
+});
+
+it("requires an explicit Start and uses the latest revision", async () => {
+  const running = { ...draft, status: "running" as const, revision: 2 };
+  const writeChatGoal = vi.fn().mockResolvedValue(running);
+  const onChange = vi.fn();
+  const onWorkDispatched = vi.fn().mockResolvedValue(undefined);
+  const api = { getChatGoal: vi.fn().mockResolvedValue(draft), writeChatGoal } as unknown as ApiClient;
+  render(<DialogProvider><ProviderGoalPanel api={api} sessionId="session" goal={draft} onChange={onChange} onWorkDispatched={onWorkDispatched} /></DialogProvider>);
+  expect(screen.getByText("draft")).toBeVisible();
+  expect(screen.getByText("step 0")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Start" }));
+  await waitFor(() => expect(writeChatGoal).toHaveBeenCalledWith("session", {
+    expectedRevision: 1, action: "start",
+  }));
+  expect(onChange).toHaveBeenCalledWith(running);
+  expect(onWorkDispatched).toHaveBeenCalledOnce();
+});
+
+it("waits for durable assistant settings before resuming a goal", () => {
+  const paused: ChatGoal = { ...draft, status: "paused", revision: 2 };
+  const writeChatGoal = vi.fn();
+  render(<DialogProvider><ProviderGoalPanel
+    api={{ writeChatGoal } as unknown as ApiClient}
+    sessionId="session"
+    goal={paused}
+    settingsBusy
+    onChange={vi.fn()}
+  /></DialogProvider>);
+
+  const resume = screen.getByRole("button", { name: "Resume" });
+  expect(resume).toBeDisabled();
+  fireEvent.click(resume);
+  expect(writeChatGoal).not.toHaveBeenCalled();
+});
+
+it("explicitly replaces immutable goal skills by exact source path", async () => {
+  const running: ChatGoal = {
+    ...draft,
+    status: "running",
+    revision: 3,
+    skillSnapshots: [{
+      name: "retained",
+      path: "/workspace/.agents/skills/retained/SKILL.md",
+      source: "project",
+      sha256: "a".repeat(64),
+    }],
+  };
+  const updated = { ...running, revision: 4, skillSnapshots: [] };
+  const replaceChatGoalSkills = vi.fn().mockResolvedValue(updated);
+  const onChange = vi.fn();
+  const api = { getChatGoal: vi.fn().mockResolvedValue(running), replaceChatGoalSkills } as unknown as ApiClient;
+  const view = render(<DialogProvider><form aria-label="Chat composer"><ProviderGoalPanel
+      api={api}
+      sessionId="session"
+      goal={running}
+      skills={[{
+        name: "report",
+        path: "/managed/.agents/skills/report/SKILL.md",
+        source: "installed",
+      }]}
+      onChange={onChange}
+    /></form></DialogProvider>);
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit skills" }));
+  expect(view.container.querySelectorAll("form")).toHaveLength(1);
+  expect(screen.getByText(/retained snapshot; source unavailable/)).toBeVisible();
+  fireEvent.click(screen.getByRole("checkbox", { name: /retained/ }));
+  fireEvent.click(screen.getByRole("checkbox", { name: /report/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Save skills" }));
+
+  await waitFor(() => expect(replaceChatGoalSkills).toHaveBeenCalledWith("session", {
+    expectedRevision: 3,
+    skills: [{ name: "report", path: "/managed/.agents/skills/report/SKILL.md" }],
+  }));
+  expect(onChange).toHaveBeenCalledWith(updated);
+});
+
+it("confirms before cancelling a goal because cancellation is final", async () => {
+  const running: ChatGoal = { ...draft, status: "running", revision: 2 };
+  const writeChatGoal = vi.fn().mockResolvedValue({ ...running, status: "cancelled", revision: 3 });
+  const onChange = vi.fn();
+  render(<DialogProvider><ProviderGoalPanel api={{ getChatGoal: vi.fn().mockResolvedValue(running), writeChatGoal } as unknown as ApiClient} sessionId="session" goal={running} onChange={onChange} /></DialogProvider>);
+
+  fireEvent.click(screen.getByRole("button", { name: "Cancel goal" }));
+  const dialog = await screen.findByRole("dialog", { name: "Cancel this goal?" });
+  expect(writeChatGoal).not.toHaveBeenCalled();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Keep goal" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(writeChatGoal).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Cancel goal" }));
+  fireEvent.click(within(await screen.findByRole("dialog", { name: "Cancel this goal?" })).getByRole("button", { name: "Cancel goal" }));
+  await waitFor(() => expect(writeChatGoal).toHaveBeenCalledWith("session", { expectedRevision: 2, action: "cancel" }));
+  expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ status: "cancelled" }));
+});
+
+it("cancels a goal whose revision moved while the model was working", async () => {
+  // Core advances a goal on every turn, so the revision an operator is looking
+  // at is stale the moment the model works. Their decision still stands.
+  const running: ChatGoal = { ...draft, status: "running", revision: 2 };
+  const advanced: ChatGoal = { ...running, currentStep: 3, revision: 7 };
+  const cancelled: ChatGoal = { ...advanced, status: "cancelled", revision: 8 };
+  const conflict = new ApiError("goal changed on another device; reload before retrying", 409);
+  const writeChatGoal = vi.fn().mockRejectedValueOnce(conflict).mockResolvedValueOnce(cancelled);
+  const getChatGoal = vi.fn().mockResolvedValue(advanced);
+  const onChange = vi.fn();
+  const api = { writeChatGoal, getChatGoal } as unknown as ApiClient;
+
+  render(<DialogProvider><ProviderGoalPanel api={api} sessionId="session" goal={running} onChange={onChange} /></DialogProvider>);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel goal" }));
+  const dialog = await screen.findByRole("dialog");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Cancel goal" }));
+
+  await waitFor(() => expect(writeChatGoal).toHaveBeenCalledTimes(2));
+  // The retry carries the revision Core actually holds, not the stale one.
+  expect(writeChatGoal.mock.calls[0][1]).toMatchObject({ expectedRevision: 2, action: "cancel" });
+  expect(writeChatGoal.mock.calls[1][1]).toMatchObject({ expectedRevision: 7, action: "cancel" });
+  expect(onChange).toHaveBeenLastCalledWith(cancelled);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("says what a goal already is instead of silently failing a transition", async () => {
+  const running: ChatGoal = { ...draft, status: "running", revision: 2 };
+  const completed: ChatGoal = { ...running, status: "completed", revision: 9 };
+  const conflict = new ApiError("goal changed on another device; reload before retrying", 409);
+  const writeChatGoal = vi.fn().mockRejectedValue(conflict);
+  const getChatGoal = vi.fn().mockResolvedValue(completed);
+  const onChange = vi.fn();
+  const api = { writeChatGoal, getChatGoal } as unknown as ApiClient;
+
+  render(<DialogProvider><ProviderGoalPanel api={api} sessionId="session" goal={running} onChange={onChange} /></DialogProvider>);
+  fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("already completed");
+  // The panel shows what Core holds rather than leaving a stale goal on screen.
+  expect(onChange).toHaveBeenCalledWith(completed);
+  expect(writeChatGoal).toHaveBeenCalledTimes(1);
+});
+
+it("counts the active stretch a running goal is still accruing", () => {
+  const since = new Date("2026-09-20T12:00:00Z");
+  const now = since.getTime() + 90_000;
+  const running: ChatGoal = { ...draft, status: "running", elapsedSeconds: 30, activeSince: since.toISOString() };
+
+  // Core banks elapsed time on a transition, so the stored value alone would
+  // report the time this goal had when it was last paused.
+  expect(activeSeconds(running, now)).toBeCloseTo(120);
+  expect(activeSeconds({ ...running, status: "paused" }, now)).toBe(30);
+  expect(activeSeconds({ ...running, activeSince: undefined }, now)).toBe(30);
+  expect(activeSeconds({ ...running, activeSince: "not a date" }, now)).toBe(30);
+
+  render(<DialogProvider><ProviderGoalPanel api={{} as unknown as ApiClient} sessionId="session" goal={running} onChange={vi.fn()} /></DialogProvider>);
+  expect(screen.getByRole("region", { name: "Conversation goal" })).toHaveTextContent(/\ds active/);
+});

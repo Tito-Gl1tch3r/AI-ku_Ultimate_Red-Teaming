@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Predefined agent mission profiles."""
+
+from __future__ import annotations
+
+from typing import Any, Dict
+
+MISSION_PROFILES: Dict[str, Dict[str, Any]] = {
+    "passive": {
+        "safety_profile": "safe",
+        "approved_risks": ["read"],
+        "request_budget": 8,
+        "http_replay": "off",
+        "description": "Read-only observation; no intrusive modules.",
+    },
+    "safe-web": {
+        "safety_profile": "safe",
+        "approved_risks": ["read", "active"],
+        "request_budget": 20,
+        "http_replay": "safe",
+        "description": "Conservative web audit with declared-safe modules only.",
+    },
+    "authenticated-audit": {
+        "safety_profile": "discreet",
+        "approved_risks": ["read", "active"],
+        "request_budget": 40,
+        "http_replay": "safe",
+        "reuse_proxy_auth": True,
+        "discovery_mode": True,
+        "description": "Authenticated review using approved proxy cookies.",
+    },
+    "api-review": {
+        "safety_profile": "discreet",
+        "approved_risks": ["read", "active"],
+        "request_budget": 30,
+        "http_replay": "safe",
+        "discovery_mode": True,
+        "description": "API surface validation without destructive actions.",
+    },
+    "internal-lab": {
+        "safety_profile": "normal",
+        "approved_risks": ["read", "active", "intrusive"],
+        "request_budget": 160,
+        "http_replay": "safe",
+        "catalog_policy": "internal-lab",
+        "description": "Lab environment with broader approvals.",
+    },
+    "bug-bounty-safe": {
+        "safety_profile": "discreet",
+        "approved_risks": ["read", "active"],
+        "request_budget": 30,
+        "http_replay": "safe",
+        "catalog_policy": "bug-bounty-safe",
+        "discovery_mode": True,
+        "description": "Bug-bounty-safe validation; no post-exploit, payloads, DoS, persistence, or brute force.",
+    },
+    "detection-validation": {
+        "safety_profile": "discreet",
+        "approved_risks": ["read", "active"],
+        "request_budget": 25,
+        "campaign_goal": "detection-validation",
+        "description": "Offensive signals paired with defensive validation artifacts.",
+    },
+    "training-lab": {
+        "safety_profile": "safe",
+        "approved_risks": ["read", "active"],
+        "request_budget": 15,
+        "plan_only": True,
+        "discovery_mode": True,
+        "description": "Training mode: plan without exploitation.",
+    },
+    "discovery": {
+        "safety_profile": "safe",
+        "approved_risks": ["read"],
+        "request_budget": 20,
+        "http_replay": "off",
+        "plan_only": True,
+        "catalog_policy": "bug-bounty-safe",
+        "discovery_mode": True,
+        "description": (
+            "Read-only application model and differential hypotheses. "
+            "No exploit execution; catalog matches do not count as novel findings."
+        ),
+    },
+    "ot-safe-assessment": {
+        "safety_profile": "safe",
+        "approved_risks": ["read", "active"],
+        "request_budget": 35,
+        "campaign_goal": "recon",
+        "catalog_policy": "ot-safe",
+        "description": (
+            "Read-only OT assessment — passive/active ICS recon, no DoS or PLC control."
+        ),
+    },
+    "ot-safe": {
+        "safety_profile": "safe",
+        "approved_risks": ["read", "active"],
+        "request_budget": 35,
+        "campaign_goal": "recon",
+        "catalog_policy": "ot-safe",
+        "description": "Alias for ot-safe-assessment; strict OT recon/gather only.",
+    },
+    "europol-passive": {
+        "safety_profile": "safe",
+        "approved_risks": ["read"],
+        "request_budget": 12,
+        "http_replay": "off",
+        "campaign_goal": "recon",
+        "catalog_policy": "europol-passive",
+        "plan_only": False,
+        "osint_retention_days": 90,
+        "osint_pseudonymize_exports": True,
+        "osint_require_legal_basis": True,
+        "description": (
+            "Law-enforcement passive OSINT only — no active scanning, bruteforce, "
+            "credential generation, or exploitation. GDPR retention defaults applied."
+        ),
+    },
+    "infra-discovery": {
+        "safety_profile": "discreet",
+        "approved_risks": ["read", "active"],
+        "request_budget": 70,
+        "http_replay": "safe",
+        "campaign_goal": "infra-discovery",
+        "catalog_policy": "infra-discovery",
+        "description": (
+            "Network service and panel discovery with verification pass — scanner modules only. "
+            "Recommended chain: network-services → devops-panels/saas-panels → verification."
+        ),
+    },
+    "owasp-web-parallel": {
+        "safety_profile": "discreet",
+        "approved_risks": ["read", "active", "intrusive"],
+        "request_budget": 140,
+        "http_replay": "safe",
+        "campaign_goal": "exploit",
+        "catalog_policy": "safe-web",
+        "specialist_parallel": True,
+        "hierarchical_planner": True,
+        "owasp_web_parallel": True,
+        "owasp_classes": ["injection", "xss", "ssrf", "auth", "authz"],
+        "fan_out": 5,
+        "description": (
+            "Parallel OWASP web/API mission: injection, XSS, SSRF, auth, and authz specialists "
+            "fan out concurrently; only evidence-gate-approved exploit-queue items are promoted."
+        ),
+    },
+}
+
+
+def apply_mission_profile(name: str) -> Dict[str, Any]:
+    key = str(name or "").strip().lower()
+    if key not in MISSION_PROFILES:
+        raise ValueError(f"Unknown mission profile: {name}")
+    return dict(MISSION_PROFILES[key])
+
+
+def list_mission_profiles() -> Dict[str, str]:
+    return {name: str(row.get("description", "")) for name, row in MISSION_PROFILES.items()}

@@ -1,0 +1,334 @@
+//! PathService - Infrastructure service for storage path management
+//!
+//! This service was moved from domain/services because it implements application traits
+//! (StoragePort) and has file system dependencies (tokio::fs).
+//!
+//! StoragePath (Value Object) remains in domain/services/path_service.rs
+
+use std::path::{Path, PathBuf};
+use tokio::fs;
+
+use crate::application::ports::outbound::StoragePort;
+use crate::common::errors::{DomainError, ErrorKind};
+use crate::domain::services::path_service::StoragePath;
+
+/// Infrastructure service for handling storage path operations
+pub struct PathService {
+    root_path: PathBuf,
+}
+
+impl PathService {
+    /// Creates a new path service with a specific root
+    pub fn new(root_path: PathBuf) -> Self {
+        Self { root_path }
+    }
+
+    /// Converts a domain path to an absolute physical path.
+    ///
+    /// Returns an error if validation fails (defense-in-depth against traversal).
+    pub fn resolve_path(&self, storage_path: &StoragePath) -> Result<PathBuf, DomainError> {
+        self.validate_path(storage_path)?;
+        let mut path = self.root_path.clone();
+        for segment in storage_path.segments() {
+            path.push(segment);
+        }
+        // Final safety check: the resolved path must remain under root
+        if !path.starts_with(&self.root_path) {
+            return Err(DomainError::new(
+                ErrorKind::InvalidInput,
+                "Path",
+                format!("Resolved path escapes storage root: {}", path.display()),
+            ));
+        }
+        Ok(path)
+    }
+
+    /// Converts a physical path to a domain path
+    pub fn to_storage_path(&self, physical_path: &Path) -> Option<StoragePath> {
+        physical_path
+            .strip_prefix(&self.root_path)
+            .ok()
+            .map(|rel_path| {
+                let segments: Vec<String> = rel_path
+                    .components()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(os_str) => {
+                            Some(os_str.to_string_lossy().to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                StoragePath::new(segments)
+            })
+    }
+
+    /// Creates a file path within a folder
+    pub fn create_file_path(&self, folder_path: &StoragePath, file_name: &str) -> StoragePath {
+        // `join` consumes its receiver to reuse the buffer; we only hold a
+        // borrow here, so clone first — the same copy the old `&self` join did.
+        folder_path.clone().join(file_name)
+    }
+
+    /// Checks if a path is a direct child of another
+    pub fn is_direct_child(
+        &self,
+        parent_path: &StoragePath,
+        potential_child: &StoragePath,
+    ) -> bool {
+        if let Some(child_parent) = potential_child.parent() {
+            &child_parent == parent_path
+        } else {
+            parent_path.is_empty()
+        }
+    }
+
+    /// Checks if a path is at the root
+    pub fn is_in_root(&self, path: &StoragePath) -> bool {
+        path.parent().is_none_or(|p| p.is_empty())
+    }
+
+    /// Gets the root path used by this service
+    pub fn get_root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    /// Validates a path to ensure it doesn't contain dangerous components
+    pub fn validate_path(&self, path: &StoragePath) -> Result<(), DomainError> {
+        // Check for empty segments
+        if path.segments().any(|s| s.is_empty()) {
+            return Err(DomainError::new(
+                ErrorKind::InvalidInput,
+                "Path",
+                format!("Path contains empty segments: {}", path),
+            ));
+        }
+
+        // Check for dangerous characters
+        let dangerous_chars = ['\\', ':', '*', '?', '"', '<', '>', '|'];
+        for segment in path.segments() {
+            if segment.contains(&dangerous_chars[..]) {
+                return Err(DomainError::new(
+                    ErrorKind::InvalidInput,
+                    "Path",
+                    format!("Path contains dangerous characters: {}", segment),
+                ));
+            }
+
+            // Check that it doesn't start with . (hidden in Unix)
+            if segment.starts_with('.') && segment != ".well-known" {
+                return Err(DomainError::new(
+                    ErrorKind::InvalidInput,
+                    "Path",
+                    format!("Path segments cannot start with dot: {}", segment),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl StoragePort for PathService {
+    fn resolve_path(&self, storage_path: &StoragePath) -> Result<PathBuf, DomainError> {
+        // Delegate to inherent method which validates + bounds-checks
+        self.resolve_path(storage_path)
+    }
+
+    async fn ensure_directory(&self, storage_path: &StoragePath) -> Result<(), DomainError> {
+        // resolve_path already calls validate_path internally
+        let physical_path = self.resolve_path(storage_path)?;
+
+        // Check current state with a single async stat() — no worker blocking.
+        match fs::metadata(&physical_path).await {
+            Ok(meta) if meta.is_dir() => { /* already exists */ }
+            Ok(_) => {
+                return Err(DomainError::new(
+                    ErrorKind::InvalidInput,
+                    "Storage",
+                    format!(
+                        "Path exists but is not a directory: {}",
+                        physical_path.display()
+                    ),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&physical_path).await.map_err(|e| {
+                    DomainError::new(
+                        ErrorKind::AccessDenied,
+                        "Storage",
+                        format!("Failed to create directory: {}", physical_path.display()),
+                    )
+                    .with_source(e)
+                })?;
+
+                tracing::debug!("Created directory: {}", physical_path.display());
+            }
+            Err(e) => {
+                return Err(DomainError::new(
+                    ErrorKind::InternalError,
+                    "Storage",
+                    format!("Cannot stat {}: {e}", physical_path.display()),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn file_exists(&self, storage_path: &StoragePath) -> Result<bool, DomainError> {
+        let physical_path = self.resolve_path(storage_path)?;
+
+        // Single async stat() — no worker blocking, one syscall instead of two.
+        match fs::metadata(&physical_path).await {
+            Ok(meta) => Ok(meta.is_file()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(DomainError::new(
+                ErrorKind::InternalError,
+                "Storage",
+                format!("Cannot stat {}: {e}", physical_path.display()),
+            )),
+        }
+    }
+
+    async fn directory_exists(&self, storage_path: &StoragePath) -> Result<bool, DomainError> {
+        let physical_path = self.resolve_path(storage_path)?;
+
+        // Single async stat() — no worker blocking, one syscall instead of two.
+        match fs::metadata(&physical_path).await {
+            Ok(meta) => Ok(meta.is_dir()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(DomainError::new(
+                ErrorKind::InternalError,
+                "Storage",
+                format!("Cannot stat {}: {e}", physical_path.display()),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_path() {
+        let service = PathService::new(PathBuf::from("/storage"));
+
+        let storage_path = StoragePath::from_string("test/file.txt");
+        let absolute = service.resolve_path(&storage_path).unwrap();
+
+        assert_eq!(absolute, PathBuf::from("/storage/test/file.txt"));
+    }
+
+    #[test]
+    fn test_to_storage_path() {
+        let service = PathService::new(PathBuf::from("/storage"));
+
+        let physical_path = PathBuf::from("/storage/folder/file.txt");
+        let storage_path = service.to_storage_path(&physical_path).unwrap();
+
+        assert_eq!(storage_path.to_string(), "/folder/file.txt");
+    }
+
+    #[test]
+    fn test_is_in_root() {
+        let service = PathService::new(PathBuf::from("/storage"));
+
+        let root_path = StoragePath::from_string("file.txt");
+        let nested_path = StoragePath::from_string("folder/file.txt");
+
+        assert!(service.is_in_root(&root_path));
+        assert!(!service.is_in_root(&nested_path));
+    }
+
+    #[test]
+    fn test_is_direct_child() {
+        let service = PathService::new(PathBuf::from("/storage"));
+
+        let parent = StoragePath::from_string("folder");
+        let child = StoragePath::from_string("folder/file.txt");
+        let not_child = StoragePath::from_string("folder2/file.txt");
+
+        assert!(service.is_direct_child(&parent, &child));
+        assert!(!service.is_direct_child(&parent, &not_child));
+    }
+
+    #[test]
+    fn test_create_file_path() {
+        let service = PathService::new(PathBuf::from("/storage"));
+
+        let folder_path = StoragePath::from_string("folder");
+        let file_path = service.create_file_path(&folder_path, "file.txt");
+
+        assert_eq!(file_path.to_string(), "/folder/file.txt");
+    }
+
+    // ── Path-traversal hardening tests (VULN-02) ──────────────
+
+    #[test]
+    fn test_resolve_path_traversal_stripped_by_domain() {
+        // StoragePath::from_string already strips ".." segments (Solution A+E),
+        // so resolve_path receives a clean path.
+        let service = PathService::new(PathBuf::from("/storage"));
+        let path = StoragePath::from_string("../../etc/passwd");
+        let resolved = service.resolve_path(&path).unwrap();
+        assert_eq!(resolved, PathBuf::from("/storage/etc/passwd"));
+        assert!(resolved.starts_with("/storage"));
+    }
+
+    #[test]
+    fn test_resolve_path_normal_path_ok() {
+        let service = PathService::new(PathBuf::from("/storage"));
+        let path = StoragePath::from_string("users/alice/documents/report.pdf");
+        let resolved = service.resolve_path(&path).unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from("/storage/users/alice/documents/report.pdf")
+        );
+    }
+
+    #[test]
+    fn test_resolve_path_root_ok() {
+        let service = PathService::new(PathBuf::from("/storage"));
+        let path = StoragePath::root();
+        let resolved = service.resolve_path(&path).unwrap();
+        assert_eq!(resolved, PathBuf::from("/storage"));
+    }
+
+    #[test]
+    fn test_validate_path_rejects_dot_prefix() {
+        let service = PathService::new(PathBuf::from("/storage"));
+        // Manually construct a path with a dot-prefixed segment
+        // (from_string strips ".." but allows ".hidden")
+        let path = StoragePath::from_string("folder/.hidden/file.txt");
+        assert!(service.validate_path(&path).is_err());
+    }
+
+    #[test]
+    fn test_validate_path_allows_well_known() {
+        let service = PathService::new(PathBuf::from("/storage"));
+        let path = StoragePath::from_string("folder/.well-known/caldav");
+        assert!(service.validate_path(&path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_dangerous_chars() {
+        let service = PathService::new(PathBuf::from("/storage"));
+        for dangerous in &[
+            "file:name",
+            "file*name",
+            "file?name",
+            "file<name",
+            "file>name",
+            "file|name",
+            "file\"name",
+        ] {
+            let path = StoragePath::new(vec![dangerous.to_string()]);
+            assert!(
+                service.validate_path(&path).is_err(),
+                "validate_path should reject segment: {}",
+                dangerous
+            );
+        }
+    }
+}

@@ -1,0 +1,269 @@
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction, type FormEvent } from "react";
+import { Archive, Trash2, RotateCcw, Check, ChevronDown, LockKeyhole, Orbit, Plus, Search, X } from "lucide-react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { navigationGroups, navigationItemForPath, navigationItems } from "../navigation";
+import { canonicalNavigationPath, projectSurface, replaceProjectInPath } from "../resourceRoutes";
+import { useWorkspace } from "../state/WorkspaceContext";
+import { DiagnosticErrorNotice, logCaughtDiagnostic } from "../diagnostics";
+import { HostFolderPicker } from "./HostFolderPicker";
+import { useConfirmation, useDialogPresence } from "./DialogSystem";
+
+import "./ProjectSwitcher.css";
+
+const SWITCHER_FOCUSABLE = "button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex='-1'])";
+
+interface SideNavProps {
+  collapsed: boolean;
+  open: boolean;
+  setOpen: Dispatch<SetStateAction<boolean>>;
+  onNavigate: () => void;
+  variant?: "standard" | "zero";
+  lensOpen?: boolean;
+  onToggleLens?: () => void;
+  onRevealLens?: () => void;
+  onLeaveLens?: () => void;
+}
+
+export function SideNav({ collapsed, open, setOpen, onNavigate, variant = "standard", lensOpen = false, onToggleLens, onRevealLens, onLeaveLens }: SideNavProps) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  // Detail and tab routes (findings/<id>, assets, …) belong to their section, as in the top bar.
+  const currentPath = navigationItemForPath(location.pathname).path;
+  const {
+    api,
+    coreState,
+    createEngagement,
+    activeOperator,
+    engagement,
+    engagements,
+    archivedEngagements,
+    setEngagementArchived,
+    deleteArchivedEngagement,
+  } = useWorkspace();
+  const confirm = useConfirmation();
+  const switcherButton = useRef<HTMLButtonElement>(null);
+  const switcherMenu = useRef<HTMLDivElement>(null);
+  const projectSearchInput = useRef<HTMLInputElement>(null);
+  const switcherWasOpen = useRef(false);
+  const [showArchived, setShowArchived] = useState(false);
+  const [projectSearch, setProjectSearch] = useState("");
+  const [updating, setUpdating] = useState(false);
+  const [projectError, setProjectError] = useState<string>();
+  const [notice, setNotice] = useState<string>();
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+  const [clientName, setClientName] = useState("");
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [saving, setSaving] = useState(false);
+  // Mirrors `saving` for the document-level Escape handler, which is registered
+  // once per open state so it cannot close the switcher over an in-flight create.
+  const savingRef = useRef(false);
+  const [error, setError] = useState<string>();
+  useDialogPresence(open);
+
+  // The switcher is a dialog: focus moves to its first control when it opens,
+  // Escape closes it (unless a modal such as the archive confirmation is above
+  // it), and focus returns to the trigger when it closes.
+  useEffect(() => {
+    if (open) {
+      switcherWasOpen.current = true;
+      (projectSearchInput.current ?? switcherMenu.current?.querySelector<HTMLElement>(SWITCHER_FOCUSABLE))?.focus();
+      const closeFromDocument = (event: KeyboardEvent) => {
+        if (event.key !== "Escape" || event.defaultPrevented) return;
+        if (document.querySelector(".dialog-backdrop > .modal-surface")) return;
+        if (savingRef.current) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(false);
+      };
+      document.addEventListener("keydown", closeFromDocument, true);
+      return () => document.removeEventListener("keydown", closeFromDocument, true);
+    }
+    if (!switcherWasOpen.current) return;
+    switcherWasOpen.current = false;
+    if (!document.activeElement || document.activeElement === document.body) switcherButton.current?.focus();
+  }, [open, setOpen]);
+
+  const engagementName = engagement?.name ?? "No project available";
+  const initials = engagementName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("") || "NE";
+  const operatorName = activeOperator?.displayName ?? "No operator profile";
+  const operatorInitials = operatorName.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "OP";
+  const searchTerm = projectSearch.trim().toLocaleLowerCase();
+  const visibleProjects = (showArchived ? archivedEngagements : engagements).filter((item) =>
+    item.name.toLocaleLowerCase().includes(searchTerm) || (item.clientName ?? "").toLocaleLowerCase().includes(searchTerm));
+
+  const changeArchived = async (id: string, projectName: string, archived: boolean, trigger: HTMLButtonElement) => {
+    if (updating) return;
+    setUpdating(true);
+    setProjectError(undefined);
+    setNotice(undefined);
+    try {
+      if (archived && !await confirm({
+        title: `Remove ${projectName}?`,
+        message: "This archives the project and removes it from your active projects. Files and chat history are kept. Running work continues. You can restore it from Archived projects.",
+        confirmLabel: "Remove project",
+      })) return;
+      const wasSelected = id === engagement?.id;
+      const nextId = await setEngagementArchived(id, archived);
+      if (archived && wasSelected) {
+        navigate(nextId ? projectSurface(nextId, "workbench") : "/", { replace: true });
+      }
+      setNotice(archived ? "Project removed. You can restore it from Archived projects." : "Project restored. Select it from your active projects.");
+      if (!archived) setShowArchived(false);
+    } catch (failure) {
+      void logCaughtDiagnostic("interface.project_switcher.archive_failed", "The project archive state could not be updated.", failure, "side_nav");
+      setProjectError(`Could not ${archived ? "remove" : "restore"} the project. ${failure instanceof Error ? failure.message : "Core could not save the change."} Try again.`);
+    } finally {
+      setUpdating(false);
+      requestAnimationFrame(() => {
+        if (trigger.isConnected) trigger.focus();
+        else switcherButton.current?.focus();
+      });
+    }
+  };
+
+  const deleteArchived = async (id: string, projectName: string) => {
+    if (updating) return;
+    setUpdating(true);
+    setProjectError(undefined);
+    setNotice(undefined);
+    try {
+      if (!await confirm({
+        title: `Permanently delete ${projectName}?`,
+        message: "This removes the archived project, chats, application model and project records. It cannot be undone. Workspace files, including the linked host folder, will not be deleted. Immutable audit logs and stored artifact files are retained.",
+        confirmLabel: "Delete permanently",
+        tone: "danger",
+      })) return;
+      await deleteArchivedEngagement(id);
+      setNotice("Project deleted. Workspace files were kept.");
+    } catch (failure) {
+      // diagnostic-expected: the failed deletion remains visible in the project switcher.
+      setProjectError(`Could not delete the project. ${failure instanceof Error ? failure.message : "Reconnect to Core and try again."}`);
+    } finally {
+      setUpdating(false);
+      requestAnimationFrame(() => switcherButton.current?.focus());
+    }
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setSaving(true);
+    savingRef.current = true;
+    setError(undefined);
+    try {
+      const created = await createEngagement({ name, clientName: clientName || undefined, workspacePath: workspacePath || undefined });
+      navigate(`${projectSurface(created.id, "workbench")}?view=chat`);
+      onNavigate();
+      setName("");
+      setClientName("");
+      setWorkspacePath("");
+      setCreating(false);
+      setOpen(false);
+    } catch (createError) {
+      void logCaughtDiagnostic("interface.side_nav.caught_failure_01", "A handled interface operation failed.", createError, "side_nav");
+      setError(createError instanceof Error ? createError.message : "Could not create the project.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  };
+  return (
+    <aside className={`side-nav${variant === "zero" ? " zero-anchor-dock" : ""}`} data-shell="shared" aria-label="Primary navigation" data-lens-open={lensOpen ? "true" : "false"} onMouseLeave={(event) => { if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return; if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) onLeaveLens?.(); }} onBlur={(event) => { if (window.matchMedia("(hover: hover) and (pointer: fine)").matches && !event.currentTarget.contains(event.relatedTarget)) onLeaveLens?.(); }}>
+      {onToggleLens && <button className="quiet-lens-handle quiet-lens-side-handle" type="button" aria-label="Open navigation" aria-expanded={lensOpen} title="Open navigation" onMouseEnter={onRevealLens} onFocus={onRevealLens} onClick={onRevealLens}>
+        <svg viewBox="0 0 44 600" preserveAspectRatio="none" aria-hidden="true"><ellipse cx="22" cy="300" rx="6" ry="290" /></svg>
+      </button>}
+      <div className="brand-lockup">
+        <span className="brand-mark" aria-hidden="true">
+          <Orbit size={24} strokeWidth={1.8} />
+        </span>
+        <span>
+          <strong>Nebula</strong>
+          <small>Security workspace</small>
+        </span>
+        <span className="alpha-label">3.0</span>
+      </div>
+
+      <div className="engagement-picker">
+        <button ref={switcherButton} className="engagement-switcher" type="button" title={engagementName} aria-label="Switch project" aria-expanded={open} onClick={() => { if (!saving) { if (!open) setProjectSearch(""); setOpen((value) => !value); } }}>
+          <span className="engagement-avatar">{initials}</span>
+          <span className="engagement-copy"><small>Active project</small><strong>{engagementName}</strong></span>
+          <ChevronDown size={16} aria-hidden="true" />
+        </button>
+        {open && <div ref={switcherMenu} className="engagement-menu" role="dialog" aria-label="Project switcher" data-selection-actions-disabled>
+          <header><strong>Projects</strong><button className="icon-button subtle" type="button" aria-label="Close project switcher" disabled={saving} onClick={() => setOpen(false)}><X size={14} /></button></header>
+          {!creating && <div className="engagement-search">
+            <Search size={16} aria-hidden="true" />
+            <input ref={projectSearchInput} type="text" inputMode="search" autoComplete="off" aria-label="Search projects" placeholder="Search projects" value={projectSearch} onChange={(event) => setProjectSearch(event.target.value)} />
+            {projectSearch && <button type="button" aria-label="Clear project search" title="Clear search" onClick={() => { setProjectSearch(""); projectSearchInput.current?.focus(); }}><X size={16} aria-hidden="true" /></button>}
+          </div>}
+          {!creating && <div className="engagement-options">
+            {visibleProjects.map((item) => <div className="project-switcher-row" key={item.id}>
+              {showArchived ? <span className="project-switcher-name">{item.name}<small>Archived</small></span> : <button type="button" disabled={updating} aria-current={item.id === engagement?.id ? "true" : undefined} onClick={() => { const target = /^\/projects\/[^/]+\/work\//.test(location.pathname) ? projectSurface(item.id, "work") : replaceProjectInPath(location.pathname, item.id); navigate(target + location.search); setOpen(false); }}><span>{item.name}<small>{item.clientName || item.status}</small></span>{item.id === engagement?.id && <Check size={14} />}</button>}
+              <button className="project-switcher-action" type="button" disabled={updating || coreState !== "online"} aria-label={`${showArchived ? "Restore" : "Remove"} project ${item.name}`} title={showArchived ? "Restore project" : "Remove project"} onClick={(event) => void changeArchived(item.id, item.name, !showArchived, event.currentTarget)}>{showArchived ? <RotateCcw size={16} aria-hidden="true" /> : <Archive size={16} aria-hidden="true" />}</button>
+              {showArchived && <button className="project-switcher-action" type="button" disabled={updating || coreState !== "online"} aria-label={`Delete project ${item.name}`} title="Delete permanently" onClick={() => void deleteArchived(item.id, item.name)}><Trash2 size={16} aria-hidden="true" /></button>}
+            </div>)}
+            {visibleProjects.length === 0 && <p>{searchTerm ? `No matching ${showArchived ? "archived " : ""}projects.` : showArchived ? "No archived projects." : "No active projects. Create a project or restore an archived one."}</p>}
+          </div>}
+          {!creating && <>
+            {projectError && <p className="project-switcher-feedback" role="alert">{projectError}</p>}
+            {notice && <p className="project-switcher-feedback" role="status">{notice}</p>}
+            <button className="engagement-new engagement-archive-toggle" type="button" disabled={updating} onClick={() => setShowArchived(!showArchived)}><Archive size={16} aria-hidden="true" />{showArchived ? "Active projects" : `Archived projects (${archivedEngagements.length})`}</button>
+          </>}
+          {creating ? <form className="engagement-create" onSubmit={(event) => void submit(event)}><label>Name<input required autoFocus value={name} onChange={(event) => setName(event.target.value)} /></label><label>Client name<input value={clientName} onChange={(event) => setClientName(event.target.value)} /></label><label>Project folder<input aria-label="Project folder" aria-describedby="project-folder-help" value={workspacePath} placeholder="Choose a folder" onChange={(event) => setWorkspacePath(event.target.value)} /><small id="project-folder-help">Optional. Grok, Codex, and Kali use this folder directly as their shared working directory.</small></label><HostFolderPicker api={api} value={workspacePath} onSelect={setWorkspacePath} />{error && <DiagnosticErrorNotice error={error} fallback="The operation could not be completed." compact />}<footer><button className="button quiet" type="button" disabled={saving} onClick={() => setCreating(false)}>Cancel</button><button className="button primary" type="submit" disabled={saving}>{saving ? "Creating…" : "Create"}</button></footer></form> : <button className="engagement-new engagement-create-action" type="button" disabled={updating || coreState !== "online"} onClick={() => setCreating(true)}><Plus size={14} /> New project</button>}
+        </div>}
+      </div>
+
+      <nav className="nav-list">
+        {navigationGroups.map((group) => (
+          <section className="nav-group" aria-labelledby={`nav-group-${group.id}`} key={group.id}>
+            <h2 id={`nav-group-${group.id}`}>{group.label}</h2>
+            {navigationItems.filter((item) => item.group === group.id && item.sidebar !== false).map(({ path, label, icon: Icon }) => (
+              <Link
+                key={path}
+                to={canonicalNavigationPath(path, engagement?.id)}
+                title={collapsed ? label : undefined}
+                aria-label={label}
+                aria-current={path === currentPath ? "page" : undefined}
+                onClick={onNavigate}
+                className={`nav-item${path === currentPath ? " active" : ""}`}
+              >
+                <Icon size={18} strokeWidth={1.8} aria-hidden="true" />
+                <span>{label}</span>
+              </Link>
+            ))}
+          </section>
+        ))}
+      </nav>
+
+      <div className="side-nav-footer">
+        {navigationItems.filter((item) => item.group === "settings").map(({ path, label, icon: Icon }) => (
+          <Link
+            key={path}
+            to={path}
+            title={collapsed ? label : undefined}
+            aria-label={label}
+            aria-current={path === currentPath ? "page" : undefined}
+            onClick={onNavigate}
+            className={`nav-item settings-nav-item${path === currentPath ? " active" : ""}`}
+          >
+            <Icon size={18} strokeWidth={1.8} aria-hidden="true" />
+            <span>{label}</span>
+          </Link>
+        ))}
+        <div className="operator-row">
+          <span className="operator-avatar">{operatorInitials}</span>
+          <span>
+            <strong title={operatorName}>{operatorName}</strong>
+            <small>{activeOperator?.role ?? activeOperator?.email ?? "Add when attribution is needed"}</small>
+          </span>
+          <LockKeyhole size={15} aria-label="Local attribution profile" />
+        </div>
+      </div>
+    </aside>
+  );
+}

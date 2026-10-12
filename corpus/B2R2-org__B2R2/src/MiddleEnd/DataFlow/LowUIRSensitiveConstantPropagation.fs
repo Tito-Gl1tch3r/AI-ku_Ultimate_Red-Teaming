@@ -1,0 +1,135 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.MiddleEnd.DataFlow
+
+open B2R2
+open B2R2.BinIR.LowUIR
+open B2R2.FrontEnd
+open B2R2.MiddleEnd.ControlFlowGraph
+open B2R2.MiddleEnd.DataFlow.LowUIRSensitiveDataFlow
+
+/// Represents a LowUIR-based sensitive constant propagation analysis. This
+/// analysis is aware of stack pointers on basic blocks and distinguishes each
+/// basic block by its stack pointer value.
+type LowUIRSensitiveConstantPropagation<'ExeCtx when 'ExeCtx: comparison>
+  public(hdl: BinHandle, scheme: IScheme<'ExeCtx>) =
+
+  /// Returns the abstract value of the given definition. A definition coming
+  /// in from outside the function is unknown, so it must not be answered with
+  /// the lattice bottom, which every join would absorb.
+  let evaluateDef (state: State<_, _>) (defSvp: SensitiveVarPoint<_>) =
+    if defSvp.SensitiveProgramPoint.ProgramPoint.IsFake then
+      ConstantDomain.NotAConst
+    else
+      (state :> IAbsValProvider<_, _>).GetAbsValue defSvp
+
+  let evaluateVarPoint (state: State<_, _>) spp varKind =
+    let svp = { SensitiveProgramPoint = spp; VarKind = varKind }
+    match state.UseDefMap.TryGetValue svp with
+    | false, _ ->
+      ConstantDomain.Undef
+    | true, rds ->
+      rds
+      |> Seq.fold (fun acc defSvp ->
+        evaluateDef state defSvp
+        |> ConstantDomain.join acc) ConstantDomain.Undef
+
+  let rec evaluateExpr state spp e =
+    match e with
+    | PCVar(Type = rt) ->
+      let addr = (spp: SensitiveProgramPoint<_>).ProgramPoint.Address
+      let bv = BitVector(addr, rt)
+      ConstantDomain.Const bv
+    | Num(Value = bv) ->
+      ConstantDomain.Const bv
+    | Var _ | TempVar _ ->
+      evaluateVarPoint state spp (VarKind.ofIRExpr e)
+    | Load(Endian = _m; Type = rt; Addr = addr) ->
+      match state.StackPointerSubState.EvalExpr(spp, addr) with
+      | StackPointerDomain.ConstSP bv ->
+        let addr = bv.ToUInt64()
+        let offset = LowUIRStackPointer.toFrameOffset addr
+        let c = evaluateVarPoint state spp (StackLocal offset)
+        match c with
+        | ConstantDomain.Const bv when bv.Length < rt ->
+          ConstantDomain.Const <| BitVector.ZExt(bv, rt)
+        | ConstantDomain.Const bv when bv.Length > rt ->
+          ConstantDomain.Const <| BitVector.Extract(bv, rt, 0)
+        | _ ->
+          c
+      | StackPointerDomain.NotConstSP ->
+        ConstantDomain.NotAConst
+      | StackPointerDomain.Undef ->
+        ConstantDomain.Undef
+    | UnOp(Op = op; Operand = e) ->
+      evaluateExpr state spp e
+      |> ConstantDomain.evalUnOp op
+    | BinOp(Op = op; Left = e1; Right = e2) ->
+      let c1 = evaluateExpr state spp e1
+      let c2 = evaluateExpr state spp e2
+      ConstantDomain.evalBinOp op c1 c2
+    | RelOp(Op = op; Left = e1; Right = e2) ->
+      let c1 = evaluateExpr state spp e1
+      let c2 = evaluateExpr state spp e2
+      ConstantDomain.evalRelOp op c1 c2
+    | Ite(Cond = e1; TrueExpr = e2; FalseExpr = e3) ->
+      let c1 = evaluateExpr state spp e1
+      let c2 = evaluateExpr state spp e2
+      let c3 = evaluateExpr state spp e3
+      ConstantDomain.ite c1 c2 c3
+    | Cast(Kind = op; Type = rt; Operand = e) ->
+      let c = evaluateExpr state spp e
+      ConstantDomain.evalCast op rt c
+    | Extract(Operand = e; Type = rt; StartPos = pos) ->
+      let c = evaluateExpr state spp e
+      ConstantDomain.extract c rt pos
+    (* A direction reaches nothing this domain folds -- it has no
+       floating-point arithmetic at all -- so only the body is read. *)
+    | RoundCtrl(Body = body) ->
+      evaluateExpr state spp body
+    | FuncName _ | ExprList _ | Undefined _ ->
+      ConstantDomain.NotAConst
+    | _ ->
+      Terminator.impossible ()
+
+  let lattice = ConstantDomain.createLattice ()
+
+  let rec evaluator =
+    { new IExprEvaluatable<SensitiveProgramPoint<'ExeCtx>,
+                           ConstantDomain.Lattice> with
+        member _.EvalExpr(pp, expr) = evaluateExpr state pp expr }
+
+  and state = State<_, _>(hdl, lattice, scheme, evaluator)
+
+  /// Returns the underlying state of this analysis.
+  member _.State with get() = state
+
+  /// Evaluates the given expression at the given sensitive program point.
+  member _.EvalExpr(spp, e) = evaluateExpr state spp e
+
+  interface IDataFlowComputable<SensitiveVarPoint<'ExeCtx>,
+                                ConstantDomain.Lattice,
+                                LowUIRBasicBlock> with
+    member _.Compute cfg = compute cfg state

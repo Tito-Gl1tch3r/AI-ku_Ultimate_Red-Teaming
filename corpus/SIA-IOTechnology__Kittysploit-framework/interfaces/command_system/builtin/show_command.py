@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Show command implementation
+"""
+
+from interfaces.command_system.base_command import BaseCommand
+from core.output_handler import print_info, print_success, print_error, print_table, print_empty, print_status, print_warning, table_render_width
+from core.framework.option.base_option import Option as BaseOption
+import os
+import logging
+import ast
+from typing import Optional, List, Dict, Any
+
+class ShowCommand(BaseCommand):
+    """Command to show module information"""
+
+    # Width for all separator lines ("=" and "-") so they match
+    SEP_WIDTH = 120
+
+    MODULE_TYPE_ALIASES = {
+        "module": None,
+        "modules": None,
+        "exploit": "exploit",
+        "exploits": "exploit",
+        "aux": "auxiliary",
+        "auxiliary": "auxiliary",
+        "payload": "payload",
+        "payloads": "payload",
+        "post": "post",
+        "listener": "listener",
+        "listeners": "listener",
+        "encoder": "encoder",
+        "encoders": "encoder",
+        "transform": "transform",
+        "transforms": "transform",
+        "obfuscator": "transform",
+        "obfuscators": "transform",
+        "workflow": "workflow",
+        "workflows": "workflow",
+        "docker": "docker_environment",
+        "environment": "docker_environment",
+        "environments": "docker_environment",
+        "docker_environment": "docker_environment",
+        "docker_environments": "docker_environment",
+        "backdoor": "backdoor",
+        "backdoors": "backdoor",
+        "analysis": "analysis",
+        "browser_auxiliary": "browser_auxiliary",
+        "browser_aux": "browser_auxiliary",
+        "browser_exploit": "browser_exploit",
+        "browser_exploits": "browser_exploit",
+    }
+    
+    MODULE_PATH_PREFIXES = [
+        ("analysis/", "analysis"),
+        ("exploits/", "exploit"),
+        ("auxiliary/", "auxiliary"),
+        ("payloads/", "payload"),
+        ("post/", "post"),
+        ("listeners/", "listener"),
+        ("encoders/", "encoder"),
+        ("transforms/", "transform"),
+        ("obfuscators/", "transform"),
+        ("workflow/", "workflow"),
+        ("docker_environments/", "docker_environment"),
+        ("browser_exploits/", "browser_exploit"),
+        ("browser_auxiliary/", "browser_auxiliary"),
+        ("backdoors/", "backdoor"),
+    ]
+    
+    @property
+    def name(self) -> str:
+        return "show"
+    
+    @property
+    def description(self) -> str:
+        return "Show module information and options"
+    
+    @property
+    def usage(self) -> str:
+        return (
+            "show [options|advanced|info|modules|exploits|auxiliary|payloads|post|"
+            "analysis|listeners|encoders|transforms|docker|backdoors|"
+            "browser_auxiliary|browser_exploits|plugins]"
+        )
+    
+    def get_subcommands(self) -> List[str]:
+        """Get available subcommands for auto-completion"""
+        subcommands = [
+            "info",
+            "modules",
+            "exploits",
+            "auxiliary",
+            "aux",  # alias
+            "payloads",
+            "payload",  # alias
+            "post",
+            "postmodules",  # alias
+            "analysis",
+            "listeners",
+            "listener",  # alias
+            "encoders",
+            "encoder",  # alias
+            "transforms",
+            "transform",  # alias
+            "obfuscators",  # legacy alias
+            "obfuscator",  # legacy alias
+            "workflows",
+            "workflow",  # alias
+            "docker",
+            "environment",  # alias
+            "environments",  # alias
+            "nops",
+            "workspaces",
+            "backdoors",
+            "backdoor",
+            "browser_auxiliary",
+            "browser_aux",  # alias
+            "browser_exploits",
+            "browser_exploit",  # alias
+            "plugins",
+            "plugin",  # alias
+        ]
+        
+        # Add module-specific options if a module is loaded
+        if hasattr(self.framework, 'current_module') and self.framework.current_module:
+            subcommands.insert(0, "options")
+            subcommands.insert(1, "advanced")
+        
+        return subcommands
+    
+    @property
+    def help_text(self) -> str:
+        return f"""
+{self.description}
+
+Usage: {self.usage}
+
+This command shows information about modules, listeners, and other framework components.
+
+Arguments:
+    options        Show current module options
+    advanced       Show only advanced module options
+    info           Show current module information (default)
+    modules        Show all available modules
+    exploits       Show exploit modules
+    auxiliary      Show auxiliary modules
+    payloads       Show payload modules
+    post           Show post-exploitation modules
+    analysis             Show analysis modules
+    browser_auxiliary    Show browser auxiliary modules
+    browser_exploits     Show browser exploit modules
+    listeners            Show available listeners
+    docker               Show Docker environment modules
+    nops                 Show available NOP types
+    workspaces           Show available workspaces
+    backdoors            Show backdoor modules
+    plugins              Show available plugins (same as 'plugin')
+
+Examples:
+    show                    # Show current module information
+    show options            # Show current module options
+    show advanced           # Show only advanced options
+    show modules            # List all available modules
+    show exploits           # List exploit modules
+    show analysis           # List analysis modules
+    show browser_auxiliary  # List browser auxiliary modules
+    show browser_exploits   # List browser exploit modules
+    show docker             # List Docker environments
+    show backdoors          # List backdoor modules
+    show listeners          # List all available listeners
+    show plugins            # List available plugins
+    show nops               # Show available NOP types
+        """
+    
+    def execute(self, args, **kwargs) -> bool:
+        """Execute the show command"""
+        show_type = args[0] if args else "info"
+
+        plugin_manager = getattr(self.framework, 'plugin_manager', None)
+        metasploit_plugin = plugin_manager.get_plugin("metasploit") if plugin_manager else None
+        if metasploit_plugin and getattr(metasploit_plugin, "is_integrated_mode_active", lambda: False)():
+            show_map = {
+                "options": "show options",
+                "advanced": "show advanced",
+                "payload": "show payloads",
+                "payloads": "show payloads",
+            }
+            lowered_show = show_type.lower()
+            if lowered_show == "info":
+                module_name = args[1] if len(args) > 1 else None
+                metasploit_plugin.msf_info(module_name)
+                return True
+            if lowered_show in ("exploit", "exploits", "aux", "auxiliary", "payload", "payloads"):
+                return self._show_federated_modules(lowered_show, metasploit_plugin)
+            command = show_map.get(lowered_show)
+            if command:
+                return metasploit_plugin.msf_show(command)
+        
+        try:
+            show_type = show_type.lower()
+            if show_type == "options":
+                if not hasattr(self.framework, 'current_module') or not self.framework.current_module:
+                    print_error("No module selected. Use 'use <module>' first.")
+                    return False
+                self._show_options(self.framework.current_module, show_advanced=False)
+            elif show_type == "advanced":
+                if not hasattr(self.framework, 'current_module') or not self.framework.current_module:
+                    print_error("No module selected. Use 'use <module>' first.")
+                    return False
+                self._show_advanced_options(self.framework.current_module)
+            elif show_type == "info":
+                if not hasattr(self.framework, 'current_module') or not self.framework.current_module:
+                    print_error("No module selected. Use 'use <module>' first.")
+                    return False
+                self._show_info(self.framework.current_module)
+            elif show_type == "modules":
+                self._show_modules()
+            elif show_type in ("exploit", "exploits"):
+                self._show_modules_by_category("Exploit", "exploit")
+            elif show_type in ("aux", "auxiliary"):
+                self._show_modules_by_category("Auxiliary", "auxiliary")
+            elif show_type in ("payload", "payloads"):
+                self._show_modules_by_category("Payload", "payload")
+            elif show_type in ("post", "postmodules"):
+                self._show_modules_by_category("Post-exploitation", "post")
+            elif show_type == "analysis":
+                self._show_modules_by_category("Analysis", "analysis")
+            elif show_type in ("listener", "listeners"):
+                self._show_listeners()
+            elif show_type in ("encoder", "encoders"):
+                self._show_modules_by_category("Encoder", "encoder")
+            elif show_type in ("transform", "transforms", "obfuscator", "obfuscators"):
+                self._show_modules_by_category("Transform", "transform")
+            elif show_type in ("workflow", "workflows"):
+                self._show_modules_by_category("Workflow", "workflow")
+            elif show_type in ("docker", "environment", "environments"):
+                self._show_modules_by_category("Docker environment", "docker_environment")
+            elif show_type in ("backdoor", "backdoors"):
+                self._show_modules_by_category("Backdoor", "backdoor")
+            elif show_type in ("browser_auxiliary", "browser_aux"):
+                self._show_modules_by_category("Browser auxiliary", "browser_auxiliary")
+            elif show_type in ("browser_exploit", "browser_exploits"):
+                self._show_modules_by_category("Browser exploit", "browser_exploit")
+            elif show_type == "nops":
+                self._show_nops()
+            elif show_type == "workspaces":
+                self._show_workspaces()
+            elif show_type in ("plugin", "plugins"):
+                return self._show_plugins(**kwargs)
+            else:
+                print_error(f"Unknown show type: {show_type}")
+                print_info(
+                    "Use 'show options', 'show advanced', 'show info', 'show modules', "
+                    "'show analysis', 'show browser_auxiliary', 'show browser_exploits', "
+                    "'show listeners', 'show encoders', 'show transforms', "
+                    "'show nops', 'show workspaces', 'show plugins', or 'show backdoors'"
+                )
+                return False
+            
+            return True
+            
+        except Exception as e:
+            print_error(f"Error showing information: {str(e)}")
+            return False
+
+    def _show_plugins(self, **kwargs) -> bool:
+        """Show available plugins (same output as the 'plugin' command)."""
+        command_registry = kwargs.get("command_registry")
+        if command_registry:
+            plugin_cmd = command_registry.get_command("plugin")
+            if plugin_cmd:
+                return bool(plugin_cmd.execute([]))
+        print_error("Plugin command not available")
+        return False
+    
+    def _show_info(self, module):
+        """Show module information"""
+        print_info(f"Module: {module.name}")
+        module_type = getattr(module, 'type', getattr(module, '_type', 'module'))
+        print_info(f"Type: {module_type}")
+        print_info(f"Description: {module.description}")
+        print_info(f"Author: {module.author}")
+        
+        if module.references:
+            print_info(f"References: {', '.join(module.references)}")
+        
+        if module.requires_root:
+            print_warning("This module requires root privileges")
+        
+        if hasattr(module, 'cve') and module.cve:
+            print_info(f"CVE: {module.cve}")
+        
+        # For transforms: show compatible payload client languages
+        if getattr(module, 'type', None) == 'transform' or (hasattr(module.__class__, 'TYPE_MODULE') and getattr(module.__class__, 'TYPE_MODULE') == 'transform'):
+            supported = getattr(module, 'get_supported_client_languages', lambda: getattr(module.__class__, 'SUPPORTED_CLIENT_LANGUAGES', []))()
+            if supported:
+                print_info(f"Compatible with payloads (client language): {', '.join(supported)}")
+            else:
+                print_info("Compatible with payloads (client language): none (listener-only)")
+        
+        # Try to load and display doc.md if available
+        doc_content = self._load_module_doc(module)
+        if doc_content:
+            print_empty()
+            print_info("=" * self.SEP_WIDTH)
+            print_info("Documentation:")
+            print_info("=" * self.SEP_WIDTH)
+            print_info(doc_content)
+            print_info("=" * self.SEP_WIDTH)
+    
+    def _load_module_doc(self, module) -> Optional[str]:
+        """Load doc.md for a module"""
+        try:
+            # Get module path
+            module_path = getattr(module, 'name', '')
+            if not module_path:
+                return None
+            
+            # Check if it's a marketplace module
+            if module_path.startswith("modules/marketplace/"):
+                return self._load_extension_doc(module_path)
+            
+            # For regular modules, look in modules directory
+            module_file = os.path.join("modules", module_path.replace("/", os.sep) + ".py")
+            if os.path.exists(module_file):
+                module_dir = os.path.dirname(module_file)
+                doc_file = os.path.join(module_dir, "doc.md")
+                if os.path.exists(doc_file):
+                    with open(doc_file, 'r', encoding='utf-8') as f:
+                        return f.read()
+            
+            return None
+        except Exception as e:
+            logging.debug(f"Could not load doc.md: {e}")
+            return None
+    
+    def _load_extension_doc(self, module_path: str) -> Optional[str]:
+        """Load doc.md for a marketplace module"""
+        try:
+            # Check if this is a marketplace module (modules/marketplace/<type>/<module_id>)
+            if not module_path.startswith("modules/marketplace/"):
+                return None
+            
+            # Extract module path components
+            rel_path = module_path.replace("modules/marketplace/", "")
+            parts = rel_path.split("/")
+            
+            if len(parts) < 2:
+                return None
+            
+            module_type = parts[0]
+            module_id = parts[1]
+            
+            # Build path to module directory
+            module_dir = os.path.join("modules", "marketplace", module_type, module_id)
+            
+            if not os.path.exists(module_dir):
+                return None
+            
+            # Look for latest version or any version
+            version_dirs = []
+            for item in os.listdir(module_dir):
+                item_path = os.path.join(module_dir, item)
+                if os.path.isdir(item_path):
+                    version_dirs.append((item, item_path))
+            
+            version_dirs.sort(key=lambda x: (x[0] != "latest", x[0]))
+            
+            if not version_dirs:
+                version_dirs = [("", module_dir)]
+            
+            # Try each version directory
+            for version_name, version_dir in version_dirs:
+                doc_file = os.path.join(version_dir, "doc.md")
+                if os.path.exists(doc_file):
+                    with open(doc_file, 'r', encoding='utf-8') as f:
+                        return f.read()
+            
+            return None
+        except Exception as e:
+            logging.debug(f"Could not load marketplace module doc.md: {e}")
+            return None
+    
+    def _show_options(self, module, show_advanced=False):
+        """Show module options (excluding advanced by default)"""
+        options = module.get_options()
+        
+        if not options:
+            print_info("No options available for this module")
+            return
+        
+        # Filter out advanced options if not requested
+        filtered_options = {}
+        advanced_count = 0
+        for name, option_data in options.items():
+            if len(option_data) >= 4:
+                default, required, description, advanced = option_data[:4]
+                if not advanced or show_advanced:
+                    filtered_options[name] = option_data
+                elif advanced:
+                    advanced_count += 1
+        
+        if not filtered_options:
+            print_info("No options available for this module")
+            if advanced_count > 0:
+                print_info(f"({advanced_count} advanced option(s) hidden - use 'show advanced' to view)")
+            return
+        
+        # Prepare table data
+        headers = ["Name", "Current Setting", "Required", "Description"]
+        rows = []
+        
+        for name, option_data in filtered_options.items():
+            if len(option_data) >= 4:
+                default, required, description, advanced = option_data[:4]
+                # Get option object from class to avoid triggering __get__ for OptFile
+                option_descriptor = getattr(type(module), name, None)
+                if option_descriptor and isinstance(option_descriptor, BaseOption):
+                    # Use to_dict to get display_value without triggering __get__
+                    option_dict = option_descriptor.to_dict(module)
+                    current_value = option_dict.get('display_value', '')
+                else:
+                    # Fallback to old method for non-Option attributes
+                    option_obj = getattr(module, name, default)
+                    if hasattr(option_obj, 'value'):
+                        current_value = option_obj.value
+                    elif hasattr(option_obj, 'display_value'):
+                        current_value = option_obj.display_value
+                    else:
+                        current_value = option_obj
+                
+                # Format current value - handle booleans and None correctly
+                if current_value is None:
+                    value_str = ""
+                elif isinstance(current_value, bool):
+                    # Always display boolean values as True/False
+                    value_str = str(current_value)
+                elif current_value == "":
+                    value_str = ""
+                else:
+                    value_str = str(current_value)
+                
+                # Format required
+                req_text = "yes" if required else "no"
+                
+                # Format description (add advanced marker if needed)
+                desc_text = description
+                if advanced:
+                    desc_text += " (advanced)"
+                
+                # Name should never be truncated - it's needed for 'set' command
+                rows.append([name, value_str, req_text, desc_text])
+        
+        # Display table
+        table_kwargs = {
+            "max_width": self.SEP_WIDTH,
+            "expand_to_terminal": True,
+            "prefer_single_line": True,
+        }
+        frame_width = table_render_width(headers, rows, **table_kwargs)
+        print_info()
+        print_info("Module options:")
+        print_info("=" * frame_width)
+        print_table(headers, rows, **table_kwargs)
+        print_info("=" * frame_width)
+        
+        if advanced_count > 0 and not show_advanced:
+            print_info()
+            print_info(f"({advanced_count} advanced option(s) hidden - use 'show advanced' to view)")
+        
+        print_info()
+        print_info("Use 'set <option> <value>' to set option values")
+    
+    def _show_advanced_options(self, module):
+        """Show only advanced module options"""
+        options = module.get_options()
+        
+        if not options:
+            print_info("No options available for this module")
+            return
+        
+        # Filter for advanced options only
+        advanced_options = {}
+        for name, option_data in options.items():
+            if len(option_data) >= 4:
+                default, required, description, advanced = option_data[:4]
+                if advanced:  # Only include advanced options
+                    advanced_options[name] = option_data
+        
+        if not advanced_options:
+            print_info("No advanced options available for this module")
+            print_info("Use 'show options' to see all options")
+            return
+        
+        # Prepare table data
+        headers = ["Name", "Current Setting", "Required", "Description"]
+        rows = []
+        
+        for name, option_data in advanced_options.items():
+            if len(option_data) >= 4:
+                default, required, description, advanced = option_data[:4]
+                # Get option object from class to avoid triggering __get__ for OptFile and OptPayload
+                option_descriptor = getattr(type(module), name, None)
+                if option_descriptor and isinstance(option_descriptor, BaseOption):
+                    # Use to_dict to get display_value without triggering __get__
+                    option_dict = option_descriptor.to_dict(module)
+                    current_value = option_dict.get('display_value', '')
+                else:
+                    # Fallback to old method for non-Option attributes
+                    option_obj = getattr(module, name, default)
+                    if hasattr(option_obj, 'value'):
+                        current_value = option_obj.value
+                    elif hasattr(option_obj, 'display_value'):
+                        current_value = option_obj.display_value
+                    else:
+                        current_value = option_obj
+                
+                # Format current value - handle booleans and None correctly
+                if current_value is None:
+                    value_str = ""
+                elif isinstance(current_value, bool):
+                    # Always display boolean values as True/False
+                    value_str = str(current_value)
+                elif current_value == "":
+                    value_str = ""
+                else:
+                    value_str = str(current_value)
+                
+                # Format required
+                req_text = "yes" if required else "no"
+                
+                rows.append([name, value_str, req_text, description])
+        
+        # Display table
+        table_kwargs = {
+            "max_width": self.SEP_WIDTH,
+            "expand_to_terminal": True,
+            "prefer_single_line": True,
+        }
+        frame_width = table_render_width(headers, rows, **table_kwargs)
+        print_info("")
+        print_info("Advanced module options:")
+        print_info("=" * frame_width)
+        print_table(headers, rows, **table_kwargs)
+        print_info("=" * frame_width)
+        print_info("")
+        print_info("Use 'set <option> <value>' to set option values")
+    
+    def _show_modules(self):
+        """Show all available modules"""
+        modules = self._get_modules()
+        if not modules:
+            print_info("No modules found")
+            return
+        
+        # Organize modules by type
+        categories = {}
+        for module in modules:
+            module_type = self._normalize_module_type(module.get('type', 'other')) or 'other'
+            if module_type not in categories:
+                categories[module_type] = []
+            categories[module_type].append(module)
+        
+        for category in sorted(categories.keys()):
+            heading = f"[{category.upper()}] ({len(categories[category])})"
+            self._print_module_table(categories[category], heading)
+
+    def _show_modules_by_category(self, label: str, module_type: str):
+        """Show modules filtered by a specific category"""
+        normalized_type = self._normalize_module_type(module_type)
+        modules = self._get_modules(normalized_type)
+        
+        if not modules:
+            print_info(f"No {label.lower()} modules found")
+            return
+        
+        heading = f"{label} modules ({len(modules)})"
+        self._print_module_table(modules, heading, include_type=False)
+
+    def _show_federated_modules(self, show_type: str, metasploit_plugin) -> bool:
+        module_type_map = {
+            "exploit": ("Exploit", "exploit"),
+            "exploits": ("Exploit", "exploit"),
+            "aux": ("Auxiliary", "auxiliary"),
+            "auxiliary": ("Auxiliary", "auxiliary"),
+            "payload": ("Payload", "payload"),
+            "payloads": ("Payload", "payload"),
+        }
+        label, normalized_type = module_type_map[show_type]
+        kitty_modules = self._get_modules(normalized_type)
+        msf_modules = metasploit_plugin.get_cached_msf_modules(normalized_type)
+
+        if not kitty_modules and not msf_modules:
+            print_info(f"No {label.lower()} modules found")
+            return True
+
+        if kitty_modules:
+            self._print_module_table(kitty_modules, f"KittySploit {label} modules ({len(kitty_modules)})", include_type=False)
+            print_empty()
+        if msf_modules:
+            self._print_module_table(msf_modules, f"Metasploit {label} modules ({len(msf_modules)})", include_type=False)
+        return True
+    
+    def _get_modules(self, module_type: str = None):
+        """Retrieve modules from DB or filesystem with optional type filtering"""
+        normalized_type = self._normalize_module_type(module_type)
+        modules = []
+        
+        # Try database first (much faster)
+        try:
+            if hasattr(self.framework, 'module_sync_manager') and self.framework.module_sync_manager:
+                # Use sync_manager directly for better control
+                modules = self.framework.module_sync_manager.search_modules(
+                    query="",
+                    module_type=normalized_type or "",
+                    limit=10000  # Large limit to get all modules
+                )
+                
+                # Convert DB format to expected format
+                if modules:
+                    formatted_modules = []
+                    seen_paths = set()
+                    for module in modules:
+                        path = module.get('path', '')
+                        seen_paths.add(path)
+                        description = self._resolve_module_description(
+                            path,
+                            module.get('description', ''),
+                        )
+                        formatted_modules.append({
+                            'path': module.get('path', ''),
+                            'name': module.get('name', module.get('path', '')),
+                            'description': description,
+                            'type': module.get('type', ''),
+                            'author': module.get('author', 'Unknown')
+                        })
+                    # The DB can be stale during development. Merge filesystem hits so
+                    # freshly-added modules show up before a manual sync.
+                    for fs_module in self._search_modules_filesystem(normalized_type):
+                        if fs_module.get('path') not in seen_paths:
+                            formatted_modules.append(fs_module)
+                    return formatted_modules
+        except Exception as e:
+            # Database search failed, fall back to filesystem
+            logging.debug(f"Database search failed: {e}")
+            modules = []
+        
+        # Fallback to filesystem if DB is empty or failed
+        if not modules:
+            # Check if we should suggest syncing
+            try:
+                if hasattr(self.framework, 'module_sync_manager') and self.framework.module_sync_manager:
+                    stats = self.framework.module_sync_manager.get_module_stats()
+                    if stats.get('total', 0) == 0:
+                        print_warning("No modules found in database. Run 'sync now' to synchronize modules from filesystem to database for faster searches.")
+            except Exception:
+                pass
+            
+            modules = self._search_modules_filesystem(normalized_type)
+        
+        return modules or []
+
+    def _resolve_module_description(self, module_path: str, description: str) -> str:
+        """Return a non-empty description, loading library workflow YAML when needed."""
+        text = str(description or "").strip()
+        if text and text.lower() != "no description":
+            return text
+        workflow_id = self._workflow_id_from_module_path(module_path)
+        if not workflow_id:
+            return text or "No description"
+        try:
+            from core.workflows.module_bridge import library_workflow_search_metadata
+
+            meta = library_workflow_search_metadata(workflow_id)
+            yaml_desc = str(meta.get("description") or "").strip()
+            if yaml_desc:
+                return yaml_desc
+        except Exception:
+            pass
+        return text or "No description"
+
+    @staticmethod
+    def _workflow_id_from_module_path(module_path: str) -> Optional[str]:
+        path = str(module_path or "").strip().strip("/")
+        if not path.startswith("workflow/"):
+            return None
+        slug = path.split("/", 1)[1].strip()
+        if not slug or slug.startswith("_"):
+            return None
+        return slug.replace("_", "-")
+
+    def _extract_module_metadata_from_source(self, file_path: str) -> Dict[str, Any]:
+        """Extract basic module metadata from source file without loading the module (fast)"""
+        metadata = {
+            'name': '',
+            'description': 'No description',
+            'author': 'Unknown'
+        }
+        
+        if not os.path.exists(file_path):
+            return metadata
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                source = f.read()
+            
+            # Parse the AST
+            tree = ast.parse(source, filename=file_path)
+            
+            # Helper to extract string value from AST node (ast.Constant since Python 3.8;
+            # ast.Str was removed in Python 3.14)
+            def get_string_value(node):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    return node.value
+                return None
+            
+            # Look for __info__ dictionary in the module
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == '__info__':
+                            # Found __info__ assignment
+                            if isinstance(node.value, ast.Dict):
+                                # Extract values from dictionary
+                                for k, v in zip(node.value.keys, node.value.values):
+                                    key = get_string_value(k)
+                                    if key:
+                                        value = get_string_value(v)
+                                        if value is not None:
+                                            key_lower = key.lower()
+                                            if key_lower == 'name':
+                                                metadata['name'] = value
+                                            elif key_lower == 'description':
+                                                metadata['description'] = value
+                                            elif key_lower == 'author':
+                                                metadata['author'] = value
+                            break
+                
+                # Also check for class attributes (name, description, author) in Module class
+                if isinstance(node, ast.ClassDef) and node.name == 'Module':
+                    for item in node.body:
+                        if isinstance(item, ast.Assign):
+                            for target in item.targets:
+                                if isinstance(target, ast.Name):
+                                    if target.id in ('name', 'description', 'author'):
+                                        value = get_string_value(item.value)
+                                        if value is not None:
+                                            if target.id == 'name':
+                                                metadata['name'] = value
+                                            elif target.id == 'description':
+                                                metadata['description'] = value
+                                            elif target.id == 'author':
+                                                metadata['author'] = value
+        except (SyntaxError, ValueError, AttributeError):
+            # If parsing fails, return default metadata
+            pass
+        except Exception:
+            # Other exceptions - return default
+            pass
+        
+        return metadata
+    
+    def _search_modules_filesystem(self, module_type_filter: str = None):
+        """Search modules from filesystem as fallback (optimized - no module loading)"""
+        modules = []
+        try:
+            discovered_modules = self.framework.module_loader.discover_modules()
+            
+            for module_path, file_path in discovered_modules.items():
+                module_type = self._detect_module_type(module_path)
+                if module_type_filter and not self._type_matches(module_type, module_type_filter):
+                    continue
+                
+                # Extract metadata directly from source file (fast, no module loading)
+                try:
+                    if str(file_path).startswith("library://"):
+                        from core.workflows.module_bridge import (
+                            library_workflow_search_metadata,
+                            workflow_id_from_uri,
+                        )
+
+                        metadata = library_workflow_search_metadata(
+                            workflow_id_from_uri(file_path)
+                        )
+                    else:
+                        metadata = self._extract_module_metadata_from_source(file_path)
+                    modules.append({
+                        'path': module_path,
+                        'name': metadata.get('name') or module_path,
+                        'description': self._resolve_module_description(
+                            module_path,
+                            metadata.get('description', ''),
+                        ),
+                        'type': module_type,
+                        'author': metadata.get('author', 'Unknown')
+                    })
+                except Exception:
+                    # If extraction fails, just add basic info
+                    modules.append({
+                        'path': module_path,
+                        'name': module_path,
+                        'description': 'No description',
+                        'type': module_type,
+                        'author': 'Unknown'
+                    })
+        except Exception as e:
+            print_info(f"Error searching filesystem: {e}")
+        
+        return modules
+    
+    def _show_listeners(self):
+        """Show all available listeners in a single compact table."""
+        listeners = self._get_modules("listener")
+        
+        if not listeners:
+            print_info("No listeners found")
+            return
+        
+        # Build rows: path and description only
+        rows = []
+        for listener in listeners:
+            path_str = str(listener.get('path', '-')).replace("\n", " ").strip()
+            desc_str = str(listener.get('description', 'No description')).replace("\n", " ").strip()
+            rows.append([path_str, desc_str])
+        rows.sort(key=lambda r: r[0].lower())
+        headers = ["Path", "Description"]
+        total = len(rows)
+        print_status(f"Available listeners ({total})")
+        print_table(
+            headers,
+            rows,
+            max_width=self.SEP_WIDTH,
+            expand_to_terminal=True,
+            prefer_single_line=True,
+        )
+        print_empty()
+        print_info(f"  Use 'use <path>' to select a listener.")
+    
+    def _show_nops(self):
+        """Show available NOP types"""
+        available = self.framework.nops.list_available()
+        
+        print_info("Available NOP types:")
+        print_info("=" * self.SEP_WIDTH)
+        
+        for arch, types in available.items():
+            print_info(f"\n[{arch.upper()}]")
+            for nop_type in types:
+                info = self.framework.nops.get_info(arch, nop_type)
+                print_info(f"  {nop_type:<15} {info}")
+    
+    def _show_workspaces(self):
+        """Show available workspaces"""
+        workspaces = self.framework.workspace_manager.list_workspaces()
+        
+        if not workspaces:
+            print_info("No workspaces found")
+            return
+        
+        print_info("Available workspaces:")
+        print_info("=" * self.SEP_WIDTH)
+        
+        current_workspace = self.framework.workspace_manager.get_current_workspace()
+        
+        for workspace in workspaces:
+            status = " (current)" if current_workspace and current_workspace.name == workspace.name else ""
+            print_info(f"{workspace.name:<20} {workspace.description or 'No description'}{status}")
+    
+    def _print_module_table(self, modules, heading: str, include_type: bool = False):
+        """Render module information focusing on path + description"""
+        if not modules:
+            print_info(f"{heading}: no entries")
+            return
+        
+        headers = ["Path", "Description"]
+        rows = []
+        for module in sorted(modules, key=lambda x: x.get('path', '')):
+            path = str(module.get('path', '-')).replace("\n", " ").strip()
+            description = str(module.get('description', 'No description')).replace("\n", " ").strip()
+            if include_type:
+                module_type = self._normalize_module_type(module.get('type', 'other')) or 'other'
+                rows.append([f"{path} ({module_type})", description])
+            else:
+                rows.append([path, description])
+        
+        # Use print_table: full terminal width, description on one line when it fits
+        print_status(heading)
+        print_table(
+            headers,
+            rows,
+            max_width=self.SEP_WIDTH,
+            expand_to_terminal=True,
+            prefer_single_line=True,
+        )
+    
+    def _normalize_module_type(self, module_type: str):
+        if not module_type:
+            return None
+        return self.MODULE_TYPE_ALIASES.get(module_type.lower(), module_type.lower())
+    
+    def _module_matches_type(self, module: dict, module_type: str) -> bool:
+        target = self._normalize_module_type(module_type)
+        if not target:
+            return True
+        
+        module_type_value = self._normalize_module_type(module.get('type'))
+        if module_type_value == target:
+            return True
+        
+        detected = self._detect_module_type(module.get('path', ''))
+        return self._type_matches(detected, target)
+    
+    def _detect_module_type(self, module_path: str) -> str:
+        path = (module_path or "").lower()
+        for prefix, module_type in self.MODULE_PATH_PREFIXES:
+            if path.startswith(prefix):
+                return module_type
+        return 'other'
+    
+    def _type_matches(self, current_type: str, target_type: str) -> bool:
+        current = self._normalize_module_type(current_type)
+        target = self._normalize_module_type(target_type)
+        return (current or 'other') == (target or 'other')

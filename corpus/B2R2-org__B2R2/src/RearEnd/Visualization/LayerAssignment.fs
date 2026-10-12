@@ -1,0 +1,124 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+[<RequireQualifiedAccess>]
+module internal B2R2.RearEnd.Visualization.LayerAssignment
+
+open System.Collections.Generic
+open B2R2.MiddleEnd.BinGraph
+
+let private assignLayerFromPred (vGraph: VisGraph) (v: IVertex<VisBBlock>) =
+  let preds = VisGraph.getPreds vGraph v
+  if preds.Length = 0 then
+    VisGraph.setLayer v 0
+  else
+    let maxLayer = preds |> Array.maxBy VisGraph.getLayer |> VisGraph.getLayer
+    VisGraph.setLayer v (maxLayer + 1)
+
+let private kahnAssignLayers (vGraph: VisGraph) =
+  Traversal.DFS.iterRevPostorder vGraph (assignLayerFromPred vGraph)
+
+let rec private addDummy g (backEdges, dummies) k parWidth src dst e cnt =
+  if cnt = 0 then
+    let edge = VisEdge((e: VisEdge).Type)
+    edge.IsBackEdge <- e.IsBackEdge
+    (g: VisGraph).AddEdge(src, dst, edge)
+    let backEdges =
+      if edge.IsBackEdge then (dst, src, edge) :: backEdges else backEdges
+    backEdges, dummies
+  else
+    let vNode = VisBBlock(src.VData, parWidth)
+    let dummy = g.AddVertex vNode
+    VisGraph.setLayer dummy <| VisGraph.getLayer src + 1
+    let edge = VisEdge e.Type
+    edge.IsBackEdge <- e.IsBackEdge
+    g.AddEdge(src, dummy, edge)
+    let backEdges =
+      if edge.IsBackEdge then (dummy, src, edge) :: backEdges else backEdges
+    let ends, eData, vertices = Map.find k dummies
+    let dummies = Map.add k (ends, eData, dummy :: vertices) dummies
+    addDummy g (backEdges, dummies) k parWidth dummy dst e (cnt - 1)
+
+(* A long back edge is routed as a chain of its own, so it drops out of the
+   list of back edges. Which ones to drop is noted as they are met and the list
+   is filtered once, rather than walked afresh for every one of them. *)
+let private collectLongEdges (spanning: HashSet<_>) longEdges edge =
+  let src, dst = (edge: Edge<_, VisEdge>).First, edge.Second
+  let delta = VisGraph.getLayer dst - VisGraph.getLayer src
+  if delta > 1 then
+    if edge.Label.IsBackEdge then spanning.Add edge.Label |> ignore else ()
+    (src, dst, edge, delta) :: longEdges
+  else
+    longEdges
+
+let private addDummyNodesLongEdge vGraph (backEdges, dummies) longEdge =
+  let src, dst, edge, delta = longEdge
+  (vGraph: VisGraph).RemoveEdge(src, dst)
+  (* A chain is named by the IDs of the pair it spans, which orders the chains
+     for a reader; the pair itself rides along, there being no looking a vertex
+     up by name any more. *)
+  let ends =
+    if (edge: Edge<_, VisEdge>).Label.IsBackEdge then dst, src else src, dst
+  let k = (fst ends).ID, (snd ends).ID
+  let dummies = Map.add k (ends, edge.Label, []) dummies
+  let width = src.VData.Width
+  let backEdges, dummies =
+    addDummy vGraph (backEdges, dummies) k width src dst edge.Label (delta - 1)
+  let dummies =
+    if edge.Label.IsBackEdge then
+      dummies
+    else
+      let ends, eData, vertices = Map.find k dummies
+      Map.add k (ends, eData, List.rev vertices) dummies
+  backEdges, dummies
+
+let private addDummyNodesRemovedBackEdge vGraph (backEdges, dummies) backEdge =
+  let src, dst, edge = backEdge
+  let dagSrc = dst
+  let dagDst = src
+  let delta = VisGraph.getLayer dagDst - VisGraph.getLayer dagSrc
+  let k = src.ID, dst.ID
+  let dummies = Map.add k ((src, dst), edge, []) dummies
+  let width = dagSrc.VData.Width
+  addDummy vGraph (backEdges, dummies) k width dagSrc dagDst edge (delta - 1)
+
+let private assignDummyNodes (vGraph: VisGraph) backEdges =
+  let spanning = HashSet<VisEdge>(HashIdentity.Reference)
+  let longEdges =
+    vGraph |> DiGraph.foldEdge (collectLongEdges spanning) []
+  let backEdges =
+    if spanning.Count = 0 then backEdges
+    else backEdges |> List.filter (fun (_, _, e) -> not (spanning.Contains e))
+  let removedLongBackEdges, backEdges =
+    backEdges
+    |> List.partition (fun (s: IVertex<VisBBlock>, d: IVertex<VisBBlock>, e) ->
+      e.IsBackEdge && s.VData.Layer - d.VData.Layer > 1)
+  let backEdges, dummies =
+    longEdges |> List.fold (addDummyNodesLongEdge vGraph) (backEdges, Map.empty)
+  removedLongBackEdges
+  |> List.fold (addDummyNodesRemovedBackEdge vGraph) (backEdges, dummies)
+
+let run vGraph backEdges =
+  kahnAssignLayers vGraph
+  assignDummyNodes vGraph backEdges

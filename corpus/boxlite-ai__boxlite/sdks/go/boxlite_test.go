@@ -1,0 +1,824 @@
+package boxlite
+
+import (
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"unsafe"
+)
+
+func testRegistryPassword() string {
+	return string([]byte{115, 101, 99, 114, 101, 116})
+}
+
+func testBearerToken() string {
+	return string([]byte{111, 112, 97, 113, 117, 101})
+}
+
+// ============================================================================
+// Error types
+// ============================================================================
+
+func TestError_Error(t *testing.T) {
+	e := &Error{Code: ErrNotFound, Message: "box not found"}
+	got := e.Error()
+	if got != "boxlite: box not found (code=2)" {
+		t.Errorf("Error(): got %q", got)
+	}
+}
+
+func TestIsNotFound(t *testing.T) {
+	err := &Error{Code: ErrNotFound, Message: "missing"}
+	if !IsNotFound(err) {
+		t.Error("expected IsNotFound to return true")
+	}
+	if IsNotFound(errors.New("other")) {
+		t.Error("expected IsNotFound to return false for non-Error")
+	}
+	if IsNotFound(&Error{Code: ErrInternal, Message: "internal"}) {
+		t.Error("expected IsNotFound to return false for different code")
+	}
+}
+
+func TestIsAlreadyExists(t *testing.T) {
+	err := &Error{Code: ErrAlreadyExists, Message: "exists"}
+	if !IsAlreadyExists(err) {
+		t.Error("expected IsAlreadyExists to return true")
+	}
+	if IsAlreadyExists(errors.New("other")) {
+		t.Error("expected IsAlreadyExists to return false for non-Error")
+	}
+}
+
+func TestIsInvalidState(t *testing.T) {
+	err := &Error{Code: ErrInvalidState, Message: "bad state"}
+	if !IsInvalidState(err) {
+		t.Error("expected IsInvalidState to return true")
+	}
+	if IsInvalidState(errors.New("other")) {
+		t.Error("expected IsInvalidState to return false for non-Error")
+	}
+}
+
+func TestIsStopped(t *testing.T) {
+	err := &Error{Code: ErrStopped, Message: "runtime shut down"}
+	if !IsStopped(err) {
+		t.Error("expected IsStopped to return true")
+	}
+	if IsStopped(errors.New("other")) {
+		t.Error("expected IsStopped to return false for non-Error")
+	}
+}
+
+func TestError_Unwrap(t *testing.T) {
+	err := &Error{Code: ErrNotFound, Message: "test"}
+	var target *Error
+	if !errors.As(err, &target) {
+		t.Error("errors.As should match *Error")
+	}
+	if target.Code != ErrNotFound {
+		t.Errorf("Code: got %d, want %d", target.Code, ErrNotFound)
+	}
+}
+
+func TestExecutionWriteRejectsClosedExecution(t *testing.T) {
+	execution := &Execution{}
+	execution.Stdin = &executionStdin{execution: execution}
+
+	_, err := execution.Write([]byte("hello"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	var boxliteErr *Error
+	if !errors.As(err, &boxliteErr) {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if boxliteErr.Code != ErrInvalidState {
+		t.Fatalf("Code: got %d, want %d", boxliteErr.Code, ErrInvalidState)
+	}
+}
+
+func TestExecutionCloseIsIdempotent(t *testing.T) {
+	execution := &Execution{}
+
+	if err := execution.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := execution.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+}
+
+// TestExecutionSignalRejectsClosedExecution: Signal on a nil-handle
+// Execution must return an InvalidState error before any FFI call. This
+// guards the contract symmetry with Kill — both must early-return when
+// the underlying C handle has been freed.
+func TestExecutionSignalRejectsClosedExecution(t *testing.T) {
+	execution := &Execution{}
+
+	err := execution.Signal(t.Context(), 15)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	var boxliteErr *Error
+	if !errors.As(err, &boxliteErr) {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if boxliteErr.Code != ErrInvalidState {
+		t.Fatalf("Code: got %d, want %d", boxliteErr.Code, ErrInvalidState)
+	}
+}
+
+// TestExecutionSignalRejectsOutOfRangeSignal: signal numbers outside
+// 1..=64 must be rejected synchronously, before any FFI call. This is
+// the layer-2 mirror of `signal_rejects_out_of_range_*` in the Rust
+// C-FFI tests; the Go SDK validates first so an invalid signal can
+// never reach the Rust runtime. Range validation runs before the
+// closed-handle check so the empty Execution (handle==nil) is fine.
+func TestExecutionSignalRejectsOutOfRangeSignal(t *testing.T) {
+	execution := &Execution{}
+
+	cases := []struct {
+		name string
+		sig  int
+	}{
+		{"zero", 0},
+		{"negative", -1},
+		{"above_max", 65},
+		{"way_above_max", 1024},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := execution.Signal(t.Context(), tc.sig)
+			if err == nil {
+				t.Fatalf("expected error for signal=%d", tc.sig)
+			}
+			var boxliteErr *Error
+			if !errors.As(err, &boxliteErr) {
+				t.Fatalf("expected *Error, got %T", err)
+			}
+			if boxliteErr.Code != ErrInvalidArgument {
+				t.Fatalf("Code: got %d, want %d", boxliteErr.Code, ErrInvalidArgument)
+			}
+		})
+	}
+}
+
+// TestExecutionSignalAcceptsBoundarySignals: signal numbers at the
+// 1 and 64 boundaries must NOT be rejected by the range check. With
+// handle==nil they fall through to the closed-execution check
+// (InvalidState), proving the range validation accepted them.
+func TestExecutionSignalAcceptsBoundarySignals(t *testing.T) {
+	execution := &Execution{}
+
+	for _, sig := range []int{1, 15, 64} {
+		err := execution.Signal(t.Context(), sig)
+		if err == nil {
+			t.Fatalf("expected closed-execution error for signal=%d", sig)
+		}
+		var boxliteErr *Error
+		if !errors.As(err, &boxliteErr) {
+			t.Fatalf("signal=%d: expected *Error, got %T", sig, err)
+		}
+		// Range check accepted the signal → fell through to handle check.
+		if boxliteErr.Code != ErrInvalidState {
+			t.Fatalf("signal=%d Code: got %d, want %d (range check should accept %d)",
+				sig, boxliteErr.Code, ErrInvalidState, sig)
+		}
+	}
+}
+
+// ============================================================================
+// Options
+// ============================================================================
+
+// A managed volume and a host bind are different origins, not two spellings of
+// one. WithManagedVolume must not land in hostPath, or the mount would be sent
+// to a REST runtime as a server-side path and refused.
+func TestWithManagedVolumeKeepsOriginsApart(t *testing.T) {
+	// By id and by name alike: the server resolves either, so the SDK stores
+	// whatever the caller passed without trying to tell them apart.
+	for _, reference := range []string{"vol_01K2EXAMPLE", "my-data"} {
+		cfg := &boxConfig{}
+		WithManagedVolume(reference, "/data")(cfg)
+		WithBindMount("/tmp/data", "/host-data")(cfg)
+
+		if len(cfg.volumes) != 2 {
+			t.Fatalf("volumes: got %d", len(cfg.volumes))
+		}
+		if cfg.volumes[0].managedVolume != reference || cfg.volumes[0].hostPath != "" {
+			t.Errorf("managed volume: got managedVolume=%q hostPath=%q",
+				cfg.volumes[0].managedVolume, cfg.volumes[0].hostPath)
+		}
+		// There is no read-only counterpart: the server rejects read_only on a
+		// managed mount, so a managed volume is always read-write here.
+		if cfg.volumes[0].readOnly {
+			t.Error("WithManagedVolume should be read-write")
+		}
+		if cfg.volumes[1].hostPath != "/tmp/data" || cfg.volumes[1].managedVolume != "" {
+			t.Errorf("host bind: got managedVolume=%q hostPath=%q",
+				cfg.volumes[1].managedVolume, cfg.volumes[1].hostPath)
+		}
+	}
+}
+
+func TestBoxOptions(t *testing.T) {
+	cfg := &boxConfig{}
+	WithName("test-box")(cfg)
+	WithCPUs(4)(cfg)
+	WithMemory(1024)(cfg)
+	WithEnv("FOO", "bar")(cfg)
+	WithBindMount("/host", "/guest")(cfg)
+	WithBindMountReadOnly("/ro-host", "/ro-guest")(cfg)
+	WithPort(PortSpec{Host: 8080, Guest: 3000})(cfg)
+	WithWorkDir("/app")(cfg)
+	WithEntrypoint("/bin/sh")(cfg)
+	WithCmd("-c", "echo hi")(cfg)
+	WithNetwork(NetworkSpec{
+		Outbound: OutboundNetworkSpec{
+			Mode:     NetworkModeEnabled,
+			AllowNet: []string{"example.com", "*.openai.com"},
+		},
+	})(cfg)
+	WithSecret(Secret{Name: "openai", Value: "sk-test"})(cfg)
+
+	if cfg.name != "test-box" {
+		t.Errorf("name: got %q", cfg.name)
+	}
+	if cfg.cpus != 4 {
+		t.Errorf("cpus: got %d", cfg.cpus)
+	}
+	if cfg.memoryMiB != 1024 {
+		t.Errorf("memoryMiB: got %d", cfg.memoryMiB)
+	}
+	if len(cfg.env) != 1 || cfg.env[0] != [2]string{"FOO", "bar"} {
+		t.Errorf("env: got %v", cfg.env)
+	}
+	if len(cfg.volumes) != 2 {
+		t.Fatalf("volumes: got %d", len(cfg.volumes))
+	}
+	if cfg.volumes[0].readOnly {
+		t.Error("first volume should be read-write")
+	}
+	if !cfg.volumes[1].readOnly {
+		t.Error("second volume should be read-only")
+	}
+	if len(cfg.ports) != 1 {
+		t.Fatalf("ports: got %d", len(cfg.ports))
+	}
+	if cfg.ports[0].Host != 8080 {
+		t.Fatalf("port host: got %d", cfg.ports[0].Host)
+	}
+	// WithPort stores the spec verbatim; the zero-value protocol is
+	// normalized to TCP only when the C spec is built.
+	if cfg.ports[0].Guest != 3000 || cfg.ports[0].Protocol != PortProtocolUnknown || cfg.ports[0].HostIP != "" {
+		t.Errorf("port: got guest=%d protocol=%s host_ip=%q", cfg.ports[0].Guest, cfg.ports[0].Protocol, cfg.ports[0].HostIP)
+	}
+	cPort, err := cfg.ports[0].toCSpec()
+	if err != nil {
+		t.Fatalf("toCSpec: %v", err)
+	}
+	if cPort.host_port != 8080 || cPort.guest_port != 3000 || cPort.protocol != PortProtocolTcp || cPort.host_ip != "" {
+		t.Errorf("c port: got host_port=%d guest_port=%d protocol=%s host_ip=%q", cPort.host_port, cPort.guest_port, cPort.protocol, cPort.host_ip)
+	}
+	if cfg.workDir != "/app" {
+		t.Errorf("workDir: got %q", cfg.workDir)
+	}
+	if cfg.network == nil {
+		t.Fatal("network should be set")
+	}
+	if cfg.network.Outbound.Mode != NetworkModeEnabled {
+		t.Errorf("network.Mode: got %q", cfg.network.Outbound.Mode)
+	}
+	if len(cfg.network.Outbound.AllowNet) != 2 {
+		t.Errorf("network.AllowNet: got %v", cfg.network.Outbound.AllowNet)
+	}
+	if len(cfg.secrets) != 1 {
+		t.Fatalf("secrets: got %d", len(cfg.secrets))
+	}
+	if cfg.secrets[0].Name != "openai" {
+		t.Errorf("secret name: got %q", cfg.secrets[0].Name)
+	}
+}
+
+func TestAdvancedOptionsSetCapabilitiesDeepCopies(t *testing.T) {
+	advanced, err := NewAdvancedBoxOptions()
+	if err != nil {
+		t.Fatalf("NewAdvancedBoxOptions: %v", err)
+	}
+	defer advanced.Close()
+
+	policy := ContainerCapabilities{
+		Add:  []string{"NET_ADMIN", "SYS_PTRACE"},
+		Drop: []string{"MKNOD", "NET_RAW"},
+	}
+	if err := advanced.SetCapabilities(policy); err != nil {
+		t.Fatalf("SetCapabilities: %v", err)
+	}
+	policy.Add[0] = "CHOWN"
+	policy.Drop[0] = "SETUID"
+
+	wantAdd := []string{"NET_ADMIN", "SYS_PTRACE"}
+	wantDrop := []string{"MKNOD", "NET_RAW"}
+	if !reflect.DeepEqual(advanced.capabilities.Add, wantAdd) {
+		t.Fatalf("advanced.capabilities.add: got %v, want %v", advanced.capabilities.Add, wantAdd)
+	}
+	if !reflect.DeepEqual(advanced.capabilities.Drop, wantDrop) {
+		t.Fatalf("advanced.capabilities.drop: got %v, want %v", advanced.capabilities.Drop, wantDrop)
+	}
+
+	cfg := &boxConfig{}
+	WithAdvancedOptions(advanced)(cfg)
+	if err := buildAndFreeCOptions("alpine:latest", cfg); err != nil {
+		t.Fatalf("nested capability options must apply cleanly: %v", err)
+	}
+}
+
+func TestSetCapabilitiesRejectsEmbeddedNUL(t *testing.T) {
+	advanced, err := NewAdvancedBoxOptions()
+	if err != nil {
+		t.Fatalf("NewAdvancedBoxOptions: %v", err)
+	}
+	defer advanced.Close()
+
+	err = advanced.SetCapabilities(ContainerCapabilities{Add: []string{"SYS_ADMIN\x00garbage"}})
+	if err == nil {
+		t.Fatal("embedded NUL in a capability must not be truncated into a valid capability")
+	}
+}
+
+func TestSetCapabilitiesReturnsInvalidArgumentForMalformedNames(t *testing.T) {
+	advanced, err := NewAdvancedBoxOptions()
+	if err != nil {
+		t.Fatalf("NewAdvancedBoxOptions: %v", err)
+	}
+	defer advanced.Close()
+
+	err = advanced.SetCapabilities(ContainerCapabilities{Add: []string{"NET-ADMIN"}})
+	if err == nil {
+		t.Fatal("malformed capability must be rejected")
+	}
+
+	var boxliteErr *Error
+	if !errors.As(err, &boxliteErr) {
+		t.Fatalf("expected *Error, got %T: %v", err, err)
+	}
+	if boxliteErr.Code != ErrInvalidArgument {
+		t.Fatalf("Code: got %d, want %d", boxliteErr.Code, ErrInvalidArgument)
+	}
+}
+
+func TestWithPortExplicitSpec(t *testing.T) {
+	cfg := &boxConfig{}
+	WithPort(PortSpec{
+		Host:     5353,
+		Guest:    53,
+		Protocol: PortProtocolTcp,
+	})(cfg)
+
+	if len(cfg.ports) != 1 {
+		t.Fatalf("ports: got %d", len(cfg.ports))
+	}
+
+	cPort, err := cfg.ports[0].toCSpec()
+	if err != nil {
+		t.Fatalf("toCSpec: %v", err)
+	}
+	if cPort.host_port != 5353 || cPort.guest_port != 53 || cPort.protocol != PortProtocolTcp || cPort.host_ip != "" {
+		t.Errorf("c port: got host_port=%d guest_port=%d protocol=%s host_ip=%q", cPort.host_port, cPort.guest_port, cPort.protocol, cPort.host_ip)
+	}
+}
+
+func TestPortSpecAcceptsHostIPAndAutomaticHostPort(t *testing.T) {
+	cPort, err := (PortSpec{
+		Host:     0,
+		Guest:    3000,
+		Protocol: PortProtocolTcp,
+		HostIP:   "127.0.0.1",
+	}).toCSpec()
+	if err != nil {
+		t.Fatalf("toCSpec: %v", err)
+	}
+	if cPort.host_port != 0 || cPort.host_ip != "127.0.0.1" {
+		t.Fatalf("c port: got host_port=%d host_ip=%q", cPort.host_port, cPort.host_ip)
+	}
+}
+
+func TestPortSpecRejectsInvalidValues(t *testing.T) {
+	tests := []struct {
+		name string
+		port PortSpec
+	}{
+		{"udp unsupported", PortSpec{Host: 5353, Guest: 53, Protocol: PortProtocolUdp}},
+		{"guest zero", PortSpec{Host: 8080, Guest: 0, Protocol: PortProtocolTcp}},
+		{"guest too high", PortSpec{Host: 8080, Guest: 65536, Protocol: PortProtocolTcp}},
+		{"host negative", PortSpec{Host: -1, Guest: 80, Protocol: PortProtocolTcp}},
+		{"host too high", PortSpec{Host: 65536, Guest: 80, Protocol: PortProtocolTcp}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := tt.port.toCSpec(); err == nil {
+				t.Fatal("toCSpec should reject invalid port spec")
+			}
+		})
+	}
+}
+
+func TestPortProtocolString(t *testing.T) {
+	tests := []struct {
+		protocol PortProtocol
+		want     string
+	}{
+		{PortProtocolTcp, "TCP"},
+		{PortProtocolUdp, "UDP"},
+		{PortProtocolUnknown, "Unknown"},
+	}
+
+	for _, tt := range tests {
+		if got := tt.protocol.String(); got != tt.want {
+			t.Errorf("portProtocol(%d).String(): got %q, want %q", tt.protocol, got, tt.want)
+		}
+	}
+}
+
+func TestRuntimeOptions(t *testing.T) {
+	password := testRegistryPassword()
+	cfg := &runtimeConfig{}
+	WithHomeDir("/custom")(cfg)
+	WithImageRegistries(
+		ImageRegistry{Host: "ghcr.io", Search: true},
+		ImageRegistry{Host: "docker.io", Search: true},
+		ImageRegistry{
+			Host:       "registry.local:5000",
+			Transport:  RegistryTransportHTTP,
+			SkipVerify: true,
+			Search:     true,
+			Auth: ImageRegistryAuth{
+				Username: "alice",
+				Password: password,
+			},
+		},
+	)(cfg)
+
+	if cfg.homeDir != "/custom" {
+		t.Errorf("homeDir: got %q", cfg.homeDir)
+	}
+	if len(cfg.imageRegistries) != 3 {
+		t.Fatalf("imageRegistries: got %v", cfg.imageRegistries)
+	}
+	if !cfg.imageRegistries[0].Search {
+		t.Errorf("image registry search: got false")
+	}
+	if cfg.imageRegistries[2].Transport != RegistryTransportHTTP {
+		t.Errorf("registry transport: got %q", cfg.imageRegistries[2].Transport)
+	}
+	if cfg.imageRegistries[2].Auth.Username != "alice" {
+		t.Errorf("registry auth username: got %q", cfg.imageRegistries[2].Auth.Username)
+	}
+}
+
+func TestToCImageRegistryArray(t *testing.T) {
+	password := testRegistryPassword()
+	token := testBearerToken()
+	cRegistries, count, free, err := toCImageRegistryArray([]ImageRegistry{
+		{Host: "ghcr.io", Search: true},
+		{
+			Host:       "registry.local:5000",
+			Transport:  RegistryTransportHTTP,
+			SkipVerify: true,
+			Search:     true,
+			Auth: ImageRegistryAuth{
+				Username: "alice",
+				Password: password,
+			},
+		},
+		{
+			Host: "registry.example.com",
+			Auth: ImageRegistryAuth{BearerToken: token},
+		},
+	})
+	if err != nil {
+		t.Fatalf("toCImageRegistryArray: %v", err)
+	}
+	defer free()
+
+	if count != 3 {
+		t.Fatalf("count: got %d, want 3", count)
+	}
+
+	registries := unsafe.Slice(cRegistries, count)
+	httpTransport, err := cRegistryTransport(RegistryTransportHTTP)
+	if err != nil {
+		t.Fatalf("cRegistryTransport: %v", err)
+	}
+
+	if cString(registries[0].host) != "ghcr.io" {
+		t.Errorf("host[0]: got %q", cString(registries[0].host))
+	}
+	if registries[0].search == 0 {
+		t.Error("search[0]: got false")
+	}
+	if cString(registries[1].host) != "registry.local:5000" {
+		t.Errorf("host[1]: got %q", cString(registries[1].host))
+	}
+	if uint32(registries[1].transport) != httpTransport {
+		t.Errorf("transport[1]: got %d, want %d", registries[1].transport, httpTransport)
+	}
+	if registries[1].skip_verify == 0 {
+		t.Error("skip_verify[1]: got false")
+	}
+	if cString(registries[1].username) != "alice" {
+		t.Errorf("username[1]: got %q", cString(registries[1].username))
+	}
+	if cString(registries[1].password) != password {
+		t.Errorf("password[1]: got %q", cString(registries[1].password))
+	}
+	if cString(registries[2].bearer_token) != token {
+		t.Errorf("bearer_token[2]: got %q", cString(registries[2].bearer_token))
+	}
+}
+
+func TestToCImageRegistryArrayRejectsInvalidConfig(t *testing.T) {
+	cases := []struct {
+		name       string
+		registries []ImageRegistry
+	}{
+		{
+			name:       "empty host",
+			registries: []ImageRegistry{{Host: " "}},
+		},
+		{
+			name:       "url host",
+			registries: []ImageRegistry{{Host: "https://registry.local"}},
+		},
+		{
+			name:       "path host",
+			registries: []ImageRegistry{{Host: "registry.local/ns"}},
+		},
+		{
+			name:       "unsupported transport",
+			registries: []ImageRegistry{{Host: "registry.local", Transport: "ftp"}},
+		},
+		{
+			name: "partial basic auth",
+			registries: []ImageRegistry{{
+				Host: "registry.local",
+				Auth: ImageRegistryAuth{Username: "alice"},
+			}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cRegistries, _, free, err := toCImageRegistryArray(tc.registries)
+			if err == nil {
+				if free != nil {
+					free()
+				}
+				t.Fatalf("expected error, got registries=%v", cRegistries)
+			}
+		})
+	}
+}
+
+func TestBuildCOptions_MissingImageAndPath(t *testing.T) {
+	cfg := &boxConfig{}
+	_, err := buildCOptions("", cfg)
+	if err == nil {
+		t.Fatal("expected error when image is empty and WithRootfsPath is not set")
+	}
+}
+
+// ============================================================================
+// Security preset
+// ============================================================================
+//
+// WithAdvancedOptions(adv) routes through `boxlite_options_set_advanced`;
+// security lives under AdvancedBoxOptions (toggle via adv.SetSecurityEnabled).
+// Both toggles must round-trip cleanly, and not calling WithAdvancedOptions
+// leaves the runtime default (enabled) in place.
+
+func TestBuildCOptions_SecurityEnabledDisabled(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		adv, err := NewAdvancedBoxOptions()
+		if err != nil {
+			t.Fatalf("enabled=%v: NewAdvancedBoxOptions failed: %v", enabled, err)
+		}
+		adv.SetSecurityEnabled(enabled)
+		cfg := &boxConfig{}
+		WithAdvancedOptions(adv)(cfg)
+		if cfg.advanced != adv {
+			t.Fatalf("enabled=%v: WithAdvancedOptions must record the handle on the config", enabled)
+		}
+		if err := buildAndFreeCOptions("alpine:latest", cfg); err != nil {
+			t.Fatalf("enabled=%v: buildCOptions must apply cleanly; got error: %v", enabled, err)
+		}
+		adv.Close()
+	}
+}
+
+func TestBuildCOptions_SecurityUnsetKeepsDefault(t *testing.T) {
+	// WithAdvancedOptions never called → nil → leaves the runtime default in place.
+	cfg := &boxConfig{}
+	if cfg.advanced != nil {
+		t.Fatal("advanced must be nil when WithAdvancedOptions is not called")
+	}
+	if err := buildAndFreeCOptions("alpine:latest", cfg); err != nil {
+		t.Fatalf("unset advanced must be a no-op; got error: %v", err)
+	}
+}
+
+// ============================================================================
+// State constants
+// ============================================================================
+
+func TestStateConstants(t *testing.T) {
+	tests := []struct {
+		state State
+		want  string
+	}{
+		{StateConfigured, "configured"},
+		{StateRunning, "running"},
+		{StateStopping, "stopping"},
+		{StateStopped, "stopped"},
+	}
+	for _, tc := range tests {
+		if string(tc.state) != tc.want {
+			t.Errorf("State %v: got %q, want %q", tc.state, string(tc.state), tc.want)
+		}
+	}
+}
+
+// ============================================================================
+// AutoRemove / Detach options
+// ============================================================================
+
+func TestWithAutoRemove(t *testing.T) {
+	cfg := &boxConfig{}
+	WithAutoRemove(false)(cfg)
+	if cfg.autoRemove == nil || *cfg.autoRemove != false {
+		t.Error("autoRemove should be false")
+	}
+}
+
+func TestBuildCOptionsAllowsAutoRemoveAndAutoDelete(t *testing.T) {
+	cfg := &boxConfig{}
+	WithAutoRemove(false)(cfg)
+	WithAutoDeleteInterval(60)(cfg)
+	if err := buildAndFreeCOptions("alpine:latest", cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestWithDetach(t *testing.T) {
+	cfg := &boxConfig{}
+	WithDetach(true)(cfg)
+	if cfg.detach == nil || *cfg.detach != true {
+		t.Error("detach should be true")
+	}
+}
+
+func TestWithNetwork(t *testing.T) {
+	cfg := &boxConfig{}
+	WithNetwork(NetworkSpec{
+		Outbound: OutboundNetworkSpec{
+			Mode:     NetworkModeDisabled,
+			AllowNet: []string{},
+		},
+	})(cfg)
+
+	if cfg.network == nil {
+		t.Fatal("network should be set")
+	}
+	if cfg.network.Outbound.Mode != NetworkModeDisabled {
+		t.Errorf("network.Mode: got %q", cfg.network.Outbound.Mode)
+	}
+	if len(cfg.network.Outbound.AllowNet) != 0 {
+		t.Errorf("network.AllowNet: got %v", cfg.network.Outbound.AllowNet)
+	}
+}
+
+// The pre-split shape was NetworkSpec{Mode, AllowNet}, which configured the
+// outbound direction. Callers that still pass it must keep working.
+func TestWithNetwork_LegacyFlatFieldsConfigureOutbound(t *testing.T) {
+	cfg := &boxConfig{}
+	WithNetwork(NetworkSpec{
+		Mode:     NetworkModeEnabled,
+		AllowNet: []string{"api.example.com"},
+	})(cfg)
+
+	if cfg.networkErr != nil {
+		t.Fatalf("unexpected error: %v", cfg.networkErr)
+	}
+	if cfg.network == nil {
+		t.Fatal("network should be set")
+	}
+	if cfg.network.Outbound.Mode != NetworkModeEnabled {
+		t.Errorf("Outbound.Mode: got %q", cfg.network.Outbound.Mode)
+	}
+	if len(cfg.network.Outbound.AllowNet) != 1 || cfg.network.Outbound.AllowNet[0] != "api.example.com" {
+		t.Errorf("Outbound.AllowNet: got %v", cfg.network.Outbound.AllowNet)
+	}
+	// A legacy spec said nothing about inbound, so inbound keeps its default.
+	if cfg.network.Inbound.Mode != "" {
+		t.Errorf("Inbound.Mode should stay unset, got %q", cfg.network.Inbound.Mode)
+	}
+	if err := buildAndFreeCOptions("alpine:latest", cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// Mixing the two shapes is ambiguous — reject rather than pick one. The error
+// surfaces at conversion because BoxOption has no error channel.
+func TestWithNetwork_RejectsMixedLegacyAndNestedShapes(t *testing.T) {
+	cfg := &boxConfig{}
+	WithNetwork(NetworkSpec{
+		Mode:     NetworkModeDisabled,
+		Outbound: OutboundNetworkSpec{Mode: NetworkModeEnabled},
+	})(cfg)
+
+	if cfg.networkErr == nil {
+		t.Fatal("mixing Mode with Outbound should be rejected")
+	}
+	err := buildAndFreeCOptions("alpine:latest", cfg)
+	if err == nil {
+		t.Fatal("buildCOptions should surface the deferred network error")
+	}
+	if !strings.Contains(err.Error(), "cannot mix Outbound with deprecated Mode/AllowNet") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestWithNetwork_InboundDisabled(t *testing.T) {
+	cfg := &boxConfig{}
+	WithNetwork(NetworkSpec{
+		Inbound: InboundNetworkSpec{Mode: NetworkModeDisabled},
+	})(cfg)
+
+	if cfg.network == nil {
+		t.Fatal("network should be set")
+	}
+	if cfg.network.Inbound.Mode != NetworkModeDisabled {
+		t.Errorf("network.Inbound.Mode: got %q", cfg.network.Inbound.Mode)
+	}
+	// Outbound is independent of Inbound: unset Outbound.Mode still means
+	// "enabled, full access" once buildCOptions runs, same as before this
+	// field existed.
+	if err := buildAndFreeCOptions("alpine:latest", cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildCOptions_RejectsUnsupportedInboundAllowNet(t *testing.T) {
+	// The field exists for shape symmetry with Outbound, but no layer
+	// enforces an inbound allowlist yet — a non-empty one must error under
+	// either mode instead of being accepted as a silent no-op.
+	for _, mode := range []NetworkMode{NetworkModeEnabled, NetworkModeDisabled} {
+		cfg := &boxConfig{}
+		WithNetwork(NetworkSpec{
+			Inbound: InboundNetworkSpec{Mode: mode, AllowNet: []string{"10.0.0.0/8"}},
+		})(cfg)
+
+		_, err := buildCOptions("alpine:latest", cfg)
+		if err == nil {
+			t.Fatalf("mode=%q: expected error for non-empty inbound allowlist", mode)
+		}
+		if !strings.Contains(err.Error(), "not supported yet") {
+			t.Fatalf("mode=%q: unexpected error: %v", mode, err)
+		}
+	}
+}
+
+func TestBuildCOptions_RejectsInvalidInboundMode(t *testing.T) {
+	cfg := &boxConfig{}
+	WithNetwork(NetworkSpec{
+		Inbound: InboundNetworkSpec{Mode: NetworkMode("readonly")},
+	})(cfg)
+
+	_, err := buildCOptions("alpine:latest", cfg)
+	if err == nil {
+		t.Fatal("expected error for invalid inbound mode")
+	}
+}
+
+func TestBuildCOptions_RejectsAllowNetWithDisabledMode(t *testing.T) {
+	cfg := &boxConfig{}
+	WithNetwork(NetworkSpec{
+		Outbound: OutboundNetworkSpec{
+			Mode:     NetworkModeDisabled,
+			AllowNet: []string{"example.com"},
+		},
+	})(cfg)
+
+	_, err := buildCOptions("alpine:latest", cfg)
+	if err == nil {
+		t.Fatal("expected error for disabled network with allowlist")
+	}
+	if err.Error() != "network.outbound.mode=\"disabled\" is incompatible with allow_net" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

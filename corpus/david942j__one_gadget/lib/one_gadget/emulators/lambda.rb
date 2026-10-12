@@ -1,0 +1,207 @@
+# frozen_string_literal: true
+
+require 'one_gadget/error'
+require 'one_gadget/helper'
+
+module OneGadget
+  module Emulators
+    # A {Lambda} object can be:
+    # 1. +String+ (variable name)
+    # 2. +Numeric+
+    # 3. {Lambda} + +Numeric+
+    # 4. dereferenced {Lambda}
+    class Lambda
+      attr_accessor :obj # @return [String, Lambda] The object currently related to.
+      attr_accessor :immi # @return [Integer] The immediate value currently added.
+      attr_accessor :deref_count # @return [Integer] The times of dereference.
+      attr_accessor :op # @return [String, nil] The operator applied to {#obj}, for an operation (see {.operation}).
+      attr_accessor :rhs # @return [Integer, Lambda, String, nil] The operator's right operand.
+
+      # Instantiate a {Lambda} object.
+      # @param [Lambda, String] obj
+      def initialize(obj)
+        @immi = 0
+        @obj = obj
+        @deref_count = 0
+      end
+
+      # Implement addition with +Numeric+.
+      # @param [Numeric] other Value to add.
+      # @return [Lambda] The result.
+      def +(other)
+        raise Error::InstructionArgumentError, "Expect other(#{other}) to be numeric." unless other.is_a?(Numeric)
+
+        if deref_count.positive?
+          ret = Lambda.new(self)
+        else
+          ret = Lambda.new(obj)
+          ret.immi = immi
+          ret.op = op
+          ret.rhs = rhs
+        end
+        ret.immi += other
+        ret
+      end
+
+      # Implement subtract with +Numeric+.
+      # @param [Numeric] other Value to subtract.
+      # @return [Lambda] The result.
+      def -(other)
+        self + -other
+      end
+
+      # Increase dereference count by 1.
+      # @return [void]
+      def deref!
+        @deref_count += 1
+      end
+
+      # Decrease dereference count by 1.
+      # @return [self]
+      # @raise [Error::InstructionArgumentError] When this object cannot be referenced anymore.
+      def ref!
+        raise Error::InstructionArgumentError, 'Cannot reference anymore!' if @deref_count <= 0
+
+        @deref_count -= 1
+        self
+      end
+
+      # A new {Lambda} object with dereference count increase 1.
+      # @return [Lambda]
+      def deref
+        ret = Lambda.new(obj)
+        ret.immi = immi
+        ret.op = op
+        ret.rhs = rhs
+        ret.deref_count = deref_count + 1
+        ret
+      end
+
+      # Expand the lambda presentation.
+      # @return [String] The expand result.
+      def to_s
+        str = ''
+        str += '[' * deref_count
+        str += base_str
+        str += OneGadget::Helper.hex(immi, psign: true) unless immi.zero?
+        str += ']' * deref_count
+        str
+      end
+
+      # A value this emulator can name but not fold: an operation applied to
+      # +lhs+, whose result no plain base+offset expresses. Kept as the operation
+      # itself, so a constraint on it still says what the caller has to arrange.
+      # @param [Lambda, String] lhs The left operand.
+      # @param [String] op The operator, as it should render.
+      # @param [Integer, Lambda, String] rhs The right operand.
+      # @return [Lambda]
+      # @example (amd64) +and rax, 0xf+ leaves rax holding +(rax & 0xf)+
+      #   Lambda.operation(registers['rax'], '&', 0xf)
+      def self.operation(lhs, op, rhs)
+        Lambda.new(lhs).tap do |lmda|
+          lmda.op = op
+          lmda.rhs = rhs
+        end
+      end
+
+      # Whether this names an operation rather than a base+offset (see {.operation}).
+      # @return [Boolean]
+      def operation?
+        !op.nil?
+      end
+
+      # What {#to_s} renders before any offset: the operation this names, or the
+      # object it is based on.
+      # @return [String]
+      def base_str
+        return '' if obj.nil?
+        return obj.to_s unless operation?
+
+        rendered = rhs.is_a?(Integer) ? OneGadget::Helper.hex(rhs) : rhs.to_s
+        "(#{obj} #{op} #{rendered})"
+      end
+
+      # Evaluates the value of lambda.
+      # Only supports +rsp+0x30+ form.
+      # @param [Hash{String => Integer}] context
+      #   The context.
+      # @return [Integer] Result of evaluation.
+      # @example
+      #   l = Lambda.parse('rax+0x30')
+      #   l.evaluate('rax' => 2)
+      #   #=> 50
+      def evaluate(context)
+        if deref_count.positive? || (obj && !context.key?(obj))
+          raise Error::InstructionArgumentError, "Can't eval #{self}"
+        end
+
+        context[obj] + immi
+      end
+
+      class << self
+        # Target: parse string like <tt>[rsp+0x50]</tt> into a {Lambda} object.
+        # @param [String] argument
+        #   The instruction operand to parse, e.g. +[rsp+0x50]+ or +rax+0x30+.
+        # @param [Hash{String => Lambda}] predefined
+        #   Maps register/variable names to known {Lambda} values, used to resolve +argument+'s base.
+        # @return [OneGadget::Emulators::Lambda, Integer]
+        #   If +argument+ contains numbers only, returns the value.
+        #   Otherwise, returns a {Lambda} object.
+        # @example
+        #   obj = Lambda.parse('[rsp+0x50]')
+        #   #=> #<Lambda @obj='rsp', @immi=80, @deref_count=1>
+        #   Lambda.parse('obj+0x30', predefined: { 'obj' => obj }).to_s
+        #   #=> '[rsp+0x50]+0x30'
+        # @example
+        #   Lambda.parse('[x0, -104]')
+        #   #=> #<Lambda @obj='x0', @immi=-104, @deref_count=1>
+        def parse(argument, predefined: {})
+          arg = argument
+          return 0 if arg.empty? || arg == '!'
+
+          literal = Integer(arg, exception: false)
+          return literal unless literal.nil?
+
+          # nested []
+          if arg[0] == '['
+            ridx = arg.rindex(']')
+            immi = parse(arg[(ridx + 1)..])
+            inner = parse(arg[1...ridx], predefined:)
+            # An absolute address (the +[0x1234]+ in +lea rax, [0x1234]+) parses to an Integer;
+            # model it as a based-nowhere Lambda so it can still be dereferenced.
+            inner = Lambda.new(nil).tap { |l| l.immi = inner } if inner.is_a?(Integer)
+            lm = inner.deref
+            lm += immi unless immi.zero?
+            return lm
+          end
+
+          base, disp = mem_obj(arg)
+          obj = predefined[base]
+          # A register may currently hold a call-target string (after a call);
+          # treat that as a fresh symbolic base. Lambda/Integer/xmm-array pass through.
+          obj = Lambda.new(base) if obj.nil? || obj.is_a?(String)
+          obj += disp unless disp.zero?
+          obj
+        end
+
+        private
+
+        # Split a memory operand into what it is based on and how far from it.
+        # @param [String] arg The operand, with its brackets already removed.
+        # @return [(String, Integer)] The base, and the offset from it.
+        def mem_obj(arg)
+          # We have three forms:
+          # 0. reg
+          # 1. reg+imm / reg-imm
+          # 2. reg, imm / reg, -imm
+          tokens = arg.gsub(/[+-]/, ' \0').scan(/[+\-\w]+/)
+          return [tokens.first, 0] if tokens.size == 1
+          raise Error::UnsupportedInstructionArgumentError, arg unless tokens.size == 2
+          raise Error::UnsupportedInstructionArgumentError, arg unless OneGadget::Helper.integer?(tokens.last)
+
+          [tokens.first, Integer(tokens.last)]
+        end
+      end
+    end
+  end
+end

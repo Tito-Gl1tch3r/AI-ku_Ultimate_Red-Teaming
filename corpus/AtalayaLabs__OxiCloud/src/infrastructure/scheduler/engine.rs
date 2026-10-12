@@ -1,0 +1,595 @@
+//! The scheduler supervisor loop.
+//!
+//! One `tokio::spawn` at startup runs [`SchedulerEngine::run`]. The
+//! loop iterates:
+//!
+//! 1. `pick_next()` — find the job with the earliest `next_run_at`.
+//! 2. Sleep until that instant.
+//! 3. Dispatch: try-acquire the job's in-flight permit; if held, warn
+//!    and reschedule; otherwise spawn the handler, apply the timeout,
+//!    catch panics, record the outcome.
+//!
+//! Sequential dispatch is intentional. Two jobs due at the same
+//! instant run one-after-the-other — the second's `pick_next` fires
+//! immediately after the first's dispatch returns, with a zero-length
+//! sleep. See `docs/plan/job-registry.md` Part 1 §Runtime model.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
+use tokio::task::JoinHandle;
+
+use super::registry::{JobEntry, JobRegistry};
+use super::types::{ErrCause, JobOutcome, JobRunArgs};
+
+/// Public handle to the running supervisor.
+///
+/// Dropping the handle does NOT cancel the loop (the spawned task
+/// runs until the runtime dies). Explicit shutdown is deferred to
+/// whenever graceful-shutdown lands globally — matches the shape
+/// every other daemon in the codebase has today. See
+/// `docs/plan/job-registry.md` Part 1 §Shutdown coordination.
+pub struct SchedulerEngine {
+    _handle: JoinHandle<()>,
+}
+
+impl SchedulerEngine {
+    /// Spawn the supervisor loop and return a handle. Callers hold
+    /// the returned `SchedulerEngine` on `AppState` so the task lives
+    /// as long as the runtime.
+    pub fn start(registry: Arc<JobRegistry>) -> Self {
+        let handle = tokio::spawn(async move {
+            run(registry).await;
+        });
+        Self { _handle: handle }
+    }
+}
+
+/// If the registry is empty (no jobs registered yet), sleep this long
+/// before rechecking. Registration happens once at boot in the current
+/// design, so this only matters as a defensive fallback — in practice
+/// the loop enters this branch at most once, right before the first
+/// `register()` call completes.
+const IDLE_POLL: Duration = Duration::from_secs(60);
+
+async fn run(registry: Arc<JobRegistry>) {
+    tracing::info!(
+        target: "oxicloud::scheduler",
+        event = "scheduler.started",
+        "periodic scheduler supervisor started"
+    );
+
+    loop {
+        // `pick_next` only returns scheduled jobs (interval = Some);
+        // on-demand jobs never appear here and are only reachable
+        // through `JobRegistry::trigger`.
+        let Some((name, next_at)) = registry.pick_next().await else {
+            tokio::time::sleep(IDLE_POLL).await;
+            continue;
+        };
+
+        // Convert to `Duration`. If `next_at` is in the past (missed
+        // tick, e.g. very short interval and the previous dispatch
+        // took longer than the interval), sleep zero and dispatch
+        // immediately.
+        let now = Utc::now();
+        let sleep_dur = (next_at - now)
+            .to_std()
+            .unwrap_or_else(|_| Duration::from_millis(0));
+        if !sleep_dur.is_zero() {
+            tokio::time::sleep(sleep_dur).await;
+        }
+
+        // The job's `next_run_at` might have changed since `pick_next`
+        // returned if a concurrent trigger fired — that's fine; the
+        // dispatch below re-reads via the `JobEntry` snapshot.
+        let Some(entry) = registry.get(&name).await else {
+            // Job was unregistered between pick_next and dispatch —
+            // unreachable in the current design (no unregister), but
+            // guard defensively.
+            continue;
+        };
+
+        // Fire and forget from the supervisor's perspective — we
+        // don't care about the outcome, `dispatch` records it on the
+        // entry and emits the log line itself. Periodic ticks never
+        // force — that's an admin-trigger-only affordance. Pass the
+        // bus reference so periodic runs also publish job events
+        // (same reasoning as the manual-trigger path).
+        let bus = registry.message_bus_snapshot();
+        // Parameters an operator attached to this job's cadence in
+        // `OXICLOUD_JOBS_SCHEDULED` (`deep=true` and the like). Empty for
+        // the common case; `repair` can never appear, the config parser
+        // refuses it.
+        let scheduled_args = {
+            let state = entry.state.lock().expect("JobState mutex poisoned");
+            state.scheduled_args.clone()
+        };
+        // `.unattended()` — the one place it is set. Nobody is watching a
+        // tick, so a paused run started under `?repair=true` must not be
+        // continued here on the strength of a consent given once, weeks
+        // ago, by someone who has since stopped looking.
+        let gate = registry.backend_write_gate_snapshot();
+        let _ = dispatch(&name, entry, &scheduled_args.unattended(), bus, gate).await;
+    }
+}
+
+/// Dispatch a single run of `name`. Handles:
+/// - exclusivity: try-acquire the in-flight permit; skip + warn if held,
+/// - spawning under panic containment (via `tokio::spawn` + `JoinHandle`),
+/// - timeout enforcement (if `ScheduledJob.timeout` is set),
+/// - recording `last_outcome` + advancing `next_run_at` on completion,
+/// - emitting the uniform `oxicloud::scheduler::job.run` log line.
+///
+/// Returns the [`JobOutcome`] the run produced. The scheduler loop
+/// discards this (records-only-via-side-effect); admin/programmatic
+/// callers via [`JobRegistry::trigger`](super::registry::JobRegistry::trigger)
+/// surface it to the caller.
+///
+/// Non-panicking; every failure path resolves to a `JobOutcome::Err`
+/// with a `cause` log field.
+///
+/// `args` is passed through to `JobHandler::run`. The supervisor's
+/// periodic ticks pass `JobRunArgs::default()`; the admin trigger
+/// endpoint forwards parsed query params such as `?force=true`.
+pub(super) async fn dispatch(
+    name: &str,
+    entry: Arc<JobEntry>,
+    args: &JobRunArgs,
+    bus: Option<std::sync::Arc<dyn crate::application::ports::message_bus_ports::MessageBus>>,
+    backend_write_gate: Option<
+        std::sync::Arc<crate::application::services::backend_write_gate::BackendWriteGate>,
+    >,
+) -> JobOutcome {
+    // Try to acquire the single-permit gate. `try_acquire` is
+    // non-blocking — if held, we know the previous run is still
+    // executing and skip this tick.
+    let permit = match entry.in_flight.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            // Someone else holds the permit → previous run still in
+            // flight. Emit the operator-signal warning and reschedule.
+            let running_for_ms = {
+                let state = entry.state.lock().expect("JobState mutex poisoned");
+                state
+                    .current_run_start
+                    .map(|t| t.elapsed().as_millis())
+                    .unwrap_or(0)
+            };
+            // On-demand jobs have `interval = None`; log 0 rather than
+            // fabricate one. Operators reading this line for a scheduled
+            // job compare `interval_ms` vs `running_for_ms`; the same
+            // line for an on-demand job just tells them a concurrent
+            // trigger raced an in-flight run.
+            let interval_ms = entry
+                .state
+                .lock()
+                .expect("JobState mutex poisoned")
+                .interval
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            tracing::warn!(
+                target: "oxicloud::scheduler",
+                event = "job.tick_skipped",
+                job = %name,
+                interval_ms = interval_ms,
+                running_for_ms = running_for_ms,
+                "{} still running past its interval — tick skipped",
+                name,
+            );
+            advance_next_run(&entry);
+            return JobOutcome::ok_with(0, serde_json::json!({ "skipped": "already_running" }));
+        }
+    };
+
+    // Backend write-lock gate — defer the tick if this job writes to
+    // the storage backend AND the gate is currently held (by a
+    // migration, backup, rotation, or operator-driven External lock).
+    // Done AFTER permit acquisition so the single-permit invariant is
+    // never violated (a parallel tick arriving one millisecond after
+    // the gate is released still sees the held in-flight semaphore,
+    // not a race), and BEFORE handler spawn so no backend bytes move
+    // during the hold. A deferred run is recorded as a `JobOutcome::Ok`
+    // with `extra.deferred_reason`/`extra.deferred_holder` — the admin
+    // panel's run history can show it as "deferred" rather than "ok"
+    // or "err" (both would be wrong).
+    if entry.is_backend_writer
+        && let Some(gate) = backend_write_gate.as_ref()
+        && gate.is_held()
+    {
+        let holder = gate.held_by();
+        let holder_kind = holder.as_ref().map(|r| r.kind()).unwrap_or("unknown");
+        let holder_display = holder.as_ref().map(|r| r.display()).unwrap_or_default();
+        tracing::info!(
+            target: "audit",
+            event = "job.deferred",
+            reason = "backend_write_locked",
+            holder_kind = %holder_kind,
+            job = %name,
+            "⏸️  {name} deferred — backend write-lock held by {holder_kind}: {holder_display}"
+        );
+        advance_next_run(&entry);
+        // Record on the entry so the admin panel's `last_outcome`
+        // shows "deferred" with the holder reason.
+        let deferred = JobOutcome::ok_with(
+            0,
+            serde_json::json!({
+                "deferred": true,
+                "deferred_reason": "backend_write_locked",
+                "deferred_holder": holder_kind,
+                "deferred_display": holder_display,
+            }),
+        );
+        {
+            let mut state = entry.state.lock().expect("JobState mutex poisoned");
+            state.last_outcome = Some((Utc::now(), deferred.clone()));
+        }
+        // Permit drops at the end of this if-branch when `permit`
+        // goes out of scope.
+        drop(permit);
+        return deferred;
+    }
+
+    // We hold the permit. Record run-start, spawn, await, translate.
+    {
+        let mut state = entry.state.lock().expect("JobState mutex poisoned");
+        state.current_run_start = Some(Instant::now());
+    }
+    let started_wall = Utc::now();
+    let start_instant = Instant::now();
+
+    // Publish `JobRunStarted` on `Topic::Job(name)` so the admin
+    // job dashboard's live tab receives a "started" tick without
+    // polling. Silent no-op when the bus isn't wired (test setup)
+    // or when nobody is subscribed. `actor` is `Uuid::nil()` today
+    // because the scheduler doesn't carry the trigger caller
+    // through — the periodic supervisor has no caller, and the
+    // admin trigger endpoints don't thread it in. When they do,
+    // swap to the real UUID.
+    if let Some(bus) = bus.as_ref() {
+        use crate::application::ports::message_bus_ports::{MessageBusEvent, Topic};
+        bus.publish(
+            &Topic::Job(name.to_string()),
+            MessageBusEvent::JobRunStarted {
+                name: name.to_string(),
+                started_at: started_wall,
+                actor: uuid::Uuid::nil(),
+            },
+        );
+    }
+
+    // Spawn so panics land as `JoinError::is_panic()` instead of
+    // unwinding into the supervisor loop. Args cloned into the spawn
+    // scope so the borrow doesn't outlive the caller.
+    let handler = entry.handler.clone();
+    // Normalise HERE, the one funnel every dispatch passes through, so a
+    // handler always sees its declared parameters with their declared
+    // defaults — whatever the caller built. The periodic tick in
+    // particular passes an empty `JobRunArgs::default()`, which would
+    // otherwise read a `default: true` parameter as false on every
+    // scheduled run. See `JobRunArgs::normalized_for`.
+    let args_owned = args.normalized_for(handler.parameters());
+    let join = tokio::spawn(async move { handler.run(&args_owned).await });
+
+    let (outcome, cause) = match entry.timeout {
+        Some(dur) => match tokio::time::timeout(dur, join).await {
+            Ok(res) => translate_join(res),
+            Err(_elapsed) => {
+                // Timeout fired. The JoinHandle is dropped, which
+                // aborts the spawned task cooperatively — but abort
+                // is best-effort in Rust; a handler that ignores
+                // yield points may run to completion in the background.
+                // We still record timeout and release the permit.
+                (
+                    JobOutcome::err(format!("wall-clock timeout of {:?} exceeded", dur)),
+                    Some(ErrCause::Timeout),
+                )
+            }
+        },
+        None => translate_join(join.await),
+    };
+
+    let elapsed_ms = start_instant.elapsed().as_millis();
+
+    // Record outcome and advance the schedule. Permit drops naturally
+    // when `permit` goes out of scope at the end of the function.
+    {
+        let mut state = entry.state.lock().expect("JobState mutex poisoned");
+        state.current_run_start = None;
+        state.last_outcome = Some((started_wall, outcome.clone()));
+        // Only scheduled jobs advance next_run_at. On-demand jobs stay
+        // at None so `pick_next` never returns them, even after a
+        // trigger. Same rule as the skip branch — schedule advances
+        // by one interval, no backlog queueing.
+        state.next_run_at = state.interval.map(|dur| {
+            Utc::now()
+                + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::seconds(0))
+        });
+    }
+
+    // Log line. `outcome=ok` runs are informational; `outcome=err` include
+    // the diagnostic `cause` field.
+    log_outcome(name, &outcome, cause, elapsed_ms);
+
+    // Publish `JobRunEnded` on `Topic::Job(name)`. This is the
+    // signal the FE watches for to terminate its subscription
+    // (`useJobTopic` unsubscribes on `onEnded`). `success = false`
+    // covers timeout, panic, handler error — the admin dashboard
+    // renders the row as failed and the "click for details"
+    // notification (Slice E) will link to `/admin/jobs/<name>`.
+    // Silent no-op when the bus isn't wired.
+    if let Some(bus) = bus.as_ref() {
+        use crate::application::ports::message_bus_ports::{MessageBusEvent, Topic};
+        let success = outcome.is_ok();
+        let reason = match &outcome {
+            crate::infrastructure::scheduler::types::JobOutcome::Err { message } => {
+                Some(message.clone())
+            }
+            _ => None,
+        };
+        bus.publish(
+            &Topic::Job(name.to_string()),
+            MessageBusEvent::JobRunEnded {
+                name: name.to_string(),
+                success,
+                reason,
+                ended_at: Utc::now(),
+            },
+        );
+    }
+
+    drop(permit);
+    outcome
+}
+
+/// Advance `next_run_at` by one interval without touching outcome or
+/// run-start (skip-path helper). No-op for on-demand jobs — `interval`
+/// is `None`, so `next_run_at` stays `None` and `pick_next` continues
+/// to skip them.
+fn advance_next_run(entry: &JobEntry) {
+    let mut state = entry.state.lock().expect("JobState mutex poisoned");
+    state.next_run_at = state.interval.map(|dur| {
+        Utc::now()
+            + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::seconds(0))
+    });
+}
+
+/// Convert the `Result<JobOutcome, JoinError>` returned by the spawned
+/// handler into `(JobOutcome, Option<ErrCause>)`. `cause` is `None`
+/// on Ok, `Some(_)` on Err.
+fn translate_join(
+    res: Result<JobOutcome, tokio::task::JoinError>,
+) -> (JobOutcome, Option<ErrCause>) {
+    match res {
+        Ok(outcome) => {
+            let cause = if outcome.is_ok() {
+                None
+            } else {
+                Some(ErrCause::Handler)
+            };
+            (outcome, cause)
+        }
+        Err(join_err) if join_err.is_panic() => {
+            let payload = join_err.into_panic();
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            (
+                JobOutcome::err(format!("handler panicked: {msg}")),
+                Some(ErrCause::Panicked),
+            )
+        }
+        Err(join_err) => (
+            JobOutcome::err(format!("task cancelled: {join_err}")),
+            Some(ErrCause::Handler),
+        ),
+    }
+}
+
+/// Emit the uniform `oxicloud::scheduler` log line for a completed run.
+/// Distinct Ok/Err branches so the tracing macros pick up the fields at
+/// compile time — `tracing` doesn't expand conditional field lists.
+fn log_outcome(name: &str, outcome: &JobOutcome, cause: Option<ErrCause>, elapsed_ms: u128) {
+    // Also render elapsed inline in the human-readable message so
+    // `tail -f` operators see the duration without waiting on a
+    // structured log renderer to project the `elapsed_ms` field.
+    let elapsed = format_elapsed(elapsed_ms);
+    match outcome {
+        // A paused run is carried as `Ok` — the handler did its job and
+        // stopped cleanly at a checkpoint — but logging it as `ok` says
+        // the opposite of what an operator needs to know: the migration
+        // is blocked and will not progress until the backend returns.
+        // Same distinction the admin panel draws between a run's STATE
+        // and its OUTCOME; this line only ever showed the outcome.
+        JobOutcome::Ok { count, extra }
+            if extra.get("paused") == Some(&serde_json::Value::Bool(true)) =>
+        {
+            tracing::warn!(
+                target: "oxicloud::scheduler",
+                event = "job.run",
+                job = %name,
+                outcome = "paused",
+                retryable = extra.get("retryable") == Some(&serde_json::Value::Bool(true)),
+                count = *count,
+                elapsed_ms = elapsed_ms,
+                extra = %extra,
+                "job {} PAUSED after {} — count={} (resume when the cause clears)",
+                name,
+                elapsed,
+                count,
+            );
+        }
+        JobOutcome::Ok { count, extra } => {
+            tracing::info!(
+                target: "oxicloud::scheduler",
+                event = "job.run",
+                job = %name,
+                outcome = "ok",
+                count = *count,
+                elapsed_ms = elapsed_ms,
+                extra = %extra,
+                "job {} ran in {} — count={}",
+                name,
+                elapsed,
+                count,
+            );
+        }
+        JobOutcome::Err { message: msg } => {
+            tracing::warn!(
+                target: "oxicloud::scheduler",
+                event = "job.run",
+                job = %name,
+                outcome = "err",
+                cause = %cause.unwrap_or(ErrCause::Handler),
+                elapsed_ms = elapsed_ms,
+                error = %msg,
+                "job {} failed after {} — {}",
+                name,
+                elapsed,
+                msg,
+            );
+        }
+    }
+}
+
+/// Human-friendly elapsed rendering — `12ms` / `340ms` / `1.4s` /
+/// `12.3s` / `4m30s`. The structured `elapsed_ms` field still carries
+/// the raw millisecond number for log aggregators.
+fn format_elapsed(ms: u128) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", (ms as f64) / 1000.0)
+    } else {
+        let secs = ms / 1000;
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{}m{}s", m, s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::scheduler::handler::JobHandler;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct CountingHandler {
+        name: String,
+        calls: Arc<AtomicU64>,
+        sleep: Duration,
+    }
+
+    #[async_trait]
+    impl JobHandler for CountingHandler {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn run(&self, _args: &JobRunArgs) -> JobOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.sleep.is_zero() {
+                tokio::time::sleep(self.sleep).await;
+            }
+            JobOutcome::ok(1)
+        }
+    }
+
+    struct PanickingHandler;
+
+    #[async_trait]
+    impl JobHandler for PanickingHandler {
+        fn name(&self) -> &str {
+            "panicker"
+        }
+        async fn run(&self, _args: &JobRunArgs) -> JobOutcome {
+            panic!("intentional test panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_containment_via_translate_join() {
+        // Directly exercise translate_join with a spawned panic — the
+        // supervisor loop's dispatch path uses this same helper.
+        let handler = Arc::new(PanickingHandler);
+        let join = tokio::spawn(async move { handler.run(&JobRunArgs::default()).await });
+        let (outcome, cause) = translate_join(join.await);
+        assert!(!outcome.is_ok());
+        assert_eq!(cause, Some(ErrCause::Panicked));
+        if let JobOutcome::Err { message: msg } = outcome {
+            assert!(msg.contains("panicked"), "expected panic marker in: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn overrun_skips_second_tick() {
+        // Handler that sleeps 200 ms; two dispatches fired back-to-back
+        // should see the second skip with a `tick_skipped` warning.
+        let calls = Arc::new(AtomicU64::new(0));
+        let handler = Arc::new(CountingHandler {
+            name: "overrun".to_string(),
+            calls: calls.clone(),
+            sleep: Duration::from_millis(200),
+        });
+
+        let registry = Arc::new(JobRegistry::new());
+        registry
+            .register(handler, Some(Duration::from_millis(100)), None)
+            .await;
+        let entry = registry.get("overrun").await.unwrap();
+
+        // Kick off dispatch 1 in the background — it holds the permit
+        // for ~200 ms.
+        let entry_bg = entry.clone();
+        let bg = tokio::spawn(async move {
+            dispatch("overrun", entry_bg, &JobRunArgs::default(), None, None).await
+        });
+
+        // Give dispatch 1 time to grab the permit.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Dispatch 2 should observe the permit taken and skip.
+        dispatch("overrun", entry.clone(), &JobRunArgs::default(), None, None).await;
+
+        // Only dispatch 1's handler should have actually run so far.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        bg.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn timeout_records_err_and_releases_permit() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let handler = Arc::new(CountingHandler {
+            name: "slow".to_string(),
+            calls: calls.clone(),
+            sleep: Duration::from_millis(500),
+        });
+
+        let registry = Arc::new(JobRegistry::new());
+        registry
+            .register(
+                handler,
+                Some(Duration::from_millis(100)),
+                Some(Duration::from_millis(50)),
+            )
+            .await;
+        let entry = registry.get("slow").await.unwrap();
+
+        dispatch("slow", entry.clone(), &JobRunArgs::default(), None, None).await;
+
+        // The timeout fired; last_outcome must be Err.
+        let state = entry.state.lock().unwrap();
+        let (_, outcome) = state.last_outcome.as_ref().expect("outcome recorded");
+        assert!(!outcome.is_ok(), "expected timeout-Err, got {outcome:?}");
+
+        // Permit released — another dispatch could acquire it.
+        assert_eq!(entry.in_flight.available_permits(), 1);
+    }
+}

@@ -1,0 +1,1607 @@
+/*
+ * Copyright 2025 Daytona Platforms Inc.
+ * Modified by BoxLite AI, 2025-2026
+ * SPDX-License-Identifier: AGPL-3.0
+ */
+
+import { ForbiddenException, Injectable, Logger, NotFoundException, ConflictException } from '@nestjs/common'
+import { InjectRepository } from '@nestjs/typeorm'
+import { Not, Repository, LessThan, In, JsonContains, FindOptionsWhere, ILike } from 'typeorm'
+import { Box } from '../entities/box.entity'
+import { persistWithGeneratedBoxName } from '../utils/box-name-generator'
+import { CreateBoxDto } from '../dto/create-box.dto'
+import { BoxState } from '../enums/box-state.enum'
+import { BoxClass } from '../enums/box-class.enum'
+import { BoxDesiredState } from '../enums/box-desired-state.enum'
+import { GetRunnerParams, RunnerService } from './runner.service'
+import { BoxExitCodeService } from './box-exit-code.service'
+import { BoxError } from '../../exceptions/box-error.exception'
+import { BadRequestError } from '../../exceptions/bad-request.exception'
+import { Cron, CronExpression } from '@nestjs/schedule'
+import { BOX_WARM_POOL_UNASSIGNED_ORGANIZATION } from '../constants/box.constants'
+import { assertSupportedImage } from '../constants/curated-images.constant'
+import { BoxWarmPoolService } from './box-warm-pool.service'
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter'
+import { WarmPoolEvents } from '../constants/warmpool-events.constants'
+import { WarmPoolTopUpRequested } from '../events/warmpool-topup-requested.event'
+import { Runner } from '../entities/runner.entity'
+import { Organization } from '../../organization/entities/organization.entity'
+import { BoxEvents } from '../constants/box-events.constants'
+import { BoxStateUpdatedEvent } from '../events/box-state-updated.event'
+import { BoxDestroyedEvent } from '../events/box-destroyed.event'
+import { BoxStartedEvent } from '../events/box-started.event'
+import { BoxDesiredStateUpdatedEvent } from '../events/box-desired-state-updated.event'
+import { BoxStoppedEvent } from '../events/box-stopped.event'
+import { OrganizationService } from '../../organization/services/organization.service'
+import { OrganizationEvents } from '../../organization/constants/organization-events.constant'
+import { OrganizationSuspendedBoxStoppedEvent } from '../../organization/events/organization-suspended-box-stopped.event'
+import { TypedConfigService } from '../../config/typed-config.service'
+import { WarmPool } from '../entities/warm-pool.entity'
+import { BoxDto, BoxVolume } from '../dto/box.dto'
+import { RunnerAdapterFactory } from '../runner-adapter/runnerAdapter'
+import { validateNetworkAllowList } from '../utils/network-validation.util'
+import { VolumeService } from './volume.service'
+import { PaginatedList } from '../../common/interfaces/paginated-list.interface'
+import {
+  BoxSortField,
+  BoxSortDirection,
+  DEFAULT_BOX_SORT_FIELD,
+  DEFAULT_BOX_SORT_DIRECTION,
+} from '../dto/list-boxes-query.dto'
+import { createRangeFilter } from '../../common/utils/range-filter'
+import { BusinessEventActorKind, recordBusinessEvent } from '../../common/utils/business-event.util'
+import { LogExecution } from '../../common/decorators/log-execution.decorator'
+import { customAlphabet as customNanoid, nanoid, urlAlphabet } from 'nanoid'
+import { WithInstrumentation } from '../../common/decorators/otel.decorator'
+import { validateMountPaths, validateSubpaths } from '../utils/volume-mount-path-validation.util'
+import { BoxRepository } from '../repositories/box.repository'
+import { Job } from '../entities/job.entity'
+import { JobService } from './job.service'
+import { JobStatus, JobType, ResourceType } from '../dto/job.dto'
+import { PortPreviewUrlDto, SignedPortPreviewUrlDto } from '../dto/port-preview-url.dto'
+import { RegionService } from '../../region/services/region.service'
+import { BoxCreatedEvent } from '../events/box-create.event'
+import { InjectRedis } from '@nestjs-modules/ioredis'
+import { Redis } from 'ioredis'
+import {
+  BOX_LOOKUP_CACHE_TTL_MS,
+  BOX_ORG_ID_CACHE_TTL_MS,
+  TOOLBOX_PROXY_URL_CACHE_TTL_S,
+  boxLookupCacheKeyById,
+  boxLookupCacheKeyByName,
+  boxOrgIdCacheKeyById,
+  boxOrgIdCacheKeyByName,
+  toolboxProxyUrlCacheKey,
+} from '../utils/box-lookup-cache.util'
+import { BoxLookupCacheInvalidationService } from './box-lookup-cache-invalidation.service'
+import { Region } from '../../region/entities/region.entity'
+import { BoxActivityService } from './box-activity.service'
+import { assertWithinPerBoxLimits } from './per-box-limits'
+import { requiresFreshBox } from '../utils/warm-pool-eligibility.util'
+import {
+  AUTO_DELETE_DISABLED,
+  AUTO_STOP_DISABLED,
+  DEFAULT_AUTO_STOP_SECONDS,
+  DEFAULT_AUTO_RESUME,
+  MIN_AUTO_STOP_SECONDS,
+} from '../constants/box-lifecycle.constants'
+
+// TODO(image-rewrite): resource defaults previously came from the removed image subsystem;
+// these mirror the Box entity column defaults until image resolution is rebuilt.
+const DEFAULT_BOX_CPU = 1
+const DEFAULT_BOX_MEM = 1
+const DEFAULT_BOX_DISK = 10
+const DEFAULT_BOX_GPU = 0
+const TERMINAL_PREVIEW_PORT = 22222
+
+export type BoxCreationOptions = {
+  maxCreatedBoxes?: number
+  // Who asked for the box, recorded on its box.create business events.
+  actorKind?: BusinessEventActorKind
+}
+
+@Injectable()
+export class BoxService {
+  private readonly logger = new Logger(BoxService.name)
+
+  constructor(
+    private readonly boxRepository: BoxRepository,
+    @InjectRepository(Runner)
+    private readonly runnerRepository: Repository<Runner>,
+    private readonly runnerService: RunnerService,
+    private readonly boxExitCodeService: BoxExitCodeService,
+    private readonly volumeService: VolumeService,
+    private readonly configService: TypedConfigService,
+    private readonly warmPoolService: BoxWarmPoolService,
+    private readonly eventEmitter: EventEmitter2,
+    private readonly organizationService: OrganizationService,
+    private readonly runnerAdapterFactory: RunnerAdapterFactory,
+    @InjectRedis() private readonly redis: Redis,
+    private readonly regionService: RegionService,
+    private readonly boxLookupCacheInvalidationService: BoxLookupCacheInvalidationService,
+    private readonly boxActivityService: BoxActivityService,
+    @InjectRepository(Job)
+    private readonly jobRepository: Repository<Job>,
+    private readonly jobService: JobService,
+  ) {}
+
+  protected getLockKey(id: string): string {
+    return `box:${id}:state-change`
+  }
+
+  /**
+   * Assigns `box` to a schedulable runner, then persists it.
+   *
+   * Nothing locks the runner row across the gap between the candidate query —
+   * which already filters out draining, unschedulable and non-READY runners —
+   * and the insert. A drain landing inside that gap therefore wins the row but
+   * not the box: the runner ends up marked draining with this box assigned to
+   * it. That is the deliberate trade, and it is how schedulers usually settle
+   * it: Nomad re-checks node eligibility only when the plan is applied
+   * (`evaluateNodePlan`, nomad/plan_apply.go:837-861, over a read-only memdb
+   * snapshot), and Kubernetes lets the kubelet reject a pod the scheduler
+   * already bound (`predicateAdmitHandler.Admit`,
+   * pkg/kubelet/lifecycle/predicate.go:118-207). A lock here buys a fence over
+   * milliseconds and charges every create for it — waiting behind runner
+   * lifecycle writers, and unable to tell "busy" from "unusable" when it loses.
+   *
+   * Draining is not a hard exclusion, it is "no new work, wait out the boxes
+   * already here". A box that slips in is one more box to wait out:
+   * `handleCheckDecommissionRunners` counts assignments before each transition
+   * and resets its counter while any remain, so the runner keeps draining and
+   * the box keeps running.
+   */
+  private async persistOnAvailableRunner(
+    box: Box,
+    runnerParams: GetRunnerParams,
+    persist: () => Promise<Box>,
+  ): Promise<Box> {
+    const runner = await this.runnerService.getRandomAvailableRunner(runnerParams)
+    box.runnerId = runner.id
+    return persist()
+  }
+
+  private assertBoxNotErrored(box: Box): void {
+    if (box.state === BoxState.ERROR) {
+      throw new BoxError('Box is in an errored state')
+    }
+  }
+
+  async createForWarmPool(warmPoolItem: WarmPool): Promise<Box> {
+    const box = new Box(warmPoolItem.target)
+
+    box.organizationId = BOX_WARM_POOL_UNASSIGNED_ORGANIZATION
+
+    box.class = warmPoolItem.class
+    box.image = warmPoolItem.image
+    //  TODO: default user should be configurable
+    box.osUser = 'boxlite'
+    box.env = warmPoolItem.env || {}
+
+    box.cpu = warmPoolItem.cpu
+    box.gpu = warmPoolItem.gpu
+    box.mem = warmPoolItem.mem
+    box.disk = warmPoolItem.disk
+
+    box.pending = true
+
+    return this.persistOnAvailableRunner(box, { regions: [box.region], boxClass: box.class }, () =>
+      this.boxRepository.insert(box),
+    )
+  }
+
+  async create(
+    createBoxDto: CreateBoxDto,
+    organization: Organization,
+    options: BoxCreationOptions = {},
+  ): Promise<BoxDto> {
+    const region = await this.getValidatedOrDefaultRegion(organization, createBoxDto.target)
+
+    try {
+      const boxClass = this.getValidatedOrDefaultClass(createBoxDto.class)
+
+      // TODO(image-rewrite): image resolution removed; boxes can no
+      // longer resolve an image at create time. Resource sizing falls back to request values
+      // (or Box entity defaults). Rebuild image resolution here.
+      const cpu = createBoxDto.cpu ?? DEFAULT_BOX_CPU
+      const mem = createBoxDto.memory ?? DEFAULT_BOX_MEM
+      const disk = createBoxDto.disk ?? DEFAULT_BOX_DISK
+      const gpu = createBoxDto.gpu ?? DEFAULT_BOX_GPU
+      // Reject over-limit requests at the boundary (the "security option"
+      // per-box ceilings) rather than persisting out-of-range values.
+      assertWithinPerBoxLimits(cpu, mem, disk, organization)
+      // Restrict box creation to the supported pinned images; reject anything else
+      // at the request boundary (defaults undefined -> base image).
+      const image = assertSupportedImage(createBoxDto.image)
+      const needsFreshBox = requiresFreshBox(createBoxDto, organization)
+
+      this.organizationService.assertOrganizationIsNotSuspended(organization)
+
+      if (createBoxDto.volumes && createBoxDto.volumes.length > 0) {
+        const volumeIdOrNames = createBoxDto.volumes.map((v) => v.volumeId)
+        const canonical = await this.volumeService.validateVolumes(organization.id, volumeIdOrNames)
+        // Replace the caller's selector with the id it resolved to inside this
+        // organization. A name is only unique per organization, but everything
+        // downstream (the runner, the `boxlite-volume-<id>` bucket) reads this
+        // field as a global id - see VolumeService.validateVolumes.
+        createBoxDto.volumes = createBoxDto.volumes.map((volume) => {
+          const canonicalId = canonical.get(volume.volumeId)
+          if (!canonicalId) {
+            // validateVolumes keys every selector or throws, so this is
+            // unreachable today. Fail closed anyway: the alternative fallback
+            // is silently persisting the caller's own string, which is exactly
+            // the tenant-controlled passthrough the resolution exists to stop.
+            throw new BadRequestError(`Volume '${volume.volumeId}' could not be resolved`)
+          }
+          return { ...volume, volumeId: canonicalId }
+        })
+      } else if (image && !needsFreshBox) {
+        //  No volumes requested — try to claim a pre-warmed box matching this image/spec
+        //  before creating a fresh one.
+        const skipWarmPool = (await this.redis.exists(`warm-pool:skip:${image}`)) === 1
+        if (!skipWarmPool) {
+          const warmPoolBox = await this.warmPoolService.fetchWarmPoolBox({
+            organizationId: organization.id,
+            image,
+            target: region.id,
+            class: boxClass,
+            cpu,
+            mem,
+            disk,
+            gpu,
+            osUser: createBoxDto.user || 'boxlite',
+            env: createBoxDto.env || {},
+            state: BoxState.STARTED,
+          })
+
+          if (warmPoolBox) {
+            return await this.assignWarmPoolBox(warmPoolBox, createBoxDto, organization, options)
+          }
+        }
+      }
+
+      const box = new Box(region.id, createBoxDto.name)
+
+      box.organizationId = organization.id
+
+      //  TODO: make configurable
+      box.class = boxClass
+      //  TODO: default user should be configurable
+      box.osUser = createBoxDto.user || 'boxlite'
+      // Only set when the caller actually asked. Collapsing "not supplied" into
+      // a default here would hand every box a USER override its image may not
+      // define — which is exactly what 16d9248bb removed.
+      box.runAsUser = createBoxDto.runAsUser
+      box.workingDir = createBoxDto.workingDir
+      box.entrypoint = createBoxDto.entrypoint
+      box.cmd = createBoxDto.cmd
+      box.env = createBoxDto.env || {}
+      box.secrets = createBoxDto.secrets || []
+      box.labels = createBoxDto.labels || {}
+
+      box.image = image
+      box.cpu = cpu
+      box.gpu = gpu
+      box.mem = mem
+      box.disk = disk
+
+      // POL-205: an unset public value on the internal create DTO defaults private.
+      box.public = createBoxDto.public ?? false
+
+      if (createBoxDto.networkBlockAll !== undefined) {
+        box.networkBlockAll = createBoxDto.networkBlockAll
+      } else if (organization.boxLimitedNetworkEgress) {
+        box.networkBlockAll = true
+      }
+
+      if (createBoxDto.networkAllowList !== undefined) {
+        box.networkAllowList = this.resolveNetworkAllowList(createBoxDto.networkAllowList)
+      }
+
+      const lifecyclePolicy = this.resolveLifecyclePolicy({
+        autoStop: createBoxDto.autoStop,
+        autoDelete: createBoxDto.autoDelete,
+        autoResume: createBoxDto.autoResume,
+      })
+      box.autoStop = lifecyclePolicy.autoStop
+      box.autoDelete = lifecyclePolicy.autoDelete
+      box.autoResume = lifecyclePolicy.autoResume
+
+      if (createBoxDto.volumes !== undefined) {
+        box.volumes = this.resolveVolumes(createBoxDto.volumes)
+      }
+
+      box.pending = true
+
+      // No caller-provided name -> assign a fun default (e.g. "cozy-otter"),
+      // falling back to "cozy-otter-{boxId}" if it collides with the per-org
+      // @Unique(['organizationId', 'name']) constraint. Only the insert retries:
+      // the chosen runner is still fine, it was the name that collided.
+      const insertedBox = await this.persistOnAvailableRunner(box, { regions: [region.id], boxClass }, () =>
+        createBoxDto.name
+          ? this.boxRepository.insert(box, options.maxCreatedBoxes)
+          : persistWithGeneratedBoxName(box.id, (name) => {
+              box.name = name
+              return this.boxRepository.insert(box, options.maxCreatedBoxes)
+            }),
+      )
+
+      recordBusinessEvent({
+        name: 'box.create',
+        outcome: 'requested',
+        correlationId: insertedBox.id,
+        orgId: insertedBox.organizationId,
+        actorKind: options.actorKind,
+      })
+
+      this.eventEmitter
+        .emitAsync(BoxEvents.CREATED, new BoxCreatedEvent(insertedBox))
+        .catch((err) => this.logger.error('Failed to emit BoxCreatedEvent', err))
+
+      return this.toBoxDto(insertedBox)
+    } catch (error) {
+      if (error.code === '23505') {
+        throw new ConflictException(
+          createBoxDto.name
+            ? `Box with name ${createBoxDto.name} already exists`
+            : 'Could not allocate a unique box name, please retry',
+        )
+      }
+
+      throw error
+    }
+  }
+
+  private async assignWarmPoolBox(
+    warmPoolBox: Box,
+    createBoxDto: CreateBoxDto,
+    organization: Organization,
+    options: BoxCreationOptions,
+  ): Promise<BoxDto> {
+    const { maxCreatedBoxes } = options
+    const now = new Date()
+    const updateData: Partial<Box> = {
+      // POL-205: same default as the fresh-box path — see the comment there.
+      public: createBoxDto.public ?? false,
+      labels: createBoxDto.labels || {},
+      organizationId: organization.id,
+      createdAt: now,
+    }
+
+    const lifecyclePolicy = this.resolveLifecyclePolicy({
+      autoStop: createBoxDto.autoStop,
+      autoDelete: createBoxDto.autoDelete,
+      autoResume: createBoxDto.autoResume,
+    })
+    updateData.autoStop = lifecyclePolicy.autoStop
+    updateData.autoDelete = lifecyclePolicy.autoDelete
+    updateData.autoResume = lifecyclePolicy.autoResume
+
+    if (createBoxDto.networkBlockAll !== undefined) {
+      updateData.networkBlockAll = createBoxDto.networkBlockAll
+    }
+
+    if (createBoxDto.networkAllowList !== undefined) {
+      updateData.networkAllowList = this.resolveNetworkAllowList(createBoxDto.networkAllowList)
+    }
+
+    if (!warmPoolBox.runnerId) {
+      throw new BoxError('Runner not found for warm pool box')
+    }
+
+    // Resolve the name at persist time. A caller-provided name updates in one
+    // shot (reusing the pre-fetched entity). A generated default falls back to
+    // "{name}-{boxId}" on collision and omits `entity` so each attempt re-reads
+    // the row — reusing the mutated entity would corrupt the optimistic-update
+    // guard.
+    const updatedBox = createBoxDto.name
+      ? await this.boxRepository.update(warmPoolBox.id, {
+          updateData: { ...updateData, name: createBoxDto.name },
+          entity: warmPoolBox,
+          maxCreatedBoxes,
+        })
+      : await persistWithGeneratedBoxName(warmPoolBox.id, (name) =>
+          this.boxRepository.update(warmPoolBox.id, {
+            updateData: { ...updateData, name },
+            maxCreatedBoxes,
+          }),
+        )
+
+    // Defensive invalidation of orgId cache since the box moved from unassigned to a real organization
+    this.boxLookupCacheInvalidationService.invalidateOrgId({
+      id: warmPoolBox.id,
+      organizationId: organization.id,
+      name: warmPoolBox.name,
+      previousOrganizationId: BOX_WARM_POOL_UNASSIGNED_ORGANIZATION,
+    })
+
+    // A claimed warm box is already started, so the request and its success
+    // commit together.
+    const createEvent = {
+      name: 'box.create',
+      correlationId: updatedBox.id,
+      orgId: organization.id,
+      actorKind: options.actorKind,
+    } as const
+    recordBusinessEvent({ ...createEvent, outcome: 'requested' })
+    recordBusinessEvent({ ...createEvent, outcome: 'success' })
+
+    // Treat this as a newly started box
+    this.eventEmitter.emit(
+      BoxEvents.STATE_UPDATED,
+      new BoxStateUpdatedEvent(updatedBox, BoxState.STARTED, BoxState.STARTED),
+    )
+    return this.toBoxDto(updatedBox)
+  }
+
+  async findAllDeprecated(
+    organizationId: string,
+    labels?: { [key: string]: string },
+    includeErroredDestroyed?: boolean,
+  ): Promise<Box[]> {
+    const baseFindOptions: FindOptionsWhere<Box> = {
+      organizationId,
+      ...(labels ? { labels: JsonContains(labels) } : {}),
+    }
+
+    const where: FindOptionsWhere<Box>[] = [
+      {
+        ...baseFindOptions,
+        state: Not(In([BoxState.DESTROYED, BoxState.ERROR])),
+      },
+      {
+        ...baseFindOptions,
+        state: BoxState.ERROR,
+        ...(includeErroredDestroyed ? {} : { desiredState: Not(BoxDesiredState.DESTROYED) }),
+      },
+    ]
+
+    return this.boxRepository.find({ where })
+  }
+
+  async findAll(
+    organizationId: string,
+    page = 1,
+    limit = 10,
+    filters?: {
+      id?: string
+      name?: string
+      labels?: { [key: string]: string }
+      includeErroredDestroyed?: boolean
+      states?: BoxState[]
+      regionIds?: string[]
+      minCpu?: number
+      maxCpu?: number
+      minMemoryGiB?: number
+      maxMemoryGiB?: number
+      minDiskGiB?: number
+      maxDiskGiB?: number
+      lastEventAfter?: Date
+      lastEventBefore?: Date
+    },
+    sort?: {
+      field?: BoxSortField
+      direction?: BoxSortDirection
+    },
+  ): Promise<PaginatedList<Box>> {
+    const pageNum = Number(page)
+    const limitNum = Number(limit)
+
+    const {
+      id,
+      name,
+      labels,
+      includeErroredDestroyed,
+      states,
+      regionIds,
+      minCpu,
+      maxCpu,
+      minMemoryGiB,
+      maxMemoryGiB,
+      minDiskGiB,
+      maxDiskGiB,
+      lastEventAfter,
+      lastEventBefore,
+    } = filters || {}
+
+    const { field: sortField = DEFAULT_BOX_SORT_FIELD, direction: sortDirection = DEFAULT_BOX_SORT_DIRECTION } =
+      sort || {}
+
+    const baseFindOptions: FindOptionsWhere<Box> = {
+      organizationId,
+      ...(labels ? { labels: JsonContains(labels) } : {}),
+      ...(regionIds ? { region: In(regionIds) } : {}),
+    }
+
+    baseFindOptions.cpu = createRangeFilter(minCpu, maxCpu)
+    baseFindOptions.mem = createRangeFilter(minMemoryGiB, maxMemoryGiB)
+    baseFindOptions.disk = createRangeFilter(minDiskGiB, maxDiskGiB)
+    baseFindOptions.updatedAt = createRangeFilter(lastEventAfter, lastEventBefore)
+
+    const statesToInclude = (states || Object.values(BoxState)).filter((state) => state !== BoxState.DESTROYED)
+    const errorStates = [BoxState.ERROR]
+
+    const nonErrorStatesToInclude = statesToInclude.filter((state) => !errorStates.includes(state))
+    const errorStatesToInclude = statesToInclude.filter((state) => errorStates.includes(state))
+
+    const where: FindOptionsWhere<Box>[] = []
+    const searchFindOptions = this.getBoxSearchFindOptions(baseFindOptions, id, name)
+
+    if (nonErrorStatesToInclude.length > 0) {
+      where.push(
+        ...searchFindOptions.map((findOptions) => ({
+          ...findOptions,
+          state: In(nonErrorStatesToInclude),
+        })),
+      )
+    }
+
+    if (errorStatesToInclude.length > 0) {
+      where.push(
+        ...searchFindOptions.map((findOptions) => ({
+          ...findOptions,
+          state: In(errorStatesToInclude),
+          ...(includeErroredDestroyed ? {} : { desiredState: Not(BoxDesiredState.DESTROYED) }),
+        })),
+      )
+    }
+
+    const [items, total] = await this.boxRepository.findAndCount({
+      where,
+      order: {
+        [sortField]: {
+          direction: sortDirection,
+          nulls: 'LAST',
+        },
+        ...(sortField !== BoxSortField.CREATED_AT && { createdAt: 'DESC' }),
+      },
+      skip: (pageNum - 1) * limitNum,
+      take: limitNum,
+    })
+
+    return {
+      items,
+      total,
+      page: pageNum,
+      totalPages: Math.ceil(total / limitNum),
+    }
+  }
+
+  private getBoxSearchFindOptions(
+    baseFindOptions: FindOptionsWhere<Box>,
+    id?: string,
+    name?: string,
+  ): FindOptionsWhere<Box>[] {
+    const nameFilter = name ? { name: ILike(`${name}%`) } : {}
+
+    if (!id) {
+      return [
+        {
+          ...baseFindOptions,
+          ...nameFilter,
+        },
+      ]
+    }
+
+    const idFilter = ILike(`${id}%`)
+    return [
+      {
+        ...baseFindOptions,
+        ...nameFilter,
+        id: idFilter,
+      },
+      {
+        ...baseFindOptions,
+        ...nameFilter,
+        name: idFilter,
+      },
+    ]
+  }
+
+  private getExpectedDesiredStateForState(state: BoxState): BoxDesiredState | undefined {
+    switch (state) {
+      case BoxState.STARTED:
+        return BoxDesiredState.STARTED
+      case BoxState.STOPPED:
+        return BoxDesiredState.STOPPED
+      case BoxState.DESTROYED:
+        return BoxDesiredState.DESTROYED
+      default:
+        return undefined
+    }
+  }
+
+  private hasValidDesiredState(state: BoxState): boolean {
+    return this.getExpectedDesiredStateForState(state) !== undefined
+  }
+
+  private getStartupJobTypeForState(state: BoxState): JobType | undefined {
+    switch (state) {
+      case BoxState.CREATING:
+        return JobType.CREATE_BOX
+      case BoxState.STARTING:
+        return JobType.START_BOX
+      default:
+        return undefined
+    }
+  }
+
+  /**
+   * The box's own startup job, if it was claimed by its runner and has since
+   * stopped making progress.
+   *
+   * "Stalled" is measured from when the runner claimed the job, because that
+   * is what a lost completion callback looks like from here: claimed, never
+   * closed. A job still within the window is assumed to be running normally,
+   * and an unclaimed (PENDING) job has no runner to have lost anything.
+   */
+  private async findStalledStartupJob(box: Box): Promise<Job | null> {
+    const startupJobType = this.getStartupJobTypeForState(box.state)
+    if (!startupJobType || !box.runnerId) {
+      return null
+    }
+
+    const stallSeconds = this.configService.getOrThrow('boxSync.startConfirmationStallSeconds')
+    const claimedBefore = new Date(Date.now() - stallSeconds * 1000)
+
+    return this.jobRepository.findOne({
+      where: {
+        runnerId: box.runnerId,
+        resourceType: ResourceType.BOX,
+        resourceId: box.id,
+        type: startupJobType,
+        status: JobStatus.IN_PROGRESS,
+        startedAt: LessThan(claimedBefore),
+      },
+      order: { createdAt: 'DESC' },
+    })
+  }
+
+  async findByRunnerId(runnerId: string, states?: BoxState[], skipReconcilingBoxes?: boolean): Promise<Box[]> {
+    const where: FindOptionsWhere<Box> = { runnerId }
+    if (states && states.length > 0) {
+      // Only the skip filter needs a state to have a corresponding desired
+      // state — it is defined as "state already matches desired state". Asking
+      // for a transitional state is a legitimate query on its own (a runner
+      // reconciling a startup whose job completion was lost does exactly
+      // that), so the requirement belongs to the filter, not to the parameter.
+      if (skipReconcilingBoxes) {
+        states.forEach((state) => {
+          if (!this.hasValidDesiredState(state)) {
+            throw new BadRequestError(`State ${state} does not have a corresponding desired state`)
+          }
+        })
+      }
+      where.state = In(states)
+    }
+
+    let boxes = await this.boxRepository.find({ where })
+
+    if (skipReconcilingBoxes) {
+      boxes = boxes.filter((box) => {
+        const expectedDesiredState = this.getExpectedDesiredStateForState(box.state)
+        return expectedDesiredState !== undefined && expectedDesiredState === box.desiredState
+      })
+    }
+
+    return boxes
+  }
+
+  async findOneByIdOrName(boxIdOrName: string, organizationId?: string, returnDestroyed?: boolean): Promise<Box> {
+    const stateFilter = returnDestroyed ? {} : { state: Not(BoxState.DESTROYED) }
+    const organizationFilter = organizationId ? { organizationId } : {}
+
+    // Public Box ID is the primary key. Name remains a user-facing fallback within an organization.
+    let box = await this.boxRepository.findOne({
+      where: {
+        id: boxIdOrName,
+        ...organizationFilter,
+        ...stateFilter,
+      },
+      cache: {
+        id: boxLookupCacheKeyById({ organizationId, returnDestroyed, id: boxIdOrName }),
+        milliseconds: BOX_LOOKUP_CACHE_TTL_MS,
+      },
+    })
+
+    if (!box) {
+      box = await this.boxRepository.findOne({
+        where: {
+          name: boxIdOrName,
+          ...organizationFilter,
+          ...stateFilter,
+        },
+        cache: {
+          id: boxLookupCacheKeyByName({ organizationId, returnDestroyed, boxName: boxIdOrName }),
+          milliseconds: BOX_LOOKUP_CACHE_TTL_MS,
+        },
+      })
+    }
+
+    if (!box || (!returnDestroyed && box.state === BoxState.ERROR && box.desiredState === BoxDesiredState.DESTROYED)) {
+      throw new NotFoundException(`Box with ID or name ${boxIdOrName} not found`)
+    }
+
+    return box
+  }
+
+  async findOne(boxId: string, returnDestroyed?: boolean): Promise<Box> {
+    const box = await this.boxRepository.findOne({
+      where: {
+        id: boxId,
+        ...(returnDestroyed ? {} : { state: Not(BoxState.DESTROYED) }),
+      },
+    })
+
+    if (!box || (!returnDestroyed && box.state === BoxState.ERROR && box.desiredState === BoxDesiredState.DESTROYED)) {
+      throw new NotFoundException(`Box with ID ${boxId} not found`)
+    }
+
+    return box
+  }
+
+  async getOrganizationId(boxIdOrName: string, organizationId?: string): Promise<string> {
+    const organizationFilter = organizationId ? { organizationId: organizationId } : {}
+
+    let box = await this.boxRepository.findOne({
+      where: {
+        id: boxIdOrName,
+        ...organizationFilter,
+      },
+      select: ['organizationId'],
+      cache: {
+        id: boxOrgIdCacheKeyById({ organizationId, id: boxIdOrName }),
+        milliseconds: BOX_ORG_ID_CACHE_TTL_MS,
+      },
+    })
+
+    if (!box && organizationId) {
+      box = await this.boxRepository.findOne({
+        where: {
+          name: boxIdOrName,
+          organizationId: organizationId,
+        },
+        select: ['organizationId'],
+        cache: {
+          id: boxOrgIdCacheKeyByName({ organizationId, boxName: boxIdOrName }),
+          milliseconds: BOX_ORG_ID_CACHE_TTL_MS,
+        },
+      })
+    }
+
+    if (!box || !box.organizationId) {
+      throw new NotFoundException(`Box with ID or name ${boxIdOrName} not found`)
+    }
+
+    return box.organizationId
+  }
+
+  async getRunnerId(boxIdOrName: string): Promise<string | null> {
+    const box = await this.boxRepository.findOne({
+      where: [{ id: boxIdOrName }, { name: boxIdOrName }],
+      select: ['runnerId'],
+      loadEagerRelations: false,
+    })
+
+    if (!box) {
+      throw new NotFoundException(`Box with ID or name ${boxIdOrName} not found`)
+    }
+
+    return box.runnerId || null
+  }
+
+  async getRegionId(boxIdOrName: string): Promise<string> {
+    const box = await this.boxRepository.findOne({
+      where: [{ id: boxIdOrName }, { name: boxIdOrName }],
+      select: ['region'],
+      loadEagerRelations: false,
+    })
+
+    if (!box) {
+      throw new NotFoundException(`Box with ID or name ${boxIdOrName} not found`)
+    }
+
+    return box.region
+  }
+
+  async getPortPreviewUrl(boxIdOrName: string, organizationId: string, port: number): Promise<PortPreviewUrlDto> {
+    if (port < 1 || port > 65535) {
+      throw new BadRequestError('Invalid port')
+    }
+
+    const proxyDomain = this.configService.getOrThrow('proxy.domain')
+    const proxyProtocol = this.configService.getOrThrow('proxy.protocol')
+
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+    // Keep the established terminal hostname stable. Service previews use an
+    // encoded ID so mixed-case box IDs remain safe in DNS hostnames.
+    const previewBoxId = port === TERMINAL_PREVIEW_PORT ? box.id : encodeDirectPreviewBoxId(box.id)
+
+    let url = `${proxyProtocol}://${port}-${previewBoxId}.${proxyDomain}`
+
+    const region = await this.regionService.findOne(box.region, true)
+    if (region && region.proxyUrl) {
+      url = region.proxyUrl.replace(/(https?:\/)(\/)/, `$1/${port}-${previewBoxId}.`)
+    }
+
+    return {
+      boxId: box.id,
+      url,
+      token: box.authToken,
+    }
+  }
+
+  async getNetworkTunnelUrl(boxIdOrName: string, organizationId: string, port: number): Promise<string> {
+    if (port < 1 || port > 65535) {
+      throw new BadRequestError('Invalid port')
+    }
+
+    const proxyDomain = this.configService.getOrThrow('proxy.domain')
+    const proxyProtocol = this.configService.getOrThrow('proxy.protocol')
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+    const endpointId = encodeDirectPreviewBoxId(box.id)
+
+    let url = `${proxyProtocol}://${port}-${endpointId}.${proxyDomain}`
+    const region = await this.regionService.findOne(box.region, true)
+    if (region?.proxyUrl) {
+      url = region.proxyUrl.replace(/(https?:\/)(\/)/, `$1/${port}-${endpointId}.`)
+    }
+    return url
+  }
+
+  /**
+   * Sign access to a box's listening port through the shared preview proxy.
+   * The hostname carries the guest port while clients use the proxy's public listener.
+   */
+  async getSignedPortPreviewUrl(
+    boxIdOrName: string,
+    organizationId: string,
+    port: number,
+    expiresInSeconds = 60,
+  ): Promise<SignedPortPreviewUrlDto> {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new BadRequestError('Invalid port')
+    }
+    if (expiresInSeconds < 1 || expiresInSeconds > 60 * 60 * 24) {
+      throw new BadRequestError('expiresInSeconds must be between 1 second and 24 hours')
+    }
+
+    const proxyDomain = this.configService.getOrThrow('proxy.domain')
+    const proxyProtocol = this.configService.getOrThrow('proxy.protocol')
+
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+
+    const token = customNanoid(urlAlphabet.replace('_', '').replace('-', ''))(16).toLocaleLowerCase()
+
+    const lockKey = `box:signed-preview-url-token:${port}:${token}`
+    await this.redis.setex(lockKey, expiresInSeconds, box.id)
+
+    let url = `${proxyProtocol}://${port}-${token}.${proxyDomain}`
+
+    const region = await this.regionService.findOne(box.region, true)
+    if (region && region.proxyUrl) {
+      // Insert port and box.id into the custom proxy URL
+      url = region.proxyUrl.replace(/(https?:\/)(\/)/, `$1/${port}-${token}.`)
+    }
+
+    return {
+      boxId: box.id,
+      port,
+      token,
+      url,
+    }
+  }
+
+  async getBoxIdFromSignedPreviewUrlToken(token: string, port: number): Promise<string> {
+    const lockKey = `box:signed-preview-url-token:${port}:${token}`
+    const boxId = await this.redis.get(lockKey)
+    if (!boxId) {
+      throw new ForbiddenException('Invalid or expired token')
+    }
+    return boxId
+  }
+
+  async expireSignedPreviewUrlToken(
+    boxIdOrName: string,
+    organizationId: string,
+    token: string,
+    port: number,
+  ): Promise<void> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+    if (!box) {
+      throw new NotFoundException(`Box with ID or name ${boxIdOrName} not found`)
+    }
+
+    const lockKey = `box:signed-preview-url-token:${port}:${token}`
+    await this.redis.del(lockKey)
+  }
+
+  async destroy(
+    boxIdOrName: string,
+    organizationId: string | undefined,
+    actorKind: BusinessEventActorKind,
+  ): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+
+    if (box.pending) {
+      throw new BoxError('Box state change in progress')
+    }
+
+    const updateData = Box.getSoftDeleteUpdate(box)
+
+    const updatedBox = await this.boxRepository.updateWhere(box.id, {
+      updateData,
+      whereCondition: { pending: box.pending, state: box.state },
+    })
+
+    recordBusinessEvent({
+      name: 'box.delete',
+      outcome: 'requested',
+      correlationId: updatedBox.id,
+      orgId: updatedBox.organizationId,
+      actorKind,
+    })
+
+    this.eventEmitter.emit(BoxEvents.DESTROYED, new BoxDestroyedEvent(updatedBox))
+    return updatedBox
+  }
+
+  async start(boxIdOrName: string, organization: Organization): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organization.id)
+
+    const region = await this.regionService.findOne(box.region)
+    if (!region) {
+      throw new NotFoundException(`Region with ID ${box.region} not found`)
+    }
+
+    if (box.state === BoxState.STARTED && box.desiredState === BoxDesiredState.STARTED) {
+      return box
+    }
+
+    this.assertBoxNotErrored(box)
+
+    if (String(box.state) !== String(box.desiredState)) {
+      throw new BoxError('State change in progress')
+    }
+
+    if (box.state !== BoxState.STOPPED) {
+      throw new BoxError('Box is not in valid state')
+    }
+
+    if (box.pending) {
+      throw new BoxError('Box state change in progress')
+    }
+
+    this.organizationService.assertOrganizationIsNotSuspended(organization)
+
+    const updateData: Partial<Box> = {
+      pending: true,
+      desiredState: BoxDesiredState.STARTED,
+      authToken: nanoid(32).toLocaleLowerCase(),
+    }
+
+    const updatedBox = await this.boxRepository.updateWhere(box.id, {
+      updateData,
+      whereCondition: { pending: false, state: box.state },
+    })
+
+    this.eventEmitter.emit(BoxEvents.STARTED, new BoxStartedEvent(updatedBox))
+
+    return updatedBox
+  }
+
+  /**
+   * Submit or join a proxy-triggered Start intent.
+   *
+   * Only a stable STOPPED box performs the conditional update. Transitional
+   * states are returned unchanged so the caller can wait and retry. Unexpected
+   * database errors propagate; AutoResume must never proxy before readiness.
+   */
+  async ensureStartedForProxy(boxIdOrName: string, organization: Organization): Promise<Box> {
+    this.organizationService.assertOrganizationIsNotSuspended(organization)
+    const box = await this.findOneByIdOrName(boxIdOrName, organization.id)
+
+    if (box.state !== BoxState.STOPPED || box.desiredState !== BoxDesiredState.STOPPED || box.pending) {
+      return box
+    }
+
+    const updated = await this.boxRepository.conditionalStartForProxy(box.id, organization.id)
+    if (!updated) {
+      return this.findOneByIdOrName(box.id, organization.id)
+    }
+
+    this.eventEmitter.emit(BoxEvents.STARTED, new BoxStartedEvent(updated))
+    this.eventEmitter.emit(
+      BoxEvents.DESIRED_STATE_UPDATED,
+      new BoxDesiredStateUpdatedEvent(updated, BoxDesiredState.STOPPED, BoxDesiredState.STARTED),
+    )
+    return updated
+  }
+
+  async stop(
+    boxIdOrName: string,
+    organizationId: string | undefined,
+    actorKind: BusinessEventActorKind,
+    force?: boolean,
+  ): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+
+    this.assertBoxNotErrored(box)
+
+    if (String(box.state) !== String(box.desiredState)) {
+      throw new BoxError('State change in progress')
+    }
+
+    if (box.state !== BoxState.STARTED) {
+      throw new BoxError('Box is not started')
+    }
+
+    if (box.pending) {
+      throw new BoxError('Box state change in progress')
+    }
+
+    const updateData: Partial<Box> = {
+      pending: true,
+      desiredState: BoxDesiredState.STOPPED,
+    }
+
+    const updatedBox = await this.boxRepository.updateWhere(box.id, {
+      updateData,
+      whereCondition: { pending: false, state: box.state },
+    })
+
+    recordBusinessEvent({
+      name: 'box.stop',
+      outcome: 'requested',
+      correlationId: updatedBox.id,
+      orgId: updatedBox.organizationId,
+      actorKind,
+    })
+
+    this.eventEmitter.emit(BoxEvents.STOPPED, new BoxStoppedEvent(updatedBox, force))
+
+    return updatedBox
+  }
+
+  async recover(boxIdOrName: string, organization: Organization): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organization.id)
+
+    if (box.state !== BoxState.ERROR) {
+      throw new BadRequestError('Box must be in error state to recover')
+    }
+
+    if (box.pending) {
+      throw new BoxError('Box state change in progress')
+    }
+
+    // Validate runner exists
+    if (!box.runnerId) {
+      throw new NotFoundException(`Box with ID ${box.id} does not have a runner`)
+    }
+    const runner = await this.runnerService.findOneOrFail(box.runnerId)
+
+    if (runner.apiVersion === '2') {
+      // TODO: we need "recovering" state that can be set after calling recover
+      // Once in recovering, we abort further processing and let the manager/job handler take care of it
+      throw new ForbiddenException('Recovering boxes with runner API version 2 is not supported')
+    }
+
+    const runnerAdapter = await this.runnerAdapterFactory.create(runner)
+
+    try {
+      await runnerAdapter.recoverBox(box)
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('storage cannot be further expanded')) {
+        const errorMsg = `Box storage cannot be further expanded. Maximum expansion of ${(box.disk * 0.1).toFixed(2)}GB (10% of original ${box.disk.toFixed(2)}GB) has been reached. Please contact support for further assistance.`
+        throw new ForbiddenException(errorMsg)
+      }
+      throw error
+    }
+
+    const updateData: Partial<Box> = {
+      state: BoxState.STOPPED,
+      desiredState: BoxDesiredState.STOPPED,
+      errorReason: null,
+      recoverable: false,
+    }
+
+    await this.boxRepository.updateWhere(box.id, {
+      updateData,
+      whereCondition: { state: BoxState.ERROR },
+    })
+
+    // Now that box is in STOPPED state, use the normal start flow
+    // This handles state validation and event emission.
+    return await this.start(box.id, organization)
+  }
+
+  async updatePublicStatus(boxIdOrName: string, isPublic: boolean, organizationId?: string): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+
+    const updateData: Partial<Box> = {
+      public: isPublic,
+    }
+
+    return await this.boxRepository.update(box.id, {
+      updateData,
+      entity: box,
+    })
+  }
+
+  async updateLastActivityAt(boxId: string, lastActivityAt: Date): Promise<void> {
+    await this.boxActivityService.updateLastActivityAt(boxId, lastActivityAt)
+  }
+
+  async getToolboxProxyUrl(boxId: string): Promise<string> {
+    const box = await this.findOne(boxId)
+    return this.resolveToolboxProxyUrl(box.region)
+  }
+
+  /**
+   * Last activity is metadata about the box rather than part of it, so the read
+   * degrades to absent instead of failing the conversion: create() has already
+   * persisted the box by the time it converts, and a rejection there would read
+   * to the client as a failed creation and invite a duplicate on retry. The
+   * auto-lifecycle paths keep reading it directly, where the distinction
+   * between "unknown" and "idle" decides whether a box is stopped.
+   */
+  async toBoxDto(box: Box): Promise<BoxDto> {
+    const [toolboxProxyUrl, lastActivityAt] = await this.resolveDtoMetadata(box)
+    return BoxDto.fromBox(box, toolboxProxyUrl, lastActivityAt)
+  }
+
+  /** The two out-of-entity values every conversion needs, read together. */
+  private async resolveDtoMetadata(box: Box): Promise<[string, Date | null]> {
+    return Promise.all([
+      this.resolveToolboxProxyUrl(box.region),
+      this.boxActivityService.getLastActivityAt(box.id).catch((err) => {
+        this.logger.warn(`Failed to read last activity for box ${box.id}: ${err}`)
+        return null
+      }),
+    ])
+  }
+
+  /**
+   * A box as a tenant asked to read it, with the main command's exit code.
+   *
+   * Separate from {@link toBoxDto} because the code comes from the box's
+   * runner, and that is a cross-service call. `toBoxDto` is on the event path:
+   * every `BoxEvents.STATE_UPDATED` converts through it
+   * (`NotificationService`), as does every resolution in
+   * `BoxStateWaiterService`. A box reaching STOPPED is exactly what fires
+   * those, so reading there would put a runner round trip in front of every
+   * stop notification — and make each one wait out the timeout precisely when
+   * the runner is the thing that went wrong.
+   *
+   * Only the two endpoints that answer a tenant's read use this.
+   */
+  async toBoxDtoWithExitCode(box: Box): Promise<BoxDto> {
+    const [[toolboxProxyUrl, lastActivityAt], exitCode] = await Promise.all([
+      this.resolveDtoMetadata(box),
+      this.boxExitCodeService.getExitCode(box),
+    ])
+    return BoxDto.fromBox(box, toolboxProxyUrl, lastActivityAt, exitCode)
+  }
+
+  /**
+   * Degrades a failed activity read to absent, as {@link toBoxDto} does.
+   *
+   * Exit codes are deliberately left out here. Reading one means asking the
+   * runner that owns the box, so a list would fan out to one call per box; the
+   * field is optional in the spec, so omitting it on a list is conformant. A
+   * client that needs it reads the box itself.
+   */
+  async toBoxDtos(boxes: Box[]): Promise<BoxDto[]> {
+    const [urlMap, activityMap] = await Promise.all([
+      this.resolveToolboxProxyUrls(boxes.map((s) => s.region)),
+      this.boxActivityService.getLastActivityAtMany(boxes.map((s) => s.id)).catch((err) => {
+        this.logger.warn(`Failed to read last activity for ${boxes.length} boxes: ${err}`)
+        return new Map<string, Date>()
+      }),
+    ])
+    return boxes.map((s) => {
+      const url = urlMap.get(s.region)
+      if (!url) {
+        throw new NotFoundException(`Toolbox proxy URL not resolved for region ${s.region}`)
+      }
+      return BoxDto.fromBox(s, url, activityMap.get(s.id))
+    })
+  }
+
+  async resolveToolboxProxyUrl(regionId: string): Promise<string> {
+    const cacheKey = toolboxProxyUrlCacheKey(regionId)
+    const cached = await this.redis.get(cacheKey)
+    if (cached) {
+      return cached
+    }
+
+    const region = await this.regionService.findOne(regionId)
+    const url = region?.toolboxProxyUrl
+      ? region.toolboxProxyUrl.replace(/\/+$/, '') + '/toolbox'
+      : this.configService.getOrThrow('proxy.toolboxUrl')
+
+    this.redis.setex(cacheKey, TOOLBOX_PROXY_URL_CACHE_TTL_S, url).catch((err) => {
+      this.logger.warn(`Failed to cache toolbox proxy URL for region ${regionId}: ${err.message}`)
+    })
+    return url
+  }
+
+  async resolveToolboxProxyUrls(regionIds: string[]): Promise<Map<string, string>> {
+    const unique = [...new Set(regionIds)]
+    const result = new Map<string, string>()
+
+    const pipeline = this.redis.pipeline()
+    for (const id of unique) {
+      pipeline.get(toolboxProxyUrlCacheKey(id))
+    }
+    const cached = await pipeline.exec()
+
+    const uncached: string[] = []
+    for (let i = 0; i < unique.length; i++) {
+      const err = cached?.[i]?.[0]
+      if (err) {
+        this.logger.warn(`Failed to get cached toolbox proxy URL for region ${unique[i]}: ${err.message}`)
+      }
+      const val = cached?.[i]?.[1] as string | null
+      if (val) {
+        result.set(unique[i], val)
+      } else {
+        uncached.push(unique[i])
+      }
+    }
+
+    if (uncached.length > 0) {
+      const regions = await this.regionService.findByIds(uncached)
+      const regionMap = new Map(regions.map((r) => [r.id, r]))
+      const fallback = this.configService.getOrThrow('proxy.toolboxUrl')
+      const setPipeline = this.redis.pipeline()
+      for (const id of uncached) {
+        const region = regionMap.get(id)
+        const url = region?.toolboxProxyUrl ? region.toolboxProxyUrl.replace(/\/+$/, '') + '/toolbox' : fallback
+        result.set(id, url)
+        setPipeline.setex(toolboxProxyUrlCacheKey(id), TOOLBOX_PROXY_URL_CACHE_TTL_S, url)
+      }
+      const setResults = await setPipeline.exec()
+      setResults?.forEach(([err], i) => {
+        if (err) {
+          this.logger.warn(`Failed to cache toolbox proxy URL for region ${uncached[i]}: ${err.message}`)
+        }
+      })
+    }
+
+    return result
+  }
+
+  private async getValidatedOrDefaultRegion(organization: Organization, regionIdOrName?: string): Promise<Region> {
+    regionIdOrName = regionIdOrName?.trim()
+
+    if (!regionIdOrName) {
+      const defaultRegionId = organization.defaultRegionId || this.configService.getOrThrow('defaultRegion.id')
+      const region = await this.regionService.findOne(defaultRegionId)
+      if (!region) {
+        throw new NotFoundException('Default region not found')
+      }
+      return region
+    }
+
+    const region =
+      (await this.regionService.findOneByName(regionIdOrName, organization.id)) ??
+      (await this.regionService.findOneByName(regionIdOrName, null)) ??
+      (await this.regionService.findOne(regionIdOrName))
+
+    if (!region) {
+      throw new NotFoundException('Region not found')
+    }
+
+    return region
+  }
+
+  private getValidatedOrDefaultClass(boxClass: BoxClass): BoxClass {
+    if (!boxClass) {
+      return BoxClass.SMALL
+    }
+
+    if (Object.values(BoxClass).includes(boxClass)) {
+      return boxClass
+    } else {
+      throw new BadRequestError('Invalid class')
+    }
+  }
+
+  async replaceLabels(boxIdOrName: string, labels: { [key: string]: string }, organizationId?: string): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+
+    // Replace all labels
+    const updateData: Partial<Box> = {
+      labels,
+    }
+
+    return await this.boxRepository.update(box.id, { updateData, entity: box })
+  }
+
+  @Cron(CronExpression.EVERY_SECOND, { name: 'cleanup-destroyed-boxes' })
+  @LogExecution('cleanup-destroyed-boxes')
+  @WithInstrumentation()
+  async cleanupDestroyedBoxes() {
+    const twentyFourHoursAgo = new Date()
+    twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24)
+
+    const destroyedBoxs = await this.boxRepository.delete({
+      state: BoxState.DESTROYED,
+      updatedAt: LessThan(twentyFourHoursAgo),
+    })
+
+    if (destroyedBoxs.affected > 0) {
+      this.logger.debug(`Cleaned up ${destroyedBoxs.affected} destroyed boxes`)
+    }
+  }
+
+  @Cron(CronExpression.EVERY_SECOND, { name: 'cleanup-stale-error-boxes' })
+  @LogExecution('cleanup-stale-error-boxes')
+  @WithInstrumentation()
+  async cleanupStaleErrorBoxes() {
+    const sevenDaysAgo = new Date()
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+
+    const result = await this.boxRepository.delete({
+      state: BoxState.ERROR,
+      desiredState: BoxDesiredState.DESTROYED,
+      updatedAt: LessThan(sevenDaysAgo),
+    })
+
+    if (result.affected > 0) {
+      this.logger.debug(`Cleaned up ${result.affected} stale error boxes`)
+    }
+  }
+
+  async setAutostopInterval(boxIdOrName: string, interval: number, organizationId?: string): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+
+    const updateData: Partial<Box> = {
+      autoStop: this.minutesToSeconds(interval),
+    }
+
+    return await this.boxRepository.update(box.id, { updateData, entity: box })
+  }
+
+  async setAutoDeleteInterval(boxIdOrName: string, interval: number, organizationId?: string): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+
+    const updateData: Partial<Box> = {
+      autoDelete: interval <= 0 ? 0 : this.minutesToSeconds(interval),
+    }
+
+    return await this.boxRepository.update(box.id, { updateData, entity: box })
+  }
+
+  async updateNetworkSettings(
+    boxIdOrName: string,
+    networkBlockAll?: boolean,
+    networkAllowList?: string,
+    organizationId?: string,
+  ): Promise<Box> {
+    const box = await this.findOneByIdOrName(boxIdOrName, organizationId)
+
+    const updateData: Partial<Box> = {}
+
+    if (networkBlockAll !== undefined) {
+      updateData.networkBlockAll = networkBlockAll
+    }
+
+    if (networkAllowList !== undefined) {
+      updateData.networkAllowList = this.resolveNetworkAllowList(networkAllowList)
+    }
+
+    const updatedBox = await this.boxRepository.update(box.id, { updateData, entity: box })
+
+    // Update network settings on the runner
+    if (box.runnerId) {
+      const runner = await this.runnerService.findOne(box.runnerId)
+      if (runner) {
+        const runnerAdapter = await this.runnerAdapterFactory.create(runner)
+        await runnerAdapter.updateNetworkSettings(box.id, networkBlockAll, networkAllowList)
+      }
+    }
+
+    return updatedBox
+  }
+
+  // used by internal services to update the state of a box to resolve domain and runner state mismatch
+  // notably, when a box instance stops or errors on the runner, the domain state needs to be updated to reflect the actual state
+  async updateState(boxId: string, newState: BoxState, recoverable = false, errorReason?: string): Promise<void> {
+    const box = await this.boxRepository.findOne({
+      where: { id: boxId },
+    })
+
+    if (!box) {
+      throw new NotFoundException(`Box with ID ${boxId} not found`)
+    }
+
+    if (box.state === newState) {
+      this.logger.debug(`Box ${boxId} is already in state ${newState}`)
+      return
+    }
+
+    //  only allow updating the state of started | stopped boxes
+    if (![BoxState.STARTED, BoxState.STOPPED].includes(box.state)) {
+      // One exception: a runner reporting STARTED for a box we still show as
+      // coming up. That means its startup job finished on the runner but the
+      // completion never reached us. Believe it only once the job has stopped
+      // making progress on its own — until then the normal callback is still
+      // the better answer, and we say nothing rather than reject a runner that
+      // is telling the truth.
+      if (newState !== BoxState.STARTED || box.desiredState !== BoxDesiredState.STARTED) {
+        throw new BadRequestError('Box is not in a valid state to be updated')
+      }
+
+      const stalledStartupJob = await this.findStalledStartupJob(box)
+      if (!stalledStartupJob) {
+        this.logger.debug(`Box ${boxId} start not yet confirmable; startup job still progressing`)
+        return
+      }
+
+      // Completing the job is what moves the box: the normal completion
+      // handler owns the STARTED transition, the pending flag, the activity
+      // stamp, the state-change event, and releasing the box's Redis lock.
+      // Doing any of that here instead would fork that logic.
+      this.logger.warn(
+        `Completing stalled startup job ${stalledStartupJob.id} for box ${boxId} from runner-reported state`,
+      )
+      await this.jobService.updateJobStatus(stalledStartupJob.id, JobStatus.COMPLETED)
+      return
+    }
+
+    if (box.desiredState == BoxDesiredState.DESTROYED) {
+      this.logger.debug(`Box ${boxId} is already DESTROYED, skipping state update`)
+      return
+    }
+
+    const oldState = box.state
+    const oldDesiredState = box.desiredState
+
+    const updateData: Partial<Box> = {
+      state: newState,
+      recoverable: false,
+    }
+
+    if (errorReason !== undefined) {
+      updateData.errorReason = errorReason
+      if (newState === BoxState.ERROR) {
+        updateData.recoverable = recoverable
+      }
+    }
+
+    //  we need to update the desired state to match the new state
+    const desiredState = this.getExpectedDesiredStateForState(newState)
+    if (desiredState) {
+      updateData.desiredState = desiredState
+    }
+
+    await this.boxRepository.updateWhere(box.id, {
+      updateData,
+      whereCondition: { pending: false, state: oldState, desiredState: oldDesiredState },
+    })
+  }
+
+  @OnEvent(WarmPoolEvents.TOPUP_REQUESTED)
+  private async createWarmPoolBox(event: WarmPoolTopUpRequested) {
+    await this.createForWarmPool(event.warmPool)
+  }
+
+  @Cron(CronExpression.EVERY_MINUTE, { name: 'handle-unschedulable-runners' })
+  @LogExecution('handle-unschedulable-runners')
+  @WithInstrumentation()
+  private async handleUnschedulableRunners() {
+    const runners = await this.runnerRepository.find({ where: { unschedulable: true } })
+
+    if (runners.length === 0) {
+      return
+    }
+
+    //  find all boxes that are using the unschedulable runners and have organizationId = '00000000-0000-0000-0000-000000000000'
+    const boxes = await this.boxRepository.find({
+      where: {
+        runnerId: In(runners.map((runner) => runner.id)),
+        organizationId: '00000000-0000-0000-0000-000000000000',
+        state: BoxState.STARTED,
+        desiredState: Not(BoxDesiredState.DESTROYED),
+      },
+    })
+
+    if (boxes.length === 0) {
+      return
+    }
+
+    const destroyPromises = boxes.map((box) => this.destroy(box.id, undefined, 'warm_pool'))
+    const results = await Promise.allSettled(destroyPromises)
+
+    // Log any failed box destructions
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        this.logger.error(`Failed to destroy box ${boxes[index].id}: ${result.reason}`)
+      }
+    })
+  }
+
+  async isBoxPublic(boxId: string): Promise<boolean> {
+    const box = await this.boxRepository.findOne({
+      where: { id: boxId },
+    })
+
+    if (!box) {
+      throw new NotFoundException(`Box with ID ${boxId} not found`)
+    }
+
+    return box.public
+  }
+
+  @OnEvent(OrganizationEvents.SUSPENDED_BOX_STOPPED)
+  async handleSuspendedBoxStopped(event: OrganizationSuspendedBoxStoppedEvent) {
+    await this.stop(event.boxId, undefined, 'org_suspension').catch((error) => {
+      //  log the error for now, but don't throw it as it will be retried
+      this.logger.error(`Error stopping box from suspended organization. BoxId: ${event.boxId}: `, error)
+    })
+  }
+
+  private minutesToSeconds(interval: number): number {
+    if (!Number.isInteger(interval) || interval < 0) {
+      throw new BadRequestError('Interval must be a non-negative integer number of minutes')
+    }
+
+    return interval * 60
+  }
+
+  private resolveLifecyclePolicy(input: { autoStop?: number; autoDelete?: number; autoResume?: boolean }): {
+    autoStop: number
+    autoDelete: number
+    autoResume: boolean
+  } {
+    const autoStop = input.autoStop ?? DEFAULT_AUTO_STOP_SECONDS
+    const autoDelete = input.autoDelete ?? AUTO_DELETE_DISABLED
+    const autoResume = input.autoResume ?? DEFAULT_AUTO_RESUME
+
+    if (!Number.isInteger(autoStop) || autoStop < AUTO_STOP_DISABLED) {
+      throw new BadRequestError('Auto-stop interval must be a non-negative integer number of seconds')
+    }
+    if (autoStop !== AUTO_STOP_DISABLED && autoStop < MIN_AUTO_STOP_SECONDS) {
+      throw new BadRequestError(
+        `Auto-stop interval must be 0 (disabled) or at least ${MIN_AUTO_STOP_SECONDS} seconds; shorter windows cannot be kept alive by proxy traffic`,
+      )
+    }
+    if (!Number.isInteger(autoDelete) || autoDelete < AUTO_DELETE_DISABLED) {
+      throw new BadRequestError('Auto-delete interval must be a non-negative integer number of seconds')
+    }
+
+    return { autoStop, autoDelete, autoResume }
+  }
+
+  private resolveNetworkAllowList(networkAllowList: string): string {
+    try {
+      validateNetworkAllowList(networkAllowList)
+    } catch (error) {
+      throw new BadRequestError(error instanceof Error ? error.message : 'Invalid network allow list')
+    }
+
+    return networkAllowList
+  }
+
+  private resolveVolumes(volumes: BoxVolume[]): BoxVolume[] {
+    try {
+      validateMountPaths(volumes)
+    } catch (error) {
+      throw new BadRequestError(error instanceof Error ? error.message : 'Invalid volume mount configuration')
+    }
+
+    try {
+      validateSubpaths(volumes)
+    } catch (error) {
+      throw new BadRequestError(error instanceof Error ? error.message : 'Invalid volume subpath configuration')
+    }
+
+    return volumes
+  }
+}
+
+function encodeDirectPreviewBoxId(boxId: string): string {
+  return `d-${Buffer.from(boxId, 'utf8').toString('hex')}`
+}

@@ -1,0 +1,470 @@
+import asyncio
+import hashlib
+import json
+
+from fastapi.testclient import TestClient
+import pytest
+
+from nebula.v3.browser_engine import BrowserEngineAction, BrowserEngineReceipt
+from nebula.v3.browserd import (
+    ActionLedger,
+    BrowserdIdentityReceipt,
+    BrowserdLifecycleReceipt,
+    BrowserdManager,
+    BrowserdSettings,
+    create_browserd_app,
+)
+from nebula.v3.domain import BrowserEngineCapability, BrowserEngineState
+
+
+def settings(tmp_path, *, headless: bool = False) -> BrowserdSettings:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    return BrowserdSettings(
+        token="opaque-browserd-token",
+        profile_root=tmp_path / "profiles",
+        policy_proxy_url="http://127.0.0.1:4911",
+        runtime_root=runtime,
+        headless=headless,
+    )
+
+
+def action(token: str = "action-1", *, url: str = "https://app.example.test/"):
+    return BrowserEngineAction(
+        action_token=token,
+        assessment_id="assessment-1",
+        session_id="session-1",
+        identity_id="identity-1",
+        tab_id="tab-1",
+        kind="navigate",
+        arguments={"url": url},
+        side_effect="possible",
+    )
+
+
+def test_browserd_settings_require_a_literal_loopback_policy_proxy(tmp_path):
+    with pytest.raises(ValueError, match="literal loopback"):
+        BrowserdSettings(
+            token="token",
+            profile_root=tmp_path / "profiles",
+            policy_proxy_url="http://proxy.example.test:4911",
+            runtime_root=tmp_path / "runtime",
+        )
+
+
+def test_browserd_uploads_are_confined_to_an_explicit_host_browser(tmp_path):
+    configured = settings(tmp_path)
+    manager = BrowserdManager(configured)
+    with pytest.raises(ValueError, match="not configured"):
+        manager._upload_path(tmp_path / "outside.txt")
+
+    upload_root = tmp_path / "uploads"
+    upload_root.mkdir()
+    selected = upload_root / "selected.txt"
+    selected.write_text("fixture", encoding="utf-8")
+    bounded = BrowserdManager(
+        BrowserdSettings(
+            token=configured.token,
+            profile_root=configured.profile_root,
+            policy_proxy_url=configured.policy_proxy_url,
+            runtime_root=configured.runtime_root,
+            upload_root=upload_root,
+        )
+    )
+    assert bounded._upload_path(str(selected)) == selected
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    with pytest.raises(ValueError, match="outside"):
+        bounded._upload_path(str(outside))
+
+
+def test_action_ledger_deduplicates_receipts_and_marks_interrupted_work_ambiguous(
+    tmp_path,
+):
+    async def exercise():
+        ledger = ActionLedger(tmp_path / "ledger" / "actions.sqlite3")
+        proposed = action()
+        assert await ledger.claim(proposed) is None
+        interrupted = await ledger.claim(proposed)
+        assert interrupted is not None
+        assert interrupted.state == "ambiguous"
+        complete = BrowserEngineReceipt(
+            action_token=proposed.action_token,
+            state="complete",
+            page_url="https://app.example.test/",
+        )
+        await ledger.finish(complete)
+        assert await ledger.claim(proposed) == complete
+        with pytest.raises(ValueError, match="different arguments"):
+            await ledger.claim(action(url="https://app.example.test/changed"))
+
+    asyncio.run(exercise())
+
+
+class FakeBrowserdManager:
+    def __init__(self) -> None:
+        self.started = False
+        self.closed = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def readiness(self) -> BrowserEngineCapability:
+        return BrowserEngineCapability(
+            adapter="managed-chromium",
+            display_name="Managed Chromium",
+            state=BrowserEngineState.READY,
+            installed_version="test",
+            digest=f"sha256:{'a' * 64}",
+            actions=["navigate"],
+            protocols=["http", "https"],
+        )
+
+    async def ensure_identity(self, identity_id: str) -> BrowserdIdentityReceipt:
+        return BrowserdIdentityReceipt(identity_id=identity_id, tab_ids=["tab-1"])
+
+    async def execute(self, request: BrowserEngineAction) -> BrowserEngineReceipt:
+        return BrowserEngineReceipt(
+            action_token=request.action_token,
+            state="complete",
+            page_url="https://app.example.test/",
+        )
+
+    async def lifecycle(
+        self, assessment_id: str, state: str
+    ) -> BrowserdLifecycleReceipt:
+        return BrowserdLifecycleReceipt(assessment_id=assessment_id, state=state)
+
+
+def test_browserd_api_is_authenticated_and_exposes_normalized_receipts(tmp_path):
+    configured = settings(tmp_path)
+    manager = FakeBrowserdManager()
+    with TestClient(
+        create_browserd_app(configured, manager=manager)  # type: ignore[arg-type]
+    ) as client:
+        assert client.get("/v1/readiness").status_code == 401
+        headers = {"Authorization": f"Bearer {configured.token}"}
+        readiness = client.get("/v1/readiness", headers=headers)
+        assert readiness.status_code == 200
+        assert readiness.json()["state"] == "ready"
+        identity = client.post(
+            "/v1/identities/ensure",
+            headers=headers,
+            json={"identity_id": "identity-1"},
+        )
+        assert identity.json()["tab_ids"] == ["tab-1"]
+        receipt = client.post(
+            "/v1/actions", headers=headers, json=action().model_dump(mode="json")
+        )
+        assert receipt.status_code == 200
+        assert receipt.json()["action_token"] == "action-1"
+        stopped = client.post(
+            "/v1/assessments/assessment-1/stop", headers=headers, json={}
+        )
+        assert stopped.json() == {
+            "assessment_id": "assessment-1",
+            "state": "stopped",
+        }
+    assert manager.started is True
+    assert manager.closed is True
+
+
+class FakeChromium:
+    def __init__(self, executable_path: str) -> None:
+        self.executable_path = executable_path
+
+
+class FakePlaywright:
+    def __init__(self, executable_path: str) -> None:
+        self.chromium = FakeChromium(executable_path)
+
+    async def stop(self) -> None:
+        return None
+
+
+class FakePlaywrightStarter:
+    def __init__(self, executable_path: str) -> None:
+        self.playwright = FakePlaywright(executable_path)
+
+    async def start(self) -> FakePlaywright:
+        return self.playwright
+
+
+def test_browserd_readiness_requires_manifest_bound_full_chromium(tmp_path):
+    configured = settings(tmp_path)
+    executable = configured.runtime_root / "chromium-test" / "chrome-linux" / "chrome"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"verified full chromium")
+    executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
+    (configured.runtime_root / "nebula-playwright-runtime.json").write_text(
+        json.dumps(
+            {
+                "browser": "chromium",
+                "playwright_version": "1.61.0",
+                "executables": ["chromium-test/chrome-linux/chrome"],
+                "executable_sha256": {
+                    "chromium-test/chrome-linux/chrome": executable_sha256
+                },
+                "sbom": "nebula-playwright-sbom.spdx.json",
+                "provenance": {"installer": "python -m playwright install chromium"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = BrowserdManager(
+        configured,
+        playwright_factory=lambda: FakePlaywrightStarter(str(executable)),
+    )
+
+    async def exercise():
+        await manager.start()
+        capability = await manager.readiness()
+        await manager.close()
+        return capability
+
+    capability = asyncio.run(exercise())
+    assert capability.state == BrowserEngineState.READY
+    assert capability.digest == f"sha256:{executable_sha256}"
+    assert "cdp-screencast" in capability.protocols
+
+
+def test_companion_page_timeout_is_sanitized_and_not_an_unhandled_500(
+    tmp_path, monkeypatch
+):
+    from nebula.v3 import browserd
+    from playwright.async_api import TimeoutError as BrowserTimeoutError
+
+    configured = settings(tmp_path)
+    manager = BrowserdManager(configured)
+
+    async def timed_out(*args):
+        raise BrowserTimeoutError("private page URL and protected contents")
+
+    monkeypatch.setattr(browserd, "companion_operate", timed_out)
+    client = TestClient(create_browserd_app(configured, manager=manager))
+    response = client.post(
+        "/v1/companion/identity",
+        headers={"Authorization": "Bearer opaque-browserd-token"},
+        json={"operation": "navigate", "url": "https://example.test/", "tab_id": "tab"},
+    )
+    assert response.status_code == 504
+    assert "retry" in response.json()["detail"]
+    assert "private" not in response.text
+    assert (
+        client.post("/v1/companion/identity", json={"operation": "tabs"}).status_code
+        == 401
+    )
+
+
+def test_companion_tabs_success_preserves_identity_and_page_contents(
+    tmp_path, monkeypatch
+):
+    configured = settings(tmp_path)
+    manager = BrowserdManager(configured)
+
+    class Page:
+        url = "https://example.test/"
+
+        def is_closed(self):
+            return False
+
+        async def title(self):
+            return "Account protected-secret"
+
+    async def ensure_identity(identity_id):
+        return BrowserdIdentityReceipt(identity_id=identity_id, tab_ids=["tab-1"])
+
+    async def page_for_screencast(identity_id, tab_id):
+        assert identity_id == "identity"
+        assert tab_id == "tab-1"
+        return Page()
+
+    monkeypatch.setattr(manager, "ensure_identity", ensure_identity)
+    monkeypatch.setattr(manager, "page_for_screencast", page_for_screencast)
+    client = TestClient(create_browserd_app(configured, manager=manager))
+    for payload in [
+        {"operation": "tabs", "protected_values": ["protected-secret"]},
+        {"operation": "tabs"},
+    ]:
+        response = client.post(
+            "/v1/companion/identity",
+            headers={"Authorization": "Bearer opaque-browserd-token"},
+            json=payload,
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "tabs": [
+                {
+                    "id": "tab-1",
+                    "url": "https://example.test/",
+                    "title": "Account protected-secret",
+                }
+            ]
+        }
+        assert "protected-secret" in response.text
+
+
+def verified_runtime(configured: BrowserdSettings):
+    executable = configured.runtime_root / "chromium-test" / "chrome-linux" / "chrome"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"verified full chromium")
+    (configured.runtime_root / "nebula-playwright-runtime.json").write_text(
+        json.dumps(
+            {
+                "browser": "chromium",
+                "playwright_version": "1.61.0",
+                "executables": ["chromium-test/chrome-linux/chrome"],
+                "executable_sha256": {
+                    "chromium-test/chrome-linux/chrome": hashlib.sha256(
+                        executable.read_bytes()
+                    ).hexdigest()
+                },
+                "sbom": "nebula-playwright-sbom.spdx.json",
+                "provenance": {"installer": "python -m playwright install chromium"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return executable
+
+
+class FakePage:
+    """Mimics the Playwright page surface browserd touches for tab bookkeeping."""
+
+    def __init__(self, context, url: str = "about:blank") -> None:
+        self.context = context
+        self.url = url
+        self.closed = False
+        self._handlers: dict[str, list] = {}
+
+    def on(self, event: str, handler) -> None:
+        self._handlers.setdefault(event, []).append(handler)
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def title(self) -> str:
+        if self.closed:
+            raise RuntimeError("Target page, context or browser has been closed")
+        return f"Title of {self.url}"
+
+    async def close(self) -> None:
+        # Mirrors Ctrl+W in the headed window: the page closes and Playwright
+        # emits ``close`` for it.
+        self.closed = True
+        self.context.pages.remove(self)
+        for handler in self._handlers.get("close", []):
+            handler(self)
+
+
+class FakeTracing:
+    async def start(self, **kwargs) -> None:
+        return None
+
+
+class FakeContext:
+    def __init__(self) -> None:
+        self.pages: list[FakePage] = []
+        self.tracing = FakeTracing()
+        self._handlers: dict[str, list] = {}
+
+    def on(self, event: str, handler) -> None:
+        self._handlers.setdefault(event, []).append(handler)
+
+    async def new_page(self) -> FakePage:
+        return self.open_page("about:blank")
+
+    def open_page(self, url: str) -> FakePage:
+        # A site-opened popup and ``context.new_page`` both surface through the
+        # context ``page`` event before the opener observes the new page.
+        page = FakePage(self, url)
+        self.pages.append(page)
+        for handler in self._handlers.get("page", []):
+            handler(page)
+        return page
+
+
+class LaunchingFakeChromium(FakeChromium):
+    def __init__(self, executable_path: str) -> None:
+        super().__init__(executable_path)
+        self.contexts: list[FakeContext] = []
+
+    async def launch_persistent_context(self, profile: str, **kwargs) -> FakeContext:
+        context = FakeContext()
+        self.contexts.append(context)
+        return context
+
+
+class LaunchingFakePlaywright(FakePlaywright):
+    def __init__(self, executable_path: str) -> None:
+        super().__init__(executable_path)
+        self.chromium = LaunchingFakeChromium(executable_path)
+
+
+def test_closed_tabs_are_forgotten_and_popups_are_listed(tmp_path):
+    from nebula.v3.browser_companion import CompanionRequest
+    from nebula.v3.browser_companion_runtime import operate
+
+    configured = settings(tmp_path)
+    executable = verified_runtime(configured)
+    playwright = LaunchingFakePlaywright(str(executable))
+    starter = FakePlaywrightStarter(str(executable))
+    starter.playwright = playwright
+    manager = BrowserdManager(configured, playwright_factory=lambda: starter)
+
+    async def exercise():
+        await manager.start()
+        assert (await manager.readiness()).state == BrowserEngineState.READY
+        receipt = await manager.ensure_identity("identity-1")
+        (first_id,) = receipt.tab_ids
+        context = playwright.chromium.contexts[0]
+
+        opened = await operate(
+            manager, "identity-1", CompanionRequest(operation="new_tab")
+        )
+        second_id = opened["active_tab_id"]
+        assert [tab["id"] for tab in opened["tabs"]] == [first_id, second_id]
+        assert len(context.pages) == 2
+
+        # The operator closes the second tab from the Chromium window.
+        await manager._tabs[("identity-1", second_id)].close()
+        listed = await operate(
+            manager, "identity-1", CompanionRequest(operation="tabs")
+        )
+        assert [tab["id"] for tab in listed["tabs"]] == [first_id]
+        assert ("identity-1", second_id) not in manager._tabs
+
+        # A site-opened popup is registered and listed alongside the opener.
+        popup = context.open_page("https://popup.example.test/")
+        listed = await operate(
+            manager, "identity-1", CompanionRequest(operation="tabs")
+        )
+        assert [tab["url"] for tab in listed["tabs"]] == [
+            "about:blank",
+            "https://popup.example.test/",
+        ]
+        popup_id = listed["tabs"][1]["id"]
+        assert manager._tabs[("identity-1", popup_id)] is popup
+
+        # A page whose close event has not been delivered yet is skipped, not
+        # allowed to wedge the listing.
+        popup.closed = True
+        listed = await operate(
+            manager, "identity-1", CompanionRequest(operation="tabs")
+        )
+        assert [tab["id"] for tab in listed["tabs"]] == [first_id]
+        with pytest.raises(ValueError, match="does not belong"):
+            await manager.page_for_screencast("identity-1", popup_id)
+
+        # Opening a tab after all of this still yields exactly one new id.
+        opened = await operate(
+            manager, "identity-1", CompanionRequest(operation="new_tab")
+        )
+        assert len(opened["tabs"]) == 2
+        assert len({tab["id"] for tab in opened["tabs"]}) == 2
+        await manager.close()
+
+    asyncio.run(exercise())

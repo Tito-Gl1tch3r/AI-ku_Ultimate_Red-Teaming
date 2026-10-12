@@ -1,0 +1,451 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.ARM32
+
+open System
+open B2R2
+open B2R2.FrontEnd.BinLifter
+open B2R2.FrontEnd.ARM32.OperandParsingHelper
+
+module private ParsingMain =
+  let parseARM (span: ByteSpan) (phlp: ParsingHelper) =
+    let bin = phlp.BinReader.ReadUInt32(span, 0)
+    phlp.Len <- 4u
+    ARMParser.parse phlp bin
+
+  let parseThumb span phlp (itstate: byref<byte list>) =
+    ThumbParser.parse span phlp &itstate
+
+  /// The bits of an instruction read as one word: an A32 word as it is, and a
+  /// 32-bit T32 one with its first halfword on top.
+  let wordOf (span: ByteSpan) (phlp: ParsingHelper) (ins: Instruction) =
+    let reader = phlp.BinReader
+    if not ins.IsThumb then
+      reader.ReadUInt32(span, 0)
+    elif ins.Length = 4u then
+      (uint32 (reader.ReadUInt16(span, 0)) <<< 16)
+      ||| uint32 (reader.ReadUInt16(span, 2))
+    else
+      uint32 (reader.ReadUInt16(span, 0))
+
+  /// One ITAdvance step: shifts IT[4:0] left, returning 0 once the block ends
+  /// (IT[2:0] = 0 marks the last instruction).
+  let itAdvance (st: byte) =
+    if st &&& 0b111uy = 0uy then 0uy
+    else (st &&& 0b11100000uy) ||| (((st &&& 0b11111uy) <<< 1) &&& 0b11111uy)
+
+  /// Walks ITAdvance from a packed ITSTATE byte, prepending IT[7:4] at each
+  /// step, until IT[3:0] = 0 marks the end of the block.
+  let rec unfoldITState st acc =
+    if st &&& 0b1111uy = 0uy then List.rev acc
+    else unfoldITState (itAdvance st) (((st >>> 4) &&& 0b1111uy) :: acc)
+
+  /// Reconstructs the remaining per-instruction condition list from a packed
+  /// ARM ITSTATE byte (IT[7:0]), the same encoding CPSR/APSR holds: it walks
+  /// ITAdvance, emitting IT[7:4] as each instruction's condition. An out-of-IT
+  /// value (IT[3:0] = 0) yields the empty list.
+  let unpackITState (it: byte) = unfoldITState it []
+
+  /// Packs the remaining per-instruction condition list back into IT[7:0]: the
+  /// head's high bits give IT[7:5], each condition's low bit gives IT[4],
+  /// IT[3], ... in turn, and a terminating 1 marks the block's remaining
+  /// length. Inverse of unpackITState; [] packs to 0 (not in an IT block).
+  let packITState (conds: byte list) =
+    match conds with
+    | [] ->
+      0uy
+    | c0 :: _ ->
+      let k = List.length conds
+      let hi = (c0 &&& 0b1110uy) <<< 4
+      let mutable m = 0uy
+      conds |> List.iteri (fun i c ->
+        if c &&& 1uy = 1uy then m <- m ||| (1uy <<< (4 - i)) else ()
+      )
+      hi ||| (m &&& 0b11111uy) ||| (1uy <<< (4 - k))
+
+/// Represents a parser for 32-bit ARM instructions.
+type Parser(isa: ISA, isThumb, reader) =
+
+  let oparsers =
+    [| OprNo() :> OperandParser
+       OprBankregRnA() :> OperandParser
+       OprCoprocCRdMem() :> OperandParser
+       OprCpOpc1CRdCRnCRmOpc2() :> OperandParser
+       OprCpOpc1RtCRnCRmOpc2() :> OperandParser
+       OprCpOpc1RtRt2CRm() :> OperandParser
+       OprDd0Rt() :> OperandParser
+       OprDd1Rt() :> OperandParser
+       OprDd2Rt() :> OperandParser
+       OprDd3Rt() :> OperandParser
+       OprDd4Rt() :> OperandParser
+       OprDd5Rt() :> OperandParser
+       OprDd6Rt() :> OperandParser
+       OprDd7Rt() :> OperandParser
+       OprDdDm() :> OperandParser
+       OprDdDmDn() :> OperandParser
+       OprDdDmFbits() :> OperandParser
+       OprDdDmImm() :> OperandParser
+       OprDdDmImm0() :> OperandParser
+       OprDdDmImmLeft() :> OperandParser
+       OprDdDmx() :> OperandParser
+       OprDdDnDm() :> OperandParser
+       OprDdDnDm0Rotate() :> OperandParser
+       OprDdDnDmidx() :> OperandParser
+       OprDdDnDmidxRotate() :> OperandParser
+       OprDdDnDmImm() :> OperandParser
+       OprDdDnDmRotate() :> OperandParser
+       OprDdDnDmx() :> OperandParser
+       OprDdImm0() :> OperandParser
+       OprDdImm8A() :> OperandParser
+       OprDdImm16A() :> OperandParser
+       OprDdImm32A() :> OperandParser
+       OprDdImm64A() :> OperandParser
+       OprDdImmF32A() :> OperandParser
+       OprDdLabel() :> OperandParser
+       OprDdListDm() :> OperandParser
+       OprDdmDdmFbits() :> OperandParser
+       OprDdMem() :> OperandParser
+       OprDdQm() :> OperandParser
+       OprDdQmImm() :> OperandParser
+       OprDdQnQm() :> OperandParser
+       OprDdRt() :> OperandParser
+       OprDdSm() :> OperandParser
+       OprDdSnSm() :> OperandParser
+       OprDdSnSmidx() :> OperandParser
+       OprDdVImm() :> OperandParser
+       OprDmRtRt2() :> OperandParser
+       OprEndianA() :> OperandParser
+       OprIflagsA() :> OperandParser
+       OprIflagsModeA() :> OperandParser
+       OprImm16A() :> OperandParser
+       OprImm1A() :> OperandParser
+       OprImm24() :> OperandParser
+       OprImm4A() :> OperandParser
+       OprLabel12A() :> OperandParser
+       OprLabelA() :> OperandParser
+       OprLabelH() :> OperandParser
+       OprListMem() :> OperandParser
+       OprListMem1() :> OperandParser
+       OprListMem2() :> OperandParser
+       OprListMem3() :> OperandParser
+       OprListMem4() :> OperandParser
+       OprListMemA() :> OperandParser
+       OprListMemB() :> OperandParser
+       OprListMemC() :> OperandParser
+       OprListMemD() :> OperandParser
+       OprMemImm() :> OperandParser
+       OprMemRegA() :> OperandParser
+       OprMode() :> OperandParser
+       OprOpt() :> OperandParser
+       OprP14C5Label() :> OperandParser
+       OprP14C5Mem() :> OperandParser
+       OprP14C5Option() :> OperandParser
+       OprQdDm() :> OperandParser
+       OprQdDmImm() :> OperandParser
+       OprQdDmImm16() :> OperandParser
+       OprQdDmImm32() :> OperandParser
+       OprQdDmImm8() :> OperandParser
+       OprQdDmx() :> OperandParser
+       OprQdDnDm() :> OperandParser
+       OprQdDnDmidx() :> OperandParser
+       OprQdDnDmx() :> OperandParser
+       OprQdImm8A() :> OperandParser
+       OprQdImm16A() :> OperandParser
+       OprQdImm32A() :> OperandParser
+       OprQdImm64A() :> OperandParser
+       OprQdImmF32A() :> OperandParser
+       OprQdQm() :> OperandParser
+       OprQdQmFbits() :> OperandParser
+       OprQdQmImm() :> OperandParser
+       OprQdQmImm0() :> OperandParser
+       OprQdQmImmLeft() :> OperandParser
+       OprQdQmQn() :> OperandParser
+       OprQdQnDm() :> OperandParser
+       OprQdQnDm0Rotate() :> OperandParser
+       OprQdQnDmidx() :> OperandParser
+       OprQdQnDmidxm() :> OperandParser
+       OprQdQnDmidxRotate() :> OperandParser
+       OprQdQnDmx() :> OperandParser
+       OprQdQnQm() :> OperandParser
+       OprQdQnQmImm() :> OperandParser
+       OprQdQnQmRotate() :> OperandParser
+       OprQdRt() :> OperandParser
+       OprRdBankregA() :> OperandParser
+       OprRdConstA() :> OperandParser
+       OprRdConstCF() :> OperandParser
+       OprRdImm16A() :> OperandParser
+       OprRdImmRnA() :> OperandParser
+       OprRdImmRnShfA() :> OperandParser
+       OprRdImmRnShfUA() :> OperandParser
+       OprRdImmRnUA() :> OperandParser
+       OprRdLabelA() :> OperandParser
+       OprRdlRdhRnRmA() :> OperandParser
+       OprRdLsbWidthA() :> OperandParser
+       OprRdRm() :> OperandParser
+       OprRdRmImmA() :> OperandParser
+       OprRdRmRnA() :> OperandParser
+       OprRdRmRorA() :> OperandParser
+       OprRdRmRsA() :> OperandParser
+       OprRdRmShf() :> OperandParser
+       OprRdRmShfRsA() :> OperandParser
+       OprRdRnConstA() :> OperandParser
+       OprRdRnConstCF() :> OperandParser
+       OprRdRnLsbWidthA() :> OperandParser
+       OprRdRnLsbWidthM1A() :> OperandParser
+       OprRdRnRm() :> OperandParser
+       OprRdRnRmOpt() :> OperandParser
+       OprRdRnRmRaA() :> OperandParser
+       OprRdRnRmRorA() :> OperandParser
+       OprRdRnRmShfA() :> OperandParser
+       OprRdRnRmShfRs() :> OperandParser
+       OprRdRtMemA() :> OperandParser
+       OprRdRtMemImmA() :> OperandParser
+       OprRdRtRt2MemA() :> OperandParser
+       OprRdSPConstA() :> OperandParser
+       OprRdSregA() :> OperandParser
+       OprRegs() :> OperandParser
+       OprRm() :> OperandParser
+       OprRn() :> OperandParser
+       OprRnConstA() :> OperandParser
+       OprRnConstCF() :> OperandParser
+       OprRnDreglist() :> OperandParser
+       OprRnRegsA() :> OperandParser
+       OprRnRegsUsr() :> OperandParser
+       OprRnRmShfA() :> OperandParser
+       OprRnRmShfRs() :> OperandParser
+       OprRnSreglist() :> OperandParser
+       OprRt15Mem() :> OperandParser
+       OprRtDn0() :> OperandParser
+       OprRtDn1() :> OperandParser
+       OprRtDn2() :> OperandParser
+       OprRtDn3() :> OperandParser
+       OprRtDn4() :> OperandParser
+       OprRtDn5() :> OperandParser
+       OprRtDn6() :> OperandParser
+       OprRtDn7() :> OperandParser
+       OprRtLabelA() :> OperandParser
+       OprRtLabelHL() :> OperandParser
+       OprRtMem() :> OperandParser
+       OprRtMemImm() :> OperandParser
+       OprRtMemImm0A() :> OperandParser
+       OprRtMemImm12A() :> OperandParser
+       OprRtMemImm12P() :> OperandParser
+       OprRtMemImmP() :> OperandParser
+       OprRtMemReg() :> OperandParser
+       OprRtMemRegP() :> OperandParser
+       OprRtMemShf() :> OperandParser
+       OprRtMemShfP() :> OperandParser
+       OprRtRt2Dm() :> OperandParser
+       OprRtRt2LabelA() :> OperandParser
+       OprRtRt2Mem2() :> OperandParser
+       OprRtRt2MemA() :> OperandParser
+       OprRtRt2MemImmA() :> OperandParser
+       OprRtRt2MemReg() :> OperandParser
+       OprRtRt2SmSm1() :> OperandParser
+       OprRtSn() :> OperandParser
+       OprRtSreg() :> OperandParser
+       OprSdDm() :> OperandParser
+       OprSdImm0() :> OperandParser
+       OprSdLabel() :> OperandParser
+       OprSdMem() :> OperandParser
+       OprSdmSdmFbits() :> OperandParser
+       OprSdSm() :> OperandParser
+       OprSdSnSm() :> OperandParser
+       OprSdVImm() :> OperandParser
+       OprSingleRegsA() :> OperandParser
+       OprSmSm1RtRt2() :> OperandParser
+       OprSnRt() :> OperandParser
+       OprSPMode() :> OperandParser
+       OprSregImm() :> OperandParser
+       OprSregRnA() :> OperandParser
+       OprSregRt() :> OperandParser
+       OprBankregRnT() :> OperandParser
+       OprCondition() :> OperandParser
+       OprDdDm0() :> OperandParser
+       OprDdImm8T() :> OperandParser
+       OprDdImm16T() :> OperandParser
+       OprDdImm32T() :> OperandParser
+       OprDdImm64T() :> OperandParser
+       OprDdImmF32T() :> OperandParser
+       OprEndianT() :> OperandParser
+       OprIflagsModeT() :> OperandParser
+       OprIflagsT16() :> OperandParser
+       OprIflagsT32() :> OperandParser
+       OprImm16T() :> OperandParser
+       OprImm1T() :> OperandParser
+       OprImm4T() :> OperandParser
+       OprImm6() :> OperandParser
+       OprImm8() :> OperandParser
+       OprLabel12T() :> OperandParser
+       OprLabel8() :> OperandParser
+       OprLabelT() :> OperandParser
+       OprLabelT2() :> OperandParser
+       OprLabelT3() :> OperandParser
+       OprLabelT4() :> OperandParser
+       OprMemImm12() :> OperandParser
+       OprMemImm8M() :> OperandParser
+       OprMemRegLSL() :> OperandParser
+       OprMemRegLSL1() :> OperandParser
+       OprMemRegT() :> OperandParser
+       OprOptImm() :> OperandParser
+       OprPCLRImm8() :> OperandParser
+       OprQdImm8T() :> OperandParser
+       OprQdImm16T() :> OperandParser
+       OprQdImm32T() :> OperandParser
+       OprQdImm64T() :> OperandParser
+       OprQdImmF32T() :> OperandParser
+       OprQdQm0() :> OperandParser
+       OprRdBankregT() :> OperandParser
+       OprRdConstT() :> OperandParser
+       OprRdImm16T() :> OperandParser
+       OprRdImm8() :> OperandParser
+       OprRdImmRnShfT() :> OperandParser
+       OprRdImmRnShfUT() :> OperandParser
+       OprRdImmRnT() :> OperandParser
+       OprRdImmRnU() :> OperandParser
+       OprRdLabelT() :> OperandParser
+       OprRdlRdhRnRmT() :> OperandParser
+       OprRdLsbWidthT() :> OperandParser
+       OprRdmRdmASRRs() :> OperandParser
+       OprRdmRdmLSLRs() :> OperandParser
+       OprRdmRdmLSRRs() :> OperandParser
+       OprRdmRdmRORRs() :> OperandParser
+       OprRdmRnRdm() :> OperandParser
+       OprRdmSPRdm() :> OperandParser
+       OprRdnImm8() :> OperandParser
+       OprRdnRdnRm() :> OperandParser
+       OprRdnRm() :> OperandParser
+       OprRdRmExt() :> OperandParser
+       OprRdRmImmT16() :> OperandParser
+       OprRdRmImmT32() :> OperandParser
+       OprRdRmRnT() :> OperandParser
+       OprRdRmRorT() :> OperandParser
+       OprRdRmRsT() :> OperandParser
+       OprRdRmShfT16() :> OperandParser
+       OprRdRmShfT32() :> OperandParser
+       OprRdRmT16() :> OperandParser
+       OprRdRmT32() :> OperandParser
+       OprRdRn0() :> OperandParser
+       OprRdRn0T32() :> OperandParser
+       OprRdRnConstT() :> OperandParser
+       OprRdRnImm12() :> OperandParser
+       OprRdRnImm3() :> OperandParser
+       OprRdRnLsbWidthM1T() :> OperandParser
+       OprRdRnLsbWidthT() :> OperandParser
+       OprRdRnRmRaT() :> OperandParser
+       OprRdRnRmRorT() :> OperandParser
+       OprRdRnRmShfT() :> OperandParser
+       OprRdRnRmT16() :> OperandParser
+       OprRdRnRmT32() :> OperandParser
+       OprRdRtMemImmT() :> OperandParser
+       OprRdRtMemT() :> OperandParser
+       OprRdRtRt2MemT() :> OperandParser
+       OprRdSPConstT() :> OperandParser
+       OprRdSPImm12() :> OperandParser
+       OprRdSPImm8() :> OperandParser
+       OprRdSPRmShf() :> OperandParser
+       OprRdSregT() :> OperandParser
+       OprRegsM() :> OperandParser
+       OprRegsP() :> OperandParser
+       OprRmT16() :> OperandParser
+       OprRmT32() :> OperandParser
+       OprRnConstT() :> OperandParser
+       OprRnLabel() :> OperandParser
+       OprRnRegsT16() :> OperandParser
+       OprRnRegsT32() :> OperandParser
+       OprRnRegsW() :> OperandParser
+       OprRnRm() :> OperandParser
+       OprRnRmExt() :> OperandParser
+       OprRnRmShfT() :> OperandParser
+       OprRtLabel12() :> OperandParser
+       OprRtLabelT() :> OperandParser
+       OprRtMemImm0T() :> OperandParser
+       OprRtMemImm1() :> OperandParser
+       OprRtMemImm12T() :> OperandParser
+       OprRtMemImm2() :> OperandParser
+       OprRtMemImm8() :> OperandParser
+       OprRtMemImm8M() :> OperandParser
+       OprRtMemImm8P() :> OperandParser
+       OprRtMemImmPr() :> OperandParser
+       OprRtMemImmPs() :> OperandParser
+       OprRtMemReg16() :> OperandParser
+       OprRtMemReg32() :> OperandParser
+       OprRtMemRegLSL() :> OperandParser
+       OprRtMemSP() :> OperandParser
+       OprRtRt2LabelT() :> OperandParser
+       OprRtRt2MemImmT() :> OperandParser
+       OprRtRt2MemT() :> OperandParser
+       OprSingleRegsT() :> OperandParser
+       OprSPSPImm7() :> OperandParser
+       OprSPSPRm() :> OperandParser
+       OprSregRnT() :> OperandParser
+       OprCsync() :> OperandParser |]
+
+  let mutable isThumb: bool = isThumb
+
+  let lifter =
+    { new ILiftable with
+        member _.Lift(ins, builder) = Lifter.translate ins builder
+        member _.Disasm(ins, builder) = Disasm.disasm ins builder; builder }
+
+  let phlp = ParsingHelper(isa.Arch, reader, oparsers, lifter)
+
+  let mutable itstate: byte list = []
+
+  interface IModeSwitchable with
+    member _.IsThumb with get() = isThumb and set v = isThumb <- v
+    member _.ITState
+      with get() = ParsingMain.packITState itstate
+      and set v = itstate <- ParsingMain.unpackITState v
+
+  interface IInstructionParsable with
+    member _.MaxInstructionSize = 4
+
+    member _.InstructionAlignment = if isThumb then 2 else 4
+
+    member _.Parse(span: ByteSpan, addr) =
+      try
+        phlp.IsThumb <- isThumb
+        phlp.InsAddr <- addr
+        let ins =
+          if isThumb then ParsingMain.parseThumb span phlp &itstate
+          else ParsingMain.parseARM span phlp
+        let bin = ParsingMain.wordOf span phlp ins
+        Features.check isa bin ins lifter :> IInstruction
+      with e when not (Terminator.isCritical e) ->
+        raise ParsingFailureException
+
+    member this.Parse(bs: byte[], addr) =
+      (this :> IInstructionParsable).Parse(ReadOnlySpan bs, addr)
+
+/// Represents a parsing mode switch between Thumb and ARM instructions.
+and IModeSwitchable =
+  /// Will this parser return Thumb instructions or ARM instructions?
+  abstract IsThumb: bool with get, set
+
+  /// ITState is a byte that represents the current state of the IT (If-Then)
+  /// block in Thumb mode. It is used to determine how many instructions are
+  /// left in the IT block and what their conditions are.
+  abstract ITState: byte with get, set

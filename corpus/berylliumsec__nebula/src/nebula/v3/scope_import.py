@@ -1,0 +1,894 @@
+"""Review-first, AI-assisted engagement scope imports."""
+
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import json
+from collections.abc import Callable
+from typing import Literal
+
+from pydantic import Field
+
+from .artifacts import ArtifactStore
+from .domain import (
+    ChatTokenUsage,
+    Engagement,
+    HarnessProfile,
+    NebulaModel,
+    ProviderProfile,
+    ScopeImport,
+    ScopeImportCandidate,
+    ScopeImportClassification,
+    ScopeImportProvenance,
+    ScopeImportStatus,
+    ScopeImportTargetType,
+    ScopePolicy,
+    utc_now,
+)
+from .harnesses import HarnessError, HarnessRuntimeService
+from .knowledge import (
+    DocumentTooLargeError,
+    ExtractedDocument,
+    ExtractedSection,
+    KnowledgeIngestionError,
+    MAX_DOCUMENT_BYTES,
+    extract_document,
+    safe_filename,
+)
+from .privacy import ProviderPrivacyViolation, validate_engagement_provider_privacy
+from .providers import (
+    ModelMessage,
+    ModelProvider,
+    ModelRequest,
+    ProviderError,
+    provider_from_profile,
+)
+from .storage import ConflictError, NebulaStore
+
+PROMPT_VERSION = "scope-import/v1"
+MAX_SCOPE_TEXT = 400_000
+MAX_CHUNK_CHARACTERS = 40_000
+MAX_CANDIDATES = 2_000
+INTERRUPTED_DETAIL = (
+    "Core restarted while the scope import was generating; upload the document again"
+)
+_CHUNK_WRAPPER = len(json.dumps({"sections": []}, separators=(",", ":")))
+_PART_LABEL_RESERVE = 24
+
+
+class ScopeImportError(RuntimeError):
+    def __init__(self, code: str, detail: str, *, status_code: int = 422) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+        self.status_code = status_code
+
+
+def _json_object(text: str) -> str:
+    clean = text.strip()
+    if clean.startswith("```"):
+        clean = clean.removeprefix("```json").removeprefix("```")
+        clean = clean.removesuffix("```").strip()
+    start, end = clean.find("{"), clean.rfind("}")
+    if start < 0 or end < start:
+        raise ScopeImportError(
+            "structured_response_invalid",
+            "harness did not return the required scope JSON",
+            status_code=502,
+        )
+    return clean[start : end + 1]
+
+
+class ScopeImportCreateRequest(NebulaModel):
+    engagement_id: str = Field(min_length=1, max_length=200)
+    backend_kind: Literal["provider", "harness"] = "provider"
+    provider_id: str | None = Field(default=None, max_length=200)
+    harness_profile_id: str | None = Field(default=None, max_length=200)
+    model: str = Field(min_length=1, max_length=500)
+    filename: str = Field(min_length=1, max_length=1024)
+    media_type: str | None = Field(default=None, max_length=200)
+    content_base64: str = Field(
+        min_length=1, max_length=4 * ((MAX_DOCUMENT_BYTES + 2) // 3)
+    )
+    cloud_confirmed: bool = False
+
+
+class ScopeImportApplyRequest(NebulaModel):
+    candidate_ids: list[str] = Field(default_factory=list, max_length=MAX_CANDIDATES)
+    expected_scope_revision: int = Field(ge=0)
+
+
+class ScopeImportApplyResult(NebulaModel):
+    scope: ScopePolicy
+    scope_import: ScopeImport
+
+
+class _ProposedCandidate(NebulaModel):
+    target_type: Literal["cidr", "domain", "url"]
+    classification: Literal["allowed", "excluded", "ambiguous"]
+    raw_value: str = Field(min_length=1, max_length=2048)
+    source_location: str = Field(default="document", max_length=500)
+    source_excerpt: str = Field(default="", max_length=1000)
+
+
+class _ExtractionOutput(NebulaModel):
+    candidates: list[_ProposedCandidate] = Field(
+        default_factory=list, max_length=MAX_CANDIDATES
+    )
+    warnings: list[str] = Field(default_factory=list, max_length=200)
+
+
+class ScopeImportService:
+    def __init__(
+        self,
+        *,
+        store: NebulaStore,
+        artifact_store: ArtifactStore,
+        provider_factory: Callable[
+            [ProviderProfile], ModelProvider
+        ] = provider_from_profile,
+        operator_id: Callable[[], str] = lambda: "local-operator",
+        harness_runtime: HarnessRuntimeService | None = None,
+    ) -> None:
+        self.store = store
+        self.artifact_store = artifact_store
+        self.provider_factory = provider_factory
+        self.operator_id = operator_id
+        self.harness_runtime = harness_runtime
+
+    async def create(
+        self,
+        *,
+        engagement_id: str,
+        backend_kind: Literal["provider", "harness"] = "provider",
+        provider_id: str | None,
+        harness_profile_id: str | None = None,
+        model: str,
+        filename: str,
+        data: bytes,
+        media_type: str | None,
+        cloud_confirmed: bool,
+    ) -> ScopeImport:
+        engagement = self.store.get(Engagement, engagement_id)
+        profile: ProviderProfile | HarnessProfile
+        if backend_kind == "harness":
+            if self.harness_runtime is None or not harness_profile_id or provider_id:
+                raise ScopeImportError(
+                    "configuration_invalid",
+                    "harness scope import requires harness_profile_id and no provider_id",
+                )
+            profile = self.store.get(HarnessProfile, harness_profile_id)
+            self._validate_harness(engagement, profile, model, cloud_confirmed)
+        else:
+            if not provider_id or harness_profile_id:
+                raise ScopeImportError(
+                    "configuration_invalid",
+                    "provider scope import requires provider_id and no harness_profile_id",
+                )
+            profile = self.store.get(ProviderProfile, provider_id)
+            self._validate_provider(engagement, profile, model, cloud_confirmed)
+        clean_name = safe_filename(filename)
+        extracted = extract_document(data, filename=clean_name, media_type=media_type)
+        extracted_size = sum(len(section.text) for section in extracted.sections)
+        if extracted_size > MAX_SCOPE_TEXT:
+            raise DocumentTooLargeError(
+                "scope import text exceeds the 400,000 character limit"
+            )
+        stored = self.artifact_store.put_bytes_with_status(
+            data,
+            engagement_id=engagement.id,
+            filename=clean_name,
+            media_type=extracted.media_type,
+            source="scope-import",
+            metadata={"prompt_version": PROMPT_VERSION},
+        )
+        current_scope = (
+            self.store.get(ScopePolicy, engagement.scope_policy_id)
+            if engagement.scope_policy_id
+            else None
+        )
+        scope_import = ScopeImport(
+            engagement_id=engagement.id,
+            artifact_id=stored.artifact.id,
+            filename=clean_name,
+            source_type=extracted.source_type,
+            source_sha256=stored.artifact.sha256,
+            base_scope_revision=current_scope.revision if current_scope else 0,
+        )
+        try:
+            self.store.create_many([stored.artifact, scope_import])
+        except Exception:
+            self.artifact_store.discard_new_blob(stored)
+            raise
+        try:
+            if backend_kind == "harness":
+                assert isinstance(profile, HarnessProfile)
+                return await self._generate_harness(
+                    scope_import, extracted, profile, model
+                )
+            assert isinstance(profile, ProviderProfile)
+            return await self._generate(scope_import, extracted, profile, model)
+        except Exception as exc:
+            current = self.store.get(ScopeImport, scope_import.id)
+            if current.status == ScopeImportStatus.GENERATING:
+                self.store.update(
+                    ScopeImport,
+                    current.id,
+                    {
+                        "status": ScopeImportStatus.FAILED,
+                        "error_detail": str(exc)[:4000],
+                    },
+                    expected_revision=current.revision,
+                )
+            if isinstance(exc, (ScopeImportError, KnowledgeIngestionError)):
+                # Document faults are the operator's to fix; only model and
+                # transport faults are reported as a provider failure.
+                raise
+            if isinstance(exc, (ProviderError, ValueError, json.JSONDecodeError)):
+                raise ScopeImportError("provider_failed", str(exc)) from exc
+            raise
+
+    async def _generate(
+        self,
+        scope_import: ScopeImport,
+        extracted: ExtractedDocument,
+        profile: ProviderProfile,
+        model: str,
+    ) -> ScopeImport:
+        provider = self.provider_factory(profile)
+        proposed: list[_ProposedCandidate] = []
+        warnings: list[str] = []
+        usage = ChatTokenUsage()
+        request_ids: list[str] = []
+        for chunk in _document_chunks(extracted):
+            request = ModelRequest(
+                model=model,
+                instructions="Extract scope targets using the supplied response schema.",
+                messages=[ModelMessage(role="user", content=chunk)],
+                response_schema=_ExtractionOutput.model_json_schema(),
+                max_output_tokens=8192,
+                temperature=0,
+                # Extraction into the schema needs no thinking, and thinking
+                # would spend the allowance the candidates need.
+                reasoning_effort="none",
+                metadata={
+                    "engagement_id": scope_import.engagement_id,
+                    "operation": "scope_import",
+                    "prompt_version": PROMPT_VERSION,
+                },
+            )
+            provider.require(request)
+            response = await provider.complete(request)
+            if response.provider_id != profile.id:
+                raise ScopeImportError(
+                    "provider_identity_mismatch",
+                    "provider response identity did not match the selected profile",
+                    status_code=502,
+                )
+            output = _ExtractionOutput.model_validate_json(response.text)
+            proposed.extend(output.candidates)
+            warnings.extend(output.warnings)
+            usage = ChatTokenUsage(
+                input_tokens=usage.input_tokens + response.usage.input_tokens,
+                output_tokens=usage.output_tokens + response.usage.output_tokens,
+                total_tokens=usage.total_tokens + response.usage.total_tokens,
+            )
+            if response.provider_request_id and len(request_ids) < 20:
+                request_ids.append(response.provider_request_id)
+            if len(proposed) > MAX_CANDIDATES:
+                raise ScopeImportError(
+                    "too_many_candidates",
+                    f"scope import exceeded the {MAX_CANDIDATES} candidate limit",
+                    status_code=413,
+                )
+        candidates, normalization_warnings = _normalize_candidates(
+            proposed,
+            source_text="\n".join(section.text for section in extracted.sections),
+        )
+        warnings.extend(normalization_warnings)
+        current = self.store.get(ScopeImport, scope_import.id)
+        return self.store.update(
+            ScopeImport,
+            current.id,
+            {
+                "status": ScopeImportStatus.READY,
+                "candidates": candidates,
+                "warnings": list(dict.fromkeys(warnings))[:2000],
+                "usage": usage,
+                "provenance": ScopeImportProvenance(
+                    provider_profile_id=profile.id,
+                    model=model,
+                    prompt_version=PROMPT_VERSION,
+                    source_sha256=current.source_sha256,
+                    provider_request_ids=request_ids,
+                ),
+            },
+            expected_revision=current.revision,
+        )
+
+    async def _generate_harness(
+        self,
+        scope_import: ScopeImport,
+        extracted: ExtractedDocument,
+        profile: HarnessProfile,
+        model: str,
+    ) -> ScopeImport:
+        if self.harness_runtime is None:
+            raise ScopeImportError(
+                "harness_unavailable", "harness runtime is unavailable"
+            )
+        proposed: list[_ProposedCandidate] = []
+        warnings: list[str] = []
+        usage = ChatTokenUsage()
+        request_ids: list[str] = []
+        prompt = (
+            "Extract scope targets from scope-chunk.json. Return one JSON object matching this schema:\n"
+            + json.dumps(_ExtractionOutput.model_json_schema(), separators=(",", ":"))
+        )
+        try:
+            for chunk in _document_chunks(extracted):
+                turn = await self.harness_runtime.analyze_structured(
+                    engagement_id=scope_import.engagement_id,
+                    profile_id=profile.id,
+                    model=model,
+                    prompt=prompt,
+                    files={"scope-chunk.json": chunk},
+                )
+                output = _ExtractionOutput.model_validate_json(
+                    _json_object(turn.response or "")
+                )
+                proposed.extend(output.candidates)
+                warnings.extend(output.warnings)
+                turn_usage = ChatTokenUsage.model_validate(turn.usage)
+                usage = ChatTokenUsage(
+                    input_tokens=usage.input_tokens + turn_usage.input_tokens,
+                    output_tokens=usage.output_tokens + turn_usage.output_tokens,
+                    total_tokens=usage.total_tokens + turn_usage.total_tokens,
+                )
+                if len(request_ids) < 20:
+                    request_ids.append(turn.id)
+                if len(proposed) > MAX_CANDIDATES:
+                    raise ScopeImportError(
+                        "too_many_candidates",
+                        f"scope import exceeded the {MAX_CANDIDATES} candidate limit",
+                        status_code=413,
+                    )
+        except HarnessError as exc:
+            raise ScopeImportError("harness_unavailable", str(exc)) from exc
+        candidates, normalization_warnings = _normalize_candidates(
+            proposed,
+            source_text="\n".join(section.text for section in extracted.sections),
+        )
+        warnings.extend(normalization_warnings)
+        current = self.store.get(ScopeImport, scope_import.id)
+        return self.store.update(
+            ScopeImport,
+            current.id,
+            {
+                "status": ScopeImportStatus.READY,
+                "candidates": candidates,
+                "warnings": list(dict.fromkeys(warnings))[:2000],
+                "usage": usage,
+                "provenance": ScopeImportProvenance(
+                    backend_kind="harness",
+                    provider_profile_id=profile.id,
+                    harness_profile_id=profile.id,
+                    model=model,
+                    prompt_version=PROMPT_VERSION,
+                    source_sha256=current.source_sha256,
+                    provider_request_ids=request_ids,
+                ),
+            },
+            expected_revision=current.revision,
+        )
+
+    def apply(
+        self, scope_import_id: str, request: ScopeImportApplyRequest
+    ) -> ScopeImportApplyResult:
+        scope_import = self.store.get(ScopeImport, scope_import_id)
+        if scope_import.status != ScopeImportStatus.READY:
+            raise ScopeImportError(
+                "import_not_ready",
+                "scope import is not ready to apply",
+                status_code=409,
+            )
+        engagement = self.store.get(Engagement, scope_import.engagement_id)
+        current_scope = (
+            self.store.get(ScopePolicy, engagement.scope_policy_id)
+            if engagement.scope_policy_id
+            else None
+        )
+        actual_revision = current_scope.revision if current_scope else 0
+        if actual_revision != request.expected_scope_revision:
+            raise ConflictError(
+                f"revision conflict: expected {request.expected_scope_revision}, found {actual_revision}"
+            )
+        by_id = {candidate.id: candidate for candidate in scope_import.candidates}
+        if len(set(request.candidate_ids)) != len(request.candidate_ids):
+            raise ScopeImportError("invalid_selection", "candidate IDs must be unique")
+        selected: list[ScopeImportCandidate] = []
+        for candidate_id in request.candidate_ids:
+            candidate = by_id.get(candidate_id)
+            if candidate is None:
+                raise ScopeImportError(
+                    "invalid_selection", f"unknown candidate ID: {candidate_id}"
+                )
+            if (
+                candidate.classification != ScopeImportClassification.ALLOWED
+                or not candidate.normalized_value
+            ):
+                raise ScopeImportError(
+                    "invalid_selection", "only valid allowed candidates may be applied"
+                )
+            selected.append(candidate)
+        cidrs = [
+            item.normalized_value
+            for item in selected
+            if item.target_type == ScopeImportTargetType.CIDR
+            and item.normalized_value is not None
+        ]
+        domains = [
+            item.normalized_value
+            for item in selected
+            if item.target_type == ScopeImportTargetType.DOMAIN
+            and item.normalized_value is not None
+        ]
+        urls = [
+            item.normalized_value
+            for item in selected
+            if item.target_type == ScopeImportTargetType.URL
+            and item.normalized_value is not None
+        ]
+        if current_scope:
+            candidate_payload = current_scope.model_dump(
+                exclude={"id", "created_at", "updated_at", "revision"}
+            )
+            candidate_payload.update(
+                allowed_cidrs=[*current_scope.allowed_cidrs, *cidrs],
+                allowed_domains=[*current_scope.allowed_domains, *domains],
+                allowed_urls=[*current_scope.allowed_urls, *urls],
+            )
+            candidate_scope = ScopePolicy(**candidate_payload)
+            changes = candidate_scope.model_dump(
+                exclude={"id", "engagement_id", "created_at", "updated_at", "revision"}
+            )
+            with self.store.transaction() as transaction:
+                scope = transaction.update(
+                    ScopePolicy,
+                    current_scope.id,
+                    changes,
+                    expected_revision=current_scope.revision,
+                )
+                completed = transaction.update(
+                    ScopeImport,
+                    scope_import.id,
+                    {
+                        "status": ScopeImportStatus.APPLIED,
+                        "applied_candidate_ids": request.candidate_ids,
+                        "applied_scope_policy_id": scope.id,
+                        "applied_scope_revision": scope.revision,
+                        "applied_at": utc_now(),
+                        "applied_by": self.operator_id(),
+                    },
+                    expected_revision=scope_import.revision,
+                )
+        else:
+            scope = ScopePolicy(
+                id=f"scope:{engagement.id}",
+                engagement_id=engagement.id,
+                allowed_cidrs=cidrs,
+                allowed_domains=domains,
+                allowed_urls=urls,
+            )
+            with self.store.transaction() as transaction:
+                transaction.add(scope)
+                transaction.update(
+                    Engagement,
+                    engagement.id,
+                    {"scope_policy_id": scope.id},
+                    expected_revision=engagement.revision,
+                )
+                completed = transaction.update(
+                    ScopeImport,
+                    scope_import.id,
+                    {
+                        "status": ScopeImportStatus.APPLIED,
+                        "applied_candidate_ids": request.candidate_ids,
+                        "applied_scope_policy_id": scope.id,
+                        "applied_scope_revision": scope.revision,
+                        "applied_at": utc_now(),
+                        "applied_by": self.operator_id(),
+                    },
+                    expected_revision=scope_import.revision,
+                )
+        return ScopeImportApplyResult(scope=scope, scope_import=completed)
+
+    async def startup(self) -> None:
+        """Fail imports the previous Core process left mid-generation."""
+
+        # Only readable records: one unreadable row must not keep Core from
+        # starting and settling the others.
+        for scope_import in self.store.iter_readable_entities(
+            ScopeImport, {"status": ScopeImportStatus.GENERATING.value}
+        ):
+            self.store.update(
+                ScopeImport,
+                scope_import.id,
+                {
+                    "status": ScopeImportStatus.FAILED,
+                    "error_detail": INTERRUPTED_DETAIL,
+                },
+                expected_revision=scope_import.revision,
+            )
+
+    async def shutdown(self) -> None:
+        return None
+
+    def discard(self, scope_import_id: str) -> ScopeImport:
+        scope_import = self.store.get(ScopeImport, scope_import_id)
+        if scope_import.status not in {
+            ScopeImportStatus.READY,
+            ScopeImportStatus.FAILED,
+        }:
+            raise ScopeImportError(
+                "import_not_ready",
+                "only a ready or failed scope import can be discarded",
+                status_code=409,
+            )
+        return self.store.update(
+            ScopeImport,
+            scope_import.id,
+            {
+                "status": ScopeImportStatus.DISCARDED,
+                "discarded_at": utc_now(),
+                "discarded_by": self.operator_id(),
+            },
+            expected_revision=scope_import.revision,
+        )
+
+    def _validate_provider(
+        self,
+        engagement: Engagement,
+        profile: ProviderProfile,
+        model: str,
+        cloud_confirmed: bool,
+    ) -> None:
+        if not profile.enabled:
+            raise ScopeImportError(
+                "provider_unavailable", "provider profile is disabled"
+            )
+        if not profile.capabilities.strict_structured_output:
+            raise ScopeImportError(
+                "structured_output_required",
+                "scope import requires a provider with strict structured output",
+            )
+        if profile.model_allowlist and model not in profile.model_allowlist:
+            raise ScopeImportError(
+                "model_not_allowed",
+                f"model {model!r} is outside the provider allowlist",
+            )
+        if not profile.is_local:
+            if not profile.privacy.permits_sensitive_data:
+                raise ScopeImportError(
+                    "privacy_denied",
+                    "provider profile does not permit engagement data transfer",
+                    status_code=409,
+                )
+            if not cloud_confirmed:
+                raise ScopeImportError(
+                    "cloud_confirmation_required",
+                    "explicit confirmation is required to send the scope document to a cloud provider",
+                    status_code=428,
+                )
+        try:
+            validate_engagement_provider_privacy(
+                self.store, engagement, self.provider_factory(profile)
+            )
+        except ProviderPrivacyViolation as exc:
+            raise ScopeImportError("privacy_denied", str(exc), status_code=409) from exc
+
+    def _validate_harness(
+        self,
+        engagement: Engagement,
+        profile: HarnessProfile,
+        model: str,
+        cloud_confirmed: bool,
+    ) -> None:
+        if not profile.enabled:
+            raise ScopeImportError("harness_unavailable", "harness profile is disabled")
+        if profile.capabilities.models and model not in profile.capabilities.models:
+            raise ScopeImportError(
+                "model_not_allowed",
+                f"model {model!r} is not supported by the harness",
+            )
+        if engagement.scope_policy_id:
+            scope = self.store.get(ScopePolicy, engagement.scope_policy_id)
+            if scope.local_only and not profile.privacy.local_only:
+                raise ScopeImportError(
+                    "privacy_denied",
+                    "engagement scope is local-only and cannot use this harness",
+                    status_code=409,
+                )
+        if not profile.privacy.local_only:
+            if not profile.privacy.permits_sensitive_data:
+                raise ScopeImportError(
+                    "privacy_denied",
+                    "harness profile does not permit engagement data transfer",
+                    status_code=409,
+                )
+            if not cloud_confirmed:
+                raise ScopeImportError(
+                    "cloud_confirmation_required",
+                    "explicit confirmation is required to send the scope document to a remote harness",
+                    status_code=428,
+                )
+
+
+def _encoded_length(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def _encode_chunk(items: list[dict[str, str]]) -> str:
+    return json.dumps({"sections": items}, ensure_ascii=False, separators=(",", ":"))
+
+
+def _split_section_text(text: str, budget: int) -> list[str]:
+    """Split text into pieces whose JSON string encoding fits within ``budget``."""
+
+    pieces: list[str] = []
+    start = 0
+    while start < len(text):
+        # JSON escaping only grows a string, so the raw budget bounds the search
+        # for the longest prefix whose encoding still fits.
+        low, high = start + 1, min(start + budget, len(text))
+        while low < high:
+            middle = (low + high + 1) // 2
+            if _encoded_length(text[start:middle]) <= budget:
+                low = middle
+            else:
+                high = middle - 1
+        end = low
+        if end < len(text):
+            minimum = start + max(1, (end - start) // 2)
+            boundary = max(
+                text.rfind("\n\n", minimum, end),
+                text.rfind("\n", minimum, end),
+                text.rfind(" ", minimum, end),
+            )
+            if boundary > start:
+                end = boundary + 1
+        piece = text[start:end]
+        if piece.strip():
+            pieces.append(piece)
+        start = end
+    return pieces
+
+
+def _section_items(index: int, section: ExtractedSection) -> list[dict[str, str]]:
+    """Return one chunk item per section, splitting sections the chunk cannot hold."""
+
+    location = section.location or (
+        f"page {section.page}" if section.page else f"section {index}"
+    )
+    item = {"location": location, "text": section.text}
+    budget = MAX_CHUNK_CHARACTERS - _CHUNK_WRAPPER
+    if _encoded_length(item) <= budget:
+        return [item]
+    overhead = _encoded_length({"location": location, "text": ""})
+    pieces = _split_section_text(
+        section.text, max(budget - overhead - _PART_LABEL_RESERVE, 1)
+    )
+    return [
+        {"location": f"{location}, part {number} of {len(pieces)}", "text": piece}
+        for number, piece in enumerate(pieces, start=1)
+    ]
+
+
+def _document_chunks(document: ExtractedDocument) -> list[str]:
+    chunks: list[str] = []
+    current: list[dict[str, str]] = []
+    current_size = _CHUNK_WRAPPER
+    for index, section in enumerate(document.sections, start=1):
+        for item in _section_items(index, section):
+            encoded = _encoded_length(item)
+            if current and current_size + encoded + 1 > MAX_CHUNK_CHARACTERS:
+                chunks.append(_encode_chunk(current))
+                current = []
+                current_size = _CHUNK_WRAPPER
+            current.append(item)
+            current_size += encoded + 1
+    if current:
+        chunks.append(_encode_chunk(current))
+    return chunks
+
+
+def _domain_covers(allowed: str, excluded: str) -> bool:
+    """Whether an allowed domain pattern authorizes an excluded host or pattern."""
+
+    if not allowed.startswith("*."):
+        return False
+    return excluded.removeprefix("*.").endswith(allowed[1:])
+
+
+def _covers_exclusion(
+    allowed: ScopeImportCandidate, excluded: ScopeImportCandidate
+) -> bool:
+    if (
+        allowed.target_type != excluded.target_type
+        or not allowed.normalized_value
+        or not excluded.normalized_value
+    ):
+        return False
+    if allowed.target_type == ScopeImportTargetType.CIDR:
+        wide = ipaddress.ip_network(allowed.normalized_value)
+        narrow = ipaddress.ip_network(excluded.normalized_value)
+        if wide.version != narrow.version:
+            return False
+        wide_first, wide_last = int(wide[0]), int(wide[-1])
+        narrow_first, narrow_last = int(narrow[0]), int(narrow[-1])
+        overlaps = wide_first <= narrow_last and narrow_first <= wide_last
+        # A narrower allowance inside a broad exclusion is a carve-out, not a
+        # conflict; an allowance that reaches into an exclusion is.
+        wide_inside_narrow = narrow_first <= wide_first and wide_last <= narrow_last
+        return overlaps and not wide_inside_narrow
+    if allowed.target_type == ScopeImportTargetType.DOMAIN:
+        return _domain_covers(allowed.normalized_value, excluded.normalized_value)
+    return False
+
+
+def _warn_about_covered_exclusions(
+    normalized: dict[tuple[str, str], ScopeImportCandidate], warnings: list[str]
+) -> None:
+    excluded = [
+        item
+        for item in normalized.values()
+        if item.classification == ScopeImportClassification.EXCLUDED
+    ]
+    for key, candidate in list(normalized.items()):
+        if candidate.classification != ScopeImportClassification.ALLOWED:
+            continue
+        covered = [
+            item.normalized_value
+            for item in excluded
+            if _covers_exclusion(candidate, item) and item.normalized_value
+        ]
+        if not covered:
+            continue
+        label = candidate.normalized_value or candidate.raw_value
+        for value in covered:
+            warnings.append(
+                f"{label}: covers excluded target {value}; the scope policy has no "
+                "exclusion list, so applying it also authorizes that target"
+            )
+        normalized[key] = candidate.model_copy(
+            update={
+                "warnings": list(
+                    dict.fromkeys(
+                        [
+                            *candidate.warnings,
+                            *(
+                                f"covers excluded target {value}; applying this "
+                                "candidate also authorizes it"
+                                for value in covered
+                            ),
+                        ]
+                    )
+                )[:20]
+            }
+        )
+
+
+def _normalize_candidates(
+    proposed: list[_ProposedCandidate], *, source_text: str
+) -> tuple[list[ScopeImportCandidate], list[str]]:
+    normalized: dict[tuple[str, str], ScopeImportCandidate] = {}
+    warnings: list[str] = []
+    source_folded = source_text.casefold()
+    for item in proposed:
+        value: str | None = None
+        item_warnings: list[str] = []
+        host_bits_masked = False
+        try:
+            if item.target_type == "cidr":
+                if "-" in item.raw_value:
+                    raise ValueError("address ranges require manual review")
+                network = ipaddress.ip_network(item.raw_value, strict=False)
+                value = str(network)
+                try:
+                    ipaddress.ip_network(item.raw_value, strict=True)
+                except ValueError:
+                    # diagnostic-expected: host bits set on a network is a
+                    # review condition surfaced below, not a parse failure.
+                    host_bits_masked = True
+            elif item.target_type == "domain":
+                value = ScopePolicy(
+                    engagement_id="validation", allowed_domains=[item.raw_value]
+                ).allowed_domains[0]
+            else:
+                value = ScopePolicy(
+                    engagement_id="validation", allowed_urls=[item.raw_value]
+                ).allowed_urls[0]
+        except ValueError as exc:
+            # diagnostic-expected: invalid model proposals become operator-visible warnings.
+            item_warnings.append(str(exc))
+            warnings.append(f"{item.raw_value}: {exc}")
+        classification = ScopeImportClassification(item.classification)
+        if host_bits_masked:
+            classification = ScopeImportClassification.AMBIGUOUS
+            item_warnings.append(
+                f"host bits masked: {item.raw_value} became {value}; confirm whether "
+                "the single host or the whole network is in scope"
+            )
+            warnings.append(
+                f"{item.raw_value}: host bits masked, normalized to {value}; "
+                "needs review before it can be applied"
+            )
+        if item.raw_value.casefold() not in source_folded:
+            classification = ScopeImportClassification.AMBIGUOUS
+            item_warnings.append(
+                "proposed value was not found verbatim in the document"
+            )
+            warnings.append(
+                f"{item.raw_value}: proposed value was not found verbatim in the document"
+            )
+        target_type = ScopeImportTargetType(item.target_type)
+        identity_value = value or item.raw_value.strip()
+        key = (target_type.value, identity_value)
+        candidate_id = hashlib.sha256(
+            f"{target_type.value}\0{identity_value}".encode("utf-8")
+        ).hexdigest()[:24]
+        candidate = ScopeImportCandidate(
+            id=candidate_id,
+            target_type=target_type,
+            classification=classification,
+            raw_value=item.raw_value,
+            normalized_value=value,
+            source_location=item.source_location,
+            source_excerpt=item.source_excerpt,
+            warnings=item_warnings,
+        )
+        existing = normalized.get(key)
+        if existing and existing.classification != candidate.classification:
+            candidate = existing.model_copy(
+                update={
+                    "classification": ScopeImportClassification.AMBIGUOUS,
+                    "warnings": list(
+                        dict.fromkeys(
+                            [
+                                *existing.warnings,
+                                "conflicting scope classifications in document",
+                            ]
+                        )
+                    ),
+                }
+            )
+            warnings.append(f"{identity_value}: conflicting scope classifications")
+        normalized[key] = (
+            candidate
+            if existing is None
+            or candidate.classification == ScopeImportClassification.AMBIGUOUS
+            else existing
+        )
+    _warn_about_covered_exclusions(normalized, warnings)
+    return sorted(
+        normalized.values(),
+        key=lambda item: (
+            item.target_type.value,
+            item.normalized_value or item.raw_value,
+        ),
+    ), warnings
+
+
+__all__ = [
+    "INTERRUPTED_DETAIL",
+    "MAX_CANDIDATES",
+    "MAX_CHUNK_CHARACTERS",
+    "MAX_SCOPE_TEXT",
+    "PROMPT_VERSION",
+    "ScopeImportApplyRequest",
+    "ScopeImportApplyResult",
+    "ScopeImportCreateRequest",
+    "ScopeImportError",
+    "ScopeImportService",
+]

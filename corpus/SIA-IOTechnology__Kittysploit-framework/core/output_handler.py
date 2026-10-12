@@ -1,0 +1,1035 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import re
+import io
+import threading
+import queue
+import logging
+import uuid
+from colorama import init, Fore, Style
+
+# CSI / OSC sequences (colorama, prompt_toolkit, etc.) — ignored for column width.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|].*?(?:\x07|\x1b\\))")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", str(text or ""))
+
+
+def _visible_len(text: str) -> int:
+    """Display width of text, excluding ANSI escape sequences."""
+    return len(_strip_ansi(text))
+
+
+def _pad_visible(text: str, width: int) -> str:
+    """Left-justify using visible width so colored cells keep column alignment."""
+    text = str(text or "")
+    return text + (" " * max(0, width - _visible_len(text)))
+
+
+def _truncate_visible(text: str, width: int) -> str:
+    """Truncate to visible width (ANSI stripped if truncation is needed)."""
+    text = str(text or "")
+    if _visible_len(text) <= width:
+        return text
+    plain = _strip_ansi(text)
+    if width <= 3:
+        return plain[:width]
+    return plain[: width - 3] + "..."
+
+try:
+    _terminal_size = os.get_terminal_size
+except AttributeError:
+    def _terminal_size():
+        class TerminalSize:
+            columns = 80
+            lines = 24
+        return TerminalSize()
+
+init(autoreset=True)
+
+USE_COLORS = True
+_DEBUG_MANAGER = None  # Global reference to debug manager
+
+# When True on the current thread, suppress noisy console helpers (used by agent/scanner non-verbose runs).
+_thread_output = threading.local()
+
+
+def set_thread_output_quiet(enabled: bool) -> None:
+    """Enable/disable quiet output for the current thread only (print_info / print_status / print_table)."""
+    _thread_output.quiet = bool(enabled)
+
+
+def is_thread_output_quiet() -> bool:
+    return bool(getattr(_thread_output, "quiet", False))
+
+def _stream_isatty(stream) -> bool:
+    """Safely determine whether a stream is a TTY.
+    
+    Some stdout/stderr redirectors used by the framework may not implement
+    `isatty()`. In those cases (or on error), treat as non-interactive.
+    """
+    try:
+        isatty = getattr(stream, "isatty", None)
+        if callable(isatty):
+            return bool(isatty())
+    except Exception:
+        return False
+    return False
+
+def _coerce_text(data) -> str:
+    """Coerce bytes/other types into a safe text string."""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        try:
+            return bytes(data).decode("utf-8", errors="replace")
+        except Exception:
+            return bytes(data).decode(errors="replace")
+    return str(data)
+
+def _safe_stream_write(stream, data) -> None:
+    """Write text/bytes to a stream without TypeError explosions.
+
+    Prefers writing text. Falls back to writing bytes to `.buffer` when needed.
+    """
+    text = _coerce_text(data)
+    try:
+        stream.write(text)
+        stream.flush()
+        return
+    except TypeError:
+        # Some streams may expect bytes; try buffer if available.
+        try:
+            raw = text.encode(getattr(stream, "encoding", "utf-8") or "utf-8", errors="replace")
+            buf = getattr(stream, "buffer", None)
+            if buf is not None:
+                buf.write(raw)
+                buf.flush()
+                return
+        except Exception:
+            pass
+        # Last resort: best-effort write as str again (may still fail).
+        try:
+            stream.write(text)
+            stream.flush()
+        except Exception:
+            pass
+
+def is_interactive_terminal():
+    return _stream_isatty(sys.stdout) and not os.environ.get('KITTYSPLOIT_NO_COLOR')
+
+def set_debug_manager(debug_manager):
+    """
+    Set the global debug manager reference
+    
+    Args:
+        debug_manager: DebugManager instance or None
+    """
+    global _DEBUG_MANAGER
+    _DEBUG_MANAGER = debug_manager
+
+def is_debug_mode() -> bool:
+    """
+    Check if debug mode is active
+    
+    Returns:
+        bool: True if debug mode is active, False otherwise
+    """
+    global _DEBUG_MANAGER
+    if _DEBUG_MANAGER:
+        return getattr(_DEBUG_MANAGER, 'is_active', False)
+    return False
+
+def color_green(text):
+    return f"{Fore.GREEN}{text}{Style.RESET_ALL}"
+
+def color_red(text):
+    return f"{Fore.RED}{text}{Style.RESET_ALL}"
+
+def color_yellow(text):
+    return f"{Fore.YELLOW}{text}{Style.RESET_ALL}"
+
+def color_blue(text):
+    return f"{Fore.BLUE}{text}{Style.RESET_ALL}"
+
+
+def color_cyan(text):
+    return f"{Fore.CYAN}{text}{Style.RESET_ALL}"
+
+
+def print_assistant(message="", **kwargs):
+    """Operator assistant line: cyan ``[?]`` prefix (distinct from ``[*]``/``[+]``/``[~]``)."""
+    if is_thread_output_quiet():
+        return
+    end_progress()
+    if USE_COLORS and is_interactive_terminal():
+        print(f"[{Fore.CYAN}?{Style.RESET_ALL}] {message}", **kwargs)
+    else:
+        print(f"[?] {message}", **kwargs)
+
+
+def print_assistant_panel(title: str, lines, *, width: int = 60) -> None:
+    """Framed cyan panel for assistant next-action suggestions."""
+    if is_thread_output_quiet():
+        return
+    end_progress()
+    items = [str(line).rstrip() for line in (lines or []) if str(line).strip()]
+    if not items:
+        return
+
+    frame_w = max(40, min(int(width) if width else 60, 80))
+    title_text = str(title or "Assistant - next actions").strip()
+    use_color = USE_COLORS and is_interactive_terminal()
+
+    def _paint(text: str) -> str:
+        return f"{Fore.CYAN}{text}{Style.RESET_ALL}" if use_color else text
+
+    top = "=" * frame_w
+    mid = "-" * frame_w
+    print(_paint(top))
+    prefix = f"[{Fore.CYAN}?{Style.RESET_ALL}] " if use_color else "[?] "
+    print(f"{prefix}{_paint(title_text)}")
+    print(_paint(mid))
+    for line in items:
+        print(_paint(f"  {line}"))
+    print(_paint(top))
+
+
+_progress_lock = threading.Lock()
+_progress_active = False
+
+
+def end_progress() -> None:
+    """Finish an in-place progress line (newline) if one is active."""
+    global _progress_active
+    with _progress_lock:
+        if _progress_active and is_interactive_terminal():
+            _safe_stream_write(sys.stdout, "\n")
+        _progress_active = False
+
+
+def print_progress(
+    current: int,
+    total: int,
+    *,
+    label: str = "Progress",
+    extra: str = "",
+    width: int = 28,
+) -> None:
+    """
+    In-place progress line for interactive TTYs (``\\r`` overwrite).
+
+    Non-TTY / redirected output: print sparingly (~every 10% or final).
+    """
+    global _progress_active
+    if is_thread_output_quiet():
+        return
+    total = max(int(total), 1)
+    current = max(0, min(int(current), total))
+    pct = 100.0 * current / total
+    filled = int(width * current / total)
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = f" {extra}" if extra else ""
+    line = f"{label} [{bar}] {current}/{total} ({pct:5.1f}%){suffix}"
+
+    with _progress_lock:
+        if is_interactive_terminal():
+            # Pad/truncate to terminal width so leftover chars disappear
+            try:
+                cols = max(40, _terminal_size().columns - 1)
+            except Exception:
+                cols = 79
+            if len(line) > cols:
+                line = line[: cols - 3] + "..."
+            else:
+                line = line.ljust(cols)
+            _safe_stream_write(sys.stdout, "\r" + line)
+            _progress_active = True
+            if current >= total:
+                _safe_stream_write(sys.stdout, "\n")
+                _progress_active = False
+            return
+
+        # Log-friendly fallback: ~10% steps + first/last
+        step = max(1, total // 10)
+        if current == 1 or current >= total or current % step == 0:
+            print(line.rstrip())
+
+
+def print_empty():
+    if is_thread_output_quiet():
+        return
+    print_info("")
+
+def print_info(message="", **kwargs):
+    if is_thread_output_quiet():
+        return
+    end_progress()
+    print(message, **kwargs)
+
+def print_status(message="", **kwargs):
+    if is_thread_output_quiet():
+        return
+    end_progress()
+    if USE_COLORS and is_interactive_terminal():
+        print(f"[{Fore.BLUE}*{Style.RESET_ALL}] {message}", **kwargs)
+    else:
+        print(f"[*] {message}", **kwargs)
+
+def print_error(message="", **kwargs):
+    # Respect quiet mode (scanner non-verbose): modules often call print_error
+    # for soft "not detected" negatives that should not spam the progress bar.
+    if is_thread_output_quiet():
+        return
+    end_progress()
+    if USE_COLORS and is_interactive_terminal():
+        print(f"[{Fore.RED}!{Style.RESET_ALL}] {message}", **kwargs)
+    else:
+        print(f"[!] {message}", **kwargs)
+
+def print_success(message="", **kwargs):
+    if is_thread_output_quiet():
+        return
+    end_progress()
+    if USE_COLORS and is_interactive_terminal():
+        print(f"[{Fore.GREEN}+{Style.RESET_ALL}] {message}", **kwargs)
+    else:
+        print(f"[+] {message}", **kwargs)
+
+# Metasploit-compatible alias used by several post modules.
+print_good = print_success
+
+def print_warning(message="", **kwargs):
+    if is_thread_output_quiet():
+        return
+    end_progress()
+    if USE_COLORS and is_interactive_terminal():
+        print(f"[{Fore.YELLOW}~{Style.RESET_ALL}] {message}", **kwargs)
+    else:
+        print(f"[~] {message}", **kwargs)
+
+def _wrap_cell_text(cell_value: str, col_width: int) -> list:
+    if col_width <= 0:
+        return [cell_value]
+    wrapped_lines = []
+    words = cell_value.split()
+    current_line = ""
+    for word in words:
+        test_line = current_line + (" " if current_line else "") + word
+        if _visible_len(test_line) <= col_width:
+            current_line = test_line
+        else:
+            if current_line:
+                wrapped_lines.append(current_line)
+            if _visible_len(word) > col_width:
+                # Break very long tokens across lines (visible width; strip if colored)
+                rest = _strip_ansi(word) if _visible_len(word) != len(word) else word
+                while _visible_len(rest) > col_width:
+                    wrapped_lines.append(rest[:col_width])
+                    rest = rest[col_width:]
+                current_line = rest
+            else:
+                current_line = word
+    if current_line:
+        wrapped_lines.append(current_line)
+    return wrapped_lines if wrapped_lines else [""]
+
+
+def _resolve_table_max_width(max_width, expand_to_terminal):
+    """Widen layout width up to the TTY when requested."""
+    if not expand_to_terminal:
+        return max_width
+    try:
+        if _stream_isatty(sys.stdout):
+            terminal_cols = _terminal_size().columns
+            if terminal_cols > max_width:
+                return min(max(terminal_cols - 2, max_width), 400)
+    except (OSError, AttributeError):
+        pass
+    return max_width
+
+
+def _compute_table_layout(headers, rows, max_width=80, expand_to_terminal=True, **kwargs):
+    prefer_single_line = bool(kwargs.get("prefer_single_line", False))
+    max_width = _resolve_table_max_width(max_width, expand_to_terminal)
+
+    # Calculate optimal column widths
+    # Reserve space for separators (3 chars per separator: " | ")
+    num_separators = len(headers) - 1
+    separator_width = 3 * num_separators
+    available_width = max_width - separator_width
+    
+    # Calculate minimum and maximum widths for each column (visible chars only)
+    col_widths = []
+    for i, header in enumerate(headers):
+        min_width = _visible_len(header)
+        max_width_col = min_width
+        
+        for row in rows:
+            if i < len(row):
+                cell_len = _visible_len(row[i])
+                max_width_col = max(max_width_col, cell_len)
+        
+        col_widths.append(max_width_col)
+
+    column_min_widths = kwargs.get("column_min_widths") or {}
+    column_max_widths = kwargs.get("column_max_widths") or {}
+    for i, header in enumerate(headers):
+        hs = str(header)
+        if hs in column_min_widths:
+            col_widths[i] = max(col_widths[i], int(column_min_widths[hs]))
+        if hs in column_max_widths:
+            col_widths[i] = min(col_widths[i], int(column_max_widths[hs]))
+
+    # Columns that get "reserve natural width" treatment when shrinking (default: name + path)
+    protect = kwargs.get("protect_full_width_headers", None)
+    if protect is None:
+        protect_set = {"name", "path"}
+    else:
+        protect_set = {str(x).strip().lower() for x in protect if str(x).strip()}
+    name_column_index = None
+    for i, header in enumerate(headers):
+        if str(header).strip().lower() in protect_set:
+            name_column_index = i
+            break
+
+    # Special handling: "Description" (or expand_headers) gets priority for extra space
+    desc_column_index = None
+    for i, header in enumerate(headers):
+        if str(header).lower() == "description":
+            desc_column_index = i
+            break
+    if desc_column_index is None:
+        for name in kwargs.get("expand_headers") or ():
+            hl = str(name).strip().lower()
+            for i, header in enumerate(headers):
+                if str(header).strip().lower() == hl:
+                    desc_column_index = i
+                    break
+            if desc_column_index is not None:
+                break
+
+    # Columns that should wrap (not truncate) so paths and long values stay readable
+    wrap_column_indices = set()
+    for i, header in enumerate(headers):
+        h = str(header).lower().strip()
+        if h in ("description", "current setting", "value", "setting", "details", "evidence"):
+            wrap_column_indices.add(i)
+    for h in kwargs.get("wrap_extra_headers") or ():
+        hl = str(h).strip().lower()
+        for i, header in enumerate(headers):
+            if str(header).strip().lower() == hl:
+                wrap_column_indices.add(i)
+                break
+    if desc_column_index is not None:
+        wrap_column_indices.add(desc_column_index)
+
+    # Wrap columns share space: prefer a readable width, then wrap leftover text
+    # (instead of demanding the full cell length and crushing neighbors).
+    if wrap_column_indices:
+        for i in wrap_column_indices:
+            header_w = _visible_len(headers[i])
+            hl = str(headers[i]).strip().lower()
+            if i == desc_column_index:
+                soft = max(header_w, min(col_widths[i], max(40, available_width // 3)))
+            elif hl in ("path", "module", "scanner", "finding"):
+                # Paths wrap only when truly needed — keep a wide soft target.
+                soft = max(header_w, min(col_widths[i], max(52, available_width // 2)))
+            else:
+                soft = max(header_w, min(col_widths[i], 28))
+            col_widths[i] = soft
+    
+    # Distribute available width proportionally
+    total_min_width = sum(col_widths)
+    if total_min_width > available_width:
+        # Scale down proportionally, but protect the Name column and prioritize Description
+        if name_column_index is not None:
+            # Reserve full width for Name column
+            name_width = col_widths[name_column_index]
+            remaining_width = available_width - name_width
+            remaining_cols = [w for i, w in enumerate(col_widths) if i != name_column_index]
+            
+            if remaining_cols and remaining_width > 0:
+                total_remaining = sum(remaining_cols)
+                if total_remaining > 0:
+                    # If Description column exists, give it more space
+                    if desc_column_index is not None and desc_column_index != name_column_index:
+                        # Calculate base scale factor
+                        scale_factor = remaining_width / total_remaining
+                        # Give Description column up to 50% more space if available
+                        desc_base_width = col_widths[desc_column_index]
+                        desc_target_width = int(desc_base_width * scale_factor * 1.5)
+                        
+                        # Calculate minimum width needed for other columns (excluding Name and Description)
+                        min_other_width = sum(_visible_len(headers[i]) for i in range(len(headers)) if i != name_column_index and i != desc_column_index)
+                        # Ensure Description doesn't take too much space
+                        desc_target_width = min(desc_target_width, remaining_width - min_other_width)
+                        desc_target_width = max(desc_target_width, int(desc_base_width * scale_factor))
+                        
+                        # Adjust remaining width after Description
+                        remaining_width_after_desc = remaining_width - desc_target_width
+                        # Get widths of columns other than Name and Description
+                        remaining_cols_no_desc = [col_widths[i] for i in range(len(col_widths)) if i != name_column_index and i != desc_column_index]
+                        total_remaining_no_desc = sum(remaining_cols_no_desc) if remaining_cols_no_desc else 1
+                        
+                        if total_remaining_no_desc > 0 and remaining_width_after_desc > 0:
+                            scale_factor_others = remaining_width_after_desc / total_remaining_no_desc
+                        else:
+                            scale_factor_others = scale_factor
+                        
+                        # Apply widths
+                        for i in range(len(col_widths)):
+                            if i == name_column_index:
+                                col_widths[i] = name_width
+                            elif i == desc_column_index:
+                                col_widths[i] = desc_target_width
+                            else:
+                                col_widths[i] = max(int(col_widths[i] * scale_factor_others), _visible_len(headers[i]))
+                    else:
+                        # No Description column, use standard scaling
+                        scale_factor = remaining_width / total_remaining
+                        for i in range(len(col_widths)):
+                            if i != name_column_index:
+                                col_widths[i] = max(int(col_widths[i] * scale_factor), _visible_len(headers[i]))
+                        col_widths[name_column_index] = name_width
+                else:
+                    col_widths[name_column_index] = name_width
+            else:
+                # Fallback: scale all columns
+                scale_factor = available_width / total_min_width
+                col_widths = [max(int(w * scale_factor), _visible_len(headers[i])) for i, w in enumerate(col_widths)]
+        else:
+            # No Name column, but still prioritize Description if it exists
+            if desc_column_index is not None:
+                # Give Description column more space
+                desc_base_width = col_widths[desc_column_index]
+                # Try to give Description up to 40% of available width
+                desc_target_width = min(int(available_width * 0.4), desc_base_width * 2)
+                desc_target_width = max(desc_target_width, int(desc_base_width))
+                
+                remaining_width_after_desc = available_width - desc_target_width
+                remaining_cols_no_desc = [w for i, w in enumerate(col_widths) if i != desc_column_index]
+                total_remaining_no_desc = sum(remaining_cols_no_desc) if remaining_cols_no_desc else 1
+                
+                if total_remaining_no_desc > 0 and remaining_width_after_desc > 0:
+                    scale_factor_others = remaining_width_after_desc / total_remaining_no_desc
+                else:
+                    scale_factor_others = available_width / total_min_width
+                
+                for i in range(len(col_widths)):
+                    if i == desc_column_index:
+                        col_widths[i] = desc_target_width
+                    else:
+                        col_widths[i] = max(int(col_widths[i] * scale_factor_others), _visible_len(headers[i]))
+            else:
+                # No Name or Description column, scale proportionally
+                scale_factor = available_width / total_min_width
+                col_widths = [max(int(w * scale_factor), _visible_len(headers[i])) for i, w in enumerate(col_widths)]
+    else:
+        # Use natural widths; give leftover terminal space to Path then Description.
+        extra_space = available_width - total_min_width
+        if extra_space > 0:
+            path_idx = None
+            for i, header in enumerate(headers):
+                if str(header).strip().lower() == "path":
+                    path_idx = i
+                    break
+            # Prefer filling Path up to its natural (full) cell width first.
+            if path_idx is not None:
+                natural = 0
+                for row in rows:
+                    if path_idx < len(row):
+                        natural = max(natural, _visible_len(row[path_idx]))
+                natural = max(natural, _visible_len(headers[path_idx]))
+                grow = min(extra_space, max(0, natural - col_widths[path_idx]))
+                if grow > 0:
+                    col_widths[path_idx] += grow
+                    extra_space -= grow
+            if desc_column_index is not None and extra_space > 0:
+                if prefer_single_line:
+                    col_widths[desc_column_index] += extra_space
+                else:
+                    col_widths[desc_column_index] += min(extra_space, int(available_width * 0.3))
+        
+        # Cap columns at reasonable maximum (skip when prefer_single_line — Description uses spare width)
+        if not prefer_single_line:
+            max_col_width = available_width // len(headers) * 2  # Allow columns to be up to 2x average
+            # Never cap Path/Name below natural content when there is room overall
+            capped = []
+            for i, w in enumerate(col_widths):
+                hl = str(headers[i]).strip().lower()
+                if hl in ("path", "name") or i == name_column_index:
+                    capped.append(w)
+                else:
+                    capped.append(min(w, max_col_width))
+            col_widths = capped
+
+    # Re-apply minimum widths (scaling can drive columns below column_min_widths) then fit by shrinking Description first.
+    if column_min_widths:
+        for i, header in enumerate(headers):
+            hs = str(header)
+            if hs in column_min_widths:
+                col_widths[i] = max(col_widths[i], int(column_min_widths[hs]))
+        desc_floor = 18
+        if desc_column_index is not None:
+            desc_floor = max(desc_floor, _visible_len(headers[desc_column_index]))
+        while sum(col_widths) + separator_width > max_width and desc_column_index is not None:
+            if col_widths[desc_column_index] <= desc_floor:
+                break
+            col_widths[desc_column_index] -= 1
+        guard = 0
+        while sum(col_widths) + separator_width > max_width and guard < max_width + 50:
+            guard += 1
+            progressed = False
+            for i in range(len(col_widths)):
+                hs = str(headers[i])
+                floor = _visible_len(headers[i])
+                if column_min_widths and hs in column_min_widths:
+                    floor = max(floor, int(column_min_widths[hs]))
+                if col_widths[i] > floor:
+                    col_widths[i] -= 1
+                    progressed = True
+                    break
+            if not progressed:
+                break
+
+    if prefer_single_line and desc_column_index is not None:
+        other_width = sum(col_widths[i] for i in range(len(col_widths)) if i != desc_column_index)
+        col_widths[desc_column_index] = max(col_widths[desc_column_index], available_width - other_width)
+
+    return {
+        "col_widths": col_widths,
+        "max_width": max_width,
+        "name_column_index": name_column_index,
+        "desc_column_index": desc_column_index,
+        "wrap_column_indices": wrap_column_indices,
+        "prefer_single_line": prefer_single_line,
+        "separator_width": separator_width,
+    }
+
+
+def table_render_width(headers, rows, max_width=80, expand_to_terminal=True, **kwargs):
+    if not headers or not rows:
+        return max_width
+    layout = _compute_table_layout(headers, rows, max_width, expand_to_terminal, **kwargs)
+    return sum(layout["col_widths"]) + layout["separator_width"]
+
+
+def print_table(headers, rows, max_width=80, expand_to_terminal=True, **kwargs):
+    """Print a formatted table with proper column alignment.
+
+    Args:
+        headers: Column titles.
+        rows: Table body.
+        max_width: Target total width for layout (column sizing and separators).
+        expand_to_terminal: If True, widen max_width up to the TTY (capped) when the terminal
+            is wider — good for large data tables. If False, keep max_width exactly (e.g. module
+            options framed with '=' lines must match the table and inner rule width).
+        column_min_widths: Optional ``{header_label: int}`` minimum widths after measuring cells.
+        column_max_widths: Optional ``{header_label: int}`` maximum widths (e.g. cap ``Path``).
+        protect_full_width_headers: Optional iterable of header names (case-insensitive) that
+            keep natural width during shrink (default: ``name``, ``path``). Pass e.g. ``("name",)``
+            so long paths can share space with other columns.
+        wrap_extra_headers: Optional iterable of header names to word-wrap like ``Description``.
+        prefer_single_line: If True, use spare terminal width for Description: one line when
+            the text fits, otherwise word-wrap the full text (never truncate with ``...``).
+
+    Returns:
+        Rendered table line width, or None when nothing was printed.
+    """
+    if is_thread_output_quiet():
+        return None
+    if not headers or not rows:
+        return None
+
+    layout = _compute_table_layout(headers, rows, max_width, expand_to_terminal, **kwargs)
+    col_widths = layout["col_widths"]
+    name_column_index = layout["name_column_index"]
+    desc_column_index = layout["desc_column_index"]
+    wrap_column_indices = layout["wrap_column_indices"]
+    prefer_single_line = layout["prefer_single_line"]
+
+    # Build header line
+    header_parts = []
+    for i, header in enumerate(headers):
+        header_parts.append(_pad_visible(header, col_widths[i]))
+    header_line = " | ".join(header_parts)
+    
+    # Print header with compact separator
+    print_info(header_line)
+    # Separator must match the rendered table width only. Using max_width here breaks layout
+    # because max_width is often expanded to terminal width while column content stays compact.
+    separator_char = "─" if _stream_isatty(sys.stdout) else "-"
+    separator_len = _visible_len(header_line)
+    print_info(separator_char * separator_len)
+    
+    for row in rows:
+        # Split cells that need wrapping (especially Description column)
+        cell_lines = []
+        max_lines = 1
+        
+        for i in range(len(headers)):
+            cell_value = str(row[i] if i < len(row) else "")
+            
+            if i == name_column_index and i not in wrap_column_indices:
+                # Protected title column: one line, no truncation (e.g. module option names)
+                cell_lines.append([cell_value])
+                max_lines = max(max_lines, 1)
+            elif i == desc_column_index and prefer_single_line:
+                if _visible_len(cell_value) <= col_widths[i]:
+                    cell_lines.append([cell_value])
+                else:
+                    wrapped = _wrap_cell_text(cell_value, col_widths[i])
+                    cell_lines.append(wrapped)
+                    max_lines = max(max_lines, len(wrapped))
+            elif i in wrap_column_indices or i == desc_column_index:
+                wrapped = _wrap_cell_text(cell_value, col_widths[i])
+                cell_lines.append(wrapped)
+                max_lines = max(max_lines, len(wrapped))
+            else:
+                # Other columns: truncate if too long (with ellipsis)
+                cell_value = _truncate_visible(cell_value, col_widths[i])
+                cell_lines.append([cell_value])
+        
+        # Print all lines for this row
+        for line_num in range(max_lines):
+            row_parts = []
+            for i in range(len(headers)):
+                cell_lines_for_col = cell_lines[i]
+                if line_num < len(cell_lines_for_col):
+                    cell_value = cell_lines_for_col[line_num]
+                else:
+                    cell_value = ""  # Empty for continuation lines
+                
+                row_parts.append(_pad_visible(cell_value, col_widths[i]))
+            
+            row_line = " | ".join(row_parts)
+            print_info(row_line)
+
+    return separator_len
+
+def print_debug(message="", force=False, **kwargs):
+    """
+    Print a debug message (only if debug mode is active or force=True)
+    
+    Args:
+        message: Debug message to print
+        force: If True, always print regardless of debug mode
+    """
+    # Only print if debug mode is active or force is True
+    if not force and not is_debug_mode():
+        return
+    
+    if USE_COLORS and is_interactive_terminal():
+        print_info(f"[{Fore.MAGENTA}DEBUG{Style.RESET_ALL}] {message}", **kwargs)
+    else:
+        print_info(f"[DEBUG] {message}", **kwargs)
+
+def set_use_colors(value=True):
+    global USE_COLORS
+    USE_COLORS = bool(value)
+
+class OutputHandler:
+    """Output manager with multi-session support"""
+
+    def __init__(self):
+        self.sessions = {}  # Store callbacks for each unique session
+        # Use the real underlying streams to avoid recursion when libraries
+        # (e.g. colorama/click) wrap sys.stdout/sys.stderr.
+        self.original_stdout = getattr(sys, "__stdout__", sys.stdout)
+        self.original_stderr = getattr(sys, "__stderr__", sys.stderr)
+        self.redirecting = False
+        self.output_queue = queue.Queue()
+        self.output_thread = None
+        self.lock = threading.Lock()  # Prevent race conditions
+        self.stdout_callbacks = []
+        self.stderr_callbacks = []
+        # Per-thread routing context (used by web terminals)
+        self._thread_context = threading.local()
+        # When False, output produced without a thread context (e.g. Werkzeug logs)
+        # will NOT be forwarded to per-session callbacks (prevents server logs
+        # leaking into terminal windows). Global stdout/stderr callbacks still run.
+        self._broadcast_unscoped_to_sessions = False
+
+    def set_broadcast_unscoped_to_sessions(self, enabled: bool):
+        self._broadcast_unscoped_to_sessions = bool(enabled)
+
+    def set_thread_context(self, session_id: str):
+        """Bind stdout/stderr output produced by the current thread to a session.
+
+        The web UI executes terminal commands in background threads. This context
+        allows OutputHandler to route output only to the correct terminal session.
+        """
+        self._thread_context.session_id = session_id
+
+    def clear_thread_context(self):
+        """Clear the current thread's routing context."""
+        try:
+            if hasattr(self._thread_context, "session_id"):
+                delattr(self._thread_context, "session_id")
+        except Exception:
+            pass
+
+    def _get_thread_context(self):
+        return getattr(self._thread_context, "session_id", None)
+
+    def get_current_session_id(self):
+        """Get the current thread's session ID (for web terminal context). Used by interactive plugins."""
+        return self._get_thread_context()
+
+    def start_redirection(self):
+        if self.redirecting:
+            return
+
+        sys.stdout = StdoutRedirector(self)
+        sys.stderr = StderrRedirector(self)
+        self.redirecting = True
+
+        # Start the background thread to process the queue
+        self.output_thread = threading.Thread(target=self._process_output_queue, daemon=True)
+        self.output_thread.start()
+        logging.debug("Output redirection started")
+
+    def stop_redirection(self):
+        if not self.redirecting:
+            return
+
+        sys.stdout = self.original_stdout
+        sys.stderr = self.original_stderr
+        self.redirecting = False
+
+        if self.output_thread:
+            self.output_queue.put(None)  # Stop signal
+            self.output_thread.join(timeout=1)
+            self.output_thread = None
+
+        logging.debug("Output redirection stopped")
+
+    def create_session(self):
+        session_id = str(uuid.uuid4())
+        self.sessions[session_id] = {"stdout": [], "stderr": []}
+        return session_id
+
+    def add_callback(self, session_id, callback, is_stderr=False):
+        # Auto-create session buckets for external session IDs (e.g. web terminals)
+        if session_id not in self.sessions:
+            self.sessions[session_id] = {"stdout": [], "stderr": []}
+        key = "stderr" if is_stderr else "stdout"
+        if callback not in self.sessions[session_id][key]:
+            self.sessions[session_id][key].append(callback)
+
+    def remove_callback(self, session_id, callback, is_stderr=False):
+        if session_id in self.sessions:
+            key = "stderr" if is_stderr else "stdout"
+            if callback in self.sessions[session_id][key]:
+                self.sessions[session_id][key].remove(callback)
+
+    def add_stdout_callback(self, callback):
+        if callback not in self.stdout_callbacks:
+            self.stdout_callbacks.append(callback)
+
+    def add_stderr_callback(self, callback):
+        if callback not in self.stderr_callbacks:
+            self.stderr_callbacks.append(callback)
+
+    def remove_stdout_callback(self, callback):
+        if callback in self.stdout_callbacks:
+            self.stdout_callbacks.remove(callback)
+
+    def remove_stderr_callback(self, callback):
+        if callback in self.stderr_callbacks:
+            self.stderr_callbacks.remove(callback)
+
+    def handle_output(self, text, is_stderr=False):
+        # Some libraries may write bytes; normalize here.
+        text = _coerce_text(text)
+        ctx_session_id = self._get_thread_context()
+        with self.lock:
+            if is_stderr:
+                _safe_stream_write(self.original_stderr, text)
+                # Appeler les callbacks stderr
+                for callback in self.stderr_callbacks:
+                    try:
+                        callback(text)
+                    except Exception as e:
+                        logging.error(f"Error in stderr callback: {e}")
+            else:
+                _safe_stream_write(self.original_stdout, text)
+                # Appeler les callbacks stdout
+                for callback in self.stdout_callbacks:
+                    try:
+                        callback(text)
+                    except Exception as e:
+                        logging.error(f"Error in stdout callback: {e}")
+
+        # Keep the session context with the queued message
+        self.output_queue.put(("stderr" if is_stderr else "stdout", text, ctx_session_id))
+
+    def _process_output_queue(self):
+        while True:
+            item = self.output_queue.get()
+            if item is None:
+                break
+
+            # Backward compatible: older queue items may be 2-tuples
+            if isinstance(item, tuple) and len(item) == 2:
+                output_type, text = item
+                target_session_id = None
+            else:
+                output_type, text, target_session_id = item
+
+            if target_session_id:
+                # Route only to the intended session (isolated terminal)
+                callbacks = self.sessions.get(target_session_id, {})
+                for callback in callbacks.get(output_type, []) or []:
+                    try:
+                        callback(text)
+                    except Exception as e:
+                        logging.error(f"Error in {output_type} callback (session {target_session_id}): {e}")
+            else:
+                # Unscoped output (e.g. server logs). By default we do NOT forward
+                # this to terminal sessions; it would pollute every terminal.
+                if self._broadcast_unscoped_to_sessions:
+                    for session_id, callbacks in self.sessions.items():
+                        for callback in callbacks.get(output_type, []) or []:
+                            try:
+                                callback(text)
+                            except Exception as e:
+                                logging.error(f"Error in {output_type} callback (session {session_id}): {e}")
+
+            self.output_queue.task_done()
+    
+    def print_info(self, message="", **kwargs):
+        print_info(message, **kwargs)
+    
+    def print_error(self, message="", **kwargs):
+        print_error(message, **kwargs)
+    
+    def print_success(self, message="", **kwargs):
+        print_success(message, **kwargs)
+    
+    def print_warning(self, message="", **kwargs):
+        """Print a warning message"""
+        print_warning(message, **kwargs)
+    
+    def print_status(self, message="", **kwargs):
+        print_status(message, **kwargs)
+    
+    def print_debug(self, message="", **kwargs):
+        print_debug(message, **kwargs)
+
+class StdoutRedirector:
+    """Redirects stdout"""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.encoding = getattr(handler.original_stdout, "encoding", "utf-8") or "utf-8"
+        self.errors = getattr(handler.original_stdout, "errors", "replace") or "replace"
+        self.closed = False
+        self.name = "<StdoutRedirector>"
+        self.mode = "w"
+
+    def write(self, text):
+        text = _coerce_text(text)
+        # Preserve newlines and formatting. Only ignore truly empty writes.
+        if text == "":
+            return
+        self.handler.handle_output(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        """Expose isatty() for compatibility with code expecting a real stream."""
+        try:
+            return _stream_isatty(self.handler.original_stdout)
+        except Exception:
+            return False
+
+    def fileno(self):
+        """Delegate to the original stdout when possible (prompt_toolkit, rich, etc.)."""
+        stream = getattr(self.handler, "original_stdout", None)
+        fileno = getattr(stream, "fileno", None)
+        if callable(fileno):
+            try:
+                return fileno()
+            except Exception:
+                pass
+        # Fall back to process stdout fd so callers that require an int keep working.
+        try:
+            return sys.__stdout__.fileno()
+        except Exception as exc:
+            raise io.UnsupportedOperation("fileno") from exc
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def reconfigure(self, *args, **kwargs):
+        return None
+
+
+class StderrRedirector:
+    """Redirects stderr"""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.encoding = getattr(handler.original_stderr, "encoding", "utf-8") or "utf-8"
+        self.errors = getattr(handler.original_stderr, "errors", "replace") or "replace"
+        self.closed = False
+        self.name = "<StderrRedirector>"
+        self.mode = "w"
+
+    def write(self, text):
+        text = _coerce_text(text)
+        # Preserve newlines and formatting. Only ignore truly empty writes.
+        if text == "":
+            return
+        self.handler.handle_output(text, is_stderr=True)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        """Expose isatty() for compatibility with code expecting a real stream."""
+        try:
+            return _stream_isatty(self.handler.original_stderr)
+        except Exception:
+            return False
+
+    def fileno(self):
+        """Delegate to the original stderr when possible."""
+        stream = getattr(self.handler, "original_stderr", None)
+        fileno = getattr(stream, "fileno", None)
+        if callable(fileno):
+            try:
+                return fileno()
+            except Exception:
+                pass
+        try:
+            return sys.__stderr__.fileno()
+        except Exception as exc:
+            raise io.UnsupportedOperation("fileno") from exc
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def reconfigure(self, *args, **kwargs):
+        return None

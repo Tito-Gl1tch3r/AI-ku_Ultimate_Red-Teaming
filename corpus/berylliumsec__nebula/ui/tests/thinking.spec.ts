@@ -1,0 +1,153 @@
+import { expect, test } from "@playwright/test";
+import AxeBuilder from "@axe-core/playwright";
+
+for (const vendor of ["grok_acp", "codex_app_server"]) {
+  test(`${vendor} thinking episodes remain discoverable and readable after reload`, async ({ page, request }, info) => {
+    const origin = `http://127.0.0.1:${new URL(String(info.project.use.baseURL)).port}`;
+    const pairing = await (await request.post(`${origin}/api/v1/auth/pairings`, { headers: { Authorization: "Bearer model-test-token" }, data: { name: "Thinking test" } })).json();
+    await page.goto(`/#pair=${encodeURIComponent(pairing.secret)}&code=${encodeURIComponent(pairing.confirmation_code)}`);
+    await page.getByLabel("Device name").fill("Thinking test");
+    await page.getByRole("button", { name: "Pair device", exact: true }).click();
+    await expect(page.locator(".pairing-gate")).toHaveCount(0, {timeout: 20_000});
+    await page.goto(`/projects/thinking-project/workbench?view=chat&session=${vendor}-chat`);
+    const openThinking = async () => {
+      await expect(page.getByText("Saved final response for " + vendor)).toBeVisible();
+      if (vendor === "grok_acp") {
+        await expect(page.getByText("A public progress update.", {exact: true})).toHaveCount(0);
+        await expect(page.getByText("Recorded work before the operator stopped.", {exact: true})).toHaveCount(0);
+        await expect(page.getByText("Stopped", {exact: true})).toBeVisible();
+        await expect(page.getByText("A partial answer retained after stopping.", {exact: true})).toBeVisible();
+        await expect(page.getByText("Reference: pending local diagnostic")).toHaveCount(0);
+        const transcript = await page.locator(".chat-message").allTextContents();
+        expect(transcript.findIndex(text => text.includes("A partial answer retained"))).toBeLessThan(transcript.findIndex(text => text.includes("My next message")));
+      }
+      const showActivity = page.getByRole("button", { name: "Show activity", exact: true }).first();
+      if (info.project.use.hasTouch) await showActivity.tap();
+      else await showActivity.click();
+      const rows = page.locator(".activity-ledger-audit li").filter({ has: page.locator(".harness-reasoning-summary") });
+      await expect(rows).toHaveCount(vendor === "grok_acp" ? 6 : 4);
+      for (const marker of ["First thinking episode from ", "Second thinking episode from "]) {
+        const row = rows.filter({ has: page.getByText(marker + vendor, { exact: true }) });
+        const summary = row.locator(".activity-ledger-entry-content > details > summary");
+        if (info.project.use.hasTouch) await summary.tap();
+        else { await summary.focus(); await summary.press("Enter"); }
+        await expect(row.getByText(marker + vendor, { exact: true })).toBeVisible();
+      }
+      const changed = rows.filter({ has: page.getByText("Completed summary for " + vendor, {exact: true}) });
+      await changed.locator(".activity-ledger-entry-content > details > summary").click();
+      await changed.getByText("Earlier streamed summary", {exact: true}).click();
+      const earlier = changed.locator(".harness-streamed-summary .harness-reasoning-summary");
+      await expect(earlier).toHaveText("Long public text. ".repeat(5000) + "PRESERVED TAIL");
+      await earlier.focus();
+      await earlier.press("End");
+      await expect.poll(() => earlier.evaluate(node => node.scrollTop > 0)).toBe(true);
+      const absent = page.locator(".activity-ledger-audit li").filter({has: page.getByText("No thinking summary was provided by the harness.", {exact: true})});
+      await expect(absent).toHaveCount(1);
+      await absent.locator(".activity-ledger-entry-content > details > summary").click();
+      await expect(absent.getByText("No thinking summary was provided by the harness.", {exact: true})).toBeVisible();
+      const thinking = page.getByLabel("Harness thinking");
+      await expect(thinking).toBeVisible();
+      await thinking.locator("summary").click();
+      await expect(thinking.getByText(`${vendor === "codex_app_server" ? "Codex" : "The harness"} did not provide a public summary for one reasoning episode.`)).toBeVisible();
+      const historical = rows.filter({has: page.getByText("Historical saved text…[truncated]", {exact: true})});
+      await historical.locator(".activity-ledger-entry-content > details > summary").click();
+      await expect(historical.getByText("This saved thinking text was shortened. The omitted text is unavailable.", {exact: true})).toBeVisible();
+      if (vendor === "grok_acp") {
+        const long = rows.filter({has: page.getByText(/^Long thinking /)});
+        await long.locator(".activity-ledger-entry-content > details > summary").click();
+        expect(await long.locator(".harness-reasoning-summary").textContent()).toBe("Long thinking " + "x".repeat(39986) + "y".repeat(40000));
+        const commentary = rows.filter({has: page.getByText("A public progress update.", {exact: true})});
+        await commentary.locator(".activity-ledger-entry-content > details > summary").click();
+        await expect(commentary.locator(".harness-reasoning-summary")).toBeVisible();
+        const stopped = page.locator(".chat-message.assistant").filter({hasText: "A partial answer retained after stopping."});
+        const showStoppedActivity = stopped.getByRole("button", {name: "Show activity"});
+        if (info.project.use.hasTouch) await showStoppedActivity.tap();
+        else await showStoppedActivity.click();
+        const recorded = stopped.locator(".activity-ledger-audit li").filter({hasText: "Recorded work before the operator stopped."});
+        await recorded.locator("summary").click();
+        await expect(recorded.getByRole("paragraph").filter({hasText: "Recorded work before the operator stopped."})).toBeVisible();
+      }
+      return rows;
+    };
+    await openThinking();
+    expect((await new AxeBuilder({ page }).include(".activity-ledger-audit").analyze()).violations).toEqual([]);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+    await page.screenshot({ path: info.outputPath(`${vendor}-thinking.png`), fullPage: true });
+    await page.reload();
+    await openThinking();
+  });
+}
+
+test("codex_app_server thinking episodes remain visible without public summaries after reload", async ({ page, request }, info) => {
+  const origin = `http://127.0.0.1:${new URL(String(info.project.use.baseURL)).port}`;
+  const pairing = await (await request.post(`${origin}/api/v1/auth/pairings`, { headers: { Authorization: "Bearer model-test-token" }, data: { name: "No-summary thinking test" } })).json();
+  await page.goto(`/#pair=${encodeURIComponent(pairing.secret)}&code=${encodeURIComponent(pairing.confirmation_code)}`);
+  await page.getByLabel("Device name").fill("No-summary thinking test");
+  await page.getByRole("button", { name: "Pair device", exact: true }).click();
+  await expect(page.locator(".pairing-gate")).toHaveCount(0, { timeout: 20_000 });
+
+  const openThinking = async () => {
+    await expect(page.getByText("Saved answer with no public thinking summary.")).toBeVisible();
+    await expect(page.getByRole("region", { name: "Work summary" })).toContainText("1 update");
+    await page.getByRole("button", { name: "Show activity", exact: true }).click();
+    const thinking = page.getByLabel("Harness thinking");
+    await expect(thinking.locator("summary")).toBeVisible();
+    await expect(thinking.locator("summary")).toHaveText("Thinking");
+    await thinking.locator("summary").click();
+    await expect(thinking.getByText("Codex did not provide a public summary for one reasoning episode.")).toBeVisible();
+    const commentary = page.getByRole("region", { name: "Work summary" }).locator(".activity-ledger-entry-content details", { hasText: "Checked the public result while Codex kept reasoning private." });
+    await commentary.locator(":scope > summary").click();
+    await expect(commentary).toContainText("Checked the public result while Codex kept reasoning private.");
+  };
+
+  await page.goto("/projects/thinking-project/workbench?view=chat&session=codex-no-summary-chat");
+  await openThinking();
+  const [item] = await (await request.get(`${origin}/api/v1/engagements/thinking-child-project/work`, { headers: { Authorization: "Bearer model-test-token" } })).json();
+  const [currentUpdate] = await (await request.get(`${origin}/api/v1/engagements/thinking-child-project/work/${item.id}/updates`, { headers: { Authorization: "Bearer model-test-token" } })).json();
+  await page.getByRole("button", { name: "Project Snapshot", exact: true }).click();
+  const progress = page.getByRole("region", { name: "Current progress" });
+  await expect(progress).toContainText(currentUpdate.summary);
+  await expect(progress).toContainText(`Next: ${currentUpdate.next_step}`);
+  await expect(progress.getByRole("link", { name: "Open work item" })).toHaveAttribute("href", `/projects/thinking-child-project/work/${item.id}`);
+  await expect(progress.getByRole("link", { name: "Open conversation" })).toHaveAttribute("href", "/projects/thinking-project/workbench?view=chat&session=codex-no-summary-chat");
+  const newSummary = `The next task is now saved in Work (${info.project.name}).`;
+  const saved = await request.post(`${origin}/api/v1/engagements/thinking-child-project/work/${item.id}/updates`, {
+    headers: { Authorization: "Bearer model-test-token" },
+    data: { summary: newSummary, next_step: "Verify the remaining join.", status: "review" },
+  });
+  expect(saved.ok()).toBe(true);
+  await expect(progress).toContainText(newSummary);
+  await page.reload();
+  await openThinking();
+  await page.getByRole("button", { name: "Project Snapshot", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Current progress" })).toContainText(newSummary);
+});
+
+
+test("expanded review queue can scroll to its last action without clipping", async ({page, request}, info) => {
+  const origin = `http://127.0.0.1:${new URL(String(info.project.use.baseURL)).port}`;
+  const pairing = await (await request.post(`${origin}/api/v1/auth/pairings`, {headers: {Authorization: "Bearer model-test-token"}, data: {name: "Queue scroll test"}})).json();
+  await page.goto(`/#pair=${encodeURIComponent(pairing.secret)}&code=${encodeURIComponent(pairing.confirmation_code)}`);
+  await page.getByLabel("Device name").fill("Queue scroll test");
+  await page.getByRole("button", {name: "Pair device", exact: true}).click();
+  await expect(page.getByRole("button", {name: /Nebula Core (ready|degraded)/})).toBeVisible({timeout: 20000});
+  await page.goto("/projects/thinking-project/workbench?view=chat&session=queue-chat");
+  const queue = page.getByRole("region", {name: "Core follow-up queue"});
+  const details = queue.locator("details");
+  await expect(details).toHaveAttribute("open", "");
+  await details.scrollIntoViewIfNeeded();
+  await details.evaluate(element => {element.scrollTop = element.scrollHeight;});
+  const remove = queue.getByRole("button", {name: "Remove", exact: true});
+  await expect(remove).toBeInViewport({ratio: 1});
+  expect(await remove.evaluate(element => {
+    const rect = element.getBoundingClientRect();
+    return element.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
+  })).toBe(true);
+  await queue.getByRole("button", {name: "Edit queued message 1"}).click();
+  await queue.getByLabel("Edit queued text").focus();
+  await queue.getByRole("button", {name: "Cancel edit"}).click();
+  await expect(queue.getByLabel("Edit queued text")).toHaveCount(0);
+  expect((await new AxeBuilder({page}).include(".chat-follow-up-queue").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  await page.screenshot({path: info.outputPath("queue-scroll.png"), fullPage: true});
+});

@@ -1,0 +1,916 @@
+"""Turn-ending native hooks: once per end, one payload shape, never blamed on Stop."""
+
+import asyncio
+import contextlib
+import json
+import time
+
+import pytest
+
+from nebula.v3 import diagnostic_sensitive, diagnostics
+from nebula.v3.chat import ChatCompletionRequest, ChatError, ChatService
+from nebula.v3.domain import (
+    ChatGoal,
+    ChatGoalStatus,
+    ChatTurn,
+    ChatTurnStatus,
+    Engagement,
+    utc_now,
+)
+from nebula.v3.native_hooks import discover_native_hooks, snapshot_native_hook
+from nebula.v3.providers import (
+    ModelRequest,
+    ModelResponse,
+    ModelStreamEvent,
+    ModelUsage,
+    StreamEventType,
+    ToolCall,
+)
+from nebula.v3.storage import NebulaStore
+from tests.v3.test_chat import (
+    FakeProvider,
+    _admitted_stream,
+    _profile,
+    _write_native_hook,
+)
+from tests.v3.test_chat_tool_loop import RecordingBroker, _prepared, _response
+
+
+# Echoes its event envelope and, like an operator's stop hook that reads
+# ``finish_reason``, fails when a turn-ending payload does not carry it.
+PAYLOAD_HOOK = (
+    "#!/bin/sh\n"
+    "python3 -c 'import json,sys; envelope=json.load(sys.stdin); "
+    "print(json.dumps(envelope)); "
+    'ending = envelope["event"] != "chat.turn.started"; '
+    'raise SystemExit(1 if ending and "finish_reason" not in envelope["payload"] else 0)\'\n'
+)
+
+
+def _failing_hook(event_name: str, exit_code: int) -> str:
+    return (
+        "#!/bin/sh\n"
+        "cat > /dev/null\n"
+        f'if [ "$NEBULA_HOOK_EVENT" = "{event_name}" ]; then\n'
+        "  echo 'rule-guard: refused the turn end, token=hunter2-secret-value' >&2\n"
+        f"  exit {exit_code}\n"
+        "fi\n"
+    )
+
+
+class BlockingProvider(FakeProvider):
+    """Starts an answer and never finishes it, so the test decides the end."""
+
+    def __init__(self, provider_id: str, *, local: bool) -> None:
+        super().__init__(provider_id, local=local)
+        self.started = asyncio.Event()
+
+    async def stream(self, request: ModelRequest):
+        del request
+        self.started.set()
+        yield ModelStreamEvent(type=StreamEventType.STARTED)
+        yield ModelStreamEvent(type=StreamEventType.TEXT_DELTA, delta="Working. ")
+        await asyncio.Event().wait()
+        raise AssertionError("stopped provider stream resumed unexpectedly")
+
+
+class FailingProvider(FakeProvider):
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        if request.metadata.get("operation"):
+            return await super().complete(request)
+        self.requests.append(request)
+        raise RuntimeError("provider billing exhausted")
+
+
+@pytest.fixture
+def diagnostic_manager(tmp_path, monkeypatch):
+    monkeypatch.setattr(diagnostic_sensitive.keyring, "get_keyring", lambda: None)
+    directory = tmp_path / "diagnostics"
+    directory.mkdir()
+    (directory / "diagnostics-settings.json").write_text(
+        json.dumps(
+            {
+                "schema": diagnostics.SETTINGS_SCHEMA,
+                "global_level": "warning",
+                "feature_levels": {},
+                "sensitive_detail_capture": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = diagnostics.DiagnosticManager(directory, watch_settings=False)
+    monkeypatch.setattr(diagnostics, "_manager", manager)
+    yield manager
+    manager.close()
+
+
+def _chat_records(manager) -> list[dict]:
+    assert manager.flush()
+    log = manager.log_dir / "chat.log"
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def _service(tmp_path, provider_type, *, hook_id, events, script, **hook):
+    store = NebulaStore(tmp_path / "turn-ends.db")
+    workspace = tmp_path / "workspace"
+    hook_dir = _write_native_hook(
+        workspace, hook_id, events=events, script=script, **hook
+    )
+    engagement = store.create(Engagement(id="eng-turn-ends", name="Turn ends"))
+    profile = store.create(_profile(local=True))
+    provider = provider_type(profile.id, local=True)
+    service = ChatService(
+        store,
+        provider_factory=lambda _: provider,
+        workspace_resolver=lambda _: workspace,
+    )
+    request = ChatCompletionRequest(
+        provider_id=profile.id,
+        engagement_id=engagement.id,
+        hook_ids=[hook_id],
+        messages=[{"role": "user", "content": "Answer, then end the turn."}],
+        include_knowledge=False,
+        stream=provider_type is BlockingProvider,
+    )
+    return store, service, provider, request, hook_dir
+
+
+def _attach_running_goal(store, prepared):
+    goal = store.create(
+        ChatGoal(
+            id="goal",
+            engagement_id=prepared.engagement_id,
+            session_id=prepared.session.id,
+            objective="Finish after the repository guard accepts the answer",
+            completion_criteria=["Repository guard accepts the answer"],
+            status=ChatGoalStatus.RUNNING,
+            time_budget_seconds=3600,
+            active_since=utc_now(),
+        )
+    )
+    turn = prepared.turn
+    prepared.turn = store.update(
+        ChatTurn,
+        turn.id,
+        {"goal_id": goal.id},
+        expected_revision=turn.revision,
+    )
+    return goal
+
+
+async def _poll(read, *, timeout: float = 5.0):
+    deadline = time.monotonic() + timeout
+    while not (value := read()) and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    return value
+
+
+def test_stop_hook_failure_is_a_warning_naming_the_hook_not_the_stop(
+    tmp_path, diagnostic_manager
+):
+    async def scenario():
+        _, service, provider, request, _ = _service(
+            tmp_path,
+            BlockingProvider,
+            hook_id="rule-guard-stop",
+            events=["chat.turn.started", "chat.turn.cancelled"],
+            script=_failing_hook("chat.turn.cancelled", 3),
+            failure_policy="block",
+        )
+        prepared = await service.prepare_async(request)
+        turn_id = service.start_provider_turn(prepared)
+        await asyncio.wait_for(provider.started.wait(), 5)
+        stopped = await service.stop_provider_turn(turn_id)
+        await service.shutdown()
+        return stopped, service.list_turn_hook_executions(turn_id)
+
+    stopped, executions = asyncio.run(scenario())
+
+    assert stopped.status == ChatTurnStatus.CANCELLED
+    ended = executions[-1]
+    assert (ended.event_name, ended.status, ended.exit_code) == (
+        "chat.turn.cancelled",
+        "failed",
+        3,
+    )
+    records = _chat_records(diagnostic_manager)
+    # A turn the operator already stopped cannot be blocked by its stop hook,
+    # and the hook's own exit is not a cancellation fault.
+    assert [
+        item["event_code"] for item in records if item["level"] in {"ERROR", "CRITICAL"}
+    ] == []
+    warning = next(
+        item
+        for item in records
+        if item["event_code"] == "chat.native_hook.terminal_hook_failed"
+    )
+    assert warning["level"] == "WARNING"
+    assert warning["stage"] == "chat.turn.cancelled"
+    assert warning["execution_id"] == ended.id
+    assert warning["metadata"]["hook_id"] == "rule-guard-stop"
+    assert warning["metadata"]["exit_code"] == 3
+    assert "exited with code 3" in warning["operator_detail"]
+    assert "rule-guard: refused the turn end" in warning["operator_detail"]
+    assert "CancelledError" not in json.dumps(warning)
+    assert "hunter2-secret-value" not in json.dumps(records)
+
+
+def test_failed_turn_hook_failure_is_a_warning_and_keeps_the_turn_error(
+    tmp_path, diagnostic_manager
+):
+    async def scenario():
+        _, service, _, request, _ = _service(
+            tmp_path,
+            FailingProvider,
+            hook_id="rule-guard-failed",
+            events=["chat.turn.failed"],
+            script=_failing_hook("chat.turn.failed", 4),
+            failure_policy="block",
+        )
+        prepared = await service.prepare_async(request)
+        with pytest.raises(RuntimeError, match="billing exhausted"):
+            await service.complete(prepared)
+        await service.shutdown()
+        return service.list_turn_hook_executions(prepared.turn.id)
+
+    executions = asyncio.run(scenario())
+
+    assert [(item.event_name, item.status, item.exit_code) for item in executions] == [
+        ("chat.turn.failed", "failed", 4)
+    ]
+    records = _chat_records(diagnostic_manager)
+    assert "chat.native_hook.terminal_failure" not in {
+        item["event_code"] for item in records
+    }
+    warning = next(
+        item
+        for item in records
+        if item["event_code"] == "chat.native_hook.terminal_hook_failed"
+    )
+    assert warning["level"] == "WARNING"
+    assert warning["stage"] == "chat.turn.failed"
+    assert warning["execution_id"] == executions[0].id
+    assert warning["metadata"] == {
+        "exit_code": 4,
+        "hook_id": "rule-guard-failed",
+        "policy": "block",
+        "status": "failed",
+    }
+    assert "rule-guard: refused the turn end" in warning["operator_detail"]
+    assert "hunter2-secret-value" not in json.dumps(records)
+
+
+@pytest.mark.parametrize(
+    "provider_type,ending,finish_reason,detail",
+    [
+        (FakeProvider, "completed", "stop", None),
+        (FailingProvider, "failed", "failed", "provider billing exhausted"),
+        (BlockingProvider, "cancelled", "cancelled", "response stopped"),
+    ],
+)
+def test_every_turn_end_sends_one_payload_shape(
+    tmp_path, provider_type, ending, finish_reason, detail
+):
+    async def scenario():
+        _, service, provider, request, _ = _service(
+            tmp_path,
+            provider_type,
+            hook_id="stop-hook",
+            events=["chat.turn.completed", "chat.turn.failed", "chat.turn.cancelled"],
+            script=PAYLOAD_HOOK,
+            failure_policy="block",
+        )
+        prepared = await service.prepare_async(request)
+        turn_id = prepared.turn.id
+        if provider_type is BlockingProvider:
+            service.start_provider_turn(prepared)
+            await asyncio.wait_for(provider.started.wait(), 5)
+            await service.stop_provider_turn(turn_id)
+        else:
+            with contextlib.suppress(RuntimeError):
+                await service.complete(prepared)
+        await service.shutdown()
+        return service.list_turn_hook_executions(turn_id)
+
+    executions = asyncio.run(scenario())
+
+    # One stop hook serves all three ends: each carries the completed keys.
+    assert [(item.event_name, item.status) for item in executions] == [
+        (f"chat.turn.{ending}", "complete")
+    ]
+    payload = json.loads(executions[0].stdout)["payload"]
+    assert payload == {
+        "provider_id": "provider-a",
+        "model": "model-a",
+        "finish_reason": finish_reason,
+        "detail": detail,
+        "assistant_message": (
+            "Evidence-backed answer [source-a:chunk-a]."
+            if ending == "completed"
+            else None
+        ),
+        "assistant_message_truncated": False,
+    }
+
+
+def test_tool_turn_runs_the_completed_hook_once(tmp_path):
+    workspace = tmp_path / "workspace"
+    _write_native_hook(
+        workspace,
+        "audit",
+        events=["chat.turn.started", "chat.turn.completed"],
+        script=PAYLOAD_HOOK,
+        failure_policy="block",
+    )
+    responses = [
+        _response(
+            calls=[ToolCall(id="call-1", name="safe_read", arguments={"value": "a"})]
+        ),
+        _response(calls=[ToolCall(id="call-2", name="finish_response", arguments={})]),
+        _response(text="Final answer."),
+    ]
+    store, service, prepared, _ = _prepared(tmp_path, responses, RecordingBroker())
+    prepared.hook_snapshots = [
+        snapshot_native_hook("audit", discover_native_hooks(workspace))
+    ]
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "Final answer."
+    assert store.get(ChatTurn, "turn").status == ChatTurnStatus.COMPLETE
+    executions = service.list_turn_hook_executions("turn")
+    assert [(item.event_name, item.status) for item in executions] == [
+        ("chat.turn.started", "complete"),
+        ("chat.turn.completed", "complete"),
+    ]
+    assert json.loads(executions[1].stdout)["payload"] == {
+        "provider_id": "provider",
+        "model": "model-a",
+        "finish_reason": "stop",
+        "detail": None,
+        "assistant_message": "Final answer.",
+        "assistant_message_truncated": False,
+    }
+
+
+def test_required_completion_hook_can_reject_final_answer(tmp_path):
+    script = (
+        "#!/bin/sh\n"
+        "python3 -c 'import json,sys; "
+        'payload=json.load(sys.stdin)["payload"]; '
+        'raise SystemExit(3 if "Evidence-backed answer" in '
+        'payload["assistant_message"] else 0)\'\n'
+    )
+    store, service, _, request, _ = _service(
+        tmp_path,
+        FakeProvider,
+        hook_id="answer-guard",
+        events=["chat.turn.completed"],
+        script=script,
+        failure_policy="block",
+    )
+    prepared = service.prepare(request)
+
+    with pytest.raises(ChatError, match="required native hook 'answer-guard'"):
+        asyncio.run(service.complete(prepared))
+
+    assert store.get(ChatTurn, prepared.turn.id).status == ChatTurnStatus.FAILED
+    execution = service.list_turn_hook_executions(prepared.turn.id)[0]
+    assert (execution.event_name, execution.status, execution.exit_code) == (
+        "chat.turn.completed",
+        "failed",
+        3,
+    )
+
+
+def test_required_completion_hook_feedback_reaches_model_and_rechecks_answer(tmp_path):
+    class RevisingProvider(FakeProvider):
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            if request.metadata.get("completion_hook_retry") == "1":
+                self.requests.append(request)
+                return ModelResponse(
+                    provider_id=self.config.id,
+                    model="model-a",
+                    text="Revised answer with evidence.",
+                    finish_reason="stop",
+                )
+            return await super().complete(request)
+
+    script = (
+        "#!/bin/sh\n"
+        "python3 -c 'import json,sys; "
+        'message=json.load(sys.stdin)["payload"]["assistant_message"]; '
+        'print("Missing evidence: cite the dossier"); '
+        'raise SystemExit(3 if "Revised answer" not in message else 0)\'\n'
+    )
+    store, service, provider, request, _ = _service(
+        tmp_path,
+        RevisingProvider,
+        hook_id="answer-guard",
+        events=["chat.turn.completed"],
+        script=script,
+        failure_policy="block",
+    )
+    prepared = service.prepare(request)
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "Revised answer with evidence."
+    assert store.get(ChatTurn, prepared.turn.id).status == ChatTurnStatus.COMPLETE
+    assert len(service.list_turn_hook_executions(prepared.turn.id)) == 2
+    retry = next(
+        item
+        for item in provider.requests
+        if item.metadata.get("completion_hook_retry") == "1"
+    )
+    assert "Missing evidence: cite the dossier" in retry.messages[-1].content
+    assert retry.messages[-2].role == "assistant"
+    assert retry.messages[-2].content == "Evidence-backed answer [source-a:chunk-a]."
+
+
+def test_tool_turn_routes_again_with_completion_hook_feedback(tmp_path):
+    script = (
+        "#!/bin/sh\n"
+        "python3 -c 'import json,sys; "
+        'message=json.load(sys.stdin)["payload"]["assistant_message"]; '
+        'print("Check the repository state before answering"); '
+        'raise SystemExit(3 if "Initial answer" in message else 0)\'\n'
+    )
+    workspace = tmp_path / "workspace"
+    _write_native_hook(
+        workspace,
+        "repository-lifecycle",
+        events=["chat.turn.completed"],
+        script=script,
+        failure_policy="block",
+    )
+    broker = RecordingBroker()
+    responses = [
+        _response(
+            calls=[ToolCall(id="finish-1", name="finish_response", arguments={})]
+        ),
+        _response(text="Initial answer."),
+        _response(
+            calls=[
+                ToolCall(id="read-1", name="safe_read", arguments={"value": "state"})
+            ]
+        ),
+        _response(
+            calls=[ToolCall(id="finish-2", name="finish_response", arguments={})]
+        ),
+        _response(text="Answer after checking state."),
+    ]
+    store, service, prepared, provider = _prepared(tmp_path, responses, broker)
+    prepared.hook_snapshots = [
+        snapshot_native_hook("repository-lifecycle", discover_native_hooks(workspace))
+    ]
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "Answer after checking state."
+    assert store.get(ChatTurn, "turn").status == ChatTurnStatus.COMPLETE
+    assert len(broker.calls) == 1
+    assert len(service.list_turn_hook_executions("turn")) == 2
+    assert any(
+        "Check the repository state before answering" in str(message.content)
+        for message in provider.requests[2].messages
+    )
+    assert "safe, owned, and in scope" in str(provider.requests[2].messages[-1].content)
+    assert "exact operator action required" in str(
+        provider.requests[2].messages[-1].content
+    )
+
+
+def test_running_goal_routes_each_replayable_completion_hook_failure(tmp_path):
+    script = (
+        "#!/bin/sh\n"
+        "python3 -c 'import json,sys; "
+        'message=json.load(sys.stdin)["payload"]["assistant_message"]; '
+        'print("Repository guard still blocks completion"); '
+        'raise SystemExit(0 if "Accepted answer" in message else 3)\'\n'
+    )
+    workspace = tmp_path / "workspace"
+    _write_native_hook(
+        workspace,
+        "repository-lifecycle",
+        events=["chat.turn.completed"],
+        script=script,
+        failure_policy="block",
+    )
+    store, service, prepared, provider = _prepared(
+        tmp_path,
+        [
+            _response(text="Initial answer."),
+            _response(text="Still blocked."),
+            _response(text="Accepted answer."),
+        ],
+        RecordingBroker(),
+    )
+    _attach_running_goal(store, prepared)
+    prepared.hook_snapshots = [
+        snapshot_native_hook("repository-lifecycle", discover_native_hooks(workspace))
+    ]
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "Accepted answer."
+    assert store.get(ChatTurn, "turn").status == ChatTurnStatus.COMPLETE
+    assert len(service.list_turn_hook_executions("turn")) == 3
+    assert prepared.turn.request_snapshot["completion_hook_feedback"]["attempt"] == 2
+    assert "Repository guard still blocks completion" in str(
+        provider.requests[2].messages[-1].content
+    )
+
+
+def test_running_goal_stops_after_bounded_tool_hook_repairs(tmp_path):
+    workspace = tmp_path / "workspace"
+    _write_native_hook(
+        workspace,
+        "repository-lifecycle",
+        events=["chat.turn.completed"],
+        script="#!/bin/sh\nprintf 'another owner must finish a clone\\n'\nexit 3\n",
+        failure_policy="block",
+    )
+    store, service, prepared, provider = _prepared(
+        tmp_path,
+        [
+            _response(text="Initial answer."),
+            _response(text="I checked my own workspace and repaired its state."),
+            _response(text="The remaining clone belongs to another owner."),
+            _response(text="This fourth response must never be requested."),
+        ],
+        RecordingBroker(),
+    )
+    _attach_running_goal(store, prepared)
+    prepared.hook_snapshots = [
+        snapshot_native_hook("repository-lifecycle", discover_native_hooks(workspace))
+    ]
+
+    with pytest.raises(ChatError, match="required native hook 'repository-lifecycle'"):
+        asyncio.run(service.complete(prepared))
+
+    turn = store.get(ChatTurn, "turn")
+    goal = store.get(ChatGoal, "goal")
+    assert turn.status == ChatTurnStatus.FAILED
+    assert goal.status == ChatGoalStatus.PAUSED
+    assert "repository-lifecycle" in (goal.blocked_reason or "")
+    assert len(provider.requests) == 3
+    assert len(service.list_turn_hook_executions("turn")) == 3
+    assert turn.request_snapshot["completion_hook_feedback"]["attempt"] == 2
+    assert turn.request_snapshot["completion_hook_resolution"]["candidate"] == (
+        "The remaining clone belongs to another owner."
+    )
+
+
+def test_running_goal_rechecks_replayable_hook_more_than_once_without_tools(
+    tmp_path,
+):
+    class RevisingProvider(FakeProvider):
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            if request.metadata.get("operation"):
+                return await super().complete(request)
+            self.requests.append(request)
+            attempt = int(request.metadata.get("completion_hook_retry", "0"))
+            return ModelResponse(
+                provider_id=self.config.id,
+                model="model-a",
+                text=(
+                    "Accepted answer."
+                    if attempt == 2
+                    else f"Incomplete answer {attempt}."
+                ),
+                finish_reason="stop",
+                usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
+            )
+
+    script = (
+        "#!/bin/sh\n"
+        "python3 -c 'import json,sys; "
+        'message=json.load(sys.stdin)["payload"]["assistant_message"]; '
+        'print("More evidence required"); '
+        'raise SystemExit(0 if "Accepted answer" in message else 3)\'\n'
+    )
+    store, service, provider, request, _ = _service(
+        tmp_path,
+        RevisingProvider,
+        hook_id="answer-guard",
+        events=["chat.turn.completed"],
+        script=script,
+        failure_policy="block",
+    )
+    prepared = service.prepare(request)
+    _attach_running_goal(store, prepared)
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "Accepted answer."
+    assert len(service.list_turn_hook_executions(prepared.turn.id)) == 3
+    assert store.get(ChatTurn, prepared.turn.id).usage.total_tokens == 9
+    assert "More evidence required" in str(provider.requests[2].messages[-1].content)
+
+
+def test_running_goal_stops_after_bounded_tool_free_hook_rechecks(tmp_path):
+    class BlockedProvider(FakeProvider):
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            return ModelResponse(
+                provider_id=self.config.id,
+                model="model-a",
+                text="The required evidence is still unavailable.",
+                finish_reason="stop",
+                usage=ModelUsage(input_tokens=2, output_tokens=1, total_tokens=3),
+            )
+
+    store, service, provider, request, _ = _service(
+        tmp_path,
+        BlockedProvider,
+        hook_id="answer-guard",
+        events=["chat.turn.completed"],
+        script="#!/bin/sh\nprintf 'evidence remains missing\\n'\nexit 3\n",
+        failure_policy="block",
+    )
+    prepared = service.prepare(request)
+    _attach_running_goal(store, prepared)
+
+    with pytest.raises(ChatError, match="required native hook 'answer-guard'"):
+        asyncio.run(service.complete(prepared))
+
+    turn = store.get(ChatTurn, prepared.turn.id)
+    goal = store.get(ChatGoal, "goal")
+    assert turn.status == ChatTurnStatus.FAILED
+    assert goal.status == ChatGoalStatus.PAUSED
+    assert (
+        len([item for item in provider.requests if not item.metadata.get("operation")])
+        == 3
+    )
+    assert len(service.list_turn_hook_executions(prepared.turn.id)) == 3
+    assert turn.request_snapshot["completion_hook_resolution"]["candidate"] == (
+        "The required evidence is still unavailable."
+    )
+
+
+def test_streamed_running_goal_pauses_after_persistent_completion_hook(tmp_path):
+    class BlockedStreamingProvider(FakeProvider):
+        async def stream(self, request: ModelRequest):
+            self.requests.append(request)
+            answer = "The required evidence is still unavailable."
+            yield ModelStreamEvent(type=StreamEventType.STARTED)
+            yield ModelStreamEvent(
+                type=StreamEventType.COMPLETED,
+                response=ModelResponse(
+                    provider_id=self.config.id,
+                    model="model-a",
+                    text=answer,
+                    finish_reason="stop",
+                ),
+            )
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            return ModelResponse(
+                provider_id=self.config.id,
+                model="model-a",
+                text="The required evidence is still unavailable.",
+                finish_reason="stop",
+            )
+
+    store, service, provider, request, _ = _service(
+        tmp_path,
+        BlockedStreamingProvider,
+        hook_id="answer-guard",
+        events=["chat.turn.completed"],
+        script="#!/bin/sh\nprintf 'evidence remains missing\\n'\nexit 3\n",
+        failure_policy="block",
+    )
+
+    async def scenario():
+        prepared = await service.prepare_async(
+            request.model_copy(update={"stream": True})
+        )
+        _attach_running_goal(store, prepared)
+        turn_id = service.start_provider_turn(prepared)
+        with pytest.raises(ChatError, match="required native hook 'answer-guard'"):
+            async for _ in service.follow_provider_turn(turn_id):
+                pass
+        turn = store.get(ChatTurn, turn_id)
+        goal = store.get(ChatGoal, "goal")
+        assert turn.status == ChatTurnStatus.FAILED
+        assert goal.status == ChatGoalStatus.PAUSED
+        assert "answer-guard" in (goal.blocked_reason or "")
+        assert len(service.list_turn_hook_executions(turn_id)) == 3
+        assert (
+            len(
+                [
+                    item
+                    for item in provider.requests
+                    if not item.metadata.get("operation")
+                ]
+            )
+            == 3
+        )
+        await service.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_tool_turn_preserves_model_decision_when_completion_hook_still_blocks(
+    tmp_path,
+):
+    script = "#!/bin/sh\nprintf 'another owner has an unmerged worktree\\n'\nexit 3\n"
+    workspace = tmp_path / "workspace"
+    _write_native_hook(
+        workspace,
+        "repository-lifecycle",
+        events=["chat.turn.completed"],
+        script=script,
+        failure_policy="block",
+    )
+    broker = RecordingBroker()
+    responses = [
+        _response(
+            calls=[ToolCall(id="finish-1", name="finish_response", arguments={})]
+        ),
+        _response(text="Initial answer."),
+        _response(
+            calls=[ToolCall(id="finish-2", name="finish_response", arguments={})]
+        ),
+        _response(
+            text=(
+                "I cannot safely repair another owner's unmerged worktree. "
+                "The operator must reconcile that owner before completion."
+            )
+        ),
+    ]
+    store, service, prepared, _ = _prepared(tmp_path, responses, broker)
+    prepared.hook_snapshots = [
+        snapshot_native_hook("repository-lifecycle", discover_native_hooks(workspace))
+    ]
+
+    with pytest.raises(ChatError, match="required native hook 'repository-lifecycle'"):
+        asyncio.run(service.complete(prepared))
+
+    turn = store.get(ChatTurn, "turn")
+    assert turn.status == ChatTurnStatus.FAILED
+    assert turn.request_snapshot["completion_hook_resolution"] == {
+        "hook_id": "repository-lifecycle",
+        "output": "another owner has an unmerged worktree",
+        "candidate": (
+            "I cannot safely repair another owner's unmerged worktree. "
+            "The operator must reconcile that owner before completion."
+        ),
+    }
+    note = next(
+        item
+        for item in service.session_messages(turn.session_id)
+        if item.metadata.get("kind") == "turn_outcome"
+    )
+    assert "Model decision after completion-hook feedback" in note.content
+    assert "operator must reconcile that owner" in note.content
+    assert len(service.list_turn_hook_executions("turn")) == 2
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_stream_holds_answer_until_required_completion_hook_accepts(tmp_path, blocked):
+    class StreamingAnswerProvider(FakeProvider):
+        answer_text = ""
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            return ModelResponse(
+                provider_id=self.config.id,
+                model="model-a",
+                text=self.answer_text,
+                finish_reason="stop",
+            )
+
+        async def stream(self, request: ModelRequest):
+            del request
+            answer = self.answer_text
+            yield ModelStreamEvent(type=StreamEventType.STARTED)
+            yield ModelStreamEvent(type=StreamEventType.TEXT_DELTA, delta=answer)
+            yield ModelStreamEvent(
+                type=StreamEventType.COMPLETED,
+                response=ModelResponse(
+                    provider_id=self.config.id,
+                    model="model-a",
+                    text=answer,
+                    finish_reason="stop",
+                ),
+            )
+
+    script = (
+        "#!/bin/sh\n"
+        "python3 -c 'import json,sys; "
+        'message=json.load(sys.stdin)["payload"]["assistant_message"]; '
+        'raise SystemExit(3 if "down" in message else 0)\'\n'
+    )
+    _, service, provider, request, _ = _service(
+        tmp_path,
+        StreamingAnswerProvider,
+        hook_id="stream-answer-guard",
+        events=["chat.turn.completed"],
+        script=script,
+        failure_policy="block",
+    )
+    provider.answer_text = (
+        "The example service is down." if blocked else "The example service is active."
+    )
+
+    async def scenario():
+        prepared = await service.prepare_async(
+            request.model_copy(update={"stream": True})
+        )
+        visible = []
+        if blocked:
+            with pytest.raises(ChatError, match="stream-answer-guard"):
+                async for event, payload in _admitted_stream(service, prepared):
+                    visible.append((event, payload))
+        else:
+            async for event, payload in _admitted_stream(service, prepared):
+                visible.append((event, payload))
+        return visible
+
+    visible = asyncio.run(scenario())
+    assert [event for event, _ in visible] == (
+        ["started"] if blocked else ["started", "delta", "done"]
+    )
+
+
+@pytest.mark.parametrize("ended_by", ["operator_stop", "core_shutdown"])
+def test_a_hook_running_when_the_turn_ends_never_stays_running(tmp_path, ended_by):
+    """A stopped turn records the hook's real outcome once its process exits.
+
+    Core shutdown parks the turn; a late successful exit is recorded and can
+    be adopted on the next recovery read without running the hook again.
+    """
+
+    async def scenario():
+        store, service, provider, request, hook_dir = _service(
+            tmp_path,
+            BlockingProvider,
+            hook_id="slow-start",
+            events=["chat.turn.started", "chat.turn.cancelled"],
+            script=(
+                "#!/bin/sh\n"
+                "cat > /dev/null\n"
+                'if [ "$NEBULA_HOOK_EVENT" = "chat.turn.started" ]; then\n'
+                "  while [ ! -f release ]; do sleep 0.02; done\n"
+                "  echo started-hook-finished\n"
+                "fi\n"
+            ),
+            side_effects="workspace",
+        )
+        prepared = await service.prepare_async(request)
+        turn_id = service.start_provider_turn(prepared)
+
+        def started_hook():
+            return [
+                item
+                for item in service.list_turn_hook_executions(turn_id)
+                if item.event_name == "chat.turn.started"
+            ]
+
+        running = await _poll(started_hook)
+        assert [item.status for item in running] == ["running"]
+        if ended_by == "operator_stop":
+            await service.stop_provider_turn(turn_id)
+        else:
+            await service.shutdown()
+        (hook_dir / "release").touch()
+        await _poll(
+            lambda: [
+                item
+                for item in started_hook()
+                if item.exit_code == 0 or item.late_outcome is not None
+            ]
+        )
+        await asyncio.sleep(0.2)
+        await service.shutdown()
+        turn = store.get(ChatTurn, turn_id)
+        if ended_by == "core_shutdown":
+            turn = service.pending_turn(turn.session_id)
+        return turn, service.list_turn_hook_executions(turn_id)
+
+    turn, executions = asyncio.run(scenario())
+
+    started = executions[0]
+    assert started.event_name == "chat.turn.started"
+    if ended_by == "operator_stop":
+        assert turn.status == ChatTurnStatus.CANCELLED
+        assert (started.status, started.exit_code) == ("complete", 0)
+        assert started.stdout.strip() == "started-hook-finished"
+        assert started.completed_at is not None
+        assert [(item.event_name, item.status) for item in executions[1:]] == [
+            ("chat.turn.cancelled", "complete")
+        ]
+    else:
+        assert turn.status == ChatTurnStatus.INTERRUPTED
+        assert started.status == "complete"
+        assert started.exit_code == 0
+        assert started.late_outcome is not None
+        assert started.late_outcome.status == "complete"
+        assert turn.request_snapshot["recovery"]["unknown_hook_execution_ids"] == []
+        assert turn.request_snapshot["recovery"]["recorded_hook_outcome_ids"] == [
+            started.id
+        ]

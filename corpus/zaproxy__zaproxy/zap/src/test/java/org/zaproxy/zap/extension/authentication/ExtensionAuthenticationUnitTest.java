@@ -1,0 +1,247 @@
+/*
+ * Zed Attack Proxy (ZAP) and its related class files.
+ *
+ * ZAP is an HTTP/HTTPS proxy for assessing web application security.
+ *
+ * Copyright 2020 The ZAP Development Team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.zaproxy.zap.extension.authentication;
+
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+
+import org.apache.commons.configuration.Configuration;
+import org.apache.commons.configuration.ConfigurationException;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.parosproxy.paros.extension.ExtensionHook;
+import org.parosproxy.paros.model.Model;
+import org.zaproxy.zap.WithConfigsTest;
+import org.zaproxy.zap.authentication.AuthenticationMethod;
+import org.zaproxy.zap.authentication.AuthenticationMethod.AuthCheckingStrategy;
+import org.zaproxy.zap.authentication.AuthenticationMethod.AuthPollFrequencyUnits;
+import org.zaproxy.zap.authentication.FormBasedAuthenticationMethodType;
+import org.zaproxy.zap.authentication.FormBasedAuthenticationMethodType.FormBasedAuthenticationMethod;
+import org.zaproxy.zap.model.Context;
+import org.zaproxy.zap.utils.ZapXmlConfiguration;
+
+/** Unit test for {@link ExtensionAuthentication}. */
+class ExtensionAuthenticationUnitTest extends WithConfigsTest {
+
+    private ExtensionAuthentication extensionAuthentication;
+
+    @BeforeEach
+    void setup() {
+        extensionAuthentication = new ExtensionAuthentication();
+    }
+
+    @Test
+    void shouldImportContextWithNoAuthenticationMethod() throws ConfigurationException {
+        // Given
+        Context context = mock(Context.class);
+        Configuration config = new ZapXmlConfiguration();
+        // When
+        extensionAuthentication.importContextData(context, config);
+        // Then
+        verify(context, times(0)).setAuthenticationMethod(any());
+    }
+
+    @Test
+    void shouldImportContextWithUnknownAuthenticationMethod() throws ConfigurationException {
+        // Given
+        Context context = mock(Context.class);
+        Configuration config = new ZapXmlConfiguration();
+        config.setProperty("context.authentication.type", Integer.MIN_VALUE);
+        // When
+        extensionAuthentication.importContextData(context, config);
+        // Then
+        verify(context, times(0)).setAuthenticationMethod(any());
+    }
+
+    @Test
+    void shouldExportAllAuthContextData() {
+        // Given
+        Context context = new Context(null, 0);
+        String loggedInIndicator = "logged in";
+        String loggedOutIndicator = "logged out";
+        String pollMethod = "Method";
+        String pollUrl = "https://www.example.com/poll";
+        String pollData = "example-poll-data";
+        String pollHeaders = "aaa : bbb\\Nccc : ddd";
+        int pollFreq = 55;
+
+        FormBasedAuthenticationMethodType type = new FormBasedAuthenticationMethodType();
+        FormBasedAuthenticationMethod method = type.createAuthenticationMethod(0);
+        context.setAuthenticationMethod(method);
+        context.getVerificationMethod().setAuthCheckingStrategy(AuthCheckingStrategy.POLL_URL);
+        context.getVerificationMethod().setPollMethod(pollMethod);
+        context.getVerificationMethod().setPollUrl(pollUrl);
+        context.getVerificationMethod().setPollData(pollData);
+        context.getVerificationMethod().setPollHeaders(pollHeaders);
+        context.getVerificationMethod().setPollFrequencyUnits(AuthPollFrequencyUnits.REQUESTS);
+        context.getVerificationMethod().setPollFrequency(pollFreq);
+        context.getVerificationMethod().setLoggedInIndicatorPattern(loggedInIndicator);
+        context.getVerificationMethod().setLoggedOutIndicatorPattern(loggedOutIndicator);
+        Configuration config = new ZapXmlConfiguration();
+
+        // When
+        extensionAuthentication.exportContextData(context, config);
+
+        // Then
+        assertThat(config.getInt(AuthenticationMethod.CONTEXT_CONFIG_AUTH_TYPE), is(2));
+        assertThat(
+                config.getString(AuthenticationMethod.CONTEXT_CONFIG_AUTH_STRATEGY),
+                is(AuthCheckingStrategy.POLL_URL.name()));
+        assertThat(
+                config.getString(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_METHOD),
+                is(pollMethod));
+        assertThat(
+                config.getString(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_URL), is(pollUrl));
+        assertThat(
+                config.getString(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_DATA), is(pollData));
+        assertThat(
+                config.getString(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_HEADERS),
+                is(pollHeaders));
+        assertThat(config.getInt(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_FREQ), is(pollFreq));
+        assertThat(
+                config.getString(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_UNITS),
+                is(AuthPollFrequencyUnits.REQUESTS.name()));
+        assertThat(
+                config.getString(AuthenticationMethod.CONTEXT_CONFIG_AUTH_LOGGEDIN),
+                is(loggedInIndicator));
+        assertThat(
+                config.getString(AuthenticationMethod.CONTEXT_CONFIG_AUTH_LOGGEDOUT),
+                is(loggedOutIndicator));
+    }
+
+    @Test
+    void shouldImportAllAuthContextData() throws ConfigurationException {
+        // Given
+        Context context = new Context(null, 0);
+        String loggedInIndicator = "logged in";
+        String loggedOutIndicator = "logged out";
+        String pollMethod = "Method";
+        String pollUrl = "https://www.example.com/poll";
+        String pollData = "example-poll-data";
+        String pollHeaders = "aaa : bbb\\Nccc : ddd";
+        int pollFreq = 55;
+
+        Configuration config = new ZapXmlConfiguration();
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_TYPE, 2);
+        config.setProperty(
+                AuthenticationMethod.CONTEXT_CONFIG_AUTH_STRATEGY,
+                AuthCheckingStrategy.POLL_URL.name());
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_METHOD, pollMethod);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_URL, pollUrl);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_DATA, pollData);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_HEADERS, pollHeaders);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_FREQ, pollFreq);
+        config.setProperty(
+                AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_UNITS,
+                AuthPollFrequencyUnits.REQUESTS.name());
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_LOGGEDIN, loggedInIndicator);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_LOGGEDOUT, loggedOutIndicator);
+
+        ExtensionHook hook = new ExtensionHook(Model.getSingleton(), null);
+        extensionAuthentication.hook(hook);
+
+        // When
+        extensionAuthentication.importContextData(context, config);
+
+        // Then
+        assertThat(
+                context.getAuthenticationMethod().getClass().getCanonicalName(),
+                is(FormBasedAuthenticationMethod.class.getCanonicalName()));
+        assertThat(
+                context.getVerificationMethod().getAuthCheckingStrategy(),
+                is(AuthCheckingStrategy.POLL_URL));
+        assertThat(context.getVerificationMethod().getPollMethod(), is(pollMethod));
+        assertThat(context.getVerificationMethod().getPollUrl(), is(pollUrl));
+        assertThat(context.getVerificationMethod().getPollData(), is(pollData));
+        assertThat(context.getVerificationMethod().getPollHeaders(), is(pollHeaders));
+        assertThat(
+                context.getVerificationMethod().getPollFrequencyUnits(),
+                is(AuthPollFrequencyUnits.REQUESTS));
+        assertThat(context.getVerificationMethod().getPollFrequency(), is(pollFreq));
+        assertThat(
+                context.getVerificationMethod().getLoggedInIndicatorPattern().toString(),
+                is(loggedInIndicator));
+        assertThat(
+                context.getVerificationMethod().getLoggedOutIndicatorPattern().toString(),
+                is(loggedOutIndicator));
+    }
+
+    @Test
+    void shouldImportContextWithNoPollData() throws ConfigurationException {
+        // Given
+        Context context = new Context(null, 0);
+        String loggedInIndicator = "logged in";
+        String loggedOutIndicator = "logged out";
+
+        Configuration config = new ZapXmlConfiguration();
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_TYPE, 2);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_LOGGEDIN, loggedInIndicator);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_LOGGEDOUT, loggedOutIndicator);
+
+        ExtensionHook hook = new ExtensionHook(Model.getSingleton(), null);
+        extensionAuthentication.hook(hook);
+
+        // When
+        extensionAuthentication.importContextData(context, config);
+
+        // Then
+        assertThat(
+                context.getAuthenticationMethod().getClass().getCanonicalName(),
+                is(FormBasedAuthenticationMethod.class.getCanonicalName()));
+        assertThat(
+                context.getVerificationMethod().getAuthCheckingStrategy(),
+                is(AuthCheckingStrategy.EACH_RESP));
+        assertThat(
+                context.getVerificationMethod().getLoggedInIndicatorPattern().toString(),
+                is(loggedInIndicator));
+        assertThat(
+                context.getVerificationMethod().getLoggedOutIndicatorPattern().toString(),
+                is(loggedOutIndicator));
+    }
+
+    @Test
+    void shouldImportContextWithPollUrlButNoStrategyAsPollUrl() throws ConfigurationException {
+        // Given
+        Context context = new Context(null, 0);
+        String pollUrl = "https://www.example.com/poll";
+        String loggedInIndicator = "logged in";
+
+        Configuration config = new ZapXmlConfiguration();
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_TYPE, 2);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_POLL_URL, pollUrl);
+        config.setProperty(AuthenticationMethod.CONTEXT_CONFIG_AUTH_LOGGEDIN, loggedInIndicator);
+
+        ExtensionHook hook = new ExtensionHook(Model.getSingleton(), null);
+        extensionAuthentication.hook(hook);
+
+        // When
+        extensionAuthentication.importContextData(context, config);
+
+        // Then
+        assertThat(
+                context.getVerificationMethod().getAuthCheckingStrategy(),
+                is(AuthCheckingStrategy.POLL_URL));
+        assertThat(context.getVerificationMethod().getPollUrl(), is(pollUrl));
+    }
+}

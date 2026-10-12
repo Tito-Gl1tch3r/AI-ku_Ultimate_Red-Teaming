@@ -1,0 +1,394 @@
+//! Files service interface.
+//!
+//! Provides tar-based upload/download to the guest container rootfs.
+
+use crate::litebox::CopySourceKind;
+use boxlite_shared::{
+    BoxByteStream, BoxliteError, BoxliteResult, DownloadRequest, FilesClient, UploadChunk,
+};
+use futures::StreamExt;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tonic::transport::Channel;
+
+const CHUNK_SIZE: usize = 1 << 20; // 1 MiB
+
+/// Files service interface.
+pub struct FilesInterface {
+    client: FilesClient<Channel>,
+}
+
+impl FilesInterface {
+    /// Create from a channel.
+    pub fn new(channel: Channel) -> Self {
+        Self {
+            client: FilesClient::new(channel),
+        }
+    }
+
+    /// Upload a tar file to the guest and extract at dest_path.
+    pub async fn upload_tar(
+        &mut self,
+        tar_path: &std::path::Path,
+        dest_path: &str,
+        container_id: Option<&str>,
+        mkdir_parents: bool,
+        overwrite: bool,
+    ) -> BoxliteResult<()> {
+        let dest = dest_path.to_string();
+        let cid = container_id.unwrap_or_default().to_string();
+
+        // Read entire tar file and build chunks
+        // Note: For very large files, consider streaming with async_stream crate
+        let mut file = File::open(tar_path)
+            .await
+            .map_err(|e| BoxliteError::Storage(format!("Failed to open tar file: {}", e)))?;
+
+        let mut chunks = Vec::new();
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut first = true;
+
+        loop {
+            match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = UploadChunk {
+                        dest_path: if first { dest.clone() } else { String::new() },
+                        container_id: cid.clone(),
+                        data: buf[..n].to_vec(),
+                        mkdir_parents,
+                        overwrite,
+                        source_is_dir: None,
+                    };
+                    first = false;
+                    chunks.push(chunk);
+                }
+                Err(e) => {
+                    return Err(BoxliteError::Storage(format!(
+                        "Failed to read tar file: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        // Use futures::stream::iter for the upload stream
+        let stream = futures::stream::iter(chunks);
+
+        let response = self
+            .client
+            .upload(stream)
+            .await
+            .map_err(map_tonic_err)?
+            .into_inner();
+
+        if response.success {
+            Ok(())
+        } else {
+            Err(BoxliteError::Internal(
+                response.error.unwrap_or_else(|| "Upload failed".into()),
+            ))
+        }
+    }
+
+    /// Download a path from guest into a local tar file.
+    ///
+    /// `container_src` is passed as the caller wrote it: a trailing `/.`
+    /// asks for the directory's contents (see `download_request`).
+    pub async fn download_tar(
+        &mut self,
+        container_src: &str,
+        container_id: Option<&str>,
+        follow_symlinks: bool,
+        tar_dest: &std::path::Path,
+    ) -> BoxliteResult<()> {
+        let request = download_request(container_src, container_id, follow_symlinks);
+
+        let mut stream = self
+            .client
+            .download(request)
+            .await
+            .map_err(map_tonic_err)?
+            .into_inner();
+
+        let mut file = File::create(tar_dest)
+            .await
+            .map_err(|e| BoxliteError::Storage(format!("Failed to create tar file: {}", e)))?;
+
+        // Use explicit match for proper error handling
+        loop {
+            match stream.message().await {
+                Ok(Some(chunk)) => {
+                    file.write_all(&chunk.data).await.map_err(|e| {
+                        BoxliteError::Storage(format!("Failed to write tar file: {}", e))
+                    })?;
+                }
+                Ok(None) => break, // Stream ended
+                Err(e) => return Err(map_tonic_err(e)),
+            }
+        }
+
+        file.flush()
+            .await
+            .map_err(|e| BoxliteError::Storage(format!("Failed to flush tar file: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Upload a byte stream to the guest and extract at `dest_path`.
+    ///
+    /// `source` is the archive shape (dir tree vs single file);
+    /// [`CopySourceKind::Unknown`] when the caller cannot tell — the guest then
+    /// peeks the archive to decide extraction mode. It is attached to the first
+    /// chunk only.
+    pub async fn upload_stream<S>(
+        &mut self,
+        stream: S,
+        dest_path: &str,
+        container_id: Option<&str>,
+        mkdir_parents: bool,
+        overwrite: bool,
+        source: CopySourceKind,
+    ) -> BoxliteResult<()>
+    where
+        S: futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static,
+    {
+        let dest = dest_path.to_string();
+        let cid = container_id.unwrap_or_default().to_string();
+
+        // tonic client-streaming yields the message directly (no per-item
+        // `Result`); a mid-stream error is signalled by ending the stream, and
+        // the guest reports the failure in `UploadResponse`. The generator
+        // parks the first source-stream error in a shared slot: the guest may
+        // still report success on the truncated archive it received, and the
+        // caller must not see that as a successful copy.
+        let stream_err: std::sync::Arc<tokio::sync::Mutex<Option<std::io::Error>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let stream_err_slot = stream_err.clone();
+        let source_is_dir = source.to_wire();
+        let chunks = async_stream::stream! {
+            futures::pin_mut!(stream);
+            let mut first = true;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(data) => {
+                        yield UploadChunk {
+                            dest_path: if first { dest.clone() } else { String::new() },
+                            container_id: cid.clone(),
+                            data,
+                            mkdir_parents,
+                            overwrite,
+                            source_is_dir: if first { source_is_dir } else { None },
+                        };
+                        first = false;
+                    }
+                    Err(e) => {
+                        *stream_err_slot.lock().await = Some(e);
+                        break;
+                    }
+                }
+            }
+        };
+
+        let response = self
+            .client
+            .upload(chunks)
+            .await
+            .map_err(map_tonic_err)?
+            .into_inner();
+
+        // Prefer the source-stream failure over the guest's verdict: a pack or
+        // read failure (or an explicit abort) must never surface as a
+        // successful copy of a truncated archive.
+        if let Some(e) = stream_err.lock().await.take() {
+            return Err(BoxliteError::Internal(format!(
+                "source stream failed during upload: {e}"
+            )));
+        }
+
+        if response.success {
+            Ok(())
+        } else {
+            Err(BoxliteError::Internal(
+                response.error.unwrap_or_else(|| "Upload failed".into()),
+            ))
+        }
+    }
+
+    /// Download a path from the guest as a byte stream.
+    ///
+    /// Returns the stream plus the source shape read from the guest's first
+    /// chunk. [`CopySourceKind::Unknown`] means the guest predates the hint
+    /// (older peer).
+    pub async fn download_stream(
+        &mut self,
+        container_src: &str,
+        container_id: Option<&str>,
+        follow_symlinks: bool,
+    ) -> BoxliteResult<(BoxByteStream, CopySourceKind)> {
+        let request = download_request(container_src, container_id, follow_symlinks);
+
+        let mut stream = self
+            .client
+            .download(request)
+            .await
+            .map_err(map_tonic_err)?
+            .into_inner();
+
+        let first = stream.message().await.map_err(map_tonic_err)?;
+        let source = CopySourceKind::from_wire(first.as_ref().and_then(|c| c.source_is_dir));
+        let mut first_data = first.map(|c| c.data);
+
+        let out = async_stream::stream! {
+            if let Some(data) = first_data.take().filter(|d| !d.is_empty()) {
+                yield Ok(data);
+            }
+            loop {
+                match stream.message().await {
+                    Ok(Some(chunk)) => {
+                        if !chunk.data.is_empty() {
+                            yield Ok(chunk.data);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        yield Err(std::io::Error::other(e));
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok((Box::pin(out), source))
+    }
+}
+
+/// Build the guest request for reading `container_src` out.
+///
+/// The API spells "the contents, not the directory" as `SRC/.`; the wire
+/// carries it as `include_parent: false`. Translating here — the one place
+/// every host-side download passes through, local or relayed for a REST
+/// caller — keeps guests that predate the spelling correct too: they read the
+/// flag, and normalize the trailing `.` away when they resolve the path.
+fn download_request(
+    container_src: &str,
+    container_id: Option<&str>,
+    follow_symlinks: bool,
+) -> DownloadRequest {
+    DownloadRequest {
+        src_path: container_src.to_string(),
+        container_id: container_id.unwrap_or_default().to_string(),
+        include_parent: !boxlite_shared::tar::specifies_current_dir(std::ffi::OsStr::new(
+            container_src,
+        )),
+        follow_symlinks,
+    }
+}
+
+/// Preserve the guest's error class instead of flattening it to `Internal`.
+///
+/// The guest rejects bad requests with real gRPC codes — an unreachable
+/// destination, a missing source, a malformed path, a payload over its size
+/// cap. Collapsing all of them into `Internal` turned every one into a 500 and
+/// buried the reason inside a `status: …` string, which is exactly how a caller
+/// ends up thinking a deliberate refusal was a server fault.
+///
+/// The arms are the complete set of codes `boxlite-guest`'s files service
+/// emits; anything else is genuinely unclassified and stays a server fault.
+fn map_tonic_err(err: tonic::Status) -> BoxliteError {
+    let message = err.message().to_owned();
+    match err.code() {
+        tonic::Code::FailedPrecondition => BoxliteError::Unsupported(message),
+        tonic::Code::InvalidArgument => BoxliteError::InvalidArgument(message),
+        tonic::Code::NotFound => BoxliteError::NotFound(message),
+        tonic::Code::ResourceExhausted => BoxliteError::ResourceExhausted(message),
+        _ => BoxliteError::Internal(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Status;
+
+    /// The API spells "the contents" as `SRC/.`; the wire still carries
+    /// `include_parent`. Every host-side download — local, or relayed for a
+    /// REST caller — goes through this translation.
+    #[test]
+    fn a_trailing_dot_asks_the_guest_for_the_contents() {
+        assert!(download_request("/app", None, false).include_parent);
+        assert!(download_request("/app/", None, false).include_parent);
+
+        let contents = download_request("/app/.", Some("c1"), true);
+        assert!(!contents.include_parent);
+        assert_eq!(
+            contents.src_path, "/app/.",
+            "the path travels as the caller wrote it"
+        );
+        assert_eq!(contents.container_id, "c1");
+        assert!(contents.follow_symlinks);
+    }
+
+    /// A destination the guest cannot reach is the caller's problem, not the
+    /// server's — it must not arrive as a 500.
+    #[test]
+    fn unreachable_destination_maps_to_unsupported() {
+        let error = map_tonic_err(Status::failed_precondition(
+            "/tmp/x is under the container's '/tmp' mount",
+        ));
+
+        assert!(matches!(error, BoxliteError::Unsupported(_)));
+        assert_eq!(error.http().0, 400);
+    }
+
+    #[test]
+    fn missing_source_maps_to_not_found() {
+        let error = map_tonic_err(Status::not_found("source path does not exist"));
+
+        assert!(matches!(error, BoxliteError::NotFound(_)));
+        assert_eq!(error.http().0, 404);
+    }
+
+    #[test]
+    fn malformed_path_maps_to_invalid_argument() {
+        let error = map_tonic_err(Status::invalid_argument("path must not contain .."));
+
+        assert!(matches!(error, BoxliteError::InvalidArgument(_)));
+        assert_eq!(error.http().0, 400);
+    }
+
+    /// The guest caps an upload at 512 MiB and says so with `ResourceExhausted`.
+    /// Flattened to `Internal` it reaches the caller as a 500 — the server
+    /// blaming itself for a payload the caller chose.
+    #[test]
+    fn oversized_upload_maps_to_resource_exhausted() {
+        let error = map_tonic_err(Status::resource_exhausted("upload too large"));
+
+        assert!(
+            matches!(error, BoxliteError::ResourceExhausted(_)),
+            "{error:?}"
+        );
+        assert_eq!(error.http().0, 429);
+    }
+
+    /// Anything the guest did not classify stays a server fault, and keeps the
+    /// full status text so the code is not lost.
+    #[test]
+    fn unclassified_status_stays_internal() {
+        let error = map_tonic_err(Status::internal("failed to create temp file"));
+
+        assert!(matches!(error, BoxliteError::Internal(_)));
+        assert_eq!(error.http().0, 500);
+    }
+
+    /// The message must survive the remap — a refusal that arrives without the
+    /// mount name in it is useless to the caller.
+    #[test]
+    fn refusal_message_survives_the_remap() {
+        let error = map_tonic_err(Status::failed_precondition(
+            "/tmp/x is under the container's '/tmp' mount",
+        ));
+
+        assert!(error.to_string().contains("'/tmp' mount"), "{error}");
+    }
+}

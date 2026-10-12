@@ -1,0 +1,2394 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+/// <summary>
+/// Encodes one instruction into the A64 word that means it. Every encoder here
+/// takes the instruction as the source wrote it and returns that word, so the
+/// families whose members differ only in a few bits are one function applied to
+/// different bits rather than one function each.
+/// </summary>
+module internal B2R2.Assembly.ARM64.AsmOpcode
+
+open B2R2.FrontEnd.ARM64
+open B2R2.Assembly.ARM64.ParserHelper
+open B2R2.Assembly.ARM64.AsmField
+
+/// A place the instruction names, which arrives here as the distance to it.
+let private (|Place|_|) = function
+  | OprMemory(LiteralMode(ImmOffset(Lbl offset))) -> Some offset
+  | _ -> None
+
+let private isStackPointer reg = reg = Register.SP || reg = Register.WSP
+
+/// The width in bits an instruction works in, which its registers say.
+let private widthOf reg = if is64Reg reg then 64 else 32
+
+(* Data processing - immediate. *)
+/// The "lsl #<amount>" written after an immediate, which is absent when the
+/// immediate is not shifted at all.
+let private lslAmount ins = function
+  | [] -> 0L
+  | [ OprShift(LSL, Imm amount) ] -> amount
+  | _ -> wrongOperands ins
+
+/// ADR and ADRP, which name a place rather than a value. How far away that
+/// place is was worked out before encoding, so what arrives here is a distance:
+/// for ADRP the distance between the page this instruction sits in and the one
+/// it names.
+let private pcRelative isPage ins =
+  match ins.Operands with
+  | TwoOperands(Rg rd, Place offset) ->
+    let offset = if isPage then scaled 4096 offset else offset
+    let imm = signedImm 21 offset
+    (if isPage then 1u <<< 31 else 0u) ||| ((imm &&& 0b11u) <<< 29)
+    ||| (0b10000u <<< 24) ||| ((imm >>> 2) <<< 5) ||| coreReg rd
+  | _ ->
+    wrongOperands ins
+
+/// The bits an add or subtract of an immediate shares, given the destination
+/// field its own form supplies.
+let private addSubImmWith op s ins rd rn imm rest =
+  let shift =
+    match lslAmount ins rest with
+    | 0L -> 0u
+    | 12L -> 1u
+    | amount -> fail $"an immediate cannot be shifted by #{amount}"
+  (op <<< 30) ||| (s <<< 29) ||| (0b100010u <<< 23) ||| (shift <<< 22)
+  ||| (unsignedImm 12 imm <<< 10) ||| (coreRegSP rn <<< 5) ||| rd
+
+/// Encodes <Rd|SP>, <Rn|SP>, #<imm>{, LSL #12}
+let private addSubImm op ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rd :: Rg rn :: Im imm :: rest ->
+    sfBit rd ||| addSubImmWith op 0u ins (coreRegSP rd) rn imm rest
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Rd>, <Rn|SP>, #<imm>{, LSL #12}, the form that sets the flags.
+let private addSubImmFlags op ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rd :: Rg rn :: Im imm :: rest ->
+    sfBit rd ||| addSubImmWith op 1u ins (coreReg rd) rn imm rest
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Rn|SP>, #<imm>{, LSL #12}, the form that only sets them.
+let private compareImm op ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rn :: Im imm :: rest ->
+    sfBit rn ||| addSubImmWith op 1u ins 31u rn imm rest
+  | _ ->
+    wrongOperands ins
+
+/// The bits a logical instruction that takes an immediate shares.
+let private logicalImmWith opc ins rd rn imm =
+  let n, immr, imms = logicalImm (widthOf rn) imm
+  (opc <<< 29) ||| (0b100100u <<< 23) ||| (n <<< 22) ||| (immr <<< 16)
+  ||| (imms <<< 10) ||| (coreReg rn <<< 5) ||| rd
+
+/// Encodes <Rd|SP>, <Rn>, #<imm>
+let private logicalImmediate opc ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Im imm) ->
+    sfBit rd ||| logicalImmWith opc ins (coreRegSP rd) rn imm
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Rd>, <Rn>, #<imm>, the form that sets the flags.
+let private logicalImmediateFlags opc ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Im imm) ->
+    sfBit rd ||| logicalImmWith opc ins (coreReg rd) rn imm
+  | _ ->
+    wrongOperands ins
+
+/// The hw field, which says which sixteen bits of the register an immediate
+/// lands in. A thirty-two bit move reaches only the lower half of the register,
+/// so only half the values name a place in it.
+let private halfwordShift is64 amount =
+  match amount with
+  | 0L -> 0u
+  | 16L -> 1u
+  | 32L when is64 -> 2u
+  | 48L when is64 -> 3u
+  | amount -> fail $"a wide immediate cannot be shifted by #{amount}"
+
+/// Encodes <Rd>, #<imm>{, LSL #<amount>}
+let private moveWide opc ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rd :: Im imm :: rest ->
+    let hw = halfwordShift (is64Reg rd) (lslAmount ins rest)
+    sfBit rd ||| (opc <<< 29) ||| (0b100101u <<< 23) ||| (hw <<< 21)
+    ||| (unsignedImm 16 imm <<< 5) ||| coreReg rd
+  | _ ->
+    wrongOperands ins
+
+/// The bits a bitfield move shares. The N bit repeats what the width says,
+/// because the field it names is as wide as the register.
+let private bitfieldWith opc rd rn immr imms =
+  let is64 = is64Reg rd
+  sfBit rd ||| (opc <<< 29) ||| (0b100110u <<< 23)
+  ||| ((if is64 then 1u else 0u) <<< 22) ||| (unsignedImm 6 immr <<< 16)
+  ||| (unsignedImm 6 imms <<< 10) ||| (coreReg rn <<< 5) ||| coreReg rd
+
+/// Encodes <Rd>, <Rn>, #<immr>, #<imms>
+let private bitfield opc ins =
+  match ins.Operands with
+  | FourOperands(Rg rd, Rg rn, Im immr, Im imms) ->
+    bitfieldWith opc rd rn immr imms
+  | _ ->
+    wrongOperands ins
+
+/// The bitfield move a "start here, this many bits" alias stands for, whose
+/// encoding says where the field ends rather than how long it is.
+let private bitfieldInsert opc ins =
+  match ins.Operands with
+  | FourOperands(Rg rd, Rg rn, Im lsb, Im width) ->
+    let bits = int64 (widthOf rd)
+    if width < 1L || lsb + width > bits then
+      fail $"a field of #{width} bits cannot start at #{lsb}"
+    else
+      bitfieldWith opc rd rn ((bits - lsb) % bits) (width - 1L)
+  | _ ->
+    wrongOperands ins
+
+/// The same for the aliases that take the field where it lies rather than
+/// moving it down to the bottom of the register.
+let private bitfieldExtract opc ins =
+  match ins.Operands with
+  | FourOperands(Rg rd, Rg rn, Im lsb, Im width) ->
+    let bits = int64 (widthOf rd)
+    if width < 1L || lsb + width > bits then
+      fail $"a field of #{width} bits cannot start at #{lsb}"
+    else
+      bitfieldWith opc rd rn lsb (lsb + width - 1L)
+  | _ ->
+    wrongOperands ins
+
+/// The extensions, which the manual defines as bitfield moves of the bottom
+/// byte, halfword or word of a register.
+let private extendAlias opc imms ins =
+  match ins.Operands with
+  | TwoOperands(Rg rd, Rg rn) -> bitfieldWith opc rd rn 0L imms
+  | _ -> wrongOperands ins
+
+/// The bits an extraction shares, which reads one field spanning two registers.
+let private extractWith rd rn rm lsb =
+  let is64 = is64Reg rd
+  sfBit rd ||| (0b100111u <<< 23) ||| ((if is64 then 1u else 0u) <<< 22)
+  ||| (coreReg rm <<< 16) ||| (unsignedImm 6 lsb <<< 10) ||| (coreReg rn <<< 5)
+  ||| coreReg rd
+
+let private extract ins =
+  match ins.Operands with
+  | FourOperands(Rg rd, Rg rn, Rg rm, Im lsb) -> extractWith rd rn rm lsb
+  | _ -> wrongOperands ins
+
+(* Data processing - register. *)
+/// The shift written after the second source of a logical or arithmetic
+/// instruction, which is absent when it shifts by nothing.
+let private shiftOf ins = function
+  | [] -> LSL, 0L
+  | [ OprShift(shift, Imm amount) ] -> shift, amount
+  | _ -> wrongOperands ins
+
+/// The bits every logical instruction on a shifted register shares.
+let private logicalShiftedWith opc n ins rd rn rm rest =
+  let shift, amount = shiftOf ins rest
+  let width = if is64Reg rd then 6 else 5
+  sfBit rd ||| (opc <<< 29) ||| (0b01010u <<< 24) ||| (shiftType shift <<< 22)
+  ||| (n <<< 21) ||| (coreReg rm <<< 16) ||| (unsignedImm width amount <<< 10)
+  ||| (coreReg rn <<< 5) ||| coreReg rd
+
+/// Encodes <Rd>, <Rn>, <Rm>{, <shift> #<amount>}
+let private logicalShifted opc n ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rd :: Rg rn :: Rg rm :: rest ->
+    logicalShiftedWith opc n ins rd rn rm rest
+  | _ ->
+    wrongOperands ins
+
+/// The bits an addition or subtraction of a shifted register shares.
+let private addSubShiftedWith op s ins rd rn rm rest =
+  let shift, amount = shiftOf ins rest
+  let width = if is64Reg rd then 6 else 5
+  if shift = ROR then
+    fail "an addition cannot rotate its second source"
+  else
+    sfBit rd ||| (op <<< 30) ||| (s <<< 29) ||| (0b01011u <<< 24)
+    ||| (shiftType shift <<< 22) ||| (coreReg rm <<< 16)
+    ||| (unsignedImm width amount <<< 10) ||| (coreReg rn <<< 5) ||| coreReg rd
+
+/// The extension written after the second source, which says which part of it
+/// to read and how far to shift what was read.
+let private extendOf ins is64 = function
+  | [] -> (if is64 then UXTX else UXTW), 0L
+  | [ OprExtReg(Some(ExtRegOffset(ext, amount))) ] -> ext, defaultArg amount 0L
+  | [ OprExtReg(Some(ShiftOffset(LSL, Imm amount))) ]
+  | [ OprShift(LSL, Imm amount) ] -> (if is64 then UXTX else UXTW), amount
+  | _ -> wrongOperands ins
+
+/// <summary>
+/// Whether the second source of an extended operand is read whole.
+///
+/// Only an extension that reads a doubleword names one, and only where the
+/// instruction works in doublewords at all: a thirty-two bit instruction reads
+/// a word however far its extension would reach.
+/// </summary>
+let private extendedSourceIs64 is64 = function
+  | UXTX | SXTX -> is64
+  | _ -> false
+
+/// The bits an addition or subtraction of an extended register shares.
+let private addSubExtendedWith op s ins rd rn rm rest =
+  let is64 = is64Reg rd
+  let ext, amount = extendOf ins is64 rest
+  if is64Reg rm <> extendedSourceIs64 is64 ext then
+    fail $"{Register.toString rm} is not the width {ext} reads"
+  elif amount > 4L then
+    fail $"an extended source cannot be shifted by #{amount}"
+  else
+    (if is64 then 1u <<< 31 else 0u) ||| (op <<< 30) ||| (s <<< 29)
+    ||| (0b01011001u <<< 21) ||| (coreReg rm <<< 16)
+    ||| (extendType ext <<< 13) ||| (unsignedImm 3 amount <<< 10)
+    ||| (coreRegSP rn <<< 5)
+
+/// <summary>
+/// The additions and subtractions of a register, which name their second
+/// source either shifted or extended.
+///
+/// Only the extended form can read the stack pointer, so a source that names it
+/// has said which form it means; anything else is the shifted one, which is
+/// what the disassembler writes wherever both would do.
+/// </summary>
+let private addSubReg op s ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rd :: Rg rn :: Rg rm :: rest ->
+    let extended =
+      isStackPointer rd || isStackPointer rn
+      || (match rest with
+          | [ OprExtReg _ ] -> true
+          | _ -> false)
+    if extended then
+      let rdField = if s = 1u then coreReg rd else coreRegSP rd
+      addSubExtendedWith op s ins rd rn rm rest ||| rdField
+    else
+      addSubShiftedWith op s ins rd rn rm rest
+  | _ ->
+    wrongOperands ins
+
+/// The zero register of the width the given one is written in, which is what
+/// the aliases naming one register fewer read or write in its place.
+let private zeroLike reg = if is64Reg reg then Register.XZR else Register.WZR
+
+/// Encodes <Rn|SP>, <Rm>{, <extend>|<shift>}, the form that names no
+/// destination.
+let private compareReg op ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rn :: Rg rm :: rest ->
+    let extended =
+      isStackPointer rn
+      || (match rest with
+          | [ OprExtReg _ ] -> true
+          | _ -> false)
+    if extended then addSubExtendedWith op 1u ins rn rn rm rest ||| 31u
+    else addSubShiftedWith op 1u ins (zeroLike rn) rn rm rest
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Rd>, <Rm>{, <shift> #<amount>}, which subtracts from the zero
+/// register.
+let private negate s ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rd :: Rg rm :: rest ->
+    addSubShiftedWith 1u s ins rd (zeroLike rd) rm rest
+  | _ ->
+    wrongOperands ins
+
+/// The bits an addition or subtraction that reads the carry flag shares.
+let private addSubCarryWith op s rd rn rm =
+  sfBit rd ||| (op <<< 30) ||| (s <<< 29) ||| (0b11010000u <<< 21)
+  ||| (coreReg rm <<< 16) ||| (coreReg rn <<< 5) ||| coreReg rd
+
+let private addSubCarry op s ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) -> addSubCarryWith op s rd rn rm
+  | _ -> wrongOperands ins
+
+/// Encodes <Rd>, <Rm>, which subtracts from the zero register with the carry
+/// flag.
+let private negateCarry s ins =
+  match ins.Operands with
+  | TwoOperands(Rg rd, Rg rm) -> addSubCarryWith 1u s rd rd rm ||| (31u <<< 5)
+  | _ -> wrongOperands ins
+
+/// The bits a conditional compare shares.
+let private condCompareWith op rn cond nzcv isImm second =
+  sfBit rn ||| (op <<< 30) ||| (1u <<< 29) ||| (0b11010010u <<< 21)
+  ||| (second <<< 16) ||| (condField cond <<< 12)
+  ||| ((if isImm then 1u else 0u) <<< 11) ||| (coreReg rn <<< 5)
+  ||| unsignedImm 4 nzcv
+
+/// Encodes <Rn>, <Rm>|#<imm>, #<nzcv>, <cond>
+let private condCompare op ins =
+  match ins.Operands with
+  | FourOperands(Rg rn, Im imm, Im nzcv, OprCond cond) ->
+    condCompareWith op rn cond nzcv true (unsignedImm 5 imm)
+  | FourOperands(Rg rn, Rg rm, Im nzcv, OprCond cond) ->
+    condCompareWith op rn cond nzcv false (coreReg rm)
+  | _ ->
+    wrongOperands ins
+
+/// The bits a conditional select shares.
+let private condSelectWith op op2 rd rn rm cond =
+  sfBit rd ||| (op <<< 30) ||| (0b11010100u <<< 21) ||| (coreReg rm <<< 16)
+  ||| (cond <<< 12) ||| (op2 <<< 10) ||| (coreReg rn <<< 5) ||| coreReg rd
+
+/// Encodes <Rd>, <Rn>, <Rm>, <cond>
+let private condSelect op op2 ins =
+  match ins.Operands with
+  | FourOperands(Rg rd, Rg rn, Rg rm, OprCond cond) ->
+    condSelectWith op op2 rd rn rm (condField cond)
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// The conditional selects written as one register and a condition, which read
+/// that register under the opposite condition and the zero register otherwise.
+///
+/// The condition an alias names is the one the instruction it stands for runs
+/// the other half of, so the field holds its opposite.
+/// </summary>
+let private condSelectAlias op op2 ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, OprCond cond) ->
+    condSelectWith op op2 rd rn rn (invertCondition cond)
+  | TwoOperands(Rg rd, OprCond cond) ->
+    condSelectWith op op2 rd (zeroLike rd) (zeroLike rd) (invertCondition cond)
+  | _ ->
+    wrongOperands ins
+
+/// The bits a three-source multiply shares.
+let private mulWith op31 o0 rd rn rm ra =
+  sfBit rd ||| (0b11011u <<< 24) ||| (op31 <<< 21) ||| (coreReg rm <<< 16)
+  ||| (o0 <<< 15) ||| (coreReg ra <<< 10) ||| (coreReg rn <<< 5) ||| coreReg rd
+
+/// Encodes <Rd>, <Rn>, <Rm>, <Ra>
+let private mulAccumulate op31 o0 ins =
+  match ins.Operands with
+  | FourOperands(Rg rd, Rg rn, Rg rm, Rg ra) -> mulWith op31 o0 rd rn rm ra
+  | _ -> wrongOperands ins
+
+/// Encodes <Rd>, <Rn>, <Rm>, which accumulates into the zero register.
+let private multiply op31 o0 ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) -> mulWith op31 o0 rd rn rm (zeroLike rd)
+  | _ -> wrongOperands ins
+
+/// The bits an instruction reading two registers into one shares.
+let private dataProc2SrcWith opcode rd rn rm =
+  sfBit rd ||| (0b11010110u <<< 21) ||| (coreReg rm <<< 16)
+  ||| (opcode <<< 10) ||| (coreReg rn <<< 5) ||| coreReg rd
+
+/// Encodes <Rd>, <Rn>, <Rm>
+let private dataProc2Src opcode ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) -> dataProc2SrcWith opcode rd rn rm
+  | _ -> wrongOperands ins
+
+/// The cyclic redundancy checks, whose source is as wide as the data it reads
+/// while their result is always a word.
+let private crc32 opcode ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) ->
+    (if is64Reg rm then 1u <<< 31 else 0u) ||| (0b11010110u <<< 21)
+    ||| (coreReg rm <<< 16) ||| (opcode <<< 10) ||| (coreReg rn <<< 5)
+    ||| coreReg rd
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Rd>, <Rn>, the instructions that read one register into another.
+let private dataProc1Src opcode ins =
+  match ins.Operands with
+  | TwoOperands(Rg rd, Rg rn) ->
+    sfBit rd ||| (0b10u <<< 29) ||| (0b11010110u <<< 21) ||| (opcode <<< 10)
+    ||| (coreReg rn <<< 5) ||| coreReg rd
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// REV, whose opcode says how wide a piece it leaves in place, and so differs
+/// between the two widths it runs in: reversing a word inside a word and
+/// reversing a doubleword are the same instruction spelt one way.
+/// </summary>
+let private reverse ins =
+  match ins.Operands with
+  | TwoOperands(Rg rd, _) when is64Reg rd -> dataProc1Src 0b000011u ins
+  | _ -> dataProc1Src 0b000010u ins
+
+(* The shifts, which are two instructions apiece. *)
+/// LSL by an immediate, which the manual defines as a bitfield move that keeps
+/// everything below where the field ends.
+let private shiftLeftImm rd rn amount =
+  let bits = int64 (widthOf rd)
+  if amount < 0L || amount >= bits then
+    fail $"a register of {bits} bits cannot be shifted by #{amount}"
+  else
+    bitfieldWith 0b10u rd rn ((bits - amount) % bits) (bits - 1L - amount)
+
+/// The right shifts, which keep the field from where they start to the top.
+let private shiftRightImm opc rd rn amount =
+  let bits = int64 (widthOf rd)
+  if amount < 0L || amount >= bits then
+    fail $"a register of {bits} bits cannot be shifted by #{amount}"
+  else
+    bitfieldWith opc rd rn amount (bits - 1L)
+
+/// <summary>
+/// A shift, which is a bitfield move when it shifts by an immediate and an
+/// instruction of its own when it shifts by a register.
+/// </summary>
+let private shift byImmediate opcode ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Im amount) -> byImmediate rd rn amount
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) -> dataProc2SrcWith opcode rd rn rm
+  | _ -> wrongOperands ins
+
+/// ROR, which rotates a register into itself when it rotates by an immediate.
+let private rotateRight ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Im amount) -> extractWith rd rn rn amount
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) -> dataProc2SrcWith 0b001011u rd rn rm
+  | _ -> wrongOperands ins
+
+(* The moves, which stand for one of four instructions. *)
+/// The hw field and immediate of a wide move that would hold the given value,
+/// if one would.
+let private tryWideImm (value: uint64) =
+  [ 0; 16; 32; 48 ]
+  |> List.tryPick (fun shift ->
+    let half = (value >>> shift) &&& 0xffffUL
+    if half <<< shift = value && (half <> 0UL || shift = 0) then
+      Some(uint32 (shift / 16), int64 half)
+    else
+      None)
+
+/// <summary>
+/// A move of an immediate, which the manual writes as a wide move of the value,
+/// a wide move of its inverse, or an inclusive or with the zero register.
+///
+/// The order is the one the disassembler reads back: a value a wide move can
+/// hold is written as one, so encoding it any other way would come back as an
+/// ORR rather than as the move the source wrote.
+/// </summary>
+let private moveImmediate rd (value: int64) =
+  let is64 = is64Reg rd
+  let width = if is64 then 64 else 32
+  let value = if is64 then uint64 value else uint64 (uint32 value)
+  let inverse = if is64 then ~~~value else uint64 (~~~(uint32 value))
+  let wide opc (hw, imm) =
+    sfBit rd ||| (opc <<< 29) ||| (0b100101u <<< 23) ||| (hw <<< 21)
+    ||| (unsignedImm 16 imm <<< 5) ||| coreReg rd
+  let inverseFits (hw, imm) = is64 || (imm <> 0xffffL && (imm <> 0L || hw = 0u))
+  match tryWideImm value with
+  | Some fields ->
+    wide 0b10u fields
+  | None ->
+    match tryWideImm inverse |> Option.filter inverseFits with
+    | Some fields ->
+      wide 0b00u fields
+    | None ->
+      let n, immr, imms = logicalImm width (int64 value)
+      if moveWidePreferred is64 (n, immr, imms) then
+        fail $"#{value} is not a move of an immediate"
+      else
+        sfBit rd ||| (0b01u <<< 29) ||| (0b100100u <<< 23) ||| (n <<< 22)
+        ||| (immr <<< 16) ||| (imms <<< 10) ||| (31u <<< 5) ||| coreReg rd
+
+/// <summary>
+/// MOV, which the manual defines as four instructions: a wide move either way
+/// round, an inclusive or with the zero register, and an addition of nothing.
+///
+/// Which one a source means follows from what it names. Only the addition
+/// reaches the stack pointer, and only the inclusive or can put an immediate
+/// there, so naming it says which of the four was meant.
+/// </summary>
+let private move ins =
+  match ins.Operands with
+  | TwoOperands(Rg rd, Rg rm) when isStackPointer rd || isStackPointer rm ->
+    sfBit rd ||| addSubImmWith 0u 0u ins (coreRegSP rd) rm 0L []
+  | TwoOperands(Rg rd, Rg rm) ->
+    logicalShiftedWith 0b01u 0u ins rd (zeroLike rd) rm []
+  | TwoOperands(Rg rd, Im imm) when isStackPointer rd ->
+    sfBit rd ||| logicalImmWith 0b01u ins (coreRegSP rd) (zeroLike rd) imm
+  | TwoOperands(Rg rd, Im imm) ->
+    moveImmediate rd imm
+  | _ ->
+    wrongOperands ins
+
+/// MVN, which the manual defines as an inclusive or of the inverse of a
+/// register with the zero register.
+let private moveNot ins =
+  match getOperandsAsList ins.Operands with
+  | Rg rd :: Rg rm :: rest ->
+    logicalShiftedWith 0b01u 1u ins rd (zeroLike rd) rm rest
+  | _ ->
+    wrongOperands ins
+
+/// TST, which is an AND that keeps nothing but the flags, so it names no
+/// destination and reads either an immediate or a shifted register.
+let private test ins =
+  match getOperandsAsList ins.Operands with
+  | [ Rg rn; Im imm ] ->
+    sfBit rn ||| logicalImmWith 0b11u ins 31u rn imm
+  | Rg rn :: Rg rm :: rest ->
+    logicalShiftedWith 0b11u 0u ins (zeroLike rn) rn rm rest
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// The arithmetic and logical instructions, which read either an immediate or a
+/// register and say which by what they name rather than by what they are
+/// called.
+///
+/// One opcode takes one encoder, so the encoder of an instruction written both
+/// ways has to reach both encodings.
+/// </summary>
+let private addSub op s ins =
+  match getOperandsAsList ins.Operands with
+  | _ :: _ :: Im _ :: _ when s = 1u -> addSubImmFlags op ins
+  | _ :: _ :: Im _ :: _ -> addSubImm op ins
+  | _ -> addSubReg op s ins
+
+let private compareOperand op ins =
+  match getOperandsAsList ins.Operands with
+  | _ :: Im _ :: _ -> compareImm op ins
+  | _ -> compareReg op ins
+
+/// The logical instructions. Only the four that read their second source as it
+/// stands have a form that takes an immediate; the ones that invert it first do
+/// not, so naming one of them with an immediate names nothing at all.
+let private logical opc n ins =
+  match getOperandsAsList ins.Operands with
+  | _ :: _ :: Im _ :: _ when n = 0u && opc = 0b11u ->
+    logicalImmediateFlags opc ins
+  | _ :: _ :: Im _ :: _ when n = 0u ->
+    logicalImmediate opc ins
+  | _ ->
+    logicalShifted opc n ins
+
+(* Branches, exception generating and system instructions. *)
+/// A branch that runs under a condition, which spells that condition into its
+/// own name rather than taking it as an operand.
+let private conditionalBranch cond ins =
+  match ins.Operands with
+  | OneOperand(Place offset) ->
+    (0b01010100u <<< 24) ||| (signedImm 19 (scaled 4 offset) <<< 5) ||| cond
+  | _ ->
+    wrongOperands ins
+
+/// B and BL, which reach the furthest of any branch.
+let private branchImm op ins =
+  match ins.Operands with
+  | OneOperand(Place offset) ->
+    (op <<< 31) ||| (0b00101u <<< 26) ||| signedImm 26 (scaled 4 offset)
+  | _ ->
+    wrongOperands ins
+
+/// The branches that read where to go from a register.
+let private branchReg opc ins =
+  match ins.Operands with
+  | OneOperand(Rg rn) ->
+    (0b1101011u <<< 25) ||| (opc <<< 21) ||| (0b11111u <<< 16)
+    ||| (coreReg rn <<< 5)
+  | _ ->
+    wrongOperands ins
+
+/// RET, whose register the disassembler leaves out when it is the one a return
+/// reads by default.
+let private returnBranch ins =
+  match ins.Operands with
+  | NoOperand ->
+    (0b1101011u <<< 25) ||| (0b0010u <<< 21) ||| (0b11111u <<< 16)
+    ||| (30u <<< 5)
+  | _ ->
+    branchReg 0b0010u ins
+
+/// ERET and DRPS, which read nowhere and so name nothing.
+let private branchNoReg opc ins =
+  match ins.Operands with
+  | NoOperand ->
+    (0b1101011u <<< 25) ||| (opc <<< 21) ||| (0b11111u <<< 16) ||| (31u <<< 5)
+  | _ ->
+    wrongOperands ins
+
+/// The fields FEAT_PAuth's branches share: those of BR, BLR, RET or ERET,
+/// with bit 11 set and the key in bit 10.
+let private authBranchHead opc key =
+  (0b1101011u <<< 25) ||| (opc <<< 21) ||| (0b11111u <<< 16) ||| (1u <<< 11)
+  ||| (key <<< 10)
+
+/// BRAA and BLRAA and their key-B forms, which name their modifier where the
+/// others hold 11111, and in which 11111 is the stack pointer.
+let private branchAuthModifier opc key ins =
+  match ins.Operands with
+  | TwoOperands(Rg rn, Rg rm) ->
+    authBranchHead opc key ||| (coreReg rn <<< 5) ||| coreRegSP rm
+  | _ ->
+    wrongOperands ins
+
+/// BRAAZ and BLRAAZ and their key-B forms, whose modifier is zero.
+let private branchAuthZero opc key ins =
+  match ins.Operands with
+  | OneOperand(Rg rn) ->
+    authBranchHead opc key ||| (coreReg rn <<< 5) ||| 0b11111u
+  | _ ->
+    wrongOperands ins
+
+/// RETAA and ERETAA and their key-B forms, which name nothing.
+let private branchAuthImplicit opc key ins =
+  match ins.Operands with
+  | NoOperand ->
+    authBranchHead opc key ||| (0b11111u <<< 5) ||| 0b11111u
+  | _ ->
+    wrongOperands ins
+
+/// CBZ and CBNZ, which branch on whether a register holds zero.
+let private compareBranch op ins =
+  match ins.Operands with
+  | TwoOperands(Rg rt, Place offset) ->
+    sfBit rt ||| (0b011010u <<< 25) ||| (op <<< 24)
+    ||| (signedImm 19 (scaled 4 offset) <<< 5) ||| coreReg rt
+  | _ ->
+    wrongOperands ins
+
+/// TBZ and TBNZ, which branch on one bit of a register. Which bit that is
+/// decides the width the instruction is written in, so its top bit sits where
+/// every other instruction keeps the bit that says so.
+let private testBranch op ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rt, Im bit, Place offset) ->
+    let bit = unsignedImm 6 bit
+    ((bit >>> 5) <<< 31) ||| (0b011011u <<< 25) ||| (op <<< 24)
+    ||| ((bit &&& 0b11111u) <<< 19) ||| (signedImm 14 (scaled 4 offset) <<< 5)
+    ||| coreReg rt
+  | _ ->
+    wrongOperands ins
+
+/// The instructions that raise an exception, which name what to raise it with.
+let private exceptionGen opc ll ins =
+  match ins.Operands with
+  | OneOperand(Im imm) ->
+    (0b11010100u <<< 24) ||| (opc <<< 21) ||| (unsignedImm 16 imm <<< 5) ||| ll
+  | _ ->
+    wrongOperands ins
+
+/// The bits every instruction in the system space shares.
+let private systemHead l = (0b1101010100u <<< 22) ||| (l <<< 21)
+
+/// The word of the hint CRm:op2 selects.
+let private hintWord crm op2 =
+  systemHead 0u ||| (0b011u <<< 16) ||| (0b0010u <<< 12) ||| (crm <<< 8)
+  ||| (op2 <<< 5) ||| 0b11111u
+
+/// A hint, which does nothing a program can see and so names nothing.
+let private namedHint crm op2 ins =
+  match ins.Operands with
+  | NoOperand -> hintWord crm op2
+  | _ -> wrongOperands ins
+
+/// PSB and TSB, whose one operand is CSYNC.
+let private syncHint op2 ins =
+  match ins.Operands with
+  | OneOperand(OprHintOpt CSYNC) -> hintWord 0b0010u op2
+  | _ -> wrongOperands ins
+
+/// BTI, whose operand says which branches may land on it.
+let private branchTarget ins =
+  match ins.Operands with
+  | NoOperand -> hintWord 0b0100u 0b000u
+  | OneOperand(OprHintOpt BTIC) -> hintWord 0b0100u 0b010u
+  | OneOperand(OprHintOpt BTIJ) -> hintWord 0b0100u 0b100u
+  | OneOperand(OprHintOpt BTIJC) -> hintWord 0b0100u 0b110u
+  | _ -> wrongOperands ins
+
+/// HINT, which names by number the hint it gives.
+let private hint ins =
+  match ins.Operands with
+  | OneOperand(Im imm) ->
+    let imm = unsignedImm 7 imm
+    systemHead 0u ||| (0b011u <<< 16) ||| (0b0010u <<< 12)
+    ||| ((imm >>> 3) <<< 8) ||| ((imm &&& 0b111u) <<< 5) ||| 0b11111u
+  | _ ->
+    wrongOperands ins
+
+/// The barriers and CLREX, which take an option written either by its name or
+/// as the number that names it.
+let private barrier op2 ins =
+  let crm =
+    match ins.Operands with
+    | NoOperand -> 0b1111u
+    | OneOperand(OprOption option) -> barrierOption option
+    | OneOperand(Im imm) -> unsignedImm 4 imm
+    | _ -> wrongOperands ins
+  systemHead 0u ||| (0b011u <<< 16) ||| (0b0011u <<< 12) ||| (crm <<< 8)
+  ||| (op2 <<< 5) ||| 0b11111u
+
+/// SB, the barrier that ends speculation, which takes no option: its CRm is
+/// zero where the other barriers hold the option.
+let private speculationBarrier ins =
+  match ins.Operands with
+  | NoOperand ->
+    systemHead 0u ||| (0b011u <<< 16) ||| (0b0011u <<< 12) ||| (0b111u <<< 5)
+    ||| 0b11111u
+  | _ ->
+    wrongOperands ins
+
+/// SYS and SYSL, which hand an instruction to whatever the numbers name.
+let private systemInstruction l ins =
+  let fields op1 cn cm op2 rt =
+    systemHead l ||| (0b01u <<< 19) ||| (unsignedImm 3 op1 <<< 16)
+    ||| (coprocReg cn <<< 12) ||| (coprocReg cm <<< 8)
+    ||| (unsignedImm 3 op2 <<< 5) ||| rt
+  match ins.Operands with
+  | FiveOperands(Im op1, Rg cn, Rg cm, Im op2, Rg rt) when l = 0u ->
+    fields op1 cn cm op2 (coreReg rt)
+  | FourOperands(Im op1, Rg cn, Rg cm, Im op2) when l = 0u ->
+    fields op1 cn cm op2 31u
+  | FiveOperands(Rg rt, Im op1, Rg cn, Rg cm, Im op2) ->
+    fields op1 cn cm op2 (coreReg rt)
+  | _ ->
+    wrongOperands ins
+
+/// The cache maintenance instructions, which the manual defines as a system
+/// instruction whose numbers say which of them it is.
+let private cacheInstruction op1 cn cm op2 ins =
+  match ins.Operands with
+  | OneOperand(Rg rt) ->
+    systemHead 0u ||| (0b01u <<< 19) ||| (op1 <<< 16) ||| (cn <<< 12)
+    ||| (cm <<< 8) ||| (op2 <<< 5) ||| coreReg rt
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// The sixteen bits that name a system register, which the encoding keeps in
+/// one field split across the instruction the way the manual writes it: an
+/// access level, an operation, two register numbers and a second operation.
+///
+/// The list is the one the disassembler reads, inverted. A register missing
+/// from it is one the disassembler cannot name, so a source naming it has
+/// nothing to be assembled back into.
+/// </summary>
+let private systemRegisters =
+  [ Register.ACTLREL1, 0b1100000010000001u
+    Register.ACTLREL2, 0b1110000010000001u
+    Register.ACTLREL3, 0b1111000010000001u
+    Register.AFSR0EL1, 0b1100001010001000u
+    Register.AFSR0EL2, 0b1110001010001000u
+    Register.AFSR0EL3, 0b1111001010001000u
+    Register.AFSR1EL1, 0b1100001010001001u
+    Register.AFSR1EL2, 0b1110001010001001u
+    Register.AFSR1EL3, 0b1111001010001001u
+    Register.AIDREL1, 0b1100100000000111u
+    Register.AMAIREL1, 0b1100010100011000u
+    Register.AMAIREL2, 0b1110010100011000u
+    Register.AMAIREL3, 0b1111010100011000u
+    Register.CCSIDREL1, 0b1100100000000000u
+    Register.CLIDREL1, 0b1100100000000001u
+    Register.CONTEXTIDREL1, 0b1100011010000001u
+    Register.CPACREL1, 0b1100000010000010u
+    Register.CPTREL2, 0b1110000010001010u
+    Register.CPTREL3, 0b1111000010001010u
+    Register.CSSELREL1, 0b1101000000000000u
+    Register.CTREL0, 0b1101100000000001u
+    Register.DACR32EL2, 0b1110000110000000u
+    Register.DCZIDEL0, 0b1101100000000111u
+    Register.ESREL1, 0b1100001010010000u
+    Register.SCTLREL1, 0b1100000010000000u
+    Register.TTBR0EL1, 0b1100000100000000u
+    Register.TTBR1EL1, 0b1100000100000001u
+    Register.TCREL1, 0b1100000100000010u
+    Register.MAIREL1, 0b1100010100010000u
+    Register.VBAREL1, 0b1100011000000000u
+    Register.FAREL1, 0b1100001100000000u
+    Register.ELREL1, 0b1100001000000001u
+    Register.SPSREL1, 0b1100001000000000u
+    Register.SPEL0, 0b1100001000001000u
+    Register.TPIDREL1, 0b1100011010000100u
+    Register.CURRENTEL, 0b1100001000010010u
+    Register.DAIF, 0b1101101000010001u
+    Register.SPSEL, 0b1100001000010000u
+    Register.PAN, 0b1100001000010011u
+    Register.UAO, 0b1100001000010100u
+    Register.DIT, 0b1101101000010101u
+    Register.SSBS, 0b1101101000010110u
+    Register.TCO, 0b1101101000010111u
+    Register.ESREL2, 0b1110001010010000u
+    Register.ESREL3, 0b1111001010010000u
+    Register.HPFAREL2, 0b1110001100000100u
+    Register.TPIDREL0, 0b1101111010000010u
+    Register.FPCR, 0b1101101000100000u
+    Register.FPSR, 0b1101101000100001u
+    Register.MIDREL1, 0b1100000000000000u
+    Register.NZCV, 0b1101101000010000u
+    Register.S3_5_C3_C2_0, 0b1110100110010000u
+    Register.S3_7_C2_C2_7, 0b1111100100010111u
+    Register.S2_7_C12_C7_6, 0b1011111000111110u
+    Register.CNTVCT_EL0, 0b1101111100000010u ]
+  |> Map.ofList
+
+let private systemRegister reg =
+  match Map.tryFind reg systemRegisters with
+  | Some value -> value
+  | None -> fail $"{Register.toString reg} is not a system register"
+
+/// The register a field of the processor state is also written through,
+/// which a line names with the field's own name: "msr pan, x0" reads as far
+/// as the field before the register after it says which form it is.
+let private pstateRegister = function
+  | SPSEL -> Register.SPSEL
+  | UAO -> Register.UAO
+  | PAN -> Register.PAN
+  | SSBS -> Register.SSBS
+  | DIT -> Register.DIT
+  | TCO -> Register.TCO
+  | DAIFSET | DAIFCLR -> fail "DAIFSet and DAIFClr take an immediate"
+
+/// MSR, which writes either a system register or one of the fields of the
+/// processor state that has a name of its own.
+let private moveToSystem ins =
+  match ins.Operands with
+  | TwoOperands(OprPstate state, Im imm) ->
+    let field = pstateField state
+    systemHead 0u ||| ((field >>> 3) <<< 16) ||| (0b0100u <<< 12)
+    ||| (unsignedImm 4 imm <<< 8) ||| ((field &&& 0b111u) <<< 5) ||| 0b11111u
+  | TwoOperands(OprPstate state, Rg rt) ->
+    let sreg = pstateRegister state
+    systemHead 0u ||| (systemRegister sreg <<< 5) ||| coreReg rt
+  | TwoOperands(Rg sreg, Rg rt) ->
+    systemHead 0u ||| (systemRegister sreg <<< 5) ||| coreReg rt
+  | TwoOperands(OprSysReg key, Rg rt) ->
+    systemHead 0u ||| (key <<< 5) ||| coreReg rt
+  | _ ->
+    wrongOperands ins
+
+/// MRS, which reads a system register into a general one.
+let private moveFromSystem ins =
+  match ins.Operands with
+  | TwoOperands(Rg rt, Rg sreg) ->
+    systemHead 1u ||| (systemRegister sreg <<< 5) ||| coreReg rt
+  | TwoOperands(Rg rt, OprSysReg key) ->
+    systemHead 1u ||| (key <<< 5) ||| coreReg rt
+  | _ ->
+    wrongOperands ins
+
+(* Loads and stores. *)
+/// What a load or store moves, which decides how wide the access is and so how
+/// far a scaled offset reaches.
+type private Access =
+  /// The mnemonic says nothing about the width, so the register does.
+  | ByRegister of load: bool
+  /// The mnemonic says both the width and which way the value moves.
+  | Fixed of size: uint32 * opc: uint32 * bytes: int
+  /// The mnemonic says the width, and the register says how far the value is
+  /// extended once it has been read.
+  | Signed of size: uint32 * bytes: int
+  /// A prefetch, which moves nothing and so names what to prefetch instead of a
+  /// register.
+  | Prefetch
+
+/// The size and V fields of an access that says its width in the register it
+/// names, together with how many bytes that is and the opc bit a quadword adds:
+/// sixteen bytes is one more than the size field can say, so it says the rest
+/// where the direction goes.
+let private widthFields ins reg =
+  match tryScalarWidth reg with
+  | Some 8 -> 0b00u, 1u, 0u, 1
+  | Some 16 -> 0b01u, 1u, 0u, 2
+  | Some 32 -> 0b10u, 1u, 0u, 4
+  | Some 64 -> 0b11u, 1u, 0u, 8
+  | Some 128 -> 0b00u, 1u, 0b10u, 16
+  | Some _ -> wrongOperands ins
+  | None -> (if is64Reg reg then 0b11u, 0u, 0u, 8 else 0b10u, 0u, 0u, 4)
+
+/// The fields a load or store reads off what it moves: how wide the access is,
+/// which way it goes, and the five bits that name what moves.
+let private accessFields access ins operand =
+  match access, operand with
+  | ByRegister load, Rg reg ->
+    let size, v, extra, bytes = widthFields ins reg
+    let field = if v = 1u then simdReg (bytes * 8) reg else coreReg reg
+    size, v, extra ||| (if load then 1u else 0u), bytes, field
+  | Fixed(size, opc, bytes), Rg reg ->
+    size, 0u, opc, bytes, coreReg reg
+  | Signed(size, bytes), Rg reg ->
+    size, 0u, (if is64Reg reg then 0b10u else 0b11u), bytes, coreReg reg
+  | Prefetch, OprPrfOp operation ->
+    0b11u, 0u, 0b10u, 8, prefetchOperation operation
+  | Prefetch, Im imm ->
+    0b11u, 0u, 0b10u, 8, unsignedImm 5 imm
+  | _ ->
+    wrongOperands ins
+
+/// The bits every load and store of one register shares.
+let private loadStoreHead size v opc =
+  (size <<< 30) ||| (0b111u <<< 27) ||| (v <<< 26) ||| (opc <<< 22)
+
+/// [<Xn|SP>{, #<imm>}], whose offset is a whole number of accesses.
+let private unsignedOffset access ins rt rn offset =
+  let size, v, opc, bytes, field = accessFields access ins rt
+  loadStoreHead size v opc ||| (0b01u <<< 24)
+  ||| (unsignedImm 12 (scaled bytes offset) <<< 10) ||| (coreRegSP rn <<< 5)
+  ||| field
+
+/// The three forms whose offset is a plain byte count: one that adds it, one
+/// that adds it and keeps the sum, and one that keeps the sum after reading.
+let private simm9Offset access ins kind rt rn offset =
+  let size, v, opc, _, field = accessFields access ins rt
+  loadStoreHead size v opc ||| (signedImm 9 offset <<< 12) ||| (kind <<< 10)
+  ||| (coreRegSP rn <<< 5) ||| field
+
+/// [<Xn|SP>, <Rm>{, <extend> {#<amount>}}], whose offset is a register, read as
+/// itself or as the part of itself the extension names.
+let private registerOffset access ins rt rn rm shift =
+  let size, v, opc, bytes, field = accessFields access ins rt
+  let scale = int64 (scaleOf bytes)
+  let shifted amount =
+    if amount = scale then 1u
+    else fail $"an offset of {bytes} bytes cannot be shifted by #{amount}"
+  let ext, s =
+    match shift with
+    | None -> (if is64Reg rm then UXTX else UXTW), 0u
+    | Some(ShiftOffset(LSL, Imm amount)) -> UXTX, shifted amount
+    | Some(ExtRegOffset(ext, None))
+    | Some(ExtRegOffset(ext, Some 0L)) -> ext, 0u
+    | Some(ExtRegOffset(ext, Some amount)) -> ext, shifted amount
+    | Some _ -> wrongOperands ins
+  if is64Reg rm <> extendedSourceIs64 true ext then
+    fail $"{Register.toString rm} is not the width {ext} reads"
+  else
+    loadStoreHead size v opc ||| (1u <<< 21) ||| (coreReg rm <<< 16)
+    ||| (extendType ext <<< 13) ||| (s <<< 12) ||| (0b10u <<< 10)
+    ||| (coreRegSP rn <<< 5) ||| field
+
+/// Encodes <Rt>, <label>, which reads what sits a distance away from here.
+let private loadLiteral opc v ins rt offset =
+  let field =
+    match rt with
+    | Rg reg when v = 1u ->
+      let _, _, _, bytes = widthFields ins reg
+      simdReg (bytes * 8) reg
+    | Rg reg ->
+      coreReg reg
+    | OprPrfOp operation ->
+      prefetchOperation operation
+    | Im imm ->
+      unsignedImm 5 imm
+    | _ ->
+      wrongOperands ins
+  (opc <<< 30) ||| (0b011u <<< 27) ||| (v <<< 26)
+  ||| (signedImm 19 (scaled 4 offset) <<< 5) ||| field
+
+/// The opc and V fields of a load of a literal, which name what it reads into.
+let private literalFields ins = function
+  | Rg reg ->
+    match tryScalarWidth reg with
+    | Some 32 -> 0b00u, 1u
+    | Some 64 -> 0b01u, 1u
+    | Some 128 -> 0b10u, 1u
+    | Some _ -> wrongOperands ins
+    | None -> (if is64Reg reg then 0b01u, 0u else 0b00u, 0u)
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// A load or store of one register, which is written the same way whichever of
+/// the six ways of naming a place it uses.
+///
+/// Which way that is decides the encoding, so the memory operand rather than
+/// the mnemonic picks it apart. What the mnemonic says is only how wide the
+/// access is, which arrives here already read off it.
+/// </summary>
+let private loadStore access ins =
+  match ins.Operands with
+  | TwoOperands(rt, OprMemory(BaseMode(ImmOffset(BaseOffset(rn, offset))))) ->
+    unsignedOffset access ins rt rn (defaultArg offset 0L)
+  | TwoOperands(rt, OprMemory(PreIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    simm9Offset access ins 0b11u rt rn (defaultArg off 0L)
+  | TwoOperands(rt, OprMemory(PostIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    simm9Offset access ins 0b01u rt rn (defaultArg off 0L)
+  | TwoOperands(rt, OprMemory(BaseMode(RegOffset(rn, rm, shift)))) ->
+    registerOffset access ins rt rn rm shift
+  | TwoOperands(rt, Place offset) ->
+    let opc, v = literalFields ins rt
+    loadLiteral opc v ins rt offset
+  | _ ->
+    wrongOperands ins
+
+/// The loads and stores whose offset the encoding holds as it stands, which
+/// reach half as far as a scaled one and both ways from where they start.
+let private loadStoreUnscaled access kind ins =
+  match ins.Operands with
+  | TwoOperands(rt, OprMemory(BaseMode(ImmOffset(BaseOffset(rn, offset))))) ->
+    simm9Offset access ins kind rt rn (defaultArg offset 0L)
+  | _ ->
+    wrongOperands ins
+
+/// LDRSW and PRFM, which read a literal as well as a place.
+let private loadStoreOrLiteral access opc v ins =
+  match ins.Operands with
+  | TwoOperands(rt, Place offset) -> loadLiteral opc v ins rt offset
+  | _ -> loadStore access ins
+
+/// The opc, V fields and access width of a transfer of a pair of registers,
+/// which the registers themselves say.
+let private pairFields ins reg =
+  match tryScalarWidth reg with
+  | Some 32 -> 0b00u, 1u, 4
+  | Some 64 -> 0b01u, 1u, 8
+  | Some 128 -> 0b10u, 1u, 16
+  | Some _ -> wrongOperands ins
+  | None -> (if is64Reg reg then 0b10u, 0u, 8 else 0b00u, 0u, 4)
+
+/// The five bits naming one register of a transferred pair.
+let private pairReg v bytes reg =
+  if v = 1u then simdReg (bytes * 8) reg else coreReg reg
+
+/// The bits a transfer of a pair of registers shares. Which of the four ways of
+/// naming a place it uses sits above the bit that says which way it moves.
+let private pairWith kind l ins rt1 rt2 rn offset fields =
+  let opc, v, bytes = fields
+  (opc <<< 30) ||| (0b101u <<< 27) ||| (v <<< 26) ||| (kind <<< 23)
+  ||| (l <<< 22) ||| (signedImm 7 (scaled bytes offset) <<< 15)
+  ||| (pairReg v bytes rt2 <<< 10) ||| (coreRegSP rn <<< 5)
+  ||| pairReg v bytes rt1
+
+/// Encodes <Rt1>, <Rt2>, [<Xn|SP>{, #<imm>}] and the two forms that keep the
+/// sum.
+let private loadStorePair l ins =
+  let fields rt = pairFields ins rt
+  match ins.Operands with
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(BaseMode(ImmOffset(BaseOffset(rn, off))))) ->
+    pairWith 0b010u l ins rt1 rt2 rn (defaultArg off 0L) (fields rt1)
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(PreIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    pairWith 0b011u l ins rt1 rt2 rn (defaultArg off 0L) (fields rt1)
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(PostIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    pairWith 0b001u l ins rt1 rt2 rn (defaultArg off 0L) (fields rt1)
+  | _ ->
+    wrongOperands ins
+
+/// The pair transfers that promise the memory will not be read again soon,
+/// which name a place one way only.
+let private loadStorePairNoAlloc l ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(BaseMode(ImmOffset(BaseOffset(rn, off))))) ->
+    pairWith 0b000u l ins rt1 rt2 rn (defaultArg off 0L) (pairFields ins rt1)
+  | _ ->
+    wrongOperands ins
+
+/// LDPSW, whose pair is as wide as a word each and lands sign-extended.
+let private loadPairSigned ins =
+  let fields _ = 0b01u, 0u, 4
+  match ins.Operands with
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(BaseMode(ImmOffset(BaseOffset(rn, off))))) ->
+    pairWith 0b010u 1u ins rt1 rt2 rn (defaultArg off 0L) (fields rt1)
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(PreIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    pairWith 0b011u 1u ins rt1 rt2 rn (defaultArg off 0L) (fields rt1)
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(PostIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    pairWith 0b001u 1u ins rt1 rt2 rn (defaultArg off 0L) (fields rt1)
+  | _ ->
+    wrongOperands ins
+
+/// The base register of a memory operand that names nothing but one.
+let private plainBase ins = function
+  | OprMemory(BaseMode(ImmOffset(BaseOffset(rn, None)))) -> rn
+  | OprMemory(BaseMode(ImmOffset(BaseOffset(rn, Some 0L)))) -> rn
+  | _ -> wrongOperands ins
+
+/// The bits an exclusive or ordered access shares.
+let private exclusiveWith size o2 l o1 o0 rs rt2 rn rt =
+  (size <<< 30) ||| (0b001000u <<< 24) ||| (o2 <<< 23) ||| (l <<< 22)
+  ||| (o1 <<< 21) ||| (rs <<< 16) ||| (o0 <<< 15) ||| (rt2 <<< 10)
+  ||| (coreRegSP rn <<< 5) ||| rt
+
+/// The size field of an access whose mnemonic does not say how wide it is, so
+/// that the register it moves says instead.
+let private accessSize rt = if is64Reg rt then 0b11u else 0b10u
+
+/// Encodes <Rt>, [<Xn|SP>], the accesses that name one register and a place.
+let private exclusiveOne size o2 l o0 ins =
+  match ins.Operands with
+  | TwoOperands(Rg rt, mem) ->
+    let size = defaultArg size (accessSize rt)
+    exclusiveWith size o2 l 0u o0 31u 31u (plainBase ins mem) (coreReg rt)
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// FEAT_LRCPC2's acquiring loads and releasing stores, which take the
+/// unscaled offset the ordinary acquiring ones have no room for.
+///
+/// They sit in the class the memory tags share and are told from them by bit
+/// 21. `opcOf` reads the opc field off the register where the mnemonic does
+/// not fix it: a sign-extending load says in that field how wide the answer
+/// is, which is the only place the register is asked.
+/// </summary>
+let private orderedUnscaled size opcOf ins =
+  match ins.Operands with
+  | TwoOperands(Rg rt, OprMemory(BaseMode(ImmOffset(BaseOffset(rn, off))))) ->
+    let sz = defaultArg size (accessSize rt)
+    ((sz <<< 30) ||| (0b011001u <<< 24) ||| (opcOf rt <<< 22)
+     ||| (signedImm 9 (defaultArg off 0L) <<< 12)
+     ||| (coreRegSP rn <<< 5) ||| coreReg rt)
+  | _ ->
+    wrongOperands ins
+
+/// The opc of a releasing store, an acquiring load, and an acquiring load
+/// that sign-extends -- the last one saying how wide it extends to.
+let private ordStore (_: Register) = 0b00u
+
+let private ordLoad (_: Register) = 0b01u
+
+let private ordSigned rt = if is64Reg rt then 0b10u else 0b11u
+
+/// Encodes <Ws>, <Rt>, [<Xn|SP>], the stores that say whether they succeeded.
+let private exclusiveStore size o0 ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rs, Rg rt, mem) ->
+    let size = defaultArg size (accessSize rt)
+    exclusiveWith size
+                  0u
+                  0u
+                  0u
+                  o0
+                  (coreReg rs)
+                  31u
+                  (plainBase ins mem)
+                  (coreReg rt)
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Rt1>, <Rt2>, [<Xn|SP>], the loads that read a pair at once.
+let private exclusivePairLoad o0 ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rt1, Rg rt2, mem) ->
+    exclusiveWith (accessSize rt1)
+                  0u
+                  1u
+                  1u
+                  o0
+                  31u
+                  (coreReg rt2)
+                  (plainBase ins mem)
+                  (coreReg rt1)
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Ws>, <Rt1>, <Rt2>, [<Xn|SP>], the stores that write a pair at once.
+let private exclusivePairStore o0 ins =
+  match ins.Operands with
+  | FourOperands(Rg rs, Rg rt1, Rg rt2, mem) ->
+    exclusiveWith (accessSize rt1)
+                  0u
+                  0u
+                  1u
+                  o0
+                  (coreReg rs)
+                  (coreReg rt2)
+                  (plainBase ins mem)
+                  (coreReg rt1)
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Rs>, <Rt>, [<Xn|SP>], the compare-and-swap accesses. The byte and
+/// halfword forms say their width in the mnemonic; the other two leave the
+/// registers to say it.
+let private compareAndSwap size l o0 ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rs, Rg rt, mem) ->
+    exclusiveWith (defaultArg size (accessSize rs))
+                  1u
+                  l
+                  1u
+                  o0
+                  (coreReg rs)
+                  31u
+                  (plainBase ins mem)
+                  (coreReg rt)
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// CASP and its orderings, which name both registers of each pair and encode
+/// only the first: it must be even, and the second the one after it.
+/// </summary>
+let private compareAndSwapPair l o0 ins =
+  match ins.Operands with
+  | FiveOperands(Rg rs, Rg rs2, Rg rt, Rg rt2, mem) ->
+    let s, t = coreReg rs, coreReg rt
+    let paired = coreReg rs2 = s + 1u && coreReg rt2 = t + 1u
+    if (s ||| t) &&& 1u <> 0u || not paired then
+      fail "a pair is an even register and the one after it"
+    else
+      let sz = if is64Reg rs then 1u else 0u
+      exclusiveWith sz 0u l 1u o0 s 31u (plainBase ins mem) t
+  | _ ->
+    wrongOperands ins
+
+/// The bits an atomic memory operation shares.
+let private atomicWith size a r rs o3 opc rn rt =
+  (size <<< 30) ||| (0b111000u <<< 24) ||| (a <<< 23) ||| (r <<< 22)
+  ||| (1u <<< 21) ||| (rs <<< 16) ||| (o3 <<< 15) ||| (opc <<< 12)
+  ||| (coreRegSP rn <<< 5) ||| rt
+
+/// <summary>
+/// Encodes the atomic memory operations, in both of the spellings they have.
+///
+/// The load form names a source and a destination. The store form names only
+/// the source and is the same encoding with the destination reading as the
+/// zero register, which is why a mnemonic beginning ST arrives here with two
+/// operands and is given thirty-one for the third.
+/// </summary>
+let private atomicMemory size a r o3 opc ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rs, Rg rt, mem) ->
+    atomicWith (defaultArg size (accessSize rs))
+               a
+               r
+               (coreReg rs)
+               o3
+               opc
+               (plainBase ins mem)
+               (coreReg rt)
+  | TwoOperands(Rg rs, mem) ->
+    atomicWith (defaultArg size (accessSize rs))
+               a
+               r
+               (coreReg rs)
+               o3
+               opc
+               (plainBase ins mem)
+               31u
+  | _ ->
+    wrongOperands ins
+
+/// Encodes <Rt>, [<Xn|SP>], the acquiring load that shares the atomic class
+/// and operates on nothing.
+let private loadAcquirePc size ins =
+  match ins.Operands with
+  | TwoOperands(Rg rt, mem) ->
+    atomicWith (defaultArg size (accessSize rt))
+               1u
+               0u
+               31u
+               1u
+               0b100u
+               (plainBase ins mem)
+               (coreReg rt)
+  | _ ->
+    wrongOperands ins
+
+(* The accesses that move whole structures of vector registers. *)
+/// <summary>
+/// Where a list of vector registers starts, how many it holds and what they all
+/// hold.
+///
+/// The registers have to run consecutively, wrapping round after the last one,
+/// because the encoding says only where the run starts and how long it is.
+/// </summary>
+let private simdList ins = function
+  | OprSIMDList regs ->
+    let parts =
+      regs |> List.map (function
+        | VecReg(reg, vec) -> vectorReg reg, vec, None
+        | VecRegWithIdx(reg, vec, index) -> vectorReg reg, vec, Some index
+        | ScalarReg reg -> vectorReg reg, VecD, None)
+    match parts with
+    | [] ->
+      wrongOperands ins
+    | (first, vec, index) :: _ ->
+      let consecutive =
+        parts
+        |> List.mapi (fun i (number, _, _) -> (first + uint32 i) % 32u = number)
+        |> List.forall id
+      let alike = parts |> List.forall (fun (_, v, _) -> v = vec)
+      if consecutive && alike then first, List.length parts, vec, index
+      else fail "a list has to name a run of registers of one arrangement"
+  | _ ->
+    wrongOperands ins
+
+/// The opcode field, which says both how many registers a structure access
+/// moves and how far apart the elements it reads are: one instruction reads a
+/// run of registers whole, and the others take one element from each in turn.
+let private structureOpcode ins listed structures =
+  match structures, listed with
+  | 1, 1 -> 0b0111u
+  | 1, 2 -> 0b1010u
+  | 1, 3 -> 0b0110u
+  | 1, 4 -> 0b0010u
+  | 2, 2 -> 0b1000u
+  | 3, 3 -> 0b0100u
+  | 4, 4 -> 0b0000u
+  | _ -> wrongOperands ins
+
+/// The bits a structure access shares, given how it names where it reads.
+let private structureWith l opcode size q rn rt =
+  (q <<< 30) ||| (0b0011u <<< 26) ||| (l <<< 22) ||| (opcode <<< 12)
+  ||| (size <<< 10) ||| (coreRegSP rn <<< 5) ||| rt
+
+/// <summary>
+/// The accesses that move whole vector registers at a time, of which there are
+/// three: one that names a place, one that steps the base on by a register, and
+/// one that steps it on by however much it moved.
+/// </summary>
+let private structureAccess l structures ins =
+  let encode list mem =
+    let first, listed, vec, index = simdList ins list
+    if structures > 1 then checkArrangement ins NotLone vec else ()
+    let size, q = arrangement vec
+    if index.IsSome then
+      wrongOperands ins
+    else
+      let head = structureWith l (structureOpcode ins listed structures) size q
+      match mem with
+      | OprMemory(BaseMode(ImmOffset(BaseOffset(rn, None)))) ->
+        head rn first
+      | OprMemory(PostIdxMode(RegOffset(rn, rm, None))) ->
+        head rn first ||| (1u <<< 23) ||| (coreReg rm <<< 16)
+      | OprMemory(PostIdxMode(ImmOffset(BaseOffset(rn, Some offset)))) ->
+        let moved = int64 (listed * (if q = 1u then 16 else 8))
+        if offset <> moved then
+          fail $"#{offset} is not how far {ins.Opcode} steps the base"
+        else
+          head rn first ||| (1u <<< 23) ||| (0b11111u <<< 16)
+      | _ ->
+        wrongOperands ins
+  match ins.Operands with
+  | TwoOperands(list, mem) -> encode list mem
+  | _ -> wrongOperands ins
+
+/// <summary>
+/// The size, S and Q fields that say which element of a register a single
+/// structure access reads.
+///
+/// Those three fields hold four bits between them, and the index sits at the
+/// top of them: the wider one element is, the fewer of them the index needs and
+/// the further up it starts. A doubleword is the exception, and says that it is
+/// one in the bit the index leaves free.
+/// </summary>
+let private elementFields ins vec (index: uint8) =
+  let shift, extra =
+    match vec with
+    | VecB -> 0, 0b0000u
+    | VecH -> 1, 0b0000u
+    | VecS -> 2, 0b0000u
+    | VecD -> 3, 0b0001u
+    | _ -> wrongOperands ins
+  let index = uint32 index
+  if index >= (16u >>> shift) then
+    fail $"a vector of {vec} has no element #{index}"
+  else
+    let bits = (index <<< shift) ||| extra
+    bits &&& 0b11u, (bits >>> 2) &&& 0b1u, bits >>> 3
+
+/// The opcode field of a single structure access, whose top two bits say how
+/// wide one element is and whose bottom bit says whether it moves an odd number
+/// of registers.
+let private elementOpcode ins count vec =
+  let width =
+    match vec with
+    | VecB -> 0b000u
+    | VecH -> 0b010u
+    | VecS | VecD -> 0b100u
+    | _ -> wrongOperands ins
+  width ||| (if count = 3 || count = 4 then 1u else 0u)
+
+/// <summary>
+/// The accesses that move one element of each of up to four registers, which
+/// name the element they move rather than an arrangement.
+/// </summary>
+let private elementAccess l count ins =
+  let encode list mem =
+    let first, listed, vec, index = simdList ins list
+    match index with
+    | None ->
+      wrongOperands ins
+    | Some _ when listed <> count ->
+      fail $"{ins.Opcode} moves {count} registers rather than {listed}"
+    | Some index ->
+      let size, s, q = elementFields ins vec index
+      let r = if count = 2 || count = 4 then 1u else 0u
+      let head rn =
+        (q <<< 30) ||| (0b0011010u <<< 23) ||| (l <<< 22) ||| (r <<< 21)
+        ||| (elementOpcode ins count vec <<< 13) ||| (s <<< 12)
+        ||| (size <<< 10) ||| (coreRegSP rn <<< 5) ||| first
+      match mem with
+      | OprMemory(BaseMode(ImmOffset(BaseOffset(rn, None)))) ->
+        head rn
+      | OprMemory(PostIdxMode(RegOffset(rn, rm, None))) ->
+        head rn ||| (1u <<< 23) ||| (coreReg rm <<< 16)
+      | OprMemory(PostIdxMode(ImmOffset(BaseOffset(rn, Some offset)))) ->
+        let width =
+          match vec with
+          | VecB -> 1L
+          | VecH -> 2L
+          | VecS -> 4L
+          | _ -> 8L
+        if offset <> width * int64 count then
+          fail $"#{offset} is not how far {ins.Opcode} steps the base"
+        else
+          head rn ||| (1u <<< 23) ||| (0b11111u <<< 16)
+      | _ ->
+        wrongOperands ins
+  match ins.Operands with
+  | TwoOperands(list, mem) -> encode list mem
+  | _ -> wrongOperands ins
+
+/// The accesses that read one element into every lane of their registers, which
+/// name an arrangement even though they read one element.
+let private replicateAccess count ins =
+  let encode list mem =
+    let first, listed, vec, index = simdList ins list
+    let size, q = arrangement vec
+    if index.IsSome || listed <> count then
+      wrongOperands ins
+    else
+      let r = if count = 2 || count = 4 then 1u else 0u
+      let opcode = if count = 1 || count = 2 then 0b110u else 0b111u
+      let head rn =
+        (q <<< 30) ||| (0b0011010u <<< 23) ||| (1u <<< 22) ||| (r <<< 21)
+        ||| (opcode <<< 13) ||| (size <<< 10) ||| (coreRegSP rn <<< 5) ||| first
+      match mem with
+      | OprMemory(BaseMode(ImmOffset(BaseOffset(rn, None)))) ->
+        head rn
+      | OprMemory(PostIdxMode(RegOffset(rn, rm, None))) ->
+        head rn ||| (1u <<< 23) ||| (coreReg rm <<< 16)
+      | OprMemory(PostIdxMode(ImmOffset(BaseOffset(rn, Some offset)))) ->
+        let width = 1L <<< int size
+        if offset <> width * int64 count then
+          fail $"#{offset} is not how far {ins.Opcode} steps the base"
+        else
+          head rn ||| (1u <<< 23) ||| (0b11111u <<< 16)
+      | _ ->
+        wrongOperands ins
+  match ins.Operands with
+  | TwoOperands(list, mem) -> encode list mem
+  | _ -> wrongOperands ins
+
+/// <summary>
+/// The structure accesses, which name either whole registers or one element of
+/// each of them, and which the source tells apart by writing an index.
+/// </summary>
+let private structureOrElement l count ins =
+  match ins.Operands with
+  | TwoOperands(OprSIMDList(VecRegWithIdx _ :: _), _) ->
+    elementAccess l count ins
+  | _ ->
+    structureAccess l count ins
+
+(* The tables. *)
+let dataProcImmEncoders () =
+  [ Opcode.ADR, pcRelative false
+    Opcode.ADRP, pcRelative true
+    Opcode.MOVN, moveWide 0b00u
+    Opcode.MOVZ, moveWide 0b10u
+    Opcode.MOVK, moveWide 0b11u
+    Opcode.SBFM, bitfield 0b00u
+    Opcode.BFM, bitfield 0b01u
+    Opcode.UBFM, bitfield 0b10u
+    Opcode.SBFIZ, bitfieldInsert 0b00u
+    Opcode.BFI, bitfieldInsert 0b01u
+    Opcode.UBFIZ, bitfieldInsert 0b10u
+    Opcode.SBFX, bitfieldExtract 0b00u
+    Opcode.BFXIL, bitfieldExtract 0b01u
+    Opcode.UBFX, bitfieldExtract 0b10u
+    Opcode.SXTB, extendAlias 0b00u 7L
+    Opcode.SXTH, extendAlias 0b00u 15L
+    Opcode.SXTW, extendAlias 0b00u 31L
+    Opcode.UXTB, extendAlias 0b10u 7L
+    Opcode.UXTH, extendAlias 0b10u 15L
+    Opcode.EXTR, extract ]
+
+let branchEncoders () =
+  [ Opcode.B, branchImm 0u
+    Opcode.BL, branchImm 1u
+    Opcode.BEQ, conditionalBranch 0b0000u
+    Opcode.BNE, conditionalBranch 0b0001u
+    Opcode.BCS, conditionalBranch 0b0010u
+    Opcode.BHS, conditionalBranch 0b0010u
+    Opcode.BCC, conditionalBranch 0b0011u
+    Opcode.BLO, conditionalBranch 0b0011u
+    Opcode.BMI, conditionalBranch 0b0100u
+    Opcode.BPL, conditionalBranch 0b0101u
+    Opcode.BVS, conditionalBranch 0b0110u
+    Opcode.BVC, conditionalBranch 0b0111u
+    Opcode.BHI, conditionalBranch 0b1000u
+    Opcode.BLS, conditionalBranch 0b1001u
+    Opcode.BGE, conditionalBranch 0b1010u
+    Opcode.BLT, conditionalBranch 0b1011u
+    Opcode.BGT, conditionalBranch 0b1100u
+    Opcode.BLE, conditionalBranch 0b1101u
+    Opcode.BAL, conditionalBranch 0b1110u
+    Opcode.BNV, conditionalBranch 0b1111u
+    Opcode.BR, branchReg 0b0000u
+    Opcode.BLR, branchReg 0b0001u
+    Opcode.RET, returnBranch
+    Opcode.ERET, branchNoReg 0b0100u
+    Opcode.DRPS, branchNoReg 0b0101u
+    Opcode.BRAA, branchAuthModifier 0b1000u 0u
+    Opcode.BRAB, branchAuthModifier 0b1000u 1u
+    Opcode.BLRAA, branchAuthModifier 0b1001u 0u
+    Opcode.BLRAB, branchAuthModifier 0b1001u 1u
+    Opcode.BRAAZ, branchAuthZero 0b0000u 0u
+    Opcode.BRABZ, branchAuthZero 0b0000u 1u
+    Opcode.BLRAAZ, branchAuthZero 0b0001u 0u
+    Opcode.BLRABZ, branchAuthZero 0b0001u 1u
+    Opcode.RETAA, branchAuthImplicit 0b0010u 0u
+    Opcode.RETAB, branchAuthImplicit 0b0010u 1u
+    Opcode.ERETAA, branchAuthImplicit 0b0100u 0u
+    Opcode.ERETAB, branchAuthImplicit 0b0100u 1u
+    Opcode.CBZ, compareBranch 0u
+    Opcode.CBNZ, compareBranch 1u
+    Opcode.TBZ, testBranch 0u
+    Opcode.TBNZ, testBranch 1u ]
+
+/// <summary>
+/// CFINV, XAFLAG and AXFLAG, which rewrite NZCV in place and name nothing.
+///
+/// They are written where a move to a PSTATE field would sit, with the
+/// immediate the field carries left at zero -- no PSTATE field uses that, so
+/// the three of them fit in the hole it leaves.
+/// </summary>
+let private flagManipulation op2 ins =
+  match ins.Operands with
+  | NoOperand ->
+    systemHead 0u ||| (0b0100u <<< 12) ||| (op2 <<< 5) ||| 0b11111u
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// RMIF, which rotates a register right and copies the bottom four bits
+/// into NZCV under a mask.
+///
+/// It shares the carrying add's class and is told from it by the opcode in
+/// bits 14:10 -- 00001, where SETF8 and SETF16 hold 00010 with the size in
+/// bit 14 above them.
+/// </summary>
+let private rotateMaskInsert ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rn, Im shift, Im mask) ->
+    (0b101u <<< 29) ||| (0b11010000u <<< 21)
+    ||| ((uint32 shift &&& 0x3fu) <<< 15) ||| (0b00001u <<< 10)
+    ||| (coreReg rn <<< 5) ||| (uint32 mask &&& 0xfu)
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// LDRAA and LDRAB, whose offset is a signed ten bits counting eight-byte
+/// words rather than bytes, split as S:imm9 with the sign at the top.
+/// </summary>
+let private loadAuth isKeyB ins =
+  let head =
+    (0b11111000u <<< 24) ||| ((if isKeyB then 1u else 0u) <<< 23)
+    ||| (1u <<< 21) ||| (1u <<< 10)
+  let encode rn rt off wback =
+    let scaled = uint32 ((off / 8L) &&& 0x3ffL)
+    head ||| ((scaled >>> 9) <<< 22) ||| ((scaled &&& 0x1ffu) <<< 12)
+    ||| ((if wback then 1u else 0u) <<< 11) ||| (coreRegSP rn <<< 5)
+    ||| coreReg rt
+  match ins.Operands with
+  | TwoOperands(Rg rt,
+                OprMemory(BaseMode(ImmOffset(BaseOffset(rn, off))))) ->
+    encode rn rt (defaultArg off 0L) false
+  | TwoOperands(Rg rt,
+                OprMemory(PreIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    encode rn rt (defaultArg off 0L) true
+  | _ ->
+    wrongOperands ins
+
+/// SETF8 and SETF16, which read a register's low byte or halfword and set the
+/// flags an addition of that width would have left.
+let private evaluateIntoFlags sz ins =
+  match ins.Operands with
+  | OneOperand(Rg rn) ->
+    (0b0011101u <<< 25) ||| (sz <<< 14) ||| (0b0010u <<< 10)
+    ||| (coreReg rn <<< 5) ||| 0b01101u
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// IRG and GMI, the two tag operations that take their operands in registers.
+///
+/// IRG's third operand is written only when it is named; the register field
+/// holds 31 for the form that leaves it out, which is the zero register and
+/// excludes no tag value.
+/// </summary>
+let private tagTwoSource opcode dstMaySP ins =
+  let head = (1u <<< 31) ||| (0b11010110u <<< 21) ||| (opcode <<< 10)
+  let dst reg = if dstMaySP then coreRegSP reg else coreReg reg
+  match ins.Operands with
+  | TwoOperands(Rg rd, Rg rn) ->
+    head ||| (0b11111u <<< 16) ||| (coreRegSP rn <<< 5) ||| dst rd
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) ->
+    head ||| (coreReg rm <<< 16) ||| (coreRegSP rn <<< 5) ||| dst rd
+  | _ ->
+    wrongOperands ins
+
+/// BFCVT, which rounds a single-precision number to the BFloat16 that keeps
+/// its exponent and the top of its significand.
+let private bfConvert ins =
+  match ins.Operands with
+  | TwoOperands(Rg rd, Rg rn) ->
+    (0b00011110u <<< 24) ||| (0b01u <<< 22) ||| (1u <<< 21)
+    ||| (0b000110u <<< 15) ||| (0b10000u <<< 10) ||| (simdReg 32 rn <<< 5)
+    ||| simdReg 16 rd
+  | _ ->
+    wrongOperands ins
+
+/// The bits a memory-tag access shares. Its offset counts GRANULES of sixteen
+/// bytes rather than bytes, because a tag belongs to a granule.
+let private tagAccessWith opc op2 rtField rt rn offset =
+  (0b11011001u <<< 24) ||| (opc <<< 22) ||| (1u <<< 21)
+  ||| (signedImm 9 (scaled 16 offset) <<< 12) ||| (op2 <<< 10)
+  ||| (coreRegSP rn <<< 5) ||| rtField rt
+
+/// <summary>
+/// LDG, STG, ST2G, STZG and STZ2G. The addressing mode sits in op2, except
+/// that the combination the stores leave free is what marks the load.
+///
+/// The stores name a register that may be the stack pointer and the load
+/// names one that may be the zero register, which is the same field read two
+/// ways -- hence rtField rather than one of the two.
+/// </summary>
+let private memoryTag opc offsetOp2 rtField ins =
+  match ins.Operands with
+  | TwoOperands(Rg rt, OprMemory(BaseMode(ImmOffset(BaseOffset(rn, off))))) ->
+    tagAccessWith opc offsetOp2 rtField rt rn (defaultArg off 0L)
+  | TwoOperands(Rg rt, OprMemory(PreIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    tagAccessWith opc 0b11u rtField rt rn (defaultArg off 0L)
+  | TwoOperands(Rg rt,
+                OprMemory(PostIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    tagAccessWith opc 0b01u rtField rt rn (defaultArg off 0L)
+  | _ ->
+    wrongOperands ins
+
+/// LDGM, STGM and STZGM, which move the tags of a whole block: op2 is 00 and
+/// there is no offset.
+let private memoryTagMultiple opc ins =
+  match ins.Operands with
+  | TwoOperands(Rg t, OprMemory(BaseMode(ImmOffset(BaseOffset(n, None))))) ->
+    tagAccessWith opc 0b00u coreReg t n 0L
+  | _ ->
+    wrongOperands ins
+
+/// The bits STGP shares with the ordinary pair transfers: it is the one
+/// combination of opc and L they leave free, and its offset is scaled by a
+/// granule the way the tag accesses above scale theirs.
+let private tagPairWith kind rt1 rt2 rn offset =
+  (0b01u <<< 30) ||| (0b101u <<< 27) ||| (kind <<< 23)
+  ||| (signedImm 7 (scaled 16 offset) <<< 15) ||| (coreReg rt2 <<< 10)
+  ||| (coreRegSP rn <<< 5) ||| coreReg rt1
+
+let private tagPair ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(BaseMode(ImmOffset(BaseOffset(rn, off))))) ->
+    tagPairWith 0b010u rt1 rt2 rn (defaultArg off 0L)
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(PreIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    tagPairWith 0b011u rt1 rt2 rn (defaultArg off 0L)
+  | ThreeOperands(Rg rt1,
+                  Rg rt2,
+                  OprMemory(PostIdxMode(ImmOffset(BaseOffset(rn, off))))) ->
+    tagPairWith 0b001u rt1 rt2 rn (defaultArg off 0L)
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// ADDG and SUBG, whose first immediate counts granules of sixteen bytes and
+/// whose second is added to the tag.
+/// </summary>
+let private tagImmediate isSub ins =
+  match ins.Operands with
+  | FourOperands(Rg rd, Rg rn, Im off, Im tag) ->
+    (* 100011 sits at 28:23, with the o2 bit below it -- a field one place
+       further up would be the ordinary add and subtract's *)
+    (1u <<< 31) ||| ((if isSub then 1u else 0u) <<< 30)
+    ||| (0b100011u <<< 23) ||| ((uint32 off / 16u &&& 0x3fu) <<< 16)
+    ||| ((uint32 tag &&& 0xfu) <<< 10) ||| (coreRegSP rn <<< 5)
+    ||| coreRegSP rd
+  | _ ->
+    wrongOperands ins
+
+/// SUBP, SUBPS and CMPP, which are the two-source class at opcode 000000.
+let private tagSubtract setsFlags ins =
+  let head = (1u <<< 31) ||| ((if setsFlags then 1u else 0u) <<< 29)
+             ||| (0b11010110u <<< 21)
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) ->
+    head ||| (coreRegSP rm <<< 16) ||| (coreRegSP rn <<< 5) ||| coreReg rd
+  | TwoOperands(Rg rn, Rg rm) ->
+    head ||| (coreRegSP rm <<< 16) ||| (coreRegSP rn <<< 5) ||| 0b11111u
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// The dot products by element, whose second source names one group of four
+/// bytes for every word: a register of five bits, and an index of two, H:L.
+/// </summary>
+let private dotProductIndexed u size opcode ins =
+  match ins.Operands with
+  | ThreeOperands(Vec(vd, ta), Vec(vn, tb), Elem(vm, FourB, index))
+    when index < 4uy ->
+    let q =
+      match ta, tb with
+      | TwoS, EightB -> 0u
+      | FourS, SixteenB -> 1u
+      | _ -> fail "a dot product reads bytes and writes words"
+    let i = uint32 index
+    (q <<< 30) ||| (u <<< 29) ||| (0b01111u <<< 24) ||| (size <<< 22)
+    ||| ((i &&& 1u) <<< 21) ||| (vectorReg vm <<< 16) ||| (opcode <<< 12)
+    ||| ((i >>> 1) <<< 11) ||| (vectorReg vn <<< 5) ||| vectorReg vd
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// The dot products, which read four bytes of each source for every word of
+/// the destination: the words of another vector, or by element the one group
+/// of four the size and the indexed opcode name.
+///
+/// Two arrangements meet in one instruction, so the Q bit cannot be read off
+/// either side alone: it comes from the destination and the sources are
+/// checked to agree with it.
+/// </summary>
+let private dotProduct u opcode size indexOpcode ins =
+  match ins.Operands with
+  | ThreeOperands(Vec(vd, ta), Vec(vn, tb), Vec(vm, tc)) ->
+    let q =
+      match ta, tb, tc with
+      | TwoS, EightB, EightB -> 0u
+      | FourS, SixteenB, SixteenB -> 1u
+      | _ -> fail "a dot product reads bytes and writes words"
+    (q <<< 30) ||| (u <<< 29) ||| (0b01110u <<< 24) ||| (0b10u <<< 22)
+    ||| (vectorReg vm <<< 16) ||| (opcode <<< 11) ||| (1u <<< 10)
+    ||| (vectorReg vn <<< 5) ||| vectorReg vd
+  | ThreeOperands(_, _, Elem _) ->
+    dotProductIndexed u size indexOpcode ins
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// The pointer authentication instructions that name registers: the whole
+/// of the one-source class at opcode2 = 00001.
+///
+/// The Z forms differ from the plain ones in the field the modifier would
+/// name, which they fix to the zero register rather than leaving out -- so
+/// one encoder serves both and the operand count is what picks between them.
+/// XPACI and XPACD are Z forms of the same shape.
+/// </summary>
+let private pacOneSource opcode ins =
+  (* sf:1:S:11010110:opcode2, with opcode2 fixed at 00001 for the whole
+     family -- the one-source class puts a 1 at bit 30 where the two-source
+     class beside it puts a 0 *)
+  let head = (0b11u <<< 30) ||| (0b11010110u <<< 21) ||| (1u <<< 16)
+             ||| (opcode <<< 10)
+  match ins.Operands with
+  | TwoOperands(Rg rd, Rg rn) ->
+    head ||| (coreRegSP rn <<< 5) ||| coreReg rd
+  | OneOperand(Rg rd) ->
+    head ||| (0b11111u <<< 5) ||| coreReg rd
+  | _ ->
+    wrongOperands ins
+
+/// The implicit pointer authentication forms, which are hints: everything
+/// but CRm and op2 is fixed, and the register field reads as the zero
+/// register because there is no register to name.
+let private pacHint crm op2 _ =
+  0xd503201fu ||| (crm <<< 8) ||| (op2 <<< 5)
+
+/// PACGA, which is a two-source instruction and the only one of the family
+/// that reads two whole registers rather than a pointer and a modifier.
+let private pacGeneric ins =
+  match ins.Operands with
+  | ThreeOperands(Rg rd, Rg rn, Rg rm) ->
+    (1u <<< 31) ||| (0b11010110u <<< 21) ||| (coreRegSP rm <<< 16)
+    ||| (0b001100u <<< 10) ||| (coreReg rn <<< 5) ||| coreReg rd
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// FEAT_SHA3's four-register instructions and its rotate-and-exclusive-or.
+///
+/// All four share the 0xce opcode byte and are told apart by bits 23:21.
+/// EOR3 and BCAX name four vectors of bytes; RAX1 names three of
+/// doublewords and fixes the field an immediate would sit in; XAR names
+/// three and an immediate. The operand shapes are what differ, so each
+/// shape gets an encoder and the two that share one share it.
+/// </summary>
+let private cryptFourReg opcode ins =
+  match ins.Operands with
+  | FourOperands(Vec(vd, SixteenB),
+                 Vec(vn, SixteenB),
+                 Vec(vm, SixteenB),
+                 Vec(va, SixteenB)) ->
+    (0b11001110u <<< 24) ||| (opcode <<< 21) ||| (vectorReg vm <<< 16)
+    ||| (vectorReg va <<< 10) ||| (vectorReg vn <<< 5) ||| vectorReg vd
+  | _ ->
+    wrongOperands ins
+
+let private cryptRax1 ins =
+  match ins.Operands with
+  | ThreeOperands(Vec(vd, TwoD), Vec(vn, TwoD), Vec(vm, TwoD)) ->
+    (0b11001110u <<< 24) ||| (0b011u <<< 21) ||| (vectorReg vm <<< 16)
+    ||| (0b100011u <<< 10) ||| (vectorReg vn <<< 5) ||| vectorReg vd
+  | _ ->
+    wrongOperands ins
+
+let private cryptXar ins =
+  match ins.Operands with
+  | FourOperands(Vec(vd, TwoD), Vec(vn, TwoD), Vec(vm, TwoD), Im imm) ->
+    (0b11001110u <<< 24) ||| (0b100u <<< 21) ||| (vectorReg vm <<< 16)
+    ||| ((uint32 imm &&& 0x3fu) <<< 10) ||| (vectorReg vn <<< 5)
+    ||| vectorReg vd
+  | _ ->
+    wrongOperands ins
+
+/// SM3SS1, the four-register class's third member, which names four vectors
+/// of words where EOR3 and BCAX name bytes.
+let private cryptSm3ss1 ins =
+  match ins.Operands with
+  | FourOperands(Vec(vd, FourS),
+                 Vec(vn, FourS),
+                 Vec(vm, FourS),
+                 Vec(va, FourS)) ->
+    (0b11001110u <<< 24) ||| (0b010u <<< 21) ||| (vectorReg vm <<< 16)
+    ||| (vectorReg va <<< 10) ||| (vectorReg vn <<< 5) ||| vectorReg vd
+  | _ ->
+    wrongOperands ins
+
+/// <summary>
+/// The three-register SHA 512 class, told apart by O and a two-bit opcode.
+/// SHA-512's hash halves name their first two operands as whole registers,
+/// which is what an arrangement of None stands for; the rest name three
+/// vectors of the arrangement given.
+/// </summary>
+let private cryptSha512Three o opcode arrangement ins =
+  let encode d n vm =
+    (0b11001110011u <<< 21) ||| (vectorReg vm <<< 16) ||| (1u <<< 15)
+    ||| (o <<< 14) ||| (opcode <<< 10) ||| (n <<< 5) ||| d
+  match ins.Operands, arrangement with
+  | ThreeOperands(Rg qd, Rg qn, Vec(vm, TwoD)), None ->
+    encode (simdReg 128 qd) (simdReg 128 qn) vm
+  | ThreeOperands(Vec(vd, td), Vec(vn, tn), Vec(vm, tm)), Some t
+    when td = t && tn = t && tm = t ->
+    encode (vectorReg vd) (vectorReg vn) vm
+  | _ ->
+    wrongOperands ins
+
+/// The two-register SHA 512 class: SHA512SU0 on doublewords, SM4E on words.
+let private cryptSha512Two opcode t ins =
+  match ins.Operands with
+  | TwoOperands(Vec(vd, td), Vec(vn, tn)) when td = t && tn = t ->
+    (0b11001110110u <<< 21) ||| (0b1000u <<< 12) ||| (opcode <<< 10)
+    ||| (vectorReg vn <<< 5) ||| vectorReg vd
+  | _ ->
+    wrongOperands ins
+
+/// SM3's round functions, whose third source is one word of a register.
+let private cryptSm3tt opcode ins =
+  match ins.Operands with
+  | ThreeOperands(Vec(vd, FourS), Vec(vn, FourS), Elem(vm, VecS, index))
+    when index < 4uy ->
+    (0b11001110010u <<< 21) ||| (vectorReg vm <<< 16) ||| (0b10u <<< 14)
+    ||| (uint32 index <<< 12) ||| (opcode <<< 10) ||| (vectorReg vn <<< 5)
+    ||| vectorReg vd
+  | _ ->
+    wrongOperands ins
+
+let systemEncoders () =
+  [ Opcode.SVC, exceptionGen 0b000u 0b01u
+    Opcode.HVC, exceptionGen 0b000u 0b10u
+    Opcode.SMC, exceptionGen 0b000u 0b11u
+    Opcode.BRK, exceptionGen 0b001u 0b00u
+    Opcode.HLT, exceptionGen 0b010u 0b00u
+    Opcode.DCPS1, exceptionGen 0b101u 0b01u
+    Opcode.DCPS2, exceptionGen 0b101u 0b10u
+    Opcode.DCPS3, exceptionGen 0b101u 0b11u
+    Opcode.NOP, namedHint 0b0000u 0b000u
+    Opcode.YIELD, namedHint 0b0000u 0b001u
+    Opcode.WFE, namedHint 0b0000u 0b010u
+    Opcode.WFI, namedHint 0b0000u 0b011u
+    Opcode.SEV, namedHint 0b0000u 0b100u
+    Opcode.SEVL, namedHint 0b0000u 0b101u
+    Opcode.ESB, namedHint 0b0010u 0b000u
+    Opcode.CSDB, namedHint 0b0010u 0b100u
+    Opcode.PSB, syncHint 0b001u
+    Opcode.TSB, syncHint 0b010u
+    Opcode.BTI, branchTarget
+    Opcode.HINT, hint
+    Opcode.CLREX, barrier 0b010u
+    Opcode.DSB, barrier 0b100u
+    Opcode.DMB, barrier 0b101u
+    Opcode.ISB, barrier 0b110u
+    Opcode.SB, speculationBarrier
+    Opcode.SYS, systemInstruction 0u
+    Opcode.SYSL, systemInstruction 1u
+    Opcode.MSR, moveToSystem
+    Opcode.MRS, moveFromSystem
+    Opcode.DCZVA, cacheInstruction 0b011u 0b0111u 0b0100u 0b001u
+    Opcode.DCIVAC, cacheInstruction 0b000u 0b0111u 0b0110u 0b001u
+    Opcode.DCISW, cacheInstruction 0b000u 0b0111u 0b0110u 0b010u
+    Opcode.DCCVAC, cacheInstruction 0b011u 0b0111u 0b1010u 0b001u
+    Opcode.DCCSW, cacheInstruction 0b000u 0b0111u 0b1010u 0b010u
+    Opcode.DCCVAU, cacheInstruction 0b011u 0b0111u 0b1011u 0b001u
+    Opcode.DCCIVAC, cacheInstruction 0b011u 0b0111u 0b1110u 0b001u
+    Opcode.DCCISW, cacheInstruction 0b000u 0b0111u 0b1110u 0b010u
+    Opcode.CFINV, flagManipulation 0b000u
+    Opcode.XAFLAG, flagManipulation 0b001u
+    Opcode.AXFLAG, flagManipulation 0b010u ]
+
+let loadStoreEncoders () =
+  [ Opcode.LDR, loadStore (ByRegister true)
+    Opcode.STR, loadStore (ByRegister false)
+    Opcode.LDRB, loadStore (Fixed(0b00u, 0b01u, 1))
+    Opcode.STRB, loadStore (Fixed(0b00u, 0b00u, 1))
+    Opcode.LDRH, loadStore (Fixed(0b01u, 0b01u, 2))
+    Opcode.STRH, loadStore (Fixed(0b01u, 0b00u, 2))
+    Opcode.LDRSB, loadStore (Signed(0b00u, 1))
+    Opcode.LDRSH, loadStore (Signed(0b01u, 2))
+    Opcode.LDRSW, loadStoreOrLiteral (Signed(0b10u, 4)) 0b10u 0u
+    Opcode.PRFM, loadStoreOrLiteral Prefetch 0b11u 0u
+    Opcode.LDUR, loadStoreUnscaled (ByRegister true) 0b00u
+    Opcode.STUR, loadStoreUnscaled (ByRegister false) 0b00u
+    Opcode.LDURB, loadStoreUnscaled (Fixed(0b00u, 0b01u, 1)) 0b00u
+    Opcode.STURB, loadStoreUnscaled (Fixed(0b00u, 0b00u, 1)) 0b00u
+    Opcode.LDURH, loadStoreUnscaled (Fixed(0b01u, 0b01u, 2)) 0b00u
+    Opcode.STURH, loadStoreUnscaled (Fixed(0b01u, 0b00u, 2)) 0b00u
+    Opcode.LDURSB, loadStoreUnscaled (Signed(0b00u, 1)) 0b00u
+    Opcode.LDURSH, loadStoreUnscaled (Signed(0b01u, 2)) 0b00u
+    Opcode.LDURSW, loadStoreUnscaled (Signed(0b10u, 4)) 0b00u
+    Opcode.PRFUM, loadStoreUnscaled Prefetch 0b00u
+    Opcode.LDTR, loadStoreUnscaled (ByRegister true) 0b10u
+    Opcode.STTR, loadStoreUnscaled (ByRegister false) 0b10u
+    Opcode.LDTRB, loadStoreUnscaled (Fixed(0b00u, 0b01u, 1)) 0b10u
+    Opcode.STTRB, loadStoreUnscaled (Fixed(0b00u, 0b00u, 1)) 0b10u
+    Opcode.LDTRH, loadStoreUnscaled (Fixed(0b01u, 0b01u, 2)) 0b10u
+    Opcode.STTRH, loadStoreUnscaled (Fixed(0b01u, 0b00u, 2)) 0b10u
+    Opcode.LDTRSB, loadStoreUnscaled (Signed(0b00u, 1)) 0b10u
+    Opcode.LDTRSH, loadStoreUnscaled (Signed(0b01u, 2)) 0b10u
+    Opcode.LDTRSW, loadStoreUnscaled (Signed(0b10u, 4)) 0b10u
+    Opcode.LDP, loadStorePair 1u
+    Opcode.STP, loadStorePair 0u
+    Opcode.LDNP, loadStorePairNoAlloc 1u
+    Opcode.STNP, loadStorePairNoAlloc 0u
+    Opcode.LDPSW, loadPairSigned
+    Opcode.STGP, tagPair
+    Opcode.LDG, memoryTag 0b01u 0b00u coreReg
+    Opcode.STG, memoryTag 0b00u 0b10u coreRegSP
+    Opcode.STZG, memoryTag 0b01u 0b10u coreRegSP
+    Opcode.ST2G, memoryTag 0b10u 0b10u coreRegSP
+    Opcode.STZ2G, memoryTag 0b11u 0b10u coreRegSP
+    Opcode.STZGM, memoryTagMultiple 0b00u
+    Opcode.STGM, memoryTagMultiple 0b10u
+    Opcode.LDGM, memoryTagMultiple 0b11u
+    Opcode.ADDG, tagImmediate false
+    Opcode.SUBG, tagImmediate true
+    Opcode.SUBP, tagSubtract false
+    Opcode.SUBPS, tagSubtract true
+    Opcode.CMPP, tagSubtract true
+    Opcode.LDAPUR, orderedUnscaled None ordLoad
+    Opcode.STLUR, orderedUnscaled None ordStore
+    Opcode.LDAPURB, orderedUnscaled (Some 0b00u) ordLoad
+    Opcode.STLURB, orderedUnscaled (Some 0b00u) ordStore
+    Opcode.LDAPURH, orderedUnscaled (Some 0b01u) ordLoad
+    Opcode.STLURH, orderedUnscaled (Some 0b01u) ordStore
+    Opcode.LDAPURSB, orderedUnscaled (Some 0b00u) ordSigned
+    Opcode.LDAPURSH, orderedUnscaled (Some 0b01u) ordSigned
+    Opcode.LDAPURSW, orderedUnscaled (Some 0b10u) ordSigned
+    Opcode.LDLARB, exclusiveOne (Some 0b00u) 1u 1u 0u
+    Opcode.STLLRB, exclusiveOne (Some 0b00u) 1u 0u 0u
+    Opcode.LDLARH, exclusiveOne (Some 0b01u) 1u 1u 0u
+    Opcode.STLLRH, exclusiveOne (Some 0b01u) 1u 0u 0u
+    Opcode.LDLAR, exclusiveOne None 1u 1u 0u
+    Opcode.STLLR, exclusiveOne None 1u 0u 0u
+    Opcode.SDOT, dotProduct 0u 0b10010u 0b10u 0b1110u
+    Opcode.UDOT, dotProduct 1u 0b10010u 0b10u 0b1110u
+    Opcode.USDOT, dotProduct 0u 0b10011u 0b10u 0b1111u
+    Opcode.SUDOT, dotProductIndexed 0u 0b00u 0b1111u
+    Opcode.BFCVT, bfConvert
+    Opcode.PACIA, pacOneSource 0b000000u
+    Opcode.PACIB, pacOneSource 0b000001u
+    Opcode.PACDA, pacOneSource 0b000010u
+    Opcode.PACDB, pacOneSource 0b000011u
+    Opcode.AUTIA, pacOneSource 0b000100u
+    Opcode.AUTIB, pacOneSource 0b000101u
+    Opcode.AUTDA, pacOneSource 0b000110u
+    Opcode.AUTDB, pacOneSource 0b000111u
+    Opcode.PACIZA, pacOneSource 0b001000u
+    Opcode.PACIZB, pacOneSource 0b001001u
+    Opcode.PACDZA, pacOneSource 0b001010u
+    Opcode.PACDZB, pacOneSource 0b001011u
+    Opcode.AUTIZA, pacOneSource 0b001100u
+    Opcode.AUTIZB, pacOneSource 0b001101u
+    Opcode.AUTDZA, pacOneSource 0b001110u
+    Opcode.AUTDZB, pacOneSource 0b001111u
+    Opcode.XPACI, pacOneSource 0b010000u
+    Opcode.XPACD, pacOneSource 0b010001u
+    Opcode.PACGA, pacGeneric
+    Opcode.XPACLRI, pacHint 0u 7u
+    Opcode.PACIA1716, pacHint 1u 0u
+    Opcode.PACIB1716, pacHint 1u 2u
+    Opcode.AUTIA1716, pacHint 1u 4u
+    Opcode.AUTIB1716, pacHint 1u 6u
+    Opcode.PACIAZ, pacHint 3u 0u
+    Opcode.PACIASP, pacHint 3u 1u
+    Opcode.PACIBZ, pacHint 3u 2u
+    Opcode.PACIBSP, pacHint 3u 3u
+    Opcode.AUTIAZ, pacHint 3u 4u
+    Opcode.AUTIASP, pacHint 3u 5u
+    Opcode.AUTIBZ, pacHint 3u 6u
+    Opcode.AUTIBSP, pacHint 3u 7u
+    Opcode.EOR3, cryptFourReg 0b000u
+    Opcode.BCAX, cryptFourReg 0b001u
+    Opcode.RAX1, cryptRax1
+    Opcode.XAR, cryptXar
+    Opcode.SM3SS1, cryptSm3ss1
+    Opcode.SHA512H, cryptSha512Three 0u 0b00u None
+    Opcode.SHA512H2, cryptSha512Three 0u 0b01u None
+    Opcode.SHA512SU1, cryptSha512Three 0u 0b10u (Some TwoD)
+    Opcode.SM3PARTW1, cryptSha512Three 1u 0b00u (Some FourS)
+    Opcode.SM3PARTW2, cryptSha512Three 1u 0b01u (Some FourS)
+    Opcode.SM4EKEY, cryptSha512Three 1u 0b10u (Some FourS)
+    Opcode.SHA512SU0, cryptSha512Two 0b00u TwoD
+    Opcode.SM4E, cryptSha512Two 0b01u FourS
+    Opcode.SM3TT1A, cryptSm3tt 0b00u
+    Opcode.SM3TT1B, cryptSm3tt 0b01u
+    Opcode.SM3TT2A, cryptSm3tt 0b10u
+    Opcode.SM3TT2B, cryptSm3tt 0b11u
+    Opcode.STXRB, exclusiveStore (Some 0b00u) 0u
+    Opcode.STLXRB, exclusiveStore (Some 0b00u) 1u
+    Opcode.STXRH, exclusiveStore (Some 0b01u) 0u
+    Opcode.STLXRH, exclusiveStore (Some 0b01u) 1u
+    Opcode.LDXRB, exclusiveOne (Some 0b00u) 0u 1u 0u
+    Opcode.LDAXRB, exclusiveOne (Some 0b00u) 0u 1u 1u
+    Opcode.LDXRH, exclusiveOne (Some 0b01u) 0u 1u 0u
+    Opcode.LDAXRH, exclusiveOne (Some 0b01u) 0u 1u 1u
+    Opcode.STLRB, exclusiveOne (Some 0b00u) 1u 0u 1u
+    Opcode.LDARB, exclusiveOne (Some 0b00u) 1u 1u 1u
+    Opcode.STLRH, exclusiveOne (Some 0b01u) 1u 0u 1u
+    Opcode.LDARH, exclusiveOne (Some 0b01u) 1u 1u 1u
+    Opcode.STXR, exclusiveStore None 0u
+    Opcode.STLXR, exclusiveStore None 1u
+    Opcode.LDXR, exclusiveOne None 0u 1u 0u
+    Opcode.LDAXR, exclusiveOne None 0u 1u 1u
+    Opcode.STLR, exclusiveOne None 1u 0u 1u
+    Opcode.LDAR, exclusiveOne None 1u 1u 1u
+    Opcode.STXP, exclusivePairStore 0u
+    Opcode.STLXP, exclusivePairStore 1u
+    Opcode.LDXP, exclusivePairLoad 0u
+    Opcode.LDAXP, exclusivePairLoad 1u
+    Opcode.CASP, compareAndSwapPair 0u 0u
+    Opcode.CASPL, compareAndSwapPair 0u 1u
+    Opcode.CASPA, compareAndSwapPair 1u 0u
+    Opcode.CASPAL, compareAndSwapPair 1u 1u
+    Opcode.CAS, compareAndSwap None 0u 0u
+    Opcode.CASL, compareAndSwap None 0u 1u
+    Opcode.CASA, compareAndSwap None 1u 0u
+    Opcode.CASAL, compareAndSwap None 1u 1u
+    Opcode.CASB, compareAndSwap (Some 0b00u) 0u 0u
+    Opcode.CASLB, compareAndSwap (Some 0b00u) 0u 1u
+    Opcode.CASAB, compareAndSwap (Some 0b00u) 1u 0u
+    Opcode.CASALB, compareAndSwap (Some 0b00u) 1u 1u
+    Opcode.CASH, compareAndSwap (Some 0b01u) 0u 0u
+    Opcode.CASLH, compareAndSwap (Some 0b01u) 0u 1u
+    Opcode.CASAH, compareAndSwap (Some 0b01u) 1u 0u
+    Opcode.CASALH, compareAndSwap (Some 0b01u) 1u 1u
+    Opcode.LDADDB, atomicMemory (Some 0b00u) 0u 0u 0u 0b000u
+    Opcode.LDADDLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b000u
+    Opcode.LDADDAB, atomicMemory (Some 0b00u) 1u 0u 0u 0b000u
+    Opcode.LDADDALB, atomicMemory (Some 0b00u) 1u 1u 0u 0b000u
+    Opcode.STADDB, atomicMemory (Some 0b00u) 0u 0u 0u 0b000u
+    Opcode.STADDLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b000u
+    Opcode.LDADDH, atomicMemory (Some 0b01u) 0u 0u 0u 0b000u
+    Opcode.LDADDLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b000u
+    Opcode.LDADDAH, atomicMemory (Some 0b01u) 1u 0u 0u 0b000u
+    Opcode.LDADDALH, atomicMemory (Some 0b01u) 1u 1u 0u 0b000u
+    Opcode.STADDH, atomicMemory (Some 0b01u) 0u 0u 0u 0b000u
+    Opcode.STADDLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b000u
+    Opcode.LDADD, atomicMemory (None) 0u 0u 0u 0b000u
+    Opcode.LDADDL, atomicMemory (None) 0u 1u 0u 0b000u
+    Opcode.LDADDA, atomicMemory (None) 1u 0u 0u 0b000u
+    Opcode.LDADDAL, atomicMemory (None) 1u 1u 0u 0b000u
+    Opcode.STADD, atomicMemory (None) 0u 0u 0u 0b000u
+    Opcode.STADDL, atomicMemory (None) 0u 1u 0u 0b000u
+    Opcode.LDCLRB, atomicMemory (Some 0b00u) 0u 0u 0u 0b001u
+    Opcode.LDCLRLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b001u
+    Opcode.LDCLRAB, atomicMemory (Some 0b00u) 1u 0u 0u 0b001u
+    Opcode.LDCLRALB, atomicMemory (Some 0b00u) 1u 1u 0u 0b001u
+    Opcode.STCLRB, atomicMemory (Some 0b00u) 0u 0u 0u 0b001u
+    Opcode.STCLRLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b001u
+    Opcode.LDCLRH, atomicMemory (Some 0b01u) 0u 0u 0u 0b001u
+    Opcode.LDCLRLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b001u
+    Opcode.LDCLRAH, atomicMemory (Some 0b01u) 1u 0u 0u 0b001u
+    Opcode.LDCLRALH, atomicMemory (Some 0b01u) 1u 1u 0u 0b001u
+    Opcode.STCLRH, atomicMemory (Some 0b01u) 0u 0u 0u 0b001u
+    Opcode.STCLRLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b001u
+    Opcode.LDCLR, atomicMemory (None) 0u 0u 0u 0b001u
+    Opcode.LDCLRL, atomicMemory (None) 0u 1u 0u 0b001u
+    Opcode.LDCLRA, atomicMemory (None) 1u 0u 0u 0b001u
+    Opcode.LDCLRAL, atomicMemory (None) 1u 1u 0u 0b001u
+    Opcode.STCLR, atomicMemory (None) 0u 0u 0u 0b001u
+    Opcode.STCLRL, atomicMemory (None) 0u 1u 0u 0b001u
+    Opcode.LDEORB, atomicMemory (Some 0b00u) 0u 0u 0u 0b010u
+    Opcode.LDEORLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b010u
+    Opcode.LDEORAB, atomicMemory (Some 0b00u) 1u 0u 0u 0b010u
+    Opcode.LDEORALB, atomicMemory (Some 0b00u) 1u 1u 0u 0b010u
+    Opcode.STEORB, atomicMemory (Some 0b00u) 0u 0u 0u 0b010u
+    Opcode.STEORLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b010u
+    Opcode.LDEORH, atomicMemory (Some 0b01u) 0u 0u 0u 0b010u
+    Opcode.LDEORLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b010u
+    Opcode.LDEORAH, atomicMemory (Some 0b01u) 1u 0u 0u 0b010u
+    Opcode.LDEORALH, atomicMemory (Some 0b01u) 1u 1u 0u 0b010u
+    Opcode.STEORH, atomicMemory (Some 0b01u) 0u 0u 0u 0b010u
+    Opcode.STEORLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b010u
+    Opcode.LDEOR, atomicMemory (None) 0u 0u 0u 0b010u
+    Opcode.LDEORL, atomicMemory (None) 0u 1u 0u 0b010u
+    Opcode.LDEORA, atomicMemory (None) 1u 0u 0u 0b010u
+    Opcode.LDEORAL, atomicMemory (None) 1u 1u 0u 0b010u
+    Opcode.STEOR, atomicMemory (None) 0u 0u 0u 0b010u
+    Opcode.STEORL, atomicMemory (None) 0u 1u 0u 0b010u
+    Opcode.LDSETB, atomicMemory (Some 0b00u) 0u 0u 0u 0b011u
+    Opcode.LDSETLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b011u
+    Opcode.LDSETAB, atomicMemory (Some 0b00u) 1u 0u 0u 0b011u
+    Opcode.LDSETALB, atomicMemory (Some 0b00u) 1u 1u 0u 0b011u
+    Opcode.STSETB, atomicMemory (Some 0b00u) 0u 0u 0u 0b011u
+    Opcode.STSETLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b011u
+    Opcode.LDSETH, atomicMemory (Some 0b01u) 0u 0u 0u 0b011u
+    Opcode.LDSETLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b011u
+    Opcode.LDSETAH, atomicMemory (Some 0b01u) 1u 0u 0u 0b011u
+    Opcode.LDSETALH, atomicMemory (Some 0b01u) 1u 1u 0u 0b011u
+    Opcode.STSETH, atomicMemory (Some 0b01u) 0u 0u 0u 0b011u
+    Opcode.STSETLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b011u
+    Opcode.LDSET, atomicMemory (None) 0u 0u 0u 0b011u
+    Opcode.LDSETL, atomicMemory (None) 0u 1u 0u 0b011u
+    Opcode.LDSETA, atomicMemory (None) 1u 0u 0u 0b011u
+    Opcode.LDSETAL, atomicMemory (None) 1u 1u 0u 0b011u
+    Opcode.STSET, atomicMemory (None) 0u 0u 0u 0b011u
+    Opcode.STSETL, atomicMemory (None) 0u 1u 0u 0b011u
+    Opcode.LDSMAXB, atomicMemory (Some 0b00u) 0u 0u 0u 0b100u
+    Opcode.LDSMAXLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b100u
+    Opcode.LDSMAXAB, atomicMemory (Some 0b00u) 1u 0u 0u 0b100u
+    Opcode.LDSMAXALB, atomicMemory (Some 0b00u) 1u 1u 0u 0b100u
+    Opcode.STSMAXB, atomicMemory (Some 0b00u) 0u 0u 0u 0b100u
+    Opcode.STSMAXLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b100u
+    Opcode.LDSMAXH, atomicMemory (Some 0b01u) 0u 0u 0u 0b100u
+    Opcode.LDSMAXLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b100u
+    Opcode.LDSMAXAH, atomicMemory (Some 0b01u) 1u 0u 0u 0b100u
+    Opcode.LDSMAXALH, atomicMemory (Some 0b01u) 1u 1u 0u 0b100u
+    Opcode.STSMAXH, atomicMemory (Some 0b01u) 0u 0u 0u 0b100u
+    Opcode.STSMAXLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b100u
+    Opcode.LDSMAX, atomicMemory (None) 0u 0u 0u 0b100u
+    Opcode.LDSMAXL, atomicMemory (None) 0u 1u 0u 0b100u
+    Opcode.LDSMAXA, atomicMemory (None) 1u 0u 0u 0b100u
+    Opcode.LDSMAXAL, atomicMemory (None) 1u 1u 0u 0b100u
+    Opcode.STSMAX, atomicMemory (None) 0u 0u 0u 0b100u
+    Opcode.STSMAXL, atomicMemory (None) 0u 1u 0u 0b100u
+    Opcode.LDSMINB, atomicMemory (Some 0b00u) 0u 0u 0u 0b101u
+    Opcode.LDSMINLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b101u
+    Opcode.LDSMINAB, atomicMemory (Some 0b00u) 1u 0u 0u 0b101u
+    Opcode.LDSMINALB, atomicMemory (Some 0b00u) 1u 1u 0u 0b101u
+    Opcode.STSMINB, atomicMemory (Some 0b00u) 0u 0u 0u 0b101u
+    Opcode.STSMINLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b101u
+    Opcode.LDSMINH, atomicMemory (Some 0b01u) 0u 0u 0u 0b101u
+    Opcode.LDSMINLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b101u
+    Opcode.LDSMINAH, atomicMemory (Some 0b01u) 1u 0u 0u 0b101u
+    Opcode.LDSMINALH, atomicMemory (Some 0b01u) 1u 1u 0u 0b101u
+    Opcode.STSMINH, atomicMemory (Some 0b01u) 0u 0u 0u 0b101u
+    Opcode.STSMINLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b101u
+    Opcode.LDSMIN, atomicMemory (None) 0u 0u 0u 0b101u
+    Opcode.LDSMINL, atomicMemory (None) 0u 1u 0u 0b101u
+    Opcode.LDSMINA, atomicMemory (None) 1u 0u 0u 0b101u
+    Opcode.LDSMINAL, atomicMemory (None) 1u 1u 0u 0b101u
+    Opcode.STSMIN, atomicMemory (None) 0u 0u 0u 0b101u
+    Opcode.STSMINL, atomicMemory (None) 0u 1u 0u 0b101u
+    Opcode.LDUMAXB, atomicMemory (Some 0b00u) 0u 0u 0u 0b110u
+    Opcode.LDUMAXLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b110u
+    Opcode.LDUMAXAB, atomicMemory (Some 0b00u) 1u 0u 0u 0b110u
+    Opcode.LDUMAXALB, atomicMemory (Some 0b00u) 1u 1u 0u 0b110u
+    Opcode.STUMAXB, atomicMemory (Some 0b00u) 0u 0u 0u 0b110u
+    Opcode.STUMAXLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b110u
+    Opcode.LDUMAXH, atomicMemory (Some 0b01u) 0u 0u 0u 0b110u
+    Opcode.LDUMAXLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b110u
+    Opcode.LDUMAXAH, atomicMemory (Some 0b01u) 1u 0u 0u 0b110u
+    Opcode.LDUMAXALH, atomicMemory (Some 0b01u) 1u 1u 0u 0b110u
+    Opcode.STUMAXH, atomicMemory (Some 0b01u) 0u 0u 0u 0b110u
+    Opcode.STUMAXLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b110u
+    Opcode.LDUMAX, atomicMemory (None) 0u 0u 0u 0b110u
+    Opcode.LDUMAXL, atomicMemory (None) 0u 1u 0u 0b110u
+    Opcode.LDUMAXA, atomicMemory (None) 1u 0u 0u 0b110u
+    Opcode.LDUMAXAL, atomicMemory (None) 1u 1u 0u 0b110u
+    Opcode.STUMAX, atomicMemory (None) 0u 0u 0u 0b110u
+    Opcode.STUMAXL, atomicMemory (None) 0u 1u 0u 0b110u
+    Opcode.LDUMINB, atomicMemory (Some 0b00u) 0u 0u 0u 0b111u
+    Opcode.LDUMINLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b111u
+    Opcode.LDUMINAB, atomicMemory (Some 0b00u) 1u 0u 0u 0b111u
+    Opcode.LDUMINALB, atomicMemory (Some 0b00u) 1u 1u 0u 0b111u
+    Opcode.STUMINB, atomicMemory (Some 0b00u) 0u 0u 0u 0b111u
+    Opcode.STUMINLB, atomicMemory (Some 0b00u) 0u 1u 0u 0b111u
+    Opcode.LDUMINH, atomicMemory (Some 0b01u) 0u 0u 0u 0b111u
+    Opcode.LDUMINLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b111u
+    Opcode.LDUMINAH, atomicMemory (Some 0b01u) 1u 0u 0u 0b111u
+    Opcode.LDUMINALH, atomicMemory (Some 0b01u) 1u 1u 0u 0b111u
+    Opcode.STUMINH, atomicMemory (Some 0b01u) 0u 0u 0u 0b111u
+    Opcode.STUMINLH, atomicMemory (Some 0b01u) 0u 1u 0u 0b111u
+    Opcode.LDUMIN, atomicMemory (None) 0u 0u 0u 0b111u
+    Opcode.LDUMINL, atomicMemory (None) 0u 1u 0u 0b111u
+    Opcode.LDUMINA, atomicMemory (None) 1u 0u 0u 0b111u
+    Opcode.LDUMINAL, atomicMemory (None) 1u 1u 0u 0b111u
+    Opcode.STUMIN, atomicMemory (None) 0u 0u 0u 0b111u
+    Opcode.STUMINL, atomicMemory (None) 0u 1u 0u 0b111u
+    Opcode.SWPB, atomicMemory (Some 0b00u) 0u 0u 1u 0b000u
+    Opcode.SWPLB, atomicMemory (Some 0b00u) 0u 1u 1u 0b000u
+    Opcode.SWPAB, atomicMemory (Some 0b00u) 1u 0u 1u 0b000u
+    Opcode.SWPALB, atomicMemory (Some 0b00u) 1u 1u 1u 0b000u
+    Opcode.SWPH, atomicMemory (Some 0b01u) 0u 0u 1u 0b000u
+    Opcode.SWPLH, atomicMemory (Some 0b01u) 0u 1u 1u 0b000u
+    Opcode.SWPAH, atomicMemory (Some 0b01u) 1u 0u 1u 0b000u
+    Opcode.SWPALH, atomicMemory (Some 0b01u) 1u 1u 1u 0b000u
+    Opcode.SWP, atomicMemory (None) 0u 0u 1u 0b000u
+    Opcode.SWPL, atomicMemory (None) 0u 1u 1u 0b000u
+    Opcode.SWPA, atomicMemory (None) 1u 0u 1u 0b000u
+    Opcode.SWPAL, atomicMemory (None) 1u 1u 1u 0b000u
+    Opcode.LDAPRB, loadAcquirePc (Some 0b00u)
+    Opcode.LDAPRH, loadAcquirePc (Some 0b01u)
+    Opcode.LDAPR, loadAcquirePc (None)
+    Opcode.LD1, structureOrElement 1u 1
+    Opcode.LD2, structureOrElement 1u 2
+    Opcode.LD3, structureOrElement 1u 3
+    Opcode.LD4, structureOrElement 1u 4
+    Opcode.ST1, structureOrElement 0u 1
+    Opcode.ST2, structureOrElement 0u 2
+    Opcode.ST3, structureOrElement 0u 3
+    Opcode.ST4, structureOrElement 0u 4
+    Opcode.LD1R, replicateAccess 1
+    Opcode.LD2R, replicateAccess 2
+    Opcode.LD3R, replicateAccess 3
+    Opcode.LD4R, replicateAccess 4 ]
+
+let dataProcRegEncoders () =
+  [ Opcode.ADD, addSub 0u 0u
+    Opcode.ADDS, addSub 0u 1u
+    Opcode.SUB, addSub 1u 0u
+    Opcode.SUBS, addSub 1u 1u
+    Opcode.CMN, compareOperand 0u
+    Opcode.CMP, compareOperand 1u
+    Opcode.NEG, negate 0u
+    Opcode.NEGS, negate 1u
+    Opcode.ADC, addSubCarry 0u 0u
+    Opcode.ADCS, addSubCarry 0u 1u
+    Opcode.SBC, addSubCarry 1u 0u
+    Opcode.SBCS, addSubCarry 1u 1u
+    Opcode.NGC, negateCarry 0u
+    Opcode.NGCS, negateCarry 1u
+    Opcode.AND, logical 0b00u 0u
+    Opcode.BIC, logical 0b00u 1u
+    Opcode.ORR, logical 0b01u 0u
+    Opcode.ORN, logical 0b01u 1u
+    Opcode.EOR, logical 0b10u 0u
+    Opcode.EON, logical 0b10u 1u
+    Opcode.ANDS, logical 0b11u 0u
+    Opcode.BICS, logical 0b11u 1u
+    Opcode.MOV, move
+    Opcode.MVN, moveNot
+    Opcode.TST, test
+    Opcode.CCMN, condCompare 0u
+    Opcode.CCMP, condCompare 1u
+    Opcode.CSEL, condSelect 0u 0b00u
+    Opcode.CSINC, condSelect 0u 0b01u
+    Opcode.CSINV, condSelect 1u 0b00u
+    Opcode.CSNEG, condSelect 1u 0b01u
+    Opcode.CINC, condSelectAlias 0u 0b01u
+    Opcode.CSET, condSelectAlias 0u 0b01u
+    Opcode.CINV, condSelectAlias 1u 0b00u
+    Opcode.CSETM, condSelectAlias 1u 0b00u
+    Opcode.CNEG, condSelectAlias 1u 0b01u
+    Opcode.MADD, mulAccumulate 0b000u 0u
+    Opcode.MSUB, mulAccumulate 0b000u 1u
+    Opcode.SMADDL, mulAccumulate 0b001u 0u
+    Opcode.SMSUBL, mulAccumulate 0b001u 1u
+    Opcode.UMADDL, mulAccumulate 0b101u 0u
+    Opcode.UMSUBL, mulAccumulate 0b101u 1u
+    Opcode.MUL, multiply 0b000u 0u
+    Opcode.MNEG, multiply 0b000u 1u
+    Opcode.SMULL, multiply 0b001u 0u
+    Opcode.SMNEGL, multiply 0b001u 1u
+    Opcode.UMULL, multiply 0b101u 0u
+    Opcode.IRG, tagTwoSource 0b000100u true
+    Opcode.GMI, tagTwoSource 0b000101u false
+    Opcode.SETF8, evaluateIntoFlags 0u
+    Opcode.RMIF, rotateMaskInsert
+    Opcode.LDRAA, loadAuth false
+    Opcode.LDRAB, loadAuth true
+    Opcode.SETF16, evaluateIntoFlags 1u
+    Opcode.UMNEGL, multiply 0b101u 1u
+    Opcode.SMULH, multiply 0b010u 0u
+    Opcode.UMULH, multiply 0b110u 0u
+    Opcode.UDIV, dataProc2Src 0b000010u
+    Opcode.SDIV, dataProc2Src 0b000011u
+    Opcode.RORV, dataProc2Src 0b001011u
+    Opcode.LSL, shift shiftLeftImm 0b001000u
+    Opcode.LSR, shift (shiftRightImm 0b10u) 0b001001u
+    Opcode.ASR, shift (shiftRightImm 0b00u) 0b001010u
+    Opcode.ROR, rotateRight
+    Opcode.CRC32B, crc32 0b010000u
+    Opcode.CRC32H, crc32 0b010001u
+    Opcode.CRC32W, crc32 0b010010u
+    Opcode.CRC32X, crc32 0b010011u
+    Opcode.CRC32CB, crc32 0b010100u
+    Opcode.CRC32CH, crc32 0b010101u
+    Opcode.CRC32CW, crc32 0b010110u
+    Opcode.CRC32CX, crc32 0b010111u
+    Opcode.RBIT, dataProc1Src 0b000000u
+    Opcode.REV16, dataProc1Src 0b000001u
+    Opcode.REV32, dataProc1Src 0b000010u
+    Opcode.CLZ, dataProc1Src 0b000100u
+    Opcode.CLS, dataProc1Src 0b000101u
+    Opcode.CTZ, dataProc1Src 0b000110u
+    Opcode.REV, reverse ]

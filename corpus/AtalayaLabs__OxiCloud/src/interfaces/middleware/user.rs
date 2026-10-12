@@ -1,0 +1,546 @@
+//! Caller-id-based user guards.
+//!
+//! All guards in this module take `(auth, caller_id) → Result<(), AppError>`
+//! so handlers compose them uniformly as one-liners. They assume the
+//! caller has already been authenticated by the
+//! [`AuthUser`](super::auth::AuthUser) extractor, and pull the current
+//! user flags via `AuthApplicationService::get_user_flags` — a
+//! lightweight, short-TTL-cached lookup (no `image` column) — so role /
+//! external-flag changes take effect within seconds without waiting
+//! for token rotation, while the hot DAV paths stop paying one full-row
+//! DB fetch per request.
+//!
+//! ```ignore
+//! let caller_id = auth_user.id;
+//! require_internal_user(&auth, caller_id).await?;
+//! require_admin_user(&auth, caller_id).await?;
+//! ```
+//!
+//! Future role-based guards (e.g. `require_active_user`) should follow
+//! the same shape so they slot in next to these without ceremony.
+//!
+//! For the legacy header-based admin guard (`require_admin`), see
+//! [`super::admin`] — that variant exists because some handlers take
+//! `headers: HeaderMap` directly instead of `AuthUser`.
+
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use smol_str::SmolStr;
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::application::services::auth_application_service::AuthApplicationService;
+use crate::common::di::AppState;
+use crate::domain::entities::user::{UserFlags, UserRole};
+use crate::domain::errors::{DomainError, ErrorKind};
+use crate::interfaces::errors::AppError;
+use crate::interfaces::middleware::auth::CurrentUser;
+
+/// Require the caller to be an internal user. Returns `Ok(())` for
+/// internal callers, `Err(403)` for externals.
+///
+/// External users authenticate via magic-link / OIDC-only / OCM and
+/// exist solely to interact with resources they were explicitly
+/// granted. They have no business enumerating the user directory, the
+/// address book, subject groups, or any other instance-wide listing —
+/// this guard locks them out of those surfaces.
+///
+/// DB lookup errors fall back to `Ok(())` so a transient outage doesn't
+/// lock everyone out — this guard is defense in depth. The canonical
+/// filter is at the service / repository layer (`include_external =
+/// false` on `list_users`, the visibility rule in `get_user_profile`,
+/// etc.); this helper just opts a surface in to "internal only" with
+/// one extra line.
+///
+/// The 403 status is honest (not 404 stealth) because the caller's own
+/// `is_external` flag is not a secret to themselves — the UI already
+/// surfaces "you came in through a magic link".
+pub async fn require_internal_user(
+    auth: &AuthApplicationService,
+    caller_id: Uuid,
+) -> Result<(), AppError> {
+    decide_internal_user(auth.get_user_flags(caller_id).await, caller_id)
+}
+
+/// Pure decision half of [`require_internal_user`].
+///
+/// Split out for the same reason as [`decide_live_role`] below: the policy
+/// is worth unit-testing without a live auth service, and this gate guards
+/// all three DAV surfaces.
+fn decide_internal_user(
+    flags: Result<UserFlags, DomainError>,
+    caller_id: Uuid,
+) -> Result<(), AppError> {
+    match flags {
+        Ok(flags) if flags.is_external => Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "External users cannot access this endpoint",
+            "Forbidden",
+        )),
+        Ok(_) => Ok(()),
+        // A caller with NO user row lands here. The arm used to be a blanket
+        // `_ => Ok(())`, i.e. fail-OPEN: any lookup failure — including
+        // `NotFound` — admitted the caller. This is the only middleware
+        // guarding `/webdav`, `/caldav` and `/carddav`, so a principal
+        // without an `auth.users` row (an anonymous share session) walked
+        // straight through the "internal users only" gate.
+        //
+        // `NotFound` is now a denial. Other errors (a DB blip) stay open
+        // deliberately: this gate is a *restriction* on external users, not
+        // the authentication check, and failing every DAV request closed
+        // during a transient database hiccup trades one outage for a worse
+        // one. The authentication decision above it is what must fail
+        // closed, and does.
+        Err(e) if matches!(e.kind, ErrorKind::NotFound) => {
+            tracing::info!(
+                target: "audit",
+                event = "authz.denied",
+                reason = "no_user_row",
+                caller_id = %caller_id,
+                "👮🏻‍♂️ principal has no user record — refused an internal-user endpoint",
+            );
+            Err(AppError::new(
+                StatusCode::FORBIDDEN,
+                "This endpoint requires a user account",
+                "Forbidden",
+            ))
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+/// Require the caller to hold the admin role. Returns `Ok(())` for
+/// admins, `Err(403)` otherwise.
+///
+/// The check pulls the role from the user record (not from JWT
+/// claims) so a role change takes effect within the flags-cache TTL —
+/// or immediately when changed through `change_user_role`, which
+/// invalidates the entry — without waiting for token rotation. Mirrors
+/// [`require_internal_user`]'s shape so handlers compose either of
+/// them as a one-liner via `?`.
+///
+/// Use this in handlers that already have an
+/// [`AuthUser`](super::auth::AuthUser) extractor (and thus a validated
+/// `caller_id`); use the legacy [`super::admin::require_admin`] variant
+/// when the handler signature is `headers: HeaderMap` instead.
+pub async fn require_admin_user(
+    auth: &AuthApplicationService,
+    caller_id: Uuid,
+) -> Result<(), AppError> {
+    let flags = auth
+        .get_user_flags(caller_id)
+        .await
+        .map_err(AppError::from)?;
+
+    if !flags.role.at_least(UserRole::Admin) {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "Admin access required",
+            "Forbidden",
+        ));
+    }
+    Ok(())
+}
+
+/// Outcome of re-checking a token-authenticated caller against the live
+/// user record (see [`resolve_live_role`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveRole {
+    /// The account exists and is active. Carries the caller's *current*
+    /// role string (`"admin"` / `"user"`), which is authoritative and
+    /// supersedes the — possibly stale — JWT `role` claim. `SmolStr` so the
+    /// per-request render of the (≤23-byte) role never heap-allocates.
+    Active(SmolStr),
+    /// The account is deactivated or deleted: the request must be rejected
+    /// even though its token is still cryptographically valid.
+    Revoked,
+}
+
+/// Re-validate a caller carried by a still-valid token against the live
+/// user record, so deactivation, deletion and role changes take effect
+/// within [`USER_FLAGS_CACHE_TTL`](crate::application::services::auth_application_service)
+/// instead of waiting for the token to expire (access 1 h / refresh 7 d by
+/// default).
+///
+/// JWT claims — `role` included — are frozen at login. Without this check a
+/// demoted admin keeps admin power, and a disabled or deleted account keeps
+/// full access, until its token expires. Returning the *current* role lets
+/// every caller stop trusting `claims.role`.
+///
+/// Cost: the short-TTL-cached `get_user_flags` (no `image` column), so ~one
+/// tiny indexed query per user per cache-TTL window; admin role/active
+/// changes invalidate the entry eagerly for immediate effect.
+///
+/// Availability stance mirrors [`require_internal_user`]: a *transient*
+/// lookup failure fails OPEN with the claim role (a DB blip must not lock
+/// every authenticated user out, and login/refresh already enforce `active`
+/// at the canonical layer). A *missing* row (`NotFound`) is a definitive
+/// revocation and fails CLOSED.
+pub async fn resolve_live_role(
+    auth: &AuthApplicationService,
+    user_id: Uuid,
+    claim_role: &str,
+) -> LiveRole {
+    if let Some(live) = anonymous_live_role(claim_role) {
+        return live;
+    }
+    decide_live_role(auth.get_user_flags(user_id).await, user_id, claim_role)
+}
+
+/// `Some` when the claim is an anonymous public-share session, which must
+/// skip the live re-check entirely.
+///
+/// Such a session has no `auth.users` row by design, so the re-check would
+/// look one up, find nothing, and report the token as revoked — every share
+/// request 401ing.
+///
+/// Skipping is safe because the re-check exists to catch deactivation,
+/// deletion and DEMOTION, and none applies here: there is no account to
+/// deactivate, and `anonymous` is already the floor of the role order, so a
+/// stale claim cannot be an over-privileged one. The claim itself is inside
+/// a signed JWT, so it cannot be forged — and forging it would only ever
+/// *reduce* what the bearer can reach.
+///
+/// The staleness this leaves is bounded elsewhere — by the session's own
+/// short TTL and by share revocation — not by the user-flags cache.
+fn anonymous_live_role(claim_role: &str) -> Option<LiveRole> {
+    UserRole::from_session(claim_role)
+        .filter(|r| r.is_anonymous())
+        .map(|r| LiveRole::Active(SmolStr::new_static(r.as_str())))
+}
+
+/// Pure decision core of [`resolve_live_role`], split out so the
+/// allow/revoke/fail-open policy is unit-testable without a service or DB.
+fn decide_live_role(
+    flags: Result<UserFlags, DomainError>,
+    user_id: Uuid,
+    claim_role: &str,
+) -> LiveRole {
+    match flags {
+        Ok(flags) if flags.active => LiveRole::Active(SmolStr::new_static(flags.role.as_str())),
+        Ok(_) => {
+            audit_token_revoked(user_id, "deactivated");
+            LiveRole::Revoked
+        }
+        // The user row is gone — a definitive revocation; fail closed.
+        Err(e) if matches!(e.kind, ErrorKind::NotFound) => {
+            audit_token_revoked(user_id, "deleted");
+            LiveRole::Revoked
+        }
+        // Transient lookup failure (DB blip): fail open on the claim role so
+        // a momentary outage doesn't 401 every authenticated user at once.
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user_id,
+                error = %e,
+                "live-user re-check failed transiently; allowing request on the JWT claim role (fail-open)"
+            );
+            LiveRole::Active(SmolStr::new(claim_role))
+        }
+    }
+}
+
+/// Audit a request rejected because the token outlived the account's access
+/// (deactivation or deletion). Anti-enumeration is not a concern — the
+/// subject is the caller's own account.
+fn audit_token_revoked(user_id: Uuid, reason: &'static str) {
+    tracing::info!(
+        target: "audit",
+        event = "auth.token_revoked",
+        reason = reason,
+        caller_id = %user_id,
+        "👮🏻‍♂️ valid token presented for an account that is no longer active — rejected"
+    );
+}
+
+/// Axum middleware layer that blocks external users from a whole route
+/// subtree. Apply via `.layer(from_fn_with_state(state, require_internal_user_layer))`
+/// on the protocol nests (CalDAV / CardDAV / WebDAV) that have no
+/// semantic meaning for externals — they own no calendars, no address
+/// books, no home folder.
+///
+/// Must run AFTER the auth middleware so `CurrentUser` is in the
+/// request extensions; in tower order that means the auth layer is
+/// added LAST (outermost). If the layer fires on an unauthenticated
+/// path (no `CurrentUser` populated), it simply passes through — the
+/// inner handler is then responsible for the 401, and we don't blanket-
+/// 403 traffic the auth layer would have rejected anyway.
+///
+/// Emits an `authz.external_user_blocked` audit event on rejection so
+/// operators can spot which surfaces externals are probing.
+pub async fn require_internal_user_layer(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let caller_id = request
+        .extensions()
+        .get::<Arc<CurrentUser>>()
+        .map(|cu| cu.id);
+
+    let (Some(caller_id), Some(svc)) = (
+        caller_id,
+        state
+            .auth_service
+            .as_ref()
+            .map(|s| &*s.auth_application_service),
+    ) else {
+        // No auth populated, or auth disabled globally — pass through.
+        return next.run(request).await;
+    };
+
+    if let Err(err) = require_internal_user(svc, caller_id).await {
+        let path = request.uri().path().to_owned();
+        tracing::info!(
+            target: "audit",
+            event = "authz.external_user_blocked",
+            reason = "internal_only_surface",
+            caller_id = %caller_id,
+            path = %path,
+            "👮🏻‍♂️ External user blocked from internal-only route subtree"
+        );
+        return err.into_response();
+    }
+
+    next.run(request).await
+}
+
+/// Endpoints the gate lets through even when
+/// `force_password_change_at_next_login` is TRUE — the caller needs
+/// them to complete the mandatory reset:
+///
+///   * `GET  /api/auth/me`             — the SPA must be able to read
+///     the flag (that's what tells it to enter mandatory-mode).
+///   * `PUT  /api/auth/change-password` — the way OUT of the state.
+///   * `POST /api/auth/logout`         — bailing out is always allowed.
+///
+/// `/api/auth/refresh` is not on this list because refresh is mounted
+/// on a rate-limited public path that doesn't carry a `CurrentUser` at
+/// middleware time; the gate never fires on it. If refresh ever moves
+/// under the gate, add `(&Method::POST, "/api/auth/refresh")` here.
+fn is_password_change_pending_allowlisted(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    matches!(
+        (method, path),
+        (&Method::GET, "/api/auth/me")
+            | (&Method::PUT, "/api/auth/change-password")
+            | (&Method::POST, "/api/auth/logout")
+    )
+}
+
+/// Axum middleware layer that blocks EVERY authenticated request when
+/// the caller's `force_password_change_at_next_login` flag is TRUE —
+/// EXCEPT the small allowlist above ([`is_password_change_pending_allowlisted`]).
+/// Mounted on all authenticated `/api/*` subtrees so an admin-set
+/// temp password cannot be used to hit files / WebDAV / CalDAV / etc.
+/// via any non-SPA client.
+///
+/// The flag is read from the cached `UserFlags` (same cache the role /
+/// external guards use — see [`require_internal_user`]), so this adds
+/// no DB round-trip on the hot path. `admin_reset_password` and
+/// `change_password` both invalidate the entry eagerly so the gate
+/// lifts within one request round-trip.
+///
+/// Response shape on refusal: `403 { error_type: "PasswordChangeRequired" }`.
+/// The SPA reads that error_type on any subsequent request that leaks
+/// past its own nav guard (mid-navigation refresh, stale tab, …) and
+/// bounces the user back to the change-password screen. Non-SPA
+/// clients (WebDAV sync, mobile app, curl) get the same 403 — that's
+/// intentional; they need to log in via the SPA once to complete the
+/// reset before other clients work again.
+///
+/// Must run AFTER the auth middleware. On unauthenticated paths (no
+/// `CurrentUser` populated) this is a pass-through — the inner
+/// handler / auth layer will produce the 401.
+pub async fn require_no_password_change_pending_layer(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Cheap path check FIRST — allowlisted endpoints never even hit
+    // the flag lookup. Keeps the /me polling path (which the SPA hits
+    // as part of every session-probe) from doing the cache lookup on
+    // every call, and makes the allowlist trivially auditable in one
+    // place (see `is_password_change_pending_allowlisted`).
+    //
+    // MUST use `OriginalUri` — axum's `.nest("/api/auth", …)` strips
+    // the prefix so `request.uri().path()` returns `/me` inside the
+    // nested router, not `/api/auth/me`. The allowlist is defined
+    // against the operator-visible full URL, so we need the pre-strip
+    // path. `OriginalUri` is set on the request extensions by axum
+    // whenever a nest strips a prefix; falls back to the current path
+    // when this middleware is layered on a top-level (non-nested)
+    // router (defense in depth).
+    let full_path = request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.0.path().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+    if is_password_change_pending_allowlisted(request.method(), &full_path) {
+        return next.run(request).await;
+    }
+
+    let current_user = request.extensions().get::<Arc<CurrentUser>>();
+
+    // An anonymous public-share visitor has no account, so no password can be
+    // pending a forced change. Skipping is not only correctness: without it
+    // every such request looks up a `visitor_id` matching no row, which misses
+    // the flags cache and reaches the database — on the highest-frequency GET
+    // in the app (one per thumbnail tile).
+    if current_user.is_some_and(|cu| cu.is_anonymous()) {
+        return next.run(request).await;
+    }
+
+    let caller_id = current_user.map(|cu| cu.id);
+
+    let (Some(caller_id), Some(svc)) = (
+        caller_id,
+        state
+            .auth_service
+            .as_ref()
+            .map(|s| &*s.auth_application_service),
+    ) else {
+        return next.run(request).await;
+    };
+
+    // Cached lookup — no DB hit on the hot path. Fail-open on repo
+    // error (the same posture as require_internal_user_layer above):
+    // a transient DB blip must not lock every user out of every API,
+    // and the SPA-side nav guard is a defense-in-depth backstop.
+    let flag = match svc.get_user_flags(caller_id).await {
+        Ok(f) => f.force_password_change,
+        Err(_) => false,
+    };
+    if flag {
+        // Log the operator-visible full path (not the nest-stripped
+        // one). `full_path` was computed above via `OriginalUri`.
+        tracing::info!(
+            target: "audit",
+            event = "auth.password_change_required_blocked",
+            reason = "force_password_change_pending",
+            caller_id = %caller_id,
+            path = %full_path,
+            "👮🏻‍♂️ Blocked API access — user must change admin-set temp password first"
+        );
+        return AppError::new(
+            StatusCode::FORBIDDEN,
+            "Password change required before accessing this endpoint",
+            "PasswordChangeRequired",
+        )
+        .into_response();
+    }
+
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags(role: UserRole, active: bool) -> UserFlags {
+        UserFlags {
+            role,
+            is_external: false,
+            active,
+            force_password_change: false,
+        }
+    }
+
+    #[test]
+    fn active_admin_yields_current_admin_role() {
+        let live = decide_live_role(Ok(flags(UserRole::Admin, true)), Uuid::nil(), "user");
+        // The live record wins over the (stale) claim — a freshly promoted
+        // user is admin even though their token still says "user".
+        assert_eq!(live, LiveRole::Active(SmolStr::new_static("admin")));
+    }
+
+    #[test]
+    fn active_user_yields_current_user_role() {
+        // A demoted admin: token claim still "admin", live record "user".
+        let live = decide_live_role(Ok(flags(UserRole::User, true)), Uuid::nil(), "admin");
+        assert_eq!(live, LiveRole::Active(SmolStr::new_static("user")));
+    }
+
+    #[test]
+    fn deactivated_account_is_revoked() {
+        let live = decide_live_role(Ok(flags(UserRole::Admin, false)), Uuid::nil(), "admin");
+        assert_eq!(live, LiveRole::Revoked);
+    }
+
+    #[test]
+    fn deleted_account_not_found_is_revoked() {
+        let err = DomainError::new(ErrorKind::NotFound, "User", "no such user");
+        let live = decide_live_role(Err(err), Uuid::nil(), "admin");
+        assert_eq!(live, LiveRole::Revoked);
+    }
+
+    #[test]
+    fn transient_error_fails_open_on_claim_role() {
+        // A DB blip must not lock everyone out: allow on the claim role.
+        let err = DomainError::new(ErrorKind::InternalError, "User", "connection reset");
+        let live = decide_live_role(Err(err), Uuid::nil(), "admin");
+        assert_eq!(live, LiveRole::Active(SmolStr::new_static("admin")));
+    }
+
+    /// An anonymous session skips the live re-check — there is no user row
+    /// to re-check against, and without this every share request 401s.
+    #[test]
+    fn anonymous_claim_skips_the_live_recheck() {
+        assert_eq!(
+            anonymous_live_role("anonymous"),
+            Some(LiveRole::Active(SmolStr::new_static("anonymous"))),
+        );
+    }
+
+    /// Every other claim must still go through the DB re-check. If this
+    /// ever returned `Some`, a demoted admin or a deleted account would
+    /// keep its token's frozen privileges until expiry — the exact thing
+    /// `resolve_live_role` exists to prevent.
+    #[test]
+    fn only_anonymous_skips_the_live_recheck() {
+        for claim in ["user", "admin", "", "Anonymous", "anonymous ", "root"] {
+            assert_eq!(
+                anonymous_live_role(claim),
+                None,
+                "claim {claim:?} must not bypass the live re-check",
+            );
+        }
+    }
+
+    #[test]
+    fn internal_user_gate_admits_an_internal_account() {
+        assert!(decide_internal_user(Ok(flags(UserRole::User, true)), Uuid::nil()).is_ok());
+    }
+
+    #[test]
+    fn internal_user_gate_refuses_an_external_account() {
+        let mut f = flags(UserRole::User, true);
+        f.is_external = true;
+        assert!(decide_internal_user(Ok(f), Uuid::nil()).is_err());
+    }
+
+    /// The regression this gate existed to have. A caller with no
+    /// `auth.users` row used to fall into a blanket `_ => Ok(())` and be
+    /// ADMITTED — and this is the only middleware guarding `/webdav`,
+    /// `/caldav` and `/carddav`.
+    #[test]
+    fn internal_user_gate_refuses_a_principal_with_no_user_row() {
+        let err = DomainError::new(ErrorKind::NotFound, "User", "no such user");
+        assert!(
+            decide_internal_user(Err(err), Uuid::nil()).is_err(),
+            "a principal with no user record must not pass the internal-user gate",
+        );
+    }
+
+    /// Deliberately still open. This gate is a restriction on external
+    /// users, not the authentication decision — failing every DAV request
+    /// closed during a database hiccup trades one outage for a worse one.
+    /// The authentication check above it is what fails closed.
+    #[test]
+    fn internal_user_gate_stays_open_on_a_transient_error() {
+        let err = DomainError::new(ErrorKind::InternalError, "User", "connection reset");
+        assert!(decide_internal_user(Err(err), Uuid::nil()).is_ok());
+    }
+}

@@ -1,0 +1,1176 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import stat
+import asyncio
+import threading
+import time
+import warnings
+import zipfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from nebula.v3 import diagnostics
+from nebula.v3.cli import app
+from nebula.v3.diagnostics import (
+    DIAGNOSTIC_SCHEMA,
+    FEATURE_FILES,
+    SETTINGS_SCHEMA,
+    DiagnosticManager,
+    create_diagnostic_task,
+    current_operation_id,
+    diagnostic_context,
+    record_caught_exception,
+    sanitize_metadata,
+)
+
+
+CONTRACT_PATH = Path(__file__).parent / "fixtures" / "diagnostics_contract.json"
+
+
+def _records(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_shared_diagnostics_contract_matches_core() -> None:
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    assert contract["record_schema"] == DIAGNOSTIC_SCHEMA
+    assert contract["settings"] == diagnostics.DiagnosticSettings().as_dict()
+    assert contract["features"] == list(FEATURE_FILES)
+    assert (
+        sanitize_metadata(contract["metadata_input"]) == contract["metadata_expected"]
+    )
+
+
+@pytest.fixture
+def manager(tmp_path: Path):
+    value = DiagnosticManager(tmp_path, watch_settings=False)
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+def test_error_default_routes_to_feature_and_aggregate_with_secure_files(
+    manager: DiagnosticManager,
+) -> None:
+    assert (
+        manager.record(
+            "info",
+            "projects",
+            "projects.lifecycle.started",
+            "A project operation started.",
+        )
+        is None
+    )
+
+    error_id = manager.record(
+        "error",
+        "projects",
+        "projects.persistence.failed",
+        "The requested project operation could not be saved.",
+        stage="persistence",
+        outcome="failure",
+        retryable=True,
+    )
+
+    assert error_id
+    feature_record = _records(manager.log_dir / "projects.log")[-1]
+    aggregate_record = _records(manager.log_dir / "errors.log")[-1]
+    assert feature_record == aggregate_record
+    assert feature_record == {
+        **feature_record,
+        "schema": DIAGNOSTIC_SCHEMA,
+        "level": "ERROR",
+        "feature": "projects",
+        "error_id": error_id,
+        "stage": "persistence",
+    }
+    assert not (manager.log_dir / "projects.log").read_text().startswith("A project")
+    assert set(FEATURE_FILES.values()).issubset(
+        {path.name for path in manager.log_dir.iterdir()}
+    )
+    for path in [manager.settings_path, *manager.log_dir.iterdir()]:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(manager.log_dir.stat().st_mode) == 0o700
+
+
+def test_every_feature_error_routes_to_its_domain_and_the_same_aggregate_record(
+    manager: DiagnosticManager,
+) -> None:
+    expected: dict[str, str] = {}
+    for feature in FEATURE_FILES:
+        error_id = manager.record(
+            "error",
+            feature,
+            f"{feature}.contract.failed",
+            "A feature contract fault was injected.",
+            outcome="failure",
+            stage="fault-injection",
+        )
+        assert error_id is not None
+        expected[feature] = error_id
+
+    aggregate = {
+        str(record["error_id"]): record
+        for record in _records(manager.log_dir / "errors.log")
+    }
+    for feature, filename in FEATURE_FILES.items():
+        feature_record = _records(manager.log_dir / filename)[-1]
+        assert feature_record["feature"] == feature
+        assert feature_record["error_id"] == expected[feature]
+        assert aggregate[expected[feature]] == feature_record
+
+
+def test_global_and_per_feature_levels_are_atomic_and_process_override_wins(
+    tmp_path: Path,
+) -> None:
+    manager = DiagnosticManager(
+        tmp_path, level_override="warning", watch_settings=False
+    )
+    try:
+        updated = manager.update_settings(
+            {
+                "schema": SETTINGS_SCHEMA,
+                "global_level": "debug",
+                "feature_levels": {"projects": "info"},
+            }
+        )
+        assert updated.global_level == "debug"
+        assert manager.effective_level("projects") == "warning"
+        assert manager.effective_level("storage") == "warning"
+        saved = json.loads(manager.settings_path.read_text(encoding="utf-8"))
+        assert saved == updated.as_dict()
+        assert not list(manager.settings_path.parent.glob(".diagnostics-settings*.tmp"))
+    finally:
+        manager.close()
+
+    feature_override = DiagnosticManager(
+        tmp_path,
+        feature_level_overrides={"projects": "debug"},
+        watch_settings=False,
+    )
+    try:
+        assert feature_override.effective_level("projects") == "debug"
+        assert feature_override.effective_level("storage") == "debug"
+    finally:
+        feature_override.close()
+
+
+def test_invalid_process_override_fails_closed_and_is_recorded(tmp_path: Path) -> None:
+    manager = DiagnosticManager(tmp_path, level_override="trace", watch_settings=False)
+    try:
+        assert manager.effective_level("projects") == "error"
+        records = _records(manager.log_dir / "errors.log")
+        assert records[-1]["event_code"] == "diagnostics.process_override_invalid"
+        assert records[-1]["level"] == "ERROR"
+    finally:
+        manager.close()
+
+
+def test_corrupt_settings_fail_closed_and_create_a_diagnostic(tmp_path: Path) -> None:
+    tmp_path.mkdir(exist_ok=True)
+    settings = tmp_path / "diagnostics-settings.json"
+    settings.write_text('{"global_level":"debug","feature_levels":', encoding="utf-8")
+    os.chmod(settings, 0o600)
+
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    try:
+        assert manager.settings.global_level == "error"
+        record = _records(manager.log_dir / "errors.log")[-1]
+        assert record["event_code"] == "diagnostics.settings_invalid"
+        assert record["level"] == "ERROR"
+    finally:
+        manager.close()
+
+
+def test_diagnostic_text_is_unredacted_while_payload_metadata_is_excluded(
+    manager: DiagnosticManager,
+) -> None:
+    try:
+        raise RuntimeError("Bearer top-secret-token-value command=canary-command")
+    except RuntimeError as exc:
+        manager.record(
+            "error",
+            "sandbox",
+            "sandbox.boundary.failed",
+            "Sandbox setup failed for Bearer top-secret-token-value.",
+            exception=exc,
+            metadata={
+                "component": "runner",
+                "command": "canary-command",
+                "nested": {"password": "canary-password"},
+                "count": 3,
+            },
+        )
+
+    encoded = (manager.log_dir / "sandbox.log").read_text(encoding="utf-8")
+    assert "top-secret-token-value" in encoded
+    assert "canary-command" not in encoded
+    assert "canary-password" not in encoded
+    record = json.loads(encoded)
+    assert record["exception_type"] == "RuntimeError"
+    assert "exception_message" not in record
+    assert record["metadata"] == {"component": "runner", "count": 3}
+    assert all("locals" not in frame for frame in record["stack_frames"])
+
+
+def test_runtime_warning_adapter_drops_message_and_source_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    manager.update_settings(
+        {
+            "schema": SETTINGS_SCHEMA,
+            "global_level": "warning",
+            "feature_levels": {},
+        }
+    )
+    original = warnings.showwarning
+    root_logger = logging.getLogger()
+    original_handlers = list(root_logger.handlers)
+    monkeypatch.setattr(diagnostics, "_manager", manager)
+    try:
+        diagnostics._install_warning_hook()
+        warnings.showwarning(
+            UserWarning("Bearer top-secret-token-value command=canary-command"),
+            UserWarning,
+            "/sensitive/canary-source.py",
+            42,
+        )
+        handler = diagnostics._SanitizingDiagnosticHandler(level=logging.WARNING)
+        handler.handle(
+            logging.LogRecord(
+                name="canary.third.party",
+                level=logging.WARNING,
+                pathname="/sensitive/canary-library.py",
+                lineno=51,
+                msg="Bearer canary-logging-token-value",
+                args=(),
+                exc_info=None,
+            )
+        )
+        manager.flush()
+    finally:
+        warnings.showwarning = original
+        for installed in list(root_logger.handlers):
+            if installed not in original_handlers:
+                root_logger.removeHandler(installed)
+        manager.close()
+
+    encoded = (manager.log_dir / "diagnostics.log").read_text(encoding="utf-8")
+    assert "diagnostics.runtime.warning" in encoded
+    assert '"category":"UserWarning"' in encoded
+    assert "top-secret-token-value" not in encoded
+    assert "canary-command" not in encoded
+    assert "canary-source.py" not in encoded
+    assert "diagnostics.runtime.log_warning" in encoded
+    assert "canary-logging-token-value" not in encoded
+    assert "canary.third.party" not in encoded
+    assert "canary-library.py" not in encoded
+
+
+def test_invalid_durations_are_omitted_from_valid_json_lines(
+    manager: DiagnosticManager,
+) -> None:
+    manager.update_settings(
+        {"schema": SETTINGS_SCHEMA, "global_level": "debug", "feature_levels": {}}
+    )
+    manager.record(
+        "debug",
+        "api",
+        "api.duration.invalid",
+        "An invalid duration was safely omitted.",
+        duration_ms=float("nan"),
+    )
+    manager.record(
+        "debug",
+        "api",
+        "api.duration.negative",
+        "A negative duration was safely omitted.",
+        duration_ms=-1,
+    )
+    assert manager.flush()
+    records = _records(manager.log_dir / "api.log")
+    assert all("duration_ms" not in record for record in records[-2:])
+
+
+def test_context_ids_and_multithreaded_sequence_are_stable(
+    manager: DiagnosticManager,
+) -> None:
+    manager.update_settings(
+        {"schema": SETTINGS_SCHEMA, "global_level": "debug", "feature_levels": {}}
+    )
+    with diagnostic_context(
+        request_id="request_1",
+        operation_id="operation_1",
+        parent_operation_id="operation_parent",
+        project_id="project_1",
+    ):
+        manager.record(
+            "error", "api", "api.correlated.failed", "A correlated operation failed."
+        )
+
+    threads = [
+        threading.Thread(
+            target=lambda index=index: manager.record(
+                "error",
+                "storage",
+                "storage.concurrent.failed",
+                "A concurrent test operation failed.",
+                metadata={"count": index},
+            )
+        )
+        for index in range(12)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    correlated = _records(manager.log_dir / "api.log")[-1]
+    assert correlated["request_id"] == "request_1"
+    assert correlated["operation_id"] == "operation_1"
+    assert correlated["parent_operation_id"] == "operation_parent"
+    assert correlated["project_id"] == "project_1"
+    sequences = [
+        int(item["sequence"]) for item in _records(manager.log_dir / "errors.log")
+    ]
+    assert sequences == sorted(sequences)
+    assert len(sequences) == len(set(sequences))
+
+
+def test_rotation_retention_and_age_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(diagnostics, "MAX_FILE_BYTES", 700)
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    try:
+        for index in range(12):
+            manager.record(
+                "error",
+                "projects",
+                "projects.rotation.failed",
+                "A bounded failure record triggered rotation.",
+                metadata={"count": index},
+            )
+        assert (manager.log_dir / "projects.log.1").is_file()
+        assert not (manager.log_dir / "projects.log.3").exists()
+        assert (
+            stat.S_IMODE((manager.log_dir / "projects.log.1").stat().st_mode) == 0o600
+        )
+
+        old = manager.log_dir / "projects.log.2"
+        old.touch(exist_ok=True)
+        old_time = (datetime.now(UTC) - timedelta(days=15)).timestamp()
+        os.utime(old, (old_time, old_time))
+        manager._prune(force=True)
+        assert not old.exists()
+    finally:
+        manager.close()
+
+
+def test_queue_pressure_drops_only_lower_levels_and_synchronously_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = DiagnosticManager(tmp_path, queue_capacity=1, watch_settings=False)
+    manager.update_settings(
+        {"schema": SETTINGS_SCHEMA, "global_level": "debug", "feature_levels": {}}
+    )
+    release = threading.Event()
+    entered = threading.Event()
+    original = manager._write_pending
+
+    def blocked(pending):
+        entered.set()
+        release.wait(timeout=5)
+        original(pending)
+
+    monkeypatch.setattr(manager, "_write_pending", blocked)
+    try:
+        manager.record("debug", "api", "api.queue.first", "First queued record.")
+        assert entered.wait(timeout=2)
+        producer = threading.Thread(
+            target=lambda: [
+                manager.record(
+                    "debug",
+                    "api",
+                    "api.queue.pressure",
+                    "A lower-level queue record.",
+                    metadata={"count": index},
+                )
+                for index in range(20)
+            ]
+        )
+        producer.start()
+        time.sleep(0.05)
+        release.set()
+        producer.join(timeout=5)
+        assert not producer.is_alive()
+        assert manager.flush(timeout=5)
+        assert manager.status()["dropped_record_count"] > 0
+        notices = [
+            item
+            for item in _records(manager.log_dir / "errors.log")
+            if item["event_code"] == "diagnostics.records_dropped"
+        ]
+        assert len(notices) == 1
+    finally:
+        release.set()
+        manager.close()
+
+
+def test_live_reload_applies_atomic_external_changes(tmp_path: Path) -> None:
+    manager = DiagnosticManager(tmp_path, watch_settings=True)
+    try:
+        original_mtime_ns = manager.settings_path.stat().st_mtime_ns
+        replacement = manager.settings_path.with_suffix(".replacement")
+        replacement.write_text(
+            json.dumps(
+                {
+                    "schema": SETTINGS_SCHEMA,
+                    "global_level": "warning",
+                    "feature_levels": {"chat": "debug"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(replacement, 0o600)
+        # Atomic writers can preserve a timestamp on coarse or heavily loaded
+        # filesystems. The replacement inode must still trigger a reload.
+        os.utime(replacement, ns=(original_mtime_ns, original_mtime_ns))
+        os.replace(replacement, manager.settings_path)
+        deadline = time.monotonic() + 3
+        while (
+            manager.effective_level("chat") != "debug" and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert manager.effective_level("chat") == "debug"
+        assert manager.effective_level("projects") == "warning"
+    finally:
+        manager.close()
+
+
+def test_background_tasks_receive_child_correlation_and_persist_failures(
+    manager: DiagnosticManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(diagnostics, "_manager", manager)
+    observed: dict[str, str | None] = {}
+    durable = threading.Event()
+
+    async def scenario() -> None:
+        async def failing_work() -> None:
+            observed["operation_id"] = current_operation_id()
+            raise RuntimeError("canary background exception")
+
+        def persist_failure(_exception: BaseException) -> None:
+            durable.set()
+
+        with diagnostic_context(operation_id="operation_parent"):
+            task = create_diagnostic_task(
+                failing_work(),
+                feature="missions",
+                event_code="missions.background.contract",
+                failure_message="A supervised mission task failed.",
+                durable_failure=persist_failure,
+            )
+            with pytest.raises(RuntimeError):
+                await task
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert observed["operation_id"] not in {None, "operation_parent"}
+    assert durable.wait(timeout=1)
+    # ERROR records are appended asynchronously; drain the writer before reading.
+    assert manager.flush()
+    failures = [
+        record
+        for record in _records(manager.log_dir / "missions.log")
+        if record["event_code"] == "missions.background.contract.failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["operation_id"] == observed["operation_id"]
+    assert failures[0]["parent_operation_id"] == "operation_parent"
+    assert "canary background exception" not in json.dumps(failures[0])
+
+
+def test_caught_exception_severity_uses_http_and_integrity_semantics(
+    manager: DiagnosticManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(diagnostics, "_manager", manager)
+    manager.update_settings(
+        {"schema": SETTINGS_SCHEMA, "global_level": "debug", "feature_levels": {}}
+    )
+
+    class ExpectedDenial(RuntimeError):
+        status_code = 409
+        code = "revision_conflict"
+
+    class StorageIntegrityError(RuntimeError):
+        pass
+
+    denial = ExpectedDenial("canary expected detail")
+    assert (
+        record_caught_exception(
+            "projects",
+            "projects.test.denied",
+            "A project update was rejected safely.",
+            denial,
+            stage="validation",
+        )
+        is None
+    )
+    integrity = StorageIntegrityError("canary integrity detail")
+    integrity_id = record_caught_exception(
+        "storage",
+        "storage.test.integrity_failed",
+        "A storage integrity check failed.",
+        integrity,
+        stage="integrity",
+    )
+    assert integrity_id
+    assert manager.flush()
+
+    denial_record = _records(manager.log_dir / "projects.log")[-1]
+    integrity_record = _records(manager.log_dir / "storage.log")[-1]
+    assert denial_record["level"] == "WARNING"
+    assert "error_id" not in denial_record
+    assert integrity_record["level"] == "CRITICAL"
+    assert integrity_record["error_id"] == integrity_id
+    assert diagnostics.diagnostic_error_id(integrity) == integrity_id
+    assert "canary" not in json.dumps([denial_record, integrity_record])
+
+
+def test_export_is_unredacted_bounded_and_manifested(
+    manager: DiagnosticManager, tmp_path: Path
+) -> None:
+    manager.record(
+        "error",
+        "providers",
+        "providers.credentials.failed",
+        "Provider authentication failed for sk-abcdefghijklmnopqrstuvwxyz123456.",
+        metadata={"credential": "canary-credential", "provider": "compatible"},
+    )
+    (manager.data_dir / "nebula-v3.db").write_text("canary-database", encoding="utf-8")
+    (manager.data_dir / "workspace-secret.txt").write_text(
+        "canary-workspace", encoding="utf-8"
+    )
+    startup_log = manager.log_dir / "nebula-core-startup.log"
+    startup_log.write_text(
+        "RuntimeError: canary-prompt-command-output\n"
+        "-----BEGIN PRIVATE KEY-----canary-key-----END PRIVATE KEY-----\n",
+        encoding="utf-8",
+    )
+    os.chmod(startup_log, 0o600)
+
+    output = manager.export(tmp_path / "support.zip")
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    with zipfile.ZipFile(output) as archive:
+        names = set(archive.namelist())
+        assert "metadata.json" in names
+        assert "SHA256SUMS.json" in names
+        assert "nebula-v3.db" not in names
+        assert "workspace-secret.txt" not in names
+        contents = b"".join(archive.read(name) for name in names)
+        assert b"canary-credential" not in contents
+        assert b"canary-database" not in contents
+        assert b"canary-workspace" not in contents
+        assert b"canary-prompt-command-output" in contents
+        assert b"canary-key" in contents
+        assert b"sk-abcdefghijklmnopqrstuvwxyz123456" in contents
+        metadata = json.loads(archive.read("metadata.json"))
+        assert "log_directory" not in metadata["health"]
+        assert "settings_path" not in metadata["health"]
+        emergency = archive.read("logs/nebula-core-startup.log")
+        assert b"RuntimeError: canary-prompt-command-output" in emergency
+        assert b"canary-key" in emergency
+        manifest = json.loads(archive.read("SHA256SUMS.json"))
+        assert manifest["schema"] == "nebula.diagnostics-manifest/v1"
+        assert set(manifest["sha256"]) == names - {"SHA256SUMS.json"}
+
+
+def test_unwritable_initialization_retains_errors_and_logger_failure_in_memory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    manager = DiagnosticManager(blocked, watch_settings=False)
+    try:
+        error_id = manager.record(
+            "error",
+            "storage",
+            "storage.test.unwritable",
+            "A storage operation failed while diagnostics were unavailable.",
+        )
+        assert error_id
+        assert manager.status()["degraded"] is True
+        recent = manager.recent_errors(limit=20)
+        by_code = {str(record["event_code"]): record for record in recent}
+        assert by_code["storage.test.unwritable"]["error_id"] == error_id
+        assert by_code["diagnostics.logging_unavailable"]["level"] == "CRITICAL"
+        emergency = capsys.readouterr().err
+        assert "NEBULA_DIAGNOSTICS_UNAVAILABLE" in emergency
+        assert "not a directory" not in emergency
+    finally:
+        manager.close()
+
+
+def test_desktop_child_mirrors_validated_error_without_owning_aggregate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    manager = DiagnosticManager(tmp_path, desktop_parent=True, watch_settings=False)
+    try:
+        error_id = manager.record(
+            "error",
+            "storage",
+            "storage.desktop_child.failed",
+            "Desktop child storage failed.",
+        )
+        captured = capsys.readouterr().err
+        assert diagnostics.ERROR_MIRROR_PREFIX in captured
+        assert error_id in captured
+        assert not (manager.log_dir / "errors.log").exists()
+        assert not (manager.log_dir / "desktop.log").exists()
+        assert not (manager.log_dir / "interface.log").exists()
+    finally:
+        manager.close()
+
+
+def test_diagnostics_cli_status_levels_reset_and_export(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / "cli-data"
+
+    status = runner.invoke(app, ["diagnostics", "status", "--data-dir", str(data_dir)])
+    assert status.exit_code == 0, status.stdout
+    assert json.loads(status.stdout)["global_level"] == "error"
+
+    global_level = runner.invoke(
+        app,
+        ["diagnostics", "set-level", "info", "--data-dir", str(data_dir)],
+    )
+    assert global_level.exit_code == 0, global_level.stdout
+    assert json.loads(global_level.stdout)["settings"]["global_level"] == "info"
+
+    feature_level = runner.invoke(
+        app,
+        [
+            "diagnostics",
+            "set-level",
+            "debug",
+            "--feature",
+            "chat",
+            "--data-dir",
+            str(data_dir),
+        ],
+    )
+    assert feature_level.exit_code == 0, feature_level.stdout
+    assert json.loads(feature_level.stdout)["settings"]["feature_levels"] == {
+        "chat": "debug"
+    }
+
+    invalid = runner.invoke(
+        app,
+        ["diagnostics", "set-level", "trace", "--data-dir", str(data_dir)],
+    )
+    assert invalid.exit_code != 0
+    assert "unsupported diagnostics level" in invalid.output
+
+    destination = tmp_path / "cli-diagnostics.zip"
+    exported = runner.invoke(
+        app,
+        [
+            "diagnostics",
+            "export",
+            str(destination),
+            "--data-dir",
+            str(data_dir),
+        ],
+    )
+    assert exported.exit_code == 0, exported.stdout
+    assert destination.is_file()
+    with zipfile.ZipFile(destination) as archive:
+        assert "SHA256SUMS.json" in archive.namelist()
+
+    reset = runner.invoke(
+        app, ["diagnostics", "reset-levels", "--data-dir", str(data_dir)]
+    )
+    assert reset.exit_code == 0, reset.stdout
+    assert json.loads(reset.stdout)["settings"] == {
+        "schema": SETTINGS_SCHEMA,
+        "global_level": "error",
+        "feature_levels": {},
+        "sensitive_detail_capture": False,
+    }
+
+    diagnostics.shutdown_diagnostics()
+
+
+def test_error_records_on_an_event_loop_return_before_the_writer_acknowledges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    gate = [threading.Event()]
+    original = manager._write_pending
+
+    def blocked(pending):
+        gate[0].wait(timeout=5)
+        original(pending)
+
+    monkeypatch.setattr(manager, "_write_pending", blocked)
+
+    async def timed_record(level: str, event_code: str) -> float:
+        started = time.monotonic()
+        manager.record(level, "api", event_code, "A record from the event loop.")
+        return time.monotonic() - started
+
+    try:
+        # The writer is stuck on a slow disk for 1.5 s. An ERROR recorded from
+        # the event loop must not stall the loop for that long.
+        threading.Timer(1.5, gate[0].set).start()
+        elapsed = asyncio.run(timed_record("error", "api.test.loop_error"))
+        assert elapsed < 1.0
+        assert manager.flush(timeout=5)
+        assert any(
+            item["event_code"] == "api.test.loop_error"
+            for item in _records(manager.log_dir / "errors.log")
+        )
+
+        # CRITICAL keeps its durable acknowledgement even on the loop.
+        gate[0] = threading.Event()
+        threading.Timer(0.3, gate[0].set).start()
+        elapsed = asyncio.run(timed_record("critical", "api.test.loop_critical"))
+        assert elapsed >= 0.3
+        assert any(
+            item["event_code"] == "api.test.loop_critical"
+            for item in _records(manager.log_dir / "errors.log")
+        )
+
+        # Synchronous callers with no loop to stall still wait for durability.
+        gate[0] = threading.Event()
+        threading.Timer(0.3, gate[0].set).start()
+        started = time.monotonic()
+        manager.record("error", "api", "api.test.sync_error", "A synchronous error.")
+        assert time.monotonic() - started >= 0.3
+        assert any(
+            item["event_code"] == "api.test.sync_error"
+            for item in _records(manager.log_dir / "errors.log")
+        )
+    finally:
+        gate[0].set()
+        manager.close()
+
+
+def test_in_memory_error_retention_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(diagnostics, "MAX_MEMORY_ERRORS", 5)
+    # Desktop children answer recent_errors() from memory alone, so the deque
+    # bound is observable through the public reader.
+    manager = DiagnosticManager(tmp_path, desktop_parent=True, watch_settings=False)
+    try:
+        for index in range(8):
+            manager.record(
+                "error",
+                "api",
+                f"api.test.retained-{index}",
+                "An error retained in memory.",
+            )
+        assert manager.flush()
+        codes = [item["event_code"] for item in manager.recent_errors(limit=500)]
+        assert codes == [f"api.test.retained-{index}" for index in range(3, 8)]
+    finally:
+        manager.close()
+
+
+def test_aggregate_sink_failure_retains_the_error_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    original = manager._append
+
+    def failing_aggregate(path: Path, line: bytes) -> None:
+        if path.name == "errors.log":
+            raise OSError(28, "No space left on device")
+        original(path, line)
+
+    monkeypatch.setattr(manager, "_append", failing_aggregate)
+    try:
+        error_id = manager.record(
+            "error", "api", "api.test.aggregate_failed", "The aggregate sink failed."
+        )
+        assert manager.flush()
+        retained = [
+            item
+            for item in manager._memory_errors
+            if item.get("event_code") == "api.test.aggregate_failed"
+        ]
+        assert len(retained) == 1
+        assert retained[0]["error_id"] == error_id
+        assert manager.status()["degraded"] is True
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("failed_sink", ["feature", "aggregate"])
+def test_transient_sink_failure_recovers_only_after_the_failed_path_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_sink: str
+) -> None:
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    original = manager._append
+    failed_once = False
+
+    def transient_failure(path: Path, line: bytes) -> None:
+        nonlocal failed_once
+        should_fail = (
+            path.name == "api.log"
+            if failed_sink == "feature"
+            else path.name == "errors.log"
+        )
+        if should_fail and not failed_once:
+            failed_once = True
+            raise OSError(28, "No space left on device")
+        original(path, line)
+
+    monkeypatch.setattr(manager, "_append", transient_failure)
+    try:
+        manager.record(
+            "error", "api", "api.test.transient_failed", "The first write failed."
+        )
+        assert manager.flush()
+        failed = manager.status()
+        assert failed["degraded"] is True
+        assert failed["writable"] is False
+
+        manager.record(
+            "info",
+            "projects",
+            "projects.test.different_sink",
+            "A different sink remained writable.",
+        )
+        assert manager.flush()
+        assert manager.status()["degraded"] is True
+
+        manager.record(
+            "error", "api", "api.test.transient_recovered", "The retry succeeded."
+        )
+        assert manager.flush()
+        recovered = manager.status()
+        assert recovered["degraded"] is False
+        assert recovered["writable"] is True
+        assert recovered["last_failure"]["message"] == (
+            "Local diagnostics storage became unavailable."
+        )
+    finally:
+        manager.close()
+
+
+def test_transient_sink_failure_is_probed_without_another_matching_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    original = manager._append
+    failed_once = False
+
+    def transient_failure(path: Path, line: bytes) -> None:
+        nonlocal failed_once
+        if path.name == "api.log" and not failed_once:
+            failed_once = True
+            raise OSError(28, "No space left on device")
+        original(path, line)
+
+    monkeypatch.setattr(manager, "_append", transient_failure)
+    try:
+        manager.record(
+            "error", "api", "api.test.transient_failed", "The first write failed."
+        )
+        assert manager.flush()
+        assert manager.status()["degraded"] is True
+
+        with manager._writer_lock:
+            manager._probe_failed_write_paths(force=True)
+
+        recovered = manager.status()
+        assert recovered["degraded"] is False
+        assert recovered["writable"] is True
+    finally:
+        manager.close()
+
+
+def test_operator_detail_drops_os_error_codes_and_host_paths(
+    manager: DiagnosticManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(diagnostics, "_manager", manager)
+    exception = diagnostics.DiagnosticsError(
+        "cannot read data.json: [Errno 13] Permission denied: "
+        "'/home/operator/private/data.json' (see https://example.test/docs/errors)"
+    )
+
+    error_id = record_caught_exception(
+        "storage",
+        "storage.test.host_path",
+        "A storage read failed.",
+        exception,
+        stage="read",
+    )
+
+    assert error_id
+    assert manager.flush()
+    record = _records(manager.log_dir / "storage.log")[-1]
+    detail = record["operator_detail"]
+    assert "cannot read data.json" in detail
+    assert "Permission denied" in detail
+    assert "https://example.test/docs/errors" in detail
+    assert "/home/operator" not in detail
+    assert "Errno" not in detail
+    exported = json.dumps(DiagnosticManager._sanitize_export_record(record))
+    assert "/home/operator" not in exported
+
+
+def test_unreadable_aggregate_line_is_skipped_and_reported_once_per_launch(
+    manager: DiagnosticManager,
+) -> None:
+    manager.record("error", "api", "api.test.before_tear", "An error before the tear.")
+    assert manager.flush()
+    aggregate = manager.log_dir / "errors.log"
+    intact = aggregate.read_text(encoding="utf-8")
+    # A torn write leaves a fragment of a record behind, and a rotation can also
+    # leave a blank line: neither may cost the reader the rest of the file.
+    aggregate.write_text(
+        f"{intact}{intact.splitlines()[0][:200]}\n\n", encoding="utf-8"
+    )
+    manager.record("error", "api", "api.test.after_tear", "An error after the tear.")
+    assert manager.flush()
+
+    first = manager.recent_errors(limit=100)
+    assert any(item["event_code"] == "api.test.after_tear" for item in first)
+    second = manager.recent_errors(limit=100)
+
+    codes = [str(item["event_code"]) for item in second]
+    assert "api.test.before_tear" in codes
+    assert "api.test.after_tear" in codes
+    assert manager.flush()
+    # One report for the launch, not one per malformed line per read: the report
+    # lands in the aggregate the reader just read.
+    written = aggregate.read_text(encoding="utf-8")
+    assert written.count("diagnostics.viewer_record_invalid") == 1
+    assert manager.status()["unreadable_record_count"] == 1
+    report = next(
+        item
+        for item in second
+        if item["event_code"] == "diagnostics.viewer_record_invalid"
+    )
+    assert report["reason_code"] == "integrity_failed"
+    assert report["metadata"] == {"component": "errors.log", "count": 1}
+    assert "skipped" in str(report["impact"])
+
+
+def test_short_appends_are_completed_instead_of_losing_the_record(
+    manager: DiagnosticManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    aggregate = manager.log_dir / "errors.log"
+    line = b'{"event_code":"api.test.short_write","level":"ERROR"}\n'
+    real_write = os.write
+    chunks: list[int] = []
+
+    def chunked_write(descriptor: int, data: bytes) -> int:
+        chunks.append(len(data))
+        return real_write(descriptor, data[:20])
+
+    monkeypatch.setattr(diagnostics.os, "write", chunked_write)
+    manager._append(aggregate, line)
+    monkeypatch.undo()
+
+    # A short write must be finished here. Buffered writers keep the remainder
+    # in a buffer that is discarded if a later write raises, which is how a
+    # record lost its tail and left a torn line behind.
+    assert aggregate.read_bytes() == line
+    assert len(chunks) == -(-len(line) // 20)
+
+
+def test_a_failed_append_closes_the_torn_line_so_the_next_record_survives(
+    manager: DiagnosticManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    aggregate = manager.log_dir / "errors.log"
+    line = b'{"event_code":"api.test.torn_write","level":"ERROR"}\n'
+    real_write = os.write
+    state = {"partial": False}
+
+    def failing_write(descriptor: int, data: bytes) -> int:
+        if not state["partial"]:
+            state["partial"] = True
+            return real_write(descriptor, data[:20])
+        if data == b"\n":
+            return real_write(descriptor, data)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(diagnostics.os, "write", failing_write)
+    with pytest.raises(OSError):
+        manager._append(aggregate, line)
+    monkeypatch.undo()
+
+    # The fragment owns its own line, so the next record is still readable.
+    assert aggregate.read_bytes() == line[:20] + b"\n"
+    manager.record("error", "api", "api.test.after_torn_write", "A later error.")
+    assert manager.flush()
+    codes = [str(item["event_code"]) for item in manager.recent_errors(limit=100)]
+    assert "api.test.after_torn_write" in codes
+    assert manager.status()["unreadable_record_count"] == 1
+
+
+def _replace_settings(manager: DiagnosticManager, payload: dict[str, object]) -> None:
+    """Rewrite the preferences file the way the desktop shell does: atomically."""
+
+    replacement = manager.settings_path.with_suffix(".replacement")
+    replacement.write_text(json.dumps(payload), encoding="utf-8")
+    os.chmod(replacement, 0o600)
+    os.replace(replacement, manager.settings_path)
+
+
+def _wait_for(predicate, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return predicate()
+
+
+def test_live_reload_reconfigures_protected_detail_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nebula.v3 import diagnostic_sensitive
+
+    # No host vault in the test: capture must select session memory, not the
+    # developer's keyring.
+    monkeypatch.setattr(diagnostic_sensitive.keyring, "get_keyring", lambda: None)
+    manager = DiagnosticManager(tmp_path, watch_settings=True)
+    try:
+        assert manager.status()["sensitive_detail_persistence"] == "disabled"
+        settings = {
+            "schema": SETTINGS_SCHEMA,
+            "global_level": "error",
+            "feature_levels": {},
+            "sensitive_detail_capture": True,
+        }
+        _replace_settings(manager, settings)
+        assert _wait_for(lambda: manager.status()["sensitive_detail_capture"])
+        assert _wait_for(
+            lambda: manager.status()["sensitive_detail_persistence"] == "session-memory"
+        ), manager.status()["sensitive_detail_persistence"]
+        error_id = manager.record(
+            "error",
+            "chat",
+            "chat.fixture.failed",
+            "Fixture failed.",
+            exception=RuntimeError("secret-ish detail xyz"),
+        )
+        assert error_id is not None
+        revealed = manager.reveal_sensitive_detail(
+            error_id, operator_id="op-1", action="reveal"
+        )
+        assert "secret-ish detail xyz" in revealed
+
+        _replace_settings(manager, {**settings, "sensitive_detail_capture": False})
+        assert _wait_for(lambda: not manager.status()["sensitive_detail_capture"])
+        assert _wait_for(
+            lambda: manager.status()["sensitive_detail_persistence"] == "disabled"
+        ), manager.status()["sensitive_detail_persistence"]
+    finally:
+        manager.close()
+
+
+def test_explicit_sensitive_detail_never_enters_exportable_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nebula.v3 import diagnostic_sensitive
+
+    monkeypatch.setattr(diagnostic_sensitive.keyring, "get_keyring", lambda: None)
+    settings_path = tmp_path / "diagnostics-settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "schema": SETTINGS_SCHEMA,
+                "global_level": "error",
+                "feature_levels": {},
+                "sensitive_detail_capture": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    try:
+        error_id = manager.record(
+            "error",
+            "providers",
+            "providers.test.raw_response",
+            "A provider response was invalid.",
+            exception=RuntimeError("safe failure"),
+            sensitive_detail='{"raw":"secret-provider-response"}',
+        )
+        assert error_id is not None
+        assert manager.flush()
+        record = _records(manager.log_dir / "providers.log")[-1]
+        assert record["sensitive_detail_available"] is True
+        assert (
+            "secret-provider-response"
+            not in (manager.log_dir / "providers.log").read_text()
+        )
+        assert (
+            "secret-provider-response"
+            not in (manager.log_dir / "errors.log").read_text()
+        )
+        assert (
+            manager.reveal_sensitive_detail(
+                error_id, operator_id="operator", action="reveal"
+            )
+            == '{"raw":"secret-provider-response"}'
+        )
+    finally:
+        manager.close()
+
+
+def test_settings_save_keeps_session_memory_protected_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nebula.v3 import diagnostic_sensitive
+
+    monkeypatch.setattr(diagnostic_sensitive.keyring, "get_keyring", lambda: None)
+    manager = DiagnosticManager(tmp_path, watch_settings=False)
+    try:
+        settings = {
+            "schema": SETTINGS_SCHEMA,
+            "global_level": "error",
+            "feature_levels": {},
+            "sensitive_detail_capture": True,
+        }
+        manager.update_settings(settings)
+        assert manager.status()["sensitive_detail_persistence"] == "session-memory"
+        error_id = manager.record(
+            "error",
+            "chat",
+            "chat.fixture.failed",
+            "Fixture failed.",
+            exception=RuntimeError("secret-ish detail xyz"),
+        )
+        assert error_id is not None
+        before = manager.reveal_sensitive_detail(
+            error_id, operator_id="op-1", action="reveal"
+        )
+        assert "secret-ish detail xyz" in before
+
+        # Any unrelated preference change used to rebuild the store and drop
+        # every memory-only detail captured so far.
+        manager.update_settings({**settings, "feature_levels": {"chat": "debug"}})
+
+        after = manager.reveal_sensitive_detail(
+            error_id, operator_id="op-1", action="reveal"
+        )
+        assert after == before
+    finally:
+        manager.close()

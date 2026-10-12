@@ -1,0 +1,174 @@
+#!/bin/bash
+# Setup script for BoxLite development on Ubuntu/Debian
+#
+# This script installs all required dependencies for building BoxLite on Linux.
+# Run this once when setting up a new development environment.
+#
+# Usage:
+#   bash scripts/setup/setup-ubuntu.sh
+
+set -e
+
+# Source common utilities
+SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$SETUP_DIR/.." && pwd)"
+source "$SCRIPT_DIR/common.sh"
+source "$SETUP_DIR/setup-common.sh"
+
+# Check if running on Linux
+check_platform() {
+    if [[ "$(uname)" != "Linux" ]]; then
+        print_error "This script is for Linux only"
+        echo "   For macOS, use: bash scripts/setup/setup-macos.sh"
+        exit 1
+    fi
+
+    # Warn if running in manylinux container
+    if command -v yum >/dev/null 2>&1 && ! command -v apt-get >/dev/null 2>&1; then
+        print_error "This script is for Ubuntu/Debian systems"
+        echo "   For manylinux/RHEL/CentOS, use: bash scripts/setup/setup-manylinux.sh"
+        exit 1
+    fi
+}
+
+# Check if a package is installed
+apt_installed() {
+    dpkg -l "$1" 2>/dev/null | grep -q "^ii"
+}
+
+# Run apt-get with network retry settings. `apt-get update` can otherwise exit
+# successfully after failed index downloads, then package install fails later.
+apt_get() {
+    run_with_sudo apt-get \
+        -o Acquire::Retries="${APT_RETRIES:-5}" \
+        -o Acquire::http::Timeout="${APT_TIMEOUT:-30}" \
+        -o Acquire::https::Timeout="${APT_TIMEOUT:-30}" \
+        "$@"
+}
+
+# Update package lists
+update_apt() {
+    print_section "🔄 Updating package lists..."
+    apt_get -o APT::Update::Error-Mode=any update -qq
+    echo ""
+}
+
+# Install system dependencies
+install_system_deps() {
+    print_section "📦 Installing system dependencies..."
+
+    local packages=(
+        # Core build tools
+        build-essential    # gcc, g++, make
+        git
+        curl
+        wget
+        file               # file type detection
+        pkg-config
+        patchelf           # ELF binary patching for wheel repair
+
+        # Rust/cargo dependencies
+        libssl-dev         # OpenSSL development headers
+
+        # Guest binary (static musl build)
+        musl-tools         # musl-gcc for static linking
+        gperf              # libseccomp build dep (used by build-libseccomp.sh)
+
+        # Python SDK
+        python3
+        python3-pip
+        python3-venv
+
+        # Note: Go is installed separately via setup_go (distro packages are too old)
+
+        # libkrun build dependencies
+        llvm               # llvm-config for clang-sys
+        libclang-dev       # libclang.so for bindgen
+
+        # libkrunfw kernel build dependencies
+        flex               # Lexical analyzer (kernel build)
+        bison              # Parser generator (kernel build)
+        bc                 # Calculator (kernel build)
+        libelf-dev         # ELF library (kernel objtool)
+        python3-pyelftools # ELF parsing (bin2cbundle.py)
+
+        # bubblewrap build dependencies (jailer sandbox)
+        meson              # Meson build system
+        ninja-build        # Ninja build backend
+        libcap-dev         # Linux capabilities library
+
+        # gRPC/protobuf (boxlite-shared)
+        protobuf-compiler  # protoc compiler
+
+        # C SDK test harness (sdks/c/tests/CMakeLists.txt)
+        cmake              # Configure/build/run C SDK unit + integration tests
+    )
+
+    for pkg in "${packages[@]}"; do
+        print_step "Checking for $pkg... "
+        if apt_installed "$pkg"; then
+            print_success "Already installed"
+        else
+            echo -e "${YELLOW}Installing...${NC}"
+            apt_get install -y -qq "$pkg"
+            print_success "$pkg installed"
+        fi
+    done
+    echo ""
+}
+
+# Setup Python dev tools
+setup_python() {
+    print_section "🐍 Checking Python..."
+    check_python
+    echo ""
+}
+
+# Node.js install delegates to setup_nodejs in setup-common.sh.
+# Distro packages on Ubuntu 24.04 ship Node 18 (EOL), so the shared installer
+# uses NodeSource to pull the active LTS line instead.
+install_nodejs() {
+    setup_nodejs
+}
+
+
+# Main installation flow
+main() {
+    local actual_user="${SUDO_USER:-$USER}"
+
+    print_header "BoxLite Development Setup for Ubuntu/Debian"
+
+    check_platform
+    require_root_or_sudo
+
+    print_section "📋 Checking prerequisites..."
+    echo ""
+
+    update_apt
+
+    install_system_deps
+
+    setup_go
+
+    setup_python
+
+    install_nodejs
+
+    init_submodules
+
+    # Track if Rust was just installed
+    local rust_just_installed=false
+    if ! check_rust; then
+        install_rust
+        rust_just_installed=true
+    fi
+
+    detect_guest_target
+    check_rust_target "$GUEST_TARGET"
+
+    run_dev_extras
+
+    print_header "Setup Complete"
+}
+
+main "$@"

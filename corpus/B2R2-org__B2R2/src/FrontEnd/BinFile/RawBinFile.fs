@@ -1,0 +1,148 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.BinFile
+
+open System.Collections.Immutable
+open B2R2
+open B2R2.Collections
+open B2R2.FrontEnd.BinLifter
+open B2R2.FrontEnd.BinFile.FileHelper
+
+/// <summary>
+/// Represents a raw binary file (containing only binary code and data without
+/// file format).
+/// </summary>
+type RawBinFile(path, bytes: byte[], isa: ISA, baseAddrOpt) =
+  let rawBytes = System.ReadOnlyMemory bytes
+
+  let size = bytes.Length
+
+  let baseAddr = defaultArg baseAddrOpt 0UL
+
+  let reader = BinReader.Init isa.Endian
+
+  (* Raw files expose the whole image as a single rwx segment. *)
+  let memoryLayout =
+    let segments =
+      [| { Name = None
+           Address = baseAddr
+           PhysAddr = baseAddr
+           Size = uint64 size
+           Offset = 0UL
+           FileSize = uint64 size
+           Permission =
+             Permission.Readable ||| Permission.Writable
+             ||| Permission.Executable } |]
+      |> ImmutableArray.ofArray
+    Some { new IMemoryLayout with
+      member _.Segments = segments }
+
+  interface IBinFile with
+    member _.Reader with get() = reader
+
+    member _.RawBytes with get() = rawBytes
+
+    member _.RawBytesOffset with get() = 0UL
+
+    member _.Length with get() = bytes.Length
+
+    member _.Path with get() = path
+
+    member _.Format with get() = FileFormat.RawBinary
+
+    member _.Kind with get() = BinFileKind.Unknown
+
+    member _.ISA with get() = isa
+
+    (* A raw image carries no format to read an OS out of, so only whoever
+       loads it knows one. *)
+    member _.OS with get() = OS.UnknownOS
+
+    member _.EntryPoint with get() = Some baseAddr
+
+    member _.BaseAddress with get() = baseAddr
+
+    member _.InterpreterPath with get() = None
+
+    member _.RPath with get() = ImmutableArray.Empty
+
+    member _.RunPath with get() = ImmutableArray.Empty
+
+    member _.DependencyNames with get() = ImmutableArray.Empty
+
+    member _.SharedObjectName with get() = None
+
+    member _.BuildId with get() = ImmutableArray.Empty
+
+    member _.ProgramHeaderTable with get() = None
+
+    member _.IsNXEnabled with get() = false
+
+    member _.IsPIE with get() = false
+
+    member _.IsBaseRelative with get() = false
+
+    member _.Relro with get() = None
+
+    member _.EncryptedRanges with get() = ImmutableArray.Empty
+
+    member _.NameResolver with get() = None
+
+    member _.SymbolTable with get() = None
+
+    member _.Structure with get() = None
+
+    member _.Relocations with get() = None
+
+    member _.ExceptionTable with get() = None
+
+    member _.ImportTable with get() = None
+
+    member _.MemoryLayout with get() = memoryLayout
+
+    member _.Slice(addr, len) = sliceBySafeOffset bytes (addr - baseAddr) len
+
+    member _.IsValidAddr addr =
+      addr >= baseAddr && addr < (baseAddr + uint64 size)
+
+    member this.IsValidRange range =
+      (this :> IAddressSpace).IsValidAddr range.Min
+      && (this :> IAddressSpace).IsValidAddr range.Max
+
+    member this.IsAddrMappedToFile addr =
+      (this :> IAddressSpace).IsValidAddr addr
+
+    member this.IsRangeMappedToFile range =
+      (this :> IAddressSpace).IsValidRange range
+
+    member this.IsExecutableAddr addr = (this :> IAddressSpace).IsValidAddr addr
+
+    member _.GetBoundedPointer(addr) =
+      if addr >= baseAddr && addr < (baseAddr + uint64 size) then
+        let maxAddr = baseAddr + uint64 size - 1UL
+        let offset = addr - baseAddr
+        BinFilePointer.CreateFileBacked(addr, maxAddr, int offset, size - 1)
+      else
+        BinFilePointer.Null

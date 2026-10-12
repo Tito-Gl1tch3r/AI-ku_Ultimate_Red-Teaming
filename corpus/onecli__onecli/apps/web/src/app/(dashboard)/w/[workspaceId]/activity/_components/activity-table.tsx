@@ -1,0 +1,197 @@
+"use client";
+
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@onecli/ui/components/tooltip";
+import { Info, KeyRound } from "lucide-react";
+import { Button } from "@onecli/ui/components/button";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@onecli/ui/components/table";
+import { StatusBadge } from "./status-badge";
+import { DecisionBadge } from "./decision-badge";
+import { MethodBadge } from "./method-badge";
+import { ProviderLabel } from "./provider-label";
+import { TimeCell } from "./time-cell";
+import { getProviderIcon } from "@onecli/api/apps/provider-icons";
+import {
+  isBlockedRequest,
+  isDefaultDenied,
+  isOwnKey,
+  isRateLimitedRequest,
+  getApprovalDecision,
+  getApprovalId,
+  type RequestLogEntry,
+} from "@onecli/api/services/request-log-service";
+import { ApprovalActions } from "@/lib/components/approvals";
+import type { PendingApproval } from "@/lib/api/approvals";
+
+interface ActivityTableProps {
+  logs: RequestLogEntry[];
+  liveApprovals: Map<string, PendingApproval>;
+  onRowClick: (log: RequestLogEntry) => void;
+  onShowApproval: (approval: PendingApproval) => void;
+  emptyMessage?: string;
+}
+
+export const ActivityTable = ({
+  logs,
+  liveApprovals,
+  onRowClick,
+  onShowApproval,
+  emptyMessage = "No requests yet.",
+}: ActivityTableProps) => (
+  <div className="rounded-lg border overflow-hidden">
+    <Table>
+      <TableHeader>
+        <TableRow className="hover:bg-transparent">
+          <TableHead className="w-[5.5rem]">Time</TableHead>
+          <TableHead className="w-[7rem]">Agent</TableHead>
+          <TableHead className="w-[4.5rem]">Method</TableHead>
+          <TableHead className="max-w-[18rem]">Endpoint</TableHead>
+          <TableHead className="w-[12rem]">Provider</TableHead>
+          <TableHead className="w-[5rem]">Status</TableHead>
+          <TableHead className="w-28">Decision</TableHead>
+          <TableHead className="w-[5rem] text-right">Latency</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {logs.length === 0 ? (
+          <TableRow className="hover:bg-transparent">
+            <TableCell
+              colSpan={8}
+              className="text-muted-foreground py-16 text-center text-sm"
+            >
+              {emptyMessage}
+            </TableCell>
+          </TableRow>
+        ) : (
+          logs.map((log) => {
+            const providerInfo = getProviderIcon(log.provider);
+            const approvalId = getApprovalId(log);
+            const liveApproval = approvalId
+              ? liveApprovals.get(approvalId)
+              : undefined;
+            const decision = getApprovalDecision(log);
+            return (
+              <TableRow
+                key={log.id}
+                className="cursor-pointer"
+                onClick={() => onRowClick(log)}
+              >
+                <TableCell>
+                  <TimeCell iso={log.createdAt} />
+                </TableCell>
+                <TableCell>
+                  <span className="text-sm truncate block max-w-[7rem]">
+                    {log.agentName ?? (
+                      <span className="text-muted-foreground font-mono text-xs">
+                        {log.agentId.slice(0, 8)}
+                      </span>
+                    )}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <MethodBadge method={log.method} />
+                </TableCell>
+                <TableCell className="max-w-[18rem]">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium truncate">
+                      {log.host.replace(/:(?:443|80)$/, "")}
+                    </div>
+                    <div className="text-muted-foreground truncate font-mono text-xs">
+                      {log.path || "/"}
+                    </div>
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <div className="min-w-0">
+                          <ProviderLabel provider={log.provider} />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        {providerInfo?.name ?? log.provider}
+                      </TooltipContent>
+                    </Tooltip>
+                    {isOwnKey(log) && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <KeyRound className="size-2.5 text-muted-foreground/40 shrink-0" />
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="text-xs">
+                          Agent&apos;s own credentials - not managed by OneCLI
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <StatusBadge
+                    status={log.status}
+                    blocked={isBlockedRequest(log)}
+                    defaultDenied={isDefaultDenied(log)}
+                    rateLimited={isRateLimitedRequest(log)}
+                  />
+                </TableCell>
+                <TableCell>
+                  {liveApproval ? (
+                    // Stop row-click (which opens the dialog) when acting here.
+                    <div
+                      onClick={(e) => e.stopPropagation()}
+                      className="flex items-center gap-1"
+                    >
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            onClick={() => onShowApproval(liveApproval)}
+                            className="text-muted-foreground hover:text-foreground"
+                          >
+                            <Info className="size-3.5" />
+                            <span className="sr-only">Details</span>
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Details</TooltipContent>
+                      </Tooltip>
+                      <ApprovalActions approvalId={liveApproval.id} iconOnly />
+                    </div>
+                  ) : log.approvedBy ? (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="inline-flex cursor-default">
+                          <DecisionBadge decision={decision} />
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {decision === "denied" ? "Denied" : "Approved"} by{" "}
+                        {log.approvedBy}
+                      </TooltipContent>
+                    </Tooltip>
+                  ) : (
+                    <DecisionBadge decision={decision} />
+                  )}
+                </TableCell>
+                <TableCell className="text-right">
+                  <span className="text-muted-foreground font-mono text-xs tabular-nums">
+                    {log.latencyMs}ms
+                  </span>
+                </TableCell>
+              </TableRow>
+            );
+          })
+        )}
+      </TableBody>
+    </Table>
+  </div>
+);

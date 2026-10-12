@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Scanner - Base class for simple remote vulnerability scanning modules
+Similar to OpenVAS, these modules perform simple version checks and response tests
+"""
+
+from core.framework.base_module import BaseModule
+from core.framework.failure import ProcedureError, FailureType
+from core.output_handler import print_info, print_success, print_error, print_warning
+from typing import Optional
+
+
+class Scanner(BaseModule):
+    """
+    Base class for scanner modules.
+    
+    These modules are designed to be very simple and focused:
+    - Version detection
+    - Response pattern matching
+    - Simple vulnerability checks
+    - No exploitation, only detection
+    
+    Similar to OpenVAS plugins - lightweight and fast.
+    """
+    
+    TYPE_MODULE = "scanner"
+
+    def __init__(self, framework=None):
+        super().__init__(framework)
+        self.vulnerable = False
+        self.vulnerability_info = {}  # Pour les infos dynamiques uniquement
+    
+    def extract_version(self, text: str, pattern: str) -> str:
+        """Helper to extract version from text using regex pattern"""
+        import re
+        match = re.search(pattern, text, re.IGNORECASE)
+        return match.group(1) if match else ""
+    
+    def set_info(self, **details):
+        """
+        Set dynamic vulnerability information (optional).
+
+        Use this only for dynamic data (detected version, etc.).
+        Prefer ``report_finding()`` for structured KittyReport findings.
+
+        Args:
+            **details: Dynamic details to store (version, cves, etc.)
+        """
+        self.vulnerability_info.update(details)
+
+    def report_finding(
+        self,
+        finding: str,
+        *,
+        severity: str = "medium",
+        evidence: Optional[dict] = None,
+        impact: Optional[object] = None,
+        remediation: Optional[object] = None,
+        **extra,
+    ) -> dict:
+        """
+        Record a structured finding for DB / KittyReport.
+
+        Example::
+
+            self.report_finding(
+                "Exposed Git repository",
+                severity="high",
+                evidence={
+                    "url": "https://example.com/.git/",
+                    "status_code": 200,
+                    "files_found": ["HEAD", "config", "index"],
+                },
+                impact={
+                    "summary": "An attacker may retrieve source code and sensitive information.",
+                    "business_risk": "Source code disclosure",
+                },
+                remediation={
+                    "summary": "Block access to .git directories.",
+                    "actions": [
+                        "Configure web server rules",
+                        "Remove exposed repository",
+                        "Rotate leaked secrets",
+                    ],
+                },
+            )
+            return True
+        """
+        from core.scanner.finding_report import build_finding_report
+
+        report = build_finding_report(
+            finding,
+            severity=severity,
+            evidence=evidence,
+            impact=impact,
+            remediation=remediation,
+            **extra,
+        )
+        # Flat keys keep legacy scanner/agent readers working.
+        self.vulnerability_info.update(
+            {
+                "report": report,
+                "finding": report["finding"],
+                "severity": report["severity"],
+                "reason": report["finding"],
+                "evidence": report.get("evidence") or {},
+                "impact": report.get("impact") or {},
+                "remediation": report.get("remediation") or {},
+            }
+        )
+        if isinstance(report.get("evidence"), dict):
+            ev = report["evidence"]
+            if ev.get("path") and "path" not in self.vulnerability_info:
+                self.vulnerability_info["path"] = ev.get("path")
+            if ev.get("url") and "url" not in self.vulnerability_info:
+                self.vulnerability_info["url"] = ev.get("url")
+        return report
+
+    def _get_detector(self, name: str):
+        """
+        Charge dynamiquement un détecteur depuis les modules organisés.
+        
+        Découvre automatiquement les détecteurs disponibles dans:
+        - lib.scanner.http.detectors
+        - lib.scanner.ftp.detectors
+        - lib.scanner.ssh.detectors
+        - lib.scanner.router.detectors
+        - etc.
+        
+        Pattern: if_<name> -> detect_<name> dans le bon module
+        """
+        # Cache des détecteurs chargés pour éviter les re-imports
+        if not hasattr(self, '_detector_cache'):
+            self._detector_cache = {}
+        
+        if name in self._detector_cache:
+            return self._detector_cache[name]
+        
+        # Liste des protocoles à chercher (dans l'ordre de priorité)
+        protocols = ['http', 'ftp', 'ssh', 'router', 'smtp', 'dns', 'ldap', 'redis', 'mysql']  # Extensible
+        
+        # Extraire le nom du détecteur (enlever le préfixe "if_")
+        if name.startswith('if_'):
+            detector_name = name[3:]  # Enlever "if_"
+            func_name = f"detect_{detector_name}"
+        else:
+            # Fonctions utilitaires (contains_pattern, has_header, etc.)
+            detector_name = name
+            func_name = name
+        
+        # Chercher dans chaque protocole
+        for protocol in protocols:
+            try:
+                module_path = f"lib.scanner.{protocol}.detectors"
+                module = __import__(module_path, fromlist=[func_name])
+                
+                if hasattr(module, func_name):
+                    detector_func = getattr(module, func_name)
+                    
+                    # Créer un wrapper pour préserver la signature
+                    def detector_wrapper(*args, **kwargs):
+                        return detector_func(*args, **kwargs)
+                    
+                    # Mettre en cache
+                    self._detector_cache[name] = detector_wrapper
+                    return detector_wrapper
+                    
+            except (ImportError, AttributeError):
+                continue
+        
+        # Si pas trouvé, retourner une fonction par défaut
+        # Déterminer le type de retour selon le nom
+        if name.startswith('if_'):
+            # Les détecteurs de version retournent None, les booléens False
+            # On peut deviner selon le nom (mais pas parfait)
+            version_detectors = ['apache', 'nginx', 'php', 'vsftpd', 'proftpd', 'openssh', 'dlink', 'cisco']
+            if any(vd in detector_name for vd in version_detectors):
+                def default_none(*args, **kwargs):
+                    return None
+                self._detector_cache[name] = default_none
+                return default_none
+        
+        def default_false(*args, **kwargs):
+            return False
+        self._detector_cache[name] = default_false
+        return default_false
+    
+    def __getattr__(self, name: str):
+        """
+        Charge dynamiquement les détecteurs à la demande.
+        
+        Permet d'utiliser self.if_apache(), self.if_vsftpd(), etc.
+        sans avoir à définir chaque méthode manuellement.
+        
+        Pattern:
+        - if_<name> -> cherche detect_<name> dans lib.scanner.*.detectors
+        - contains_pattern, has_header -> cherche directement dans http.detectors
+        """
+        # Seulement pour les helpers de détection
+        if name.startswith('if_') or name in ['contains_pattern', 'has_header', 'detect_version']:
+            return self._get_detector(name)
+        
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+    
+    def run(self) -> bool:
+        """
+        Run the scanner module.
+        
+        This method must be implemented by scanner modules.
+        It should perform the scan and return True if vulnerable, False otherwise.
+        
+        Returns:
+            bool: True if vulnerable, False otherwise
+        
+        Note: Use set_info() to store dynamic details (version, cves, etc.)
+        """
+        raise NotImplementedError("Scanner modules must implement the run() method")
+    
+    def _exploit(self):
+        """
+        Execute the scan (scanner modules don't exploit, they only scan).
+        Prints a clear positive/negative outcome; sets ``_scan_error`` on failure
+        so the console can distinguish a completed negative scan from an error.
+        """
+        info = getattr(self, '__info__', {}) or {}
+        label = info.get('name', self.__class__.__name__)
+        self._scan_error = False
+        try:
+            raw = self.run()
+            from core.scanner.result_dedup import (
+                enrich_scanner_result,
+                scanner_return_is_vulnerable,
+            )
+
+            detected = scanner_return_is_vulnerable(raw)
+            vi = getattr(self, 'vulnerability_info', None) or {}
+            if detected and isinstance(vi, dict):
+                normalized = enrich_scanner_result(
+                    {
+                        "vulnerable": True,
+                        "severity": vi.get("severity") or info.get("severity") or "info",
+                        "cve": vi.get("cve") or info.get("cve"),
+                        "message": vi.get("reason") or str(label),
+                        "details": vi,
+                        "path": self.__class__.__module__.replace(".", "/"),
+                    }
+                )
+                detected = bool(normalized.get("vulnerable"))
+                if not detected and normalized.get("detected"):
+                    print_info(f"{label}: informational match (not a vulnerability).")
+                    return False
+                if not detected and normalized.get("suppressed_reason"):
+                    print_info(f"{label}: {normalized['suppressed_reason']}.")
+                    return False
+
+            if detected:
+                # Console stays brief; structured report is for DB / KittyReport push.
+                title = None
+                if isinstance(vi, dict):
+                    title = vi.get("finding") or (vi.get("report") or {}).get("finding")
+                print_success(f"{title or label}: positive match (indicators detected).")
+            else:
+                print_error(f"{label}: no match")
+                return False
+
+            if raw is None:
+                return False
+            return bool(raw)
+        except ProcedureError as e:
+            self._scan_error = True
+            print_error(f"{label}: {e}")
+            return False
+        except Exception as e:
+            self._scan_error = True
+            print_error(f"Scan error ({label}): {e}")
+            return False

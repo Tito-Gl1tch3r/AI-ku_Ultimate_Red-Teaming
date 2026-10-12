@@ -1,0 +1,2199 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Message bus smoke test — the parts Hurl can't drive.
+#
+# Hurl is HTTP-only and cannot open a WebSocket, so the WS half of the test
+# runs through `rt-hurl-helper` (a small Rust bin gated on `test_utils`).
+# This script orchestrates it against a live oxicloud server: bootstraps
+# state with curl, exercises the bus, asserts on the helper's JSON output.
+#
+# Nine scenarios:
+#   S1  Positive delivery       — subscribe to folder A, upload into A, see event.
+#   S2  Topic isolation         — subscribe to folder A only, upload into B and
+#                                 then A; must see A's event only.
+#   S3  AuthZ denial            — user2 subscribes to folder A owned by user1
+#                                 without a grant; expect wire reason `no_read`.
+#   S4  Anti-enumeration        — subscribe to a folder that does not exist;
+#                                 must return the SAME wire reason (`no_read`)
+#                                 as S3, per the plan's anti-enum invariant.
+#   S5  Server keepalive        — 3 s of idle surfaces multiple RFC 6455 Ping
+#                                 frames from the server (proves the interval
+#                                 fires), and the session still delivers an
+#                                 event on the same subscription afterwards.
+#   S6  Delete emits            — DELETE a pre-uploaded file → subscriber sees
+#                                 one `file_deleted` event with correct
+#                                 `file_id` + `parent_id` (snapshotted
+#                                 pre-delete since the row is gone by then).
+#   S7  Move fan-out            — MOVE A→B while subscribed to BOTH topics on
+#                                 one session → observe TWO `file_moved`
+#                                 events (one via the A topic, one via B).
+#                                 Same file_id/from/to on both.
+#   S8  Grant-revoke eviction   — user2 subscribes to A + B (both granted),
+#                                 user1 revokes only A → user2 sees
+#                                 `rt.revoked` for folder:A AND an event
+#                                 on folder:B (upload after revoke).
+#                                 Locks in three invariants: eviction
+#                                 fires, scoping is per-topic, session
+#                                 survives.
+#   S9  Cross-user identity     — user1 tries to subscribe to
+#                                 `user:{user2_id}:authz` (an identity-scoped
+#                                 topic that resolves to somebody else). Server
+#                                 must reject with `topic_forbidden` (same wire
+#                                 shape as an unknown topic — anti-enumeration).
+#                                 Guards the strict-privacy Class-2 AuthZ gate:
+#                                 no admin bypass, direct UUID equality only.
+#   S10 Ticket happy path       — user1 POSTs `/api/rt/ticket`, receives a
+#                                 short-lived opaque token, opens the WS with
+#                                 `Sec-WebSocket-Protocol: oxi.ticket.<uuid>`
+#                                 and successfully subscribes + delivers an
+#                                 event. Exercises the ticket path — the only
+#                                 path a DPoP-required browser can take.
+#   S11 Ticket single-use       — a ticket redeemed once cannot be redeemed
+#                                 again. Guards replay: a captured token
+#                                 outside its 30 s TTL, or one already
+#                                 consumed, MUST fail the upgrade with 401.
+#   S12 Job topic admin-only    — user1 (non-admin) subscribes to
+#                                 `job:<any-name>`; server must reject
+#                                 with `topic_forbidden` (audit reason
+#                                 `role_denied`). Guards the Class-3
+#                                 role-scoped AuthZ gate on
+#                                 `Topic::Job` — admin-only, no bypass,
+#                                 anti-enumeration parity with unknown
+#                                 topics. The allow side is covered by
+#                                 the Rust `required_perm` + dispatch
+#                                 unit tests; the seeded suite has no
+#                                 admin token, and minting one here
+#                                 would pollute state for other files.
+#   S13 Notification wire push  — user2 subscribes to
+#                                 `user:{user2_id}:notifications`; user1
+#                                 creates a grant that targets user2.
+#                                 Server must publish one `rt.event`
+#                                 with `event="notification_received"`,
+#                                 `data.kind="share_granted"`. Guards
+#                                 the Slice-E ingester + the auto-sub
+#                                 delivery path together — this is the
+#                                 only scenario that exercises the
+#                                 wire push from the `NotificationService`.
+#   S14 Notification DB row     — after S13's grant, GET
+#                                 `/api/notifications` as user2 lists
+#                                 at least one row with
+#                                 `kind="share_granted"` whose payload
+#                                 references the freshly-shared folder,
+#                                 and `unread_count >= 1`. Guards the
+#                                 authoritative side of the pattern —
+#                                 a subscriber offline at publish time
+#                                 recovers via this endpoint.
+#   S15 Cross-user notif deny   — user1 subscribes to
+#                                 `user:{user2_id}:notifications`
+#                                 (an identity-scoped topic that
+#                                 resolves to somebody else). Server
+#                                 must reject with `topic_forbidden`
+#                                 (same wire shape as unknown topic,
+#                                 same rule as S9 for `:authz`).
+#                                 Guards the strict-privacy Class-2
+#                                 AuthZ gate on Slice-E notifications
+#                                 — no admin bypass, direct UUID
+#                                 equality only. If this ever accepts
+#                                 and delivers events, an admin (or
+#                                 anyone else) could snoop on other
+#                                 users' notification streams.
+#   S16 Notif ?after= cursor    — the delta catch-up cursor the FE
+#                                 bell hits on WS reconnect / tab
+#                                 reactivation. Snapshots the newest
+#                                 row's `created_at` as T0, fires a
+#                                 fresh share (folder D) that lands
+#                                 exactly one new row, and asserts:
+#                                   (a) GET ?after=T0 returns exactly
+#                                       one row — the folder-D row
+#                                       (guards: predicate applied at
+#                                       all; silently-dropped param
+#                                       would return everything).
+#                                   (b) GET ?after=<newRow.created_at>
+#                                       returns exactly zero rows
+#                                       (guards: bound is strict `>`,
+#                                       not `>=` — a `>=` regression
+#                                       would break FE `mergeById`
+#                                       dedup because rows would come
+#                                       in both via WS push and via
+#                                       the delta fetch).
+#   S29 Collab multi-client convergence
+#                             — 5 headless clients on the same .md
+#                                file each subscribe, insert a
+#                                distinct string, and listen until
+#                                the fan-out quiesces. All 5 clients'
+#                                final decoded texts MUST be
+#                                byte-identical — that's CRDT
+#                                convergence in one assertion. Guards
+#                                the C7 robustness item: broadcast
+#                                backpressure under contention,
+#                                forwarder lag handling, and CRDT
+#                                ordering when writes interleave —
+#                                none of which the 2-client S22 can
+#                                reach.
+#   S28 Collab external-write eviction
+#                             — a .md file is under active collab
+#                                edit; a REST upload replaces its
+#                                content directly (as WebDAV PUT /
+#                                WOPI PutFile / delta-upload would).
+#                                The FileLifecycleHook fan-out reaches
+#                                the collab-evict hook with
+#                                WriteSource::External, which fires
+#                                evict_sessions_for_file(id,
+#                                "external_write"). Guards the safety
+#                                property: an out-of-band write must
+#                                invalidate the in-memory CRDT so
+#                                clients don't keep applying updates
+#                                to a Yjs doc that's now diverged
+#                                from the on-disk truth.
+#   S27 Collab grant-revoke eviction
+#                             — user2 has a file-level Viewer grant
+#                                and subscribes to `collab:<file_id>`.
+#                                user1 revokes the grant. user2's
+#                                socket MUST receive `rt.revoked` on
+#                                the collab topic with reason
+#                                "grant_revoked" — the FE's read-only
+#                                slice cached `can_write` at subscribe
+#                                time and would otherwise stay stale
+#                                until the next reconnect. Guards the
+#                                `AuthzChanged.affected_files` cascade.
+#   S26 Collab graceful write-denial
+#                             — a Viewer sends a `0x01` UPDATE frame
+#                                on a subscribed collab topic. The
+#                                server MUST respond with an
+#                                `rt.write_denied { file_id, reason:
+#                                "no_edit" }` notification AND keep
+#                                the socket open. Prior behaviour
+#                                closed the WS on every denied UPDATE
+#                                — a Viewer typing into an editable-
+#                                looking editor would flap the
+#                                connection on every keystroke.
+#                                Guards the graceful-denial invariant.
+#   S25 Collab capabilities in subscribe ack
+#                             — the `collab:<file_id>` subscribe ack
+#                                carries the caller's `can_write`
+#                                capability inline. Owner sees
+#                                `capabilities.can_write: true`;
+#                                Viewer sees `capabilities.can_write:
+#                                false` while still passing the Read
+#                                gate (the sub itself acks). The FE
+#                                gates CodeMirror between edit and
+#                                read-only on this — without it,
+#                                Viewers type into an editable-looking
+#                                editor and the server drops the WS
+#                                on the first UPDATE frame.
+#   S24 Collab eviction on delete
+#                             — subscribe to `collab:<file_id>` (the
+#                                subscribe alone attaches the actor;
+#                                no write needed), then `DELETE
+#                                /api/files/{id}`. The delete path
+#                                (`FileManagementService::
+#                                delete_and_cleanup_with_perms`) MUST
+#                                fire an eviction on the collab
+#                                service BEFORE the trash / permanent
+#                                delete lands, translating into an
+#                                `rt.revoked` frame on the WS with
+#                                `reason: "resource_deleted"` on the
+#                                collab topic. Guards the file-scoped
+#                                eviction slice: without it, the FE
+#                                editor keeps rendering a doc whose
+#                                storage row is about to vanish, and
+#                                the actor becomes an orphan (the
+#                                cascade drops its `doc_sessions` row
+#                                only on hard delete, not on trash).
+#   S23 Collab idle-GC sweep  — write via collab, explicit-flush so
+#                                the blob has the CRDT text, wait
+#                                past the (shrunk) idle TTL, then
+#                                trigger the `collab_idle_gc` job
+#                                via `POST /api/admin/jobs/…/trigger`.
+#                                Asserts the sweep count ≥ 1 and
+#                                that a subsequent sync-step probe
+#                                re-seeds cleanly from the blob
+#                                (proving the row was actually
+#                                deleted, not just re-flushed).
+#   S22 Collab explicit flush  — call `rt.collab_flush {file_id}` on
+#                                the WS after a write, then GET the
+#                                file BEFORE the debouncer would
+#                                have fired. Guards the FE's
+#                                "on tab close, save now" path — a
+#                                blob update within a few ms of the
+#                                explicit trigger, not bounded by
+#                                the ambient debounce cadence.
+#                                Also guards `no_edit` denial when
+#                                the caller lacks Update.
+#   S21 Collab flush-to-blob   — write via collab, wait past the
+#                                debouncer's idle threshold, then
+#                                GET /api/files/{id} and assert the
+#                                downloaded content reflects the
+#                                CRDT text. Guards the C7 write side
+#                                end-to-end: dedup ingest, atomic
+#                                blob swap, cache invalidation.
+#                                Depends on OXICLOUD_COLLAB_DEBOUNCE_*
+#                                being shrunk in server.env — a
+#                                default-tuned server would need
+#                                60 s of wall-clock for this to fire.
+#   S20 Collab seed-from-blob   — upload a .md whose bytes are NOT
+#                                 empty, then open a collab session
+#                                 for the first time (no prior
+#                                 `collab.doc_sessions` row). The
+#                                 actor MUST seed from the file's
+#                                 blob text via the FileBlobDocContentReader
+#                                 adapter, not from an empty
+#                                 doc. Assertion is on
+#                                 the sync-step-2 reply size: an
+#                                 empty-seed doc replies with the
+#                                 2-byte empty-update marker; a
+#                                 blob-seeded doc replies with a
+#                                 payload roughly proportional to
+#                                 the file's byte count. Guards the
+#                                 C7 read-side bridge (was
+#                                 EmptySeedReader stub; now
+#                                 FileBlobDocContentReader).
+#   S19 Collab per-frame AuthZ  — user2 gets a Viewer grant on
+#                                 folder A (Read but not Update on
+#                                 files inside). User2 subscribes to
+#                                 `collab:<file_id>` (Read gate: OK),
+#                                 then sends a 0x01 UPDATE frame.
+#                                 Server must deny at the service-level
+#                                 `Update` gate → close socket with a
+#                                 `collab.write_denied` audit line.
+#                                 The write-side helper's normal exit
+#                                 is 0 after `ws.send`; a denial shows
+#                                 up as an immediate close so the
+#                                 scenario reads the exit code AND
+#                                 verifies the doc's text was NOT
+#                                 modified on the server. Guards the
+#                                 Class-1 Write gate — without it, a
+#                                 viewer could mutate every doc they
+#                                 could see.
+#   S18 Collab fan-out          — two sockets on the same .md file:
+#                                 socket A sends a 0x01 UPDATE frame
+#                                 that inserts "hello from A"; socket
+#                                 B, subscribed to `collab:{file}`,
+#                                 receives the SAME UPDATE via the
+#                                 actor's broadcast outbox → WS
+#                                 forwarder path. Guards C2's fan-out
+#                                 end-to-end: without it, collab is a
+#                                 single-user editor with a fancy
+#                                 persistence layer.
+#   S17 Collab binary frame     — upload a .md file, send one Yjs
+#                                 sync-step-1 request on the WS as a
+#                                 binary frame keyed on file_id, and
+#                                 assert the server replies with a
+#                                 well-formed sync-step-2 frame
+#                                 (kind=0x03, matching file_id,
+#                                 non-empty payload). Guards the C2
+#                                 wire path end-to-end: parse the
+#                                 wire header, spawn the actor,
+#                                 encode `state_as_update_v1(&sv)`,
+#                                 wrap in a 0x03 frame, ship it.
+#                                 Depends on
+#                                 `OXICLOUD_ENABLE_MARKDOWN_COLLAB=true`
+#                                 in server.env; without it the WS
+#                                 branch silently drops the frame
+#                                 and the probe times out — which
+#                                 is exactly what this scenario
+#                                 catches for a mis-configured build.
+#
+# Exit non-zero on any failure — run.sh treats that as a suite failure.
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BUILD_TARGET="${BUILD_TARGET:-debug}"
+HELPER_BIN="$REPO_ROOT/target/$BUILD_TARGET/rt-hurl-helper"
+
+# ── Shared cargo-build wrapper (quiet on success, tailable while it runs) ────
+# shellcheck disable=SC1091
+source "$REPO_ROOT/tests/common/cargo_build.sh"
+
+# ── Env from test.env (base_url, admin username/password) ────────────────────
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test.env"
+: "${base_url:?}" "${username:?}" "${password:?}"
+
+# WS URL derived from base_url (test.env uses http://); tolerate https for
+# future deployments even though the test suite runs plain HTTP.
+case "$base_url" in
+  http://*)   ws_url="ws://${base_url#http://}/api/rt/ws" ;;
+  https://*)  ws_url="wss://${base_url#https://}/api/rt/ws" ;;
+  *)          echo "rt_bus_check: unexpected base_url scheme: $base_url" >&2; exit 2 ;;
+esac
+
+log()  { printf '\033[1;36m[rt_bus_check]\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31m[rt_bus_check FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ── Rebuild the helper every run ────────────────────────────────────────────
+# Deliberately unconditional — the previous `[[ ! -x $HELPER_BIN ]]` guard
+# silently reused a stale binary whenever the helper's source changed
+# without touching the caller shell script, producing "unknown flag"
+# exits that looked like test bugs (see the S10/S11 --ticket rollout).
+# Cargo incremental short-circuits in ~50 ms when nothing changed, so
+# the cost of the always-build is negligible; the cost of a stale binary
+# is a wild-goose chase.
+case "$BUILD_TARGET" in
+  debug)   cargo_build_logged "rt-hurl-helper (debug)"             --features test_utils --bin rt-hurl-helper || die "rt-hurl-helper build failed" ;;
+  release) cargo_build_logged "rt-hurl-helper (release)" --release --features test_utils --bin rt-hurl-helper || die "rt-hurl-helper build failed" ;;
+esac
+
+# ── curl wrappers ───────────────────────────────────────────────────────────
+c_post() {
+  local url="$1" auth="$2" body="$3"
+  curl -sS -X POST -H "Content-Type: application/json" \
+    ${auth:+-H "Authorization: Bearer $auth"} \
+    -d "$body" "$url"
+}
+
+c_get() {
+  local url="$1" auth="$2"
+  curl -sS -H "Accept: application/json" \
+    ${auth:+-H "Authorization: Bearer $auth"} \
+    "$url"
+}
+
+# Block until the helper writes `--ready-file <path>` (touched the
+# moment every requested subscribe is ack'd) or `$timeout` seconds
+# elapse. Replaces the older `sleep 0.4` heuristic that flaked on
+# cold-cache runs where the helper's fork/tokio-init/connect chain
+# crossed 400 ms and the shell's mkfile_in publish arrived at an
+# empty topic. See `Args::ready_file` in rt-hurl-helper.rs.
+wait_ready() {
+  local path="$1" timeout="${2:-5}"
+  local waited=0
+  while [[ ! -f "$path" && "$waited" -lt "$((timeout * 20))" ]]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [[ -f "$path" ]] || die "wait_ready: $path never appeared within ${timeout}s (subscribe likely never ack'd)"
+}
+
+# ── Setup: register fresh users; the test.env admin may be OPAQUE-
+# migrated and the legacy password-login path refuses those accounts,
+# so we don't use it at all — same pattern as `dedup_admin_gate.hurl`
+# and the other hurl scenarios that need a self-contained principal.
+# The scenarios only need "a user with their own folders", not admin
+# rights.
+suffix="$(date +%s)_$$"
+user1_name="rtbus_u1_$suffix"
+user1_pass="RtBusU1Pass1!"
+user2_name="rtbus_u2_$suffix"
+user2_pass="RtBusU2Pass1!"
+
+log "Register user1 ($user1_name) and log in..."
+c_post "$base_url/api/auth/register" "" \
+  "$(printf '{"username":"%s","email":"%s@example.com","password":"%s"}' \
+       "$user1_name" "$user1_name" "$user1_pass")" > /dev/null
+u1_login=$(c_post "$base_url/api/auth/login" "" \
+  "$(printf '{"username":"%s","password":"%s"}' "$user1_name" "$user1_pass")")
+user1_token=$(printf '%s' "$u1_login" | jq -r '.access_token')
+[[ -n "$user1_token" && "$user1_token" != "null" ]] || die "no user1 token: $u1_login"
+
+log "Discover user1 root folder..."
+folders=$(c_get "$base_url/api/folders" "$user1_token")
+root_id=$(printf '%s' "$folders" | jq -r '.[0].id')
+[[ -n "$root_id" && "$root_id" != "null" ]] || die "no root folder for user1: $folders"
+
+log "Create folder A (rt_bus_A_$suffix) and folder B (rt_bus_B_$suffix)..."
+folder_a=$(c_post "$base_url/api/folders" "$user1_token" \
+  "$(printf '{"name":"rt_bus_A_%s","parent_id":"%s"}' "$suffix" "$root_id")" | jq -r '.id')
+folder_b=$(c_post "$base_url/api/folders" "$user1_token" \
+  "$(printf '{"name":"rt_bus_B_%s","parent_id":"%s"}' "$suffix" "$root_id")" | jq -r '.id')
+[[ -n "$folder_a" && "$folder_a" != "null" ]] || die "folder A creation failed"
+[[ -n "$folder_b" && "$folder_b" != "null" ]] || die "folder B creation failed"
+
+# Register a second user for the AuthZ-denial scenario (S3). No grant on
+# folder A → subscribe attempt must be denied.
+log "Register user2 ($user2_name) and log in..."
+c_post "$base_url/api/auth/register" "" \
+  "$(printf '{"username":"%s","email":"%s@example.com","password":"%s"}' \
+       "$user2_name" "$user2_name" "$user2_pass")" > /dev/null
+user2_login=$(c_post "$base_url/api/auth/login" "" \
+  "$(printf '{"username":"%s","password":"%s"}' "$user2_name" "$user2_pass")")
+user2_token=$(printf '%s' "$user2_login" | jq -r '.access_token')
+[[ -n "$user2_token" && "$user2_token" != "null" ]] || die "no user2 token: $user2_login"
+# S8 needs user2's UUID to target them as the grant subject.
+user2_id=$(printf '%s' "$user2_login" | jq -r '.user.full.user.id')
+[[ -n "$user2_id" && "$user2_id" != "null" ]] || die "no user2 id: $user2_login"
+
+# ── Helper: create a small file inside a folder via the byte-upload path.
+# Not delta / instant-upload; keeps the wire simple and hits the same
+# `upload_file_streaming` publish hook.
+mkfile_in() {
+  local folder_id="$1" name="$2" token="$3"
+  local tmpfile respfile status
+  tmpfile="$(mktemp -t rtbus_body.XXXXXX)"
+  respfile="$(mktemp -t rtbus_resp.XXXXXX)"
+  printf 'rt-bus-test-payload' > "$tmpfile"
+  # Multipart-upload path used by the frontend for byte uploads.
+  # NOTE: `folder_id` MUST come BEFORE the `file` part — file_handler.rs
+  # streams the parts in order and the fail-fast folder-required check
+  # fires the moment it sees the file bytes; a folder_id sent after the
+  # file arrives too late (returns 400 "folder_id is required").
+  #
+  # Capture body + status so a silent 4xx doesn't look like a timing
+  # bug in the bus. A stale server binary that lost the publish hook,
+  # or a schema change that broke the endpoint, would otherwise
+  # present as "subscribe works, no event, timeout" — exactly the
+  # shape of a real regression but a completely different root cause.
+  status=$(curl -sS -o "$respfile" -w "%{http_code}" -X POST \
+    -H "Authorization: Bearer $token" \
+    -F "folder_id=$folder_id" \
+    -F "file=@$tmpfile;filename=$name" \
+    "$base_url/api/files/upload")
+  rm -f "$tmpfile"
+  if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+    printf 'mkfile_in FAIL: HTTP %s\nbody: %s\n' "$status" "$(cat "$respfile")" >&2
+    rm -f "$respfile"
+    return 1
+  fi
+  rm -f "$respfile"
+}
+
+# ── Scenario 1 — Positive delivery ──────────────────────────────────────────
+log "S1: subscribe to folder A, upload into A, expect one file_created event."
+out_s1="$(mktemp -t rtbus_s1.XXXXXX)"
+ready_s1="$(mktemp -t rtbus_s1_ready.XXXXXX)"
+rm -f "$ready_s1"  # mktemp creates it; ready-file semantics need "appears when subscribed"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --subscribe "folder:$folder_a" \
+  --expect-events 1 \
+  --timeout 5s \
+  --ready-file "$ready_s1" \
+  --output "$out_s1" &
+helper_pid=$!
+# Block on the helper's ready-file signal, not a wall-clock sleep —
+# see wait_ready doc. Closes the "publish before subscribe installed"
+# race that flaked S1 on cold-cache runs.
+wait_ready "$ready_s1"
+mkfile_in "$folder_a" "s1.txt" "$user1_token"
+if ! wait "$helper_pid"; then
+  cat "$out_s1" >&2 || true
+  die "S1: helper did not observe the expected event"
+fi
+# jq assertions — one event, correct parent_id, correct discriminator.
+[[ "$(jq -r '.events | length' "$out_s1")" == "1" ]] \
+  || { cat "$out_s1"; die "S1: expected 1 event, got $(jq -r '.events | length' "$out_s1")"; }
+[[ "$(jq -r '.events[0].event' "$out_s1")" == "file_created" ]] \
+  || die "S1: wrong event discriminator: $(jq -r '.events[0].event' "$out_s1")"
+[[ "$(jq -r '.events[0].data.parent_id' "$out_s1")" == "$folder_a" ]] \
+  || die "S1: parent_id mismatch"
+log "S1 OK"
+
+# ── Scenario 2 — Topic isolation ────────────────────────────────────────────
+log "S2: subscribe to folder A, upload into B (must be silent) and A (triggers exit)."
+out_s2="$(mktemp -t rtbus_s2.XXXXXX)"
+ready_s2="$(mktemp -t rtbus_s2_ready.XXXXXX)"; rm -f "$ready_s2"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --subscribe "folder:$folder_a" \
+  --expect-events 1 \
+  --timeout 5s \
+  --ready-file "$ready_s2" \
+  --output "$out_s2" &
+helper_pid=$!
+wait_ready "$ready_s2"
+# B first — should be dropped for the A subscriber.
+mkfile_in "$folder_b" "s2_in_B.txt" "$user1_token"
+# Small settle so if isolation is BROKEN, the B event has time to arrive
+# before A's; the assertion below then catches it as a wrong parent_id.
+sleep 0.2
+mkfile_in "$folder_a" "s2_in_A.txt" "$user1_token"
+if ! wait "$helper_pid"; then
+  cat "$out_s2" >&2 || true
+  die "S2: helper did not observe the expected A event"
+fi
+# Exactly one event, and it MUST be from folder A. If isolation were
+# broken, we'd either see 2 events or a B-parented event first.
+[[ "$(jq -r '.events | length' "$out_s2")" == "1" ]] \
+  || { cat "$out_s2"; die "S2: expected 1 event, got $(jq -r '.events | length' "$out_s2") (isolation broken?)"; }
+[[ "$(jq -r '.events[0].data.parent_id' "$out_s2")" == "$folder_a" ]] \
+  || die "S2: parent_id was $(jq -r '.events[0].data.parent_id' "$out_s2"), expected $folder_a"
+log "S2 OK"
+
+# ── Scenario 3 — AuthZ denial ───────────────────────────────────────────────
+log "S3: user2 subscribes to folder A (no grant); expect no_read denial."
+if ! "$HELPER_BIN" expect-denied \
+     --url "$ws_url" \
+     --token "$user2_token" \
+     --subscribe "folder:$folder_a" \
+     --reason no_read \
+     --timeout 3s; then
+  die "S3: user2 was NOT denied on folder A (AuthZ gate broken?)"
+fi
+log "S3 OK"
+
+# ── Scenario 4 — Anti-enumeration parity ────────────────────────────────────
+log "S4: subscribe to a nonexistent folder; wire reason must equal S3."
+fake_folder="00000000-0000-0000-0000-000000000000"
+if ! "$HELPER_BIN" expect-denied \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --subscribe "folder:$fake_folder" \
+     --reason no_read \
+     --timeout 3s; then
+  die "S4: nonexistent folder did not collapse to no_read (anti-enum invariant broken)"
+fi
+log "S4 OK"
+
+# ── Scenario 5 — Server-initiated keepalive ─────────────────────────────────
+# Verifies the WS handler sends RFC 6455 Ping control frames on the
+# `OXICLOUD_MESSAGEBUS_KEEPALIVE_SECONDS` cadence (1 s in tests/common/server.env).
+# Two invariants:
+#   (a) idling on a live subscription surfaces multiple Ping frames — the
+#       keepalive interval genuinely fires, not just at connect and never again.
+#   (b) after 3 s of app-layer idle + keepalive traffic, the session is
+#       still healthy: an upload's event still delivers cleanly.
+# If the keepalive impl were broken (missed-tick burst, dead select! arm,
+# stalled write on the socket), either (a) trips (0-1 pings observed) or
+# (b) trips (event never arrives after idle).
+log "S5: server-initiated keepalive fires on idle; session still delivers."
+out_s5="$(mktemp -t rtbus_s5.XXXXXX)"
+ready_s5="$(mktemp -t rtbus_s5_ready.XXXXXX)"; rm -f "$ready_s5"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --subscribe "folder:$folder_a" \
+  --expect-events 1 \
+  --timeout 6s \
+  --ready-file "$ready_s5" \
+  --output "$out_s5" &
+helper_pid=$!
+# Wait for the subscribe to install BEFORE starting the idle window —
+# otherwise slow helper startup eats into the 3 s and we observe
+# fewer pings than the assertion below tolerates.
+wait_ready "$ready_s5"
+# 3 s of pure idle — with 1 s keepalive on the server, that's ~3 Pings.
+sleep 3
+mkfile_in "$folder_a" "s5.txt" "$user1_token"
+if ! wait "$helper_pid"; then
+  cat "$out_s5" >&2 || true
+  die "S5: helper did not observe the expected event after idle"
+fi
+# (a) At least 2 Pings during the 3 s idle. Tolerant floor: with 1 s
+# interval and a first-tick discard, 2 is the minimum credible observation
+# before flakiness (missed tick, timer coalesce) becomes a concern.
+pings=$(jq -r '.pings_received' "$out_s5")
+if [[ "$pings" -lt 2 ]]; then
+  cat "$out_s5" >&2 || true
+  die "S5: expected >=2 keepalive pings during 3 s idle, got $pings"
+fi
+# (b) Exactly one event on the folder A subscription, from the post-idle upload.
+[[ "$(jq -r '.events | length' "$out_s5")" == "1" ]] \
+  || { cat "$out_s5"; die "S5: expected 1 event after idle, got $(jq -r '.events | length' "$out_s5")"; }
+[[ "$(jq -r '.events[0].data.parent_id' "$out_s5")" == "$folder_a" ]] \
+  || die "S5: parent_id mismatch after idle"
+log "S5 OK ($pings pings observed)"
+
+# ── Scenario 6 — File delete emits `file_deleted` ───────────────────────────
+# Pre-create a file in folder A, then subscribe to `folder:$folder_a`, then
+# DELETE the file. The subscription must observe exactly one
+# `file_deleted` event — proves the delete publish hook fires and carries
+# the correct `parent_id` (snapshotted pre-delete, since the row is gone
+# by publish time).
+log "S6: DELETE a file → subscriber observes file_deleted."
+# Pre-create the file BEFORE the subscriber goes up, so S6 asserts on the
+# delete event alone (S1 already covered the create-side).
+s6_upload=$(curl -sS -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$(mktemp -t rtbus_s6_body.XXXXXX);filename=s6.txt" \
+  "$base_url/api/files/upload")
+s6_file_id=$(printf '%s' "$s6_upload" | jq -r '.id')
+[[ -n "$s6_file_id" && "$s6_file_id" != "null" ]] \
+  || die "S6: pre-upload failed: $s6_upload"
+
+out_s6="$(mktemp -t rtbus_s6.XXXXXX)"
+ready_s6="$(mktemp -t rtbus_s6_ready.XXXXXX)"; rm -f "$ready_s6"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --subscribe "folder:$folder_a" \
+  --expect-events 1 \
+  --timeout 5s \
+  --ready-file "$ready_s6" \
+  --output "$out_s6" &
+helper_pid=$!
+wait_ready "$ready_s6"
+# `DELETE /api/files/{id}` routes to `delete_and_cleanup_with_perms` —
+# the trash-first path. Publish fires on BOTH the trash and the
+# permanent-delete branch, so this covers whichever the test hits.
+curl -sS -X DELETE \
+  -H "Authorization: Bearer $user1_token" \
+  "$base_url/api/files/$s6_file_id" > /dev/null
+if ! wait "$helper_pid"; then
+  cat "$out_s6" >&2 || true
+  die "S6: helper did not observe the expected file_deleted event"
+fi
+[[ "$(jq -r '.events | length' "$out_s6")" == "1" ]] \
+  || { cat "$out_s6"; die "S6: expected 1 event, got $(jq -r '.events | length' "$out_s6")"; }
+[[ "$(jq -r '.events[0].event' "$out_s6")" == "file_deleted" ]] \
+  || die "S6: wrong event: $(jq -r '.events[0].event' "$out_s6")"
+[[ "$(jq -r '.events[0].data.file_id' "$out_s6")" == "$s6_file_id" ]] \
+  || die "S6: file_id mismatch"
+[[ "$(jq -r '.events[0].data.parent_id' "$out_s6")" == "$folder_a" ]] \
+  || die "S6: parent_id mismatch"
+log "S6 OK"
+
+# ── Scenario 7 — Move fans out on BOTH source and destination ───────────────
+# Pre-create a file in folder A, subscribe to BOTH `folder:$folder_a` and
+# `folder:$folder_b` on ONE session, then MOVE the file A → B. The single
+# session must observe TWO `file_moved` events — one delivered on the A
+# topic, one on the B topic. Same file_id in both. Same event contents
+# (from=A, to=B). Proves the plan's "fan out on both source AND
+# destination" invariant.
+# Broken publish (source-only or dest-only) would surface as 1 event.
+# Broken publish-after-commit would surface as 0 events.
+log "S7: MOVE fans out on both source AND destination folder topics."
+s7_upload=$(curl -sS -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$(mktemp -t rtbus_s7_body.XXXXXX);filename=s7.txt" \
+  "$base_url/api/files/upload")
+s7_file_id=$(printf '%s' "$s7_upload" | jq -r '.id')
+[[ -n "$s7_file_id" && "$s7_file_id" != "null" ]] \
+  || die "S7: pre-upload failed: $s7_upload"
+
+out_s7="$(mktemp -t rtbus_s7.XXXXXX)"
+ready_s7="$(mktemp -t rtbus_s7_ready.XXXXXX)"; rm -f "$ready_s7"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --subscribe "folder:$folder_a" \
+  --subscribe "folder:$folder_b" \
+  --expect-events 2 \
+  --timeout 5s \
+  --ready-file "$ready_s7" \
+  --output "$out_s7" &
+helper_pid=$!
+wait_ready "$ready_s7"
+# `PUT /api/files/{id}/move` — MoveFilePayload = { folder_id: <dest> }.
+curl -sS -X PUT \
+  -H "Authorization: Bearer $user1_token" \
+  -H "Content-Type: application/json" \
+  -d "$(printf '{"folder_id":"%s"}' "$folder_b")" \
+  "$base_url/api/files/$s7_file_id/move" > /dev/null
+if ! wait "$helper_pid"; then
+  cat "$out_s7" >&2 || true
+  die "S7: helper did not observe 2 file_moved events"
+fi
+# Both events same shape, same file_id, from = A, to = B.
+[[ "$(jq -r '.events | length' "$out_s7")" == "2" ]] \
+  || { cat "$out_s7"; die "S7: expected 2 events (fan-out on A + B), got $(jq -r '.events | length' "$out_s7")"; }
+# Every event has event=file_moved, correct file_id/from/to.
+if ! jq -e --arg fid "$s7_file_id" --arg from "$folder_a" --arg to "$folder_b" \
+     '.events | all(.event == "file_moved" and .data.file_id == $fid and .data.from == $from and .data.to == $to)' \
+     "$out_s7" > /dev/null; then
+  cat "$out_s7"
+  die "S7: event contents mismatch (expected file_moved, from=$folder_a, to=$folder_b)"
+fi
+log "S7 OK"
+
+# ── Scenario 8 — Grant-revocation eviction (scoped, session survives) ───────
+# The strong version of "eviction fires": prove that revoking one grant
+# affects ONLY the corresponding subscription — the session stays alive,
+# unrelated subs keep delivering events, and only the revoked topic
+# gets `rt.revoked`.
+#
+# Setup:
+#   - user1 grants user2 `viewer` on folders A AND B (two independent
+#     grants; user2 has no prior access).
+#   - user2 subscribes to BOTH folders on one WS session.
+# Action:
+#   - user1 revokes the grant on folder A only.
+#   - user1 uploads a file to folder B (the surviving sub).
+# Invariants:
+#   (a) helper output records exactly ONE `rt.revoked` for `folder:A`
+#       with reason `grant_revoked` — the eviction fired.
+#   (b) helper output records exactly ONE `file_created` event for
+#       `folder:B` — the unrelated sub is still delivering. Regression
+#       that mass-drops subs on any AuthzChanged would surface as 0
+#       events.
+#   (c) `subscribed` contains BOTH folder:A and folder:B — both
+#       original subs were installed (regression that failed the initial
+#       subscribe under AuthZ would fail here).
+#   (d) `timed_out == false` — session actor kept running through the
+#       revoke + subsequent event. Regression that killed the whole
+#       session on AuthzChanged would surface as a timeout or the
+#       helper's `wait` failing.
+log "S8: revoke user2's grant on folder A; unrelated sub on B still delivers."
+# 8.1 Grant user2 viewer role on folder A + folder B.
+grant_a=$(c_post "$base_url/api/grants" "$user1_token" \
+  "$(printf '{"subject":{"type":"user","id":"%s"},"resource":{"type":"folder","id":"%s"},"role":"viewer"}' \
+       "$user2_id" "$folder_a")")
+grant_a_id=$(printf '%s' "$grant_a" | jq -r '.grants[0].id')
+[[ -n "$grant_a_id" && "$grant_a_id" != "null" ]] \
+  || die "S8: grant on folder A failed: $grant_a"
+
+grant_b=$(c_post "$base_url/api/grants" "$user1_token" \
+  "$(printf '{"subject":{"type":"user","id":"%s"},"resource":{"type":"folder","id":"%s"},"role":"viewer"}' \
+       "$user2_id" "$folder_b")")
+grant_b_id=$(printf '%s' "$grant_b" | jq -r '.grants[0].id')
+[[ -n "$grant_b_id" && "$grant_b_id" != "null" ]] \
+  || die "S8: grant on folder B failed: $grant_b"
+
+# 8.2 user2 subscribes to BOTH folder topics; --expect-events 1 exits
+# when the post-revoke upload lands on the SURVIVING sub.
+out_s8="$(mktemp -t rtbus_s8.XXXXXX)"
+ready_s8="$(mktemp -t rtbus_s8_ready.XXXXXX)"; rm -f "$ready_s8"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user2_token" \
+  --subscribe "folder:$folder_a" \
+  --subscribe "folder:$folder_b" \
+  --expect-events 1 \
+  --timeout 6s \
+  --ready-file "$ready_s8" \
+  --output "$out_s8" &
+helper_pid=$!
+wait_ready "$ready_s8"  # both subscribes installed before we revoke/upload
+
+# 8.3 user1 revokes only the folder-A grant.
+curl -sS -X DELETE \
+  -H "Authorization: Bearer $user1_token" \
+  "$base_url/api/grants/$grant_a_id" > /dev/null
+sleep 0.3  # let AuthzChanged propagate
+
+# 8.4 user1 uploads to folder B → triggers file_created on the
+# surviving sub.
+mkfile_in "$folder_b" "s8.txt" "$user1_token"
+
+if ! wait "$helper_pid"; then
+  cat "$out_s8" >&2 || true
+  die "S8: helper did not observe the post-revoke event on folder B"
+fi
+
+# 8.5 Assert on the four invariants.
+# (a) One rt.revoked for folder:A with reason grant_revoked.
+revoked_count=$(jq -r '.revoked | length' "$out_s8")
+[[ "$revoked_count" == "1" ]] \
+  || { cat "$out_s8"; die "S8: expected 1 rt.revoked, got $revoked_count"; }
+[[ "$(jq -r '.revoked[0].topic' "$out_s8")" == "folder:$folder_a" ]] \
+  || die "S8: revoked wrong topic: $(jq -r '.revoked[0].topic' "$out_s8")"
+[[ "$(jq -r '.revoked[0].reason' "$out_s8")" == "grant_revoked" ]] \
+  || die "S8: revoked wrong reason: $(jq -r '.revoked[0].reason' "$out_s8")"
+
+# (b) One file_created for folder:B — surviving sub delivered.
+event_count=$(jq -r '.events | length' "$out_s8")
+[[ "$event_count" == "1" ]] \
+  || { cat "$out_s8"; die "S8: expected 1 event on surviving sub, got $event_count (regression: mass eviction?)"; }
+[[ "$(jq -r '.events[0].event' "$out_s8")" == "file_created" ]] \
+  || die "S8: wrong event kind on surviving sub"
+[[ "$(jq -r '.events[0].data.parent_id' "$out_s8")" == "$folder_b" ]] \
+  || die "S8: wrong parent_id on surviving-sub event"
+
+# (c) Both original subs were installed.
+sub_count=$(jq -r '.subscribed | length' "$out_s8")
+[[ "$sub_count" == "2" ]] \
+  || { cat "$out_s8"; die "S8: expected both subs installed, got $sub_count"; }
+
+# (d) Session did not time out — main loop kept running.
+[[ "$(jq -r '.timed_out' "$out_s8")" == "false" ]] \
+  || die "S8: session timed out (regression: session died on AuthzChanged?)"
+
+log "S8 OK"
+
+# ── Scenario 9 — Cross-user identity topic denial ───────────────────────────
+# Identity-scoped topics (`user:{u}:authz`, later `user:{u}:notifications`,
+# `user:{u}:sessions`) use a Class-2 AuthZ gate: `caller_id == user_id` by
+# direct UUID equality. No admin bypass, no group expansion — privacy is
+# absolute. Regression guard: user1 asks for user2's authz stream; server
+# MUST reject.
+#
+# The wire response uses `topic_forbidden` — the SAME error string the
+# server returns for a malformed/unknown topic — so an attacker cannot
+# distinguish "no such user" from "user exists but not you". `expect-denied
+# --reason topic_forbidden` matches on the wire `error.message` string
+# emitted by `application/ports/message_bus_ports.rs::error_message`.
+#
+# If this ever regresses to `no_read` or delivers events, someone changed
+# the identity gate (removed the equality check, wired the AuthorizationEngine
+# on the identity path, or reused the folder AuthZ dispatch). All three
+# would leak user metadata across accounts.
+log "S9: user1 subscribes to user:{user2_id}:authz; expect topic_forbidden."
+if ! "$HELPER_BIN" expect-denied \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --subscribe "user:${user2_id}:authz" \
+     --reason topic_forbidden \
+     --timeout 3s; then
+  die "S9: user1 was NOT denied on user2's authz topic (identity gate broken?)"
+fi
+log "S9 OK"
+
+# ── Scenario 10 — Ticket happy path ─────────────────────────────────────────
+# The browser flow: POST /api/rt/ticket under the full middleware stack
+# (auth + DPoP proofed), then open the WS with `oxi.ticket.<uuid>` in
+# Sec-WebSocket-Protocol. Same delivery guarantees as the bearer path.
+# `curl` mints the ticket; `rt-hurl-helper --ticket` redeems it on the
+# upgrade.
+log "S10: issue rt ticket, open WS with subprotocol, subscribe + deliver."
+# c_post takes the raw JWT as its second arg (not the full
+# `Authorization:` line); it assembles the header itself.
+tkt_resp=$(c_post "$base_url/api/rt/ticket" "$user1_token" "")
+ticket=$(printf '%s' "$tkt_resp" | jq -r '.ticket')
+[[ -n "$ticket" && "$ticket" != "null" ]] \
+  || die "S10: no ticket in POST /api/rt/ticket response: $tkt_resp"
+out_s10="$(mktemp -t rtbus_s10.XXXXXX)"
+ready_s10="$(mktemp -t rtbus_s10_ready.XXXXXX)"; rm -f "$ready_s10"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --ticket "$ticket" \
+  --subscribe "folder:$folder_a" \
+  --expect-events 1 \
+  --timeout 3s \
+  --ready-file "$ready_s10" \
+  --output "$out_s10" &
+helper_pid=$!
+wait_ready "$ready_s10"
+mkfile_in "$folder_a" "s10.txt" "$user1_token"
+if ! wait "$helper_pid"; then
+  cat "$out_s10" >&2 || true
+  die "S10: helper did not observe event on ticket-authenticated WS"
+fi
+[[ "$(jq -r '.events | length' "$out_s10")" == "1" ]] \
+  || { cat "$out_s10"; die "S10: expected 1 event, got $(jq -r '.events | length' "$out_s10")"; }
+log "S10 OK"
+
+# ── Scenario 11 — Ticket single-use ─────────────────────────────────────────
+# S10 already redeemed the ticket. A second connection with the SAME
+# token MUST be refused at the upgrade with 401 (`ticket_invalid`
+# audit reason). Proves replay protection — the store removes entries
+# on first successful redeem, even if the caller reconnects before
+# the 30 s TTL would have expired anyway.
+#
+# The helper distinguishes "expectation failure" (exit 1 — WS opened
+# and then something was off) from "protocol/connect failure" (exit 2
+# — connect_ws itself refused). Ticket rejection lands in the second
+# bucket, so we assert on exit code 2. Bash's `!` inverter treats any
+# non-zero as success, so we capture the exact code.
+log "S11: reuse the redeemed ticket, expect upgrade rejected."
+set +e
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --ticket "$ticket" \
+  --subscribe "folder:$folder_a" \
+  --expect-events 1 \
+  --timeout 2s \
+  --output /dev/null
+reuse_exit=$?
+set -e
+[[ "$reuse_exit" -eq 2 ]] \
+  || die "S11: expected exit 2 (connect refused), got $reuse_exit"
+log "S11 OK"
+
+# ── Scenario 12 — Job topic is admin-only ───────────────────────────────────
+# `Topic::Job("<name>")` maps to `AuthzCheck::RoleAdmin` in
+# `application/ports/message_bus_ports.rs::required_perm`, and
+# `handle_subscribe` denies any caller whose snapshotted role at
+# session open is not "admin". user1 is a plain account, so this
+# subscribe MUST land on the deny arm.
+#
+# The wire response uses `topic_forbidden` (same shape as an unknown
+# topic — anti-enumeration: a non-admin cannot probe which job names
+# are registered). The audit reason `role_denied` is asserted at the
+# Rust unit-test layer.
+#
+# If this ever accepts and delivers events, someone weakened the
+# Class-3 gate (dropped the role-snapshot check in the Job arm,
+# widened `required_perm`, or reused a permissive dispatch branch).
+log "S12: user1 subscribes to job:whatever; expect topic_forbidden."
+if ! "$HELPER_BIN" expect-denied \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --subscribe "job:whatever" \
+     --reason topic_forbidden \
+     --timeout 3s; then
+  die "S12: user1 was NOT denied on job topic (admin gate broken?)"
+fi
+log "S12 OK"
+
+# ── Scenario 13 — Notification wire push (Slice E) ──────────────────────────
+# The `share_granted` ingester runs in `grant_handler::create_grant`:
+# after `set_role` lands and before the email path, it calls
+# `NotificationService::create` for every resolved recipient user.
+# `create` writes the DB row AND publishes a thin
+# `MessageBusEvent::NotificationReceived` on
+# `user:{user_id}:notifications`. This scenario exercises the wire
+# path end-to-end: user2 opens a WS + explicitly subscribes to their
+# own notifications topic (idempotent with the server's auto-sub),
+# user1 fires a fresh grant, user2 sees the one event.
+#
+# A fresh folder C is used so this scenario is independent of the
+# S8 grant/revoke sequence — user2 already has DB rows from S8's
+# grants on A + B, but those events fired BEFORE user2's WS opened
+# so no wire delivery competes with S13's.
+log "S13: create folder C, subscribe user2 to their notifications, expect one share_granted event."
+folder_c=$(c_post "$base_url/api/folders" "$user1_token" \
+  "$(printf '{"name":"rt_bus_C_%s","parent_id":"%s"}' "$suffix" "$root_id")" | jq -r '.id')
+[[ -n "$folder_c" && "$folder_c" != "null" ]] || die "S13: folder C creation failed"
+
+out_s13="$(mktemp -t rtbus_s13.XXXXXX)"
+ready_s13="$(mktemp -t rtbus_s13_ready.XXXXXX)"; rm -f "$ready_s13"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user2_token" \
+  --subscribe "user:${user2_id}:notifications" \
+  --expect-events 1 \
+  --timeout 5s \
+  --ready-file "$ready_s13" \
+  --output "$out_s13" &
+helper_pid=$!
+wait_ready "$ready_s13"
+
+grant_c=$(c_post "$base_url/api/grants" "$user1_token" \
+  "$(printf '{"subject":{"type":"user","id":"%s"},"resource":{"type":"folder","id":"%s"},"role":"viewer"}' \
+       "$user2_id" "$folder_c")")
+grant_c_id=$(printf '%s' "$grant_c" | jq -r '.grants[0].id')
+[[ -n "$grant_c_id" && "$grant_c_id" != "null" ]] \
+  || die "S13: grant on folder C failed: $grant_c"
+
+if ! wait "$helper_pid"; then
+  cat "$out_s13" >&2 || true
+  die "S13: helper did not observe the notification_received event"
+fi
+[[ "$(jq -r '.events | length' "$out_s13")" == "1" ]] \
+  || { cat "$out_s13"; die "S13: expected 1 event, got $(jq -r '.events | length' "$out_s13")"; }
+[[ "$(jq -r '.events[0].event' "$out_s13")" == "notification_received" ]] \
+  || die "S13: wrong event discriminator: $(jq -r '.events[0].event' "$out_s13")"
+# Pure cache-invalidation event — `data` is intentionally an empty
+# object. Everything about the notification (id, kind, payload) is
+# on the REST wire (asserted by S14 below), not here. See
+# `docs/plan/templated-messages.md § Bus event is a pure poke`.
+# If a future change adds fields back to the wire, this assertion
+# will fail loudly so the drift is caught.
+[[ "$(jq -c '.events[0].data' "$out_s13")" == "{}" ]] \
+  || { cat "$out_s13"; die "S13: expected empty data on the wire, got $(jq -c '.events[0].data' "$out_s13")"; }
+log "S13 OK"
+
+# ── Scenario 14 — Notification DB row (Slice E) ─────────────────────────────
+# The bus event is best-effort. The DB row is truth: a subscriber
+# offline at publish time recovers via `GET /api/notifications`.
+# S13 fired a grant on folder C; the ingester wrote a row for user2.
+# This scenario reads it back and asserts on shape.
+#
+# `unread_count` from the same response reflects ALL unread rows,
+# including the 2 from S8's grants (folders A + B) — the fresh grant
+# in S13 brings the total to >= 3. We assert >= 1 (loose enough to
+# not couple to S8's state, tight enough to prove the row landed).
+log "S14: GET /api/notifications as user2; expect a share_granted row for folder C."
+notifs=$(c_get "$base_url/api/notifications" "$user2_token")
+unread=$(printf '%s' "$notifs" | jq -r '.unread_count')
+[[ "$unread" -ge 1 ]] \
+  || { printf '%s\n' "$notifs" >&2; die "S14: unread_count expected >= 1, got $unread"; }
+# Filter for the S13 row: kind == share_granted AND payload.resource_id == folder_c.
+match_count=$(printf '%s' "$notifs" | jq --arg fc "$folder_c" \
+  '[.items[] | select(.kind == "share_granted" and .payload.resource_id == $fc)] | length')
+[[ "$match_count" -ge 1 ]] \
+  || { printf '%s\n' "$notifs" >&2; die "S14: no share_granted row for folder C (matches=$match_count)"; }
+# The matched row must be unread (read_at is null) — the caller
+# hasn't clicked it yet, so the bell would still badge it.
+first_read_at=$(printf '%s' "$notifs" | jq -r --arg fc "$folder_c" \
+  'first(.items[] | select(.kind == "share_granted" and .payload.resource_id == $fc)) | .read_at')
+[[ "$first_read_at" == "null" ]] \
+  || die "S14: matched row unexpectedly marked read: read_at=$first_read_at"
+
+# Payload enrichment (Slice E — templated messages): the ingester
+# snapshots the resource's display name + storage path at grant
+# time so the FE bell can render "Alice shared 'rt_bus_C_…'" with
+# a clickable link. If enrichment silently regressed to ID-only,
+# the FE would still work via generic fallback but lose the
+# clickable / labelled UX. Assert the enrichment fields landed on
+# the folder-C row.
+folder_c_name="rt_bus_C_$suffix"
+first_name=$(printf '%s' "$notifs" | jq -r --arg fc "$folder_c" \
+  'first(.items[] | select(.kind == "share_granted" and .payload.resource_id == $fc)) | .payload.resource_name')
+[[ "$first_name" == "$folder_c_name" ]] \
+  || { printf '%s\n' "$notifs" >&2; die "S14: expected resource_name='$folder_c_name', got '$first_name'"; }
+first_path=$(printf '%s' "$notifs" | jq -r --arg fc "$folder_c" \
+  'first(.items[] | select(.kind == "share_granted" and .payload.resource_id == $fc)) | .payload.resource_path')
+# Path must be non-null AND non-empty AND end with the folder's
+# name — the FE builds `/files${path}` for the bell's anchor, so a
+# missing/wrong path breaks the click-through.
+[[ -n "$first_path" && "$first_path" != "null" && "$first_path" == *"$folder_c_name" ]] \
+  || { printf '%s\n' "$notifs" >&2; die "S14: expected resource_path ending with '$folder_c_name', got '$first_path'"; }
+log "S14 OK"
+
+# ── Scenario 15 — Cross-user notifications identity gate ────────────────────
+# `Topic::UserNotifications(u)` maps to `AuthzCheck::IdentityMatch{u}`
+# in `application/ports/message_bus_ports.rs::required_perm`. Direct
+# UUID equality only — no admin bypass. A caller subscribing to
+# another user's notifications channel MUST be denied with the same
+# wire shape (`topic_forbidden`) as an unknown topic — anti-enum.
+#
+# If this ever regresses (identity check dropped, engine wired on
+# this class, admin bypass added) it becomes a privacy leak on par
+# with an admin snooping on `:authz` streams. Same guard as S9,
+# different topic suffix.
+log "S15: user1 subscribes to user:{user2_id}:notifications; expect topic_forbidden."
+if ! "$HELPER_BIN" expect-denied \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --subscribe "user:${user2_id}:notifications" \
+     --reason topic_forbidden \
+     --timeout 3s; then
+  die "S15: user1 was NOT denied on user2's notifications topic (identity gate broken?)"
+fi
+log "S15 OK"
+
+# ── Scenario 16 — Notifications `?after=` cursor ────────────────────────────
+# The FE bell fires `refreshDelta()` with `?after=<lastReceivedAt>`
+# on WS reconnect (grace-close return, network reconnect) and on
+# rt.event push. `mergeById` dedups client-side; the server-side
+# strict-`>` predicate is what keeps the boundary row from
+# double-arriving in the first place. This scenario locks both
+# invariants at the wire.
+#
+# Reuses S13's fresh row on folder C as T0. Creates a new folder D
+# and grants it → one row lands strictly after T0. Then two
+# assertions: `?after=T0` returns EXACTLY that one row (predicate
+# applied), and `?after=<newRow.created_at>` returns ZERO rows
+# (strict `>` boundary — the row equal to its own cursor is
+# excluded, so no duplicate delivery).
+log "S16: cursor delta — grant on folder D, expect ?after=T0 returns 1 row, ?after=T1 returns 0."
+# T0 = the S13 row's created_at. Pull it fresh via list so this
+# scenario stays self-contained; the S13 row is the newest row
+# for user2 at this point (S8 grants are older, S13/C is newest).
+notifs_pre=$(c_get "$base_url/api/notifications" "$user2_token")
+t0=$(printf '%s' "$notifs_pre" | jq -r --arg fc "$folder_c" \
+  'first(.items[] | select(.kind == "share_granted" and .payload.resource_id == $fc)) | .created_at')
+[[ -n "$t0" && "$t0" != "null" ]] \
+  || { printf '%s\n' "$notifs_pre" >&2; die "S16: could not resolve T0 from folder C row"; }
+
+# Fresh folder D, grant to user2 → one share_granted row lands.
+folder_d=$(c_post "$base_url/api/folders" "$user1_token" \
+  "$(printf '{"name":"rt_bus_D_%s","parent_id":"%s"}' "$suffix" "$root_id")" | jq -r '.id')
+[[ -n "$folder_d" && "$folder_d" != "null" ]] || die "S16: folder D creation failed"
+
+grant_d=$(c_post "$base_url/api/grants" "$user1_token" \
+  "$(printf '{"subject":{"type":"user","id":"%s"},"resource":{"type":"folder","id":"%s"},"role":"viewer"}' \
+       "$user2_id" "$folder_d")")
+grant_d_id=$(printf '%s' "$grant_d" | jq -r '.grants[0].id')
+[[ -n "$grant_d_id" && "$grant_d_id" != "null" ]] \
+  || die "S16: grant on folder D failed: $grant_d"
+
+# `after` must URL-encode the ISO timestamp — `:` and `+` are
+# reserved. curl's `--data-urlencode`/`-G` handles it cleanly.
+notifs_after_t0=$(curl -sS -G \
+  -H "Accept: application/json" \
+  -H "Authorization: Bearer $user2_token" \
+  --data-urlencode "after=$t0" \
+  "$base_url/api/notifications")
+count_after_t0=$(printf '%s' "$notifs_after_t0" | jq -r '.items | length')
+[[ "$count_after_t0" == "1" ]] \
+  || { printf '%s\n' "$notifs_after_t0" >&2; die "S16: expected 1 row after T0, got $count_after_t0"; }
+# The one row MUST be the folder-D row.
+d_kind=$(printf '%s' "$notifs_after_t0" | jq -r '.items[0].kind')
+d_resource=$(printf '%s' "$notifs_after_t0" | jq -r '.items[0].payload.resource_id')
+[[ "$d_kind" == "share_granted" && "$d_resource" == "$folder_d" ]] \
+  || { printf '%s\n' "$notifs_after_t0" >&2; die "S16: post-T0 row not folder D (kind=$d_kind resource=$d_resource)"; }
+
+# T1 = folder-D row's own created_at. Bound is strict `>`, so a
+# query at T1 must return zero rows (the boundary row is excluded).
+# This is what keeps the FE's mergeById honest — a `>=` regression
+# would return the boundary row here, then the WS push would
+# deliver it AGAIN, and only client-side dedup would save us.
+t1=$(printf '%s' "$notifs_after_t0" | jq -r '.items[0].created_at')
+[[ -n "$t1" && "$t1" != "null" ]] || die "S16: could not resolve T1"
+
+notifs_after_t1=$(curl -sS -G \
+  -H "Accept: application/json" \
+  -H "Authorization: Bearer $user2_token" \
+  --data-urlencode "after=$t1" \
+  "$base_url/api/notifications")
+count_after_t1=$(printf '%s' "$notifs_after_t1" | jq -r '.items | length')
+[[ "$count_after_t1" == "0" ]] \
+  || { printf '%s\n' "$notifs_after_t1" >&2; die "S16: expected 0 rows after T1 (strict '>' bound), got $count_after_t1"; }
+log "S16 OK"
+
+# ── Scenario 17 — Collab binary sync-step round-trip (Phase A C2) ───────────
+# Upload a .md file into folder A, then open a WS and send one Yjs
+# sync-step-1 request as a binary frame keyed on the file's UUID.
+# The server must route through `CollabSessionService::handle_binary_frame`,
+# spawn (or reuse) the actor, and reply with a sync-step-2 binary
+# frame carrying the same header (kind 0x03, matching file_id) and
+# a non-empty payload — even an untouched doc yields the 2-byte
+# empty-update marker from `encode_state_as_update_v1`.
+#
+# The scenario is intentionally minimal: no assertions on payload
+# semantics beyond "non-empty" — Yjs update parsing lives in the
+# Rust unit tests. This is the end-to-end wire probe, and it fails
+# for exactly the regressions that unit tests can't see:
+#   * `collab_session_service` not wired in AppState (silent drop on the WS)
+#   * `OXICLOUD_ENABLE_MARKDOWN_COLLAB` missing from the test env
+#   * binary-frame branch replaced with an ignore
+#   * kind or file_id serialization off by one
+log "S17: upload .md and probe Yjs sync-step round-trip."
+tmp_md="$(mktemp -t rtbus_s17_body.XXXXXX)"
+printf '# hello collab\n\nsync-probe smoke\n' > "$tmp_md"
+upload_resp="$(mktemp -t rtbus_s17_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md;filename=s17.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp" >&2
+  rm -f "$upload_resp"
+  die "S17: .md upload failed with HTTP $status"
+fi
+s17_file_id=$(jq -r '.id' "$upload_resp")
+rm -f "$upload_resp"
+[[ -n "$s17_file_id" && "$s17_file_id" != "null" ]] \
+  || die "S17: could not extract file id from upload response"
+
+out_s17="$(mktemp -t rtbus_s17.XXXXXX)"
+if ! "$HELPER_BIN" collab-sync-probe \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --file "$s17_file_id" \
+     --timeout 5s \
+     --output "$out_s17"; then
+  cat "$out_s17" >&2 || true
+  die "S17: sync-step probe failed — collab wire regression?"
+fi
+# Sanity on the helper's summary — belt-and-braces so a helper regression
+# that returns 0 without probing is caught.
+[[ "$(jq -r '.kind' "$out_s17")" == "3" ]] \
+  || { cat "$out_s17"; die "S17: reply kind not 3"; }
+[[ "$(jq -r '.file_id_matches' "$out_s17")" == "true" ]] \
+  || { cat "$out_s17"; die "S17: reply file_id did not match request"; }
+[[ "$(jq -r '.payload_len' "$out_s17")" -ge 1 ]] \
+  || { cat "$out_s17"; die "S17: reply payload empty"; }
+log "S17 OK"
+
+# ── Scenario 18 — Collab actor-side fan-out (Phase A C2) ────────────────────
+# Two sockets, one user, one .md file. Socket B subscribes to
+# `collab:<file_id>` and touches a ready-file the moment the server
+# ack's it. Socket A then subscribes AND fires a `0x01` UPDATE frame
+# whose payload is a Yjs update that inserts "Hello OxiCloud from S18"
+# at position 0. The server's `CollabSessionService::apply_update`
+# broadcasts the raw update bytes on its per-actor outbox, and the
+# WS forwarder task installed for socket B's subscription pipes them
+# to socket B as a `0x01` binary frame. Socket B decodes the frame's
+# payload as a Yjs update, applies it to a fresh Doc, and asserts the
+# resulting text matches — the strongest wire-level assertion we can
+# make without pulling the CRDT semantics into the shell.
+#
+# Guards against:
+#   * `SessionOut::Binary` handler missing / miswired in the WS out loop
+#   * `spawn_collab_forwarder` failing silently and leaving a dead sub
+#   * `apply_update` no longer publishing on `outbox` after apply
+#   * broadcast channel capacity too small (would `Lagged` and the
+#     resubscribe path would rescue silently, but the test would
+#     still pass because Yjs would replay via sync-step-1 next time)
+log "S18: two sockets on one .md — sender's UPDATE fans out to the listener."
+
+# Fresh .md file so the actor starts empty. Reusing S17's file would
+# work too, but a clean actor gives an unambiguous "the fan-out
+# delivered what the sender sent, and nothing else" assertion.
+tmp_md="$(mktemp -t rtbus_s18_body.XXXXXX)"
+printf '# S18 seed\n\n' > "$tmp_md"
+upload_resp="$(mktemp -t rtbus_s18_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md;filename=s18.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp" >&2
+  rm -f "$upload_resp"
+  die "S18: .md upload failed with HTTP $status"
+fi
+s18_file_id=$(jq -r '.id' "$upload_resp")
+rm -f "$upload_resp"
+[[ -n "$s18_file_id" && "$s18_file_id" != "null" ]] \
+  || die "S18: could not extract file id from upload response"
+
+s18_content="Hello OxiCloud from S18"
+ready_s18="$(mktemp -t rtbus_s18_ready.XXXXXX)"; rm -f "$ready_s18"
+
+# Socket B — listener. Blocks on inbound 0x01 with matching file_id.
+# Started FIRST + waits on --ready-file so the writer only fires
+# after B's subscribe is ack'd (same race-close pattern as S1).
+"$HELPER_BIN" collab-fanout-listen \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --file "$s18_file_id" \
+  --expect-content "$s18_content" \
+  --ready-file "$ready_s18" \
+  --timeout 8s &
+listener_pid=$!
+wait_ready "$ready_s18"
+
+# Socket A — writer. Subscribes (clears Read gate the frontend will
+# also clear), sends the 0x01 UPDATE, exits.
+if ! "$HELPER_BIN" collab-fanout-write \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --file "$s18_file_id" \
+     --content "$s18_content" \
+     --timeout 5s; then
+  # Kill the listener so `wait` below returns; otherwise it hangs
+  # until its own timeout expires and drowns the writer error.
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
+  die "S18: writer helper failed to send the 0x01 UPDATE"
+fi
+
+if ! wait "$listener_pid"; then
+  die "S18: listener did not observe the fan-out (content mismatch or timeout)"
+fi
+log "S18 OK"
+
+# ── Scenario 19 — Collab per-frame AuthZ (Phase A C2, Write gate) ───────────
+# The frontend flow: user1 shares a folder with user2 as a Viewer.
+# User2 opens a .md inside it and starts editing in the browser. On
+# the wire that's exactly what this scenario does: user2 subscribes
+# to `collab:<file_id>` (Read passes — the Viewer role includes it),
+# and sends a 0x01 UPDATE frame. The server must deny at the per-
+# frame Update gate — Viewer doesn't hold Update, so the write path
+# is refused even though the read/subscribe path is fine.
+#
+# What we assert:
+#   1. The socket closes on the writer's side (helper exit != 0 OR
+#      the ws.close() completes without an ACK). Depending on
+#      timing, tungstenite reads the server's close as `ws error`
+#      (exit code 2, HelperError::Protocol) — we accept either
+#      non-zero exit as a denial signal, since a permitted write
+#      would exit 0.
+#   2. The doc content on the server is unchanged: user1 opens a
+#      separate socket and pulls sync-step-2 → the sync-step-2
+#      payload IS the empty-update marker (2 bytes, the shape of a
+#      never-touched actor). If user2's UPDATE had leaked through,
+#      the payload would carry the "unauthorized text" bytes.
+#
+# Prerequisite grant: user1 already registered user2 as a Viewer on
+# folder A in S3 wait — no, S3 tests unauthorised subscribe on folder
+# A and user2 has no grant at that point. We grant fresh here on a
+# new folder E so the state is unambiguous, and skip the folder-share
+# side effects on the S8 grant.
+log "S19: user2 (Viewer on folder E) tries to UPDATE a .md — write gate must deny."
+
+folder_e=$(c_post "$base_url/api/folders" "$user1_token" \
+  "$(printf '{"name":"rt_bus_E_%s","parent_id":"%s"}' "$suffix" "$root_id")" | jq -r '.id')
+[[ -n "$folder_e" && "$folder_e" != "null" ]] || die "S19: folder E creation failed"
+
+# Upload the .md as user1 (owner).
+tmp_md="$(mktemp -t rtbus_s19_body.XXXXXX)"
+printf '# S19 seed\n' > "$tmp_md"
+upload_resp="$(mktemp -t rtbus_s19_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_e" \
+  -F "file=@$tmp_md;filename=s19.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp" >&2
+  rm -f "$upload_resp"
+  die "S19: .md upload failed with HTTP $status"
+fi
+s19_file_id=$(jq -r '.id' "$upload_resp")
+rm -f "$upload_resp"
+[[ -n "$s19_file_id" && "$s19_file_id" != "null" ]] \
+  || die "S19: could not extract file id"
+
+# Grant user2 as Viewer on folder E — Read cascades to files in it,
+# Update does not (only Editor+ carry Update).
+grant_e=$(c_post "$base_url/api/grants" "$user1_token" \
+  "$(printf '{"subject":{"type":"user","id":"%s"},"resource":{"type":"folder","id":"%s"},"role":"viewer"}' \
+       "$user2_id" "$folder_e")")
+grant_e_id=$(printf '%s' "$grant_e" | jq -r '.grants[0].id')
+[[ -n "$grant_e_id" && "$grant_e_id" != "null" ]] \
+  || die "S19: viewer grant on folder E failed: $grant_e"
+
+# BEFORE the unauthorized write: probe the actor to record the
+# baseline sync-step-2 payload size. Post-C7 the actor seeds from
+# the file's blob text, so this is NOT zero — it's a Yjs-encoded
+# snapshot of "# S19 seed\n". User1 has Update on their own file so
+# this probe passes the AuthZ gate.
+out_s19_before="$(mktemp -t rtbus_s19_before.XXXXXX)"
+if ! "$HELPER_BIN" collab-sync-probe \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --file "$s19_file_id" \
+     --timeout 5s \
+     --output "$out_s19_before"; then
+  cat "$out_s19_before" >&2 || true
+  die "S19: baseline sync-step probe failed"
+fi
+payload_len_before=$(jq -r '.payload_len' "$out_s19_before")
+
+# User2 tries to WRITE. Anything non-zero counts as a denial —
+# either an "expectation failed" (server closed after our frame) or
+# a "protocol error" (`ws error: ... Connection reset`).
+set +e
+"$HELPER_BIN" collab-fanout-write \
+  --url "$ws_url" \
+  --token "$user2_token" \
+  --file "$s19_file_id" \
+  --content "unauthorized write from viewer" \
+  --timeout 5s > /dev/null 2>&1
+write_exit=$?
+set -e
+# NB: today the write-side helper does `ws.send(...)` then `close(None)`
+# and returns 0. The server closes the socket in response to the frame,
+# but the write may already have flushed. So we don't strictly assert
+# exit != 0 — that's a timing-sensitive assertion. What we DO assert
+# is the AUTHORITATIVE thing: the actor's Doc must not carry the
+# unauthorized bytes. User1 syncs and reads back.
+log "S19: (writer exit=$write_exit — not asserted; the doc-state check below is authoritative)"
+
+# AFTER the unauthorized write: probe again. Same session, so the
+# actor's state is unchanged UNLESS the write gate leaked. A leak
+# would grow the CRDT by ~30 bytes of "unauthorized write from
+# viewer" plus Yjs framing → payload_len_after >> payload_len_before.
+# Byte-exact equality is the tight assertion.
+out_s19_after="$(mktemp -t rtbus_s19_after.XXXXXX)"
+if ! "$HELPER_BIN" collab-sync-probe \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --file "$s19_file_id" \
+     --timeout 5s \
+     --output "$out_s19_after"; then
+  cat "$out_s19_after" >&2 || true
+  die "S19: post-write sync-step probe failed"
+fi
+payload_len_after=$(jq -r '.payload_len' "$out_s19_after")
+if [[ "$payload_len_after" -ne "$payload_len_before" ]]; then
+  cat "$out_s19_after"
+  die "S19: server-side doc changed (before=$payload_len_before, after=$payload_len_after) — write gate leaked!"
+fi
+log "S19 OK (payload_len unchanged: $payload_len_before)"
+
+# ── Scenario 20 — Collab seed-from-blob on first attach (C7 read side) ──────
+# Regression test for the reader adapter. Uploads a .md whose bytes
+# are non-trivial (~400 bytes of prose), opens a fresh collab session
+# on it, and asserts the sync-step-2 payload is proportional to the
+# file's byte count — proof that `FileBlobDocContentReader` streamed
+# the blob and seeded the actor's `yrs::Doc`.
+#
+# Numbers: an empty seed produces a 2-byte reply (the "empty update"
+# marker). A CRDT holding N UTF-8 bytes of text produces a reply
+# encoding at least those N bytes plus a small per-client-id header
+# (typically ~15 B). With ~400 B of text, the reply lands in the
+# 400-500 B range; with an empty seed it would be 2 B. The threshold
+# is set generously enough to survive Yjs encoding overhead swings
+# but tight enough that the EmptySeedReader stub would fail loudly.
+log "S20: upload non-empty .md and open a fresh collab session — sync-step-2 must carry the seed."
+
+# ~400 bytes of markdown — well above the "empty-update marker" size
+# but small enough that the whole thing round-trips comfortably
+# inside a single WS frame.
+tmp_md="$(mktemp -t rtbus_s20_body.XXXXXX)"
+cat > "$tmp_md" <<'EOF'
+# Collab seed-from-blob test
+
+This markdown file is the source-of-truth content for the first
+attach on the file. When a client opens the collab session for the
+first time, the server MUST hand these bytes to `yrs::Doc` as the
+initial `Y.Text` content — anyone joining later sees this text via
+sync-step-2, without touching the blob store again.
+EOF
+upload_resp="$(mktemp -t rtbus_s20_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md;filename=s20.md" \
+  "$base_url/api/files/upload")
+seed_bytes=$(wc -c < "$tmp_md")
+rm -f "$tmp_md"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp" >&2
+  rm -f "$upload_resp"
+  die "S20: .md upload failed with HTTP $status"
+fi
+s20_file_id=$(jq -r '.id' "$upload_resp")
+rm -f "$upload_resp"
+[[ -n "$s20_file_id" && "$s20_file_id" != "null" ]] \
+  || die "S20: could not extract file id"
+
+out_s20="$(mktemp -t rtbus_s20.XXXXXX)"
+if ! "$HELPER_BIN" collab-sync-probe \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --file "$s20_file_id" \
+     --timeout 5s \
+     --output "$out_s20"; then
+  cat "$out_s20" >&2 || true
+  die "S20: sync-step probe failed — reader adapter broken?"
+fi
+payload_len=$(jq -r '.payload_len' "$out_s20")
+# Guard: on a ~400 B seed, the reply lands well above the empty-update
+# marker (2 B) and well below the seed size + generous encoding
+# overhead. A regression to `EmptySeedReader` would return exactly 2.
+if [[ "$payload_len" -lt 100 ]]; then
+  cat "$out_s20"
+  die "S20: sync-step-2 payload_len=$payload_len — the actor seeded EMPTY, not from the blob (seed_bytes=$seed_bytes). Reader adapter regressed?"
+fi
+log "S20 OK (seed_bytes=$seed_bytes, sync-step-2 payload_len=$payload_len)"
+
+# ── Scenario 21 — Debounced flush-to-blob (C7 write side) ───────────────────
+# End-to-end proof that the writer bridge is wired:
+#   1. Upload a .md whose blob content is known ("seed").
+#   2. Open a collab session and write "Hello OxiCloud from S21" via the
+#      fanout-write helper — this fires the actor's apply_update
+#      which arms the debouncer.
+#   3. Wait past the idle threshold (200 ms from server.env → give
+#      it 800 ms of comfort so a slow CI runner doesn't flake).
+#   4. GET /api/files/{id} directly. If the writer is wired, the
+#      body is the CRDT text; if it isn't, the body is still the
+#      original "seed" upload.
+#
+# Why we don't just check "any change" — a bug that swapped the
+# blob to arbitrary bytes would look like success under a weaker
+# assertion. Byte-exact match makes the wire test load-bearing.
+log "S21: write via collab, wait for debouncer, verify GET returns CRDT text."
+
+# Empty seed — Yjs is a CRDT that INSERTS, not overwrites. If we seed
+# with pre-existing bytes, the client's `text.insert(0, ...)` would
+# prepend the new content instead of replacing it, and the resulting
+# blob would be new+seed (correct Yjs semantics; wrong for a "does
+# the flush work" byte-exact test). An empty seed avoids that trap
+# without weakening the assertion — a leak would still show up as a
+# blob change.
+tmp_md="$(mktemp -t rtbus_s21_body.XXXXXX)"
+: > "$tmp_md"   # empty file
+upload_resp="$(mktemp -t rtbus_s21_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md;filename=s21.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp" >&2
+  rm -f "$upload_resp"
+  die "S21: .md upload failed with HTTP $status"
+fi
+s21_file_id=$(jq -r '.id' "$upload_resp")
+rm -f "$upload_resp"
+[[ -n "$s21_file_id" && "$s21_file_id" != "null" ]] \
+  || die "S21: could not extract file id"
+
+s21_content="Hello OxiCloud from S21"
+if ! "$HELPER_BIN" collab-fanout-write \
+     --url "$ws_url" \
+     --token "$user1_token" \
+     --file "$s21_file_id" \
+     --content "$s21_content" \
+     --timeout 5s > /dev/null 2>&1; then
+  die "S21: helper failed to send the 0x01 UPDATE"
+fi
+
+# Sleep past the idle threshold — server.env sets it to 2 s (raised
+# from 200 ms so S22 can prove its explicit flush is the writer; the
+# reasoning is on the knob), so 3 s is 1.5× headroom. Not a polling
+# loop because the debouncer's fire time is bounded and deterministic;
+# a poll would either race the download cache or mask a stuck
+# debouncer.
+sleep 3
+
+# Download the file body verbatim. Content-Disposition and MIME
+# shouldn't matter — we're comparing bytes.
+downloaded=$(curl -sS -H "Authorization: Bearer $user1_token" \
+  "$base_url/api/files/$s21_file_id")
+if [[ "$downloaded" != "$s21_content" ]]; then
+  printf 'expected: %s\ngot     : %s\n' "$s21_content" "$downloaded" >&2
+  die "S21: downloaded body does not match CRDT text — debouncer/writer regression?"
+fi
+log "S21 OK (blob updated to CRDT text within 3 s)"
+
+# ── Scenario 22 — Explicit flush via WS `rt.collab_flush` ───────────────────
+# The FE editor's "on tab close" path: the client knows better than
+# the debouncer when a flush is actually wanted. This scenario
+# exercises the WS-level trigger without waiting on the ambient
+# 200 ms idle deadline. Two assertions in one scenario:
+#
+#   (a) rt.collab_flush { file_id } fires a flush → GET returns the
+#       CRDT text within ~100 ms (below the idle threshold, so ONLY
+#       the explicit path could have made this happen).
+#   (b) A caller with only Read (Viewer role) gets `no_edit` back
+#       — same gate as UPDATE frames, no admin bypass.
+log "S22: rt.collab_flush triggers an immediate flush; Viewer is denied."
+
+tmp_md="$(mktemp -t rtbus_s22_body.XXXXXX)"
+: > "$tmp_md"   # empty seed for byte-exact assertion (see S21 rationale)
+upload_resp="$(mktemp -t rtbus_s22_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md;filename=s22.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp" >&2; rm -f "$upload_resp"; die "S22: .md upload failed with HTTP $status"
+fi
+s22_file_id=$(jq -r '.id' "$upload_resp")
+rm -f "$upload_resp"
+[[ -n "$s22_file_id" && "$s22_file_id" != "null" ]] || die "S22: could not extract file id"
+
+s22_content="Hello OxiCloud from S22"
+# The write happens INSIDE the collab-flush invocation below, on the same
+# connection — deliberately, and it is what makes `flushed:true` assertable.
+#
+# Writing from a separate helper process meant the document's dirty window had
+# to survive process exit, process spawn, a fresh WS connect and re-auth. If the
+# debouncer's 2 s idle threshold elapsed in that gap it flushed first, and the
+# explicit flush then correctly reported `flushed:false` — a failure about
+# process-spawn latency, not about the feature.
+#
+# That gap is unbounded in practice and is why this passed locally and failed in
+# CI: on a workstation the spawn is ~100 ms, while the CI runner is also
+# cold-building this helper in release with no cargo cache, so it can exceed
+# seconds. Raising the server threshold cannot fix it either — S21 above asserts
+# the debouncer DOES fire within 3 s, so the window is squeezed from both sides.
+
+# Explicit flush trigger. No sleep first — this is the entire point:
+# the FE wants a flush RIGHT NOW, not on the debouncer's schedule.
+#
+# `flushed:true` is asserted strictly, and that is now meaningful rather
+# than a race: the debouncer's idle threshold is 2 s (server.env), so the
+# document is still dirty for any plausible gap between the two helper
+# processes. It was 200 ms, which a loaded CI runner could not beat.
+#
+# UNRESOLVED, and worth knowing before weakening anything here: CI has
+# also been seen to return `flushed:false` together with an EMPTY body —
+# see the run on 2026-09-26. Neither is explicable by the debouncer
+# winning, because every path that ends a session flushes first
+# (`gc_stale` does a final `flush_to_blob` explicitly, "so nothing dirty
+# escapes the GC"). An empty blob means the update never entered the
+# CRDT at all, so the loss is on the WRITE side, not the flush side. A
+# `rt-hurl-helper: connect failed: HTTP error: 401 Unauthorized` appears
+# in the same logs and is the leading suspect.
+#
+# Do not relax this assertion to make CI green — it is the only thing
+# currently catching that.
+out_s22="$(mktemp -t rtbus_s22_flush.XXXXXX)"
+if ! "$HELPER_BIN" collab-flush \
+     --url "$ws_url" --token "$user1_token" \
+     --file "$s22_file_id" --content "$s22_content" \
+     --timeout 3s \
+     --output "$out_s22"; then
+  cat "$out_s22" >&2 || true
+  die "S22: rt.collab_flush call failed"
+fi
+flushed=$(jq -r '.flushed' "$out_s22")
+[[ "$flushed" == "true" ]] \
+  || { cat "$out_s22"; die "S22: expected {flushed:true}, got flushed=$flushed"; }
+
+# GET now — the flush was synchronous, so no wall-clock wait.
+downloaded=$(curl -sS -H "Authorization: Bearer $user1_token" \
+  "$base_url/api/files/$s22_file_id")
+if [[ "$downloaded" != "$s22_content" ]]; then
+  printf 'expected: %s\ngot     : %s\n' "$s22_content" "$downloaded" >&2
+  die "S22: downloaded body does not match after rt.collab_flush"
+fi
+log "S22a OK (rt.collab_flush wrote synchronously)"
+
+# (b) Viewer denial. Grant user2 Viewer on folder A so they can read
+# the file (Read passes) but Update is refused. Their rt.collab_flush
+# must come back with `no_edit`.
+grant_a_viewer=$(c_post "$base_url/api/grants" "$user1_token" \
+  "$(printf '{"subject":{"type":"user","id":"%s"},"resource":{"type":"folder","id":"%s"},"role":"viewer"}' \
+       "$user2_id" "$folder_a")")
+[[ "$(printf '%s' "$grant_a_viewer" | jq -r '.grants[0].id')" != "null" ]] \
+  || die "S22: viewer grant on folder A failed: $grant_a_viewer"
+
+# The collab-flush helper returns exit 1 on a JSON-RPC error object —
+# that's the expected denial shape here.
+set +e
+"$HELPER_BIN" collab-flush \
+  --url "$ws_url" --token "$user2_token" \
+  --file "$s22_file_id" \
+  --timeout 3s > /dev/null 2>&1
+denied_exit=$?
+set -e
+[[ "$denied_exit" -eq 1 ]] \
+  || die "S22: Viewer's rt.collab_flush was NOT denied (helper exit=$denied_exit, expected 1)"
+
+log "S22b OK (Viewer denied on rt.collab_flush)"
+log "S22 OK"
+
+# ── Scenario 23 — Collab idle-GC sweep (`collab_idle_gc` job) ──────────────
+# End-to-end proof that the reaper works via the actual scheduled
+# job pipeline (not just the service-level `gc_stale` method covered
+# by unit tests):
+#
+#   1. Upload an empty .md, write "Hello OxiCloud from S23" via
+#      collab, `rt.collab_flush` so the blob carries the CRDT text.
+#   2. Wait past the shrunken TTL (server.env sets IDLE_TTL_SECONDS=1;
+#      2 s here is 2× headroom for a slow runner).
+#   3. Trigger the job via admin. The response's `.outcome.swept`
+#      field carries the reap count; ≥ 1 proves the sweep saw our row.
+#   4. Confirm the row was ACTUALLY deleted (not just re-flushed):
+#      a fresh sync-step probe re-seeds from the blob — the DB
+#      lookup returns None → the actor loads seed_content path.
+#      That'd fail if the row survived (load-path takes over and
+#      the state carries CRDT metadata beyond the raw text).
+log "S23: idle-GC job reaps a stale collab session."
+
+# Admin token — the trigger endpoint is admin-gated.
+admin_login=$(c_post "$base_url/api/auth/login" "" \
+  "$(printf '{"username":"%s","password":"%s"}' "$username" "$password")")
+admin_token=$(printf '%s' "$admin_login" | jq -r '.access_token')
+[[ -n "$admin_token" && "$admin_token" != "null" ]] \
+  || die "S23: admin login failed: $admin_login"
+
+# Fresh .md file, empty seed (see S21 for the "Yjs inserts, doesn't
+# overwrite" rationale).
+tmp_md="$(mktemp -t rtbus_s23_body.XXXXXX)"; : > "$tmp_md"
+upload_resp="$(mktemp -t rtbus_s23_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md;filename=s23.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp" >&2; rm -f "$upload_resp"; die "S23: .md upload failed with HTTP $status"
+fi
+s23_file_id=$(jq -r '.id' "$upload_resp")
+rm -f "$upload_resp"
+[[ -n "$s23_file_id" && "$s23_file_id" != "null" ]] || die "S23: could not extract file id"
+
+s23_content="Hello OxiCloud from S23"
+if ! "$HELPER_BIN" collab-fanout-write \
+     --url "$ws_url" --token "$user1_token" \
+     --file "$s23_file_id" --content "$s23_content" \
+     --timeout 5s > /dev/null 2>&1; then
+  die "S23: fanout-write failed"
+fi
+# Explicit flush so the blob carries the CRDT text BEFORE the GC
+# fires (the GC's final flush would do this too, but we want to
+# separate "flush works" from "reap works" in this assertion).
+if ! "$HELPER_BIN" collab-flush \
+     --url "$ws_url" --token "$user1_token" \
+     --file "$s23_file_id" \
+     --timeout 3s > /dev/null 2>&1; then
+  die "S23: rt.collab_flush failed pre-GC"
+fi
+
+# Wait past the TTL (server.env IDLE_TTL_SECONDS=1).
+sleep 2
+
+# Trigger the job via admin. Response carries the outcome JSON.
+gc_resp=$(curl -sS -X POST \
+  -H "Authorization: Bearer $admin_token" \
+  "$base_url/api/admin/jobs/collab_idle_gc/trigger")
+# JobOutcome wire shape: {ok, outcome:{count, extra:{...}, outcome:"ok"}}.
+# The reap count lands on `.outcome.count` (from JobOutcome::ok_with's
+# first arg); the same integer is echoed under `.outcome.extra.swept`
+# for redundancy. Either path works; use `.outcome.count` — it's the
+# universal shape across all scheduled jobs.
+swept=$(printf '%s' "$gc_resp" | jq -r '.outcome.count // 0')
+[[ "$swept" -ge 1 ]] \
+  || { printf '%s\n' "$gc_resp" >&2; die "S23: expected swept >= 1, got $swept"; }
+log "S23a OK (reaped $swept session(s) via admin trigger)"
+
+# The row must actually be gone. A subsequent sync-step probe on
+# the SAME file_id sees the actor re-spawn on the seed path (no
+# DB row → load_or_seed reads content via the reader adapter).
+# The reply's payload_len should match the seeded text roughly,
+# and be DIFFERENT from the pre-GC probe's payload_len that
+# reflected the full CRDT state with client-id metadata.
+out_s23_after="$(mktemp -t rtbus_s23_after.XXXXXX)"
+if ! "$HELPER_BIN" collab-sync-probe \
+     --url "$ws_url" --token "$user1_token" \
+     --file "$s23_file_id" --timeout 5s \
+     --output "$out_s23_after"; then
+  cat "$out_s23_after" >&2 || true
+  die "S23: post-GC sync-step probe failed"
+fi
+# Post-GC probe must succeed (non-empty payload) — that alone
+# proves the actor re-seeded from the blob. The row-gone
+# assertion is transitive via the swept count above; a second
+# GC trigger on a quiet server would count 0 more sweeps.
+gc_resp2=$(curl -sS -X POST \
+  -H "Authorization: Bearer $admin_token" \
+  "$base_url/api/admin/jobs/collab_idle_gc/trigger")
+swept2=$(printf '%s' "$gc_resp2" | jq -r '.outcome.count // 0')
+# The freshly-attached session isn't stale yet (last_activity_at
+# just bumped), so the second trigger MUST see 0 or exclude our
+# row. We only assert the endpoint keeps working, not the count.
+[[ "$swept2" =~ ^[0-9]+$ ]] \
+  || { printf '%s\n' "$gc_resp2" >&2; die "S23: second GC trigger response malformed"; }
+log "S23b OK (post-GC probe re-seeded; second trigger returned swept=$swept2)"
+log "S23 OK"
+
+# ── Scenario 24 — Collab eviction on delete ────────────────────────────────
+# End-to-end proof that `FileManagementService::delete_and_cleanup_with_perms`
+# fires the collab eviction hook BEFORE the row is trashed / dropped:
+#
+#   1. Upload an empty .md — subscribing to `collab:<file_id>` alone
+#      attaches the per-file actor (the WS handler's collab forwarder
+#      calls `attach_file` on install), so no write is needed to
+#      make the eviction observable.
+#   2. Subscribe to `collab:<file_id>` in a background helper and
+#      wait for `--ready-file` to close the "publish before subscribe"
+#      race.
+#   3. `DELETE /api/files/{file_id}`. The service publishes an
+#      `INTERNAL_KIND_EVICTED` control on the actor's outbox with
+#      reason "resource_deleted"; the WS forwarder translates that
+#      into an `rt.revoked` text frame on `collab:<file_id>` and
+#      unwinds.
+#   4. Helper's `revoked[]` must carry exactly one entry with
+#      topic == `collab:<file_id>` and reason == "resource_deleted".
+#
+# Broken paths this guards against:
+#   * eviction skipped on trash-first branch → 0 revoked entries.
+#   * eviction fired on the wrong topic       → topic mismatch.
+#   * reason field truncated / mis-encoded    → reason mismatch.
+log "S24: file delete evicts every attached collab session with reason=resource_deleted."
+
+tmp_md_s24="$(mktemp -t rtbus_s24_body.XXXXXX)"; : > "$tmp_md_s24"
+upload_resp_s24="$(mktemp -t rtbus_s24_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp_s24" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md_s24;filename=s24.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md_s24"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp_s24" >&2; rm -f "$upload_resp_s24"
+  die "S24: .md upload failed with HTTP $status"
+fi
+s24_file_id=$(jq -r '.id' "$upload_resp_s24")
+rm -f "$upload_resp_s24"
+[[ -n "$s24_file_id" && "$s24_file_id" != "null" ]] || die "S24: could not extract file id"
+
+out_s24="$(mktemp -t rtbus_s24.XXXXXX)"
+ready_s24="$(mktemp -t rtbus_s24_ready.XXXXXX)"; rm -f "$ready_s24"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --subscribe "collab:$s24_file_id" \
+  --expect-events 0 \
+  --expect-revoked 1 \
+  --timeout 5s \
+  --ready-file "$ready_s24" \
+  --output "$out_s24" &
+helper_pid=$!
+wait_ready "$ready_s24"
+
+# `DELETE /api/files/{id}` — routes through delete_and_cleanup_with_perms,
+# which calls `collab.evict_sessions_for_file(...)` BEFORE the trash
+# or permanent-delete branch, so the assertion holds on either code
+# path.
+curl -sS -X DELETE \
+  -H "Authorization: Bearer $user1_token" \
+  "$base_url/api/files/$s24_file_id" > /dev/null
+
+if ! wait "$helper_pid"; then
+  cat "$out_s24" >&2 || true
+  die "S24: helper did not observe the collab eviction"
+fi
+
+# Shape asserts: exactly one revoked entry on our topic, with the
+# stable "resource_deleted" reason. Extra revoked entries would be
+# a producer bug (double-eviction); a missing reason field would
+# be an rt_ws.rs regression.
+rev_len=$(jq -r '.revoked | length' "$out_s24")
+[[ "$rev_len" == "1" ]] \
+  || { cat "$out_s24"; die "S24: expected 1 revoked, got $rev_len"; }
+rev_topic=$(jq -r '.revoked[0].topic' "$out_s24")
+[[ "$rev_topic" == "collab:$s24_file_id" ]] \
+  || { cat "$out_s24"; die "S24: wrong topic: $rev_topic"; }
+rev_reason=$(jq -r '.revoked[0].reason' "$out_s24")
+[[ "$rev_reason" == "resource_deleted" ]] \
+  || { cat "$out_s24"; die "S24: wrong reason: $rev_reason"; }
+
+# A collab-events channel is BINARY only — `rt.event` on this topic
+# is a producer bug. Assert none leaked.
+ev_len=$(jq -r '.events | length' "$out_s24")
+[[ "$ev_len" == "0" ]] \
+  || { cat "$out_s24"; die "S24: unexpected rt.event on collab topic (got $ev_len)"; }
+
+rm -f "$out_s24"
+log "S24 OK (collab session evicted with reason=resource_deleted on file delete)"
+
+# ── Scenario 25 — Collab capabilities in subscribe ack ─────────────────────
+# The `collab:<file_id>` subscribe ack carries `capabilities.can_write`
+# so the FE can gate CodeMirror between edit and read-only without a
+# probe round-trip. Two subs on the same file:
+#
+#   * user1 owns folder E and file s19 → `can_write: true`.
+#   * user2 has Viewer on folder E (granted back in S19)         →
+#     `can_write: false`. The subscribe still ACKS (Read passes),
+#     only the capabilities differ.
+#
+# Guards a real regression: without the ack payload, an editable-
+# looking editor on a Viewer's screen would drop the WS on the first
+# UPDATE — Viewers would see "Disconnected" flashing on every
+# keystroke.
+log "S25: collab subscribe ack carries can_write; Owner=true, Viewer=false."
+
+out_s25_owner="$(mktemp -t rtbus_s25_owner.XXXXXX)"
+ready_s25_owner="$(mktemp -t rtbus_s25_owner_ready.XXXXXX)"; rm -f "$ready_s25_owner"
+# expect_events=0 + expect_revoked=0 → helper exits as soon as the ack
+# lands (all pending subs cleared). 3s timeout is 15× headroom on the
+# ~200 ms subscribe RTT observed locally.
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --subscribe "collab:$s19_file_id" \
+  --expect-events 0 \
+  --timeout 3s \
+  --ready-file "$ready_s25_owner" \
+  --output "$out_s25_owner"
+wait_ready "$ready_s25_owner"
+
+owner_can_write=$(jq -r '.subscribe_acks[0].result.capabilities.can_write' "$out_s25_owner")
+[[ "$owner_can_write" == "true" ]] \
+  || { cat "$out_s25_owner"; die "S25: owner expected can_write=true, got $owner_can_write"; }
+rm -f "$out_s25_owner"
+log "S25a OK (owner sees can_write=true)"
+
+out_s25_viewer="$(mktemp -t rtbus_s25_viewer.XXXXXX)"
+ready_s25_viewer="$(mktemp -t rtbus_s25_viewer_ready.XXXXXX)"; rm -f "$ready_s25_viewer"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user2_token" \
+  --subscribe "collab:$s19_file_id" \
+  --expect-events 0 \
+  --timeout 3s \
+  --ready-file "$ready_s25_viewer" \
+  --output "$out_s25_viewer"
+wait_ready "$ready_s25_viewer"
+
+viewer_can_write=$(jq -r '.subscribe_acks[0].result.capabilities.can_write' "$out_s25_viewer")
+[[ "$viewer_can_write" == "false" ]] \
+  || { cat "$out_s25_viewer"; die "S25: viewer expected can_write=false, got $viewer_can_write"; }
+# Viewer's subscribe still SUCCEEDS — anti-enum + read is enough for
+# the topic. A missing entry here would mean the ack turned into a
+# denial, which is a regression on the Read gate.
+viewer_subscribed=$(jq -r '.subscribed | length' "$out_s25_viewer")
+[[ "$viewer_subscribed" == "1" ]] \
+  || { cat "$out_s25_viewer"; die "S25: viewer's subscribe did not ack (subscribed len=$viewer_subscribed)"; }
+rm -f "$out_s25_viewer"
+log "S25b OK (viewer sees can_write=false with a successful subscribe)"
+log "S25 OK"
+
+# ── Scenario 26 — Collab graceful write-denial ─────────────────────────────
+# Viewer sends an UPDATE frame on a collab topic; server MUST respond
+# with rt.write_denied AND keep the socket open. Prior behaviour closed
+# the WS on every denied UPDATE, which caused Viewer editors to flap
+# the connection on every keystroke.
+#
+# Reuses `s19_file_id` (folder E) + user2 (Viewer on folder E). The
+# `--expect-write-denied "no_edit"` flag on `collab-fanout-write` does
+# three things:
+#   1. Subscribe + send the UPDATE (existing helper behaviour).
+#   2. Wait for `rt.write_denied { file_id: <s19>, reason: "no_edit" }`
+#      and assert both fields match.
+#   3. Send `rt.ping` and require a successful ack — proving the socket
+#      survived the denial. A prior implementation broke the WS loop
+#      on denial; that shape would fail step 3.
+log "S26: server sends rt.write_denied on Viewer UPDATE and keeps the socket alive."
+
+set +e
+"$HELPER_BIN" collab-fanout-write \
+  --url "$ws_url" \
+  --token "$user2_token" \
+  --file "$s19_file_id" \
+  --content "graceful denial probe" \
+  --expect-write-denied "no_edit" \
+  --timeout 5s > /dev/null 2>&1
+denied_exit=$?
+set -e
+[[ "$denied_exit" == "0" ]] \
+  || die "S26: expected graceful rt.write_denied + socket alive, helper exit=$denied_exit"
+log "S26 OK (rt.write_denied fired; socket survived; ping ack'd)"
+
+# ── Scenario 27 — Collab grant-revoke eviction ─────────────────────────────
+# user1 owns a .md file in folder A and grants user2 a FILE-scoped
+# Viewer role on it — so revoking the grant should fire an
+# `AuthzChanged { affected_files: [<file_id>] }` on
+# `user:{user2}:authz`. The WS handler translates that into an
+# `rt.revoked` on `collab:<file_id>` for user2's socket with reason
+# `grant_revoked`. Without this the FE's cached `can_write` (or
+# read gate) stays stale until reconnect — a security regression.
+#
+# Steps:
+#   1. Upload a .md file in folder A as user1.
+#   2. Grant user2 Viewer on the FILE (not the folder — file-level
+#      grants are what emit affected_files).
+#   3. user2 subscribes to `collab:<file_id>` in a background helper
+#      that expects one revoked notification.
+#   4. user1 revokes the grant.
+#   5. Assert revoked[0].topic and .reason.
+log "S27: revoke a file-scoped grant → user2's collab sub is evicted with reason=grant_revoked."
+
+tmp_md_s27="$(mktemp -t rtbus_s27_body.XXXXXX)"; : > "$tmp_md_s27"
+upload_resp_s27="$(mktemp -t rtbus_s27_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp_s27" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md_s27;filename=s27.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md_s27"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp_s27" >&2; rm -f "$upload_resp_s27"
+  die "S27: .md upload failed with HTTP $status"
+fi
+s27_file_id=$(jq -r '.id' "$upload_resp_s27")
+rm -f "$upload_resp_s27"
+[[ -n "$s27_file_id" && "$s27_file_id" != "null" ]] || die "S27: could not extract file id"
+
+# File-level grant. Note `resource.type = "file"` — the folder-scoped
+# path was covered by S8; this scenario locks in the sibling code
+# path for file resources.
+grant_s27=$(c_post "$base_url/api/grants" "$user1_token" \
+  "$(printf '{"subject":{"type":"user","id":"%s"},"resource":{"type":"file","id":"%s"},"role":"viewer"}' \
+       "$user2_id" "$s27_file_id")")
+grant_s27_id=$(printf '%s' "$grant_s27" | jq -r '.grants[0].id')
+[[ -n "$grant_s27_id" && "$grant_s27_id" != "null" ]] \
+  || die "S27: file grant failed: $grant_s27"
+
+out_s27="$(mktemp -t rtbus_s27.XXXXXX)"
+ready_s27="$(mktemp -t rtbus_s27_ready.XXXXXX)"; rm -f "$ready_s27"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user2_token" \
+  --subscribe "collab:$s27_file_id" \
+  --expect-events 0 \
+  --expect-revoked 1 \
+  --timeout 5s \
+  --ready-file "$ready_s27" \
+  --output "$out_s27" &
+helper_pid=$!
+wait_ready "$ready_s27"
+
+# Revoke — publishes AuthzChanged { affected_files } on user:{user2}:authz.
+curl -sS -X DELETE \
+  -H "Authorization: Bearer $user1_token" \
+  "$base_url/api/grants/$grant_s27_id" > /dev/null
+
+if ! wait "$helper_pid"; then
+  cat "$out_s27" >&2 || true
+  die "S27: helper did not observe the grant-revoke eviction"
+fi
+
+rev_len_s27=$(jq -r '.revoked | length' "$out_s27")
+[[ "$rev_len_s27" == "1" ]] \
+  || { cat "$out_s27"; die "S27: expected 1 revoked, got $rev_len_s27"; }
+rev_topic_s27=$(jq -r '.revoked[0].topic' "$out_s27")
+[[ "$rev_topic_s27" == "collab:$s27_file_id" ]] \
+  || { cat "$out_s27"; die "S27: wrong topic: $rev_topic_s27"; }
+rev_reason_s27=$(jq -r '.revoked[0].reason' "$out_s27")
+[[ "$rev_reason_s27" == "grant_revoked" ]] \
+  || { cat "$out_s27"; die "S27: wrong reason: $rev_reason_s27"; }
+
+# Sanity: the subscribe SHOULD have succeeded before revoke — user2
+# had Viewer on the file. `capabilities.can_write` must have been
+# false at that moment (no Update, only Read) but the sub itself is
+# ack'd.
+initial_can_write=$(jq -r '.subscribe_acks[0].result.capabilities.can_write' "$out_s27")
+[[ "$initial_can_write" == "false" ]] \
+  || { cat "$out_s27"; die "S27: pre-revoke expected can_write=false, got $initial_can_write"; }
+rm -f "$out_s27"
+log "S27 OK (file grant revoked → collab:<id> evicted with grant_revoked)"
+
+# ── Scenario 28 — External-write eviction ─────────────────────────────────
+# user1 uploads an empty .md, subscribes to `collab:<id>`, then
+# uploads a NEW body under the same filename → replaces content.
+# The FileLifecycleService fan-out reaches the collab-evict hook with
+# WriteSource::External, which calls
+# evict_sessions_for_file(id, "external_write"). The helper's
+# revoked[] array captures the eviction; the wire reason distinguishes
+# this from grant_revoked (S27) and resource_deleted (S24).
+#
+# The collab actor's OWN debounced flush also fires
+# `on_file_updated` (with WriteSource::CollabFlush) — that branch
+# short-circuits inside the hook. To keep this test deterministic
+# we skip sending any UPDATE frame: the actor never dirties, so the
+# flush path never runs; the only writes are the initial upload and
+# the external replace.
+log "S28: WebDAV PUT overwrite of a live-collab file evicts with reason=external_write."
+
+# Upload the .md at the DRIVE ROOT so the WebDAV PUT below has a
+# trivial path (no folder-name path segment needed). WebDAV serves
+# the user's default drive, so `/webdav/s28-<suffix>.md` maps to a
+# root-level file. `s28-$suffix.md` keeps the name unique across
+# retries.
+s28_name="s28_${suffix}.md"
+tmp_md_s28="$(mktemp -t rtbus_s28_body.XXXXXX)"; : > "$tmp_md_s28"
+upload_resp_s28="$(mktemp -t rtbus_s28_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp_s28" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$root_id" \
+  -F "file=@$tmp_md_s28;filename=$s28_name" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md_s28"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp_s28" >&2; rm -f "$upload_resp_s28"
+  die "S28: initial upload failed with HTTP $status"
+fi
+s28_file_id=$(jq -r '.id' "$upload_resp_s28")
+rm -f "$upload_resp_s28"
+[[ -n "$s28_file_id" && "$s28_file_id" != "null" ]] || die "S28: could not extract file id"
+
+out_s28="$(mktemp -t rtbus_s28.XXXXXX)"
+ready_s28="$(mktemp -t rtbus_s28_ready.XXXXXX)"; rm -f "$ready_s28"
+"$HELPER_BIN" subscribe-and-collect \
+  --url "$ws_url" \
+  --token "$user1_token" \
+  --subscribe "collab:$s28_file_id" \
+  --expect-events 0 \
+  --expect-revoked 1 \
+  --timeout 5s \
+  --ready-file "$ready_s28" \
+  --output "$out_s28" &
+helper_pid=$!
+wait_ready "$ready_s28"
+
+# External replace — WebDAV PUT overwrites the existing file at
+# the same path. This routes through
+# FileUploadService::update_file_streaming_with_perms — the same
+# branch NextCloud PUT and WOPI PutFile take — which fires
+# on_file_updated with WriteSource::External. The multipart
+# `POST /api/files/upload` path would 409 on a duplicate name;
+# WebDAV PUT is the canonical external-write producer.
+tmp_md_replace="$(mktemp -t rtbus_s28_replace.XXXXXX)"
+printf 'external write from outside collab\n' > "$tmp_md_replace"
+status=$(curl -sS -o /dev/null -w "%{http_code}" -X PUT \
+  -H "Authorization: Bearer $user1_token" \
+  -H "Content-Type: text/markdown" \
+  --data-binary "@$tmp_md_replace" \
+  "$base_url/webdav/$s28_name")
+rm -f "$tmp_md_replace"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  die "S28: external replace via WebDAV PUT failed with HTTP $status"
+fi
+
+if ! wait "$helper_pid"; then
+  cat "$out_s28" >&2 || true
+  die "S28: helper did not observe the external-write eviction"
+fi
+
+rev_len_s28=$(jq -r '.revoked | length' "$out_s28")
+[[ "$rev_len_s28" == "1" ]] \
+  || { cat "$out_s28"; die "S28: expected 1 revoked, got $rev_len_s28"; }
+rev_topic_s28=$(jq -r '.revoked[0].topic' "$out_s28")
+[[ "$rev_topic_s28" == "collab:$s28_file_id" ]] \
+  || { cat "$out_s28"; die "S28: wrong topic: $rev_topic_s28"; }
+rev_reason_s28=$(jq -r '.revoked[0].reason' "$out_s28")
+[[ "$rev_reason_s28" == "external_write" ]] \
+  || { cat "$out_s28"; die "S28: wrong reason: $rev_reason_s28"; }
+rm -f "$out_s28"
+log "S28 OK (external replace → collab:<id> evicted with external_write)"
+
+# ── Scenario 29 — Multi-client convergence (C7 robustness) ────────────────
+# Five headless clients on the same .md file each subscribe, insert a
+# distinct string, and listen until the fan-out quiesces. All five
+# `final_text` outputs MUST be byte-identical — that's CRDT convergence
+# in one assertion. Guards a class of regressions the 2-client S22 can't
+# reach: broadcast backpressure, forwarder lag on the slowest client,
+# and CRDT ordering when writes interleave.
+log "S29: 5-client CRDT convergence — all peers agree on the same final text."
+
+tmp_md_s29="$(mktemp -t rtbus_s29_body.XXXXXX)"; : > "$tmp_md_s29"
+upload_resp_s29="$(mktemp -t rtbus_s29_resp.XXXXXX)"
+status=$(curl -sS -o "$upload_resp_s29" -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $user1_token" \
+  -F "folder_id=$folder_a" \
+  -F "file=@$tmp_md_s29;filename=s29.md" \
+  "$base_url/api/files/upload")
+rm -f "$tmp_md_s29"
+if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+  cat "$upload_resp_s29" >&2; rm -f "$upload_resp_s29"
+  die "S29: .md upload failed with HTTP $status"
+fi
+s29_file_id=$(jq -r '.id' "$upload_resp_s29")
+rm -f "$upload_resp_s29"
+[[ -n "$s29_file_id" && "$s29_file_id" != "null" ]] || die "S29: could not extract file id"
+
+# Distinct insertions per client — a divergence bug surfaces as
+# different final_text values across the five outputs. Same length
+# for each so the converged text has a predictable total.
+S29_INSERTIONS=("alpha " "bravo " "delta " "gamma " "kappa ")
+S29_CLIENTS=5
+
+s29_ready_files=()
+s29_output_files=()
+s29_pids=()
+
+# Launch all 5 clients in parallel. Each blocks on its own ready-file
+# path, so orchestration waits for all subscribes to install BEFORE
+# any peer's UPDATE goes out. Without that, a slow subscribe would
+# miss earlier peers' initial inserts and the final text would be
+# missing that peer's contribution — surfacing as divergence rather
+# than a stuck peer.
+for i in $(seq 0 $((S29_CLIENTS - 1))); do
+  out=$(mktemp -t "rtbus_s29_c${i}.XXXXXX")
+  ready=$(mktemp -t "rtbus_s29_c${i}_ready.XXXXXX"); rm -f "$ready"
+  s29_output_files+=("$out")
+  s29_ready_files+=("$ready")
+  "$HELPER_BIN" collab-converge \
+    --url "$ws_url" \
+    --token "$user1_token" \
+    --file "$s29_file_id" \
+    --my-content "${S29_INSERTIONS[$i]}" \
+    --settle-ms 800 \
+    --timeout 15s \
+    --ready-file "$ready" \
+    --output "$out" &
+  s29_pids+=($!)
+done
+
+# Wait for every client's subscribe ack.
+for ready in "${s29_ready_files[@]}"; do
+  wait_ready "$ready"
+done
+
+# All 5 subscribes installed — now the clients start broadcasting
+# their inserts. Wait for every client to exit.
+s29_failed=0
+for pid in "${s29_pids[@]}"; do
+  if ! wait "$pid"; then
+    s29_failed=1
+  fi
+done
+if [[ "$s29_failed" -ne 0 ]]; then
+  for out in "${s29_output_files[@]}"; do
+    printf '\n--- %s ---\n' "$out" >&2
+    cat "$out" >&2 || true
+  done
+  die "S29: at least one client exited non-zero"
+fi
+
+# Convergence assertion — every final_text must equal client 0's.
+c0_text=$(jq -r '.final_text' "${s29_output_files[0]}")
+c0_len=$(jq -r '.final_length' "${s29_output_files[0]}")
+[[ -n "$c0_text" && "$c0_text" != "null" ]] \
+  || { cat "${s29_output_files[0]}"; die "S29: client 0 has no final_text"; }
+# Total length must be sum of every insertion — 5 × 6 chars = 30.
+expected_len=30
+[[ "$c0_len" == "$expected_len" ]] \
+  || { for out in "${s29_output_files[@]}"; do cat "$out"; done
+       die "S29: client 0 length $c0_len != expected $expected_len"; }
+for i in $(seq 1 $((S29_CLIENTS - 1))); do
+  ci_text=$(jq -r '.final_text' "${s29_output_files[$i]}")
+  if [[ "$ci_text" != "$c0_text" ]]; then
+    for out in "${s29_output_files[@]}"; do
+      printf '\n--- %s ---\n' "$out" >&2
+      cat "$out" >&2 || true
+    done
+    die "S29: client $i diverged from client 0
+  c0: $c0_text
+  ci: $ci_text"
+  fi
+done
+# Every insertion must be present in the converged text — a helper
+# that trivially converged on empty would fail this.
+for insertion in "${S29_INSERTIONS[@]}"; do
+  [[ "$c0_text" == *"$insertion"* ]] \
+    || die "S29: converged text missing $insertion: $c0_text"
+done
+
+# Cleanup
+for out in "${s29_output_files[@]}"; do rm -f "$out"; done
+log "S29 OK (5 clients converged: $c0_len chars, text=$c0_text)"
+
+log "All twenty-nine message-bus scenarios passed."

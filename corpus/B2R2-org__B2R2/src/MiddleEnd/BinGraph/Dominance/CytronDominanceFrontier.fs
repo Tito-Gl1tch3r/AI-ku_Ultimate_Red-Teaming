@@ -1,0 +1,73 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.MiddleEnd.BinGraph.Dominance
+
+open System.Collections.Generic
+open B2R2.MiddleEnd.BinGraph
+
+/// Represents the Cytron et al.'s dominance frontier algorithm presented in
+/// their paper "Efficiently Computing Static Single Assignment Form and the
+/// Control Dependence Graph", TOPLAS 1991.
+type CytronDominanceFrontier<'V, 'E when 'V: equality and 'E: equality>() =
+  let traverseBottomUp (domTree: DominatorTree<_>) =
+    let stack1, stack2 = Stack(), Stack()
+    domTree.Roots |> Seq.iter stack1.Push
+    while stack1.Count > 0 do
+      let v = stack1.Pop()
+      stack2.Push v
+      for child in domTree.GetChildren v do stack1.Push child
+    stack2
+
+  /// Compute dominance frontiers.
+  let computeDF (g: IDiGraph<_, _>) dom =
+    let domTree = (dom: IForwardDominance<_>).DominatorTree
+    let idom = dom.ImmediateDominator
+    let frontiers = Dictionary<IVertex<_>, HashSet<IVertex<_>>>()
+    (* A vertex unreachable from the roots has no dominance information, hence
+       no dominance frontier of its own. *)
+    let reachables = GraphUtils.computeReachables g
+    for v in g.Vertices do frontiers[v] <- HashSet<IVertex<_>>()
+    for v in traverseBottomUp domTree do
+      if reachables.Contains v then
+        let df = frontiers[v]
+        for succ in g.GetSuccs v do
+          if idom succ <> v then df.Add succ |> ignore else ()
+        done
+        for child in domTree.GetChildren v do
+          for node in frontiers[child] do
+            if idom node <> v then df.Add node |> ignore else ()
+          done
+        done
+      else
+        ()
+    frontiers
+
+  interface IDominanceFrontierProvider<'V, 'E> with
+    member _.CreateIDominanceFrontier(g, dom) =
+      let frontiers = computeDF g dom
+      { new IDominanceFrontier<'V> with
+          member _.DominanceFrontier(v) =
+            GraphUtils.checkVertexInGraph g v
+            frontiers[v] }

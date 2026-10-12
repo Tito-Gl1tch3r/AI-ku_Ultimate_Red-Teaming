@@ -1,0 +1,95 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.MiddleEnd.ControlFlowAnalysis.Strategies
+
+open B2R2
+open B2R2.BinIR.SSA
+open B2R2.MiddleEnd.BinGraph
+open B2R2.MiddleEnd.ControlFlowGraph
+open B2R2.MiddleEnd.ControlFlowAnalysis
+open B2R2.MiddleEnd.SSA
+open B2R2.MiddleEnd.DataFlow
+
+/// Perform stack pointer propgation analysis on the current SSACFG. This
+/// analysis performs mainly two tasks: (1) identify stack variables and promote
+/// the SSACFG, and (2) calculate the stack frame size of the function.
+type SSALifter() =
+  let extractStackVar stmt =
+    match stmt with
+    | Def(v, _) -> v
+    | _ -> Terminator.impossible ()
+
+  let findLastStackDef dom v targetVarKind =
+    SSACFG.findReachingDef dom v targetVarKind
+    |> Option.map extractStackVar
+
+  let updateIfStackValueIsConstant ctx (ssaCFG: SSACFG) state v sp =
+    match (state: SSASparseDataFlow.State<_>).GetRegValue sp with
+    | StackPointerDomain.ConstSP bv ->
+      let spValue = bv.ToUInt64()
+      let offset = Constants.InitialStackPointer - spValue |> int
+      let intraCallTable = (ctx: CFGBuildingContext<_, _>).IntraCallTable
+      let pred = ssaCFG.GetPreds v |> Seq.exactlyOne
+      let stmts = pred.VData.Internals.Statements
+      let lastPP, _ = stmts[stmts.Length - 1]
+      let lastInsAddr = lastPP.Address
+      let callsite = LeafCallSite lastInsAddr
+      intraCallTable.UpdateFrameDistance(callsite, offset)
+#if CFGDEBUG
+      dbglog ctx.ThreadID "FrameDistance" $"{lastPP.Address:x}: {offset}"
+#endif
+    | _ ->
+      ()
+
+  let updateFrameDistance ctx ssaCFG dom state (v: IVertex<SSABasicBlock>) =
+    let hdl = (ctx: CFGBuildingContext<_, _>).BinHandle
+    match hdl.RegisterFactory.StackPointer with
+    | Some rid ->
+      let spName = hdl.RegisterFactory.GetRegisterName rid
+      let rt = hdl.ISA.WordSize |> WordSize.toRegType
+      let spRegKind = RegVar(rt, rid, spName)
+      match findLastStackDef dom v spRegKind with
+      | Some sp -> updateIfStackValueIsConstant ctx ssaCFG state v sp
+      | None -> ()
+    | None ->
+      ()
+
+  let createObserver ctx =
+    { new ISSAStackPointerObserver with
+        member _.Observe(ssaCFG, dom, state) =
+          for v in ssaCFG.Vertices do
+            if (v.VData :> IAbstractable<_>).IsAbstract then
+              updateFrameDistance ctx ssaCFG dom state v
+            else
+              () }
+
+  interface ICFGAnalysis<unit -> SSACFGWithDominance> with
+    member _.Unwrap env =
+      let ctx = env.Context
+      fun () ->
+        let observer = createObserver ctx
+        let lifter = SSALifterFactory.Create ctx.BinHandle
+        let promoter = SSAPromoterFactory.Create(ctx.BinHandle, observer)
+        lifter.Lift ctx.CFG |> promoter.Promote

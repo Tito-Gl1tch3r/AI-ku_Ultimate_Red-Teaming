@@ -1,0 +1,183 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.MiddleEnd.DataFlow
+
+open B2R2
+open B2R2.Collections
+open B2R2.BinIR.LowUIR
+open B2R2.MiddleEnd.BinGraph
+open B2R2.MiddleEnd.ControlFlowGraph
+
+/// Represents a data-flow chain containing both Use-Def and Def-Use chains.
+type DataFlowChain =
+  { /// Use-def chain.
+    UseDefChain: Map<VarPoint, Set<VarPoint>>
+    /// Def-use chain.
+    DefUseChain: Map<VarPoint, Set<VarPoint>> }
+
+/// Represents the granularity at which a data-flow chain relates variables.
+and ChainGranularity =
+  /// Every LowUIR statement is its own program point, so a chain distinguishes
+  /// the statements of a single instruction.
+  | IRLevel
+  /// Every LowUIR statement of an instruction collapses into the instruction's
+  /// program point, so a chain relates instructions rather than statements.
+  | DisasmLevel
+
+/// Builds Use-Def and Def-Use chains from reaching definition analysis.
+[<RequireQualifiedAccess>]
+module DataFlowChain =
+  /// Returns the definition of u that reaches pp from within the same block,
+  /// which is the one sitting at the largest program point before pp.
+  let private computeInBlockDefs pp u (outset: Set<VarPoint>) =
+    outset
+    |> Set.fold (fun (best: VarPoint option) vp ->
+      if vp.VarKind <> u || vp.ProgramPoint >= (pp: ProgramPoint) then
+        best
+      else
+        match best with
+        | Some b when b.ProgramPoint > vp.ProgramPoint -> best
+        | _ -> Some vp) None
+
+  /// Keeps only the last def at each instruction address, since a later def
+  /// of the same variable overwrites an earlier one.
+  let private filterLastDefInBlock defs =
+    defs
+    |> Set.fold (fun map d ->
+      let addr = d.ProgramPoint.Address
+      match Map.tryFind addr map with
+      | None ->
+        Map.add addr d map
+      | Some old ->
+        if old.ProgramPoint.Position > d.ProgramPoint.Position then map
+        else Map.add addr d map) Map.empty
+    |> Map.toList
+    |> List.map snd
+
+  let private computeOutBlockDefs u (inset: Set<VarPoint>) =
+    inset
+    |> Set.filter (fun d -> d.VarKind = u)
+    |> filterLastDefInBlock
+
+  let rec private extractUseFromExpr e acc =
+    match e with
+    | Var(RegisterID = id) ->
+      Regular id :: acc
+    | TempVar(Index = n) ->
+      Temporary n :: acc
+    | UnOp(Operand = e) ->
+      extractUseFromExpr e acc
+    | BinOp(Left = e1; Right = e2) ->
+      extractUseFromExpr e1 (extractUseFromExpr e2 acc)
+    | RelOp(Left = e1; Right = e2) ->
+      extractUseFromExpr e1 (extractUseFromExpr e2 acc)
+    | Load(Addr = e) ->
+      extractUseFromExpr e acc
+    | Ite(Cond = c; TrueExpr = e1; FalseExpr = e2) ->
+      extractUseFromExpr c (extractUseFromExpr e1 (extractUseFromExpr e2 acc))
+    | Cast(Operand = e) ->
+      extractUseFromExpr e acc
+    | RoundCtrl(Mode = mode; Body = body) ->
+      extractUseFromExpr mode (extractUseFromExpr body acc)
+    | Extract(Operand = e) ->
+      extractUseFromExpr e acc
+    | _ ->
+      []
+
+  let private extractUseFromStmt s =
+    match s with
+    | Put(Src = e)
+    | Store(Value = e)
+    | Jmp(Target = e)
+    | CJmp(Cond = e)
+    | InterJmp(Target = e) ->
+      extractUseFromExpr e []
+    | InterCJmp(Cond = c; TrueTarget = e1; FalseTarget = e2) ->
+      extractUseFromExpr c (extractUseFromExpr e1 (extractUseFromExpr e2 []))
+    | _ ->
+      []
+
+  let private extractUses stmt =
+    extractUseFromStmt stmt
+    |> Set.ofList
+
+  let private initUDChain cfg (provider: IAbsValProvider<_, _>) =
+    (cfg: IDiGraph<LowUIRBasicBlock, _>)
+    |> DiGraph.foldVertex (fun map v ->
+      let abs = provider.GetAbsValue v
+      v.VData.Internals.LiftedInstructions
+      |> Array.fold (fun map lifted ->
+        lifted.Stmts
+        |> Array.foldi (fun map idx stmt ->
+          let pp = ProgramPoint(lifted.Original.Address, idx)
+          let uses = extractUses stmt
+          uses |> Set.fold (fun map u ->
+            let usepoint = { ProgramPoint = pp; VarKind = u }
+            let set = computeOutBlockDefs u abs.Ins |> Set.ofList
+            let set =
+              match computeInBlockDefs pp u abs.Outs with
+              | Some def -> Set.add def set
+              | None -> set
+            Map.add usepoint set map
+          ) map
+        ) map
+      ) map) Map.empty
+
+  let private initDUChain udchain =
+    udchain
+    |> Map.fold (fun map u ds ->
+      ds
+      |> Set.fold (fun map d ->
+        match Map.tryFind d map with
+        | None -> Map.add d (Set.singleton u) map
+        | Some us -> Map.add d (Set.add u us) map) map) Map.empty
+
+  let private normalizeVP (vp: VarPoint) =
+    let addr = vp.ProgramPoint.Address
+    { vp with ProgramPoint = ProgramPoint(addr, 0) }
+
+  let private normalizeChain chain =
+    chain
+    |> Map.fold (fun map vp set ->
+      let vp = normalizeVP vp
+      let newSet = set |> Set.map normalizeVP
+      match Map.tryFind vp map with
+      | None -> Map.add vp newSet map
+      | Some old -> Map.add vp (Set.union old newSet) map) Map.empty
+
+  let private applyGranularity granularity chain =
+    match granularity with
+    | IRLevel -> chain
+    | DisasmLevel -> normalizeChain chain
+
+  /// Computes Use-Def and Def-Use chains for the given CFG using reaching
+  /// definition analysis.
+  [<CompiledName "Compute">]
+  let compute cfg granularity =
+    let rd = ReachingDefinitionAnalysis() :> IDataFlowComputable<_, _, _>
+    let provider = rd.Compute cfg
+    let udchain = initUDChain cfg provider |> applyGranularity granularity
+    let duchain = initDUChain udchain |> applyGranularity granularity
+    { UseDefChain = udchain; DefUseChain = duchain }

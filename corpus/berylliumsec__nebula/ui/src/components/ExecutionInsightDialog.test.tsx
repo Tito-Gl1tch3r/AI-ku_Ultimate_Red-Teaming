@@ -1,0 +1,217 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+import type { ApiClient } from "../api/client";
+import type {
+  GeneratedDraft,
+  HarnessProfile,
+  OperatorExecution,
+  ProviderHealth,
+} from "../api/types";
+import { ExecutionInsightDialog } from "./ExecutionInsightDialog";
+
+const execution = { id: "execution-1" } as OperatorExecution;
+
+function provider(
+  changes: Partial<ProviderHealth> & Pick<ProviderHealth, "id" | "name">,
+): ProviderHealth {
+  return {
+    revision: 1,
+    providerType: "openai",
+    kind: "commercial",
+    local: false,
+    state: "healthy",
+    enabled: true,
+    models: ["model-1"],
+    modelAllowlist: ["model-1"],
+    defaultModel: "model-1",
+    permitsSensitiveData: true,
+    autoShareToolResults: false,
+    residency: [],
+    options: {},
+    metadata: {},
+    modelCount: 1,
+    privacy: "cloud",
+    capabilities: ["strict structured output"],
+    ...changes,
+  };
+}
+
+describe("ExecutionInsightDialog", () => {
+  it("requires per-request cloud consent and accepts one reviewed draft", async () => {
+    const user = userEvent.setup();
+    const content = {
+      title: "Execution note",
+      summary: "Bounded summary",
+      observations: ["One observation"],
+      potentialFindings: [{ title: "Hypothesis", rationale: "Needs verification" }],
+      evidenceIds: ["evidence-1"],
+    };
+    const draft = {
+      id: "draft-1",
+      engagementId: "engagement-1",
+      executionId: execution.id,
+      providerProfileId: "cloud-1",
+      model: "model-1",
+      promptVersion: "execution-note/v1",
+      contextFingerprint: "a".repeat(64),
+      status: "ready",
+      content,
+      metadata: {},
+      revision: 1,
+    } satisfies GeneratedDraft;
+    const generateExecutionDraft = vi.fn().mockResolvedValue(draft);
+    const editGeneratedDraft = vi.fn().mockResolvedValue({ ...draft, revision: 2 });
+    const transitionGeneratedDraft = vi
+      .fn()
+      .mockResolvedValue({ ...draft, revision: 3, status: "accepted" });
+    const api = {
+      generateExecutionDraft,
+      editGeneratedDraft,
+      transitionGeneratedDraft,
+    } as unknown as ApiClient;
+    const onClose = vi.fn();
+
+    render(
+      <ExecutionInsightDialog
+        action="draft"
+        api={api}
+        execution={execution}
+        providers={[
+          provider({ id: "cloud-1", name: "Cloud provider" }),
+          provider({
+            id: "prose-only",
+            name: "Prose only",
+            capabilities: ["chat"],
+          }),
+        ]}
+        onClose={onClose}
+        onChatAttached={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Up to 32 KiB of bounded redacted source")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Generate draft" })).toBeDisabled();
+    expect(screen.queryByRole("option", { name: /Prose only/ })).toBeNull();
+
+    await user.click(screen.getByRole("checkbox", { name: /Allow this cloud request/ }));
+    await user.click(screen.getByRole("button", { name: "Generate draft" }));
+    await screen.findByText(/Accepting creates one observation/);
+    expect(generateExecutionDraft).toHaveBeenCalledWith(
+      execution.id,
+      "cloud-1",
+      "model-1",
+      true,
+    );
+    expect(screen.getByText("Unverified hypothesis 1")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: /Accept as observation/ }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    expect(editGeneratedDraft).toHaveBeenCalledWith("draft-1", content, 1);
+    expect(transitionGeneratedDraft).toHaveBeenCalledWith("draft-1", "accept", 2);
+  });
+
+  it("lets the operator close the dialog while a draft is still generating and stops polling", async () => {
+    const user = userEvent.setup();
+    const generating = {
+      id: "draft-slow",
+      engagementId: "engagement-1",
+      executionId: execution.id,
+      providerProfileId: "cloud-1",
+      model: "model-1",
+      promptVersion: "execution-note/v1",
+      contextFingerprint: "c".repeat(64),
+      status: "generating",
+      metadata: {},
+      revision: 1,
+    } satisfies GeneratedDraft;
+    const generateExecutionDraft = vi.fn().mockResolvedValue(generating);
+    const getGeneratedDraft = vi.fn().mockResolvedValue(generating);
+    const onClose = vi.fn();
+
+    render(
+      <ExecutionInsightDialog
+        action="draft"
+        api={{ generateExecutionDraft, getGeneratedDraft } as unknown as ApiClient}
+        execution={execution}
+        providers={[provider({ id: "cloud-1", name: "Cloud provider" })]}
+        onClose={onClose}
+        onChatAttached={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("checkbox", { name: /Allow this cloud request/ }));
+    await user.click(screen.getByRole("button", { name: "Generate draft" }));
+    expect(await screen.findByRole("button", { name: /Generating…/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Close execution action" })).toBeEnabled();
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(cancel).toBeEnabled();
+
+    await user.click(cancel);
+    expect(onClose).toHaveBeenCalledOnce();
+    const polled = getGeneratedDraft.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    expect(getGeneratedDraft.mock.calls.length).toBe(polled);
+  });
+
+  it("offers a Codex harness for structured execution drafts", async () => {
+    const user = userEvent.setup();
+    const draft = {
+      id: "draft-codex",
+      engagementId: "engagement-1",
+      executionId: execution.id,
+      providerProfileId: "harness-1",
+      model: "codex-model",
+      promptVersion: "execution-note/v1",
+      contextFingerprint: "b".repeat(64),
+      status: "ready",
+      content: {
+        title: "Codex execution note",
+        summary: "Bounded summary",
+        observations: [],
+        potentialFindings: [],
+        evidenceIds: [],
+      },
+      metadata: { backend_kind: "harness" },
+      revision: 1,
+    } satisfies GeneratedDraft;
+    const generateExecutionDraft = vi.fn().mockResolvedValue(draft);
+    const harness = {
+      id: "harness-1",
+      name: "Local Codex",
+      kind: "codex_app_server",
+      enabled: true,
+      localOnly: true,
+      permitsSensitiveData: false,
+      autoShareToolResults: false,
+      models: ["codex-model"],
+      defaultModel: "codex-model",
+    } as HarnessProfile;
+
+    render(
+      <ExecutionInsightDialog
+        action="draft"
+        api={{ generateExecutionDraft } as unknown as ApiClient}
+        execution={execution}
+        providers={[]}
+        harnesses={[harness]}
+        onClose={vi.fn()}
+        onChatAttached={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("option", { name: /Local Codex · Codex/ })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Generate draft" }));
+    await screen.findByText(/Accepting creates one observation/);
+    expect(generateExecutionDraft).toHaveBeenCalledWith(
+      execution.id,
+      "harness",
+      "codex-model",
+      false,
+      expect.objectContaining({
+        backendKind: "harness",
+        harnessProfileId: "harness-1",
+      }),
+    );
+  });
+});

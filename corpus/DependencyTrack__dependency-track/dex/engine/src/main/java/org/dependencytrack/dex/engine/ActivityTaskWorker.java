@@ -1,0 +1,260 @@
+/*
+ * This file is part of Dependency-Track.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) OWASP Foundation. All Rights Reserved.
+ */
+package org.dependencytrack.dex.engine;
+
+import io.github.resilience4j.core.IntervalFunction;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.dependencytrack.dex.api.RetryPolicy;
+import org.dependencytrack.dex.api.failure.ApplicationFailureException;
+import org.dependencytrack.dex.api.failure.TerminalApplicationFailureException;
+import org.dependencytrack.dex.engine.TaskEvent.ActivityTaskAbandonedEvent;
+import org.dependencytrack.dex.engine.TaskEvent.ActivityTaskCompletedEvent;
+import org.dependencytrack.dex.engine.TaskEvent.ActivityTaskFailedEvent;
+import org.dependencytrack.dex.engine.persistence.command.PollActivityTaskCommand;
+import org.dependencytrack.dex.proto.payload.v1.Payload;
+import org.jspecify.annotations.Nullable;
+import org.slf4j.MDC;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.BooleanSupplier;
+
+import static java.util.Objects.requireNonNull;
+import static java.util.Objects.requireNonNullElse;
+import static org.dependencytrack.dex.engine.MdcKeys.MDC_ACTIVITY_NAME;
+import static org.dependencytrack.dex.engine.MdcKeys.MDC_ACTIVITY_TASK_ATTEMPT;
+import static org.dependencytrack.dex.engine.MdcKeys.MDC_ACTIVITY_TASK_EXECUTION_ID;
+import static org.dependencytrack.dex.engine.MdcKeys.MDC_WORKFLOW_RUN_ID;
+
+final class ActivityTaskWorker extends AbstractTaskWorker<ActivityTask> {
+
+    private final DexEngineImpl engine;
+    private final MetadataRegistry metadataRegistry;
+    private final String queueName;
+    private final List<PollActivityTaskCommand> pollCommands;
+    private final ExecutorService executionExecutor;
+
+    ActivityTaskWorker(
+            final String name,
+            final DexEngineImpl engine,
+            final Duration minPollInterval,
+            final IntervalFunction pollBackoffIntervalFunction,
+            final MetadataRegistry metadataRegistry,
+            final String queueName,
+            final int maxConcurrency,
+            final MeterRegistry meterRegistry,
+            final BooleanSupplier downstreamAcceptsWork) {
+        super(name, minPollInterval, pollBackoffIntervalFunction, maxConcurrency, meterRegistry, downstreamAcceptsWork);
+        this.engine = requireNonNull(engine, "engine must not be null");
+        this.metadataRegistry = requireNonNull(metadataRegistry, "metadataRegistry must not be null");
+        this.queueName = requireNonNull(queueName, "queueName must not be null");
+        this.pollCommands = metadataRegistry.getAllActivityMetadata().stream()
+                .map(metadata -> new PollActivityTaskCommand(metadata.name(), metadata.lockTimeout()))
+                .toList();
+        this.executionExecutor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
+                .name("%s-%s-ActivityExecutor".formatted(getClass().getSimpleName(), name), 0)
+                .factory());
+    }
+
+    @Override
+    List<ActivityTask> poll(final int limit) {
+        return engine.pollActivityTasks(queueName, pollCommands, limit);
+    }
+
+    @Override
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    void process(final ActivityTask task) {
+        try (var _ = MDC.putCloseable(
+                        MDC_WORKFLOW_RUN_ID, task.id().workflowRunId().toString());
+                var _ = MDC.putCloseable(MDC_ACTIVITY_NAME, task.activityName());
+                var _ = MDC.putCloseable(MDC_ACTIVITY_TASK_ATTEMPT, String.valueOf(task.attempt()));
+                var _ = MDC.putCloseable(MDC_ACTIVITY_TASK_EXECUTION_ID, task.executionId())) {
+            final ActivityMetadata activityMetadata;
+            try {
+                activityMetadata = metadataRegistry.getActivityMetadata(task.activityName());
+            } catch (NoSuchElementException e) {
+                logger.warn("Activity does not exist");
+                abandon(task);
+                return;
+            }
+
+            final Object arg;
+            try {
+                arg = activityMetadata.argumentConverter().convertFromPayload(task.argument());
+            } catch (RuntimeException e) {
+                fail(task, "Failed to deserialize activity argument", new TerminalApplicationFailureException(e));
+                return;
+            }
+
+            final var ctx = new ActivityContextImpl(task);
+            final var executionStoppedLatch = new CountDownLatch(1);
+            final Future<Object> executionFuture;
+            try {
+                executionFuture = executionExecutor.submit(() -> {
+                    try {
+                        return activityMetadata.executor().execute(ctx, arg);
+                    } finally {
+                        executionStoppedLatch.countDown();
+                    }
+                });
+            } catch (RejectedExecutionException e) {
+                logger.debug("Execution executor is shut down; Abandoning task");
+                abandon(task);
+                return;
+            }
+
+            final Duration executionTimeout = activityMetadata.executionTimeout();
+            final ActivityHeartbeatRegistration heartbeatRegistration =
+                    engine.registerActivityHeartbeat(task, activityMetadata.lockTimeout(), executionFuture);
+            final Object activityResult;
+
+            try (heartbeatRegistration) {
+                activityResult = executionFuture.get(executionTimeout.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (CancellationException e) {
+                tryAwaitExecutionCompletion(executionStoppedLatch);
+                logger.warn("""
+                        Activity task lock was lost; discarding this execution as \
+                        another worker has taken over the task""");
+                return;
+            } catch (TimeoutException e) {
+                executionFuture.cancel(/* interruptIfRunning */ true);
+                tryAwaitExecutionCompletion(executionStoppedLatch);
+
+                final String message = "Activity execution exceeded timeout of %s".formatted(executionTimeout);
+                final var cause = new TimeoutException(message);
+                cause.initCause(e);
+
+                fail(task, message, cause);
+                return;
+            } catch (ExecutionException e) {
+                final Throwable cause = e.getCause();
+                if (cause instanceof InterruptedException || executionExecutor.isShutdown()) {
+                    logger.debug("Activity was interrupted or worker is shutting down; abandoning task");
+                    abandon(task);
+                } else {
+                    fail(task, "Activity failed", requireNonNullElse(cause, e));
+                }
+                return;
+            } catch (InterruptedException e) {
+                logger.debug("Interrupted while waiting for activity execution to complete; Abandoning task");
+                executionFuture.cancel(true);
+                abandon(task);
+                Thread.currentThread().interrupt();
+                return;
+            }
+
+            final Payload result;
+            try {
+                result = activityMetadata.resultConverter().convertToPayload(activityResult);
+            } catch (RuntimeException e) {
+                fail(task, "Failed to serialize activity result", new TerminalApplicationFailureException(e));
+                return;
+            }
+
+            engine.onTaskEvent(new ActivityTaskCompletedEvent(task, result));
+        }
+    }
+
+    @Override
+    void abandon(final ActivityTask task) {
+        engine.onTaskEvent(new ActivityTaskAbandonedEvent(task));
+    }
+
+    @Override
+    public void close() {
+        executionExecutor.shutdownNow();
+        try {
+            if (!executionExecutor.awaitTermination(3, TimeUnit.SECONDS)) {
+                logger.warn("Activity executor did not terminate in time");
+            }
+        } catch (InterruptedException e) {
+            logger.warn("Interrupted while waiting for activity executor to terminate");
+            Thread.currentThread().interrupt();
+        }
+        super.close();
+    }
+
+    private void tryAwaitExecutionCompletion(CountDownLatch executionStoppedLatch) {
+        // Wait a short moment for the activity task to terminate before moving on.
+        //
+        // NB: Calling Future#get after cancellation returns immediately even
+        // when the backing task is still executing. Hence, using a latch instead.
+        try {
+            if (!executionStoppedLatch.await(5, TimeUnit.SECONDS)) {
+                logger.warn("""
+                        Activity did not complete within 5s after cancellation; \
+                        the next attempt may run concurrently with it""");
+            }
+        } catch (InterruptedException _) {
+            logger.debug("Interrupted while waiting for cancelled task execution to complete");
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void fail(ActivityTask task, String message, Throwable cause) {
+        final Instant retryAt = computeRetryAt(task, cause);
+        if (retryAt == null) {
+            logger.warn("{}; Failing task terminally after {} attempt(s)", message, task.attempt(), cause);
+        } else {
+            logger.warn(
+                    "{}; Next retry due at {} (attempt {}/{})",
+                    message,
+                    retryAt,
+                    task.attempt() + 1,
+                    task.retryPolicy().maxAttempts(),
+                    cause);
+        }
+        engine.onTaskEvent(new ActivityTaskFailedEvent(task, cause, retryAt));
+    }
+
+    private static @Nullable Instant computeRetryAt(ActivityTask task, Throwable cause) {
+        final RetryPolicy retryPolicy = task.retryPolicy();
+        final boolean isTerminal = cause instanceof ApplicationFailureException afe && afe.isTerminal();
+        if (isTerminal || retryPolicy.maxAttempts() <= task.attempt()) {
+            return null;
+        }
+
+        final Duration retryAfter = cause instanceof ApplicationFailureException afe ? afe.retryAfter() : null;
+
+        final Duration retryDelay;
+        if (retryAfter != null) {
+            retryDelay = retryAfter.compareTo(retryPolicy.maxDelay()) > 0 ? retryPolicy.maxDelay() : retryAfter;
+        } else {
+            final var intervalFunc = IntervalFunction.ofExponentialRandomBackoff(
+                    retryPolicy.initialDelay(),
+                    retryPolicy.delayMultiplier(),
+                    retryPolicy.delayRandomizationFactor(),
+                    retryPolicy.maxDelay());
+            retryDelay = Duration.ofMillis(intervalFunc.apply(task.attempt() + 1));
+        }
+
+        return Instant.now().plus(retryDelay);
+    }
+}

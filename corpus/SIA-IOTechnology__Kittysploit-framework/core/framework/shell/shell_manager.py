@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Shell manager for handling different shell types
+"""
+
+import importlib
+from typing import Dict, Any, List, Optional, Type
+from .base_shell import BaseShell
+from core.output_handler import print_info, print_error, print_success
+
+
+def _lazy_import(module_path: str, class_name: str):
+    _cls = None
+
+    class _Proxy:
+        def __new__(cls, *args, **kwargs):
+            nonlocal _cls
+            if _cls is None:
+                mod = importlib.import_module(module_path, package=__package__)
+                _cls = getattr(mod, class_name)
+            return _cls(*args, **kwargs)
+
+        @classmethod
+        def _resolve(cls):
+            nonlocal _cls
+            if _cls is None:
+                mod = importlib.import_module(module_path, package=__package__)
+                _cls = getattr(mod, class_name)
+            return _cls
+
+    _Proxy.__name__ = class_name
+    _Proxy.__qualname__ = class_name
+    return _Proxy
+
+
+# Shells that only depend on the stdlib are imported eagerly
+from .classic_shell import ClassicShell
+from .javascript_shell import JavaScriptShell
+from .ssh_shell import SSHShell
+from .meterpreter_shell import MeterpreterShell
+from .php_shell import PHPShell
+from .mqtt_shell import MQTTShell
+from .dns_shell import DNSShell
+from .ftp_shell import FTPShell
+from .aws_sqs_shell import AWSSQSShell
+from .aws_sqs_command_shell import AWSSQSCommandShell
+from .android_shell import AndroidShell
+from .email_shell import EmailShell
+from .quic_shell import QuicShell
+from .http_cmd_shell import HttpCmdShell
+
+# Shells that need optional third-party packages are loaded lazily
+# so the framework can start even when those packages are missing.
+MySQLShell = _lazy_import('.mysql_shell', 'MySQLShell')
+PostgreSQLShell = _lazy_import('.postgresql_shell', 'PostgreSQLShell')
+RedisShell = _lazy_import('.redis_shell', 'RedisShell')
+LDAPShell = _lazy_import('.ldap_shell', 'LDAPShell')
+MongoDBShell = _lazy_import('.mongodb_shell', 'MongoDBShell')
+ElasticsearchShell = _lazy_import('.elasticsearch_shell', 'ElasticsearchShell')
+MSSQLShell = _lazy_import('.mssql_shell', 'MSSQLShell')
+WinRMShell = _lazy_import('.winrm_shell', 'WinRMShell')
+SMBShell = _lazy_import('.smb_shell', 'SMBShell')
+S7CommShell = _lazy_import('.s7comm_shell', 'S7CommShell')
+ModbusShell = _lazy_import('.modbus_shell', 'ModbusShell')
+OpcUaShell = _lazy_import('.opcua_shell', 'OpcUaShell')
+BacnetShell = _lazy_import('.bacnet_shell', 'BacnetShell')
+Dnp3Shell = _lazy_import('.dnp3_shell', 'Dnp3Shell')
+Iec104Shell = _lazy_import('.iec104_shell', 'Iec104Shell')
+Iec61850Shell = _lazy_import('.iec61850_shell', 'Iec61850Shell')
+CoapShell = _lazy_import('.coap_shell', 'CoapShell')
+OnvifShell = _lazy_import('.onvif_shell', 'OnvifShell')
+UpnpShell = _lazy_import('.upnp_shell', 'UpnpShell')
+RtspShell = _lazy_import('.rtsp_shell', 'RtspShell')
+MatterShell = _lazy_import('.matter_shell', 'MatterShell')
+PollingShell = _lazy_import('.polling_shell', 'PollingShell')
+AzureRunCommandShell = _lazy_import('.azure_run_command_shell', 'AzureRunCommandShell')
+GcpComputeSshShell = _lazy_import('.gcp_compute_ssh_shell', 'GcpComputeSshShell')
+GcpApiShell = _lazy_import('.gcp_api_shell', 'GcpApiShell')
+KubernetesShell = _lazy_import('.kubernetes_shell', 'KubernetesShell')
+BleShell = _lazy_import('.ble_shell', 'BleShell')
+
+class ShellManager:
+    
+    def __init__(self):
+        self.shells: Dict[str, BaseShell] = {}
+        self.shell_types: Dict[str, Type[BaseShell]] = {
+            'classic': ClassicShell,
+            'javascript': JavaScriptShell,
+            'ssh': SSHShell,
+            'meterpreter': MeterpreterShell,
+            'webshell': PHPShell,
+            'php': PHPShell,
+            'mysql': MySQLShell,
+            'postgresql': PostgreSQLShell,
+            'redis': RedisShell,
+            'ldap': LDAPShell,
+            'mongodb': MongoDBShell,
+            'elasticsearch': ElasticsearchShell,
+            'mssql': MSSQLShell,
+            'winrm': WinRMShell,
+            'smb': SMBShell,
+            's7comm': S7CommShell,
+            'modbus': ModbusShell,
+            'opcua': OpcUaShell,
+            'bacnet': BacnetShell,
+            'dnp3': Dnp3Shell,
+            'iec104': Iec104Shell,
+            'iec61850': Iec61850Shell,
+            'coap': CoapShell,
+            'onvif': OnvifShell,
+            'upnp': UpnpShell,
+            'rtsp': RtspShell,
+            'matter': MatterShell,
+            'polling': PollingShell,
+            'azure_run_command': AzureRunCommandShell,
+            'gcp_compute_ssh': GcpComputeSshShell,
+            'gcp_api': GcpApiShell,
+            'kubernetes': KubernetesShell,
+            'ble': BleShell,
+            'mqtt': MQTTShell,
+            'dns': DNSShell,
+            'ftp': FTPShell,
+            'aws_sqs': AWSSQSShell,
+            'aws_sqs_command': AWSSQSCommandShell,
+            'android': AndroidShell,
+            'email': EmailShell,
+            'quic': QuicShell,
+            'http_cmd': HttpCmdShell,
+        }
+        self.active_shell: Optional[str] = None
+    
+    def create_shell(self, session_id: str, shell_type: str, session_type: str = "unknown", browser_server=None, **kwargs) -> Optional[BaseShell]:
+        """
+        Create a new shell instance
+        
+        Args:
+            session_id: Unique session identifier
+            shell_type: Type of shell to create
+            session_type: Type of session
+            **kwargs: Additional arguments for shell creation
+            
+        Returns:
+            BaseShell instance or None if creation failed
+        """
+        try:
+            if shell_type not in self.shell_types:
+                print_error(f"Unknown shell type: {shell_type}")
+                print_info(f"Available shell types: {', '.join(self.shell_types.keys())}")
+                return None
+            
+            # Resolve lazy proxy to the real class (triggers the import)
+            shell_class = self.shell_types[shell_type]
+            if hasattr(shell_class, '_resolve'):
+                try:
+                    shell_class = shell_class._resolve()
+                except (ImportError, ModuleNotFoundError) as exc:
+                    print_error(f"Cannot create {shell_type} shell: missing package — {exc}")
+                    print_info(f"Install the required package and try again.")
+                    return None
+            if shell_type == "javascript" and browser_server:
+                shell = shell_class(session_id, session_type, browser_server)
+            elif shell_type in ("ssh", "php", "mysql", "postgresql", "redis", "ldap", "mongodb", "elasticsearch", "mssql", "winrm", "smb", "s7comm", "modbus", "opcua", "bacnet", "dnp3", "iec104", "iec61850", "coap", "onvif", "upnp", "rtsp", "matter", "polling", "azure_run_command", "gcp_compute_ssh", "gcp_api", "kubernetes", "ble", "mqtt", "dns", "ftp", "aws_sqs", "aws_sqs_command", "android", "email", "quic", "http_cmd", "classic"):
+                # These shells need framework to get connection from listener
+                framework = kwargs.get('framework')
+                shell = shell_class(session_id, session_type, framework)
+            else:
+                shell = shell_class(session_id, session_type)
+            
+            # Apply additional configuration
+            if 'username' in kwargs:
+                shell.username = kwargs['username']
+            if 'hostname' in kwargs:
+                shell.hostname = kwargs['hostname']
+            if 'is_root' in kwargs:
+                shell.is_root = kwargs['is_root']
+            if 'current_directory' in kwargs:
+                shell.current_directory = kwargs['current_directory']
+            
+            # Store shell
+            self.shells[session_id] = shell
+            
+            print_success(f"Created {shell_type} shell for session {session_id}")
+            return shell
+            
+        except Exception as e:
+            print_error(f"Failed to create shell: {str(e)}")
+            return None
+    
+    def get_shell(self, session_id: str) -> Optional[BaseShell]:
+        return self.shells.get(session_id)
+    
+    def remove_shell(self, session_id: str) -> bool:
+        if session_id in self.shells:
+            shell = self.shells.pop(session_id)
+            shell.deactivate()
+            
+            # Clear active shell if it was this one
+            if self.active_shell == session_id:
+                self.active_shell = None
+            
+            print_success(f"Removed shell for session {session_id}")
+            return True
+        return False
+    
+    def set_active_shell(self, session_id: str) -> bool:
+        if session_id in self.shells:
+            self.active_shell = session_id
+            return True
+        return False
+    
+    def get_active_shell(self) -> Optional[BaseShell]:
+        if self.active_shell and self.active_shell in self.shells:
+            return self.shells[self.active_shell]
+        return None
+    
+    def execute_command(self, session_id: str, command: str, framework=None, pty: bool = False) -> Dict[str, Any]:
+        """Execute command in specific shell.
+
+        ``pty`` is honored by SSH shells (pseudo-TTY); other shell types ignore it.
+        """
+        shell = self.get_shell(session_id)
+        
+        # If no shell exists, try to create one automatically
+        if not shell:
+            # Try to auto-create shell based on session type
+            if framework and hasattr(framework, 'session_manager'):
+                session = framework.session_manager.get_session(session_id)
+                if session:
+                    # Determine shell type from session type
+                    session_type = session.session_type.lower()
+                    session_data = session.data if hasattr(session, 'data') and isinstance(session.data, dict) else {}
+                    if session_type == 'ssh':
+                        shell_type = 'ssh'
+                    elif session_type == 'meterpreter':
+                        shell_type = 'meterpreter'
+                    elif session_type == 'android':
+                        shell_type = 'android'
+                    elif session_type == 'email':
+                        shell_type = 'email'
+                    elif session_type in ('php', 'webshell', 'http', 'https'):
+                        shell_type = 'php'
+                    elif session_type == 'mysql':
+                        shell_type = 'mysql'
+                    elif session_type == 'postgresql':
+                        shell_type = 'postgresql'
+                    elif session_type == 'redis':
+                        shell_type = 'redis'
+                    elif session_type == 'ldap':
+                        shell_type = 'ldap'
+                    elif session_type == 'mongodb':
+                        shell_type = 'mongodb'
+                    elif session_type == 'elasticsearch':
+                        shell_type = 'elasticsearch'
+                    elif session_type == 'mssql':
+                        shell_type = 'mssql'
+                    elif session_type == 'winrm':
+                        shell_type = 'winrm'
+                    elif session_type == 'smb':
+                        shell_type = 'smb'
+                    elif session_type == 's7comm':
+                        shell_type = 's7comm'
+                    elif session_type == 'modbus':
+                        shell_type = 'modbus'
+                    elif session_type == 'opcua':
+                        shell_type = 'opcua'
+                    elif session_type == 'bacnet':
+                        shell_type = 'bacnet'
+                    elif session_type == 'dnp3':
+                        shell_type = 'dnp3'
+                    elif session_type == 'iec104':
+                        shell_type = 'iec104'
+                    elif session_type == 'iec61850':
+                        shell_type = 'iec61850'
+                    elif session_type == 'coap':
+                        shell_type = 'coap'
+                    elif session_type == 'onvif':
+                        shell_type = 'onvif'
+                    elif session_type == 'upnp':
+                        shell_type = 'upnp'
+                    elif session_type == 'rtsp':
+                        shell_type = 'rtsp'
+                    elif session_type == 'matter':
+                        shell_type = 'matter'
+                    elif session_type == 'polling':
+                        shell_type = 'polling'
+                    elif session_type == 'azure_run_command':
+                        shell_type = 'azure_run_command'
+                    elif session_type == 'gcp_compute_ssh':
+                        shell_type = 'gcp_compute_ssh'
+                    elif session_type == 'gcp_api':
+                        shell_type = 'gcp_api'
+                    elif session_type == 'kubernetes':
+                        shell_type = 'kubernetes'
+                    elif session_type == 'ble':
+                        shell_type = 'ble'
+                    elif session_type == 'mqtt':
+                        shell_type = 'mqtt'
+                    elif session_type == 'dns':
+                        shell_type = 'dns'
+                    elif session_type == 'ftp':
+                        shell_type = 'ftp'
+                    elif session_type == 'quic':
+                        shell_type = 'quic'
+                    elif session_type == 'aws' or session_type == 'aws_sqs':
+                        # Check if it's a command executor or interactive shell
+                        if session_data and session_data.get('command_executor'):
+                            shell_type = 'aws_sqs_command'
+                        else:
+                            shell_type = 'aws_sqs'
+                    else:
+                        shell_type = 'classic'
+                    
+                    # Try to create shell automatically
+                    shell = self.create_shell(
+                        session_id=session_id,
+                        shell_type=shell_type,
+                        session_type=session_type,
+                        framework=framework
+                    )
+        
+        if not shell:
+            return {'output': '', 'status': 1, 'error': f'No shell found for session {session_id} and could not create one automatically'}
+        
+        if not shell.is_active:
+            # Try to activate the shell
+            shell.activate()
+        
+        try:
+            if pty:
+                try:
+                    return shell.execute_command(command, pty=True)
+                except TypeError:
+                    pass
+            return shell.execute_command(command)
+        except Exception as e:
+            return {'output': '', 'status': 1, 'error': f'Command execution error: {str(e)}'}
+    
+    def execute_active_command(self, command: str) -> Dict[str, Any]:
+        if not self.active_shell:
+            return {'output': '', 'status': 1, 'error': 'No active shell'}
+        
+        return self.execute_command(self.active_shell, command)
+    
+    def get_shell_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+        shell = self.get_shell(session_id)
+        if shell:
+            return shell.get_shell_info()
+        return None
+    
+    def list_shells(self) -> List[Dict[str, Any]]:
+        shells_info = []
+        for session_id, shell in self.shells.items():
+            info = shell.get_shell_info()
+            info['is_active'] = (session_id == self.active_shell)
+            shells_info.append(info)
+        return shells_info
+    
+    def get_available_shell_types(self) -> List[str]:
+        return list(self.shell_types.keys())
+    
+    def get_shell_type_info(self, shell_type: str) -> Optional[Dict[str, Any]]:
+        if shell_type not in self.shell_types:
+            return None
+        
+        shell_class = self.shell_types[shell_type]
+        if hasattr(shell_class, '_resolve'):
+            try:
+                shell_class = shell_class._resolve()
+            except (ImportError, ModuleNotFoundError):
+                return {
+                    'name': shell_type,
+                    'shell_name': shell_type,
+                    'description': f"{shell_type} shell (package not installed)",
+                    'available_commands': 0,
+                }
+        # Do not instantiate shell classes here: some require constructor args (session_id/framework).
+        return {
+            'name': shell_class.__name__,
+            'shell_name': shell_type,
+            'description': shell_class.__doc__ or f"{shell_type} shell implementation",
+            'available_commands': 0,
+        }
+    
+    def switch_shell(self, session_id: str) -> bool:
+        """Switch to a different shell"""
+        if session_id in self.shells:
+            self.active_shell = session_id
+            print_success(f"Switched to shell for session {session_id}")
+            return True
+        else:
+            print_error(f"Shell for session {session_id} not found")
+            return False
+    
+    def get_shell_prompt(self, session_id: str) -> str:
+        shell = self.get_shell(session_id)
+        if shell:
+            return shell.get_prompt()
+        return "> "
+    
+    def get_active_shell_prompt(self) -> str:
+        shell = self.get_active_shell()
+        if shell:
+            return shell.get_prompt()
+        return "> "
+    
+    def cleanup_inactive_shells(self):
+        inactive_sessions = []
+        for session_id, shell in self.shells.items():
+            if not shell.is_active:
+                inactive_sessions.append(session_id)
+        
+        for session_id in inactive_sessions:
+            self.remove_shell(session_id)
+        
+        if inactive_sessions:
+            print_info(f"Cleaned up {len(inactive_sessions)} inactive shells")
+    
+    def get_shell_statistics(self) -> Dict[str, Any]:
+        total_shells = len(self.shells)
+        active_shells = sum(1 for shell in self.shells.values() if shell.is_active)
+        
+        shell_type_counts = {}
+        for shell in self.shells.values():
+            shell_type = shell.shell_name
+            shell_type_counts[shell_type] = shell_type_counts.get(shell_type, 0) + 1
+        
+        return {
+            'total_shells': total_shells,
+            'active_shells': active_shells,
+            'inactive_shells': total_shells - active_shells,
+            'shell_type_counts': shell_type_counts,
+            'active_shell_id': self.active_shell
+        }

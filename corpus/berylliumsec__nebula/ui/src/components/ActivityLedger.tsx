@@ -1,0 +1,206 @@
+import { HarnessReasoningDetails } from "./HarnessReasoningDetails";
+import { ChevronDown } from "lucide-react";
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  activityLedgerStatusLabel,
+  type ActivityLedgerEntry,
+  type ActivityLedgerStatus,
+  type ActivityLedgerViewModel,
+} from "./activityLedgerModel";
+
+function durationLabel(durationMs: number | undefined): string | undefined {
+  if (!durationMs) return undefined;
+  if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
+  const minutes = Math.floor(durationMs / 60_000);
+  const seconds = Math.round((durationMs % 60_000) / 1000);
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function timeLabel(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return undefined;
+  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(parsed);
+}
+
+function receiptParts(model: ActivityLedgerViewModel): string[] {
+  const parts: string[] = [];
+  if (model.totalTasks !== undefined) parts.push(`${model.completedTasks ?? 0}/${model.totalTasks} tasks`);
+  const commentaryCount = model.entries.filter(entry => Boolean(entry.sourceItem?.streams.commentary?.trim())).length;
+  if (commentaryCount) parts.push(`${commentaryCount} update${commentaryCount === 1 ? "" : "s"}`);
+  const reasoningCount = model.entries.filter(entry => entry.kind === "reasoning" && !entry.sourceItem?.streams.commentary?.trim()).length;
+  if (reasoningCount) parts.push(`${reasoningCount} thinking episode${reasoningCount === 1 ? "" : "s"}`);
+  if (model.actionCount) parts.push(`${model.actionCount} action${model.actionCount === 1 ? "" : "s"}`);
+  if (model.attentionCount) parts.push(`${model.attentionCount} warning${model.attentionCount === 1 ? "" : "s"}`);
+  if (model.artifactCount) parts.push(`${model.artifactCount} artifact${model.artifactCount === 1 ? "" : "s"}`);
+  const duration = durationLabel(model.durationMs);
+  if (duration) parts.push(duration);
+  return parts;
+}
+
+function statusClass(status: ActivityLedgerStatus): string {
+  return `status-${status}`;
+}
+
+function DefaultEntryDetails({ entry }: { entry: ActivityLedgerEntry }) {
+  const hasPayload = Object.keys(entry.payload).length > 0;
+  if (!entry.summary && !entry.outputs.length && !hasPayload && !entry.usageLabel) return null;
+  return <div className="activity-ledger-entry-body">
+    {entry.sourceItem?.kind === "reasoning" ? <HarnessReasoningDetails item={entry.sourceItem} /> : entry.summary && entry.summary !== entry.label && <p>{entry.summary}</p>}
+    {entry.outputs.map((output, index) => <div className="harness-output" key={`${output.label}-${index}`}><small>{output.label}</small><pre tabIndex={0}>{output.content}</pre></div>)}
+    {hasPayload && entry.sourceItem?.kind !== "reasoning" && <details className="activity-ledger-technical"><summary>Technical details</summary><pre tabIndex={0}>{JSON.stringify(entry.payload, null, 2)}</pre></details>}
+    {entry.usageLabel && <small>{entry.usageLabel}</small>}
+  </div>;
+}
+
+export function ActivityLedger({
+  model,
+  renderEntryDetails,
+  renderEntryActions,
+  onExpandedChange,
+  emptyState,
+  compact = false,
+  historyPending = false,
+  progress,
+  latestUpdate,
+}: {
+  model: ActivityLedgerViewModel;
+  renderEntryDetails?: (entry: ActivityLedgerEntry) => ReactNode;
+  renderEntryActions?: (entry: ActivityLedgerEntry) => ReactNode;
+  onExpandedChange?: (expanded: boolean) => void;
+  emptyState?: ReactNode;
+  compact?: boolean;
+  historyPending?: boolean;
+  /** Most recent public harness commentary; the complete event remains in activity. */
+  latestUpdate?: string;
+  /** The provider's visible prose while it calls tools, retained as work history. */
+  progress?: {
+    headline?: string;
+    latest?: string;
+    statusLabel?: string;
+    elapsed?: ReactNode;
+    receipt: string;
+    details: ReactNode;
+  };
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const auditRef = useRef<HTMLDivElement>(null);
+  const followLatestRef = useRef(true);
+  const auditId = useId();
+  useLayoutEffect(() => {
+    if (expanded && followLatestRef.current && auditRef.current) {
+      auditRef.current.scrollTop = auditRef.current.scrollHeight;
+    }
+  }, [expanded, model.entries.length]);
+  const active = model.status === "active" || model.status === "queued" || model.status === "attention";
+  const attentionEntries = model.entries.filter((entry) => entry.status === "attention" || (!compact && entry.status === "failed"));
+  const receipt = receiptParts(model);
+  const commentaryCount = model.entries.filter((entry) => Boolean(entry.sourceItem?.streams.commentary?.trim())).length;
+  const compactReceipt = [
+    !progress && commentaryCount ? `${commentaryCount} update${commentaryCount === 1 ? "" : "s"}` : "",
+    model.actionCount ? `${model.actionCount} action${model.actionCount === 1 ? "" : "s"}` : "",
+    model.attentionCount ? `${model.attentionCount} warning${model.attentionCount === 1 ? "" : "s"}` : "",
+    model.artifactCount ? `${model.artifactCount} artifact${model.artifactCount === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
+  const meaningful = Boolean(progress) || model.entries.some((entry) => entry.countsAsAction || entry.artifactIds.length || entry.evidenceIds.length || entry.outputs.length || Boolean(entry.sourceItem?.streams.commentary?.trim()) || ["checkpoint", "plan", "goal", "file_change"].includes(entry.kind ?? "") || entry.kind === "reasoning" || ["attention", "failed", "cancelled"].includes(entry.status));
+  if (compact && model.status === "complete" && !meaningful && !historyPending && !model.artifactCount && !model.attentionCount) return null;
+  return (
+    <section className={`activity-ledger ${statusClass(model.status)}${compact ? " activity-ledger-compact" : ""}${progress ? " has-progress" : ""}`} aria-label={model.title}>
+      {!compact && <header className="activity-ledger-header">
+        <span className={`activity-ledger-state ${statusClass(model.status)}`} aria-hidden="true" />
+        <strong>{model.title}</strong>
+        <span>{activityLedgerStatusLabel(model.status)}{model.durationMs ? ` · ${durationLabel(model.durationMs)}` : ""}</span>
+      </header>}
+      {compact && active && <div className="activity-ledger-compact-header">
+        <span className={`activity-ledger-state ${statusClass(model.status)}`} aria-hidden="true" />
+        <strong>{model.status === "queued" ? "Queued work" : model.status === "attention" ? "Action required" : "Current run"}</strong>
+        <span className="activity-ledger-compact-state">{progress?.statusLabel ?? activityLedgerStatusLabel(model.status)}
+          {progress?.elapsed ?? (model.durationMs ? <span className="activity-ledger-compact-duration"> · {durationLabel(model.durationMs)}</span> : null)}
+        </span>
+      </div>}
+
+      {!compact && (active ? <div className="activity-ledger-live">
+        {model.phases.length > 0 && <ol className="activity-ledger-phases" aria-label="Work phases">
+          {model.phases.map((phase) => <li className={statusClass(phase.status)} key={phase.key}>
+            <span className="activity-ledger-phase-marker" aria-hidden="true" />
+            <span>{phase.label}</span>
+            <small>{phase.total > 1 ? `${phase.completed} of ${phase.total}` : activityLedgerStatusLabel(phase.status)}</small>
+          </li>)}
+        </ol>}
+        {model.currentAction && <p className="activity-ledger-current" aria-live="polite"><small>Now</small><span>{model.currentAction}</span></p>}
+      </div> : <p className="activity-ledger-receipt">
+        <strong>{activityLedgerStatusLabel(model.status)}</strong>
+        {receipt.length > 0 && <span>{receipt.join(" · ")}</span>}
+      </p>)}
+
+      {compact && active && (progress?.headline || model.currentAction) && <p className="activity-ledger-current activity-ledger-compact-current" aria-live="polite"><small>Now</small><span>{progress?.headline ?? model.currentAction}</span></p>}
+      {compact && active && (progress?.latest || latestUpdate) && <p className="activity-ledger-progress-preview" aria-live="polite"><small>Latest update</small><span>{progress?.latest || latestUpdate}</span></p>}
+
+      {attentionEntries.length > 0 && <div className="activity-ledger-attention" aria-label="Activity requiring attention">
+        {attentionEntries.map((entry) => entry.status === "failed" ? <details className="activity-ledger-failure status-failed" key={`attention:${entry.id}`}>
+          <summary>
+            <span className="activity-ledger-phase-marker status-failed" aria-hidden="true" />
+            <strong>{entry.label}</strong>
+            {entry.brief && entry.brief !== entry.label && <small title={entry.brief}>{entry.brief.startsWith(`${entry.label} failed — `) ? entry.brief.slice(`${entry.label} failed — `.length) : entry.brief}</small>}
+            <em>{entry.statusLabel ?? activityLedgerStatusLabel(entry.status)}</em>
+            <ChevronDown size={14} aria-hidden="true" />
+          </summary>
+          {renderEntryDetails?.(entry) ?? <DefaultEntryDetails entry={entry} />}
+          {renderEntryActions && <div className="activity-ledger-entry-actions">{renderEntryActions(entry)}</div>}
+        </details> : <div className={statusClass(entry.status)} key={`attention:${entry.id}`}>
+          <span className={`activity-ledger-phase-marker ${statusClass(entry.status)}`} aria-hidden="true" />
+          <span><strong>{entry.label}</strong>{entry.brief && entry.brief !== entry.label && <small>{entry.brief}</small>}</span>
+          <em>{entry.statusLabel ?? activityLedgerStatusLabel(entry.status)}</em>
+        </div>)}
+      </div>}
+
+      <footer className="activity-ledger-footer">
+        <span>{compact
+          ? progress
+            ? [progress.receipt, ...compactReceipt].join(" · ")
+            : [active ? "Work in progress" : activityLedgerStatusLabel(model.status), ...compactReceipt].join(" · ")
+          : `${model.actionCount} actions`}</span>
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={auditId}
+          onClick={() => setExpanded((value) => {
+            const next = !value;
+            if (next) followLatestRef.current = true;
+            onExpandedChange?.(next);
+            return next;
+          })}
+        >
+          {progress ? expanded ? "Hide work" : "View work" : expanded ? "Hide activity" : historyPending ? "Inspect saved work" : "Show activity"}
+          <ChevronDown size={14} aria-hidden="true" />
+        </button>
+      </footer>
+
+      {expanded && <div className="activity-ledger-audit" id={auditId} ref={auditRef} tabIndex={0}
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          followLatestRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+        }}>
+        <header><strong>{progress ? "Work" : "Activity"}</strong>{model.entries.length > 0 && <small>{receipt.join(" · ")} · latest below</small>}</header>
+        {progress && <div className="activity-ledger-progress-details">{progress.details}</div>}
+        {model.entries.length > 0 ? <ol>
+          {[...model.entries].reverse().map((entry) => {
+            const details = renderEntryDetails?.(entry);
+            const actions = renderEntryActions?.(entry);
+            const hasDetails = Boolean(details || entry.summary || entry.outputs.length || Object.keys(entry.payload).length || entry.usageLabel || actions);
+            return <li className={statusClass(entry.status)} key={entry.id}>
+              <span className="activity-ledger-entry-time">{timeLabel(entry.occurredAt) ?? `#${entry.sequence}`}</span>
+              <div className="activity-ledger-entry-content">
+                {hasDetails ? <details>
+                  <summary><strong>{entry.label}</strong><span>{entry.statusLabel ?? activityLedgerStatusLabel(entry.status)}</span><ChevronDown size={14} aria-hidden="true" /></summary>
+                  {details ?? <DefaultEntryDetails entry={entry} />}
+                  {actions && <div className="activity-ledger-entry-actions">{actions}</div>}
+                </details> : <div className="activity-ledger-entry-static"><strong>{entry.label}</strong><span>{entry.statusLabel ?? activityLedgerStatusLabel(entry.status)}</span></div>}
+              </div>
+            </li>;
+          })}
+        </ol> : progress ? null : emptyState ?? <p>No activity has been recorded yet.</p>}
+      </div>}
+    </section>
+  );
+}

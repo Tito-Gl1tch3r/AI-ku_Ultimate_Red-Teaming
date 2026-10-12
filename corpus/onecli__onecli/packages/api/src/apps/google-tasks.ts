@@ -1,0 +1,49 @@
+import type { AppDefinition } from "./types";
+import {
+  buildGoogleAuthUrl,
+  exchangeGoogleCode,
+  googleConfigFields,
+} from "./oauth/google";
+
+export const googleTasks: AppDefinition = {
+  id: "google-tasks",
+  setupGuideUrl: "https://onecli.sh/docs/integrations/google-tasks",
+  name: "Google Tasks",
+  apiDocsUrl: "https://developers.google.com/workspace/tasks/reference/rest",
+  icon: "/icons/google-tasks.svg",
+  description: "Manage task lists and tasks.",
+  connectionMethod: {
+    type: "oauth",
+    defaultScopes: [
+      "openid",
+      "email",
+      "profile",
+      "https://www.googleapis.com/auth/tasks",
+    ],
+    permissions: [
+      {
+        scope: "https://www.googleapis.com/auth/tasks",
+        name: "Tasks",
+        description: "Read, create, and manage task lists and tasks",
+        access: "write",
+      },
+      {
+        scope: "https://www.googleapis.com/auth/userinfo.email",
+        name: "Email address",
+        description: "View your email address",
+        access: "read",
+      },
+      {
+        scope: "https://www.googleapis.com/auth/userinfo.profile",
+        name: "Profile",
+        description: "Name and profile picture",
+        access: "read",
+      },
+    ],
+    buildAuthUrl: buildGoogleAuthUrl,
+    exchangeCode: exchangeGoogleCode,
+  },
+  configurable: {
+    fields: googleConfigFields,
+  },
+};

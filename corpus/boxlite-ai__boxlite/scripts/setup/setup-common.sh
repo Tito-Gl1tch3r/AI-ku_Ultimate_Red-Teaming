@@ -1,0 +1,615 @@
+#!/bin/bash
+# Common utilities for BoxLite setup scripts
+#
+# This file should be sourced by setup scripts, not executed directly.
+# Usage: source scripts/setup-common.sh
+
+# Exit if executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "❌ Error: This script should be sourced, not executed directly"
+    echo "Usage: source scripts/setup-common.sh"
+    exit 1
+fi
+
+# Ensure common.sh is loaded
+if [[ -z "$SCRIPT_DIR" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    source "$SCRIPT_DIR/common.sh"
+fi
+
+# Configure sudo helper for scripts that write system locations.
+setup_sudo() {
+    if [ "$EUID" -eq 0 ]; then
+        SUDO=""
+    elif command_exists sudo; then
+        SUDO="sudo"
+    else
+        SUDO=""
+    fi
+
+    export SUDO
+}
+
+# Fail early when a setup flow needs system-level package installation.
+require_root_or_sudo() {
+    setup_sudo
+
+    if [ "$EUID" -ne 0 ] && [ -z "$SUDO" ]; then
+        print_error "This setup requires root privileges or sudo"
+        echo "   Re-run as root or install sudo and retry"
+        exit 1
+    fi
+}
+
+# Run a command through sudo when the current shell is not root.
+run_with_sudo() {
+    if [ -n "${SUDO:-}" ]; then
+        "$SUDO" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Check Rust installation
+check_rust() {
+    print_step "Checking for Rust... "
+
+    # Source cargo env if not already in PATH
+    if ! command_exists rustc; then
+        [ -f "${CARGO_HOME:-$HOME/.cargo}/env" ] && source "${CARGO_HOME:-$HOME/.cargo}/env"
+    fi
+
+    if command_exists rustc; then
+        local rust_version=$(rustc --version | cut -d' ' -f2)
+        print_success "Found (version $rust_version)"
+        return 0
+    else
+        print_error "Not found"
+        return 1
+    fi
+}
+
+# Install Rust
+install_rust() {
+    echo ""
+    print_section "Installing Rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source "${CARGO_HOME:-$HOME/.cargo}/env"
+    print_success "Rust installed"
+}
+
+# Initialize git submodules
+init_submodules() {
+    "$SCRIPT_DIR/setup/setup-submodules.sh"
+}
+
+# Install cargo-nextest
+install_cargo_nextest() {
+    print_step "Checking for cargo-nextest... "
+    if cargo nextest --version &>/dev/null; then
+        print_success "Already installed"
+    else
+        echo -e "${YELLOW}Installing...${NC}"
+        cargo install cargo-nextest --locked
+        print_success "cargo-nextest installed"
+    fi
+    echo ""
+}
+
+# Detect guest target architecture
+detect_guest_target() {
+    source "$SCRIPT_DIR/util.sh"
+    export GUEST_TARGET
+}
+
+# Check and add Rust target
+check_rust_target() {
+    local target="$1"
+
+    print_step "Checking for $target target... "
+    if rustup target list | grep -q "$target (installed)"; then
+        print_success "Already installed"
+        return 0
+    else
+        echo -e "${YELLOW}Installing...${NC}"
+        rustup target add "$target"
+        print_success "Target installed"
+        return 0
+    fi
+}
+
+# Check Python installation
+check_python() {
+    print_step "Checking for Python 3... "
+    if command_exists python3; then
+        local python_version=$(python3 --version | cut -d' ' -f2)
+        print_success "Found (version $python_version)"
+        return 0
+    else
+        print_error "Not found"
+        return 1
+    fi
+}
+
+# Minimum Go version required by libgvproxy-sys go.mod
+GO_MIN_MAJOR=1
+GO_MIN_MINOR=24
+
+# Check Go installation and version.
+# Returns: 0 = OK, 1 = missing, 2 = too old
+check_go() {
+    print_step "Checking for Go >= ${GO_MIN_MAJOR}.${GO_MIN_MINOR}... "
+
+    if ! command_exists go; then
+        print_error "Not found"
+        return 1
+    fi
+
+    local go_version
+    go_version=$(go version | awk '{print $3}' | sed 's/go//')
+
+    local major minor
+    major=$(echo "$go_version" | cut -d. -f1)
+    minor=$(echo "$go_version" | cut -d. -f2)
+
+    if [ "$major" -gt "$GO_MIN_MAJOR" ] 2>/dev/null ||
+       { [ "$major" -eq "$GO_MIN_MAJOR" ] 2>/dev/null && [ "$minor" -ge "$GO_MIN_MINOR" ] 2>/dev/null; }; then
+        print_success "Found (version $go_version)"
+        return 0
+    else
+        echo -e "${YELLOW}Found Go $go_version (too old, need >= ${GO_MIN_MAJOR}.${GO_MIN_MINOR})${NC}"
+        return 2
+    fi
+}
+
+# Install Go from official go.dev tarball (Linux only).
+install_go_from_official() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        *)
+            print_error "Unsupported architecture for Go: $arch"
+            return 1
+            ;;
+    esac
+
+    print_step "Fetching latest Go version... "
+    local go_version
+    go_version=$(curl -sL https://go.dev/VERSION?m=text | head -1)
+    if [ -z "$go_version" ]; then
+        print_error "Failed to fetch Go version from go.dev"
+        return 1
+    fi
+    print_success "$go_version"
+
+    local tarball="${go_version}.linux-${arch}.tar.gz"
+    local url="https://go.dev/dl/${tarball}"
+
+    print_step "Downloading ${tarball}... "
+    local tmpfile="/tmp/${tarball}"
+    if ! curl -sSL "$url" -o "$tmpfile"; then
+        print_error "Failed to download Go from $url"
+        return 1
+    fi
+    print_success "Done"
+
+    print_step "Installing to /usr/local/go... "
+    run_with_sudo rm -rf /usr/local/go
+    run_with_sudo tar -C /usr/local -xzf "$tmpfile"
+    rm -f "$tmpfile"
+    print_success "Installed"
+
+    # Ensure /usr/local/go/bin is in PATH for this session
+    export PATH="/usr/local/go/bin:$PATH"
+
+    # Persist PATH for future shells
+    local path_line='export PATH="/usr/local/go/bin:$PATH"'
+    local actual_user="${SUDO_USER:-$USER}"
+    local user_home
+    user_home=$(eval echo "~$actual_user")
+
+    for profile in "$user_home/.profile" "$user_home/.bashrc"; do
+        if [ -f "$profile" ] && ! grep -q '/usr/local/go/bin' "$profile"; then
+            echo "" >> "$profile"
+            echo "# Added by boxlite setup — Go from go.dev" >> "$profile"
+            echo "$path_line" >> "$profile"
+        fi
+    done
+
+    local installed_version
+    installed_version=$(go version | awk '{print $3}' | sed 's/go//')
+    print_success "Go $installed_version installed"
+    print_info "Run 'source ~/.profile' or open a new terminal to use Go everywhere"
+}
+
+# Setup Go with version validation.
+# On Linux: installs from go.dev if missing or too old.
+# Respects SKIP_INSTALL_GO=1 to skip entirely.
+setup_go() {
+    if [ "${SKIP_INSTALL_GO:-}" = "1" ]; then
+        print_step "Skipping Go (SKIP_INSTALL_GO=1)"
+        echo ""
+        return 0
+    fi
+
+    print_section "🐹 Checking Go..."
+
+    # Prefer /usr/local/go/bin if it exists (official install location)
+    if [ -d "/usr/local/go/bin" ]; then
+        export PATH="/usr/local/go/bin:$PATH"
+    fi
+
+    local status=0
+    check_go || status=$?
+
+    case "$status" in
+        0)
+            # Version OK
+            ;;
+        1)
+            # Missing — install automatically
+            install_go_from_official
+            ;;
+        2)
+            # Too old — ask user (auto-install in CI)
+            if [ "${CI:-}" = "true" ]; then
+                install_go_from_official
+            else
+                echo ""
+                echo "   libgvproxy requires Go >= ${GO_MIN_MAJOR}.${GO_MIN_MINOR}."
+                echo "   The build will fail without a compatible Go version."
+                echo ""
+                read -rp "   Upgrade Go from go.dev? [y/N] " answer
+                case "$answer" in
+                    [yY]|[yY][eE][sS])
+                        install_go_from_official
+                        ;;
+                    *)
+                        print_warning "Skipping Go upgrade. To upgrade manually:"
+                        echo "   sudo rm -rf /usr/local/go"
+                        echo "   wget https://go.dev/dl/go1.24.linux-\$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz"
+                        echo "   sudo tar -C /usr/local -xzf go1.24.*.tar.gz"
+                        echo "   export PATH=/usr/local/go/bin:\$PATH"
+                        ;;
+                esac
+            fi
+            ;;
+    esac
+    echo ""
+}
+
+# Minimum Node.js version. The Node SDK's transitive devDeps
+# (@napi-rs/cli@3 -> @inquirer/core@11) need Node >= 20.12, and Node 20 hit
+# EOL on 2026-04-30, so we standardize on the active LTS line.
+NODE_MIN_MAJOR=22
+NODE_MIN_MINOR=0
+
+# Pinned Node.js version used for fresh installs. Should track the active LTS.
+NODE_INSTALL_VERSION="22.18.0"
+
+# Check Node.js installation and version.
+# Returns: 0 = OK, 1 = missing, 2 = too old
+check_nodejs() {
+    print_step "Checking for Node.js >= ${NODE_MIN_MAJOR}.${NODE_MIN_MINOR}... "
+
+    if ! command_exists node; then
+        print_error "Not found"
+        return 1
+    fi
+
+    local node_version
+    node_version=$(node --version | sed 's/^v//')
+
+    local major minor
+    major=$(echo "$node_version" | cut -d. -f1)
+    minor=$(echo "$node_version" | cut -d. -f2)
+
+    if [ "$major" -gt "$NODE_MIN_MAJOR" ] 2>/dev/null ||
+       { [ "$major" -eq "$NODE_MIN_MAJOR" ] 2>/dev/null && [ "$minor" -ge "$NODE_MIN_MINOR" ] 2>/dev/null; }; then
+        print_success "Found (version $node_version)"
+        return 0
+    else
+        echo -e "${YELLOW}Found Node.js $node_version (too old, need >= ${NODE_MIN_MAJOR}.${NODE_MIN_MINOR})${NC}"
+        return 2
+    fi
+}
+
+# Install Node.js from official nodejs.org tarball (Linux).
+# Used as a fallback when no package manager path is available.
+install_nodejs_from_tarball() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch="x64" ;;
+        aarch64) arch="arm64" ;;
+        *)
+            print_error "Unsupported architecture for Node.js: $arch"
+            return 1
+            ;;
+    esac
+
+    local tarball="node-v${NODE_INSTALL_VERSION}-linux-${arch}.tar.xz"
+    local url="https://nodejs.org/dist/v${NODE_INSTALL_VERSION}/${tarball}"
+
+    print_step "Downloading ${tarball}... "
+    local tmpfile="/tmp/${tarball}"
+    if ! curl -fsSL "$url" -o "$tmpfile"; then
+        print_error "Failed to download Node.js from $url"
+        return 1
+    fi
+    print_success "Done"
+
+    print_step "Installing to /usr/local... "
+    run_with_sudo tar -xJ -C /usr/local --strip-components=1 -f "$tmpfile"
+    rm -f "$tmpfile"
+    print_success "Installed"
+
+    local installed_version
+    installed_version=$(node --version | sed 's/^v//')
+    print_success "Node.js $installed_version installed"
+}
+
+# Install Node.js via NodeSource on Debian/Ubuntu.
+# Distro packages on Ubuntu 24.04 ship Node 18, which is EOL.
+install_nodejs_from_nodesource() {
+    print_step "Configuring NodeSource repository for Node.js ${NODE_MIN_MAJOR}.x... "
+    local nodesource_url="https://deb.nodesource.com/setup_${NODE_MIN_MAJOR}.x"
+    # NodeSource's setup script writes to /etc/apt/sources.list.d and runs
+    # apt-get update; pipe through sudo so it has the right privileges, but
+    # keep the body in a here-string to avoid shell quoting pitfalls.
+    local nodesource_script
+    if ! nodesource_script=$(curl -fsSL "$nodesource_url"); then
+        print_error "Failed to download NodeSource setup script"
+        return 1
+    fi
+    if ! echo "$nodesource_script" | run_with_sudo bash -; then
+        print_error "NodeSource setup script failed"
+        return 1
+    fi
+    print_success "Configured"
+
+    print_step "Installing nodejs... "
+    run_with_sudo apt-get install -y -qq nodejs
+    print_success "Installed"
+
+    local installed_version
+    installed_version=$(node --version | sed 's/^v//')
+    print_success "Node.js $installed_version installed"
+}
+
+# Install Node.js via Homebrew (macOS).
+install_nodejs_from_brew() {
+    if ! command_exists brew; then
+        print_error "Homebrew not found"
+        return 1
+    fi
+
+    local formula="node@${NODE_MIN_MAJOR}"
+    print_step "Installing ${formula} via Homebrew... "
+    brew install "$formula"
+    # node@N is keg-only; expose it on PATH (idempotent — --force overwrites symlinks).
+    brew link --overwrite --force "$formula" >/dev/null 2>&1 || true
+    print_success "Installed"
+
+    local installed_version
+    installed_version=$(node --version | sed 's/^v//')
+    print_success "Node.js $installed_version installed"
+}
+
+# Setup Node.js with version validation. Picks an installer based on platform.
+# Respects SKIP_INSTALL_NODEJS=1 to skip entirely.
+setup_nodejs() {
+    if [ "${SKIP_INSTALL_NODEJS:-}" = "1" ]; then
+        print_step "Skipping Node.js (SKIP_INSTALL_NODEJS=1)"
+        echo ""
+        return 0
+    fi
+
+    print_section "📦 Checking Node.js..."
+
+    local status=0
+    check_nodejs || status=$?
+
+    if [ "$status" -eq 0 ]; then
+        echo ""
+        return 0
+    fi
+
+    # Pick installer for the current platform
+    local os
+    os=$(detect_os)
+
+    case "$os" in
+        macos)
+            install_nodejs_from_brew
+            ;;
+        linux)
+            if command_exists apt-get && [ -f /etc/debian_version ]; then
+                install_nodejs_from_nodesource
+            else
+                install_nodejs_from_tarball
+            fi
+            ;;
+        *)
+            print_error "Unsupported platform for Node.js install: $os"
+            return 1
+            ;;
+    esac
+    echo ""
+}
+
+# Check if musl toolchain is available (fail fast)
+require_musl() {
+    local os=$(detect_os)
+    if [ "$os" = "macos" ]; then
+        # macOS: check for musl-cross (e.g., x86_64-linux-musl-gcc or aarch64-linux-musl-gcc)
+        if ! command_exists x86_64-linux-musl-gcc && ! command_exists aarch64-linux-musl-gcc; then
+            print_error "musl-cross toolchain not found"
+            echo "   Run: scripts/setup/setup-macos.sh"
+            exit 1
+        fi
+    else
+        # Linux: check for musl-gcc
+        if ! command_exists musl-gcc; then
+            print_error "musl-gcc not found"
+            echo "   Run: scripts/setup/setup-ubuntu.sh (or setup-musllinux.sh)"
+            exit 1
+        fi
+    fi
+}
+
+# Resolve PREK_VERSION from environment with a stable default.
+setup_prek_version() {
+    if [ -z "${PREK_VERSION:-}" ]; then
+        export PREK_VERSION="0.3.3"
+    fi
+}
+
+# Install pinned prek in best-effort mode.
+install_prek_best_effort() {
+    if [ "${CI:-}" = "true" ]; then
+        print_info "CI detected, skipping prek installation"
+        return 0
+    fi
+
+    setup_prek_version
+
+    # Source cargo env if available to make freshly installed cargo visible.
+    if [ -f "${CARGO_HOME:-$HOME/.cargo}/env" ]; then
+        source "${CARGO_HOME:-$HOME/.cargo}/env"
+    fi
+
+    if ! command_exists cargo; then
+        print_warning "cargo not found; skipping prek installation"
+        return 0
+    fi
+
+    local current_prek_version
+    current_prek_version=$(prek --version 2>/dev/null | awk '{print $2}')
+
+    if [ "$current_prek_version" = "$PREK_VERSION" ]; then
+        print_success "prek $PREK_VERSION already installed"
+        return 0
+    fi
+
+    print_step "Installing prek $PREK_VERSION... "
+    if cargo install --locked prek --version "$PREK_VERSION"; then
+        print_success "installed"
+    else
+        print_warning "Failed to install prek $PREK_VERSION; continuing without hook bootstrap"
+    fi
+}
+
+# Install repository git hooks in best-effort mode.
+install_git_hooks_best_effort() {
+    if [ "${CI:-}" = "true" ]; then
+        print_info "CI detected, skipping git hook installation"
+        return 0
+    fi
+
+    local root_dir="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+    local config_path="$root_dir/.pre-commit-config.yaml"
+
+    # Ask git, rather than testing for a directory named .git: in a linked
+    # worktree .git is a FILE pointing at the real gitdir, so the directory test
+    # returned early and installed nothing in any worktree.
+    if ! (cd "$root_dir" && git rev-parse --git-dir >/dev/null 2>&1); then
+        print_warning "not a git repository at $root_dir; skipping hook installation"
+        return 0
+    fi
+
+    # prek first, agent-tooling second, and the redirect cleared in between — the
+    # order is load-bearing. prek writes .git/hooks/{pre-commit,pre-push} and refuses
+    # outright while core.hooksPath is set ("Cowardly refusing to install hooks
+    # with core.hooksPath set"), while the gate CHAINS into the very files prek
+    # writes (agent-tooling/.githooks/pre-commit ->
+    # --git-common-dir/hooks/pre-commit). Set the
+    # redirect first and prek installs nothing, so the gate chains into a file
+    # that does not exist and lint-fix and the test matrix silently stop running.
+    # Clearing up front also makes a re-run of `make setup` idempotent.
+    # Linked worktrees with extensions.worktreeConfig=true store core.hooksPath
+    # in worktree-local config; --local alone leaves that value in place and
+    # prek still refuses to install (#1482).
+    (cd "$root_dir" && git config --local --unset-all core.hooksPath) 2>/dev/null || true
+    (cd "$root_dir" && git config --worktree --unset-all core.hooksPath) 2>/dev/null || true
+
+    if [ ! -f "$config_path" ]; then
+        print_warning ".pre-commit-config.yaml not found at $config_path; skipping hook installation"
+    elif ! command_exists prek; then
+        print_warning "prek not available; skipping hook installation"
+    else
+        # Local scope only — a user's global config is theirs. But prek refuses on
+        # a global core.hooksPath too, and would then fail with a generic message
+        # while the gate still reports success, so name that case exactly. Inside
+        # this branch, not above it: elsewhere prek was never going to run, and the
+        # warning would contradict the one already printed.
+        local global_hooks_path
+        global_hooks_path="$(git config --global core.hooksPath 2>/dev/null || true)"
+        if [ -n "$global_hooks_path" ]; then
+            print_warning "core.hooksPath is set globally to '$global_hooks_path'; prek cannot install while it is. Clear it with: git config --global --unset core.hooksPath"
+        fi
+        print_step "Installing pre-commit and pre-push hooks... "
+        if (cd "$root_dir" && prek install -t pre-commit -t pre-push --overwrite); then
+            print_success "installed"
+        else
+            print_warning "Hook installation failed; continuing setup"
+        fi
+    fi
+
+    # Resolve the immutable agent-tooling pin and point git at its gate layer.
+    # The bootstrap validates the consumer profile and all native activation
+    # files before changing core.hooksPath. Reached whether or not prek ran: the
+    # branches above warn rather than return because the gate does not depend on
+    # prek.
+    local agent_tooling_installer="$root_dir/.agent-tooling/install.sh"
+    if [ ! -x "$agent_tooling_installer" ]; then
+        print_warning "Agent tooling installer not found at $agent_tooling_installer"
+    elif (cd "$root_dir" && "$agent_tooling_installer"); then
+        print_success "Pinned agent-tooling gate active"
+    else
+        print_warning "Agent tooling installation failed; the agent gate will not run"
+    fi
+}
+
+# Install Node SDK dev dependencies (prettier, etc.)
+install_node_sdk_deps() {
+    local sdk_dir="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}/sdks/node"
+    if [ ! -d "$sdk_dir" ]; then
+        return 0
+    fi
+    print_step "Installing Node SDK dependencies... "
+    if [ -d "$sdk_dir/node_modules" ]; then
+        print_success "Already installed"
+    else
+        (cd "$sdk_dir" && npm install --silent)
+        print_success "Installed"
+    fi
+}
+
+# Bootstrap prek and hooks as non-fatal setup steps.
+bootstrap_prek_and_hooks() {
+    install_prek_best_effort
+    install_git_hooks_best_effort
+}
+
+# True when running in build-only mode.
+is_build_mode() {
+    [ "${BOXLITE_SETUP_MODE:-dev}" = "build" ]
+}
+
+# Run dev/test-only steps (no-op in build-only mode).
+run_dev_extras() {
+    if is_build_mode; then
+        return 0
+    fi
+
+    install_cargo_nextest
+
+    if command_exists npm; then
+        install_node_sdk_deps
+    fi
+
+    bootstrap_prek_and_hooks
+}

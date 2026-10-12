@@ -1,0 +1,310 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import contract from "../../../tests/v3/fixtures/diagnostics_contract.json";
+import { diagnosticFeatures } from "./types";
+
+async function freshLogger() {
+  vi.resetModules();
+  return import("./logger");
+}
+
+describe("interface diagnostics", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+    delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  it.each([
+    {diagnosticsDegraded: false, browserDiagnosticIngress: "disabled", available: false, reason: "Browser event capture"},
+    {diagnosticsDegraded: true, browserDiagnosticIngress: "disabled", available: false, reason: "degraded local diagnostics"},
+    {diagnosticsDegraded: false, browserDiagnosticIngress: "enabled", available: true, reason: undefined},
+  ])("publishes one coherent diagnostics state for $browserDiagnosticIngress ingress and degraded=$diagnosticsDegraded", async sample => {
+    const logger = await freshLogger();
+    const events: Array<{available: boolean; reason?: string}> = [];
+    const record = (event: Event) => events.push((event as CustomEvent).detail);
+    window.addEventListener("nebula-diagnostics-health", record);
+    try {
+      logger.setCoreDiagnosticsHealth(sample);
+      logger.setCoreDiagnosticsHealth(sample);
+      expect(events).toHaveLength(2);
+      expect(events.map(event => event.available)).toEqual([sample.available, sample.available]);
+      if (sample.reason) expect(events[0].reason).toContain(sample.reason);
+    } finally { window.removeEventListener("nebula-diagnostics-health", record); }
+  });
+
+  it("does not let an older successful event write recover a newer Core failure", async () => {
+    let finish!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockReturnValue(new Promise(resolve => { finish = resolve; })));
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("/api/v1");
+    const write = logger.logDiagnostic({level: "error", eventCode: "interface.test.failed", message: "Synthetic failure."});
+    logger.setCoreDiagnosticsHealth({diagnosticsDegraded: false, browserDiagnosticIngress: "disabled"});
+    finish(new Response(JSON.stringify({accepted: 1, error_ids: ["err_fixture"]}), {status: 202}));
+    await write;
+    expect(logger.isDiagnosticsAvailable()).toBe(false);
+    logger.setCoreDiagnosticsHealth({diagnosticsDegraded: false, browserDiagnosticIngress: "enabled"});
+    expect(logger.isDiagnosticsAvailable()).toBe(true);
+  });
+
+  it("sends the paired browser CSRF cookie with diagnostic writes and buffered retries", async () => {
+    document.cookie = "nebula_csrf=paired%20csrf; path=/";
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 403 }))
+      .mockResolvedValue(new Response(JSON.stringify({ accepted: 1, error_ids: ["err_saved"] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const logger = await freshLogger();
+      logger.configureBrowserDiagnostics("/api/v1");
+      logger.setCoreDiagnosticsHealth({ diagnosticsDegraded: false, browserDiagnosticIngress: "enabled" });
+      await logger.logDiagnostic({ level: "error", eventCode: "interface.test.failed", message: "Synthetic failure." });
+      expect(logger.isDiagnosticsAvailable()).toBe(false);
+      logger.setCoreDiagnosticsHealth({ diagnosticsDegraded: false, browserDiagnosticIngress: "enabled" });
+      await vi.waitFor(() => expect(logger.isDiagnosticsAvailable()).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      for (const [, init] of fetchMock.mock.calls) {
+        expect(new Headers(init?.headers).get("X-Nebula-CSRF")).toBe("paired csrf");
+        expect(init?.credentials).toBe("same-origin");
+      }
+    } finally {
+      document.cookie = "nebula_csrf=; Max-Age=0; path=/";
+    }
+  });
+
+  it("matches the shared cross-language schema, settings, features, and sanitizer contract", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ accepted: 1, error_ids: ["err_contract"] }), { status: 202 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("/api/v1");
+
+    await logger.logDiagnostic({
+      level: "error",
+      eventCode: "interface.contract.failed",
+      message: "A contract fault was injected.",
+      metadata: contract.metadata_input,
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(contract.record_schema).toBe("nebula.diagnostic/v1");
+    expect(contract.settings).toEqual({
+      schema: "nebula.diagnostics-settings/v1",
+      global_level: "error",
+      feature_levels: {},
+      sensitive_detail_capture: false,
+    });
+    expect(contract.features).toEqual(diagnosticFeatures);
+    expect(body.events[0].metadata).toEqual(contract.metadata_expected);
+  });
+
+  it("filters below Error by default and sends a bounded unredacted record", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ accepted: 1, error_ids: ["err_server"] }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("http://127.0.0.1:8765/api/v1", "test-token");
+
+    await logger.logDiagnostic({
+      level: "info",
+      eventCode: "interface.test.started",
+      message: "A test started.",
+    });
+    const errorId = await logger.logDiagnostic({
+      level: "error",
+      eventCode: "interface.test.failed",
+      message: "Authentication failed for Bearer top-secret-token-value.",
+      exception: new Error("canary exception payload"),
+      metadata: {
+        component: "test",
+        authorization: "canary-authorization",
+        command: "canary-command",
+        count: 2,
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(errorId).toBe("err_server");
+    const [, init] = fetchMock.mock.calls[0];
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-token");
+    const encoded = String(init?.body);
+    expect(encoded).toContain("top-secret-token-value");
+    expect(encoded).not.toContain("canary exception payload");
+    expect(encoded).not.toContain("canary-authorization");
+    expect(encoded).not.toContain("canary-command");
+    expect(JSON.parse(encoded)).toEqual({
+      events: [expect.objectContaining({
+        schema: "nebula.diagnostic/v1",
+        level: "error",
+        feature: "interface",
+        event_code: "interface.test.failed",
+        error_id: expect.stringMatching(/^err_[a-f0-9]{32}$/),
+        exception_type: "Error",
+        stack_frames: expect.arrayContaining([
+          expect.objectContaining({ module: "interface", line: expect.any(Number) }),
+        ]),
+        metadata: { component: "test", count: 2 },
+      })],
+    });
+  });
+
+  it("applies the interface feature override without a restart", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ accepted: 1, error_ids: [] }), { status: 202 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("/api/v1");
+    logger.setDiagnosticSettings({
+      schema: "nebula.diagnostics-settings/v1",
+      global_level: "error",
+      feature_levels: { interface: "debug" },
+      sensitive_detail_capture: false,
+    });
+
+    await logger.logDiagnostic({
+      level: "debug",
+      eventCode: "interface.test.decision",
+      message: "A bounded interface decision was made.",
+    });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("retains errors and reports degraded health while the sink is unavailable", async () => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockRejectedValue(new Error("offline")));
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("/api/v1");
+
+    const result = await logger.logDiagnostic({
+      level: "critical",
+      eventCode: "interface.bootstrap.failed",
+      message: "The interface could not start.",
+    });
+
+    expect(result).toBeUndefined();
+    expect(logger.isDiagnosticsAvailable()).toBe(false);
+    expect(logger.diagnosticsFallbackErrors()).toEqual([
+      expect.objectContaining({
+        level: "critical",
+        event_code: "interface.bootstrap.failed",
+        error_id: expect.stringMatching(/^err_[a-f0-9]{32}$/),
+      }),
+    ]);
+  });
+
+  it("preserves a Core error reference when the UI handles an API failure", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ accepted: 1, error_ids: [] }), { status: 202 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("/api/v1");
+    logger.setDiagnosticSettings({
+      schema: "nebula.diagnostics-settings/v1",
+      global_level: "debug",
+      feature_levels: {},
+      sensitive_detail_capture: false,
+    });
+    const failure = Object.assign(new Error("safe API detail"), {
+      status: 503,
+      errorId: "err_core_123",
+      requestId: "req_core_123",
+    });
+
+    logger.logCaughtDiagnostic(
+      "interface.api.handled_failure",
+      "An API operation failed.",
+      failure,
+      "api-response",
+    );
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body.events[0]).toMatchObject({
+      level: "debug",
+      error_id: "err_core_123",
+      request_id: "req_core_123",
+      metadata: { kind: "core-error-handled", http_status: 503 },
+    });
+  });
+
+  it("classifies an uncorrelated expected API denial as Warning", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ accepted: 1, error_ids: [] }), { status: 202 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("/api/v1");
+    logger.setDiagnosticSettings({
+      schema: "nebula.diagnostics-settings/v1",
+      global_level: "warning",
+      feature_levels: {},
+      sensitive_detail_capture: false,
+    });
+
+    logger.logCaughtDiagnostic(
+      "interface.api.expected_denial",
+      "An API operation was rejected safely.",
+      Object.assign(new Error("safe denial"), { status: 409, requestId: "req_denied_123" }),
+      "api-response",
+    );
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body.events[0]).toMatchObject({
+      level: "warning",
+      request_id: "req_denied_123",
+      retryable: true,
+      safe_failure_cause: "The request was rejected safely.",
+      metadata: { kind: "interface-error", http_status: 409 },
+    });
+    expect(body.events[0]).not.toHaveProperty("error_id");
+  });
+
+  it("assigns a frontend failure reference before its catch handler updates the UI", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ accepted: 1, error_ids: [] }), { status: 202 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("/api/v1");
+    const failure = new Error("A local renderer failed.");
+
+    logger.logCaughtDiagnostic(
+      "interface.renderer.failed",
+      "The interface renderer failed.",
+      failure,
+      "render",
+    );
+
+    expect(failure).toMatchObject({
+      errorId: expect.stringMatching(/^err_[a-f0-9]{32}$/),
+      message: expect.stringMatching(/Reference: err_[a-f0-9]{32}\.$/),
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body.events[0].error_id).toBe((failure as Error & { errorId: string }).errorId);
+    expect(body.events[0].safe_failure_cause).toBe("The interface operation raised Error.");
+  });
+
+  it("bounds retained errors while the sink stays unavailable and counts the drop", async () => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockRejectedValue(new Error("offline")));
+    const logger = await freshLogger();
+    logger.configureBrowserDiagnostics("/api/v1");
+
+    for (let index = 0; index < 1_050; index += 1) {
+      await logger.logDiagnostic({ level: "error", eventCode: "interface.api.transport_failed", message: `Failure ${index}.` });
+    }
+
+    const retained = logger.diagnosticsFallbackErrors();
+    expect(retained.length).toBeLessThanOrEqual(1_000);
+    expect(retained.at(-1)?.message).toBe("Failure 1049.");
+    expect(retained.some((record) => record.message === "Failure 0.")).toBe(false);
+    const notice = retained.find((record) => record.event_code === "interface.diagnostics.records_dropped");
+    expect(notice?.metadata).toMatchObject({ dropped_count: expect.any(Number) });
+    expect((notice?.metadata?.dropped_count as number) >= 50).toBe(true);
+  });
+});

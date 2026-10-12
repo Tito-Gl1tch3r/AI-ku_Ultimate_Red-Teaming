@@ -1,0 +1,409 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.BinIR.LowUIR
+
+open System
+open System.Numerics
+open System.Globalization
+open FParsec
+open B2R2
+open B2R2.BinIR
+open B2R2.BinIR.LowUIR
+
+/// <summary>
+/// Represents a parser for LowUIR statements.
+/// </summary>
+type Parser(isa: ISA,
+            regNameAccessor: IRegisterNameAccessor,
+            regVarAccessor: IRegisterVarAccessor) =
+  let isAllowedFirstCharForID c = isAsciiLetter c
+
+  let isAllowedCharForID c = isAsciiLetter c || isDigit c
+
+  let pIdentifier =
+    many1Satisfy2L isAllowedFirstCharForID isAllowedCharForID "identifier"
+
+  let ws = spaces
+
+  let numberFormat =
+    NumberLiteralOptions.AllowMinusSign |||
+    NumberLiteralOptions.AllowBinary |||
+    NumberLiteralOptions.AllowHexadecimal |||
+    NumberLiteralOptions.AllowOctal |||
+    NumberLiteralOptions.AllowPlusSign
+
+  let pNumber =
+    numberLiteral numberFormat "number"
+    |>> fun n ->
+      let s = n.String
+      let bigInt =
+        if s.StartsWith("0x") then
+          BigInteger.Parse("0" + s.Substring(2), NumberStyles.AllowHexSpecifier)
+        else
+          BigInteger.Parse(s)
+      fun rt -> BitVector(bigInt, rt)
+
+  let pRegType = (anyOf "IiFf") >>. pint32 |>> RegType.fromBitWidth
+
+  let pBitVector =
+    pNumber
+    .>>. opt (pchar ':' >>. ws >>. pRegType)
+    >>= (fun (toBV, typ) ->
+      match typ with
+      | None -> getUserState |>> toBV
+      | Some typ -> preturn (toBV typ))
+
+  let pUnaryOperator =
+    [ "-"; "~"; "sqrt"; "cos"; "sin"; "tan"; "atan" ]
+    |> List.map (pstring >> attempt)
+    |> choice
+    |>> UnOpType.ofString
+
+  let pCastType =
+    [ "sext"
+      "zext"
+      "sfloat"
+      "ufloat"
+      "fsint"
+      "fext"
+      "rint" ]
+    |> List.map (pstring >> attempt)
+    |> choice
+    |>> CastKind.ofString
+
+  let pExpr, pExprRef = createParserForwardedToRef ()
+
+  let pNum = pBitVector |>> AST.num
+
+  let regnames = regNameAccessor.GetAllRegisterNames()
+
+  let pVar =
+    regnames
+    |> Array.map (pstringCI >> attempt)
+    |> choice
+    |>> regVarAccessor.GetRegVar
+
+  let pTempVar =
+    pstring "T_" >>. pint32 .>> ws
+    .>> pchar ':' .>> ws .>>. pRegType
+    |>> (fun (num, typ) -> AST.tmpvar typ num)
+
+  let pUnOp =
+    pUnaryOperator .>> ws .>>. pExpr
+    |>> (fun (op, e1) -> AST.unop op e1)
+
+  let pLoad =
+    pchar '[' >>. pExpr .>> ws .>> pchar ']' .>> ws
+    .>> pchar ':' .>> ws .>>. pRegType
+    |>> (fun (e, typ) -> AST.load isa.Endian typ e)
+
+  let pCast =
+    pCastType .>> ws .>> pchar ':' .>> ws .>>. pRegType .>> ws
+    .>> pchar '(' .>> ws .>>. pExpr .>> ws .>> pchar ')'
+    |>> (fun ((kind, typ), expr) -> AST.cast kind typ expr)
+
+  let pRoundCtrl =
+    pstring "rnd" >>. ws
+    >>. pchar '(' >>. ws >>. pExpr .>> ws .>> pchar ',' .>> ws
+    .>>. pExpr .>> ws .>> pchar ')'
+    |>> (fun (mode, body) -> AST.roundCtrl mode body)
+
+  let toExtractExpr ((expr, n), pos) =
+    AST.extract expr (RegType.fromBitWidth (n + 1 - pos)) pos
+
+  let pExtractNoParen =
+    (pVar <|> pTempVar <|> pLoad <|> pNum <|> pCast)
+    .>> ws .>> pchar '[' .>> ws
+    .>>. pint32 .>> ws .>> pchar ':' .>> ws .>>. pint32 .>> ws
+    .>> pchar ']'
+    |>> toExtractExpr
+
+  let pComment =
+    let isComment c = isLetter c || isDigit c || Char.IsWhiteSpace c || c = '.'
+    many1Satisfy isComment
+
+  let pUndefinedExpr =
+    pstring "??" >>. ws
+    >>. pchar '(' >>. ws >>. pComment .>> ws .>> pchar ')'
+    >>= fun comment ->
+      getUserState |>> (fun rt -> AST.undef rt comment)
+
+  let pPrimaryValue =
+    [ attempt pExtractNoParen .>> ws
+      (* Ahead of pVar: a register name is matched as a prefix, so one that
+         begins with an "r" would take the "r" of an "rnd" and leave the rest
+         unparsed. *)
+      attempt pRoundCtrl .>> ws
+      pVar .>> ws
+      pTempVar .>> ws
+      pUnOp .>> ws
+      pLoad .>> ws
+      pNum .>> ws
+      pCast .>> ws
+      pUndefinedExpr .>> ws ] |> choice
+
+  let pFLog =
+    pstring "lg" >>. ws
+    >>. pchar '(' >>. ws
+    >>. pExpr .>> ws .>> pchar ',' .>> ws
+    .>>. pExpr .>> ws .>> pchar ')'
+    |>> (fun (e1, e2) -> AST.binop BinOpType.FLOG e1 e2)
+
+  let initInfix (opp: OperatorPrecedenceParser<_, _, _>) ops =
+    ops |> List.iter (fun (initializer, op, prec, assoc) ->
+      opp.AddOperator(InfixOperator(op, ws, prec, assoc, initializer)))
+
+  let initTernary (opp: OperatorPrecedenceParser<_, _, _>) args =
+    args |> fun (initializer, opl, opr, assoc) ->
+      opp.AddOperator(TernaryOperator(opl, ws, opr, ws, 1, assoc, initializer))
+
+  let opp = OperatorPrecedenceParser<Expr, _, RegType>()
+  let pOps = opp.ExpressionParser
+
+  let pExtractPattern =
+    pchar '[' >>. ws
+    >>. pint32 .>> ws .>> pchar ':' .>> ws .>>. pint32 .>> ws
+    .>> pchar ']'
+
+  let pBetweenParen p =
+    between (pchar '(' >>. spaces) (spaces .>> pchar ')' .>> spaces) p
+
+  let pParenOrExtract =
+    pBetweenParen pOps .>>. opt pExtractPattern
+    |>> (fun (e, extract) ->
+      match extract with
+      | Some(n, pos) -> AST.extract e (RegType.fromBitWidth (n + 1 - pos)) pos
+      | None -> e)
+
+  let term =
+    attempt pParenOrExtract
+    <|> pPrimaryValue
+    <|> pFLog
+
+  let () =
+    opp.TermParser <- term
+    pExprRef.Value <- pOps
+    [ AST.binop BinOpType.ADD, "+", 3, Associativity.Left
+      AST.binop BinOpType.SUB, "-", 3, Associativity.Left
+      AST.binop BinOpType.MUL, "*", 4, Associativity.Left
+      AST.binop BinOpType.DIV, "/", 4, Associativity.Left
+      AST.binop BinOpType.SDIV, "?/", 4, Associativity.Left
+      AST.binop BinOpType.MOD, "%", 4, Associativity.Left
+      AST.binop BinOpType.SMOD, "?%", 4, Associativity.Left
+      AST.binop BinOpType.SHL, "<<", 4, Associativity.Left
+      AST.binop BinOpType.SHR, ">>", 4, Associativity.Left
+      AST.binop BinOpType.SAR, "?>>", 4, Associativity.Left
+      AST.binop BinOpType.AND, "&", 4, Associativity.Left
+      AST.binop BinOpType.OR, "|", 4, Associativity.Left
+      AST.binop BinOpType.XOR, "^", 4, Associativity.Left
+      AST.binop BinOpType.CONCAT, "++", 4, Associativity.Left
+      AST.binop BinOpType.APP, "-|", 5, Associativity.Right
+      AST.binop BinOpType.FADD, "+.", 4, Associativity.Left
+      AST.binop BinOpType.FSUB, "-.", 4, Associativity.Left
+      AST.binop BinOpType.FMUL, "*.", 4, Associativity.Left
+      AST.binop BinOpType.FDIV, "/.", 4, Associativity.Left
+      AST.binop BinOpType.FPOW, "^^", 4, Associativity.Left ]
+    |> initInfix opp
+    [ AST.relop RelOpType.EQ, "=", 1, Associativity.Left
+      AST.relop RelOpType.NEQ, "!=", 1, Associativity.Left
+      AST.relop RelOpType.GT, ">", 2, Associativity.Left
+      AST.relop RelOpType.GE, ">=", 2, Associativity.Left
+      AST.relop RelOpType.SGT, "?>", 2, Associativity.Left
+      AST.relop RelOpType.SGE, "?>=", 2, Associativity.Left
+      AST.relop RelOpType.LT, "<", 2, Associativity.Left
+      AST.relop RelOpType.LE, "<=", 2, Associativity.Left
+      AST.relop RelOpType.SLT, "?<", 2, Associativity.Left
+      AST.relop RelOpType.SLE, "?<=", 2, Associativity.Left
+      AST.relop RelOpType.FEQ, "=.", 2, Associativity.Left
+      AST.relop RelOpType.FNEQ, "!=.", 2, Associativity.Left
+      AST.relop RelOpType.FGT, ">.", 2, Associativity.Left
+      AST.relop RelOpType.FGE, ">=.", 2, Associativity.Left
+      AST.relop RelOpType.FLT, "<.", 2, Associativity.Left
+      AST.relop RelOpType.FLE, "<=.", 2, Associativity.Left ]
+    |> initInfix opp
+    (AST.ite, "?", ":", Associativity.Right)
+    |> initTernary opp
+
+  let pISMark =
+    ws
+    >>. pchar '('
+    >>. ws >>. puint32 .>> ws
+    .>> pchar ')'
+    .>> ws .>> pchar '{'
+    |>> AST.ismark
+
+  let pIEMark =
+    ws
+    >>. pchar '}' >>. ws
+    >>. pstring "//" >>. ws >>. puint32 .>> ws
+    |>> AST.iemark
+
+  let pLMark =
+    ws >>. pchar ':' >>. pIdentifier
+    |>> (fun name -> AST.label name 0 0UL |> AST.lmark)
+
+  let updateExpectedType e =
+    updateUserState (fun _ -> Expr.typeOf e)
+    >>. preturn e
+
+  let pPut =
+    ws
+    >>. ((attempt pTempVar <|> pVar) >>= updateExpectedType)
+    .>> ws .>> pstring ":=" .>> ws .>>. pExpr
+    |>> (fun (dest, value) -> AST.assign dest value)
+
+  let pStore =
+    ws
+    >>. pchar '[' .>> ws >>. pExpr .>> ws .>> pchar ']' .>> ws
+    .>> pstring ":=" .>> ws .>>. pExpr
+    |>> (fun (e1, e2) -> AST.store isa.Endian e1 e2)
+
+  let pJmp =
+    ws >>. pstring "jmp" >>. ws >>. pIdentifier
+    |>> (fun lab ->
+      AST.jmp (AST.jmpDest <| AST.label lab 0 0UL))
+
+  let pCJmp =
+    ws
+    >>. pstring "if" .>> ws >>. pExpr .>> ws
+    .>> pstring "then" .>> ws
+    .>> pstring "jmp" .>> ws .>>. pIdentifier .>> ws
+    .>> pstring "else" .>> ws .>> pstring "jmp" .>> ws .>>. pIdentifier
+    |>> (fun ((cond, tlab), flab) ->
+      let tlab = AST.jmpDest <| AST.label tlab 0 0UL
+      let flab = AST.jmpDest <| AST.label flab 0 0UL
+      AST.cjmp cond tlab flab)
+
+  let pInterJmp =
+    pstring "ijmp" .>> ws >>. pExpr
+    |>> (fun expr ->
+      AST.interjmp expr InterJmpKind.Base)
+
+  let pInterCJmp =
+    ws
+    >>. pstring "if" .>> ws >>. pExpr .>> ws
+    .>> pstring "then" .>> ws
+    .>> pstring "ijmp" .>> ws .>>. pExpr .>> ws
+    .>> pstring "else" .>> ws .>> pstring "ijmp" .>> ws .>>. pExpr
+    |>> (fun ((cond, tExp), fExp) ->
+      AST.intercjmp cond tExp fExp)
+
+  let comma = pstring ","
+
+  let pArgs = sepBy (ws >>. pExpr) comma
+
+  let pApp =
+    ws
+    >>. pIdentifier
+    .>>. pBetweenParen pArgs
+    .>> ws .>> pchar ':' .>> ws .>>. pRegType
+    |>> (fun ((fnName, args), rt) -> AST.app fnName args rt)
+
+  let pExtCall =
+    ws
+    >>. pstringCI "call"
+    >>. pApp
+    |>> AST.extCall
+
+  let pException =
+    let fromExceptionString (s: string) =
+      match ExceptionKind.tryOfString s with
+      | Some kind -> preturn <| Exception kind
+      | None -> fail "unknown exception kind"
+    pstringCI "Exception"
+    >>. ws >>. pchar '(' >>. manyCharsTill anyChar (pchar ')')
+    >>= fromExceptionString
+
+  let pSideEffectKind =
+    attempt (pstringCI "breakpoint" >>% Breakpoint)
+    <|> attempt (pstringCI "clockcounterread" >>% ClockCounterRead None)
+    <|> attempt (pstringCI "fence" >>% Fence)
+    <|> attempt (pstringCI "delay" >>% Delay)
+    <|> attempt (pstringCI "terminate" >>% Terminate)
+    <|> attempt (pstringCI "int" >>. pint32 |>> Interrupt)
+    <|> attempt pException
+    <|> attempt (pstringCI "atomicbegin" >>% AtomicBegin)
+    <|> attempt (pstringCI "atomicend" >>% AtomicEnd)
+    <|> attempt (pstringCI "processorinforead" >>% ProcessorInfoRead)
+    <|> attempt (pstringCI "syscall" >>% SysCall)
+    <|> attempt (pstringCI "undefinedinstruction" >>% UndefinedInstruction)
+    <|> attempt (pstringCI "unsupportedinstruction" >>% UnsupportedInstruction)
+    <|> attempt (pstringCI "savewindow" >>% SaveWindow)
+    <|> attempt (pstringCI "restorewindow" >>% RestoreWindow)
+    <|> attempt (pstringCI "flushwindows" >>% FlushWindows)
+
+  let pSideEffect =
+    ws
+    >>. pstring "!!" .>> ws >>. pSideEffectKind
+    |>> AST.sideEffect
+
+  let typeCheck st =
+    if TypeCheck.stmt st then preturn st else fail "Type check failed."
+
+  let pStatement =
+    attempt pISMark
+    <|> attempt pIEMark
+    <|> attempt pLMark
+    <|> attempt pPut
+    <|> attempt pStore
+    <|> attempt pJmp
+    <|> attempt pCJmp
+    <|> attempt pInterJmp
+    <|> attempt pInterCJmp
+    <|> attempt pExtCall
+    <|> attempt pSideEffect
+    >>= typeCheck
+
+  let pLines = sepBy (restOfLine false) newline
+
+  member private _.SeparateLines str =
+    match run pLines str with
+    | Success(lines, _, _) -> Result.Ok lines
+    | Failure(errStr, _, _) -> Result.Error(errStr)
+
+  member private _.TryParseStmt line =
+    try
+      runParserOnString pStatement 0<rt> "" line
+    with e ->
+      let dummyPos = Position("", 0L, 0L, 0L)
+      let nl = Environment.NewLine
+      let msg = e.Message + nl + e.StackTrace + nl + nl + "> " + line
+      Failure(msg, ParserError(dummyPos, 0<rt>, unexpected ""), 0<rt>)
+
+  member private this.ParseLines(acc, lines) =
+    match lines with
+    | line :: rest ->
+      if String.length line = 0 then
+        this.ParseLines(acc, rest)
+      else (* A LowUIR stmt always occupies a single line. *)
+        match this.TryParseStmt line with
+        | Success(stmt, _, _pos) -> this.ParseLines(stmt :: acc, rest)
+        | Failure(errStr, _, _) -> Result.Error(errStr)
+    | [] ->
+      Result.Ok(List.rev acc |> List.toArray)
+
+  member this.Parse str =
+    this.SeparateLines str
+    |> Result.bind (fun lines -> this.ParseLines([], lines))

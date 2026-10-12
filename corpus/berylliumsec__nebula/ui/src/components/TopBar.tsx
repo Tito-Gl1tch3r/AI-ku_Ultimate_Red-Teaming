@@ -1,0 +1,198 @@
+import {
+  Check,
+  ChevronLeft,
+  Command,
+  Compass,
+  Copy,
+  PanelLeftClose,
+  PanelLeftOpen,
+  RefreshCw,
+  ShieldAlert,
+  Wifi,
+  WifiOff,
+  X,
+} from "lucide-react";
+import { useEffect, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { sameJson, startVisiblePoll } from "../api/visiblePoll";
+import { logCaughtDiagnostic } from "../diagnostics";
+import { navigationItemForPath } from "../navigation";
+import { useWorkspace } from "../state/WorkspaceContext";
+import type { ContainerTerminalPublicIpStatus } from "../api/types";
+import { copySelectionText } from "./selection";
+import { createPortal } from "react-dom";
+import { ModalSurface } from "./DialogSystem";
+import { useOptionalGuides } from "../guides/GuideProvider";
+import { projectSurface } from "../resourceRoutes";
+import { NebulaAssistantLauncherButton } from "./NebulaAssistantLauncher";
+
+interface TopBarProps {
+  activityOpen: boolean;
+  approvalsCount: number;
+  onToggleActivity: () => void;
+  onToggleSidebar: () => void;
+  onOpenPalette: () => void;
+  setToolbarHost: (element: HTMLDivElement | null) => void;
+  setTrailingToolbarHost?: (element: HTMLDivElement | null) => void;
+  sidebarCollapsed: boolean;
+  variant?: "standard" | "zero";
+  lensOpen?: boolean;
+  onToggleLens?: () => void;
+  onRevealLens?: () => void;
+  onLeaveLens?: () => void;
+}
+
+export function TopBar({
+  activityOpen,
+  approvalsCount,
+  onToggleActivity,
+  onToggleSidebar,
+  onOpenPalette,
+  setToolbarHost,
+  setTrailingToolbarHost,
+  sidebarCollapsed,
+  variant = "standard",
+  lensOpen = false,
+  onToggleLens,
+  onRevealLens,
+  onLeaveLens,
+}: TopBarProps) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const page = navigationItemForPath(location.pathname);
+  const { api, coreError, engagement, reconnect, workspaceState } = useWorkspace();
+  const [publicIp, setPublicIp] = useState<ContainerTerminalPublicIpStatus>();
+  const [publicIpCopied, setPublicIpCopied] = useState(false);
+  const [copyError, setCopyError] = useState("");
+  const [addressOpen, setAddressOpen] = useState(false);
+  const canRetry = workspaceState === "failed" || workspaceState === "degraded";
+  const guides = useOptionalGuides();
+
+  useEffect(() => { setAddressOpen(false); setCopyError(""); setPublicIpCopied(false); }, [engagement?.id]);
+
+  useEffect(() => {
+    if (!api || typeof api.engagementContainerTerminalPublicIp !== "function" || !engagement || !["ready", "degraded"].includes(workspaceState)) {
+      setPublicIp(undefined);
+      return;
+    }
+    const controller = new AbortController();
+    // A background tab does not read the address; it reads again on return.
+    startVisiblePoll({
+      intervalMs: 15_000,
+      signal: controller.signal,
+      read: async (signal) => {
+        try {
+          const status = await api.engagementContainerTerminalPublicIp(engagement.id, signal);
+          if (!signal.aborted) setPublicIp((current) => sameJson(current, status) ? current : status);
+        } catch (caught) {
+          if (!signal.aborted) {
+            setPublicIp(undefined);
+            void logCaughtDiagnostic(
+              "interface.container_terminal.public_ip_load_failed",
+              "The terminal container public IP could not be refreshed.",
+              caught,
+              "container_terminal",
+            );
+          }
+        }
+      },
+    });
+    return () => controller.abort();
+  }, [api, engagement, workspaceState]);
+
+  const copyPublicIp = async () => {
+    if (!publicIp) return;
+    try {
+      await copySelectionText(publicIp.address);
+      setCopyError("");
+      setPublicIpCopied(true);
+      globalThis.setTimeout(() => setPublicIpCopied(false), 1_500);
+    } catch (error) {
+      // diagnostic-expected: copy denial is surfaced with manual recovery guidance.
+      setCopyError(error instanceof Error ? error.message : "Select the address and copy it manually.");
+    }
+  };
+
+  return (
+    <><header className={`top-bar${variant === "zero" ? " zero-status-band" : ""}`} data-shell="shared" data-lens-open={lensOpen ? "true" : "false"} onMouseLeave={(event) => { if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return; if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) onLeaveLens?.(); }} onBlur={(event) => { if (window.matchMedia("(hover: hover) and (pointer: fine)").matches && !event.currentTarget.contains(event.relatedTarget)) onLeaveLens?.(); }}>
+      {onToggleLens && <button className="quiet-lens-handle quiet-lens-top-handle" type="button" aria-label="Open top menu" aria-expanded={lensOpen} title="Open top menu" onMouseEnter={onRevealLens} onFocus={onRevealLens} onClick={onRevealLens}>
+        <svg viewBox="0 0 800 44" preserveAspectRatio="none" aria-hidden="true"><ellipse cx="400" cy="22" rx="390" ry="6" /></svg>
+      </button>}
+      <div className="top-bar-leading">
+        {/* Phones reach these pages from the Workbench More tab; this is the way back. */}
+        <button className="button quiet top-bar-back" type="button" onClick={() => navigate(engagement ? projectSurface(engagement.id, "workbench") : "/")}>
+          <ChevronLeft size={20} aria-hidden="true" /><span>Workbench</span>
+        </button>
+        <button
+          className="icon-button toolbar-button"
+          type="button"
+          onClick={onToggleSidebar}
+          aria-label={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
+          aria-expanded={!sidebarCollapsed}
+          title={`${sidebarCollapsed ? "Show" : "Hide"} sidebar (⌥⌘S)`}
+        >
+          {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+        </button>
+        <div className="top-bar-title">
+          <span>Project</span>
+          <span aria-hidden="true">/</span>
+          <strong>{page.label}</strong>
+        </div>
+      </div>
+      <div className="top-bar-page-actions" ref={setToolbarHost} role="group" aria-label={`${page.label} actions`} />
+      <div className="top-bar-actions">
+        <button
+          className={`connection-chip ${workspaceState}`}
+          type="button"
+          onClick={canRetry ? reconnect : undefined}
+          disabled={!canRetry}
+          title={coreError}
+          aria-label={canRetry ? `Nebula Core ${workspaceState}. Retry connection` : `Nebula Core ${workspaceState}`}
+        >
+          {workspaceState === "starting" ? (
+            <RefreshCw className="spin" size={14} aria-hidden="true" />
+          ) : workspaceState === "ready" ? (
+            <Wifi size={14} aria-hidden="true" />
+          ) : (
+            <WifiOff size={14} aria-hidden="true" />
+          )}
+          <span>{workspaceState === "degraded" ? "Limited" : workspaceState}</span>
+        </button>
+        <button className={`top-bar-public-ip${publicIp?.stale ? " stale" : ""}`} type="button" disabled={!publicIp} onClick={() => { setCopyError(""); setPublicIpCopied(false); setAddressOpen(true); }} aria-haspopup="dialog" title={publicIp ? `Terminal container public IP ${publicIp.address} · observed ${new Date(publicIp.observedAt).toLocaleString()}` : "Start a terminal to observe its container public IP"} aria-label={publicIp ? `Terminal container public IP ${publicIp.address}. Show details` : "Terminal container public IP unavailable"}>
+          <span>IP</span><code>{publicIp?.address ?? "—"}</code>{publicIp && (publicIpCopied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />)}
+        </button>
+        {guides && <button className="command-trigger guides-trigger" type="button" data-guide="guides-button" onClick={guides.openHub} aria-haspopup="dialog" aria-expanded={guides.hubOpen} aria-label="Guides" title="Interactive guides">
+          <Compass size={15} aria-hidden="true" />
+          <span>Guides</span>
+        </button>}
+        <button className="command-trigger" type="button" data-guide="command-palette" onClick={onOpenPalette} aria-label="Search pages, actions, and settings">
+          <Command size={15} aria-hidden="true" />
+          <span>Commands</span>
+          <kbd>⌘K</kbd>
+        </button>
+        <NebulaAssistantLauncherButton />
+        {approvalsCount > 0 && <button
+          className={`icon-button approval-trigger${approvalsCount > 0 ? " has-approvals" : ""}`}
+          type="button"
+          onClick={onToggleActivity}
+          aria-expanded={activityOpen}
+          aria-controls="activity-center"
+          aria-label={`${activityOpen ? "Hide" : "Show"} activity inspector${approvalsCount ? `, ${approvalsCount} pending approval${approvalsCount === 1 ? "" : "s"}` : ""}`}
+          title={`${activityOpen ? "Hide" : "Show"} activity inspector (⌥⌘I)`}
+        >
+          <ShieldAlert size={18} aria-hidden="true" />
+          {approvalsCount > 0 && <span className="notification-count" aria-hidden="true">{approvalsCount}</span>}
+        </button>}
+      </div>
+      <div className="top-bar-trailing-actions" ref={setTrailingToolbarHost} role="group" aria-label={`${page.label} primary action`} />
+    </header>
+    {addressOpen && createPortal(<ModalSurface labelledBy="terminal-address-title" onClose={() => setAddressOpen(false)}>
+      <div className="dialog-heading"><h2 id="terminal-address-title">Terminal network address</h2><button className="icon-button subtle" type="button" aria-label="Close network address" onClick={() => setAddressOpen(false)}><X size={18} aria-hidden="true" /></button></div>
+      <p>The observed address belongs to the terminal container, not this browser device.</p>
+      {publicIp ? <><label>Public IP address<input readOnly value={publicIp.address} onFocus={event => event.currentTarget.select()} /></label><p>{publicIp.stale ? "Last known address" : "Observed"} · {new Date(publicIp.observedAt).toLocaleString()}</p><button className="button secondary" type="button" onClick={() => void copyPublicIp()}><Copy size={16} aria-hidden="true" /> Copy address</button></> : <p role="status">The address is no longer available. Saved work is unchanged.</p>}
+      {publicIpCopied && <p role="status">Address copied.</p>}
+      {copyError && <p role="alert">{copyError}. Select the address above and copy it manually.</p>}
+    </ModalSurface>, document.body)}
+    </>
+  );
+}

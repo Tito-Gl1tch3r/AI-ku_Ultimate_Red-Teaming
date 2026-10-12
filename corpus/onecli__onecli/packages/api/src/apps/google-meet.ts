@@ -1,0 +1,50 @@
+import type { AppDefinition } from "./types";
+import {
+  buildGoogleAuthUrl,
+  exchangeGoogleCode,
+  googleConfigFields,
+} from "./oauth/google";
+
+export const googleMeet: AppDefinition = {
+  id: "google-meet",
+  setupGuideUrl: "https://onecli.sh/docs/integrations/google-meet",
+  name: "Google Meet",
+  apiDocsUrl:
+    "https://developers.google.com/workspace/meet/api/reference/rest/v2",
+  icon: "/icons/google-meet.svg",
+  description: "Create and manage meetings.",
+  connectionMethod: {
+    type: "oauth",
+    defaultScopes: [
+      "openid",
+      "email",
+      "profile",
+      "https://www.googleapis.com/auth/meetings.space.created",
+    ],
+    permissions: [
+      {
+        scope: "https://www.googleapis.com/auth/meetings.space.created",
+        name: "Meet",
+        description: "Create and manage meeting spaces",
+        access: "write",
+      },
+      {
+        scope: "https://www.googleapis.com/auth/userinfo.email",
+        name: "Email address",
+        description: "View your email address",
+        access: "read",
+      },
+      {
+        scope: "https://www.googleapis.com/auth/userinfo.profile",
+        name: "Profile",
+        description: "Name and profile picture",
+        access: "read",
+      },
+    ],
+    buildAuthUrl: buildGoogleAuthUrl,
+    exchangeCode: exchangeGoogleCode,
+  },
+  configurable: {
+    fields: googleConfigFields,
+  },
+};

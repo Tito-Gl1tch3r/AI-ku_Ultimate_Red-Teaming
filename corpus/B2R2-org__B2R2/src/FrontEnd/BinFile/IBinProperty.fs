@@ -1,0 +1,68 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.BinFile
+
+open System.Collections.Immutable
+open B2R2
+
+/// <summary>
+/// Represents an interface for accessing the basic properties of a binary
+/// file. Every array it returns is the storage the file itself keeps, handed
+/// over rather than copied.
+/// </summary>
+type IBinProperty =
+  /// Is NX enabled for this binary? (DEP enabled or not)
+  abstract IsNXEnabled: bool
+
+  /// <summary>
+  /// Is this a position-independent executable (PIE)? Unlike <see
+  /// cref="IsBaseRelative"/>, this covers only executables, excluding shared
+  /// libraries.
+  /// </summary>
+  abstract IsPIE: bool
+
+  /// <summary>
+  /// Is this binary loaded at a non-fixed base, i.e., are its addresses
+  /// base-relative rather than absolute? Unlike <see cref="IsPIE"/>, this is
+  /// true for every format except fixed-base executables, covering shared
+  /// libraries and relocatable objects.
+  /// </summary>
+  abstract IsBaseRelative: bool
+
+  /// <summary>
+  /// Returns the RELRO (RELocation Read-Only) protection level of this binary,
+  /// or <c>None</c> if the underlying format has no notion of RELRO (e.g., PE,
+  /// Mach-O).
+  /// </summary>
+  abstract Relro: Relro option
+
+  /// <summary>
+  /// Returns the address ranges of this binary that ship encrypted, and whose
+  /// bytes therefore decode to nothing meaningful until a loader has
+  /// decrypted them. Mach-O names them through <c>LC_ENCRYPTION_INFO</c> and
+  /// <c>LC_ENCRYPTION_INFO_64</c>; formats that have no such notion return an
+  /// empty array, as does a binary that ships none.
+  /// </summary>
+  abstract EncryptedRanges: ImmutableArray<AddrRange>

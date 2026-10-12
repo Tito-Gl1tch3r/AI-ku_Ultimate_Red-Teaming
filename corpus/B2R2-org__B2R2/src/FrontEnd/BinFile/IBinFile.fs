@@ -1,0 +1,75 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.BinFile
+
+open B2R2.FrontEnd.BinLifter
+
+/// <summary>
+/// Represents a format-agnostic binary file interface.
+/// </summary>
+type IBinFile =
+  inherit IBinMetadata
+  inherit IBinProperty
+  inherit IAddressSpace
+
+  /// Returns a reader for this binary file.
+  abstract Reader: IBinReader
+
+  /// Returns the raw file content as a read-only memory block.
+  abstract RawBytes: System.ReadOnlyMemory<byte>
+
+  /// <summary>
+  /// Returns where <see cref="RawBytes"/> begins within the file at <see
+  /// cref="P:B2R2.FrontEnd.BinFile.IBinMetadata.Path"/>. Every file offset
+  /// this interface hands out counts from there, so a consumer that maps the
+  /// file on disk directly adds this to rebase them. It is the slice offset
+  /// for a Mach-O universal binary, and zero for every other file.
+  /// </summary>
+  abstract RawBytesOffset: uint64
+
+  /// Returns the size of the associated binary file in bytes.
+  abstract Length: int
+
+  /// Returns a name resolver if this binary format provides names.
+  abstract NameResolver: INameResolvable option
+
+  /// Returns the symbol table if this binary format provides one.
+  abstract SymbolTable: ISymbolTable option
+
+  /// Returns a structural view if this binary format has one.
+  abstract Structure: IBinStructure option
+
+  /// Returns a relocation table if this binary format has relocations.
+  abstract Relocations: IRelocationTable option
+
+  /// Returns an exception table if this binary format provides exception
+  /// (unwinding) information.
+  abstract ExceptionTable: IExceptionTable option
+
+  /// Returns an import table if this binary format has imported symbols.
+  abstract ImportTable: IImportTable option
+
+  /// Returns a memory layout view if this binary format is memory-mapped.
+  abstract MemoryLayout: IMemoryLayout option

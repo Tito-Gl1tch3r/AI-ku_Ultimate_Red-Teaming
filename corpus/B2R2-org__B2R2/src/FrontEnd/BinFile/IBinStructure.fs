@@ -1,0 +1,104 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.BinFile
+
+open System.Collections.Immutable
+open B2R2
+
+/// <summary>
+/// Represents the structural view of a binary file, such as its sections and
+/// functions. Every array it returns is the storage the file itself keeps,
+/// handed over rather than copied, so reading one costs nothing however large
+/// it is; being immutable is what lets it be shared that way.
+/// </summary>
+type IBinStructure =
+  /// <summary>
+  /// Returns an array of binary sections in the associated binary file.
+  /// </summary>
+  abstract Sections: ImmutableArray<BinSection>
+
+  /// <summary>
+  /// Returns a binary file pointer that points to the beginning of the code
+  /// section, e.g., ".text" section of ELF.
+  /// </summary>
+  abstract CodeSectionPointer: BinFilePointer
+
+  /// <summary>
+  /// Returns a binary file pointer of the given section whose name is given as
+  /// an argument. The resulting pointer will point to the beginning of the
+  /// section. If the address is not in any section, then this function returns
+  /// a null pointer.
+  /// </summary>
+  abstract GetSectionPointer: name: string -> BinFilePointer
+
+  /// <summary>
+  /// Finds the section whose name matches the given name. If no such section
+  /// exists, then this function returns an error.
+  /// </summary>
+  abstract TryFindSectionByName:
+    name: string -> Result<BinSection, ErrorCase>
+
+  /// <summary>
+  /// Finds the section that contains the given address. If the address is not
+  /// in any section, then this function returns an error.
+  /// </summary>
+  abstract TryFindSectionByAddr: addr: Addr -> Result<BinSection, ErrorCase>
+
+  /// <summary>
+  /// Finds the section that contains the given file offset. Sections without
+  /// file-backed contents are not considered. If the offset is not in any
+  /// section, then this function returns an error.
+  /// </summary>
+  abstract TryFindSectionByOffset:
+    offset: uint32 -> Result<BinSection, ErrorCase>
+
+  /// <summary>
+  /// Returns the name of the section that contains the given address. If the
+  /// address is not in any section, then this function returns an error. This
+  /// is a lightweight name-only query that does not require creating a section
+  /// record.
+  /// </summary>
+  abstract TryFindSectionNameByAddr: addr: Addr -> Result<string, ErrorCase>
+
+  /// <summary>
+  /// Returns the name of the section that contains the given file offset. If
+  /// the offset is not in any section, then this function returns an error.
+  /// This is a lightweight name-only query that does not require creating a
+  /// section record.
+  /// </summary>
+  abstract TryFindSectionNameByOffset:
+    offset: uint32 -> Result<string, ErrorCase>
+
+  /// <summary>
+  /// Returns an array of local function addresses (excluding external
+  /// functions) from a given BinFile. This function only considers addresses
+  /// that are certain. We do not include the entry point address (e.g., _start)
+  /// in the result, because it is not necessarily a function address in
+  /// general.
+  /// </summary>
+  /// <returns>
+  /// An array of function addresses.
+  /// </returns>
+  abstract FunctionAddresses: ImmutableArray<Addr>

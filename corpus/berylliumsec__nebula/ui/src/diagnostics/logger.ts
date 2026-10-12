@@ -1,0 +1,738 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  DiagnosticFile,
+  DiagnosticInput,
+  DiagnosticLevel,
+  DiagnosticRecord,
+  DiagnosticSettings,
+  DiagnosticStatus,
+} from "./types";
+import { diagnosticFeatures } from "./types";
+import { randomId } from "../randomId";
+import { pairedCsrfToken } from "../api/pairedCsrf";
+
+const DEFAULT_SETTINGS: DiagnosticSettings = {
+  schema: "nebula.diagnostics-settings/v1",
+  global_level: "error",
+  feature_levels: {},
+  sensitive_detail_capture: false,
+};
+const levelValues: Record<DiagnosticLevel, number> = {
+  debug: 10,
+  info: 20,
+  warning: 30,
+  error: 40,
+  critical: 50,
+};
+const allowedMetadata = new Set([
+  "action",
+  "adapter",
+  "attempt",
+  "available",
+  "backend",
+  "batch_count",
+  "byte_count",
+  "capability",
+  "category",
+  "chunk_count",
+  "code",
+  "collection_count",
+  "component",
+  "connection_state",
+  "count",
+  "current_revision",
+  "decision",
+  "digest",
+  "direction",
+  "disk_bytes",
+  "dropped_count",
+  "entity_count",
+  "entity_id",
+  "entity_type",
+  "expected_revision",
+  "feature",
+  "fingerprint",
+  "format",
+  "health",
+  "http_status",
+  "image_digest",
+  "installed",
+  "item_count",
+  "kind",
+  "limit",
+  "method",
+  "mode",
+  "model_id",
+  "operation",
+  "operator_id",
+  "origin",
+  "policy",
+  "persistence",
+  "port_class",
+  "provider",
+  "queue_depth",
+  "reason_code",
+  "record_count",
+  "recovered_count",
+  "result",
+  "retry_count",
+  "revision",
+  "route",
+  "runner",
+  "sequence_end",
+  "sequence_start",
+  "size_class",
+  "state",
+  "status",
+  "step",
+  "target_fingerprint",
+  "task_count",
+  "timeout_seconds",
+  "tool_id",
+  "transport",
+  "truncated",
+  "validation",
+  "vendor_request_id",
+  "version",
+  "warning_count",
+]);
+const deniedMetadata = /secret|credential|authorization|cookie|header|body|prompt|content|source|command|argv|stdout|stderr|document|terminal_(?:bytes|output)|evidence_bytes|private_key|password|passwd|api_key|access_token|refresh_token|filename|file_path|path|query|sql|payload|selected_text/i;
+const maxFallbackRecords = 250;
+/** Error-level records retained while the sink is down, including the drop notice. */
+const maxFallbackErrors = 1_000;
+const maxErrorPresentations = 250;
+
+export interface DiagnosticErrorPresentation {
+  retryable?: boolean;
+  code?: string;
+  reasonCode?: string;
+  operatorDetail?: string;
+  impact?: string;
+  remediationId?: string;
+}
+
+interface BrowserSink {
+  baseUrl: string;
+  token?: string;
+}
+
+let settings = DEFAULT_SETTINGS;
+let browserSink: BrowserSink | undefined;
+let browserIngressEnabled = true;
+let fallback: DiagnosticRecord[] = [];
+let flushing = false;
+let globalHandlersInstalled = false;
+let diagnosticsAvailable = true;
+let coreUnavailableReason: string | undefined;
+let lastDropNotice = 0;
+const errorPresentations = new Map<string, DiagnosticErrorPresentation>();
+
+function isTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function identifier(prefix: string): string {
+  return `${prefix}_${randomId().replaceAll("-", "")}`;
+}
+
+export function newOperationId(): string {
+  return identifier("op");
+}
+
+export function rememberDiagnosticErrorPresentation(
+  reference: string | undefined,
+  presentation: DiagnosticErrorPresentation,
+): void {
+  if (!reference || !/^(?:err|req)_[A-Za-z0-9._:-]{1,160}$/.test(reference)) return;
+  errorPresentations.delete(reference);
+  errorPresentations.set(reference, {
+    retryable: presentation.retryable,
+    code: presentation.code && /^[a-z][a-z0-9._-]{1,159}$/.test(presentation.code)
+      ? presentation.code
+      : undefined,
+    reasonCode: presentation.reasonCode,
+    operatorDetail: presentation.operatorDetail ? safeText(presentation.operatorDetail) : undefined,
+    impact: presentation.impact ? safeText(presentation.impact) : undefined,
+    remediationId: presentation.remediationId,
+  });
+  while (errorPresentations.size > maxErrorPresentations) {
+    const oldest = errorPresentations.keys().next().value;
+    if (typeof oldest !== "string") break;
+    errorPresentations.delete(oldest);
+  }
+}
+
+export function diagnosticErrorPresentation(
+  reference: string | undefined,
+): DiagnosticErrorPresentation | undefined {
+  return reference ? errorPresentations.get(reference) : undefined;
+}
+
+function safeText(value: string, limit = 2_048): string {
+  const result = value.replaceAll("\0", "�");
+  return result.length <= limit ? result : `${result.slice(0, limit - 1)}…`;
+}
+
+function sanitizeValue(value: unknown, depth: number): unknown {
+  if (depth > 5) return "[MAX_DEPTH]";
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+  if (typeof value === "string") return safeText(value);
+  if (Array.isArray(value)) return value.slice(0, 64).map((item) => sanitizeValue(item, depth + 1));
+  if (value && typeof value === "object") return sanitizeMetadata(value as Record<string, unknown>, depth + 1);
+  return `[${typeof value}]`;
+}
+
+function sanitizeMetadata(value?: Record<string, unknown>, depth = 0): Record<string, unknown> {
+  if (!value || depth > 5) return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .slice(0, 64)
+      .map(([key, item]) => [key.toLowerCase().replaceAll("-", "_"), item] as const)
+      .filter(([key, item]) => item !== undefined && allowedMetadata.has(key) && !deniedMetadata.test(key))
+      .map(([key, item]) => [key, sanitizeValue(item, depth + 1)]),
+  );
+}
+
+function exceptionType(value: unknown): string | undefined {
+  if (value instanceof Error) return safeText(value.name || "Error", 128);
+  if (value === undefined || value === null) return undefined;
+  return "NonErrorRejection";
+}
+
+function caughtFailureCause(value: unknown, status: number | undefined, cancelled: boolean): string {
+  if (cancelled) return "The operation ended through expected cancellation.";
+  if (status !== undefined && status < 500) return "The request was rejected safely.";
+  if (value instanceof Error && value.name === "TimeoutError") {
+    return "The operation exceeded its bounded time limit.";
+  }
+  if (value instanceof Error) {
+    return `The interface operation raised ${safeText(value.name || "Error", 128)}.`;
+  }
+  return "The interface operation failed with a non-Error rejection.";
+}
+
+function stackFrames(value: unknown): DiagnosticRecord["stack_frames"] {
+  if (!(value instanceof Error) || !value.stack) return undefined;
+  const frames = value.stack.split("\n").slice(1, 33).flatMap((raw) => {
+    const lineMatch = raw.match(/:(\d+)(?::\d+)?\)?$/);
+    if (!lineMatch) return [];
+    const rawFunction = raw
+      .trim()
+      .replace(/^at\s+/, "")
+      .split(/\s+\(|@/u, 1)[0]
+      ?.trim();
+    const functionName = rawFunction
+      && !rawFunction.includes("/")
+      && !rawFunction.includes("\\")
+      && /^[A-Za-z0-9_$<>.:[\] -]+$/u.test(rawFunction)
+      ? safeText(rawFunction, 128)
+      : "anonymous";
+    return [{ module: "interface", function: functionName, line: Number(lineMatch[1]) }];
+  });
+  return frames.length ? frames : undefined;
+}
+
+function enabled(level: DiagnosticLevel): boolean {
+  const threshold = settings.feature_levels?.interface ?? settings.global_level ?? "error";
+  return levelValues[level] >= levelValues[threshold];
+}
+
+export function normalizeDiagnosticSettings(value: unknown): DiagnosticSettings {
+  if (!value || typeof value !== "object") return { ...DEFAULT_SETTINGS, feature_levels: {} };
+  const candidate = value as {
+    global_level?: unknown;
+    feature_levels?: unknown;
+    sensitive_detail_capture?: unknown;
+  };
+  const globalLevel = typeof candidate.global_level === "string"
+    && candidate.global_level in levelValues
+    ? candidate.global_level as DiagnosticLevel
+    : "error";
+  const featureLevels: DiagnosticSettings["feature_levels"] = {};
+  if (candidate.feature_levels && typeof candidate.feature_levels === "object") {
+    for (const feature of diagnosticFeatures) {
+      const level = (candidate.feature_levels as Record<string, unknown>)[feature];
+      if (typeof level === "string" && level in levelValues) {
+        featureLevels[feature] = level as DiagnosticLevel;
+      }
+    }
+  }
+  return {
+    schema: "nebula.diagnostics-settings/v1",
+    global_level: globalLevel,
+    feature_levels: featureLevels,
+    sensitive_detail_capture: candidate.sensitive_detail_capture === true,
+  };
+}
+
+function setAvailability(available: boolean, reason?: string, occurrence = false): void {
+  // A completed event write is evidence about that sink, not recovery of the
+  // latest Core health snapshot (which may have changed while it was in flight).
+  if (available && coreUnavailableReason) {
+    available = false;
+    reason = coreUnavailableReason;
+  }
+  diagnosticsAvailable = available;
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("nebula-diagnostics-health", {
+      detail: { available, reason: reason ? safeText(reason, 256) : undefined, occurrence },
+    }));
+  }
+}
+
+function isErrorLevel(level: DiagnosticRecord["level"]): boolean {
+  return ["error", "critical", "ERROR", "CRITICAL"].includes(level);
+}
+
+let droppedErrors = 0;
+let errorDropNotice: DiagnosticRecord | undefined;
+
+/** Keeps the newest error-level records within the bound and counts what was dropped in one notice. */
+function boundErrors(records: DiagnosticRecord[]): DiagnosticRecord[] {
+  const droppable = records.filter((item) => isErrorLevel(item.level) && item !== errorDropNotice);
+  const overflow = droppable.length - (maxFallbackErrors - 1);
+  if (overflow <= 0) return records;
+  const dropped = new Set(droppable.slice(0, overflow));
+  droppedErrors += overflow;
+  const kept = records.filter((item) => !dropped.has(item));
+  if (errorDropNotice && kept.includes(errorDropNotice)) {
+    errorDropNotice.metadata = { dropped_count: droppedErrors };
+    return kept;
+  }
+  errorDropNotice = {
+    schema: "nebula.diagnostic/v1",
+    level: "error",
+    feature: "interface",
+    event_code: "interface.diagnostics.records_dropped",
+    message: "Older interface error diagnostics were dropped while the local sink was unavailable.",
+    error_id: identifier("err"),
+    outcome: "degraded",
+    stage: "fallback-queue",
+    retryable: true,
+    safe_failure_cause: "The bounded interface diagnostics fallback reached its error capacity.",
+    metadata: { dropped_count: droppedErrors },
+  };
+  return [errorDropNotice, ...kept];
+}
+
+function remember(record: DiagnosticRecord): void {
+  const error = isErrorLevel(record.level);
+  if (error) {
+    fallback = boundErrors([...fallback, record]);
+    setAvailability(false, "The local diagnostics sink is temporarily unavailable.", true);
+    return;
+  }
+  if (fallback.length >= maxFallbackRecords) {
+    const lowerIndex = fallback.findIndex((item) => !["error", "critical", "ERROR", "CRITICAL"].includes(item.level));
+    if (lowerIndex >= 0) fallback.splice(lowerIndex, 1);
+    else {
+      const now = Date.now();
+      if (now - lastDropNotice >= 60_000) {
+        lastDropNotice = now;
+        fallback.push({
+          schema: "nebula.diagnostic/v1",
+          level: "error",
+          feature: "interface",
+          event_code: "interface.diagnostics.records_dropped",
+          message: "Lower-level interface diagnostics were dropped while the local sink was unavailable.",
+          error_id: identifier("err"),
+          outcome: "degraded",
+          stage: "fallback-queue",
+          retryable: true,
+          safe_failure_cause: "The bounded interface diagnostics fallback reached capacity.",
+        });
+      }
+      setAvailability(false, "The interface diagnostics fallback is full.");
+      return;
+    }
+  }
+  fallback.push(record);
+  setAvailability(false, "The local diagnostics sink is temporarily unavailable.", true);
+}
+
+function wireRecord(input: DiagnosticInput): DiagnosticRecord {
+  const isError = input.level === "error" || input.level === "critical";
+  return {
+    schema: "nebula.diagnostic/v1",
+    level: input.level,
+    feature: "interface",
+    event_code: input.eventCode,
+    message: safeText(input.message),
+    request_id: input.requestId,
+    operation_id: input.operationId,
+    parent_operation_id: input.parentOperationId,
+    error_id: input.errorId ?? (isError ? identifier("err") : undefined),
+    project_id: input.projectId,
+    run_id: input.runId,
+    execution_id: input.executionId,
+    session_id: input.sessionId,
+    outcome: input.outcome ? safeText(input.outcome, 64) : undefined,
+    stage: input.stage ? safeText(input.stage, 128) : undefined,
+    duration_ms: Number.isFinite(input.durationMs)
+      && Number(input.durationMs) >= 0
+      && Number(input.durationMs) <= 86_400_000
+      ? input.durationMs
+      : undefined,
+    retryable: input.retryable,
+    safe_failure_cause: input.safeFailureCause ? safeText(input.safeFailureCause) : undefined,
+    reason_code: input.reasonCode,
+    operator_detail: input.operatorDetail ? safeText(input.operatorDetail) : undefined,
+    impact: input.impact ? safeText(input.impact) : undefined,
+    remediation_id: input.remediationId,
+    exception_type: exceptionType(input.exception),
+    stack_frames: stackFrames(input.exception),
+    metadata: sanitizeMetadata(input.metadata),
+  };
+}
+
+async function sendNative(
+  record: DiagnosticRecord,
+  sensitiveDetail?: string,
+): Promise<string | undefined> {
+  return (await invoke<string | null>("diagnostics_log_frontend", { record, sensitiveDetail })) ?? undefined;
+}
+
+async function sendBrowser(records: DiagnosticRecord[]): Promise<string[]> {
+  if (!browserSink) throw new Error("browser diagnostics sink is not configured");
+  const csrf = pairedCsrfToken();
+  const response = await fetch(`${browserSink.baseUrl.replace(/\/+$/, "")}/diagnostics/events`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(browserSink.token ? { Authorization: `Bearer ${browserSink.token}` } : {}),
+      ...(csrf ? { "X-Nebula-CSRF": csrf } : {}),
+    },
+    credentials: "same-origin",
+    body: JSON.stringify({ events: records }),
+  });
+  if (!response.ok) throw new Error("browser diagnostics sink rejected a batch");
+  const result = await response.json() as { error_ids?: string[] };
+  return result.error_ids ?? [];
+}
+
+async function flushFallback(): Promise<void> {
+  if (flushing || fallback.length === 0 || (!isTauri() && !browserIngressEnabled)) return;
+  flushing = true;
+  const pending = fallback;
+  fallback = [];
+  let cursor = 0;
+  let completed = false;
+  try {
+    if (isTauri()) {
+      while (cursor < pending.length) {
+        await sendNative(pending[cursor]);
+        cursor += 1;
+      }
+    } else {
+      while (cursor < pending.length) {
+        const batch = pending.slice(cursor, cursor + 100);
+        await sendBrowser(batch);
+        cursor += batch.length;
+      }
+    }
+    completed = true;
+    setAvailability(fallback.length === 0);
+  } catch (error) {
+    // diagnostic-expected: sink failure is retained in the no-error-drop fallback.
+    markRejectionHandled(error);
+    const restored = [...pending.slice(cursor), ...fallback];
+    const retainedErrors = boundErrors(restored.filter((record) => isErrorLevel(record.level)));
+    const retainedLower = restored
+      .filter((record) => !isErrorLevel(record.level))
+      .slice(-maxFallbackRecords);
+    fallback = [...retainedErrors, ...retainedLower];
+    setAvailability(false, "Buffered diagnostics could not be flushed.");
+  } finally {
+    flushing = false;
+    // Once the notice has been delivered (or lost with its batch) a new run of drops starts a fresh count.
+    if (errorDropNotice && !fallback.includes(errorDropNotice)) {
+      errorDropNotice = undefined;
+      droppedErrors = 0;
+    }
+    if (completed && fallback.length > 0) void flushFallback();
+  }
+}
+
+/**
+ * Rejection reasons Nebula has already handled. Something that wraps
+ * ``window.fetch`` (typically a browser extension) can branch its own promise
+ * off Nebula's request and leave that branch without a handler; the browser
+ * then reports the very error Nebula handled as an unhandled rejection.
+ */
+const handledRejections = new WeakSet<object>();
+
+/** Record that ``reason`` was handled, so a stray copy of it is not an incident. */
+export function markRejectionHandled(reason: unknown): void {
+  if (reason !== null && (typeof reason === "object" || typeof reason === "function")) {
+    handledRejections.add(reason as object);
+  }
+}
+
+// Stack frames served from an installed browser extension, not from Nebula.
+const extensionFrame = /\b(?:chrome|moz|safari-web|safari|ms-browser)-extension:\/\//i;
+
+/** How the global handler records an unhandled rejection, from its reason alone. */
+export function classifyUnhandledRejection(reason: unknown): "cancelled" | "handled" | "extension" | "failure" {
+  if (reason && typeof reason === "object" && (reason as {name?: unknown}).name === "AbortError") return "cancelled";
+  if (reason !== null && (typeof reason === "object" || typeof reason === "function") && handledRejections.has(reason as object)) {
+    return "handled";
+  }
+  const stack = reason && typeof reason === "object" ? (reason as {stack?: unknown}).stack : undefined;
+  if (typeof stack === "string" && extensionFrame.test(stack)) return "extension";
+  return "failure";
+}
+
+export async function logDiagnostic(input: DiagnosticInput): Promise<string | undefined> {
+  markRejectionHandled(input.exception);
+  if (!enabled(input.level)) return undefined;
+  const record = wireRecord(input);
+  if (!isTauri() && !browserIngressEnabled) {
+    remember(record);
+    return undefined;
+  }
+  try {
+    const errorId = isTauri()
+      ? await sendNative(
+        record,
+        settings.sensitive_detail_capture && input.exception instanceof Error
+          ? `${safeText(input.exception.name || "Error", 128)}: ${safeText(input.exception.message, 64 * 1_024)}`
+          : undefined,
+      )
+      : (await sendBrowser([record]))[0];
+    setAvailability(true);
+    void flushFallback();
+    return errorId;
+  } catch (error) {
+    // diagnostic-expected: remember() preserves the record and marks health degraded.
+    markRejectionHandled(error);
+    remember(record);
+    return undefined;
+  }
+}
+
+export function logCaughtDiagnostic(
+  eventCode: string,
+  message: string,
+  error: unknown,
+  stage = "handled-error",
+): void {
+  const classified = error && typeof error === "object"
+    ? error as {
+      name?: unknown;
+      status?: unknown;
+      errorId?: unknown;
+      requestId?: unknown;
+      retryable?: unknown;
+      code?: unknown;
+      reasonCode?: unknown;
+      operatorDetail?: unknown;
+      impact?: unknown;
+      remediationId?: unknown;
+    }
+    : undefined;
+  const cancelled = classified?.name === "AbortError";
+  const status = typeof classified?.status === "number" ? classified.status : undefined;
+  const alreadyRecordedByCore = typeof classified?.errorId === "string";
+  const retryable = typeof classified?.retryable === "boolean"
+    ? classified.retryable
+    : cancelled
+      ? false
+      : status !== undefined && [408, 409, 425, 429].includes(status)
+        ? true
+        : classified?.name === "TimeoutError"
+          ? true
+          : undefined;
+  const level: DiagnosticLevel = cancelled || alreadyRecordedByCore
+    ? "debug"
+    : status !== undefined && status < 500
+      ? "warning"
+      : "error";
+  const localErrorId = level === "error" ? identifier("err") : undefined;
+  if (localErrorId && error instanceof Error && Object.isExtensible(error)) {
+    Object.defineProperty(error, "errorId", {
+      configurable: true,
+      enumerable: false,
+      value: localErrorId,
+    });
+    if (!/\bReference:\s*(?:err|req)_/i.test(error.message)) {
+      error.message = `${error.message} Reference: ${localErrorId}.`;
+    }
+  }
+  const reference = typeof classified?.errorId === "string"
+    ? classified.errorId
+    : localErrorId ?? (typeof classified?.requestId === "string" ? classified.requestId : undefined);
+  rememberDiagnosticErrorPresentation(reference, {
+    retryable,
+    code: typeof classified?.code === "string" ? classified.code : undefined,
+    reasonCode: typeof classified?.reasonCode === "string" ? classified.reasonCode : undefined,
+    operatorDetail: typeof classified?.operatorDetail === "string" ? classified.operatorDetail : undefined,
+    impact: typeof classified?.impact === "string" ? classified.impact : undefined,
+    remediationId: typeof classified?.remediationId === "string" ? classified.remediationId : undefined,
+  });
+  void logDiagnostic({
+    level,
+    eventCode,
+    message: cancelled ? "An interface operation was cancelled." : message,
+    outcome: cancelled ? "cancelled" : "failure",
+    stage,
+    retryable,
+    safeFailureCause: caughtFailureCause(error, status, cancelled),
+    reasonCode: typeof classified?.reasonCode === "string" ? classified.reasonCode : undefined,
+    operatorDetail: typeof classified?.operatorDetail === "string" ? classified.operatorDetail : undefined,
+    impact: typeof classified?.impact === "string" ? classified.impact : undefined,
+    remediationId: typeof classified?.remediationId === "string" ? classified.remediationId : undefined,
+    exception: error,
+    requestId: typeof classified?.requestId === "string" ? classified.requestId : undefined,
+    errorId: typeof classified?.errorId === "string" ? classified.errorId : localErrorId,
+    metadata: {
+      kind: alreadyRecordedByCore ? "core-error-handled" : cancelled ? "expected-cancellation" : "interface-error",
+      http_status: status,
+    },
+  });
+}
+
+export function configureBrowserDiagnostics(baseUrl: string, token?: string): void {
+  browserSink = { baseUrl, token };
+  void flushFallback();
+}
+
+export function setBrowserDiagnosticIngress(enabled: boolean): void {
+  browserIngressEnabled = enabled;
+  if (enabled) void flushFallback();
+  else setAvailability(false, "Browser event capture is disabled for this Core binding; Core storage remains independently available.");
+}
+
+/** Publish one coherent result: storage health alone cannot recover ingress. */
+export function setCoreDiagnosticsHealth(health: {diagnosticsDegraded?: boolean; browserDiagnosticIngress?: string}): void {
+  browserIngressEnabled = health.browserDiagnosticIngress === "enabled";
+  coreUnavailableReason = health.diagnosticsDegraded
+    ? "Nebula Core reported degraded local diagnostics."
+    : !browserIngressEnabled
+      ? "Browser event capture is disabled for this Core binding; Core storage remains independently available."
+      : undefined;
+  setAvailability(coreUnavailableReason === undefined, coreUnavailableReason);
+  if (browserIngressEnabled) void flushFallback();
+}
+
+export function setDiagnosticSettings(next: DiagnosticSettings): void {
+  settings = normalizeDiagnosticSettings(next);
+}
+
+export function diagnosticsFallbackErrors(): DiagnosticRecord[] {
+  return fallback.filter((record) => isErrorLevel(record.level));
+}
+
+export function isDiagnosticsAvailable(): boolean {
+  return diagnosticsAvailable;
+}
+
+export function setDiagnosticsAvailability(available: boolean, reason?: string): void {
+  setAvailability(available, reason);
+}
+
+export function installGlobalDiagnosticHandlers(): void {
+  if (globalHandlersInstalled || typeof window === "undefined") return;
+  globalHandlersInstalled = true;
+  window.addEventListener("error", (event) => {
+    void logDiagnostic({
+      level: "error",
+      eventCode: "interface.window.unhandled_error",
+      message: "The interface encountered an unhandled runtime error.",
+      outcome: "failure",
+      stage: "window",
+      retryable: false,
+      exception: event.error instanceof Error ? event.error : undefined,
+    });
+  });
+  window.addEventListener("unhandledrejection", (event) => {
+    const kind = classifyUnhandledRejection(event.reason);
+    if (kind === "cancelled") {
+      // Navigating between conversations intentionally abandons superseded reads.
+      // Do not surface those cancellations as browser errors or failure incidents.
+      event.preventDefault();
+      void logDiagnostic({
+        level: "debug",
+        eventCode: "interface.promise.cancelled",
+        message: "The interface abandoned an obsolete asynchronous operation.",
+        outcome: "cancelled",
+        stage: "promise",
+        retryable: false,
+        safeFailureCause: "A newer interface action superseded the pending operation.",
+        exception: event.reason instanceof Error ? event.reason : undefined,
+      });
+      return;
+    }
+    if (kind === "handled" || kind === "extension") {
+      // Nebula already recorded this failure where it happened, or the promise
+      // belongs to a browser extension. Neither is an unhandled Nebula error.
+      void logDiagnostic({
+        level: "debug",
+        eventCode: kind === "handled" ? "interface.promise.duplicate_rejection" : "interface.promise.extension_rejection",
+        message: kind === "handled"
+          ? "A copy of an already handled failure reached the page without a handler."
+          : "A browser extension left a rejected promise without a handler.",
+        outcome: "failure",
+        stage: "promise",
+        retryable: false,
+        safeFailureCause: kind === "handled"
+          ? "Another script wrapped a Nebula request and did not handle its own copy of the failure."
+          : "The rejection's stack comes from a browser extension, not from Nebula.",
+        exception: event.reason instanceof Error ? event.reason : undefined,
+      });
+      return;
+    }
+    void logDiagnostic({
+      level: "error",
+      eventCode: "interface.promise.unhandled_rejection",
+      message: "An interface operation failed without a rejection handler.",
+      outcome: "failure",
+      stage: "promise",
+      retryable: false,
+      exception: event.reason instanceof Error ? event.reason : undefined,
+    });
+  });
+}
+
+export async function nativeDiagnosticSettings(): Promise<DiagnosticSettings> {
+  const value = normalizeDiagnosticSettings(await invoke<DiagnosticSettings>("diagnostics_get_settings"));
+  setDiagnosticSettings(value);
+  return value;
+}
+
+export async function updateNativeDiagnosticSettings(value: DiagnosticSettings): Promise<DiagnosticSettings> {
+  const updated = normalizeDiagnosticSettings(
+    await invoke<DiagnosticSettings>("diagnostics_update_settings", { settings: value }),
+  );
+  setDiagnosticSettings(updated);
+  return updated;
+}
+
+export function nativeDiagnosticStatus(): Promise<DiagnosticStatus> {
+  return invoke<DiagnosticStatus>("diagnostics_status");
+}
+
+export function nativeDiagnosticFiles(): Promise<DiagnosticFile[]> {
+  return invoke<DiagnosticFile[]>("diagnostics_files");
+}
+
+export function nativeRecentErrors(feature?: string, after?: string, limit = 100): Promise<DiagnosticRecord[]> {
+  return invoke<DiagnosticRecord[]>("diagnostics_recent_errors", { feature, after, limit });
+}
+
+export function revealNativeLogs(): Promise<void> {
+  return invoke<void>("diagnostics_reveal_logs");
+}
+
+export function nativeSensitiveDiagnosticDetail(
+  errorId: string,
+  action: "reveal" | "copy",
+): Promise<{ error_id: string; action: "reveal" | "copy"; detail: string }> {
+  return invoke("diagnostics_sensitive_detail", {
+    errorId,
+    action,
+    confirmed: true,
+    operatorId: "local-operator",
+  });
+}

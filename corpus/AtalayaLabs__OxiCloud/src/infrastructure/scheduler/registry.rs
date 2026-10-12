@@ -1,0 +1,882 @@
+//! In-memory registry of periodic jobs.
+//!
+//! The [`JobRegistry`] owns a map `name → JobEntry`. Native services
+//! `register()` themselves during DI; the [`SchedulerEngine`](super::engine::SchedulerEngine)
+//! iterates this map on every tick to pick the next-due job.
+//!
+//! Per-job state (in-flight semaphore, last outcome, next-run time)
+//! lives inside each [`JobEntry`] behind a short-lived `std::sync::Mutex`.
+//! The outer map uses a `tokio::sync::RwLock` so `pick_next` and
+//! `snapshot` don't block one another and so future dynamic
+//! registration (plugin manifests, admin UI) can acquire a write
+//! lock without racing readers.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use tokio::sync::{RwLock, Semaphore};
+
+use super::handler::JobHandler;
+use super::types::{JobOutcome, JobParam, JobParamValue, JobRunArgs, Mutates};
+
+/// A registered job plus its runtime state. Held as `Arc<JobEntry>`
+/// inside the registry so the engine can hold a snapshot across an
+/// `await` without pinning the registry's outer lock.
+pub struct JobEntry {
+    pub(super) handler: Arc<dyn JobHandler>,
+    pub(super) timeout: Option<Duration>,
+    /// `true` = this job writes to the storage backend (PUT / DELETE
+    /// chunk objects, migrate satellites, re-encrypt blobs). The
+    /// scheduler's dispatch prologue consults
+    /// `JobRegistry::backend_write_gate` on every tick; a held gate
+    /// defers THIS job's tick to its next interval and records a
+    /// `JobOutcome::Ok` with `extra.deferred_reason = "backend_write_locked"`.
+    /// `false` = DB-only or local-cache maintenance; dispatches
+    /// unconditionally. Registered at `register(…, mutates = …)` time
+    /// via [`Mutates::backend`]; non-backend `Mutates` variants
+    /// default to `false`.
+    pub(super) is_backend_writer: bool,
+    /// Single-permit gate enforcing the "one in-flight run per
+    /// `job_name`" invariant. A tick that finds the permit taken
+    /// emits `job.tick_skipped` and does not spawn.
+    pub(super) in_flight: Semaphore,
+    /// Mutable state — protected by `std::sync::Mutex` because guards
+    /// are only held for a few statements at a time, never across an
+    /// `await`. `tokio::sync::Mutex` would add overhead for no benefit.
+    pub(super) state: Mutex<JobState>,
+}
+
+pub(super) struct JobState {
+    /// `None` = on-demand only; the supervisor never fires this job
+    /// (`pick_next` skips it). Admin/programmatic callers reach it
+    /// via [`JobRegistry::trigger`].
+    /// `Some(dur)` = periodic; supervisor dispatches every `dur`.
+    ///
+    /// Lives here rather than on the immutable part of the entry so
+    /// `OXICLOUD_JOBS_SCHEDULED` can override it after every registration
+    /// has run — the alternative was threading config through all 17
+    /// call sites. Changed only by [`JobRegistry::set_schedule`], at
+    /// boot, before the supervisor starts.
+    pub interval: Option<Duration>,
+    /// Parameters each scheduled tick dispatches with, from
+    /// `OXICLOUD_JOBS_SCHEDULED`. Empty for the common case.
+    ///
+    /// Cannot carry `repair` — the config parser refuses it, because a
+    /// tick that repairs deletes on a cadence with nobody consenting
+    /// after the first time.
+    pub scheduled_args: JobRunArgs,
+    /// Set when a run starts, cleared when it ends. Used to include
+    /// `running_for_ms` in the `job.tick_skipped` warning.
+    pub current_run_start: Option<Instant>,
+    /// Wall-clock time + outcome of the most recent completed run.
+    /// `None` until the first run finishes.
+    pub last_outcome: Option<(DateTime<Utc>, JobOutcome)>,
+    /// Wall-clock time of the next scheduled dispatch. `None` for
+    /// on-demand jobs (never fires periodically); `Some(...)` for
+    /// scheduled jobs, advanced by one interval after every tick.
+    pub next_run_at: Option<DateTime<Utc>>,
+}
+
+/// In-memory job registry. `Arc<JobRegistry>` lives on `AppState`;
+/// native services `register()` during DI wiring.
+pub struct JobRegistry {
+    entries: RwLock<HashMap<String, Arc<JobEntry>>>,
+    /// Message bus — used by `dispatch` (via `trigger`) to publish
+    /// `JobRunStarted` / `JobRunProgress` / `JobRunEnded` on
+    /// `Topic::Job(name)` so the admin dashboard can render live
+    /// progress without polling. `OnceLock` because it's set exactly
+    /// once at DI time (after both the registry and the bus are
+    /// constructed) and read from many concurrent triggers; `Arc`
+    /// keeps consumers cheap. `None` before wiring (unit tests
+    /// exercise the registry without a bus).
+    message_bus: std::sync::OnceLock<
+        std::sync::Arc<dyn crate::application::ports::message_bus_ports::MessageBus>,
+    >,
+    /// Out-of-band alerting for recoverable runs, handed to every
+    /// `RecoverableAdapter` as a shared handle.
+    ///
+    /// `Arc<OnceLock<_>>` rather than a plain `OnceLock` so the adapters
+    /// observe a later `set_finding_notifier` — DI can wire notifications
+    /// before or after the jobs register and get the same behaviour. The
+    /// alternative, capturing at construction, makes two lines in `di.rs`
+    /// silently decide whether a deployment is ever alerted.
+    finding_notifier: Arc<std::sync::OnceLock<Arc<super::finding_notifier::FindingNotifier>>>,
+
+    /// Backend write-lock gate. Consulted by the dispatch prologue
+    /// for any job whose handler declares
+    /// [`JobHandler::is_backend_writer() == true`]. `None` =
+    /// gate not wired yet (unit tests exercise the registry without
+    /// one, which short-circuits the prologue to "proceed"). `Some(_)`
+    /// in a wired server — set by DI exactly once via
+    /// [`Self::set_backend_write_gate`].
+    backend_write_gate: std::sync::OnceLock<
+        Arc<crate::application::services::backend_write_gate::BackendWriteGate>,
+    >,
+}
+
+impl JobRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            message_bus: std::sync::OnceLock::new(),
+            finding_notifier: Arc::new(std::sync::OnceLock::new()),
+            backend_write_gate: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Install the backend write-lock gate the dispatch prologue
+    /// consults for `is_backend_writer` jobs. Idempotent — a
+    /// second call is ignored (same contract as the message bus and
+    /// finding notifier). Set by DI once both the gate and the
+    /// registry exist.
+    pub fn set_backend_write_gate(
+        &self,
+        gate: Arc<crate::application::services::backend_write_gate::BackendWriteGate>,
+    ) -> bool {
+        self.backend_write_gate.set(gate).is_ok()
+    }
+
+    /// Current gate snapshot — the engine calls this at every dispatch
+    /// so a later `set_backend_write_gate` is visible to the loop.
+    /// `None` in unit tests (no gate wired) → dispatch proceeds
+    /// unconditionally.
+    pub(super) fn backend_write_gate_snapshot(
+        &self,
+    ) -> Option<Arc<crate::application::services::backend_write_gate::BackendWriteGate>> {
+        self.backend_write_gate.get().cloned()
+    }
+
+    /// Install the out-of-band notifier for recoverable runs. Idempotent;
+    /// a second call is ignored, like the message bus.
+    pub fn set_finding_notifier(
+        &self,
+        notifier: Arc<super::finding_notifier::FindingNotifier>,
+    ) -> bool {
+        self.finding_notifier.set(notifier).is_ok()
+    }
+
+    /// The installed notifier, if any. Used by the admin panel's
+    /// "test notifications" action.
+    pub fn finding_notifier(&self) -> Option<Arc<super::finding_notifier::FindingNotifier>> {
+        self.finding_notifier.get().cloned()
+    }
+
+    /// Shared handle for the adapters. See the field doc for why this is
+    /// shared rather than read once.
+    pub(super) fn finding_notifier_handle(
+        &self,
+    ) -> Arc<std::sync::OnceLock<Arc<super::finding_notifier::FindingNotifier>>> {
+        self.finding_notifier.clone()
+    }
+
+    /// Register a job — production wiring path.
+    ///
+    /// - `interval = Some(dur)` → **scheduled**. The supervisor fires
+    ///   the job every `dur`, starting `now + dur`. Registration does
+    ///   NOT fire the job immediately — callers that want an at-startup
+    ///   run should invoke the service's own initialiser once before
+    ///   registering.
+    /// - `interval = None` → **on-demand only**. The supervisor never
+    ///   fires this job. Admin endpoint (or programmatic callers) can
+    ///   still invoke it via [`JobRegistry::trigger`] — the dispatch
+    ///   goes through the same panic/timeout/exclusivity gates.
+    ///
+    /// **Panics on error.** Registration failure (duplicate name today)
+    /// is a DI-wiring bug — the server must not start with a mis-wired
+    /// scheduler. Emits a uniform `job.registered` log line on success
+    /// so callers don't reinvent the log message at every site.
+    ///
+    /// For unit tests that need to assert the error path use
+    /// [`Self::try_register`] instead.
+    pub async fn register(
+        &self,
+        handler: Arc<dyn JobHandler>,
+        interval: Option<Duration>,
+        timeout: Option<Duration>,
+    ) {
+        let name = handler.name().to_string();
+        match self.try_register(handler, interval, timeout).await {
+            Ok(()) => {
+                let cadence = match interval {
+                    Some(dur) => {
+                        let secs = dur.as_secs();
+                        if secs % 3600 == 0 {
+                            format!("every {} h", secs / 3600)
+                        } else if secs % 60 == 0 {
+                            format!("every {} min", secs / 60)
+                        } else {
+                            format!("every {} s", secs)
+                        }
+                    }
+                    None => "on-demand".to_string(),
+                };
+                tracing::info!(
+                    target: "oxicloud::scheduler",
+                    event = "job.registered",
+                    job = %name,
+                    cadence = %cadence,
+                    "job {} registered ({})",
+                    name,
+                    cadence,
+                );
+            }
+            Err(e) => panic!("JobRegistry::register({name}) failed — DI wiring bug: {e}"),
+        }
+    }
+
+    /// Fallible sibling of [`Self::register`]. Returns `Err` on
+    /// duplicate-name instead of panicking, and does NOT emit the
+    /// `job.registered` log line — for unit tests that need to
+    /// assert failure without triggering the boot panic path.
+    pub async fn try_register(
+        &self,
+        handler: Arc<dyn JobHandler>,
+        interval: Option<Duration>,
+        timeout: Option<Duration>,
+    ) -> Result<(), RegisterError> {
+        let name = handler.name().to_string();
+        // A job declaring it mutates only under a flag it does not support
+        // is self-contradictory, and the UI would render it as safe with no
+        // way to reach the mutating path. Cheap to catch here, invisible
+        // otherwise.
+        if handler.mutates() == Mutates::OnRepairOnly && handler.repair_description().is_none() {
+            return Err(RegisterError::RepairOnlyWithoutRepair(name));
+        }
+        let mut guard = self.entries.write().await;
+        if guard.contains_key(&name) {
+            return Err(RegisterError::DuplicateName(name));
+        }
+        let next_run_at = interval.map(|dur| {
+            Utc::now()
+                + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::seconds(0))
+        });
+        let is_backend_writer = handler.is_backend_writer();
+        let entry = Arc::new(JobEntry {
+            handler,
+            timeout,
+            is_backend_writer,
+            in_flight: Semaphore::new(1),
+            state: Mutex::new(JobState {
+                interval,
+                scheduled_args: JobRunArgs::default(),
+                current_run_start: None,
+                last_outcome: None,
+                next_run_at,
+            }),
+        });
+        guard.insert(name, entry);
+        Ok(())
+    }
+
+    /// Return the name and next-due timestamp of the earliest-firing
+    /// **scheduled** job, or `None` if no scheduled jobs are registered.
+    /// On-demand jobs (registered with `interval = None`) are invisible
+    /// to `pick_next` — they only run when reached via
+    /// [`Self::trigger`]. Read-lock only — safe to call frequently from
+    /// the supervisor loop.
+    pub async fn pick_next(&self) -> Option<(String, DateTime<Utc>)> {
+        let guard = self.entries.read().await;
+        let mut earliest: Option<(String, DateTime<Utc>)> = None;
+        for (name, entry) in guard.iter() {
+            let Some(next_at) = entry
+                .state
+                .lock()
+                .expect("JobState mutex poisoned")
+                .next_run_at
+            else {
+                continue; // on-demand only — never picked
+            };
+            match &earliest {
+                None => earliest = Some((name.clone(), next_at)),
+                Some((_, current)) if next_at < *current => {
+                    earliest = Some((name.clone(), next_at))
+                }
+                _ => {}
+            }
+        }
+        earliest
+    }
+
+    /// Snapshot handle to a single job. Returns `Arc<JobEntry>` so
+    /// callers can hold across `await` points without pinning the
+    /// outer read lock.
+    pub async fn get(&self, name: &str) -> Option<Arc<JobEntry>> {
+        let guard = self.entries.read().await;
+        guard.get(name).cloned()
+    }
+
+    /// Snapshot every registered job (used by the admin listing
+    /// endpoint). Returns owned `(name, Arc<JobEntry>)` pairs to
+    /// avoid pinning the outer lock through the HTTP response
+    /// serialisation.
+    pub async fn snapshot_all(&self) -> Vec<(String, Arc<JobEntry>)> {
+        let guard = self.entries.read().await;
+        guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// The parameters `name` declares, or `None` when no such job is
+    /// registered.
+    ///
+    /// Callers need this BEFORE dispatch: raw query strings can only be
+    /// parsed against the declaration, and an undeclared parameter has
+    /// to be rejected rather than dropped. Returning `None` lets the
+    /// caller answer 404 for an unknown job without a second lookup.
+    pub async fn parameters_of(&self, name: &str) -> Option<&'static [JobParam]> {
+        let guard = self.entries.read().await;
+        guard.get(name).map(|e| e.handler.parameters())
+    }
+
+    /// Serialisable snapshot for `GET /api/admin/jobs`. Each entry
+    /// captures the operator-visible state: interval (null for on-
+    /// demand), next scheduled dispatch (null for on-demand), when
+    /// the last run started, and its outcome.
+    pub async fn snapshot(&self) -> Vec<JobSummary> {
+        let entries = self.snapshot_all().await;
+        entries
+            .into_iter()
+            .map(|(name, entry)| {
+                let state = entry.state.lock().expect("JobState mutex poisoned");
+                let (last_run_at, last_outcome) = match &state.last_outcome {
+                    Some((at, outcome)) => (Some(*at), Some(outcome.clone())),
+                    None => (None, None),
+                };
+                JobSummary {
+                    name,
+                    description: entry.handler.description(),
+                    mutates: entry.handler.mutates(),
+                    repair_description: entry.handler.repair_description(),
+                    parameters: entry.handler.parameters(),
+                    interval_ms: state.interval.map(|d| d.as_millis() as u64),
+                    next_run_at: state.next_run_at,
+                    last_run_at,
+                    last_outcome,
+                    running: state.current_run_start.is_some(),
+                    recoverable: entry.handler.is_recoverable(),
+                    // All populated in the `list_jobs` handler — two
+                    // from a DB round-trip, one from AppConfig. Kept
+                    // out of the registry snapshot so the in-memory
+                    // scheduler state pulls in neither dependency.
+                    paused_run: None,
+                    last_run_status: None,
+                    last_run_severity_counts: None,
+                    last_run_error_reason: None,
+                    scheduled_via: None,
+                    startup: None,
+                }
+            })
+            .collect()
+    }
+
+    /// Override a registered job's cadence and the parameters its
+    /// scheduled ticks run with. Returns `false` if no job by that name
+    /// is registered, so the caller can fail the boot with a message
+    /// naming the typo rather than ignoring it.
+    ///
+    /// Applied once at boot, after every registration and before the
+    /// supervisor starts. `interval = None` makes the job on-demand —
+    /// manual triggering is untouched, which is what separates "not
+    /// scheduled" from "disabled".
+    ///
+    /// `next_run_at` is recomputed from now, so an override takes effect
+    /// one interval from boot rather than inheriting the schedule the
+    /// registration site set.
+    pub async fn set_schedule(
+        &self,
+        name: &str,
+        interval: Option<Duration>,
+        scheduled_args: JobRunArgs,
+    ) -> bool {
+        let guard = self.entries.read().await;
+        let Some(entry) = guard.get(name) else {
+            return false;
+        };
+        let mut state = entry.state.lock().expect("JobState mutex poisoned");
+        state.interval = interval;
+        state.scheduled_args = scheduled_args;
+        state.next_run_at = interval.map(|dur| {
+            Utc::now()
+                + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::seconds(0))
+        });
+        true
+    }
+
+    /// Count of registered jobs — used for the startup log line.
+    pub async fn len(&self) -> usize {
+        self.entries.read().await.len()
+    }
+
+    #[allow(dead_code)]
+    pub async fn is_empty(&self) -> bool {
+        self.entries.read().await.is_empty()
+    }
+
+    /// Manual dispatch — the single entry point for running a
+    /// registered job outside the scheduler's tick loop. Called by:
+    ///
+    /// - The admin endpoint `POST /api/admin/jobs/{name}/trigger`.
+    /// - Any service that wants a scheduler-uniform dispatch of a
+    ///   peer job (uniform log line, exclusivity, panic containment,
+    ///   timeout enforcement).
+    ///
+    /// Returns `None` when the name isn't registered. Returns
+    /// `Some(JobOutcome)` when it is — including the case where
+    /// exclusivity denied the trigger (previous run still in flight),
+    /// which surfaces as
+    /// `Ok { count: 0, extra: { "skipped": "already_running" } }` per
+    /// the engine's dispatch protocol.
+    ///
+    /// Works for BOTH scheduled and on-demand jobs — for on-demand
+    /// jobs this is the only way they ever run.
+    ///
+    /// `args` is forwarded to `JobHandler::run`. Admin trigger routes
+    /// use `JobRunArgs { force: query.force }`; programmatic callers
+    /// that just want a plain run pass `JobRunArgs::default()`.
+    pub async fn trigger(self: &Arc<Self>, name: &str, args: &JobRunArgs) -> Option<JobOutcome> {
+        let entry = self.get(name).await?;
+        // Pass the bus reference through to `dispatch` so start / end
+        // events publish on `Topic::Job(name)`. `Option::cloned()`
+        // returns a fresh `Arc` clone (or None) — negligible.
+        let bus = self.message_bus.get().cloned();
+        // The gate too — admin-triggered runs are gated by the same
+        // rule as periodic ticks. An operator who presses "Run now"
+        // on `backend_reclaim` while a migration is in progress sees
+        // the same `deferred` outcome instead of racing the walk.
+        let gate = self.backend_write_gate_snapshot();
+        Some(super::engine::dispatch(name, entry, args, bus, gate).await)
+    }
+
+    /// Wire the message bus. Called once from DI after both the
+    /// registry and the bus are constructed. Idempotent: a second
+    /// call is a silent no-op (`OnceLock::set` returns `Err`), so
+    /// test setups that call this more than once don't panic.
+    pub fn set_message_bus(
+        &self,
+        bus: std::sync::Arc<dyn crate::application::ports::message_bus_ports::MessageBus>,
+    ) {
+        let _ = self.message_bus.set(bus);
+    }
+
+    /// Snapshot the currently-wired bus (if any). `None` when
+    /// `set_message_bus` hasn't been called yet — every test setup
+    /// that skips DI wiring, and the very early boot before the
+    /// bus is constructed. Called by the periodic supervisor and
+    /// by `trigger` so both paths publish job events identically.
+    pub(super) fn message_bus_snapshot(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::application::ports::message_bus_ports::MessageBus>> {
+        self.message_bus.get().cloned()
+    }
+}
+
+impl Default for JobRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RegisterError {
+    #[error("job name already registered: {0}")]
+    DuplicateName(String),
+    #[error(
+        "job {0} declares mutates = OnRepairOnly but no repair_description() — \
+         it claims to mutate only under a flag it does not support"
+    )]
+    RepairOnlyWithoutRepair(String),
+}
+
+/// Per-job row in the `GET /api/admin/jobs` response.
+///
+/// - `interval_ms` — periodic cadence; `null` for on-demand jobs.
+/// - `next_run_at` — next scheduled dispatch; `null` for on-demand.
+/// - `last_run_at` / `last_outcome` — most recent completed run;
+///   `null` until the first run finishes.
+/// - `running` — true iff the in-flight permit is currently held
+///   (either the supervisor tick is in progress or an admin trigger
+///   raced in).
+/// - `recoverable` — true iff the job persists runs + findings to
+///   `jobs.recoverable_runs`. Consumed by the admin UI to decide
+///   whether the row is expandable (drawer with run history +
+///   findings) and to gate the retention/purge action.
+/// - `paused_run` — populated iff a `Paused` row exists in
+///   `jobs.recoverable_runs` for this job. The UI uses it to render
+///   "Resume (scanned/total)" instead of "Run".
+#[derive(Debug, Clone, Serialize)]
+pub struct JobSummary {
+    pub name: String,
+    /// One or two sentences on what the job does. Empty for jobs that
+    /// haven't declared one yet — the UI omits the line rather than
+    /// rendering a blank block.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub description: &'static str,
+    pub mutates: Mutates,
+    /// `Some` iff the job does something extra under `?repair=true`.
+    /// Presence is what gates the repair toggle in the UI; the string
+    /// is the confirmation text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_description: Option<&'static str>,
+    /// What this job accepts on a trigger. The panel renders exactly
+    /// these — previously it showed the same fixed checkboxes on every
+    /// job, most of which the job ignored with no way to tell.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub parameters: &'static [JobParam],
+    /// Status of this job's most recent run row, for recoverable jobs.
+    ///
+    /// Populated by the `list_jobs` handler from the DB, and it exists
+    /// because [`Self::last_outcome`] cannot answer this: that field is
+    /// in-memory, written when a dispatch completes through the engine,
+    /// so anything changing a run row without running the handler leaves
+    /// it stale. Cancelling a Paused run is exactly that — a direct SQL
+    /// flip — and the panel went on showing the pause's outcome.
+    ///
+    /// Prefer this over `last_outcome` wherever the two could disagree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_status: Option<String>,
+    /// Findings of the most recent run, counted per severity, read from
+    /// `jobs.run_findings` — the same numbers [`JobOutcome`] carries in
+    /// `extra.severity_counts`, but sourced from the rows rather than
+    /// from memory.
+    ///
+    /// It exists because the panel turns its outcome pill amber on a
+    /// non-empty count, and `last_outcome` is in-memory: a restart
+    /// empties it, so a completed run that recorded data loss read as a
+    /// neutral "—" with nothing to act on. Findings are durable, so the
+    /// signal drawn from them must be too — and that matters most for a
+    /// *scheduled* detector, which runs with nobody watching the
+    /// dispatch.
+    ///
+    /// `None` — no run row for this job. `Some({})` — a run that found
+    /// nothing, which is the good news and a different fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_severity_counts: Option<BTreeMap<String, u64>>,
+    /// Why the most recent run stopped, read from the run row —
+    /// `backend_unavailable`, `backend_timeout`, `job_failed`,
+    /// `server_restart`.
+    ///
+    /// Same reasoning as `last_run_severity_counts`, and the same defect
+    /// behind it: a retryable pause reports `ok` on the wire, so the
+    /// panel showed a green "ok" for a job that gave up because its
+    /// backend was unreachable. The row knows better and survives a
+    /// restart.
+    ///
+    /// `None` is two good cases at once — a clean run, or a pause an
+    /// operator asked for. Neither should render as a problem, which is
+    /// why the alerting path keys off this field's presence too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_error_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+    /// Set when this job has no cadence of its own but IS run by one
+    /// that does — today, a `*_consistency` detector swept by a
+    /// scheduled `consistency_batch`.
+    ///
+    /// Without it the panel reads `interval_ms: null` and renders the
+    /// row as manual-only, which is false in exactly the configuration
+    /// that ships by default. Filled by the `list_jobs` handler, which
+    /// can see the other jobs; the registry snapshot describes one job
+    /// at a time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_via: Option<ScheduledVia>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<JobOutcome>,
+    pub running: bool,
+    pub recoverable: bool,
+    /// Populated iff a `Paused` row exists in `jobs.recoverable_runs`
+    /// for this job. Distinct from `running` — a paused run is
+    /// resumable via the same trigger endpoint (`run_or_resume`
+    /// picks Resume when the latest row is Paused).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_run: Option<PausedRunBrief>,
+    /// Populated iff `OXICLOUD_JOBS_STARTUP` names this job — the flags
+    /// it will be dispatched with at every boot.
+    ///
+    /// Surfaced because the panel would otherwise be silently wrong
+    /// about the most consequential thing on the row: a job configured
+    /// with `repair=true` deletes files on every restart, and reading
+    /// the row you would think that only happens when someone clicks.
+    /// Filled by the `list_jobs` handler, which has the config; the
+    /// registry deliberately doesn't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup: Option<StartupTrigger>,
+}
+
+/// The parameters a job configured in `OXICLOUD_JOBS_STARTUP` runs with.
+///
+/// A map keyed by parameter name, for the same reason `JobRunArgs` is:
+/// the four named fields it used to carry meant a job growing a
+/// parameter silently dropped it from the panel's "at boot" pill.
+///
+/// Still a distinct type rather than `JobRunArgs` itself — this is an
+/// API shape the admin panel switches on, and the dispatch type should
+/// stay free to change without a frontend release.
+#[derive(Debug, Clone, Serialize)]
+pub struct StartupTrigger {
+    pub params: std::collections::BTreeMap<String, JobParamValue>,
+}
+
+/// Enough info about a paused recoverable run for the admin panel to
+/// render "Resume (scanned/total)" on the job row without opening the
+/// drawer. Populated by `list_jobs` in the admin handler from a
+/// single `SELECT job_name, id, stats->>'scanned_count',
+/// params->>'total_rows' FROM jobs.recoverable_runs WHERE status =
+/// 'Paused'` — indexed by the `one_active_run_per_job` partial UNIQUE.
+///
+/// `total` is `None` when the tenant doesn't seed a countable subject
+/// (`RecoverableJobHandler::count_total`); the UI then shows just
+/// "Resume" without progress.
+/// "This job has no cadence of its own, but `job` runs it every
+/// `interval_ms`." See [`JobSummary::scheduled_via`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledVia {
+    /// The scheduled job that dispatches this one.
+    pub job: String,
+    /// That job's cadence — what this one effectively runs at.
+    pub interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PausedRunBrief {
+    pub id: uuid::Uuid,
+    pub scanned: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct DummyHandler {
+        name: String,
+    }
+
+    #[async_trait]
+    impl JobHandler for DummyHandler {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn run(&self, _args: &JobRunArgs) -> JobOutcome {
+            JobOutcome::ok(0)
+        }
+    }
+
+    fn handler(name: &str) -> Arc<dyn JobHandler> {
+        Arc::new(DummyHandler {
+            name: name.to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn register_and_pick_next() {
+        let reg = JobRegistry::new();
+        reg.register(handler("job_a"), Some(Duration::from_secs(60)), None)
+            .await;
+        reg.register(handler("job_b"), Some(Duration::from_secs(10)), None)
+            .await;
+
+        let (next_name, _) = reg.pick_next().await.expect("expected a due job");
+        // job_b has the shorter interval → earlier next_run_at.
+        assert_eq!(next_name, "job_b");
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_rejected() {
+        let reg = JobRegistry::new();
+        // Use the fallible `try_register` here so we can assert the
+        // Err path without triggering `register`'s boot-time panic.
+        reg.try_register(handler("job_x"), Some(Duration::from_secs(60)), None)
+            .await
+            .unwrap();
+        let err = reg
+            .try_register(handler("job_x"), Some(Duration::from_secs(60)), None)
+            .await
+            .expect_err("duplicate name must be rejected");
+        assert!(matches!(err, RegisterError::DuplicateName(_)));
+    }
+
+    /// A job declaring `OnRepairOnly` without a `repair_description` has
+    /// no reachable mutating path — the UI gates the repair toggle on
+    /// that string's presence, so the job would render as safe and stay
+    /// read-only forever. Catch it at wiring time rather than let it read
+    /// as a working configuration.
+    #[tokio::test]
+    async fn repair_only_without_repair_description_rejected() {
+        struct Contradictory;
+        #[async_trait]
+        impl JobHandler for Contradictory {
+            fn name(&self) -> &str {
+                "contradictory"
+            }
+            async fn run(&self, _args: &JobRunArgs) -> JobOutcome {
+                JobOutcome::ok(0)
+            }
+            fn mutates(&self) -> Mutates {
+                Mutates::OnRepairOnly
+            }
+            // repair_description() left at its `None` default — the bug.
+        }
+
+        let reg = JobRegistry::new();
+        let err = reg
+            .try_register(Arc::new(Contradictory), None, None)
+            .await
+            .expect_err("OnRepairOnly without a repair_description must be rejected");
+        assert!(matches!(err, RegisterError::RepairOnlyWithoutRepair(_)));
+    }
+
+    /// The registry hands `dyn JobHandler` to the admin snapshot, so a
+    /// tenant's own metadata is only visible if it survives that erasure.
+    #[tokio::test]
+    async fn snapshot_carries_job_metadata() {
+        struct Described;
+        #[async_trait]
+        impl JobHandler for Described {
+            fn name(&self) -> &str {
+                "described"
+            }
+            async fn run(&self, _args: &JobRunArgs) -> JobOutcome {
+                JobOutcome::ok(0)
+            }
+            fn description(&self) -> &'static str {
+                "does a thing"
+            }
+            fn mutates(&self) -> Mutates {
+                Mutates::Always
+            }
+            fn repair_description(&self) -> Option<&'static str> {
+                Some("also deletes the thing")
+            }
+            fn parameters(&self) -> &'static [JobParam] {
+                const PARAMS: &[JobParam] = &[
+                    JobParam::boolean("force", false, "skip the grace window"),
+                    JobParam::string("storage", "entry to scope to"),
+                ];
+                PARAMS
+            }
+        }
+
+        let reg = JobRegistry::new();
+        reg.register(Arc::new(Described), None, None).await;
+        let snap = reg.snapshot().await;
+        let row = snap.iter().find(|j| j.name == "described").unwrap();
+        assert_eq!(row.description, "does a thing");
+        assert_eq!(row.mutates, Mutates::Always);
+        assert_eq!(row.repair_description, Some("also deletes the thing"));
+        assert_eq!(row.parameters.len(), 2);
+        assert_eq!(row.parameters[0].name, "force");
+
+        // The wire contract the admin panel renders from. Pinned as JSON
+        // because the panel switches on these exact strings — `type`
+        // (not `param_type`), snake_case values, and `default` inlined
+        // rather than tagged. Renaming any of them is a frontend break,
+        // the same way renaming a `Mutates` variant is.
+        let json = serde_json::to_value(row).unwrap();
+        assert_eq!(
+            json["parameters"],
+            serde_json::json!([
+                {
+                    "name": "force",
+                    "type": "boolean",
+                    "default": false,
+                    "description": "skip the grace window"
+                },
+                {
+                    "name": "storage",
+                    "type": "string",
+                    "default": null,
+                    "description": "entry to scope to"
+                }
+            ])
+        );
+
+        // Undeclared jobs stay at the safe defaults so the panel can tell
+        // "read-only" from "not yet described" — empty string, not prose.
+        reg.register(handler("bare"), None, None).await;
+        let snap = reg.snapshot().await;
+        let bare = snap.iter().find(|j| j.name == "bare").unwrap();
+        assert_eq!(bare.description, "");
+        assert_eq!(bare.mutates, Mutates::Never);
+        assert!(bare.repair_description.is_none());
+        // Omitted entirely rather than sent as `[]`, so the panel renders
+        // no parameter controls at all for a job that takes none.
+        assert!(bare.parameters.is_empty());
+        assert!(
+            serde_json::to_value(bare)
+                .unwrap()
+                .get("parameters")
+                .is_none(),
+            "an empty declaration must not reach the wire"
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "DI wiring bug")]
+    async fn register_panics_on_duplicate() {
+        let reg = JobRegistry::new();
+        reg.register(handler("job_dup"), Some(Duration::from_secs(60)), None)
+            .await;
+        // Second register with same name — boot panic. Anything doing
+        // this outside a #[should_panic] test is a mis-wired DI.
+        reg.register(handler("job_dup"), Some(Duration::from_secs(60)), None)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn empty_registry_picks_nothing() {
+        let reg = JobRegistry::new();
+        assert!(reg.pick_next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_all_returns_every_entry() {
+        let reg = JobRegistry::new();
+        reg.register(handler("a"), Some(Duration::from_secs(1)), None)
+            .await;
+        reg.register(handler("b"), Some(Duration::from_secs(1)), None)
+            .await;
+        let all = reg.snapshot_all().await;
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn on_demand_job_invisible_to_pick_next() {
+        let reg = JobRegistry::new();
+        // Scheduled job with a long interval.
+        reg.register(handler("scheduled"), Some(Duration::from_secs(3600)), None)
+            .await;
+        // On-demand job — supervisor must never pick it.
+        reg.register(handler("on_demand"), None, None).await;
+
+        let (next_name, _) = reg.pick_next().await.expect("scheduled job due");
+        assert_eq!(
+            next_name, "scheduled",
+            "pick_next must ignore on-demand jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_dispatches_on_demand_job() {
+        let reg = Arc::new(JobRegistry::new());
+        reg.register(handler("gc"), None, None).await;
+
+        let outcome = reg
+            .trigger("gc", &JobRunArgs::default())
+            .await
+            .expect("job exists");
+        assert!(outcome.is_ok());
+    }
+
+    #[tokio::test]
+    async fn trigger_returns_none_for_unknown_job() {
+        let reg = Arc::new(JobRegistry::new());
+        assert!(reg.trigger("nope", &JobRunArgs::default()).await.is_none());
+    }
+}

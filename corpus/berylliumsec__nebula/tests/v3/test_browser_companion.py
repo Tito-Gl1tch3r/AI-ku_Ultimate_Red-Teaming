@@ -1,0 +1,2012 @@
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from nebula.v3.browser_companion import (
+    BrowserCompanion,
+    CompanionAction,
+    CompanionRequest,
+)
+from nebula.v3.browser_companion_tools import (
+    attached_session,
+    companion_components,
+    companion_spec,
+)
+from nebula.v3.browser_engine import BrowserEngineRegistry
+from nebula.v3.domain import BrowserIdentity, BrowserSession, ChatSession, Engagement
+from nebula.v3.storage import NebulaStore, NotFoundError
+from nebula.v3.tools import InvalidToolArguments
+from tests.v3.row_horizon_fixture import seed_older_copies
+
+
+def setup(tmp_path):
+    store = NebulaStore(tmp_path / "nebula.db")
+    project = store.create(Engagement(name="Browser test"))
+    identity = store.create(BrowserIdentity(engagement_id=project.id, name="Browser"))
+    session = store.create(
+        BrowserSession(
+            engagement_id=project.id,
+            identity_id=identity.id,
+            name="Browser",
+            metadata={"browser_companion_version": 1, "assistant_paused": False},
+        )
+    )
+    service = BrowserCompanion(store, BrowserEngineRegistry([]))
+    return store, project, identity, session, service
+
+
+def test_binding_rejects_other_project_and_survives_store_reopen(tmp_path):
+    store, project, _, session, service = setup(tmp_path)
+    other = store.create(Engagement(name="Other"))
+    chat = store.create(
+        ChatSession(
+            engagement_id=other.id,
+            title="Other chat",
+            model="fixture",
+            provider_profile_id="provider",
+        )
+    )
+    with pytest.raises(ValueError, match="another project"):
+        service.bind(session.id, chat.id)
+    own = store.create(
+        ChatSession(
+            engagement_id=project.id,
+            title="Own chat",
+            model="fixture",
+            provider_profile_id="provider",
+        )
+    )
+    service.bind(session.id, own.id)
+    reopened = NebulaStore(tmp_path / "nebula.db")
+    assert (
+        reopened.get(BrowserSession, session.id).metadata["conversation_id"] == own.id
+    )
+
+
+def test_open_scopes_browser_sessions_to_chat_and_promotes_draft(tmp_path, monkeypatch):
+    store, project, _, _, service = setup(tmp_path)
+    chats = [
+        store.create(
+            ChatSession(
+                engagement_id=project.id,
+                title=f"Chat {index}",
+                model="fixture",
+                provider_profile_id="provider",
+            )
+        )
+        for index in range(3)
+    ]
+
+    class Adapter:
+        async def ensure_identity(self, identity_id):
+            return None
+
+    async def adapter():
+        return Adapter()
+
+    async def tabs(session_id, request):
+        return {"tabs": []}
+
+    monkeypatch.setattr(service, "adapter", adapter)
+    monkeypatch.setattr(service, "request", tabs)
+
+    async def run():
+        first = await service.open(project.id, chats[0].id)
+        second = await service.open(project.id, chats[1].id)
+        assert first["session_id"] != second["session_id"]
+        assert (await service.open(project.id, chats[0].id))["session_id"] == first[
+            "session_id"
+        ]
+        draft = await service.open(project.id, draft_id="draft-chat-three")
+        promoted = await service.open(project.id, chats[2].id, "draft-chat-three")
+        assert promoted["session_id"] == draft["session_id"]
+        assert (
+            store.get(BrowserSession, promoted["session_id"]).metadata[
+                "conversation_id"
+            ]
+            == chats[2].id
+        )
+        assert (await service.open(project.id, chats[2].id))["session_id"] == promoted[
+            "session_id"
+        ]
+
+    asyncio.run(run())
+
+
+def test_revoked_identity_cannot_be_read_or_controlled(tmp_path):
+    store, _, identity, session, service = setup(tmp_path)
+    store.update(
+        BrowserIdentity, identity.id, {"revoked_at": datetime.now(timezone.utc)}
+    )
+    with pytest.raises(ValueError, match="revoked"):
+        service.session(session.id)
+
+
+def test_takeover_revokes_pending_actions_across_service_instances(tmp_path):
+    store, _, _, session, service = setup(tmp_path)
+    second = BrowserCompanion(store, BrowserEngineRegistry([]))
+    assert second._locks is service._locks
+    action = service.propose(
+        session.id,
+        CompanionRequest(
+            operation="click", tab_id="tab", page_revision="old", element_id="0"
+        ),
+    )
+    second.takeover(session.id, True)
+    assert store.get(CompanionAction, action.id).status == "revoked"
+    with pytest.raises(ValueError, match="paused"):
+        service.propose(session.id, action.request)
+
+
+def test_expired_approval_does_not_execute(tmp_path, monkeypatch):
+    store, _, _, session, service = setup(tmp_path)
+    action = service.propose(
+        session.id, CompanionRequest(operation="click", page_revision="old")
+    )
+    store.update(
+        CompanionAction,
+        action.id,
+        {"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)},
+    )
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Expired approval executed")
+
+    monkeypatch.setattr(service, "request", forbidden)
+    assert (
+        asyncio.run(service.decide(session.id, action.id, "approve")).status
+        == "revoked"
+    )
+
+
+def test_decided_mutation_is_never_replayed(tmp_path, monkeypatch):
+    _, _, _, session, service = setup(tmp_path)
+    action = service.propose(
+        session.id, CompanionRequest(operation="click", page_revision="old")
+    )
+    calls = []
+
+    async def execute(*args, **kwargs):
+        calls.append(args)
+        return {"text": "changed"}
+
+    monkeypatch.setattr(service, "request", execute)
+    assert (
+        asyncio.run(service.decide(session.id, action.id, "approve")).status
+        == "complete"
+    )
+    with pytest.raises(ValueError, match="already been decided"):
+        asyncio.run(service.decide(session.id, action.id, "approve"))
+    assert len(calls) == 1
+
+
+def test_companion_tool_has_no_script_or_security_testing_operations(tmp_path):
+    spec = companion_spec()
+    operations = spec.input_schema["properties"]["operation"]["enum"]
+    assert set(operations) == {
+        "tabs",
+        "navigate",
+        "capture",
+        "click",
+        "fill",
+        "upload",
+        "select",
+        "press",
+        "scroll",
+        "highlight",
+    }
+    store, _, _, session, _ = setup(tmp_path)
+    other = store.create(Engagement(name="Other"))
+    # Another project's browser is an unavailable resource, refused before
+    # anything ran, as the broker refuses another project's call.
+    with pytest.raises(NotFoundError, match="another project") as refused:
+        companion_components(store, other.id, session.id)
+    assert getattr(refused.value, "_nebula_before_execution", False) is True
+
+
+def test_real_chromium_capture_retains_fields_and_rejects_changed_document():
+    from playwright.async_api import async_playwright
+    from nebula.v3.browser_companion_runtime import capture, operate
+    from types import SimpleNamespace
+
+    async def run():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=True, executable_path=playwright.chromium.executable_path
+            )
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+                await page.set_content(
+                    '<main><h1>Account</h1><input type="password" value="do-not-export"><textarea>private-draft</textarea><button>Save</button></main>'
+                )
+                request = CompanionRequest(operation="capture", tab_id="tab")
+                result = await capture(page, request)
+                assert result["elements"][0]["value"] == "do-not-export"
+                assert result["elements"][1]["value"] == "private-draft"
+                assert "private-draft" in result["html"]
+                assert result["elements"][0]["sensitive"] is True
+                await page.locator("button").evaluate("el => el.textContent = 'Delete'")
+
+                class Manager:
+                    def __init__(self):
+                        self._tabs = {("identity", "tab"): page}
+
+                    async def ensure_identity(self, identity_id):
+                        return SimpleNamespace(
+                            tab_ids=[
+                                key[1] for key in self._tabs if key[0] == identity_id
+                            ]
+                        )
+
+                    async def page_for_screencast(self, identity_id, tab_id):
+                        return self._tabs[(identity_id, tab_id)]
+
+                manager = Manager()
+                created = await operate(
+                    manager, "identity", CompanionRequest(operation="new_tab")
+                )
+                assert len(created["tabs"]) == 2
+                closed = await operate(
+                    manager,
+                    "identity",
+                    CompanionRequest(
+                        operation="close_tab", tab_id=created["active_tab_id"]
+                    ),
+                )
+                assert len(closed["tabs"]) == 1
+                with pytest.raises(ValueError, match="Page content changed"):
+                    await operate(
+                        manager,
+                        "identity",
+                        CompanionRequest(
+                            operation="click",
+                            tab_id="tab",
+                            element_id="2",
+                            page_revision=result["page_revision"],
+                        ),
+                    )
+                before_replacement = await capture(page, request)
+                await page.locator("button").evaluate(
+                    "el => el.replaceWith(el.cloneNode(true))"
+                )
+                after_replacement = await capture(page, request)
+                assert before_replacement["text"] == after_replacement["text"]
+                assert (
+                    before_replacement["page_revision"]
+                    != after_replacement["page_revision"]
+                )
+                with pytest.raises(ValueError, match="Page content changed"):
+                    await operate(
+                        manager,
+                        "identity",
+                        CompanionRequest(
+                            operation="click",
+                            tab_id="tab",
+                            element_id=before_replacement["elements"][-1]["id"],
+                            page_revision=before_replacement["page_revision"],
+                        ),
+                    )
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+
+
+def test_real_core_requires_auth_and_reports_absent_browser_runtime(
+    tmp_path, monkeypatch
+):
+    from fastapi.testclient import TestClient
+    from nebula.v3.api import create_app
+
+    monkeypatch.delenv("NEBULA_BROWSERD_URL", raising=False)
+    monkeypatch.delenv("NEBULA_BROWSERD_TOKEN", raising=False)
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    store = NebulaStore(tmp_path / "core.db")
+    client = TestClient(create_app(store, auth_token="test-token"))
+    headers = {"Authorization": "Bearer test-token"}
+    project = client.post(
+        "/api/v1/engagements", headers=headers, json={"name": "Browser"}
+    ).json()
+    endpoint = f"/api/v1/engagements/{project['id']}/browser-companion"
+    assert client.post(endpoint).status_code == 401
+    result = client.post(endpoint, headers=headers)
+    assert result.status_code == 409
+    assert "saved conversations remain available" in result.text
+
+
+@pytest.mark.parametrize("cancel", [False, True, "saved-turn", "late-approval"])
+def test_assistant_waits_for_inline_approval_and_receives_actual_result(
+    tmp_path, monkeypatch, cancel
+):
+    from nebula.v3.browser_companion_tools import CompanionBroker
+    from nebula.v3.domain import ScopePolicy
+    from nebula.v3.tools import ToolInvocation
+
+    store, project, _, session, service = setup(tmp_path)
+    chat = store.create(
+        ChatSession(
+            engagement_id=project.id,
+            title="Browser",
+            model="fixture",
+            provider_profile_id="provider",
+        )
+    )
+    service.bind(session.id, chat.id)
+    from nebula.v3.domain import ChatTurn, ToolCallOrigin
+
+    turn = store.create(
+        ChatTurn(
+            engagement_id=project.id,
+            session_id=chat.id,
+            model="fixture",
+            provider_profile_id="provider",
+            tools_enabled=True,
+        )
+    )
+    broker = CompanionBroker(store, session.id)
+    operations = []
+
+    async def request(session_id, request, **kwargs):
+        operations.append(request.operation)
+        return {
+            "page_revision": "page-1",
+            "elements": [{"id": "0", "sensitive": False}],
+            "text": "Saved",
+        }
+
+    monkeypatch.setattr(broker.service, "request", request)
+    invocation = ToolInvocation(
+        engagement_id=project.id,
+        run_id=turn.id,
+        origin=ToolCallOrigin.CHAT,
+        chat_session_id=chat.id,
+        chat_turn_id=turn.id,
+        tool_name="browser.companion",
+        arguments={
+            "operation": "click",
+            "tab_id": "tab",
+            "page_revision": "page-1",
+            "element_id": "0",
+            "url": "https://example.test/",
+        },
+        workspace=tmp_path,
+    )
+
+    async def run():
+        task = asyncio.create_task(
+            broker.execute(invocation, ScopePolicy(engagement_id=project.id))
+        )
+        try:
+            for _ in range(100):
+                if task.done():
+                    await task
+                actions = broker.service.actions(session.id)
+                if actions:
+                    break
+                await asyncio.sleep(0.01)
+            assert actions and not task.done()
+            assert operations == ["capture"]
+            if cancel in {"saved-turn", "late-approval"}:
+                from nebula.v3.domain import ChatTurnStatus
+
+                store.update(
+                    ChatTurn,
+                    turn.id,
+                    {"status": ChatTurnStatus.CANCELLED},
+                    expected_revision=turn.revision,
+                )
+                if cancel == "late-approval":
+                    action = await broker.service.decide(
+                        session.id, actions[0].id, "approve"
+                    )
+                    assert action.status == "revoked"
+                result = await asyncio.wait_for(task, 2)
+                assert result.output["status"] == "revoked"
+                assert operations == ["capture"]
+                return
+            if cancel:
+                from nebula.v3.domain import (
+                    ToolCall as PersistedToolCall,
+                    ToolCallStatus,
+                )
+
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert broker.service.actions(session.id)[0].status == "revoked"
+                assert (
+                    store.get(PersistedToolCall, invocation.id).status
+                    == ToolCallStatus.FAILED
+                )
+                assert operations == ["capture"]
+                return
+            await broker.service.decide(session.id, actions[0].id, "approve")
+            result = await asyncio.wait_for(task, 2)
+            assert result.output["status"] == "complete"
+            assert result.output["result"]["text"] == "Saved"
+            assert operations == ["capture", "click"]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_project_never_policy_executes_scoped_companion_change_without_prompt(
+    tmp_path, monkeypatch
+):
+    from nebula.v3.browser_companion_tools import CompanionBroker
+    from nebula.v3.domain import (
+        AutomationProjectPolicy,
+        ChatTurn,
+        ScopePolicy,
+        ToolCallOrigin,
+    )
+    from nebula.v3.tools import ToolInvocation
+
+    store, project, _, session, service = setup(tmp_path)
+    store.create(
+        AutomationProjectPolicy(engagement_id=project.id, approval_policy="never")
+    )
+    chat = store.create(
+        ChatSession(
+            engagement_id=project.id,
+            title="Browser",
+            model="fixture",
+            provider_profile_id="provider",
+        )
+    )
+    service.bind(session.id, chat.id)
+    turn = store.create(
+        ChatTurn(
+            engagement_id=project.id,
+            session_id=chat.id,
+            model="fixture",
+            provider_profile_id="provider",
+            tools_enabled=True,
+        )
+    )
+    broker = CompanionBroker(store, session.id)
+    operations = []
+
+    async def request(session_id, request, **kwargs):
+        operations.append(request.operation)
+        return {
+            "page_revision": "page-1",
+            "elements": [{"id": "0", "sensitive": False}],
+            "text": "Saved",
+        }
+
+    monkeypatch.setattr(broker.service, "request", request)
+    invocation = ToolInvocation(
+        engagement_id=project.id,
+        run_id=turn.id,
+        origin=ToolCallOrigin.CHAT,
+        chat_session_id=chat.id,
+        chat_turn_id=turn.id,
+        tool_name="browser.companion",
+        arguments={
+            "operation": "click",
+            "tab_id": "tab",
+            "page_revision": "page-1",
+            "element_id": "0",
+            "url": "https://example.test/",
+        },
+        workspace=tmp_path,
+    )
+
+    result = asyncio.run(
+        broker.execute(invocation, ScopePolicy(engagement_id=project.id))
+    )
+    assert result.output["status"] == "complete"
+    assert operations == ["capture", "click"]
+    assert service.actions(session.id)[0].status == "complete"
+
+
+def test_manual_action_revokes_approvals_without_clearing_control_grant(tmp_path):
+    store, _, _, session, service = setup(tmp_path)
+    pending = service.propose(
+        session.id,
+        CompanionRequest(
+            operation="click",
+            tab_id="tab",
+            page_revision="page-1",
+            element_id="0",
+        ),
+    )
+
+    async def run():
+        lock = service._locks.setdefault(session.id, asyncio.Lock())
+        async with lock:
+            task = asyncio.create_task(
+                service.request(
+                    session.id,
+                    CompanionRequest(
+                        operation="navigate",
+                        tab_id="tab",
+                        url="https://example.test/",
+                    ),
+                )
+            )
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert service.session(session.id).metadata["assistant_paused"] is False
+            assert store.get(CompanionAction, pending.id).status == "revoked"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+
+
+def test_cancelled_turn_cannot_dispatch_an_approved_action_waiting_for_control(
+    tmp_path,
+):
+    from nebula.v3.domain import ChatTurn, ChatTurnStatus
+
+    store, project, _, session, service = setup(tmp_path)
+    turn = store.create(
+        ChatTurn(
+            engagement_id=project.id,
+            session_id="chat",
+            model="fixture",
+            provider_profile_id="provider",
+        )
+    )
+    action = service.propose(
+        session.id,
+        CompanionRequest(
+            operation="click", tab_id="tab", page_revision="page-1", element_id="0"
+        ),
+        chat_turn_id=turn.id,
+    )
+
+    async def run():
+        lock = service._locks.setdefault(session.id, asyncio.Lock())
+        async with lock:
+            task = asyncio.create_task(service.decide(session.id, action.id, "approve"))
+            await asyncio.sleep(0)
+            assert store.get(CompanionAction, action.id).status == "running"
+            store.update(
+                ChatTurn,
+                turn.id,
+                {"status": ChatTurnStatus.CANCELLED},
+                expected_revision=turn.revision,
+            )
+        with pytest.raises(ValueError, match="originating Assistant turn ended"):
+            await task
+        assert store.get(CompanionAction, action.id).status == "failed"
+
+    asyncio.run(run())
+
+
+def test_model_results_remove_url_credentials_and_tokens():
+    from nebula.v3.browser_companion_tools import model_browser_result
+
+    result = model_browser_result(
+        {
+            "tabs": [
+                {
+                    "url": "https://user:secret@example.test:443/page?token=private#secret"
+                }
+            ]
+        }
+    )
+    assert result["tabs"][0]["url"] == "https://example.test:443/page"
+
+
+def test_screenshot_tool_persists_owned_image_and_replays_without_recapture(
+    tmp_path, monkeypatch
+):
+    import base64
+    from types import SimpleNamespace
+    from nebula.v3.artifacts import ArtifactStore
+    from nebula.v3.browser_companion_tools import CompanionBroker
+    from nebula.v3.chat import ChatService
+    from nebula.v3.chat_turn_ledger import turn_history
+    from nebula.v3.domain import ChatTurn, ToolCallOrigin, ScopePolicy
+    from nebula.v3.providers import ModelRequest
+    from nebula.v3.tools import ToolInvocation
+
+    store, project, _, session, service = setup(tmp_path)
+    chat = store.create(
+        ChatSession(
+            engagement_id=project.id,
+            title="Images",
+            model="fixture",
+            provider_profile_id="fixture",
+        )
+    )
+    service.bind(session.id, chat.id)
+    turn = store.create(
+        ChatTurn(
+            engagement_id=project.id,
+            session_id=chat.id,
+            model="fixture",
+            provider_profile_id="fixture",
+            tools_enabled=True,
+        )
+    )
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    broker = CompanionBroker(
+        store, session.id, artifact_store=artifacts, image_supported=True
+    )
+    image_data = base64.b64encode(b"controlled image bytes").decode()
+    captures = []
+
+    async def request(*args, **kwargs):
+        captures.append(args)
+        return {"image": image_data, "text": "Page", "page_revision": "1"}
+
+    monkeypatch.setattr(broker.service, "request", request)
+    invocation = ToolInvocation(
+        engagement_id=project.id,
+        run_id=turn.id,
+        origin=ToolCallOrigin.CHAT,
+        chat_session_id=chat.id,
+        tool_name="browser.companion",
+        arguments={
+            "operation": "capture",
+            "capture_kind": "region",
+            "tab_id": "tab",
+            "url": "https://example.test/",
+            "width": 100,
+            "height": 100,
+        },
+        workspace=tmp_path,
+    )
+
+    async def run():
+        result = await broker.execute(invocation, ScopePolicy(engagement_id=project.id))
+        assert "image" not in result.output
+        assert result.mcp_content_blocks[0]["data"] == image_data
+        repeated = await broker.execute(
+            invocation, ScopePolicy(engagement_id=project.id)
+        )
+        assert repeated.output == result.output
+        assert len(captures) == 1
+        turn.tool_history = [
+            {
+                "name": "browser.companion",
+                "status": "complete",
+                "tool_call_id": invocation.id,
+                "model_call_id": "call-1",
+                "artifacts": result.output["artifacts"],
+            }
+        ]
+        prepared = SimpleNamespace(
+            model_request=ModelRequest(model="fixture", messages=[]),
+            provider_profile=SimpleNamespace(capabilities=SimpleNamespace(vision=True)),
+        )
+        owner = SimpleNamespace(
+            store=store,
+            artifact_store=artifacts,
+            _turn_history=lambda item: turn_history(store.database, item),
+        )
+        call_id, parts = ChatService._browser_screenshot(owner, prepared, turn)
+        assert call_id == "call-1"
+        assert parts[1]["data"] == image_data
+        prepared.provider_profile.capabilities.vision = False
+        assert ChatService._browser_screenshot(owner, prepared, turn) is None
+
+    asyncio.run(run())
+    assert (
+        "region"
+        not in companion_spec().input_schema["properties"]["capture_kind"]["enum"]
+    )
+
+
+def test_harness_image_capability_follows_discovered_model_modalities():
+    from nebula.v3.harnesses import CodexAppServerAdapter
+
+    class Catalog:
+        async def request(self, method, params):
+            assert method == "model/list"
+            return {
+                "data": [
+                    {"model": "vision", "inputModalities": ["text", "image"]},
+                    {"model": "text-only", "inputModalities": ["text"]},
+                    {"model": "unknown"},
+                ]
+            }
+
+    _, models = asyncio.run(CodexAppServerAdapter()._models(Catalog(), timeout=1))
+    assert {model.model: model.image_input for model in models} == {
+        "vision": True,
+        "text-only": False,
+        "unknown": False,
+    }
+
+
+def test_protected_reference_fills_only_after_approval_and_retains_capture(
+    tmp_path, monkeypatch
+):
+    import json
+    from pydantic import SecretStr
+    from nebula.v3.browser_companion import CompanionCredentialCreate
+    from nebula.v3.credentials import CredentialStore
+
+    store, _, _, session, service = setup(tmp_path)
+    secret = "private-browser-value-123"
+    catalog = service.save_credential(
+        session.id,
+        CompanionCredentialCreate(label="Test password", secret=SecretStr(secret)),
+    )
+    reference = catalog[0]["reference"]
+    assert secret not in json.dumps(catalog)
+    assert secret not in service.session(session.id).model_dump_json()
+    action = service.propose(
+        session.id,
+        CompanionRequest(
+            operation="fill",
+            tab_id="tab",
+            page_revision="revision",
+            element_id="0",
+            credential_ref=reference,
+        ),
+    )
+    assert secret not in action.model_dump_json()
+    payloads = []
+
+    class Response:
+        is_error = False
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.payload
+
+    class Adapter:
+        async def _request(self, method, path, payload):
+            if payload["operation"] == "tabs":
+                return Response(
+                    {
+                        "tabs": [
+                            {
+                                "id": "tab",
+                                "url": "https://example.test/",
+                                "title": "Test",
+                            }
+                        ]
+                    }
+                )
+            payloads.append(payload)
+            assert payload["text"] == secret
+            return Response(
+                {
+                    "text": secret,
+                    "title": secret,
+                    "page_revision": "revision",
+                    "elements": [],
+                }
+            )
+
+    async def adapter():
+        return Adapter()
+
+    monkeypatch.setattr(service, "adapter", adapter)
+    monkeypatch.setattr(service.security, "_scope", lambda _: None)
+    monkeypatch.setattr(service.security, "_require_in_scope", lambda *args: None)
+    assert payloads == []
+    result = asyncio.run(service.decide(session.id, action.id, "approve"))
+    assert result.status == "complete" and len(payloads) == 1
+    assert result.result["text"] == secret
+    with pytest.raises(ValueError):
+        asyncio.run(
+            service.request(
+                session.id,
+                CompanionRequest(
+                    operation="fill",
+                    tab_id="tab",
+                    page_revision="revision",
+                    element_id="0",
+                    credential_ref="env:UNATTACHED",
+                ),
+            )
+        )
+    assert len(payloads) == 1
+    restarted = BrowserCompanion(
+        store, BrowserEngineRegistry([]), credentials=CredentialStore()
+    )
+    assert restarted.credential_catalog(session.id)[0]["available"] is False
+
+
+def test_attached_files_are_scoped_revocable_and_integrity_checked(tmp_path):
+    import base64
+    from pydantic import ValidationError
+    from nebula.v3.artifacts import ArtifactStore
+    from nebula.v3.browser_companion import CompanionFileCreate
+    from nebula.v3.domain import Artifact
+
+    store, project, identity, session, _ = setup(tmp_path)
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    service = BrowserCompanion(
+        store, BrowserEngineRegistry([]), artifact_store=artifacts
+    )
+    with pytest.raises(ValidationError):
+        CompanionFileCreate(filename="../secret.txt", content_base64="")
+    catalog = service.save_file(
+        session.id,
+        CompanionFileCreate(
+            filename="sample.txt",
+            media_type="text/plain",
+            content_base64=base64.b64encode(b"file fixture").decode(),
+        ),
+    )
+    reference = catalog[0]["reference"]
+    assert catalog[0]["size"] == 12
+    assert "content_base64" not in str(catalog)
+    assert (
+        service.file_payload(session.id, reference)["content_base64"]
+        == "ZmlsZSBmaXh0dXJl"
+    )
+    other = store.create(
+        BrowserSession(
+            engagement_id=project.id,
+            identity_id=identity.id,
+            name="Other browser",
+            metadata={"browser_companion_version": 1},
+        )
+    )
+    with pytest.raises(ValueError, match="attached"):
+        service.file_payload(other.id, reference)
+    request = CompanionRequest(
+        operation="upload",
+        file_ref=reference,
+        tab_id="tab",
+        page_revision="page",
+        element_id="2",
+    )
+    with pytest.raises(ValueError, match="inline approval"):
+        asyncio.run(service.request(session.id, request))
+    action = service.propose(session.id, request)
+    service.remove_file(session.id, reference)
+    assert store.get(CompanionAction, action.id).status == "revoked"
+    with pytest.raises(ValueError, match="attached"):
+        service.file_payload(session.id, reference)
+    catalog = service.save_file(
+        session.id,
+        CompanionFileCreate(filename="sample.txt", content_base64="ZmlsZSBmaXh0dXJl"),
+    )
+    reference = catalog[0]["reference"]
+    operator_action = service.propose(
+        session.id,
+        request.model_copy(update={"file_ref": reference}),
+        operator_requested=True,
+    )
+    assert operator_action.operator_requested
+    entry = service.session(session.id).metadata["browser_files"][reference]
+    artifact = store.get(Artifact, entry["artifact_id"])
+    path = artifacts.path_for(artifact)
+    path.chmod(0o600)
+    path.write_bytes(b"changed data")
+    with pytest.raises(ValueError, match="integrity"):
+        service.file_payload(session.id, reference)
+
+
+def test_background_tab_poll_reports_lost_state_once_without_repausing_on_reconnect(
+    tmp_path, monkeypatch
+):
+    import httpx
+
+    store, project, _, session, service = setup(tmp_path)
+    store.update(
+        BrowserSession,
+        session.id,
+        {
+            "tabs": [{"id": "old-tab", "title": "Unsaved page", "position": 0}],
+            "active_tab_id": "old-tab",
+        },
+    )
+    pending = service.propose(
+        session.id,
+        CompanionRequest(operation="click", tab_id="old-tab", page_revision="old"),
+    )
+
+    class Adapter:
+        async def ensure_identity(self, identity_id):
+            return None
+
+        async def _request(self, method, path, payload):
+            return httpx.Response(
+                200,
+                request=httpx.Request(method, "http://fixture.test"),
+                json={
+                    "tabs": [
+                        {"id": "new-tab", "title": "New page", "url": "about:blank"}
+                    ]
+                }
+                if payload["operation"] == "tabs"
+                else {"text": "Fresh page"},
+            )
+
+    async def adapter():
+        return Adapter()
+
+    monkeypatch.setattr(service, "adapter", adapter)
+    monkeypatch.setattr(service.security, "_scope", lambda _: None)
+    monkeypatch.setattr(service.security, "_require_in_scope", lambda *args: None)
+
+    async def run():
+        await service.request(session.id, CompanionRequest(operation="tabs"))
+        saved = NebulaStore(tmp_path / "nebula.db").get(BrowserSession, session.id)
+        assert saved.metadata["browser_page_state_reset"] is True
+        assert saved.metadata["assistant_paused"] is True
+        assert store.get(CompanionAction, pending.id).status == "revoked"
+        assert (await service.open(project.id))["page_state_reset"] is True
+        assert service.session(session.id).metadata["browser_page_state_reset"] is False
+        service.takeover(session.id, False)
+        assert (await service.open(project.id))["page_state_reset"] is False
+        assert service.session(session.id).metadata["assistant_paused"] is False
+        await service.request(
+            session.id,
+            CompanionRequest(
+                operation="navigate", tab_id="new-tab", url="https://example.test/"
+            ),
+        )
+        assert (await service.open(project.id))["page_state_reset"] is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["transport", "timeout", "page_timeout"])
+def test_host_failure_explains_recovery_without_replaying(
+    tmp_path, monkeypatch, failure
+):
+    import httpx
+
+    _, _, _, session, service = setup(tmp_path)
+    calls = []
+
+    class Adapter:
+        async def _request(self, *args):
+            calls.append(args)
+            if failure == "transport":
+                raise httpx.ConnectError("private endpoint")
+            if failure == "timeout":
+                raise httpx.ReadTimeout("private endpoint")
+            return httpx.Response(504, json={"detail": "private upstream details"})
+
+    async def adapter():
+        return Adapter()
+
+    monkeypatch.setattr(service, "adapter", adapter)
+    with pytest.raises(ValueError, match="[Rr]econnect|[Rr]etry") as error:
+        asyncio.run(service.request(session.id, CompanionRequest(operation="tabs")))
+    assert len(calls) == 1
+    assert "private" not in str(error.value)
+
+
+def test_attached_browser_has_project_graph_capabilities(tmp_path):
+    from nebula.v3.domain import ScopePolicy
+    from nebula.v3.application_model.tools import INPUTS
+
+    store, project, _, session, _ = setup(tmp_path)
+    scope = store.create(ScopePolicy(engagement_id=project.id))
+    store.update(
+        Engagement,
+        project.id,
+        {"scope_policy_id": scope.id},
+        expected_revision=project.revision,
+    )
+    runtime = companion_components(store, project.id, session.id)
+    assert set(runtime.specs) == {"browser.companion", *INPUTS}
+    assert "application-model-v2" in runtime.runtime_digest
+
+
+@pytest.mark.parametrize(
+    "operation,assistant,expected",
+    [
+        ("navigate", True, True),
+        ("capture", True, True),
+        ("click", True, True),
+        ("tabs", True, False),
+        ("navigate", False, False),
+    ],
+)
+def test_agent_browser_result_carries_durable_model_evidence(
+    tmp_path, operation, assistant, expected
+):
+    from nebula.v3.domain import Observation
+    from nebula.v3.application_model.service import ApplicationModelService
+    from nebula.v3.application_model.graph import GraphTransaction
+
+    store, project, identity, session, service = setup(tmp_path)
+    result = {
+        "url": "https://example.test/",
+        "title": "Example page",
+        "page_revision": "page-1",
+    }
+    service._record_interaction(
+        session,
+        CompanionRequest(operation=operation),
+        result,
+        assistant=assistant,
+        chat_turn_id=None,
+    )
+    assert ("model_evidence" in result) is expected
+    if not expected:
+        return
+    reference = result["model_evidence"]
+    assert result["model_authentication_context"] == identity.id
+    reopened = NebulaStore(tmp_path / "nebula.db")
+    observation = reopened.get(Observation, reference["id"])
+    assert observation.engagement_id == project.id
+    assert observation.revision == reference["revision"]
+    model = ApplicationModelService(reopened)
+    transaction = GraphTransaction.model_validate(
+        {
+            "expected_revision": 0,
+            "idempotency_key": "browser-observation-1",
+            "operations": [
+                {
+                    "op": "put_object",
+                    "id": "page-example",
+                    "label": "Example page",
+                    "authentication_context": result["model_authentication_context"],
+                    "classification": {
+                        "value": "Page",
+                        "status": "observed",
+                        "evidence": [reference],
+                    },
+                    "properties": {
+                        "purpose": {
+                            "value": "Identify the entry point into the captured application workflow."
+                        }
+                    },
+                }
+            ],
+        }
+    )
+    model.transact(project.id, transaction, producer="assistant")
+    model.transact(project.id, transaction, producer="assistant")
+    assert len(model.search(project.id)["objects"]) == 1
+
+
+def test_automatic_browser_model_workflow_reaches_provider_and_harness():
+    from types import SimpleNamespace
+    from nebula.v3.application_model.workflow import BROWSER_MODEL_WORKFLOW
+    from nebula.v3.chat import _CHAT_TOOL_INSTRUCTIONS
+    from nebula.v3.harnesses import _harness_developer_instructions
+    from nebula.v3.domain import HarnessNativeCapabilities
+
+    assert BROWSER_MODEL_WORKFLOW in _CHAT_TOOL_INSTRUCTIONS
+    assert BROWSER_MODEL_WORKFLOW in companion_spec().description
+    assert "Use browser.companion" in BROWSER_MODEL_WORKFLOW
+    assert "model.transact" in BROWSER_MODEL_WORKFLOW
+    instructions = _harness_developer_instructions(
+        SimpleNamespace(metadata={}, mcp_snapshot=[]),
+        HarnessNativeCapabilities(),
+        vendor="test",
+    )
+    assert BROWSER_MODEL_WORKFLOW in instructions
+
+
+@pytest.mark.parametrize("failure", ["transport", "timeout", "page_timeout", "error"])
+def test_preflight_tab_check_failure_is_sanitized_like_the_operation(
+    tmp_path, monkeypatch, failure
+):
+    import httpx
+
+    _, _, _, session, service = setup(tmp_path)
+    calls = []
+
+    class Adapter:
+        async def _request(self, method, path, payload):
+            calls.append(payload["operation"])
+            if failure == "transport":
+                raise httpx.ConnectError("private endpoint")
+            if failure == "timeout":
+                raise httpx.ReadTimeout("private endpoint")
+            return httpx.Response(
+                504 if failure == "page_timeout" else 500,
+                request=httpx.Request(method, "http://fixture.test" + path),
+                json={"detail": "private upstream details"},
+            )
+
+    async def adapter():
+        return Adapter()
+
+    monkeypatch.setattr(service, "adapter", adapter)
+    with pytest.raises(ValueError, match="[Rr]econnect|[Rr]etry") as error:
+        asyncio.run(
+            service.request(
+                session.id, CompanionRequest(operation="capture", tab_id="tab")
+            )
+        )
+    assert calls == ["tabs"]
+    assert "private" not in str(error.value)
+
+
+def test_cancelled_decision_leaves_a_terminal_action(tmp_path, monkeypatch):
+    store, _, _, session, service = setup(tmp_path)
+    action = service.propose(
+        session.id, CompanionRequest(operation="click", page_revision="old")
+    )
+    dispatched = asyncio.Event()
+
+    async def request(*args, **kwargs):
+        dispatched.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "request", request)
+
+    async def run():
+        task = asyncio.create_task(service.decide(session.id, action.id, "approve"))
+        await dispatched.wait()
+        assert store.get(CompanionAction, action.id).status == "running"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert store.get(CompanionAction, action.id).status == "failed"
+    with pytest.raises(ValueError, match="already been decided"):
+        asyncio.run(service.decide(session.id, action.id, "approve"))
+
+
+def test_invalidating_approvals_sweeps_stale_running_actions_only(tmp_path):
+    from nebula.v3.domain import ChatTurn, ChatTurnStatus
+
+    store, project, _, session, service = setup(tmp_path)
+
+    def turn():
+        return store.create(
+            ChatTurn(
+                engagement_id=project.id,
+                session_id="chat",
+                model="fixture",
+                provider_profile_id="provider",
+            )
+        )
+
+    def running(chat_turn_id=None, **changes):
+        action = service.propose(
+            session.id,
+            CompanionRequest(operation="click", page_revision="old"),
+            chat_turn_id=chat_turn_id,
+        )
+        return store.update(
+            CompanionAction, action.id, {"status": "running", **changes}
+        )
+
+    ended = turn()
+    interrupted = running(ended.id)
+    store.update(
+        ChatTurn,
+        ended.id,
+        {"status": ChatTurnStatus.CANCELLED},
+        expected_revision=ended.revision,
+    )
+    lapsed = running(
+        expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    live = running(turn().id)
+    pending = service.propose(
+        session.id, CompanionRequest(operation="click", page_revision="old")
+    )
+
+    service.invalidate_pending_actions(session.id)
+
+    assert store.get(CompanionAction, interrupted.id).status == "failed"
+    assert store.get(CompanionAction, lapsed.id).status == "failed"
+    assert store.get(CompanionAction, live.id).status == "running"
+    assert store.get(CompanionAction, pending.id).status == "revoked"
+
+
+def test_new_approvals_stay_visible_and_revocable_after_a_page_of_actions(tmp_path):
+    store, project, _, session, service = setup(tmp_path)
+    seed_older_copies(
+        store,
+        CompanionAction(
+            engagement_id=project.id,
+            browser_session_id=session.id,
+            request=CompanionRequest(operation="click", page_revision="old"),
+            status="complete",
+        ),
+    )
+    action = service.propose(
+        session.id, CompanionRequest(operation="click", page_revision="new")
+    )
+
+    listed = service.actions(session.id)
+    assert len(listed) == 1_000
+    assert listed[-1].id == action.id
+    assert listed[-1].status == "pending"
+
+    service.takeover(session.id, True)
+    assert store.get(CompanionAction, action.id).status == "revoked"
+
+
+def test_conversation_browser_is_found_after_a_page_of_project_sessions(tmp_path):
+    store, project, identity, session, service = setup(tmp_path)
+    seed_older_copies(
+        store,
+        BrowserSession(engagement_id=project.id, identity_id=identity.id, name="Tab"),
+    )
+    chat = store.create(
+        ChatSession(
+            engagement_id=project.id,
+            title="Own chat",
+            model="fixture",
+            provider_profile_id="provider",
+        )
+    )
+    service.bind(session.id, chat.id)
+
+    assert attached_session(store, project.id, chat.id) == session.id
+    assert attached_session(store, project.id, "other-chat") is None
+
+
+def test_detached_browser_is_an_unavailable_resource_to_a_provider_chat(tmp_path):
+    """The provider path refuses a detached browser as the harness gateway does."""
+
+    import dataclasses
+    import json
+
+    from nebula.v3.browser_companion_tools import CompanionBroker
+    from nebula.v3.domain import (
+        BrowserIdentity as Identity,
+        BrowserSession as Browser,
+        ChatTurn,
+        ChatTurnStatus,
+        ToolCall as PersistedToolCall,
+    )
+    from nebula.v3.providers import ToolCall
+    from tests.v3.test_chat_tool_loop import RecordingBroker, _prepared, _response
+
+    arguments = {"operation": "tabs", "url": "https://example.test/"}
+    store, service, prepared, provider = _prepared(
+        tmp_path,
+        [
+            _response(
+                calls=[
+                    ToolCall(id="call-1", name="browser.companion", arguments=arguments)
+                ]
+            ),
+            _response(text="The browser is no longer attached."),
+        ],
+        RecordingBroker(),
+    )
+    identity = store.create(Identity(engagement_id="project", name="Browser"))
+    browser = store.create(
+        Browser(
+            engagement_id="project",
+            identity_id=identity.id,
+            name="Browser",
+            # Attached to another conversation: the operator moved it.
+            metadata={
+                "browser_companion_version": 1,
+                "assistant_paused": False,
+                "conversation_id": "another-conversation",
+            },
+        )
+    )
+    broker = CompanionBroker(store, browser.id)
+    prepared.tool_components = dataclasses.replace(
+        prepared.tool_components,
+        broker=broker,
+        specs={broker.spec.name: broker.spec},
+    )
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "The browser is no longer attached."
+    turn = store.get(ChatTurn, "turn")
+    assert turn.status == ChatTurnStatus.COMPLETE
+    [entry] = turn.tool_history
+    assert entry["name"] == "browser.companion" and entry["status"] == "failed"
+    failure = json.loads(entry["provider_result"])
+    # Refused before anything ran (#520 contract): an unavailable resource,
+    # not an argument to correct or an operation with unknown effects.
+    assert failure["schema"] == "nebula.tool-failure/v1"
+    assert failure["category"] == "unavailable_resource"
+    assert failure["side_effects"] == "none"
+    assert failure["retry_safe"] is False
+    [replayed] = provider.requests[1].tool_results
+    assert replayed.is_error is True
+    assert replayed.output["category"] == "unavailable_resource"
+    # Nothing reached the browser or its ledger.
+    assert broker.service.actions(browser.id) == []
+    assert store.list_entities(PersistedToolCall) == []
+
+
+@pytest.mark.parametrize(
+    ("browser_project", "paused", "category", "status"),
+    [
+        # The operator paused assistant control beside the page: a denial to
+        # ask about, not an argument to correct.
+        ("project", True, "permission_denied", "denied"),
+        # A broker for another project's browser: unavailable to this call,
+        # described as a missing resource is.
+        ("other-project", False, "unavailable_resource", "failed"),
+    ],
+)
+def test_companion_refusals_before_execution_report_no_side_effects(
+    tmp_path, browser_project, paused, category, status
+):
+    """Nothing runs for these refusals, so the #520 envelope says so."""
+
+    import dataclasses
+    import json
+
+    from nebula.v3.browser_companion_tools import CompanionBroker
+    from nebula.v3.domain import (
+        BrowserIdentity as Identity,
+        BrowserSession as Browser,
+        ChatTurn,
+        ChatTurnStatus,
+    )
+    from nebula.v3.providers import ToolCall
+    from tests.v3.test_chat_tool_loop import RecordingBroker, _prepared, _response
+
+    arguments = {"operation": "tabs", "url": "https://example.test/"}
+    store, service, prepared, provider = _prepared(
+        tmp_path,
+        [
+            _response(
+                calls=[
+                    ToolCall(id="call-1", name="browser.companion", arguments=arguments)
+                ]
+            ),
+            _response(text="The browser is not available."),
+        ],
+        RecordingBroker(),
+    )
+    if browser_project != "project":
+        store.create(Engagement(id=browser_project, name="Other project"))
+    identity = store.create(Identity(engagement_id=browser_project, name="Browser"))
+    browser = store.create(
+        Browser(
+            engagement_id=browser_project,
+            identity_id=identity.id,
+            name="Browser",
+            metadata={
+                "browser_companion_version": 1,
+                "assistant_paused": paused,
+                "conversation_id": "session",
+            },
+        )
+    )
+    broker = CompanionBroker(store, browser.id)
+    prepared.tool_components = dataclasses.replace(
+        prepared.tool_components,
+        broker=broker,
+        specs={broker.spec.name: broker.spec},
+    )
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "The browser is not available."
+    turn = store.get(ChatTurn, "turn")
+    assert turn.status == ChatTurnStatus.COMPLETE
+    [entry] = turn.tool_history
+    assert entry["name"] == "browser.companion" and entry["status"] == status
+    failure = json.loads(entry["provider_result"])
+    assert failure["schema"] == "nebula.tool-failure/v1"
+    assert failure["category"] == category
+    assert failure["side_effects"] == "none"
+    assert failure["invalid_input"] is None
+    [replayed] = provider.requests[1].tool_results
+    assert replayed.is_error is True
+    assert replayed.output["category"] == category
+    # Nothing reached the browser.
+    assert broker.service.actions(browser.id) == []
+
+
+def _provider_chat_with_companion(tmp_path, arguments, *, answer):
+    """A provider chat whose one tool call reaches a real CompanionBroker."""
+
+    import dataclasses
+
+    from nebula.v3.browser_companion_tools import CompanionBroker
+    from nebula.v3.domain import BrowserIdentity as Identity, BrowserSession as Browser
+    from nebula.v3.providers import ToolCall
+    from tests.v3.test_chat_tool_loop import RecordingBroker, _prepared, _response
+
+    store, service, prepared, provider = _prepared(
+        tmp_path,
+        [
+            _response(
+                calls=[
+                    ToolCall(id="call-1", name="browser.companion", arguments=arguments)
+                ]
+            ),
+            _response(text=answer),
+        ],
+        RecordingBroker(),
+    )
+    identity = store.create(Identity(engagement_id="project", name="Browser"))
+    browser = store.create(
+        Browser(
+            engagement_id="project",
+            identity_id=identity.id,
+            name="Browser",
+            metadata={
+                "browser_companion_version": 1,
+                "assistant_paused": False,
+                "conversation_id": "session",
+            },
+        )
+    )
+    broker = CompanionBroker(store, browser.id)
+    prepared.tool_components = dataclasses.replace(
+        prepared.tool_components,
+        broker=broker,
+        specs={broker.spec.name: broker.spec},
+    )
+    return store, service, prepared, provider, broker, browser
+
+
+def _refused_before_execution(store, turn_id, provider, status="denied"):
+    import json
+
+    from nebula.v3.domain import ChatTurn, ChatTurnStatus
+
+    turn = store.get(ChatTurn, turn_id)
+    assert turn.status == ChatTurnStatus.COMPLETE
+    [entry] = turn.tool_history
+    assert entry["name"] == "browser.companion" and entry["status"] == status
+    failure = json.loads(entry["provider_result"])
+    # The #520 contract: the operator's rule refused the call, nothing ran,
+    # and the call is not to be repeated as it was.
+    assert failure["schema"] == "nebula.tool-failure/v1"
+    assert failure["category"] == "permission_denied"
+    assert failure["side_effects"] == "none"
+    assert failure["invalid_input"] is None
+    assert failure["retry_safe"] is False
+    [replayed] = provider.requests[-1].tool_results
+    assert replayed.is_error is True
+    assert replayed.output["category"] == "permission_denied"
+    assert replayed.output["side_effects"] == "none"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "field", "offered_region"),
+    [
+        # Outside the offered schema.
+        ({"operation": "teleport", "url": "https://example.test/"}, "operation", False),
+        # Inside the schema, but not a value the browser request accepts.
+        (
+            {"operation": "scroll", "url": "https://example.test/", "x": float("nan")},
+            None,
+            False,
+        ),
+        # Region screenshots were offered, but this runtime cannot receive one.
+        (
+            {
+                "operation": "capture",
+                "capture_kind": "region",
+                "tab_id": "tab",
+                "width": 10,
+                "height": 10,
+                "url": "https://example.test/",
+            },
+            "capture_kind",
+            True,
+        ),
+    ],
+)
+def test_invalid_browser_arguments_are_refused_before_execution(
+    tmp_path, arguments, field, offered_region
+):
+    """An argument to correct, and nothing ran: the call is safe to reissue.
+
+    Both refusals came before the call was recorded, but read as invalid
+    input with unknown side effects that must not be retried.
+    """
+
+    import dataclasses
+    import json
+
+    from nebula.v3.domain import ChatTurn, ChatTurnStatus, ToolCall as PersistedToolCall
+
+    store, service, prepared, provider, broker, browser = _provider_chat_with_companion(
+        tmp_path, arguments, answer="The browser request needs other arguments."
+    )
+    if offered_region:
+        broker.spec = companion_spec(image_supported=True)
+        prepared.tool_components = dataclasses.replace(
+            prepared.tool_components, specs={broker.spec.name: broker.spec}
+        )
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "The browser request needs other arguments."
+    turn = store.get(ChatTurn, "turn")
+    assert turn.status == ChatTurnStatus.COMPLETE
+    [entry] = turn.tool_history
+    assert entry["name"] == "browser.companion" and entry["status"] == "failed"
+    failure = json.loads(entry["provider_result"])
+    assert failure["schema"] == "nebula.tool-failure/v1"
+    assert failure["category"] == "invalid_arguments"
+    assert failure["side_effects"] == "none"
+    assert failure["retry_safe"] is True
+    assert failure["invalid_input"] == field
+    assert failure["next_action"].startswith("Correct the indicated argument")
+    [replayed] = provider.requests[-1].tool_results
+    assert replayed.is_error is True
+    assert replayed.output["category"] == "invalid_arguments"
+    assert replayed.output["side_effects"] == "none"
+    # Nothing reached the browser or its ledger.
+    assert broker.service.actions(browser.id) == []
+    assert store.list_entities(PersistedToolCall) == []
+
+
+def test_a_nebula_approval_handed_to_the_browser_is_refused_before_execution(
+    tmp_path,
+):
+    """Browser changes are approved in the inline panel, not by a Nebula approval.
+
+    The refusal read as invalid input with unknown side effects, although the
+    browser received nothing.
+    """
+
+    import dataclasses
+
+    from nebula.v3.domain import (
+        Approval,
+        ApprovalStatus,
+        ChatTurn,
+        ChatTurnStatus,
+        RiskClass,
+        ToolCall as PersistedToolCall,
+        utc_now,
+    )
+    from nebula.v3.tools import ApprovalRequired
+
+    arguments = {"operation": "tabs", "url": "https://example.test/"}
+    store, service, prepared, provider, broker, browser = _provider_chat_with_companion(
+        tmp_path, arguments, answer="Browser actions are approved beside the page."
+    )
+    approval = store.create(
+        Approval(
+            id="approval-1",
+            engagement_id="project",
+            run_id="turn",
+            risk_class=RiskClass.PASSIVE,
+            exact_request={"tool_name": "browser.companion", "arguments": arguments},
+            policy_rationale="the operator approves this browser call",
+            requested_by="chat-assistant",
+        )
+    )
+
+    class ApprovalFirst:
+        """Pauses for a Nebula approval, then hands it to the browser broker."""
+
+        async def execute(self, invocation, scope, *, approval=None):
+            if approval is None:
+                raise ApprovalRequired(store.get(Approval, "approval-1"))
+            return await broker.execute(invocation, scope, approval=approval)
+
+    prepared.tool_components = dataclasses.replace(
+        prepared.tool_components, broker=ApprovalFirst()
+    )
+
+    async def scenario():
+        turn_id = service.start_provider_turn(prepared)
+        first = [event async for event, _ in service.follow_provider_turn(turn_id)]
+        assert first[-1] == "approval_required"
+        paused = store.get(ChatTurn, turn_id)
+        assert paused.status == ChatTurnStatus.WAITING_APPROVAL
+        store.update(
+            Approval,
+            approval.id,
+            {
+                "status": ApprovalStatus.APPROVED,
+                "decided_by": "operator",
+                "decided_at": utc_now(),
+            },
+            expected_revision=approval.revision,
+        )
+        prepared.turn = paused
+        prepared.execution_claim_id = None
+        service.start_provider_turn(prepared)
+        resumed = [event async for event, _ in service.follow_provider_turn(turn_id)]
+        assert resumed[-1] == "done"
+        await service.shutdown()
+        return turn_id
+
+    turn_id = asyncio.run(scenario())
+
+    _refused_before_execution(store, turn_id, provider)
+    # Nothing reached the browser or its ledger.
+    assert broker.service.actions(browser.id) == []
+    assert store.list_entities(PersistedToolCall) == []
+
+
+@pytest.mark.parametrize(
+    ("arguments", "pause_on"),
+    [
+        # A change: the operator pauses while Core reads the page to check it.
+        (
+            {
+                "operation": "click",
+                "tab_id": "tab",
+                "page_revision": "page-1",
+                "element_id": "0",
+                "url": "https://example.test/",
+            },
+            "capture",
+        ),
+        # A read: the operator pauses while Core checks the tab.
+        (
+            {"operation": "scroll", "tab_id": "tab", "url": "https://example.test/"},
+            "tabs",
+        ),
+    ],
+)
+def test_control_paused_mid_request_is_refused_before_the_browser_acts(
+    tmp_path, monkeypatch, arguments, pause_on
+):
+    """Pausing control while a call is checked refuses it, and says nothing ran.
+
+    The refusal fired after the call was marked running, as an execution
+    failure with unknown side effects.
+    """
+
+    import httpx
+
+    from nebula.v3.domain import ToolCall as PersistedToolCall, ToolCallStatus
+
+    store, service, prepared, provider, broker, browser = _provider_chat_with_companion(
+        tmp_path, arguments, answer="The operator paused browser control."
+    )
+    sent: list[str] = []
+
+    class Adapter:
+        async def _request(self, method, path, payload):
+            sent.append(payload["operation"])
+            if payload["operation"] == pause_on:
+                broker.service.takeover(browser.id, True)
+            return httpx.Response(
+                200,
+                request=httpx.Request(method, "http://fixture.test" + path),
+                json={
+                    "tabs": [
+                        {"id": "tab", "title": "Page", "url": "https://example.test/"}
+                    ]
+                }
+                if payload["operation"] == "tabs"
+                else {
+                    "page_revision": "page-1",
+                    "elements": [{"id": "0", "sensitive": False, "type": "button"}],
+                    "text": "Page",
+                },
+            )
+
+    async def adapter():
+        return Adapter()
+
+    monkeypatch.setattr(broker.service, "adapter", adapter)
+    monkeypatch.setattr(broker.service.security, "_scope", lambda _: None)
+    monkeypatch.setattr(
+        broker.service.security, "_require_in_scope", lambda *args: None
+    )
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "The operator paused browser control."
+    _refused_before_execution(store, "turn", provider)
+    # Only reads reached the browser, no change was proposed, and the ledger
+    # records a denial.
+    assert arguments["operation"] not in sent
+    assert broker.service.actions(browser.id) == []
+    [call] = store.list_entities(PersistedToolCall)
+    assert call.status == ToolCallStatus.DENIED
+    if arguments["operation"] == "click":
+        # The check ran before the call was marked running.
+        assert call.started_at is None
+
+
+class _TabsAdapter:
+    """A browser host that lists one tab and records what it was sent."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def _request(self, method, path, payload):
+        import httpx
+
+        self.sent.append(payload["operation"])
+        return httpx.Response(
+            200,
+            request=httpx.Request(method, "http://fixture.test" + path),
+            json={
+                "tabs": [{"id": "tab", "title": "Page", "url": "https://example.test/"}]
+            }
+            if payload["operation"] == "tabs"
+            else {
+                "page_revision": "page-1",
+                "elements": [{"id": "0", "sensitive": False, "type": "button"}],
+                "text": "Page",
+            },
+        )
+
+
+def _out_of_scope(scope, target, action, risk):
+    from nebula.v3.browser_security import BrowserWorkflowError
+
+    if "outside.test" in target:
+        raise BrowserWorkflowError("target is outside the project scope")
+
+
+@pytest.mark.parametrize(
+    ("arguments", "category", "status", "invalid_input", "sent"),
+    [
+        # A tab the model named from an old tabs result.
+        (
+            {"operation": "scroll", "tab_id": "gone", "url": "https://example.test/"},
+            "invalid_arguments",
+            "failed",
+            "tab_id",
+            ["tabs"],
+        ),
+        # The same stale tab in a change: refused while its page is checked.
+        (
+            {
+                "operation": "click",
+                "tab_id": "gone",
+                "page_revision": "page-1",
+                "element_id": "0",
+                "url": "https://example.test/",
+            },
+            "invalid_arguments",
+            "failed",
+            "tab_id",
+            ["tabs"],
+        ),
+        # A file reference outside an upload.
+        (
+            {
+                "operation": "scroll",
+                "tab_id": "tab",
+                "file_ref": "file-1",
+                "url": "https://example.test/",
+            },
+            "invalid_arguments",
+            "failed",
+            "file_ref",
+            ["tabs"],
+        ),
+        # A page outside the project's scope: a rule, not an argument.
+        (
+            {"operation": "navigate", "url": "https://outside.test/"},
+            "permission_denied",
+            "denied",
+            None,
+            [],
+        ),
+    ],
+)
+def test_browser_service_refusals_reach_the_model_classified(
+    tmp_path, monkeypatch, arguments, category, status, invalid_input, sent
+):
+    """Refusals the browser service makes before sending anything.
+
+    They reached the model as an execution failure with unknown side
+    effects, telling it to check a diagnostic reference instead of fixing
+    the argument or leaving the page alone.
+    """
+
+    import json
+
+    from nebula.v3.domain import ChatTurn, ChatTurnStatus
+
+    store, service, prepared, provider, broker, browser = _provider_chat_with_companion(
+        tmp_path, arguments, answer="The browser refused."
+    )
+    host = _TabsAdapter()
+
+    async def adapter():
+        return host
+
+    monkeypatch.setattr(broker.service, "adapter", adapter)
+    monkeypatch.setattr(broker.service.security, "_scope", lambda _: None)
+    monkeypatch.setattr(broker.service.security, "_require_in_scope", _out_of_scope)
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "The browser refused."
+    turn = store.get(ChatTurn, "turn")
+    assert turn.status == ChatTurnStatus.COMPLETE
+    [entry] = turn.tool_history
+    assert entry["name"] == "browser.companion" and entry["status"] == status
+    failure = json.loads(entry["provider_result"])
+    assert failure["schema"] == "nebula.tool-failure/v1"
+    assert failure["category"] == category
+    assert failure["side_effects"] == "none"
+    assert failure["invalid_input"] == invalid_input
+    assert failure["retry_safe"] is (category == "invalid_arguments")
+    for detail in ("no longer available", "outside the project", "uploads"):
+        assert detail not in entry["provider_result"]
+    [replayed] = provider.requests[-1].tool_results
+    assert replayed.output["category"] == category
+    # Only the tab list reached the browser, and nothing was proposed.
+    assert host.sent == sent
+    assert broker.service.actions(browser.id) == []
+
+
+def test_a_closed_browser_session_is_an_unavailable_resource(tmp_path):
+    import json
+
+    from nebula.v3.browser_companion_tools import CompanionBroker
+    from nebula.v3.domain import BrowserSessionStatus, ChatTurn
+
+    store, service, prepared, provider, broker, browser = _provider_chat_with_companion(
+        tmp_path,
+        {"operation": "tabs", "url": "https://example.test/"},
+        answer="The browser was closed.",
+    )
+    # The operator closes the browser after the turn picked it up.
+    latest = store.get(BrowserSession, browser.id)
+    store.update(
+        BrowserSession,
+        latest.id,
+        {"status": BrowserSessionStatus.CLOSED},
+        expected_revision=latest.revision,
+    )
+
+    completion = asyncio.run(service.complete(prepared))
+
+    assert completion.message.content == "The browser was closed."
+    [entry] = store.get(ChatTurn, "turn").tool_history
+    failure = json.loads(entry["provider_result"])
+    assert failure["category"] == "unavailable_resource"
+    assert failure["side_effects"] == "none"
+    assert failure["retry_safe"] is False
+    assert "closed" not in entry["provider_result"]
+    # Building its tools for a later call refuses the same way, with the
+    # service's wording kept for the operator's view.
+    with pytest.raises(NotFoundError, match="closed") as refused:
+        CompanionBroker(store, browser.id)
+    assert getattr(refused.value, "_nebula_before_execution", False) is True
+
+
+def test_harness_gateway_reports_another_projects_browser_as_unavailable(tmp_path):
+    """The harness gateway builds the companion tools inside the call."""
+
+    import json
+
+    from nebula.v3.harnesses import HarnessRuntimeService
+    from nebula.v3.tool_failures import FAILURE_SCHEMA
+
+    store, _, _, session, _ = setup(tmp_path)
+    other = store.create(Engagement(name="Other"))
+    schema = companion_spec().input_schema
+
+    class Gateway:
+        def _gateway_catalog(self, harness_session, params=None):
+            return {
+                "tools": [
+                    {
+                        "name": "browser.companion",
+                        "description": "Browser",
+                        "inputSchema": schema,
+                    }
+                ]
+            }
+
+        async def _gateway_call_unwrapped(self, harness_session, name, arguments):
+            companion_components(store, other.id, session.id)
+            raise AssertionError("another project's browser was offered")
+
+    response = asyncio.run(
+        HarnessRuntimeService._gateway_call(
+            Gateway(),
+            None,
+            "browser.companion",
+            {"operation": "tabs", "url": "https://example.test/"},
+        )
+    )
+    failure = response["structuredContent"]
+    assert response["isError"] is True
+    assert failure["schema"] == FAILURE_SCHEMA
+    assert failure["category"] == "unavailable_resource"
+    assert failure["side_effects"] == "none"
+    assert "another project" not in json.dumps(response)
+
+
+def test_screenshot_refusals_after_the_capture_leave_no_effect(tmp_path, monkeypatch):
+    import base64
+
+    from nebula.v3.artifacts import ArtifactStore
+    from nebula.v3.browser_companion_tools import CompanionBroker
+    from nebula.v3.domain import Artifact, ChatTurn, ScopePolicy, ToolCallOrigin
+    from nebula.v3.tool_failures import tool_failure
+    from nebula.v3.tools import ToolInvocation
+
+    store, project, _, session, service = setup(tmp_path)
+    chat = store.create(
+        ChatSession(
+            engagement_id=project.id,
+            title="Images",
+            model="fixture",
+            provider_profile_id="fixture",
+        )
+    )
+    service.bind(session.id, chat.id)
+    turn = store.create(
+        ChatTurn(
+            engagement_id=project.id,
+            session_id=chat.id,
+            model="fixture",
+            provider_profile_id="fixture",
+            tools_enabled=True,
+        )
+    )
+    broker = CompanionBroker(
+        store,
+        session.id,
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        image_supported=True,
+    )
+    images = {"size": 5 * 1024 * 1024}
+
+    async def request(*args, **kwargs):
+        data = b"x" * images["size"]
+        return {"image": base64.b64encode(data).decode(), "page_revision": "1"}
+
+    monkeypatch.setattr(broker.service, "request", request)
+    scope = ScopePolicy(engagement_id=project.id)
+
+    def invocation(call_id: str) -> ToolInvocation:
+        return ToolInvocation(
+            id=call_id,
+            engagement_id=project.id,
+            run_id=turn.id,
+            origin=ToolCallOrigin.CHAT,
+            chat_session_id=chat.id,
+            tool_name="browser.companion",
+            arguments={
+                "operation": "capture",
+                "capture_kind": "region",
+                "tab_id": "tab",
+                "url": "https://example.test/",
+                "width": 1900,
+                "height": 1000,
+            },
+            workspace=tmp_path,
+        )
+
+    def failure_of(error, call):
+        return tool_failure(
+            broker.spec,
+            call.arguments,
+            error,
+            phase="before_execution"
+            if getattr(error, "_nebula_before_execution", False)
+            else "after_execution",
+        )
+
+    async def run() -> None:
+        # Too large to keep: a capture changes nothing, so the model narrows
+        # the region and retries.
+        too_large = invocation("capture-1")
+        with pytest.raises(InvalidToolArguments) as caught:
+            await broker.execute(too_large, scope)
+        failure = failure_of(caught.value, too_large)
+        assert failure["category"] == "invalid_arguments"
+        assert failure["invalid_input"] == "width"
+        assert failure["side_effects"] == "none"
+        assert failure["retry_safe"] is True
+
+        # A replayed capture whose screenshot is gone is unavailable, and
+        # the replay runs nothing.
+        images["size"] = 100
+        kept = invocation("capture-2")
+        first = await broker.execute(kept, scope)
+        store.delete(Artifact, first.output["screenshot_artifact_id"])
+        with pytest.raises(NotFoundError) as missing:
+            await broker.execute(kept, scope)
+        failure = failure_of(missing.value, kept)
+        assert failure["category"] == "unavailable_resource"
+        assert failure["side_effects"] == "none"
+
+    asyncio.run(run())

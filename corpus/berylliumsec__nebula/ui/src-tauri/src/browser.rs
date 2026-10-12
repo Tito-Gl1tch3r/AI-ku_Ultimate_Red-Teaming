@@ -1,0 +1,2912 @@
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddrV4, TcpStream},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+use getrandom::fill as random_fill;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tauri::{
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State, Url, WebviewUrl,
+    menu::{MenuBuilder, MenuItemBuilder},
+    webview::{DownloadEvent, NewWindowResponse, PageLoadEvent, WebviewBuilder},
+};
+
+#[cfg(target_os = "macos")]
+use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSView;
+#[cfg(target_os = "macos")]
+use objc2_foundation::{
+    NSArray, NSObject, NSObjectNSKeyValueCoding, NSPoint, NSRect, NSSize, NSString, NSUUID,
+};
+#[cfg(target_os = "macos")]
+use objc2_web_kit::WKWebsiteDataStore;
+
+use crate::{
+    diagnostics::{DiagnosticLevel, DiagnosticsState},
+    sidecar::BackendState,
+};
+
+const MAX_TABS_PER_PROJECT: usize = 16;
+const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAX_CAPTURE_TEXT_CHARS: usize = 16_000;
+const MAX_CAPTURE_SELECTION_CHARS: usize = 4_000;
+const MAX_CAPTURE_FORMS: usize = 40;
+const MAX_CAPTURE_LINKS: usize = 80;
+const MAX_CAPTURE_RAW_BYTES: usize = 2 * 1024 * 1024;
+const BROWSER_CONTEXT_SCHEME: &str = "nebula-browser-context";
+const BROWSER_CONTEXT_MENU_PREFIX: &str = "browser-context-";
+
+const BROWSER_CONTEXT_SCRIPT: &str = r#"(() => {
+  const text = String(document.body?.innerText ?? "");
+  const selectedText = String(window.getSelection?.()?.toString() ?? "");
+  const forms = Array.from(document.forms ?? []).slice(0, 40).map((form) => ({
+    method: String(form.method || "GET").toUpperCase().slice(0, 16),
+    action: String(form.action || location.href).slice(0, 2048),
+    fields: Array.from(form.elements ?? []).slice(0, 40).map((element) => ({
+      name: String(element.getAttribute?.("name") ?? "").slice(0, 200),
+      id: String(element.id ?? "").slice(0, 200),
+      type: String(element.getAttribute?.("type") ?? element.tagName ?? "").toLowerCase().slice(0, 40),
+      autocomplete: String(element.getAttribute?.("autocomplete") ?? "").slice(0, 100),
+      required: Boolean(element.required),
+    })),
+  }));
+  const links = Array.from(document.links ?? []).slice(0, 80).map((link) => ({
+    text: String(link.innerText ?? link.textContent ?? "").trim().slice(0, 300),
+    href: String(link.href ?? "").slice(0, 2048),
+  }));
+  return {
+    url: String(location.href).slice(0, 4096),
+    title: String(document.title ?? "").slice(0, 500),
+    selectedText: selectedText.slice(0, 6000),
+    text: text.slice(0, 24000),
+    truncated: text.length > 24000 || selectedText.length > 6000,
+    forms,
+    links,
+  };
+})()"#;
+
+#[derive(Default)]
+pub(crate) struct BrowserState {
+    tabs: Mutex<HashMap<String, BrowserTab>>,
+    session_proxies: Mutex<HashMap<String, crate::browser_proxy::BrowserProxyHandle>>,
+    session_projects: Mutex<HashMap<String, String>>,
+    downloads: Mutex<HashMap<PathBuf, PendingDownload>>,
+    context_targets: Mutex<HashMap<String, PendingBrowserContext>>,
+}
+
+struct BrowserTab {
+    project_id: String,
+    session_id: String,
+    identity_partition: String,
+    label: String,
+    proxy: Option<crate::browser_proxy::BrowserProxyHandle>,
+}
+
+struct PendingDownload {
+    id: String,
+    project_id: String,
+    tab_id: String,
+    filename: String,
+    path: PathBuf,
+    finished: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct PendingBrowserContext {
+    project_id: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPageEvent {
+    tab_id: String,
+    url: String,
+    state: &'static str,
+    title: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserScopeRequestEvent {
+    tab_id: String,
+    project_id: String,
+    url: String,
+    state: &'static str,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserSelectionRequestEvent {
+    tab_id: String,
+    project_id: String,
+    url: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserDownloadEvent {
+    tab_id: String,
+    download_id: Option<String>,
+    filename: Option<String>,
+    size: Option<u64>,
+    state: &'static str,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawBrowserPageContext {
+    url: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    selected_text: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    forms: Vec<RawBrowserPageForm>,
+    #[serde(default)]
+    links: Vec<RawBrowserPageLink>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawBrowserPageForm {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    fields: Vec<RawBrowserPageFormField>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawBrowserPageFormField {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    autocomplete: String,
+    #[serde(default)]
+    required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBrowserPageLink {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    href: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPageContext {
+    url: String,
+    title: String,
+    selected_text: String,
+    text: String,
+    truncated: bool,
+    forms: Vec<BrowserPageForm>,
+    links: Vec<BrowserPageLink>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPageForm {
+    method: String,
+    action: String,
+    fields: Vec<BrowserPageFormField>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPageFormField {
+    name: String,
+    id: String,
+    r#type: String,
+    autocomplete: String,
+    required: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq, Clone)]
+struct BrowserPageLink {
+    text: String,
+    href: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserContextEvent {
+    request_id: String,
+    tab_id: String,
+    state: &'static str,
+    context: Option<BrowserPageContext>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserActionRequest {
+    action_id: String,
+    kind: String,
+    locator: serde_json::Map<String, serde_json::Value>,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    page_url: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BrowserActionEvent {
+    action_id: String,
+    tab_id: String,
+    state: &'static str,
+    result: serde_json::Value,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserImportResult {
+    state: &'static str,
+    path: String,
+    size: u64,
+    sha256: Option<String>,
+    overwritten: bool,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserCapabilities {
+    engine: &'static str,
+    project_storage: &'static str,
+    identity_partitions: bool,
+    devtools: bool,
+    interception_proxy: bool,
+    http2_capture: bool,
+    websocket_capture: bool,
+    autonomous_commands: bool,
+}
+
+#[tauri::command]
+pub(crate) fn browser_capabilities() -> BrowserCapabilities {
+    #[cfg(target_os = "macos")]
+    let engine = "WKWebView";
+    #[cfg(target_os = "linux")]
+    let engine = "WebKitGTK";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let engine = "system webview";
+    BrowserCapabilities {
+        engine,
+        project_storage: if macos_supports_project_store() {
+            "persistent"
+        } else {
+            "ephemeral"
+        },
+        identity_partitions: true,
+        devtools: true,
+        interception_proxy: true,
+        http2_capture: true,
+        websocket_capture: true,
+        autonomous_commands: true,
+    }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn validated_url(value: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|_| "Enter a valid HTTP or HTTPS address.".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Nebula Browser permits only HTTP and HTTPS addresses.".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Addresses containing embedded credentials are not accepted.".to_string());
+    }
+    Ok(url)
+}
+
+const BROWSER_CREDENTIAL_SERVICE: &str = "io.berylliumsec.nebula.provider-credentials";
+
+pub(crate) fn resolve_browser_credential(reference: &str) -> Result<String, String> {
+    if let Some(name) = reference.strip_prefix("env:") {
+        if name.is_empty()
+            || !name.chars().enumerate().all(|(index, value)| {
+                value == '_'
+                    || value.is_ascii_alphanumeric() && (index > 0 || value.is_ascii_alphabetic())
+            })
+        {
+            return Err("The credential reference is invalid.".to_string());
+        }
+        return std::env::var(name)
+            .map_err(|_| "The referenced environment credential is unavailable.".to_string());
+    }
+    let Some(identifier) = reference.strip_prefix("vault:") else {
+        return Err(
+            "This desktop worker can resolve only vault: or env: credential references."
+                .to_string(),
+        );
+    };
+    if identifier.len() != 32 || !identifier.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err("The credential reference is invalid.".to_string());
+    }
+    let entry = keyring::Entry::new(BROWSER_CREDENTIAL_SERVICE, identifier)
+        .map_err(|_| "The operating-system credential vault is unavailable.".to_string())?;
+    entry
+        .get_password()
+        .map_err(|_| "The referenced credential is unavailable.".to_string())
+}
+
+fn native_upstream_proxy_config(
+    enabled: bool,
+    url: Option<String>,
+    credential_ref: Option<String>,
+) -> Result<Option<crate::browser_proxy::NativeUpstreamProxyConfig>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    let url = url.ok_or_else(|| "an enabled upstream proxy requires a URL".to_string())?;
+    let credential = credential_ref
+        .as_deref()
+        .map(resolve_browser_credential)
+        .transpose()?;
+    Ok(Some(crate::browser_proxy::NativeUpstreamProxyConfig {
+        url,
+        credential,
+    }))
+}
+
+fn browser_context_menu_script(token: &str) -> Result<String, String> {
+    let endpoint = serde_json::to_string(&format!("{BROWSER_CONTEXT_SCHEME}://menu/{token}?url="))
+        .map_err(|error| format!("cannot prepare browser context menu: {error}"))?;
+    let selection_endpoint = serde_json::to_string(&format!(
+        "{BROWSER_CONTEXT_SCHEME}://selection/{token}?url="
+    ))
+    .map_err(|error| format!("cannot prepare browser selection actions: {error}"))?;
+    Ok(format!(
+        r##"(() => {{
+          const endpoint = {endpoint};
+          const selectionEndpoint = {selection_endpoint};
+          const host = document.createElement("div");
+          host.setAttribute("data-nebula-selection-actions", "");
+          const shadow = host.attachShadow({{ mode: "closed" }});
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = "Ask Nebula";
+          button.setAttribute("aria-label", "Ask Nebula about selected text");
+          Object.assign(button.style, {{
+            position: "fixed", zIndex: "2147483647", display: "none",
+            minHeight: "34px", padding: "6px 10px", border: "1px solid rgba(255,255,255,.28)",
+            borderRadius: "8px", color: "#fff", background: "#20242b",
+            boxShadow: "0 8px 24px rgba(0,0,0,.32)", font: "600 13px system-ui, sans-serif",
+            cursor: "pointer"
+          }});
+          shadow.append(button);
+          const mount = () => {{ if (!host.isConnected) document.documentElement?.append(host); }};
+          mount();
+          let selectionTimer;
+          const hide = () => {{ button.style.display = "none"; }};
+          const showForSelection = () => {{
+            const selection = window.getSelection?.();
+            if (!selection || selection.isCollapsed || !selection.toString().trim() || selection.rangeCount !== 1) {{ hide(); return; }}
+            const rect = selection.getRangeAt(0).getBoundingClientRect();
+            if (!rect || (!rect.width && !rect.height)) {{ hide(); return; }}
+            mount();
+            const left = Math.max(8, Math.min(innerWidth - 112, rect.left + rect.width / 2 - 52));
+            const top = rect.bottom + 44 < innerHeight ? rect.bottom + 8 : Math.max(8, rect.top - 42);
+            button.style.left = `${{left}}px`;
+            button.style.top = `${{top}}px`;
+            button.style.display = "block";
+          }};
+          button.addEventListener("pointerdown", (event) => event.preventDefault());
+          button.addEventListener("click", (event) => {{
+            if (!event.isTrusted) return;
+            const selection = window.getSelection?.();
+            if (!selection || selection.isCollapsed || !selection.toString().trim()) {{ hide(); return; }}
+            const target = String(location.href ?? "").slice(0, 4096);
+            hide();
+            location.assign(selectionEndpoint + encodeURIComponent(target));
+          }});
+          document.addEventListener("pointerup", (event) => {{
+            if (event.composedPath?.().includes(host)) return;
+            setTimeout(showForSelection, 0);
+          }}, true);
+          document.addEventListener("keyup", (event) => {{
+            if (event.key === "Escape") hide(); else setTimeout(showForSelection, 0);
+          }}, true);
+          document.addEventListener("selectionchange", () => {{
+            clearTimeout(selectionTimer);
+            selectionTimer = setTimeout(showForSelection, 120);
+          }}, true);
+          document.addEventListener("pointerdown", (event) => {{
+            if (!event.composedPath?.().includes(host)) hide();
+          }}, true);
+          addEventListener("scroll", hide, true);
+          addEventListener("resize", hide);
+          document.addEventListener("contextmenu", (event) => {{
+            if (!event.isTrusted) return;
+            event.preventDefault();
+            const target = String(location.href ?? "").slice(0, 4096);
+            location.assign(endpoint + encodeURIComponent(target));
+          }}, true);
+        }})()"##
+    ))
+}
+
+fn selection_request_target(next: &Url, token: &str) -> Result<Option<String>, String> {
+    if next.scheme() != BROWSER_CONTEXT_SCHEME || next.host_str() != Some("selection") {
+        return Ok(None);
+    }
+    if next.path() != format!("/{token}") {
+        return Err("The browser selection request was not authentic.".to_string());
+    }
+    let value = next
+        .query_pairs()
+        .find_map(|(key, value)| (key == "url").then(|| value.into_owned()))
+        .ok_or_else(|| "The browser selection target is missing.".to_string())?;
+    if value.len() > 4096 {
+        return Err("The browser selection target is too long.".to_string());
+    }
+    Ok(Some(validated_url(&value)?.to_string()))
+}
+
+fn context_menu_target(next: &Url, token: &str) -> Result<Option<String>, String> {
+    if next.scheme() != BROWSER_CONTEXT_SCHEME {
+        return Ok(None);
+    }
+    if next.host_str() != Some("menu") || next.path() != format!("/{token}") {
+        return Err("The browser context-menu request was not authentic.".to_string());
+    }
+    let value = next
+        .query_pairs()
+        .find_map(|(key, value)| (key == "url").then(|| value.into_owned()))
+        .ok_or_else(|| "The browser context-menu target is missing.".to_string())?;
+    if value.len() > 4096 {
+        return Err("The browser context-menu target is too long.".to_string());
+    }
+    Ok(Some(validated_url(&value)?.to_string()))
+}
+
+fn context_menu_id(action: &str, tab_id: &str) -> String {
+    format!("{BROWSER_CONTEXT_MENU_PREFIX}{action}-{tab_id}")
+}
+
+fn show_browser_context_menu(
+    app: &AppHandle,
+    tab_id: &str,
+    project_id: &str,
+    url: String,
+) -> Result<(), String> {
+    let state = app.state::<BrowserState>();
+    let label = find_tab(&state, tab_id, project_id)?;
+    state
+        .context_targets
+        .lock()
+        .map_err(|_| "Browser context-menu state is unavailable.".to_string())?
+        .insert(
+            tab_id.to_string(),
+            PendingBrowserContext {
+                project_id: project_id.to_string(),
+                url,
+            },
+        );
+    let add_scope = MenuItemBuilder::with_id(context_menu_id("add-scope", tab_id), "Add to scope")
+        .build(app)
+        .map_err(|error| format!("cannot prepare Add to scope: {error}"))?;
+    let back = MenuItemBuilder::with_id(context_menu_id("back", tab_id), "Back")
+        .build(app)
+        .map_err(|error| format!("cannot prepare browser Back: {error}"))?;
+    let forward = MenuItemBuilder::with_id(context_menu_id("forward", tab_id), "Forward")
+        .build(app)
+        .map_err(|error| format!("cannot prepare browser Forward: {error}"))?;
+    let reload = MenuItemBuilder::with_id(context_menu_id("reload", tab_id), "Reload")
+        .build(app)
+        .map_err(|error| format!("cannot prepare browser Reload: {error}"))?;
+    let inspect = MenuItemBuilder::with_id(context_menu_id("inspect", tab_id), "Open DevTools")
+        .build(app)
+        .map_err(|error| format!("cannot prepare browser DevTools: {error}"))?;
+    let menu = MenuBuilder::new(app)
+        .item(&add_scope)
+        .separator()
+        .item(&back)
+        .item(&forward)
+        .item(&reload)
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .select_all()
+        .separator()
+        .item(&inspect)
+        .build()
+        .map_err(|error| format!("cannot prepare browser context menu: {error}"))?;
+    app.get_webview(&label)
+        .ok_or_else(|| "This browser tab is unavailable.".to_string())?
+        .window()
+        .popup_menu(&menu)
+        .map_err(|error| format!("cannot open browser context menu: {error}"))
+}
+
+fn bounded_chars(value: String, limit: usize) -> (String, bool) {
+    let mut characters = value.chars();
+    let bounded: String = characters.by_ref().take(limit).collect();
+    (bounded, characters.next().is_some())
+}
+
+fn decode_browser_context(raw: &str) -> Result<BrowserPageContext, String> {
+    if raw.len() > MAX_CAPTURE_RAW_BYTES {
+        return Err("The live page context snapshot exceeded the safe size limit.".to_string());
+    }
+    let raw: RawBrowserPageContext = serde_json::from_str(raw)
+        .map_err(|_| "The live page returned an invalid context snapshot.".to_string())?;
+    let url = validated_url(&raw.url)?.to_string();
+    let (title, title_truncated) = bounded_chars(raw.title, 500);
+    let (selected_text, selection_truncated) =
+        bounded_chars(raw.selected_text, MAX_CAPTURE_SELECTION_CHARS);
+    let (text, text_truncated) = bounded_chars(raw.text, MAX_CAPTURE_TEXT_CHARS);
+    let forms = raw
+        .forms
+        .into_iter()
+        .take(MAX_CAPTURE_FORMS)
+        .map(|form| BrowserPageForm {
+            method: bounded_chars(form.method.to_uppercase(), 16).0,
+            action: bounded_chars(form.action, 2_048).0,
+            fields: form
+                .fields
+                .into_iter()
+                .take(40)
+                .map(|field| BrowserPageFormField {
+                    name: bounded_chars(field.name, 200).0,
+                    id: bounded_chars(field.id, 200).0,
+                    r#type: bounded_chars(field.r#type.to_lowercase(), 40).0,
+                    autocomplete: bounded_chars(field.autocomplete, 100).0,
+                    required: field.required,
+                })
+                .collect(),
+        })
+        .collect();
+    let links = raw
+        .links
+        .into_iter()
+        .take(MAX_CAPTURE_LINKS)
+        .map(|link| BrowserPageLink {
+            text: bounded_chars(link.text, 300).0,
+            href: bounded_chars(link.href, 2_048).0,
+        })
+        .collect();
+    Ok(BrowserPageContext {
+        url,
+        title,
+        selected_text,
+        text,
+        truncated: raw.truncated || title_truncated || selection_truncated || text_truncated,
+        forms,
+        links,
+    })
+}
+
+fn checked_bounds(bounds: BrowserBounds) -> Result<BrowserBounds, String> {
+    let values = [bounds.x, bounds.y, bounds.width, bounds.height];
+    if values.iter().any(|value| !value.is_finite())
+        || bounds.x < 0.0
+        || bounds.y < 0.0
+        || bounds.width < 1.0
+        || bounds.height < 1.0
+        || bounds.width > 16_384.0
+        || bounds.height > 16_384.0
+    {
+        return Err("The browser surface has invalid bounds.".to_string());
+    }
+    Ok(bounds)
+}
+
+fn child_position(bounds: &BrowserBounds) -> LogicalPosition<f64> {
+    LogicalPosition::new(bounds.x, bounds.y)
+}
+
+fn child_size(bounds: &BrowserBounds) -> LogicalSize<f64> {
+    LogicalSize::new(bounds.width, bounds.height)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn inset_browser_bounds(mut bounds: BrowserBounds, top_inset: f64) -> BrowserBounds {
+    let inset = top_inset
+        .clamp(0.0, 96.0)
+        .min((bounds.height - 1.0).max(0.0));
+    bounds.y += inset;
+    bounds.height -= inset;
+    bounds
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn appkit_child_y(
+    parent_origin_y: f64,
+    parent_height: f64,
+    y: f64,
+    height: f64,
+    parent_is_flipped: bool,
+) -> f64 {
+    if parent_is_flipped {
+        parent_origin_y + y
+    } else {
+        parent_origin_y + parent_height - y - height
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn appkit_browser_frame(parent: &NSView, bounds: &BrowserBounds) -> NSRect {
+    let parent_bounds = parent.bounds();
+    // Full-size-content windows place the WKWebView beneath the title bar while WebKit's DOM
+    // viewport begins at the unobscured safe-area origin. Window inner/outer positions do not
+    // describe this offset and are commonly identical in Tauri.
+    let bounds = inset_browser_bounds(*bounds, parent.safeAreaInsets().top);
+    NSRect::new(
+        NSPoint::new(
+            parent_bounds.origin.x + bounds.x,
+            appkit_child_y(
+                parent_bounds.origin.y,
+                parent_bounds.size.height,
+                bounds.y,
+                bounds.height,
+                parent.isFlipped(),
+            ),
+        ),
+        NSSize::new(bounds.width, bounds.height),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_native_browser_result(
+    receiver: std::sync::mpsc::Receiver<Result<(), String>>,
+) -> Result<(), String> {
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| "The macOS browser surface did not respond.".to_string())?
+}
+
+// Child WKWebViews created by Tauri are siblings of the main application WKWebView. AppKit
+// composites those native siblings above the DOM, so CSS overflow cannot stop a page from
+// covering Nebula's address bar. Reparent the page beneath a layer-backed NSView attached to the
+// main WKWebView. Its coordinates now match getBoundingClientRect(), and masksToBounds provides a
+// real native clip at every edge of the Browser surface.
+#[cfg(target_os = "macos")]
+fn install_macos_browser_container<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    browser: &tauri::Webview<R>,
+    bounds: BrowserBounds,
+) -> Result<(), String> {
+    let main = app
+        .get_webview("main")
+        .ok_or_else(|| "The Nebula webview is unavailable.".to_string())?;
+    let browser = browser.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
+    main.with_webview(move |main_native| {
+        let main_address = main_native.inner() as usize;
+        let callback_sender = sender.clone();
+        if let Err(error) = browser.with_webview(move |browser_native| {
+            let result = (|| {
+                let marker = MainThreadMarker::new().ok_or_else(|| {
+                    "The browser container must be created on the main thread.".to_string()
+                })?;
+                // SAFETY: Tauri supplies live WKWebView pointers to this main-thread callback.
+                // WKWebView inherits from NSView, and both views remain retained by Tauri.
+                let (parent, child): (&NSView, &NSView) = unsafe {
+                    (
+                        &*((main_address as *mut std::ffi::c_void).cast::<NSView>()),
+                        &*browser_native.inner().cast::<NSView>(),
+                    )
+                };
+                if std::ptr::eq(parent, child) {
+                    return Err(
+                        "The embedded browser cannot use Nebula's root webview.".to_string()
+                    );
+                }
+
+                let container = NSView::initWithFrame(
+                    NSView::alloc(marker),
+                    appkit_browser_frame(parent, &bounds),
+                );
+                container.setWantsLayer(true);
+                let layer = container
+                    .layer()
+                    .ok_or_else(|| "The browser clipping layer is unavailable.".to_string())?;
+                layer.setMasksToBounds(true);
+                container.setAutoresizesSubviews(true);
+                container.setHidden(true);
+
+                parent.addSubview(&container);
+                // The existing superview remains alive, and AppKit retains the child when it is
+                // immediately added to the new container.
+                child.removeFromSuperview();
+                container.addSubview(child);
+                child.setFrame(container.bounds());
+                child.setHidden(true);
+                Ok(())
+            })();
+            if callback_sender.send(result).is_err() {
+                // The caller already timed out and dropped its one-shot receiver.
+            }
+        }) {
+            if sender
+                .send(Err(format!(
+                    "cannot access the embedded macOS browser view: {error}"
+                )))
+                .is_err()
+            {
+                // The caller already timed out and dropped its one-shot receiver.
+            }
+        }
+    })
+    .map_err(|error| format!("cannot access the Nebula macOS webview: {error}"))?;
+
+    wait_for_native_browser_result(receiver)
+}
+
+#[cfg(target_os = "macos")]
+fn with_macos_browser_container<R, F>(
+    browser: &tauri::Webview<R>,
+    operation: F,
+) -> Result<(), String>
+where
+    R: tauri::Runtime,
+    F: FnOnce(&NSView, &NSView) -> Result<(), String> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    browser
+        .with_webview(move |native| {
+            let result = (|| {
+                // SAFETY: Tauri supplies a live WKWebView pointer on the AppKit main thread.
+                let child: &NSView = unsafe { &*native.inner().cast::<NSView>() };
+                // SAFETY: The container is retained by its parent and remains attached for the
+                // lifetime of the browser tab.
+                let container: Retained<NSView> = unsafe { child.superview() }
+                    .ok_or_else(|| "The browser clipping container is unavailable.".to_string())?;
+                operation(&container, child)
+            })();
+            if sender.send(result).is_err() {
+                // The caller already timed out and dropped its one-shot receiver.
+            }
+        })
+        .map_err(|error| format!("cannot access the embedded macOS browser view: {error}"))?;
+    wait_for_native_browser_result(receiver)
+}
+
+#[cfg(target_os = "macos")]
+fn resize_macos_browser_container<R: tauri::Runtime>(
+    browser: &tauri::Webview<R>,
+    bounds: BrowserBounds,
+) -> Result<(), String> {
+    with_macos_browser_container(browser, move |container, child| {
+        // SAFETY: The clipping container remains attached to Nebula's main WKWebView.
+        let parent = unsafe { container.superview() }
+            .ok_or_else(|| "The Nebula browser surface is unavailable.".to_string())?;
+        container.setFrame(appkit_browser_frame(&parent, &bounds));
+        child.setFrame(container.bounds());
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_browser_container_visible<R: tauri::Runtime>(
+    browser: &tauri::Webview<R>,
+    visible: bool,
+) -> Result<(), String> {
+    with_macos_browser_container(browser, move |container, child| {
+        container.setHidden(!visible);
+        child.setHidden(!visible);
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_browser_container<R: tauri::Runtime>(
+    browser: &tauri::Webview<R>,
+) -> Result<(), String> {
+    with_macos_browser_container(browser, |container, child| {
+        // Both views are retained for this callback. Removing the child first prevents an orphaned
+        // native view from intercepting input while Tauri closes it.
+        child.removeFromSuperview();
+        container.removeFromSuperview();
+        Ok(())
+    })
+}
+
+fn project_key(project_id: &str) -> [u8; 16] {
+    let digest = Sha256::digest(format!("nebula-browser-profile-v1:{project_id}").as_bytes());
+    let mut key = [0_u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
+
+fn project_key_hex(project_id: &str) -> String {
+    project_key(project_id)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+const DEFAULT_IDENTITY_PARTITION: &str = "browser-00000000-0000-0000-0000-000000000000";
+
+fn identity_key(project_id: &str, identity_partition: &str) -> [u8; 16] {
+    if identity_partition == DEFAULT_IDENTITY_PARTITION {
+        return project_key(project_id);
+    }
+    let digest = Sha256::digest(
+        format!("nebula-browser-profile-v2:{project_id}:{identity_partition}").as_bytes(),
+    );
+    let mut key = [0_u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
+
+fn identity_key_hex(project_id: &str, identity_partition: &str) -> String {
+    identity_key(project_id, identity_partition)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_supports_project_store() -> bool {
+    use objc2_foundation::NSProcessInfo;
+    NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion
+        >= 14
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_identity_proxy(
+    app: &AppHandle,
+    project_id: &str,
+    identity_partition: &str,
+) -> Result<(), String> {
+    if !macos_supports_project_store() {
+        return Ok(());
+    }
+    let identifier = identity_key(project_id, identity_partition);
+    let main = app
+        .get_webview("main")
+        .ok_or_else(|| "The Nebula webview is unavailable.".to_string())?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    main.with_webview(move |_| {
+        let result = (|| {
+            let marker = MainThreadMarker::new().ok_or_else(|| {
+                "The browser data store must be updated on the main thread.".to_string()
+            })?;
+            let uuid = NSUUID::from_bytes(identifier);
+            // SAFETY: Custom website data stores are available on macOS 14 and later.
+            let store = unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&uuid, marker) };
+            let empty = NSArray::<NSObject>::array();
+            // SAFETY: Wry uses this same WebKit key to configure the identity proxy.
+            unsafe {
+                store.setValue_forKey(Some(&empty), &NSString::from_str("proxyConfigurations"));
+            }
+            Ok(())
+        })();
+        if sender.send(result).is_err() {
+            // The caller already timed out and reported the native browser failure.
+            eprintln!("Nebula could not deliver the macOS browser data-store reset result.");
+        }
+    })
+    .map_err(|error| format!("cannot access the macOS browser data store: {error}"))?;
+    wait_for_native_browser_result(receiver)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_supports_project_store() -> bool {
+    true
+}
+
+fn random_id(prefix: &str) -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    random_fill(&mut bytes)
+        .map_err(|error| format!("cannot create a browser identifier: {error}"))?;
+    Ok(format!(
+        "{prefix}-{}",
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn safe_filename(value: &str) -> String {
+    let candidate = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download.bin");
+    let mut cleaned: String = candidate
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '/' | '\\' | ':' | '\0') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .take(180)
+        .collect();
+    cleaned = cleaned.trim_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() {
+        "download.bin".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn emit_page(app: &AppHandle, event: BrowserPageEvent) {
+    if app.emit_to("main", "nebula-browser-page", event).is_err() {
+        record_browser_failure(
+            app,
+            "desktop.browser.page_event_delivery_failed",
+            "A browser page update could not be delivered to the interface.",
+            "event-delivery",
+        );
+    }
+}
+
+pub(crate) fn handle_menu_event(app: &AppHandle, command: &str) -> bool {
+    let matched = ["add-scope", "back", "forward", "reload", "inspect"]
+        .into_iter()
+        .find_map(|action| {
+            command
+                .strip_prefix(&format!("{BROWSER_CONTEXT_MENU_PREFIX}{action}-"))
+                .map(|tab_id| (action, tab_id))
+        });
+    let Some((action, tab_id)) = matched else {
+        return false;
+    };
+    let state = app.state::<BrowserState>();
+    let pending = state
+        .context_targets
+        .lock()
+        .ok()
+        .and_then(|mut targets| targets.remove(tab_id));
+    let Some(pending) = pending else {
+        record_browser_failure(
+            app,
+            "desktop.browser.context_menu_stale",
+            "A stale browser context-menu action was ignored.",
+            "context-menu",
+        );
+        return true;
+    };
+    let label = match find_tab(&state, tab_id, &pending.project_id) {
+        Ok(label) => label,
+        Err(_) => return true,
+    };
+    let Some(webview) = app.get_webview(&label) else {
+        return true;
+    };
+    let result = match action {
+        "add-scope" => {
+            let current = webview
+                .url()
+                .map_err(|error| format!("The current page address could not be read: {error}"))
+                .and_then(|value| validated_url(value.as_str()));
+            let expected = validated_url(&pending.url);
+            let (state, detail) = match (current, expected) {
+                (Ok(current), Ok(expected)) if current == expected => ("ready", None),
+                (Ok(_), Ok(_)) => (
+                    "failed",
+                    Some("The page changed after the context menu opened. Right-click the current page and try again.".to_string()),
+                ),
+                (Err(error), _) | (_, Err(error)) => ("failed", Some(error)),
+            };
+            app.emit_to(
+                "main",
+                "nebula-browser-scope-request",
+                BrowserScopeRequestEvent {
+                    tab_id: tab_id.to_string(),
+                    project_id: pending.project_id,
+                    url: pending.url,
+                    state,
+                    detail,
+                },
+            )
+            .map_err(|error| format!("cannot deliver Add to scope: {error}"))
+        }
+        "back" => webview
+            .eval("history.back()")
+            .map_err(|error| error.to_string()),
+        "forward" => webview
+            .eval("history.forward()")
+            .map_err(|error| error.to_string()),
+        "reload" => webview.reload().map_err(|error| error.to_string()),
+        "inspect" => {
+            webview.open_devtools();
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+    if result.is_err() {
+        record_browser_failure(
+            app,
+            "desktop.browser.context_menu_action_failed",
+            "A browser context-menu action failed.",
+            "context-menu",
+        );
+    }
+    true
+}
+
+fn emit_download(app: &AppHandle, event: BrowserDownloadEvent) {
+    if app
+        .emit_to("main", "nebula-browser-download", event)
+        .is_err()
+    {
+        record_browser_failure(
+            app,
+            "desktop.browser.download_event_delivery_failed",
+            "A browser download update could not be delivered to the interface.",
+            "event-delivery",
+        );
+    }
+}
+
+fn emit_context(app: &AppHandle, event: BrowserContextEvent) {
+    if app
+        .emit_to("main", "nebula-browser-context", event)
+        .is_err()
+    {
+        record_browser_failure(
+            app,
+            "desktop.browser.context_event_delivery_failed",
+            "A live-page context update could not be delivered to the interface.",
+            "event-delivery",
+        );
+    }
+}
+
+fn record_browser_failure(app: &AppHandle, event_code: &str, message: &str, stage: &str) {
+    drop(app.state::<DiagnosticsState>().record_desktop(
+        DiagnosticLevel::Error,
+        event_code,
+        message,
+        Some("failure"),
+        Some(stage),
+        Some(true),
+        serde_json::Map::new(),
+    ));
+}
+
+fn find_tab(state: &BrowserState, tab_id: &str, project_id: &str) -> Result<String, String> {
+    let tabs = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?;
+    let tab = tabs
+        .get(tab_id)
+        .ok_or_else(|| "This browser tab is no longer open.".to_string())?;
+    if tab.project_id != project_id {
+        return Err("The browser tab belongs to another Project.".to_string());
+    }
+    Ok(tab.label.clone())
+}
+
+fn close_tab_internal(app: &AppHandle, state: &BrowserState, tab_id: &str) -> Result<(), String> {
+    if let Ok(mut targets) = state.context_targets.lock() {
+        targets.remove(tab_id);
+    }
+    let tab = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .remove(tab_id);
+    if let Some(tab) = tab {
+        if let Some(webview) = app.get_webview(&tab.label) {
+            #[cfg(target_os = "macos")]
+            if remove_macos_browser_container(&webview).is_err() {
+                record_browser_failure(
+                    app,
+                    "desktop.browser.native_container_cleanup_failed",
+                    "A macOS browser clipping container could not be removed cleanly.",
+                    "tab-cleanup",
+                );
+            }
+            webview
+                .close()
+                .map_err(|error| format!("cannot close browser tab: {error}"))?;
+        }
+        drop(tab.proxy);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+// Tauri derives this flat named-argument IPC contract; grouping the fields
+// would break the invoke payload shared with the browser interface.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn browser_create_tab(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+    identity_partition: String,
+    session_id: String,
+    proxy_enabled: bool,
+    url: String,
+    bounds: BrowserBounds,
+    upstream_proxy_enabled: bool,
+    upstream_proxy_url: Option<String>,
+    upstream_proxy_credential_ref: Option<String>,
+    capture_bodies: bool,
+    interception_enabled: bool,
+    scope: Option<crate::browser_proxy::NativeProxyScopeInput>,
+) -> Result<(), String> {
+    if !valid_identifier(&tab_id)
+        || !valid_identifier(&project_id)
+        || !valid_identifier(&identity_partition)
+        || !valid_identifier(&session_id)
+        || !identity_partition.starts_with("browser-")
+    {
+        return Err("The browser tab, Project, or identity identifier is invalid.".to_string());
+    }
+    let url = validated_url(&url)?;
+    let bounds = checked_bounds(bounds)?;
+    {
+        let tabs = state
+            .tabs
+            .lock()
+            .map_err(|_| "Browser state is unavailable.".to_string())?;
+        if tabs.contains_key(&tab_id) {
+            return Ok(());
+        }
+        if tabs
+            .values()
+            .filter(|tab| tab.project_id == project_id)
+            .count()
+            >= MAX_TABS_PER_PROJECT
+        {
+            return Err(format!(
+                "A Project may have at most {MAX_TABS_PER_PROJECT} browser tabs."
+            ));
+        }
+    }
+
+    let label = format!("browser-{tab_id}");
+    let profile_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("cannot locate browser storage: {error}"))?
+        .join("browser-profiles");
+    let profile_dir = if identity_partition == DEFAULT_IDENTITY_PARTITION {
+        profile_root.join(project_key_hex(&project_id))
+    } else {
+        profile_root
+            .join("identities")
+            .join(project_key_hex(&project_id))
+            .join(identity_key_hex(&project_id, &identity_partition))
+    };
+    fs::create_dir_all(&profile_dir)
+        .map_err(|error| format!("cannot prepare browser storage: {error}"))?;
+
+    let context_token = random_id("context")?;
+    let context_script = browser_context_menu_script(&context_token)?;
+    let navigation_app = app.clone();
+    let navigation_tab = tab_id.clone();
+    let navigation_project = project_id.clone();
+    let navigation_token = context_token.clone();
+    let popup_app = app.clone();
+    let popup_tab = tab_id.clone();
+    let load_app = app.clone();
+    let load_tab = tab_id.clone();
+    let title_app = app.clone();
+    let title_tab = tab_id.clone();
+    let download_app = app.clone();
+    let download_tab = tab_id.clone();
+    let download_project = project_id.clone();
+
+    let proxy = if proxy_enabled {
+        let upstream = native_upstream_proxy_config(
+            upstream_proxy_enabled,
+            upstream_proxy_url,
+            upstream_proxy_credential_ref,
+        )?;
+        let mut proxies = state
+            .session_proxies
+            .lock()
+            .map_err(|_| "Browser state is unavailable.".to_string())?;
+        if let Some(existing) = proxies.get(&session_id) {
+            Some(existing.clone())
+        } else {
+            let created = crate::browser_proxy::start(
+                &app,
+                &project_key_hex(&project_id),
+                &project_id,
+                &session_id,
+                &tab_id,
+                upstream,
+                capture_bodies,
+                interception_enabled,
+            )?;
+            proxies.insert(session_id.clone(), created.clone());
+            Some(created)
+        }
+    } else {
+        None
+    };
+
+    // Scope must be compiled before the webview can issue its first request.
+    // Missing policy remains fail-closed, including for an existing proxy.
+    if let Some(proxy) = &proxy {
+        match scope {
+            Some(scope) => proxy.configure_scope(scope)?,
+            None => {
+                proxy.clear_scope()?;
+                return Err(
+                    "Project scope is unavailable. Reconnect to Core and retry opening the page."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    // Wry sets the proxy on the persistent WKWebsiteDataStore. Closing a proxied
+    // tab does not clear that setting, so a new direct tab can still use the
+    // stopped local proxy unless we reset this identity before its first load.
+    #[cfg(target_os = "macos")]
+    if !proxy_enabled {
+        let shared_proxy_active = state
+            .tabs
+            .lock()
+            .map_err(|_| "Browser state is unavailable.".to_string())?
+            .values()
+            .any(|tab| {
+                tab.project_id == project_id
+                    && tab.identity_partition == identity_partition
+                    && tab.proxy.is_some()
+            });
+        if shared_proxy_active {
+            return Err("Another open tab in this browser identity is using capture. Close it before browsing directly.".to_string());
+        }
+        clear_macos_identity_proxy(&app, &project_id, &identity_partition)?;
+    }
+
+    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(url))
+        .initialization_script(context_script)
+        .on_navigation(move |next| {
+            match selection_request_target(next, &navigation_token) {
+                Ok(Some(target)) => {
+                    if navigation_app
+                        .emit_to(
+                            "main",
+                            "nebula-browser-selection-request",
+                            BrowserSelectionRequestEvent {
+                                tab_id: navigation_tab.clone(),
+                                project_id: navigation_project.clone(),
+                                url: target,
+                            },
+                        )
+                        .is_err()
+                    {
+                        record_browser_failure(
+                            &navigation_app,
+                            "desktop.browser.selection_event_delivery_failed",
+                            "A browser selection request could not be delivered to the interface.",
+                            "event-delivery",
+                        );
+                    }
+                    return false;
+                }
+                Err(_) => {
+                    record_browser_failure(
+                        &navigation_app,
+                        "desktop.browser.selection_request_rejected",
+                        "An invalid browser selection request was rejected.",
+                        "selection-actions",
+                    );
+                    return false;
+                }
+                Ok(None) => {}
+            }
+            match context_menu_target(next, &navigation_token) {
+                Ok(Some(target)) => {
+                    if show_browser_context_menu(
+                        &navigation_app,
+                        &navigation_tab,
+                        &navigation_project,
+                        target,
+                    )
+                    .is_err()
+                    {
+                        record_browser_failure(
+                            &navigation_app,
+                            "desktop.browser.context_menu_open_failed",
+                            "The browser context menu could not be opened.",
+                            "context-menu",
+                        );
+                    }
+                    return false;
+                }
+                Err(_) => {
+                    record_browser_failure(
+                        &navigation_app,
+                        "desktop.browser.context_menu_request_rejected",
+                        "An invalid browser context-menu request was rejected.",
+                        "context-menu",
+                    );
+                    return false;
+                }
+                Ok(None) => {}
+            }
+            let allowed = validated_url(next.as_str()).is_ok();
+            if !allowed {
+                emit_page(&navigation_app, BrowserPageEvent { tab_id: navigation_tab.clone(), url: next.to_string(), state: "blocked", title: None, detail: Some("Nebula Browser blocked a non-HTTP navigation.".to_string()) });
+            }
+            allowed
+        })
+        .on_new_window(move |next, _features| {
+            if validated_url(next.as_str()).is_ok() {
+                emit_page(&popup_app, BrowserPageEvent { tab_id: popup_tab.clone(), url: next.to_string(), state: "new_tab", title: None, detail: None });
+            } else {
+                emit_page(&popup_app, BrowserPageEvent { tab_id: popup_tab.clone(), url: next.to_string(), state: "blocked", title: None, detail: Some("Nebula Browser blocked a pop-up with an unsupported address.".to_string()) });
+            }
+            NewWindowResponse::Deny
+        })
+        .on_page_load(move |_webview, payload| {
+            let state = match payload.event() { PageLoadEvent::Started => "loading", PageLoadEvent::Finished => "loaded" };
+            emit_page(&load_app, BrowserPageEvent { tab_id: load_tab.clone(), url: payload.url().to_string(), state, title: None, detail: None });
+        })
+        .on_document_title_changed(move |_webview, title| {
+            emit_page(&title_app, BrowserPageEvent { tab_id: title_tab.clone(), url: String::new(), state: "title", title: Some(title.chars().take(300).collect()), detail: None });
+        })
+        .on_download(move |_webview, event| {
+            match event {
+                DownloadEvent::Requested { url: _, destination } => {
+                    let original_name = destination.file_name().and_then(|name| name.to_str()).unwrap_or("download.bin");
+                    let filename = safe_filename(original_name);
+                    let Ok(download_id) = random_id("download") else { return false; };
+                    let Ok(cache_dir) = download_app.path().app_cache_dir() else { return false; };
+                    let staging = cache_dir.join("browser-downloads");
+                    if fs::create_dir_all(&staging).is_err() { return false; }
+                    let path = staging.join(format!("{download_id}.part"));
+                    *destination = path.clone();
+                    let finished = Arc::new(AtomicBool::new(false));
+                    let pending = PendingDownload { id: download_id.clone(), project_id: download_project.clone(), tab_id: download_tab.clone(), filename: filename.clone(), path: path.clone(), finished: finished.clone() };
+                    if let Ok(mut downloads) = download_app.state::<BrowserState>().downloads.lock() {
+                        downloads.insert(path.clone(), pending);
+                    } else { return false; }
+
+                    let monitor_app = download_app.clone();
+                    let monitor_tab = download_tab.clone();
+                    std::thread::spawn(move || {
+                        while !finished.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(250));
+                            if fs::metadata(&path).map(|meta| meta.len() > MAX_DOWNLOAD_BYTES).unwrap_or(false) {
+                                finished.store(true, Ordering::Relaxed);
+                                if let Err(error) = fs::remove_file(&path)
+                                    && error.kind() != std::io::ErrorKind::NotFound
+                                {
+                                    record_browser_failure(
+                                        &monitor_app,
+                                        "desktop.browser.staged_download_cleanup_failed",
+                                        "An oversized staged browser download could not be removed.",
+                                        "download-cleanup",
+                                    );
+                                }
+                                if let Ok(mut downloads) = monitor_app.state::<BrowserState>().downloads.lock() { downloads.remove(&path); }
+                                if close_tab_internal(&monitor_app, &monitor_app.state::<BrowserState>(), &monitor_tab).is_err() {
+                                    record_browser_failure(
+                                        &monitor_app,
+                                        "desktop.browser.oversized_download_tab_close_failed",
+                                        "The browser tab for an oversized download could not be closed.",
+                                        "download-cleanup",
+                                    );
+                                }
+                                emit_download(&monitor_app, BrowserDownloadEvent { tab_id: monitor_tab.clone(), download_id: None, filename: None, size: None, state: "rejected", detail: Some("The download exceeded the 1 GiB Project file limit. Reload the tab to continue browsing.".to_string()) });
+                                break;
+                            }
+                        }
+                    });
+                    true
+                }
+                DownloadEvent::Finished { url: _, path, success } => {
+                    let pending = download_app.state::<BrowserState>().downloads.lock().ok().and_then(|mut downloads| {
+                        let key = path.or_else(|| downloads.iter().find(|(_, item)| item.tab_id == download_tab).map(|(key, _)| key.clone()));
+                        key.and_then(|key| downloads.remove(&key))
+                    });
+                    if let Some(pending) = pending {
+                        pending.finished.store(true, Ordering::Relaxed);
+                        if success {
+                            let size = fs::metadata(&pending.path).map(|meta| meta.len()).unwrap_or(0);
+                            if size <= MAX_DOWNLOAD_BYTES {
+                                let download_id = pending.id.clone();
+                                let filename = pending.filename.clone();
+                                let tab_id = pending.tab_id.clone();
+                                if let Ok(mut downloads) = download_app.state::<BrowserState>().downloads.lock() { downloads.insert(pending.path.clone(), pending); }
+                                emit_download(&download_app, BrowserDownloadEvent { tab_id, download_id: Some(download_id), filename: Some(filename), size: Some(size), state: "ready", detail: None });
+                            } else {
+                                if let Err(error) = fs::remove_file(&pending.path)
+                                    && error.kind() != std::io::ErrorKind::NotFound
+                                {
+                                    record_browser_failure(
+                                        &download_app,
+                                        "desktop.browser.staged_download_cleanup_failed",
+                                        "An oversized staged browser download could not be removed.",
+                                        "download-cleanup",
+                                    );
+                                }
+                                emit_download(&download_app, BrowserDownloadEvent { tab_id: pending.tab_id, download_id: Some(pending.id), filename: Some(pending.filename), size: Some(size), state: "rejected", detail: Some("The download exceeded the 1 GiB Project file limit.".to_string()) });
+                            }
+                        } else {
+                            if let Err(error) = fs::remove_file(&pending.path)
+                                && error.kind() != std::io::ErrorKind::NotFound
+                            {
+                                record_browser_failure(
+                                    &download_app,
+                                    "desktop.browser.staged_download_cleanup_failed",
+                                    "A failed staged browser download could not be removed.",
+                                    "download-cleanup",
+                                );
+                            }
+                            emit_download(&download_app, BrowserDownloadEvent { tab_id: pending.tab_id, download_id: Some(pending.id), filename: Some(pending.filename), size: None, state: "failed", detail: Some("The website download did not complete.".to_string()) });
+                        }
+                    }
+                    true
+                }
+                _ => true,
+            }
+        })
+        .enable_clipboard_access()
+        .focused(false)
+        .zoom_hotkeys_enabled(true)
+        .devtools(true);
+
+    if let Some(proxy) = &proxy {
+        builder = builder.proxy_url(proxy.url.clone());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if macos_supports_project_store() {
+            builder = builder.data_store_identifier(identity_key(&project_id, &identity_partition));
+        } else {
+            builder = builder.incognito(true);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder = builder.data_directory(profile_dir);
+    }
+
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "The Nebula window is unavailable.".to_string())?;
+    let webview = window
+        .add_child(builder, child_position(&bounds), child_size(&bounds))
+        .map_err(|error| format!("cannot create browser tab: {error}"))?;
+    if let Err(error) = webview.hide() {
+        if webview.close().is_err() {
+            record_browser_failure(
+                &app,
+                "desktop.browser.failed_tab_cleanup_failed",
+                "A browser tab that failed to initialize could not be closed.",
+                "tab-cleanup",
+            );
+        }
+        return Err(format!("cannot initialize browser tab visibility: {error}"));
+    }
+    #[cfg(target_os = "macos")]
+    if let Err(error) = install_macos_browser_container(&app, &webview, bounds) {
+        if webview.close().is_err() {
+            record_browser_failure(
+                &app,
+                "desktop.browser.failed_tab_cleanup_failed",
+                "A browser tab with a failed clipping container could not be closed.",
+                "tab-cleanup",
+            );
+        }
+        return Err(format!(
+            "cannot initialize the macOS browser surface: {error}"
+        ));
+    }
+    state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .insert(
+            tab_id,
+            BrowserTab {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                identity_partition,
+                label,
+                proxy,
+            },
+        );
+    state
+        .session_projects
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .insert(session_id, project_id);
+    Ok(())
+}
+
+fn close_project_tabs(
+    app: &AppHandle,
+    state: &BrowserState,
+    project_id: &str,
+) -> Result<(), String> {
+    let tab_ids: Vec<String> = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .iter()
+        .filter(|(_, tab)| tab.project_id == project_id)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for tab_id in tab_ids {
+        close_tab_internal(app, state, &tab_id)?;
+    }
+    Ok(())
+}
+
+fn stop_project_proxies(state: &BrowserState, project_id: &str) -> Result<(), String> {
+    let session_ids: Vec<String> = state
+        .session_projects
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .iter()
+        .filter(|(_, value)| value.as_str() == project_id)
+        .map(|(session_id, _)| session_id.clone())
+        .collect();
+    for session_id in session_ids {
+        let proxy = state
+            .session_proxies
+            .lock()
+            .map_err(|_| "Browser state is unavailable.".to_string())?
+            .remove(&session_id);
+        if let Some(proxy) = proxy {
+            proxy.shutdown_now();
+        }
+        if let Ok(mut projects) = state.session_projects.lock() {
+            projects.remove(&session_id);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn browser_reveal_proxy_ca(
+    app: AppHandle,
+    project_id: String,
+) -> Result<String, String> {
+    if !valid_identifier(&project_id) {
+        return Err("The Project identifier is invalid.".to_string());
+    }
+    crate::browser_proxy::reveal_ca(&app, &project_key_hex(&project_id))
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub(crate) fn browser_proxy_ca_status(
+    app: AppHandle,
+    project_id: String,
+) -> Result<crate::browser_proxy::BrowserCaStatus, String> {
+    if !valid_identifier(&project_id) {
+        return Err("The Project identifier is invalid.".to_string());
+    }
+    crate::browser_proxy::ca_status(&app, &project_key_hex(&project_id))
+}
+
+#[tauri::command]
+pub(crate) fn browser_rotate_proxy_ca(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    project_id: String,
+) -> Result<crate::browser_proxy::BrowserCaStatus, String> {
+    if !valid_identifier(&project_id) {
+        return Err("The Project identifier is invalid.".to_string());
+    }
+    close_project_tabs(&app, &state, &project_id)?;
+    stop_project_proxies(&state, &project_id)?;
+    crate::browser_proxy::rotate_ca(&app, &project_key_hex(&project_id))
+}
+
+#[tauri::command]
+pub(crate) fn browser_revoke_proxy_ca(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    project_id: String,
+) -> Result<(), String> {
+    if !valid_identifier(&project_id) {
+        return Err("The Project identifier is invalid.".to_string());
+    }
+    close_project_tabs(&app, &state, &project_id)?;
+    stop_project_proxies(&state, &project_id)?;
+    crate::browser_proxy::revoke_ca(&app, &project_key_hex(&project_id))
+}
+
+#[tauri::command]
+pub(crate) fn browser_stop_session_proxy(
+    state: State<'_, BrowserState>,
+    project_id: String,
+    session_id: String,
+) -> Result<(), String> {
+    if !valid_identifier(&project_id) || !valid_identifier(&session_id) {
+        return Err("The Project or session identifier is invalid.".to_string());
+    }
+    let owns_project = state
+        .session_projects
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .get(&session_id)
+        .is_some_and(|value| value == &project_id);
+    if !owns_project {
+        return Err("The browser session is not owned by this Project on the desktop.".to_string());
+    }
+    let proxy = state
+        .session_proxies
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .remove(&session_id);
+    if let Some(proxy) = proxy {
+        proxy.shutdown_now();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+// The flat argument list is the stable Tauri command boundary consumed by the UI.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn browser_configure_session_proxy(
+    state: State<'_, BrowserState>,
+    project_id: String,
+    session_id: String,
+    upstream_proxy_enabled: bool,
+    upstream_proxy_url: Option<String>,
+    upstream_proxy_credential_ref: Option<String>,
+    capture_bodies: bool,
+    interception_enabled: bool,
+) -> Result<Vec<String>, String> {
+    if !valid_identifier(&project_id) || !valid_identifier(&session_id) {
+        return Err("The Project or session identifier is invalid.".to_string());
+    }
+    let owns_project = state
+        .session_projects
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .get(&session_id)
+        .is_some_and(|value| value == &project_id);
+    if !owns_project {
+        return Err("The browser session is not owned by this Project on the desktop.".to_string());
+    }
+    let proxy = state
+        .session_proxies
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| {
+            "The session capture proxy is not running yet; open a trusted browser tab first."
+                .to_string()
+        })?;
+    let has_attached_tab = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .values()
+        .any(|tab| {
+            tab.project_id == project_id && tab.session_id == session_id && tab.proxy.is_some()
+        });
+    if !has_attached_tab {
+        return Err(
+            "No open browser tab is attached to the session capture proxy; reopen the tab before enabling interception."
+                .to_string(),
+        );
+    }
+    let upstream = native_upstream_proxy_config(
+        upstream_proxy_enabled,
+        upstream_proxy_url,
+        upstream_proxy_credential_ref,
+    )?;
+    proxy.configure_upstream(upstream, capture_bodies, interception_enabled)
+}
+
+#[tauri::command]
+pub(crate) fn browser_decide_session_intercept(
+    state: State<'_, BrowserState>,
+    project_id: String,
+    session_id: String,
+    transaction_id: String,
+    decision: String,
+    method: Option<String>,
+    url: Option<String>,
+    headers: Vec<(String, String)>,
+) -> Result<(), String> {
+    if !valid_identifier(&project_id)
+        || !valid_identifier(&session_id)
+        || transaction_id.is_empty()
+        || transaction_id.len() > 300
+    {
+        return Err("The Project, session, or transaction identifier is invalid.".to_string());
+    }
+    let proxy = state
+        .session_proxies
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "The live session proxy is no longer running.".to_string())?;
+    let decision = match decision.as_str() {
+        "forward" => crate::browser_proxy::NativeInterceptDecision::Forward(
+            crate::browser_proxy::NativeInterceptEdits {
+                method,
+                url,
+                headers,
+            },
+        ),
+        "drop" => crate::browser_proxy::NativeInterceptDecision::Drop,
+        _ => return Err("The intercept decision must be forward or drop.".to_string()),
+    };
+    proxy.decide_intercept(&transaction_id, decision)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn browser_apply_proxy_rule(
+    state: State<'_, BrowserState>,
+    project_id: String,
+    session_id: String,
+    rule_id: String,
+    match_criteria: serde_json::Map<String, serde_json::Value>,
+    action: serde_json::Map<String, serde_json::Value>,
+    priority: i32,
+    expires_at: Option<String>,
+    enabled: bool,
+) -> Result<(), String> {
+    if !valid_identifier(&project_id)
+        || !valid_identifier(&session_id)
+        || !valid_identifier(&rule_id)
+    {
+        return Err("The Project, session, or proxy rule identifier is invalid.".to_string());
+    }
+    let owns_project = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .values()
+        .any(|tab| tab.session_id == session_id && tab.project_id == project_id);
+    if !owns_project {
+        return Err("The browser session is not open in this Project.".to_string());
+    }
+    let proxy = state
+        .session_proxies
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "The session capture proxy is not running. Trust the Project CA and enable capture first.".to_string())?;
+    proxy.configure_rule(
+        rule_id,
+        match_criteria,
+        action,
+        priority,
+        expires_at,
+        enabled,
+    )
+}
+
+#[tauri::command]
+pub(crate) fn browser_apply_proxy_scope(
+    state: State<'_, BrowserState>,
+    project_id: String,
+    session_id: String,
+    scope: crate::browser_proxy::NativeProxyScopeInput,
+) -> Result<(), String> {
+    if !valid_identifier(&project_id) || !valid_identifier(&session_id) {
+        return Err("The Project or session identifier is invalid.".to_string());
+    }
+    let owns_project = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .values()
+        .any(|tab| tab.session_id == session_id && tab.project_id == project_id);
+    if !owns_project {
+        return Err("The browser session is not open in this Project.".to_string());
+    }
+    let proxy = state
+        .session_proxies
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "The session capture proxy is not running. Enable capture before applying Project scope.".to_string())?;
+    proxy.configure_scope(scope)
+}
+
+#[tauri::command]
+pub(crate) fn browser_clear_proxy_scope(
+    state: State<'_, BrowserState>,
+    project_id: String,
+    session_id: String,
+) -> Result<(), String> {
+    if !valid_identifier(&project_id) || !valid_identifier(&session_id) {
+        return Err("The Project or session identifier is invalid.".to_string());
+    }
+    let owns_project = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .values()
+        .any(|tab| tab.session_id == session_id && tab.project_id == project_id);
+    if !owns_project {
+        return Err("The browser session is not open in this Project.".to_string());
+    }
+    let proxy = state
+        .session_proxies
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "The session capture proxy is not running.".to_string())?;
+    proxy.clear_scope()
+}
+
+#[tauri::command]
+pub(crate) fn browser_navigate(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+    url: String,
+) -> Result<(), String> {
+    let label = find_tab(&state, &tab_id, &project_id)?;
+    app.get_webview(&label)
+        .ok_or_else(|| "This browser tab is unavailable.".to_string())?
+        .navigate(validated_url(&url)?)
+        .map_err(|error| format!("cannot navigate browser tab: {error}"))
+}
+
+#[tauri::command]
+pub(crate) fn browser_capture_context(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+    request_id: String,
+) -> Result<(), String> {
+    if !valid_identifier(&request_id) {
+        return Err("The browser capture identifier is invalid.".to_string());
+    }
+    let label = find_tab(&state, &tab_id, &project_id)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "This browser tab is unavailable.".to_string())?;
+    let callback_app = app.clone();
+    let callback_tab = tab_id.clone();
+    webview
+        .eval_with_callback(BROWSER_CONTEXT_SCRIPT, move |raw| {
+            let event = match decode_browser_context(&raw) {
+                Ok(context) => BrowserContextEvent {
+                    request_id: request_id.clone(),
+                    tab_id: callback_tab.clone(),
+                    state: "ready",
+                    context: Some(context),
+                    detail: None,
+                },
+                Err(detail) => BrowserContextEvent {
+                    request_id: request_id.clone(),
+                    tab_id: callback_tab.clone(),
+                    state: "failed",
+                    context: None,
+                    detail: Some(detail),
+                },
+            };
+            emit_context(&callback_app, event);
+        })
+        .map_err(|error| format!("cannot capture live page context: {error}"))
+}
+
+#[tauri::command]
+pub(crate) fn browser_execute_action(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+    request: BrowserActionRequest,
+) -> Result<(), String> {
+    if !valid_identifier(&request.action_id) {
+        return Err("The browser action identifier is invalid.".to_string());
+    }
+    validated_url(&request.page_url)?;
+    let allowed_kinds = [
+        "navigate",
+        "click",
+        "fill",
+        "select",
+        "press",
+        "extract",
+        "replay",
+        "research_request",
+    ];
+    if !allowed_kinds.contains(&request.kind.as_str()) {
+        return Err(
+            "This browser action kind is not executable by the native browser.".to_string(),
+        );
+    }
+    if request.kind == "navigate" {
+        let target = request
+            .arguments
+            .get("url")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Navigate actions require a URL argument.".to_string())?;
+        validated_url(target)?;
+    }
+    if request.kind == "replay" || request.kind == "research_request" {
+        let target = request
+            .arguments
+            .get("url")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Replay actions require a URL argument.".to_string())?;
+        validated_url(target)?;
+    }
+    let locator = serde_json::to_string(&request.locator)
+        .map_err(|error| format!("cannot encode browser action locator: {error}"))?;
+    let arguments = serde_json::to_string(&request.arguments)
+        .map_err(|error| format!("cannot encode browser action arguments: {error}"))?;
+    let kind = serde_json::to_string(&request.kind)
+        .map_err(|error| format!("cannot encode browser action kind: {error}"))?;
+    let expected_url = serde_json::to_string(&request.page_url)
+        .map_err(|error| format!("cannot encode browser action page: {error}"))?;
+    let script = format!(
+        r#"(() => {{
+      const kind = {kind};
+      const locator = {locator};
+      const args = {arguments};
+      const expectedUrl = {expected_url};
+      const fail = (error) => ({{ ok: false, error: String(error).slice(0, 2000), pageUrl: String(location.href).slice(0, 4096) }});
+      try {{
+        if (String(location.href) !== expectedUrl) return fail("The page changed after approval.");
+        if (kind === "navigate") {{ location.assign(String(args.url)); return {{ ok: true, kind, pageUrl: expectedUrl, navigation: String(args.url).slice(0, 4096) }}; }}
+        if (kind === "replay" || kind === "research_request") {{
+          const target = new URL(String(args.url), location.href);
+          const requestHeaders = args.headers && typeof args.headers === "object" ? args.headers : {{}};
+          const forbidden = /authorization|cookie|csrf|xsrf|api[-_]?key|token/i;
+          if (Object.keys(requestHeaders).some((name) => forbidden.test(name))) return fail("Replay headers cannot contain reusable secrets.");
+          const xhr = new XMLHttpRequest();
+          xhr.open(String(args.method || "GET").toUpperCase(), target.href, false);
+          xhr.withCredentials = true;
+          for (const [name, value] of Object.entries(requestHeaders)) xhr.setRequestHeader(String(name), String(value));
+          const startedAt = Date.now();
+          xhr.send(args.body === undefined || args.body === "" ? null : String(args.body).slice(0, 65536));
+          const responseSecret = /authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|csrf|xsrf|api[-_]?key|token/i;
+          const responseHeaders = Object.fromEntries(String(xhr.getAllResponseHeaders()).trim().split(/[\r\n]+/).filter(Boolean).map((line) => {{ const index = line.indexOf(":"); if (index <= 0) return [line, ""]; const name = line.slice(0, index).trim(); const value = responseSecret.test(name) ? "<redacted>" : line.slice(index + 1).trim().slice(0, 8192); return [name, value]; }}));
+          const responseText = String(xhr.responseText || "");
+          if (kind === "replay") return {{ ok: true, kind, pageUrl: expectedUrl, requestUrl: target.href.slice(0, 4096), method: String(args.method || "GET").toUpperCase(), status: xhr.status, responseHeaders, responseBytes: responseText.length, durationMs: Date.now() - startedAt, untrusted_response_body: true }};
+          const contentType = String(xhr.getResponseHeader("content-type") || "").slice(0, 500);
+          let links = [];
+          if (/text\/html|application\/xhtml\+xml/i.test(contentType)) {{
+            const documentValue = new DOMParser().parseFromString(responseText.slice(0, 1048576), "text/html");
+            links = Array.from(documentValue.querySelectorAll("a[href],form[action]"), (element) => {{
+              const raw = element.getAttribute(element.tagName === "FORM" ? "action" : "href") || "";
+              try {{ return new URL(raw, target.href).href.slice(0, 16384); }} catch {{ return ""; }}
+            }}).filter(Boolean).slice(0, 500);
+          }}
+          return {{ ok: true, kind, pageUrl: expectedUrl, requestUrl: target.href.slice(0, 16384), method: String(args.method || "GET").toUpperCase(), status: xhr.status, responseHeaders, responseBytes: responseText.length, responseText: responseText.slice(0, 65536), responseTruncated: responseText.length > 65536, contentType, links, durationMs: Date.now() - startedAt, untrusted_response_body: true }};
+        }}
+        let candidates = [];
+        if (locator.css) candidates = Array.from(document.querySelectorAll(String(locator.css)));
+        else if (locator.label) {{
+          const wanted = String(locator.label).trim().toLocaleLowerCase();
+          candidates = Array.from(document.querySelectorAll("label")).filter((label) => String(label.innerText || label.textContent || "").trim().toLocaleLowerCase() === wanted).map((label) => label.control).filter(Boolean);
+        }} else {{
+          candidates = Array.from(document.querySelectorAll("button,a,input,select,textarea,[role],[tabindex]"));
+          if (locator.role) candidates = candidates.filter((element) => String(element.getAttribute("role") || element.tagName).toLocaleLowerCase() === String(locator.role).toLocaleLowerCase());
+          if (locator.name) {{ const wanted = String(locator.name).trim().toLocaleLowerCase(); candidates = candidates.filter((element) => String(element.getAttribute("aria-label") || element.innerText || element.textContent || element.getAttribute("name") || "").trim().toLocaleLowerCase() === wanted); }}
+          if (locator.text) {{ const wanted = String(locator.text).trim().toLocaleLowerCase(); candidates = candidates.filter((element) => String(element.innerText || element.textContent || "").trim().toLocaleLowerCase() === wanted); }}
+        }}
+        candidates = Array.from(new Set(candidates)).filter((element) => element instanceof HTMLElement && element.isConnected);
+        if (candidates.length !== 1) return fail(`Semantic locator matched ${{candidates.length}} elements; exactly one is required.`);
+        const element = candidates[0];
+        if (kind === "click") element.click();
+        else if (kind === "fill") {{
+          if (!("non_secret_text" in args)) return fail("Fill requires an explicit non_secret_text argument.");
+          if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) return fail("Fill target is not a text control.");
+          const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value")?.set;
+          if (!setter) return fail("Fill target has no value setter.");
+          setter.call(element, String(args.non_secret_text).slice(0, 4000));
+          element.dispatchEvent(new Event("input", {{ bubbles: true }}));
+          element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+        }} else if (kind === "select") {{
+          if (!(element instanceof HTMLSelectElement)) return fail("Select target is not a select control.");
+          element.value = String(args.value || ""); element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+        }} else if (kind === "press") {{
+          const key = String(args.key || "").slice(0, 80); if (!key) return fail("Press requires a key.");
+          element.dispatchEvent(new KeyboardEvent("keydown", {{ key, bubbles: true }})); element.dispatchEvent(new KeyboardEvent("keyup", {{ key, bubbles: true }}));
+        }}
+        const extracted = kind === "extract" ? String(element.innerText || element.textContent || "").slice(0, 16000) : undefined;
+        return {{ ok: true, kind, pageUrl: expectedUrl, matched: 1, extracted, tag: element.tagName.toLocaleLowerCase() }};
+      }} catch (error) {{ return fail(error instanceof Error ? error.message : error); }}
+    }})()"#
+    );
+    let label = find_tab(&state, &tab_id, &project_id)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "This browser tab is unavailable.".to_string())?;
+    let callback_app = app.clone();
+    let callback_tab = tab_id.clone();
+    let action_id = request.action_id.clone();
+    webview
+        .eval_with_callback(&script, move |raw| {
+            let decoded = serde_json::from_str::<serde_json::Value>(&raw);
+            let (state, result, detail) = match decoded {
+                Ok(result) if result.get("ok").and_then(|value| value.as_bool()) == Some(true) => {
+                    ("complete", result, None)
+                }
+                Ok(result) => {
+                    let detail = result
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("The browser action failed.")
+                        .to_string();
+                    ("failed", result, Some(detail))
+                }
+                Err(_) => (
+                    "failed",
+                    serde_json::json!({}),
+                    Some("The browser returned an invalid action receipt.".to_string()),
+                ),
+            };
+            if callback_app
+                .emit(
+                    "nebula-browser-action",
+                    BrowserActionEvent {
+                        action_id: action_id.clone(),
+                        tab_id: callback_tab.clone(),
+                        state,
+                        result,
+                        detail,
+                    },
+                )
+                .is_err()
+            {
+                record_browser_failure(
+                    &callback_app,
+                    "desktop.browser.action_event_delivery_failed",
+                    "A browser action receipt could not be delivered to the interface.",
+                    "event-delivery",
+                );
+            }
+        })
+        .map_err(|error| format!("cannot execute the approved browser action: {error}"))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn browser_execute_automation_command(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+    command_id: String,
+    kind: String,
+    locator: serde_json::Map<String, serde_json::Value>,
+    mut arguments: serde_json::Map<String, serde_json::Value>,
+    page_url: Option<String>,
+) -> Result<(), String> {
+    if !valid_identifier(&tab_id)
+        || !valid_identifier(&project_id)
+        || command_id.is_empty()
+        || command_id.len() > 200
+    {
+        return Err("The browser automation command identifier is invalid.".to_string());
+    }
+    let expected_page_url = page_url.unwrap_or_default();
+    if !expected_page_url.is_empty() {
+        validated_url(&expected_page_url)?;
+    }
+    if kind == "browser.observe" || kind == "browser.capture_evidence" {
+        return browser_capture_context(app, state, tab_id, project_id, command_id);
+    }
+    if kind == "browser.control" {
+        let action = arguments
+            .get("action")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "browser.control requires an action".to_string())?;
+        if action == "wait" {
+            return Err(
+                "browser.control wait must be implemented by the desktop worker".to_string(),
+            );
+        }
+        return browser_control(app, state, tab_id, project_id, action.to_string());
+    }
+    if kind == "proxy.observe" || kind == "proxy.configure" {
+        return Err("live proxy rule execution is not available in this native build".to_string());
+    }
+    let action_kind = match kind.as_str() {
+        "browser.navigate" => "navigate".to_string(),
+        "browser.interact" => arguments
+            .get("operation")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "browser.interact requires an operation".to_string())?,
+        "browser.extract" => "extract".to_string(),
+        "browser.replay" | "proxy.replay" => "replay".to_string(),
+        _ => return Err("unsupported browser automation command".to_string()),
+    };
+    if let Some(reference) = arguments
+        .get("credential_ref")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    {
+        if action_kind != "fill" {
+            return Err("credential_ref is supported only for bounded fill actions; it is never returned to the agent".to_string());
+        }
+        let secret = resolve_browser_credential(&reference)?;
+        arguments.insert(
+            "non_secret_text".to_string(),
+            serde_json::Value::String(secret),
+        );
+        arguments.remove("credential_ref");
+    }
+    browser_execute_action(
+        app,
+        state,
+        tab_id,
+        project_id,
+        BrowserActionRequest {
+            action_id: format!("automation:{command_id}"),
+            kind: action_kind,
+            locator,
+            arguments,
+            page_url: expected_page_url,
+        },
+    )
+}
+
+#[tauri::command]
+pub(crate) fn browser_control(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+    action: String,
+) -> Result<(), String> {
+    let label = find_tab(&state, &tab_id, &project_id)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "This browser tab is unavailable.".to_string())?;
+    match action.as_str() {
+        "back" => webview.eval("history.back()"),
+        "forward" => webview.eval("history.forward()"),
+        "stop" => webview.eval("window.stop()"),
+        "reload" => webview.reload(),
+        _ => return Err("The browser control is invalid.".to_string()),
+    }
+    .map_err(|error| format!("cannot control browser tab: {error}"))
+}
+
+#[tauri::command]
+pub(crate) fn browser_set_bounds(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+    bounds: BrowserBounds,
+) -> Result<(), String> {
+    let label = find_tab(&state, &tab_id, &project_id)?;
+    let bounds = checked_bounds(bounds)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "This browser tab is unavailable.".to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        resize_macos_browser_container(&webview, bounds)
+            .map_err(|error| format!("cannot resize browser tab: {error}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        webview
+            .set_position(child_position(&bounds))
+            .and_then(|_| webview.set_size(child_size(&bounds)))
+            .map_err(|error| format!("cannot resize browser tab: {error}"))
+    }
+}
+
+#[tauri::command]
+pub(crate) fn browser_set_visible(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+    visible: bool,
+) -> Result<(), String> {
+    let label = find_tab(&state, &tab_id, &project_id)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "This browser tab is unavailable.".to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        set_macos_browser_container_visible(&webview, visible)
+            .map_err(|error| format!("cannot change browser visibility: {error}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if visible {
+            webview.show()
+        } else {
+            webview.hide()
+        }
+        .map_err(|error| format!("cannot change browser visibility: {error}"))
+    }
+}
+
+#[tauri::command]
+pub(crate) fn browser_close_tab(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+) -> Result<(), String> {
+    find_tab(&state, &tab_id, &project_id)?;
+    close_tab_internal(&app, &state, &tab_id)
+}
+
+#[tauri::command]
+pub(crate) fn browser_open_devtools(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    tab_id: String,
+    project_id: String,
+) -> Result<(), String> {
+    let label = find_tab(&state, &tab_id, &project_id)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "This browser tab is unavailable.".to_string())?;
+    webview.open_devtools();
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn browser_clear_identity_data(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    project_id: String,
+    identity_partition: String,
+) -> Result<(), String> {
+    if !valid_identifier(&project_id)
+        || !valid_identifier(&identity_partition)
+        || !identity_partition.starts_with("browser-")
+    {
+        return Err("The Project or identity identifier is invalid.".to_string());
+    }
+    let tabs: Vec<String> = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .iter()
+        .filter(|(_, tab)| {
+            tab.project_id == project_id && tab.identity_partition == identity_partition
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in tabs {
+        let label = find_tab(&state, &id, &project_id)?;
+        if let Some(webview) = app.get_webview(&label) {
+            webview
+                .clear_all_browsing_data()
+                .map_err(|error| format!("cannot clear browser identity storage: {error}"))?;
+        }
+        close_tab_internal(&app, &state, &id)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let profile_root = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| format!("cannot locate browser storage: {error}"))?
+            .join("browser-profiles");
+        let profile = if identity_partition == DEFAULT_IDENTITY_PARTITION {
+            profile_root.join(project_key_hex(&project_id))
+        } else {
+            profile_root
+                .join("identities")
+                .join(project_key_hex(&project_id))
+                .join(identity_key_hex(&project_id, &identity_partition))
+        };
+        if profile.exists() {
+            fs::remove_dir_all(profile)
+                .map_err(|error| format!("cannot clear browser identity storage: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn browser_clear_project_data(
+    app: AppHandle,
+    state: State<'_, BrowserState>,
+    project_id: String,
+) -> Result<(), String> {
+    if !valid_identifier(&project_id) {
+        return Err("The Project identifier is invalid.".to_string());
+    }
+    // Clearing a Project profile invalidates every session-owned proxy as well;
+    // otherwise a later tab could inherit a runtime whose identity data was
+    // just removed.
+    stop_project_proxies(&state, &project_id)?;
+    let tabs: Vec<(String, String)> = state
+        .tabs
+        .lock()
+        .map_err(|_| "Browser state is unavailable.".to_string())?
+        .iter()
+        .filter(|(_, tab)| tab.project_id == project_id)
+        .map(|(id, tab)| (id.clone(), tab.label.clone()))
+        .collect();
+    for (_, label) in &tabs {
+        if let Some(webview) = app.get_webview(label) {
+            webview
+                .clear_all_browsing_data()
+                .map_err(|error| format!("cannot clear browser storage: {error}"))?;
+        }
+    }
+    for (id, _) in tabs {
+        close_tab_internal(&app, &state, &id)?;
+    }
+    let profile = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("cannot locate browser storage: {error}"))?
+        .join("browser-profiles")
+        .join(project_key_hex(&project_id));
+    if profile.exists() {
+        fs::remove_dir_all(profile)
+            .map_err(|error| format!("cannot clear browser storage: {error}"))?;
+    }
+    let identity_profiles = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("cannot locate browser storage: {error}"))?
+        .join("browser-profiles")
+        .join("identities")
+        .join(project_key_hex(&project_id));
+    if identity_profiles.exists() {
+        fs::remove_dir_all(identity_profiles)
+            .map_err(|error| format!("cannot clear browser identity storage: {error}"))?;
+    }
+    Ok(())
+}
+
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+fn upload_staged(
+    session: &crate::sidecar::BackendSession,
+    project_id: &str,
+    destination: &str,
+    overwrite: bool,
+    path: &Path,
+) -> Result<BrowserImportResult, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|_| "The staged download is no longer available.".to_string())?;
+    if metadata.len() > MAX_DOWNLOAD_BYTES {
+        return Err("The staged download exceeds the 1 GiB file limit.".to_string());
+    }
+    let endpoint = Url::parse(&session.endpoint)
+        .map_err(|_| "Nebula Core returned an invalid endpoint.".to_string())?;
+    if endpoint.host_str() != Some("127.0.0.1") {
+        return Err("Refusing a non-loopback Core endpoint.".to_string());
+    }
+    let port = endpoint
+        .port()
+        .ok_or_else(|| "Nebula Core did not provide a port.".to_string())?;
+    let request_path = format!(
+        "{}/engagements/{}/workspace/file?path={}&overwrite={}",
+        endpoint.path().trim_end_matches('/'),
+        percent_encode(project_id),
+        percent_encode(destination),
+        overwrite
+    );
+    let mut stream = TcpStream::connect_timeout(
+        &SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(),
+        Duration::from_secs(3),
+    )
+    .map_err(|error| format!("cannot connect to Nebula Core: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(300))))
+        .map_err(|error| format!("cannot configure the Core connection: {error}"))?;
+    write!(stream, "PUT {request_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", session.token, metadata.len())
+        .map_err(|error| format!("cannot start the workspace import: {error}"))?;
+    let mut file =
+        File::open(path).map_err(|error| format!("cannot read the staged download: {error}"))?;
+    std::io::copy(&mut file, &mut stream)
+        .map_err(|error| format!("cannot stream the download to Core: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("cannot finish the workspace import: {error}"))?;
+    let mut response = Vec::new();
+    stream
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response)
+        .map_err(|error| format!("cannot read the Core response: {error}"))?;
+    if response.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err("Nebula Core returned an oversized response.".to_string());
+    }
+    let response = String::from_utf8(response)
+        .map_err(|_| "Nebula Core returned an invalid response.".to_string())?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "Nebula Core returned a malformed response.".to_string())?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("");
+    if status == "409" {
+        return Ok(BrowserImportResult {
+            state: "conflict",
+            path: destination.to_string(),
+            size: metadata.len(),
+            sha256: None,
+            overwritten: false,
+            detail: Some("A Project file with this name already exists.".to_string()),
+        });
+    }
+    if status != "201" {
+        return Err(format!(
+            "Nebula Core rejected the download import (HTTP {status})."
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| "Nebula Core returned malformed import JSON.".to_string())?;
+    Ok(BrowserImportResult {
+        state: "imported",
+        path: value
+            .get("path")
+            .and_then(|item| item.as_str())
+            .unwrap_or(destination)
+            .to_string(),
+        size: value
+            .get("size")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(metadata.len()),
+        sha256: value
+            .get("sha256")
+            .and_then(|item| item.as_str())
+            .map(str::to_string),
+        overwritten: value
+            .get("overwritten")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(overwrite),
+        detail: None,
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn browser_import_download(
+    state: State<'_, BrowserState>,
+    backend: State<'_, BackendState>,
+    download_id: String,
+    project_id: String,
+    overwrite: bool,
+) -> Result<BrowserImportResult, String> {
+    let path = state
+        .downloads
+        .lock()
+        .map_err(|_| "Browser download state is unavailable.".to_string())?
+        .iter()
+        .find(|(_, item)| item.id == download_id && item.project_id == project_id)
+        .map(|(path, _)| path.clone())
+        .ok_or_else(|| "The staged download is no longer available.".to_string())?;
+    let filename = state
+        .downloads
+        .lock()
+        .map_err(|_| "Browser download state is unavailable.".to_string())?
+        .get(&path)
+        .map(|item| item.filename.clone())
+        .ok_or_else(|| "The staged download is no longer available.".to_string())?;
+    let session = backend.active_session()?;
+    let upload_path = path.clone();
+    let upload_project = project_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        upload_staged(
+            &session,
+            &upload_project,
+            &filename,
+            overwrite,
+            &upload_path,
+        )
+    })
+    .await
+    .map_err(|error| format!("The browser download import stopped unexpectedly: {error}"))??;
+    if result.state == "imported" {
+        state
+            .downloads
+            .lock()
+            .map_err(|_| "Browser download state is unavailable.".to_string())?
+            .remove(&path);
+        fs::remove_file(path)
+            .map_err(|error| format!("cannot remove imported staged download: {error}"))?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn browser_discard_download(
+    state: State<'_, BrowserState>,
+    download_id: String,
+    project_id: String,
+) -> Result<(), String> {
+    let path = state
+        .downloads
+        .lock()
+        .map_err(|_| "Browser download state is unavailable.".to_string())?
+        .iter()
+        .find(|(_, item)| item.id == download_id && item.project_id == project_id)
+        .map(|(path, _)| path.clone())
+        .ok_or_else(|| "The staged download is no longer available.".to_string())?;
+    state
+        .downloads
+        .lock()
+        .map_err(|_| "Browser download state is unavailable.".to_string())?
+        .remove(&path);
+    fs::remove_file(path)
+        .map_err(|error| format!("cannot remove discarded staged download: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn initialize(app: &AppHandle) -> Result<(), String> {
+    let staging = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("cannot locate browser cache: {error}"))?
+        .join("browser-downloads");
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .map_err(|error| format!("cannot clear stale browser downloads: {error}"))?;
+    }
+    fs::create_dir_all(staging)
+        .map_err(|error| format!("cannot prepare browser downloads: {error}"))
+}
+
+pub(crate) fn shutdown(app: &AppHandle) {
+    if let Ok(staging) = app.path().app_cache_dir() {
+        let downloads = staging.join("browser-downloads");
+        if let Err(error) = fs::remove_dir_all(downloads)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            record_browser_failure(
+                app,
+                "desktop.browser.shutdown_cleanup_failed",
+                "Staged browser downloads could not be removed during shutdown.",
+                "shutdown-cleanup",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn accepts_only_network_urls_without_embedded_credentials() {
+        assert!(validated_url("https://example.test/path").is_ok());
+        assert!(validated_url("http://127.0.0.1:8000/").is_ok());
+        assert!(validated_url("file:///etc/passwd").is_err());
+        assert!(validated_url("javascript:alert(1)").is_err());
+        assert!(validated_url("https://user:secret@example.test/").is_err());
+    }
+
+    #[test]
+    fn context_menu_navigation_requires_the_per_tab_token_and_a_safe_target() {
+        let token = "context-0123456789abcdef";
+        let mut request = Url::parse(&format!("{BROWSER_CONTEXT_SCHEME}://menu/{token}")).unwrap();
+        request
+            .query_pairs_mut()
+            .append_pair("url", "https://example.test/account?view=security");
+        assert_eq!(
+            context_menu_target(&request, token).unwrap().as_deref(),
+            Some("https://example.test/account?view=security")
+        );
+        assert!(context_menu_target(&request, "context-other").is_err());
+        let mut unsafe_request =
+            Url::parse(&format!("{BROWSER_CONTEXT_SCHEME}://menu/{token}")).unwrap();
+        unsafe_request
+            .query_pairs_mut()
+            .append_pair("url", "file:///etc/passwd");
+        assert!(context_menu_target(&unsafe_request, token).is_err());
+    }
+
+    #[test]
+    fn context_menu_script_uses_trusted_right_clicks_without_exposing_tauri_ipc() {
+        let script = browser_context_menu_script("context-safe").unwrap();
+        assert!(script.contains("contextmenu"));
+        assert!(script.contains("event.isTrusted"));
+        assert!(script.contains("nebula-browser-context://menu/context-safe?url="));
+        assert!(script.contains("nebula-browser-context://selection/context-safe?url="));
+        assert!(script.contains("Ask Nebula"));
+        assert!(!script.contains("__TAURI"));
+        assert!(!script.contains("ipc.postMessage"));
+    }
+
+    #[test]
+    fn selection_navigation_requires_the_per_tab_token_and_a_safe_target() {
+        let token = "context-0123456789abcdef";
+        let mut request =
+            Url::parse(&format!("{BROWSER_CONTEXT_SCHEME}://selection/{token}")).unwrap();
+        request
+            .query_pairs_mut()
+            .append_pair("url", "https://example.test/report");
+        assert_eq!(
+            selection_request_target(&request, token)
+                .unwrap()
+                .as_deref(),
+            Some("https://example.test/report")
+        );
+        assert!(selection_request_target(&request, "context-other").is_err());
+        let mut unsafe_request =
+            Url::parse(&format!("{BROWSER_CONTEXT_SCHEME}://selection/{token}")).unwrap();
+        unsafe_request
+            .query_pairs_mut()
+            .append_pair("url", "file:///etc/passwd");
+        assert!(selection_request_target(&unsafe_request, token).is_err());
+    }
+
+    #[test]
+    fn live_page_context_is_bounded_and_contains_no_form_values() {
+        let raw = serde_json::json!({
+            "url": "https://app.example.test/login",
+            "title": "Sign in",
+            "selectedText": "csrf token rotates",
+            "text": "x".repeat(MAX_CAPTURE_TEXT_CHARS + 50),
+            "truncated": false,
+            "forms": [{
+                "method": "post",
+                "action": "https://app.example.test/session",
+                "fields": [{
+                    "name": "password",
+                    "id": "password",
+                    "type": "PASSWORD",
+                    "autocomplete": "current-password",
+                    "required": true,
+                    "value": "never-capture-this"
+                }]
+            }],
+            "links": [{"text": "Reset", "href": "https://app.example.test/reset"}]
+        })
+        .to_string();
+
+        let context = decode_browser_context(&raw).unwrap();
+
+        assert_eq!(context.url, "https://app.example.test/login");
+        assert_eq!(context.text.chars().count(), MAX_CAPTURE_TEXT_CHARS);
+        assert!(context.truncated);
+        assert_eq!(context.forms[0].method, "POST");
+        assert_eq!(context.forms[0].fields[0].r#type, "password");
+        let serialized = serde_json::to_string(&context).unwrap();
+        assert!(!serialized.contains("never-capture-this"));
+        assert!(!serialized.contains("\"value\""));
+    }
+
+    #[test]
+    fn live_page_context_rejects_non_network_or_credentialed_provenance() {
+        for url in ["file:///etc/passwd", "https://user:secret@example.test/"] {
+            let raw = serde_json::json!({"url": url, "text": "page"}).to_string();
+            assert!(decode_browser_context(&raw).is_err());
+        }
+    }
+
+    #[test]
+    fn live_page_context_rejects_an_oversized_raw_snapshot_before_decoding() {
+        let raw = "x".repeat(MAX_CAPTURE_RAW_BYTES + 1);
+        assert_eq!(
+            decode_browser_context(&raw).unwrap_err(),
+            "The live page context snapshot exceeded the safe size limit."
+        );
+    }
+
+    #[test]
+    fn profile_keys_are_stable_and_project_specific() {
+        assert_eq!(project_key("one"), project_key("one"));
+        assert_ne!(project_key("one"), project_key("two"));
+    }
+
+    #[test]
+    fn filenames_cannot_escape_the_workspace() {
+        assert_eq!(safe_filename("../../report.txt"), "report.txt");
+        assert_eq!(safe_filename("bad:name\0.txt"), "bad_name_.txt");
+        assert_eq!(safe_filename(".."), "download.bin");
+    }
+
+    #[test]
+    fn bounds_reject_negative_or_unbounded_surfaces() {
+        assert!(
+            checked_bounds(BrowserBounds {
+                x: 1.0,
+                y: 2.0,
+                width: 900.0,
+                height: 600.0,
+            })
+            .is_ok()
+        );
+        assert!(
+            checked_bounds(BrowserBounds {
+                x: -1.0,
+                y: 2.0,
+                width: 900.0,
+                height: 600.0,
+            })
+            .is_err()
+        );
+        assert!(
+            checked_bounds(BrowserBounds {
+                x: 1.0,
+                y: 2.0,
+                width: 99_000.0,
+                height: 600.0,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_bounds_remain_logical_at_high_density() {
+        let bounds = checked_bounds(BrowserBounds {
+            x: 12.5,
+            y: 86.0,
+            width: 900.0,
+            height: 600.0,
+        })
+        .unwrap();
+        assert_eq!(bounds.x, 12.5);
+        assert_eq!(bounds.y, 86.0);
+        assert_eq!(bounds.width, 900.0);
+        assert_eq!(bounds.height, 600.0);
+    }
+
+    #[test]
+    fn macos_browser_frame_uses_the_main_webview_coordinate_space() {
+        assert_eq!(appkit_child_y(0.0, 900.0, 120.0, 600.0, true), 120.0);
+        assert_eq!(appkit_child_y(0.0, 900.0, 120.0, 600.0, false), 180.0);
+        assert_eq!(appkit_child_y(12.0, 900.0, 120.0, 600.0, false), 192.0);
+    }
+
+    #[test]
+    fn macos_safe_area_offset_keeps_the_browser_bottom_fixed() {
+        let bounds = inset_browser_bounds(
+            BrowserBounds {
+                x: 20.0,
+                y: 100.0,
+                width: 900.0,
+                height: 600.0,
+            },
+            28.0,
+        );
+        assert_eq!(bounds.y, 128.0);
+        assert_eq!(bounds.height, 572.0);
+        assert_eq!(bounds.y + bounds.height, 700.0);
+    }
+
+    #[test]
+    fn staged_download_streams_through_the_authenticated_workspace_endpoint() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|item| item == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if request.len() >= header_end + 4 + length {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&request);
+            assert!(text.starts_with("PUT /api/v1/engagements/project-1/workspace/file?path=report.txt&overwrite=false HTTP/1.1"));
+            assert!(text.contains("Authorization: Bearer private-token\r\n"));
+            assert!(request.ends_with(b"download body"));
+            let body = r#"{"path":"report.txt","size":13,"sha256":"abc123","overwritten":false}"#;
+            write!(
+                socket,
+                "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let path = std::env::temp_dir().join(format!(
+            "nebula-browser-test-{}",
+            random_id("file").unwrap()
+        ));
+        fs::write(&path, b"download body").unwrap();
+        let session = crate::sidecar::BackendSession {
+            endpoint: format!("http://127.0.0.1:{port}/api/v1"),
+            token: "private-token".to_string(),
+            protocol: "nebula-sidecar-v1",
+            source: "local",
+        };
+
+        let result = upload_staged(&session, "project-1", "report.txt", false, &path).unwrap();
+
+        assert_eq!(result.state, "imported");
+        assert_eq!(result.path, "report.txt");
+        assert_eq!(result.sha256.as_deref(), Some("abc123"));
+        server.join().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_staged_download_is_rejected_before_connecting_to_core() {
+        let path = std::env::temp_dir().join(format!(
+            "nebula-browser-large-{}",
+            random_id("file").unwrap()
+        ));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_DOWNLOAD_BYTES + 1).unwrap();
+        let session = crate::sidecar::BackendSession {
+            endpoint: "http://127.0.0.1:9/api/v1".to_string(),
+            token: "private-token".to_string(),
+            protocol: "nebula-sidecar-v1",
+            source: "local",
+        };
+
+        let error = upload_staged(&session, "project-1", "large.bin", false, &path).unwrap_err();
+
+        assert!(error.contains("exceeds the 1 GiB"));
+        fs::remove_file(path).unwrap();
+    }
+}

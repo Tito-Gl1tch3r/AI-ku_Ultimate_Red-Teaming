@@ -1,0 +1,109 @@
+/*
+ * Copyright 2025 Daytona Platforms Inc.
+ * Modified by BoxLite AI, 2025-2026
+ * SPDX-License-Identifier: AGPL-3.0
+ */
+
+import React, { Suspense, useEffect, useMemo, useState } from 'react'
+import { Outlet } from 'react-router-dom'
+import { Skeleton } from '@/components/ui/skeleton'
+
+import { AnnouncementBanner } from '@/components/AnnouncementBanner'
+import { OnboardingDialogHost } from '@/components/OnboardingDialogHost'
+import { Sidebar } from '@/components/Sidebar'
+import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar'
+import { Toaster } from '@/components/ui/sonner'
+import { VerifyEmailDialog } from '@/components/VerifyEmailDialog'
+import { LocalStorageKey } from '@/enums/LocalStorageKey'
+import { useOwnerWalletQuery } from '@/hooks/queries/billingQueries'
+import { useConfig } from '@/hooks/useConfig'
+import { useSelectedOrganization } from '@/hooks/useSelectedOrganization'
+import { useSuspensionBanner } from '@/hooks/useSuspensionBanner'
+import { cn } from '@/lib/utils'
+
+const Dashboard: React.FC = () => {
+  const { selectedOrganization } = useSelectedOrganization()
+  const [showVerifyEmailDialog, setShowVerifyEmailDialog] = useState(false)
+  const config = useConfig()
+  useOwnerWalletQuery() // prefetch wallet
+
+  useSuspensionBanner(selectedOrganization)
+
+  useEffect(() => {
+    if (
+      selectedOrganization?.suspended &&
+      selectedOrganization.suspensionReason === 'Please verify your email address'
+    ) {
+      setShowVerifyEmailDialog(true)
+    }
+  }, [selectedOrganization])
+
+  const [bannerText, bannerLearnMoreUrl] = useMemo(() => {
+    if (!config.announcements || Object.entries(config.announcements).length === 0) {
+      return [null, null]
+    }
+
+    return [Object.values(config.announcements)[0].text, Object.values(config.announcements)[0].learnMoreUrl]
+  }, [config.announcements])
+  const [isBannerVisible, setIsBannerVisible] = useState(false)
+
+  useEffect(() => {
+    if (!bannerText) {
+      setIsBannerVisible(false)
+      return
+    }
+
+    // Check if this announcement has been dismissed
+    const dismissedBanners = JSON.parse(localStorage.getItem(LocalStorageKey.AnnouncementBannerDismissed) || '[]')
+    const isDismissed = dismissedBanners.includes(bannerText)
+
+    setIsBannerVisible(!isDismissed)
+  }, [bannerText])
+
+  const handleDismissBanner = () => {
+    // Add this announcement to the dismissed list
+    const dismissedBanners = JSON.parse(localStorage.getItem(LocalStorageKey.AnnouncementBannerDismissed) || '[]')
+    localStorage.setItem(LocalStorageKey.AnnouncementBannerDismissed, JSON.stringify([...dismissedBanners, bannerText]))
+
+    setIsBannerVisible(false)
+  }
+
+  return (
+    <div
+      className={cn(
+        'relative w-full [--app-content-height:calc(100svh_-_60px)]',
+        isBannerVisible &&
+          'pt-16 [--app-banner-height:4rem] [--app-content-height:calc(100svh_-_60px_-_var(--app-banner-height))] md:pt-12 md:[--app-banner-height:3rem]',
+      )}
+    >
+      {isBannerVisible && bannerText && (
+        <AnnouncementBanner text={bannerText} onDismiss={handleDismissBanner} learnMoreUrl={bannerLearnMoreUrl} />
+      )}
+      <SidebarProvider isBannerVisible={false} defaultOpen={true} className="flex-col">
+        <Sidebar isBannerVisible={isBannerVisible} version={config.version} />
+        <SidebarInset className="min-h-0 overflow-visible">
+          <div className="w-full min-h-[var(--app-content-height,calc(100svh_-_60px))] overscroll-none">
+            {/* Lazy route components (Admin/Billing/Settings/box-details) suspend
+                here so only the content area shows a fallback — the sidebar/shell
+                stays mounted across navigation. */}
+            <Suspense
+              fallback={
+                <div className="space-y-3 p-4 sm:p-5">
+                  <Skeleton className="h-8 w-48" />
+                  <Skeleton className="h-32 w-full" />
+                </div>
+              }
+            >
+              <Outlet />
+            </Suspense>
+          </div>
+        </SidebarInset>
+        <OnboardingDialogHost />
+        <Toaster />
+        <VerifyEmailDialog open={showVerifyEmailDialog} onOpenChange={setShowVerifyEmailDialog} />
+      </SidebarProvider>
+    </div>
+  )
+}
+
+export default Dashboard

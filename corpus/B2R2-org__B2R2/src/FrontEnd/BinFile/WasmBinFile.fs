@@ -1,0 +1,331 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.BinFile
+
+open System.Collections.Generic
+open System.Collections.Immutable
+open B2R2
+open B2R2.Collections
+open B2R2.FrontEnd.BinLifter
+open B2R2.FrontEnd.BinFile.FileHelper
+open B2R2.FrontEnd.BinFile.Wasm
+open B2R2.FrontEnd.BinFile.Wasm.Helper
+
+/// Represents a Web Assembly (Wasm) binary file.
+type WasmBinFile(path, bytes: byte[], baseAddrOpt) =
+  let rawBytes = System.ReadOnlyMemory bytes
+
+  let wm = Parser.parse bytes
+
+  let baseAddr = defaultArg baseAddrOpt 0UL
+
+  let reader = BinReader.Init Endian.Little
+
+  let isa = ISA Architecture.WASM
+
+  let secByAddr = wm.SectionsInfo.SecByAddr
+
+  let sectionSummaryToPointer (sec: SectionSummary) =
+    let addr = uint64 sec.Offset
+    let size = sec.HeaderSize + sec.ContentsSize
+    BinFilePointer.CreateFileBacked(
+      addr,
+      addr + uint64 size - 1UL,
+      sec.Offset,
+      sec.Offset + int size - 1
+    )
+
+  let tryFindSectionByOffset offset =
+    wm.SectionsInfo.SecArray
+    |> Array.tryFind (fun sec ->
+      offset >= uint32 sec.Offset
+      && offset < uint32 sec.Offset + sec.HeaderSize + sec.ContentsSize)
+
+  let secKind (sec: SectionSummary) =
+    match sec.Id with
+    | SectionId.Code -> CodeSection
+    | SectionId.Data -> DataSection
+    | SectionId.Custom when sec.Name = Section.CustomName -> DebugSection
+    | SectionId.Custom -> UnknownSection
+    | _ -> MetadataSection
+
+  let secPermission sec =
+    match secKind sec with
+    | CodeSection -> int Permission.Readable ||| int Permission.Executable
+    | DataSection -> int Permission.Readable ||| int Permission.Writable
+    | DebugSection
+    | MetadataSection
+    | UnknownSection -> int Permission.Readable
+    | _ -> 0
+    |> LanguagePrimitives.EnumOfValue
+
+  let toBinSection (sec: SectionSummary) =
+    { Name = sec.Name
+      Address = uint64 sec.Offset
+      Size = uint64 (sec.HeaderSize + sec.ContentsSize)
+      Offset = Some(uint64 sec.Offset)
+      FileSize = uint64 (sec.HeaderSize + sec.ContentsSize)
+      Permission = secPermission sec
+      Kind = secKind sec }
+
+  (* An index entry names a function of this module only where the offset it
+     carries falls in the code section: an imported one carries the offset of
+     the import that names it instead. Whether a section holds the offset and
+     which section that is are the one lookup, so it is made once. *)
+  let tryFunctionAddr (idx: IndexInfo) =
+    if idx.Kind <> IndexKind.Function then
+      None
+    else
+      let addr = uint64 idx.ElemOffset
+      match NoOverlapIntervalMap.tryFindByAddr addr secByAddr with
+      | Some sec when sec.Id = SectionId.Code -> Some addr
+      | _ -> None
+
+  let functionAddrs =
+    lazy
+      (Array.choose tryFunctionAddr wm.IndexMap |> ImmutableArray.ofArray)
+
+  let binSections =
+    lazy (wm.SectionsInfo.SecArray
+          |> Array.map toBinSection
+          |> ImmutableArray.ofArray)
+
+  let importEntries = lazy (getImports wm |> ImmutableArray.ofArray)
+
+  (* Every import names the module it comes from, and those names made
+     distinct are the modules this one needs instantiated alongside it. *)
+  let dependencies =
+    lazy
+      importEntries.Value
+      |> ImmutableArray.map _.LibraryName
+      |> Array.filter (fun name -> name <> "")
+      |> Array.distinct
+      |> ImmutableArray.ofArray
+
+  (* Only the table addresses are ever asked for by address, so they are kept
+     on their own rather than looked for among the entries each time. *)
+  let importAddrs =
+    lazy
+      let addrs = HashSet<Addr>()
+      for entry in importEntries.Value do
+        addrs.Add entry.TableAddress |> ignore
+      addrs
+
+  let symbolMap = lazy getFunctionNameMap wm
+
+  let toFunctionBody importedCount index (code: Code) =
+    let body = code.Offset + code.LenFieldSize
+    let first = body + code.LocalsSize
+    let last = body + int code.CodeSize - 1
+    let name =
+      match Map.tryFind (uint64 body) symbolMap.Value with
+      | Some name -> name
+      | None -> $"func[{importedCount + index}]"
+    let ptr =
+      BinFilePointer.CreateFileBacked(uint64 first, uint64 last, first, last)
+    name, ptr
+
+  let functionBodies =
+    lazy
+      let importedCount = importEntries.Value.Length
+      match wm.CodeSection with
+      | Some { Contents = Some conts } ->
+        conts.Elements |> Array.mapi (toFunctionBody importedCount)
+      | _ ->
+        [||]
+
+  let nameResolver =
+    Some { new INameResolvable with
+      member _.TryResolveName addr =
+        match Map.tryFind addr symbolMap.Value with
+        | Some name -> Ok name
+        | None -> Error ErrorCase.SymbolNotFound
+    }
+
+  let structure =
+    Some { new IBinStructure with
+      member _.Sections with get() = binSections.Value
+
+      member _.CodeSectionPointer =
+        match wm.CodeSection with
+        | Some sec ->
+          let headerSize =
+            wm.SectionsInfo.SecArray
+            |> Array.tryFind (fun sm -> sm.Id = SectionId.Code)
+            |> Option.map (fun sm -> sm.HeaderSize)
+            |> Option.defaultValue 0u
+          let addr = uint64 sec.Offset
+          let size = headerSize + sec.Size
+          BinFilePointer.CreateFileBacked(
+            addr,
+            addr + uint64 size - 1UL,
+            sec.Offset,
+            sec.Offset + int size - 1
+          )
+        | None ->
+          BinFilePointer.Null
+
+      member _.GetSectionPointer name =
+        match Map.tryFind name wm.SectionsInfo.SecByName with
+        | Some sec -> sectionSummaryToPointer sec
+        | None -> BinFilePointer.Null
+
+      member _.TryFindSectionByName name =
+        Map.tryFind name wm.SectionsInfo.SecByName
+        |> function
+          | Some sec -> Ok(toBinSection sec)
+          | None -> Error ErrorCase.ItemNotFound
+
+      member _.TryFindSectionByAddr addr =
+        NoOverlapIntervalMap.tryFindByAddr addr secByAddr
+        |> function
+          | Some sec -> Ok(toBinSection sec)
+          | None -> Error ErrorCase.ItemNotFound
+
+      member _.TryFindSectionByOffset offset =
+        match tryFindSectionByOffset offset with
+        | Some sec -> Ok(toBinSection sec)
+        | None -> Error ErrorCase.ItemNotFound
+
+      member _.TryFindSectionNameByAddr addr =
+        NoOverlapIntervalMap.tryFindByAddr addr secByAddr
+        |> function
+          | Some sec -> Ok sec.Name
+          | None -> Error ErrorCase.ItemNotFound
+
+      member _.TryFindSectionNameByOffset offset =
+        match tryFindSectionByOffset offset with
+        | Some sec -> Ok sec.Name
+        | None -> Error ErrorCase.ItemNotFound
+
+      member _.FunctionAddresses = functionAddrs.Value
+    }
+
+  let importTable =
+    Some { new IImportTable with
+      member _.Imports = importEntries.Value
+
+      member _.IsInImportTable addr = importAddrs.Value.Contains addr
+    }
+
+  new(path, bytes) = WasmBinFile(path, bytes, None)
+
+  member internal _.WASM with get() = wm
+
+  /// Returns each locally defined function as its name paired with a pointer
+  /// to its instructions. A body entry opens with a vector of local
+  /// declarations, which are not code, so the pointer starts past it.
+  member _.FunctionBodies with get() = functionBodies.Value
+
+  member internal _.Sections with get() = wm.SectionsInfo.SecArray
+
+  interface IBinFile with
+    member _.Reader with get() = reader
+
+    member _.RawBytes with get() = rawBytes
+
+    member _.RawBytesOffset with get() = 0UL
+
+    member _.Length with get() = bytes.Length
+
+    member _.Path with get() = path
+
+    member _.Format with get() = FileFormat.WasmBinary
+
+    member _.Kind with get() = BinFileKind.Unknown
+
+    member _.ISA with get() = isa
+
+    (* Wasm names the host it expects nowhere: a module runs under
+       whatever embeds it. *)
+    member _.OS with get() = OS.UnknownOS
+
+    member _.EntryPoint with get() = entryPointOf wm
+
+    member _.BaseAddress with get() = baseAddr
+
+    member _.InterpreterPath with get() = None
+
+    member _.RPath with get() = ImmutableArray.Empty
+
+    member _.RunPath with get() = ImmutableArray.Empty
+
+    member _.DependencyNames with get() = dependencies.Value
+
+    member _.SharedObjectName with get() = None
+
+    member _.BuildId with get() = ImmutableArray.Empty
+
+    member _.ProgramHeaderTable with get() = None
+
+    member _.IsNXEnabled with get() = true
+
+    member _.IsPIE with get() = false
+
+    member _.IsBaseRelative with get() = false
+
+    member _.Relro with get() = None
+
+    member _.EncryptedRanges with get() = ImmutableArray.Empty
+
+    member _.NameResolver with get() = nameResolver
+
+    member _.SymbolTable with get() = None
+
+    member _.Structure with get() = structure
+
+    member _.Relocations with get() = None
+
+    member _.ExceptionTable with get() = None
+
+    member _.ImportTable with get() = importTable
+
+    member _.MemoryLayout with get() = None
+
+    member _.Slice(addr, len) = sliceBySafeOffset bytes addr len
+
+    member _.IsValidAddr(addr) = addr >= 0UL && addr < (uint64 bytes.LongLength)
+
+    member this.IsValidRange range =
+      (this :> IAddressSpace).IsValidAddr range.Min
+      && (this :> IAddressSpace).IsValidAddr range.Max
+
+    member this.IsAddrMappedToFile addr =
+      (this :> IAddressSpace).IsValidAddr addr
+
+    member this.IsRangeMappedToFile range =
+      (this :> IAddressSpace).IsValidRange range
+
+    member this.IsExecutableAddr addr = (this :> IAddressSpace).IsValidAddr addr
+
+    member _.GetBoundedPointer addr =
+      NoOverlapIntervalMap.tryFindByAddr addr secByAddr
+      |> function
+        | Some s ->
+          let size = s.HeaderSize + s.ContentsSize
+          let maxAddr = uint64 s.Offset + uint64 size - 1UL
+          BinFilePointer.CreateFileBacked(addr, maxAddr, int addr, int maxAddr)
+        | None ->
+          BinFilePointer.Null

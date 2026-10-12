@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import requests
+import urllib3
+from typing import Dict, List, Any, Optional, Union
+from urllib.parse import urljoin, urlparse
+import logging
+import time
+
+from core.framework.option import OptString, OptPort, OptBool
+from core.framework.base_module import BaseModule
+from lib.scanner.target_utils import normalize_scanner_target
+
+logger = logging.getLogger(__name__)
+
+class Http_client(BaseModule):
+    """Advanced HTTP client with security testing capabilities"""
+    
+    target = OptString("", "Target URL, IP or hostname", True)
+    port = OptPort(443, "Target port", True)
+    path = OptString("/", "Target path", True)  
+    ssl = OptBool(True, "SSL enabled: true/false", True, advanced=True)
+    user_agent = OptString("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "User agent", True, advanced=True)
+    follow_redirects = OptBool(True, "Follow redirects: true/false", True, advanced=True)
+    timeout = OptPort(10, "Request timeout in seconds", True, advanced=True)
+    verify_ssl = OptBool(False, "Verify SSL certificates: true/false", False, advanced=True)
+    proxy = OptString("", "Proxy URL (e.g., 'http://127.0.0.1:8080')", False, advanced=True)
+    
+    def __init__(self, framework=None):
+        """
+        Initialize HTTP client using options from the module.
+        Options are defined as class attributes and can be set via set_option().
+        """
+        super().__init__(framework)
+        # Prefer scan-scoped shared session (bulk scanner) to avoid Session-per-module
+        shared = None
+        try:
+            from lib.scanner.http_pool import get_scan_session
+
+            shared = get_scan_session()
+        except ImportError:
+            shared = None
+        self._owns_session = shared is None
+        self.session = shared if shared is not None else requests.Session()
+        self.logger = logger  # Initialize logger
+        # Initialize session configuration (will be updated in _configure_session)
+        if self._owns_session:
+            self._configure_session()
+    
+    def _configure_session(self):
+        """Configure the HTTP session using current option values"""
+        # Get option values (handle both OptString/OptPort/OptBool and direct values)
+        def get_option_value(option):
+            if hasattr(option, 'value'):
+                return option.value
+            elif hasattr(option, '__get__'):
+                # It's a descriptor, try to get the value
+                try:
+                    return option.__get__(self, type(self))
+                except:
+                    return option
+            return option
+        
+        # Get values from options
+        user_agent = get_option_value(self.user_agent) if hasattr(self, 'user_agent') else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        proxy = get_option_value(self.proxy) if hasattr(self, 'proxy') else ""
+        verify_ssl = get_option_value(self.verify_ssl) if hasattr(self, 'verify_ssl') else False
+        follow_redirects = get_option_value(self.follow_redirects) if hasattr(self, 'follow_redirects') else True
+        
+        # Convert verify_ssl to boolean if it's a string
+        if isinstance(verify_ssl, str):
+            verify_ssl = verify_ssl.lower() in ('true', 'yes', 'y', '1')
+        elif not isinstance(verify_ssl, bool):
+            verify_ssl = bool(verify_ssl)
+        
+        # Configure session headers
+        self.session.headers.update({
+            'User-Agent': user_agent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        })
+        
+        # Set proxy if provided, otherwise check framework proxy config
+        # Priority: explicit proxy > Tor > regular proxy
+        if proxy:
+            self.session.proxies = {
+                'http': proxy,
+                'https': proxy
+            }
+        else:
+            # Check if Tor is enabled first
+            if self.framework and hasattr(self.framework, 'is_tor_enabled') and self.framework.is_tor_enabled():
+                tor_proxies = self.framework.tor_manager.get_tor_proxy_dict()
+                if tor_proxies:
+                    self.session.proxies = tor_proxies
+                else:
+                    self.session.proxies = {}
+            # Fallback to regular proxy
+            elif self.framework and hasattr(self.framework, 'is_proxy_enabled'):
+                if self.framework.is_proxy_enabled():
+                    proxy_url = self.framework.get_proxy_url()
+                    if proxy_url:
+                        self.session.proxies = {
+                            'http': proxy_url,
+                            'https': proxy_url,
+                            'all': proxy_url
+                        }
+                    else:
+                        self.session.proxies = {}
+                else:
+                    self.session.proxies = {}
+            else:
+                self.session.proxies = {}
+        
+        # Disable SSL warnings if verify_ssl is False
+        if not verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Configure redirects
+        self.session.max_redirects = 10 if follow_redirects else 0
+
+    def _to_bool(self, value: Any) -> bool:
+        """Safely convert framework option values to boolean."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ('true', 'yes', 'y', '1', 'on')
+        return bool(value)
+
+    def response_effective_path(self, requested_path: str, response: Any) -> str:
+        """
+        Path (and query string) of the final URL after redirects.
+
+        ``requests`` sets ``response.url`` to the last URL in the chain; use this when
+        reporting where the page body came from (e.g. GET ``/`` → 302 → ``/login.php``).
+        """
+        if not response or not getattr(response, "url", None):
+            return requested_path
+        try:
+            parsed = urlparse(str(response.url))
+            out = parsed.path or "/"
+            if parsed.query:
+                out = f"{out}?{parsed.query}"
+            return out[:500]
+        except Exception:
+            return requested_path
+
+    def get(self, url: str, **kwargs) -> requests.Response:
+        """Perform GET request"""
+        return self._request('GET', url, **kwargs)
+    
+    def post(self, url: str, data: Optional[Union[Dict, str]] = None, **kwargs) -> requests.Response:
+        """Perform POST request"""
+        return self._request('POST', url, data=data, **kwargs)
+    
+    def put(self, url: str, data: Optional[Union[Dict, str]] = None, **kwargs) -> requests.Response:
+        """Perform PUT request"""
+        return self._request('PUT', url, data=data, **kwargs)
+    
+    def delete(self, url: str, **kwargs) -> requests.Response:
+        """Perform DELETE request"""
+        return self._request('DELETE', url, **kwargs)
+    
+    def head(self, url: str, **kwargs) -> requests.Response:
+        """Perform HEAD request"""
+        return self._request('HEAD', url, **kwargs)
+    
+    def options(self, url: str, **kwargs) -> requests.Response:
+        """Perform OPTIONS request"""
+        return self._request('OPTIONS', url, **kwargs)
+    
+    def http_request(self, method: str = 'GET', path: str = '/', 
+                     cookies: Optional[Dict[str, str]] = None,
+                     headers: Optional[Dict[str, str]] = None,
+                     data: Optional[Union[Dict, str]] = None,
+                     session: bool = False,
+                     **kwargs) -> Union[requests.Response, Any]:
+        """
+        Make an HTTP request using target and port from the module options.
+        
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            path: URL path (default: '/')
+            cookies: Dictionary of cookies to send
+            headers: Dictionary of headers to send
+            data: Data to send (for POST, PUT, etc.)
+            session: If True, return a response object with a 'session' attribute
+            **kwargs: Additional arguments passed to requests
+        
+        Returns:
+            requests.Response: If session=False
+            Response-like object with 'session' attribute: If session=True
+        """
+        # Helper to get option value
+        def get_option_value(option):
+            if hasattr(option, 'value'):
+                return option.value
+            elif hasattr(option, '__get__'):
+                try:
+                    return option.__get__(self, type(self))
+                except:
+                    return option
+            return option
+        
+        # Get target and port from options (fallback to rhost/rport for compatibility)
+        target = None
+        port = None
+        
+        if hasattr(self, 'target'):
+            target = get_option_value(self.target)
+        elif hasattr(self, 'rhost'):
+            target = get_option_value(self.rhost)
+
+        host, url_port, url_ssl = normalize_scanner_target(str(target or ""))
+        if host:
+            target = host
+
+        if hasattr(self, 'port'):
+            port = get_option_value(self.port)
+        elif hasattr(self, 'rport'):
+            port = get_option_value(self.rport)
+
+        # Full URL in `target` carries its own port (http://127.0.0.1 → 80).
+        # Do not keep the Http_client default 443 when the URL disagrees.
+        if url_port is not None:
+            port = url_port
+        
+        if not target:
+            raise ValueError("target not set. Please set target option (or rhost for compatibility).")
+        if not port:
+            raise ValueError("port not set. Please set port option (or rport for compatibility).")
+        
+        # Determine protocol based on ssl option or URL scheme
+        if url_ssl is not None:
+            protocol = 'https' if url_ssl else 'http'
+        elif hasattr(self, 'ssl'):
+            ssl_enabled = self._to_bool(get_option_value(self.ssl))
+            protocol = 'https' if ssl_enabled else 'http'
+        else:
+            # Fallback: determine protocol based on port
+            # Port 443 typically uses HTTPS
+            protocol = 'https' if int(port) == 443 else 'http'
+        
+        # Auto-enable SSL for port 443 if not explicitly set
+        if protocol == 'https' and hasattr(self, 'ssl'):
+            ssl_enabled = self._to_bool(get_option_value(self.ssl))
+            if not ssl_enabled and int(port) == 443:
+                # Auto-enable SSL for port 443
+                if hasattr(self.ssl, 'value'):
+                    self.ssl.value = True
+                # Also ensure verify_ssl is False for self-signed certificates
+                if hasattr(self, 'verify_ssl') and hasattr(self.verify_ssl, 'value'):
+                    if self.verify_ssl.value is True:
+                        # Only disable if it was explicitly set to True, otherwise keep False
+                        pass
+                    else:
+                        self.verify_ssl.value = False
+
+        # Path must start with ``/`` so values like ``%2fadmin`` (403 bypass encoded segments)
+        # do not get concatenated as ``:80%2fadmin``, which breaks URL parsing.
+        path_str = "/" if path in (None, "") else str(path)
+        if not path_str.startswith("/"):
+            path_str = "/" + path_str
+
+        url = f"{protocol}://{target}:{port}{path_str}"
+
+        def _finalize(response):
+            return self._annotate_scanner_http_response(
+                response,
+                url=url,
+                path=path_str,
+                method=str(method or "GET").upper(),
+            )
+        
+        # Prepare request parameters
+        request_kwargs = kwargs.copy()
+        
+        # Add cookies if provided
+        if cookies:
+            request_kwargs['cookies'] = cookies
+        
+        # Add headers if provided
+        if headers:
+            request_kwargs['headers'] = headers
+        
+        # Add data if provided
+        if data:
+            request_kwargs['data'] = data
+        
+        # Check if this is a Scanner module and use cache if available
+        use_cache = False
+        cache = None
+        
+        # Vérifier si le module est un Scanner et si le cache est activé
+        try:
+            from core.framework.scanner import Scanner
+            from lib.scanner.cache import get_cache, is_cache_enabled
+            
+            if isinstance(self, Scanner) and is_cache_enabled():
+                use_cache = True
+                cache = get_cache()
+        except (ImportError, AttributeError):
+            pass
+        
+        # Essayer de récupérer depuis le cache si activé
+        if use_cache and cache:
+            cached_response = cache.get(method, url, headers, data)
+            if cached_response is not None:
+                # Retourner la réponse en cache
+                if session:
+                    # Créer un wrapper avec session si nécessaire
+                    class ResponseWithSession:
+                        def __init__(self, response_obj, session_obj):
+                            for attr in dir(response_obj):
+                                if not attr.startswith('_'):
+                                    try:
+                                        setattr(self, attr, getattr(response_obj, attr))
+                                    except:
+                                        pass
+                            self.session = session_obj
+                    return _finalize(ResponseWithSession(cached_response, self.session))
+                return _finalize(cached_response)
+        
+        # Make the request
+        response = self._request(method, url, **request_kwargs)
+        
+        # Mettre en cache si c'est un Scanner
+        if use_cache and cache:
+            cache.set(method, url, response, headers, data)
+        
+        # If session=True, wrap the response to include the session
+        if session:
+            # Create a wrapper object that has both response attributes and session
+            class ResponseWithSession:
+                def __init__(self, response_obj, session_obj):
+                    # Copy all response attributes
+                    for attr in dir(response_obj):
+                        if not attr.startswith('_'):
+                            try:
+                                setattr(self, attr, getattr(response_obj, attr))
+                            except:
+                                pass
+                    # Add session attribute
+                    self.session = session_obj
+            
+            return _finalize(ResponseWithSession(response, self.session))
+        
+        return _finalize(response)
+
+    def _annotate_scanner_http_response(self, response, *, url: str, path: str, method: str = "GET"):
+        """Track last HTTP hit and mark soft-404 / same-as-index clones."""
+        if response is None:
+            return response
+        try:
+            from lib.scanner.http.soft_404 import (
+                annotate_response,
+                origin_key_from_url,
+                register_baseline_from_response,
+            )
+
+            origin = origin_key_from_url(url)
+            self._ks_http_origin = origin
+            self._ks_last_http_path = path
+            self._ks_last_http_method = method
+            if path in ("/", "") and str(method).upper() == "GET":
+                register_baseline_from_response(origin, response)
+            annotate_response(response, origin=origin, path=path or "/")
+            self._ks_last_http_response = response
+        except Exception:
+            pass
+        return response
+
+    def is_same_as_index(self, response=None, path: str = "") -> bool:
+        """True when response mirrors the site index (catch-all / SPA soft-404)."""
+        try:
+            from lib.scanner.http.soft_404 import is_same_as_index
+
+            resp = response if response is not None else getattr(self, "_ks_last_http_response", None)
+            path_s = path or getattr(self, "_ks_last_http_path", "") or "/"
+            origin = getattr(self, "_ks_http_origin", "") or ""
+            if resp is not None and getattr(resp, "ks_same_as_index", None) is not None and not path:
+                return bool(resp.ks_same_as_index)
+            return bool(is_same_as_index(resp, origin=origin, path=path_s))
+        except Exception:
+            return False
+    
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Internal request method"""
+        try:
+            agent_policy = None
+            try:
+                from interfaces.command_system.builtin.agent.runtime_policy import (
+                    active_runtime_policy,
+                )
+
+                agent_policy = active_runtime_policy()
+            except ImportError:
+                pass
+
+            # Prefer scan-scoped shared session (connection pool) when active
+            shared = None
+            try:
+                from lib.scanner.http_pool import get_scan_session
+
+                shared = get_scan_session()
+            except ImportError:
+                shared = None
+
+            session = shared if shared is not None else self.session
+
+            def get_option_value(option):
+                if hasattr(option, 'value'):
+                    return option.value
+                elif hasattr(option, '__get__'):
+                    try:
+                        return option.__get__(self, type(self))
+                    except Exception:
+                        return option
+                return option
+
+            # Merge headers for this request only (avoid racing on shared session.headers)
+            req_headers = dict(session.headers)
+            if shared is None:
+                # Private session: keep legacy configure + mutate behavior
+                self._configure_session()
+                req_headers = dict(self.session.headers)
+            else:
+                # Shared pool: apply per-module options without mutating the pool session
+                user_agent = (
+                    get_option_value(self.user_agent)
+                    if hasattr(self, "user_agent")
+                    else req_headers.get("User-Agent")
+                )
+                if user_agent:
+                    req_headers["User-Agent"] = user_agent
+                proxy = get_option_value(self.proxy) if hasattr(self, "proxy") else ""
+                if proxy:
+                    kwargs.setdefault(
+                        "proxies",
+                        {"http": proxy, "https": proxy},
+                    )
+                elif self.framework and hasattr(self.framework, "is_tor_enabled") and self.framework.is_tor_enabled():
+                    tor_proxies = self.framework.tor_manager.get_tor_proxy_dict()
+                    if tor_proxies:
+                        kwargs.setdefault("proxies", tor_proxies)
+                elif self.framework and hasattr(self.framework, "is_proxy_enabled") and self.framework.is_proxy_enabled():
+                    proxy_url = self.framework.get_proxy_url()
+                    if proxy_url:
+                        kwargs.setdefault(
+                            "proxies",
+                            {"http": proxy_url, "https": proxy_url, "all": proxy_url},
+                        )
+
+            extra_headers = kwargs.pop("headers", None) or {}
+            if extra_headers:
+                req_headers.update(extra_headers)
+            kwargs["headers"] = req_headers
+
+            timeout = get_option_value(self.timeout) if hasattr(self, 'timeout') else 30
+            verify_ssl = get_option_value(self.verify_ssl) if hasattr(self, 'verify_ssl') else False
+
+            if isinstance(verify_ssl, str):
+                verify_ssl = verify_ssl.lower() in ('true', 'yes', 'y', '1')
+            elif not isinstance(verify_ssl, bool):
+                verify_ssl = bool(verify_ssl)
+
+            kwargs.setdefault('timeout', timeout)
+            if agent_policy is not None:
+                kwargs["verify"] = agent_policy.tls_verify_value()
+            else:
+                kwargs["verify"] = verify_ssl
+
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(f"Request: {method} {url}")
+                if 'cookies' in kwargs:
+                    self.logger.debug(f"Cookies: {kwargs['cookies']}")
+                self.logger.debug(f"Headers: {req_headers}")
+
+            response = session.request(method, url, **kwargs)
+
+            if response.status_code != 200:
+                self.logger.debug(
+                    "HTTP %s %s returned status %s", method, url, response.status_code
+                )
+
+            return response
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Request failed: {method} {url} - {e}")
+            raise
+    
+    def set_header(self, name: str, value: str):
+        """Set a custom header"""
+        self.session.headers[name] = value
+    
+    def remove_header(self, name: str):
+        """Remove a header"""
+        if name in self.session.headers:
+            del self.session.headers[name]
+    
+    def set_cookie(self, name: str, value: str, domain: Optional[str] = None):
+        """Set a cookie"""
+        self.session.cookies.set(name, value, domain=domain)
+    
+    def get_cookies(self) -> Dict[str, str]:
+        """Get all cookies"""
+        return dict(self.session.cookies)
+    
+    def clear_cookies(self):
+        """Clear all cookies"""
+        self.session.cookies.clear()
+    
+    def set_auth(self, username: str, password: str):
+        """Set basic authentication"""
+        self.session.auth = (username, password)
+    
+    def set_bearer_token(self, token: str):
+        """Set bearer token authentication"""
+        self.session.headers['Authorization'] = f'Bearer {token}'
+    
+    
+    def close(self):
+        """Close the session"""
+        self.session.close()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()

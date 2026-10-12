@@ -1,0 +1,332 @@
+//! Executor trait and implementations.
+//!
+//! Provides abstraction for spawning processes in different contexts:
+//! - ContainerExecutor: runs commands inside OCI container
+//! - GuestExecutor: runs commands directly on guest
+
+use crate::container::Container;
+use crate::service::exec::exec_handle::{ExecHandle, PtyConfig};
+use async_trait::async_trait;
+use boxlite_shared::errors::{BoxliteError, BoxliteResult};
+use boxlite_shared::ExecRequest;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Executor spawns processes.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates a must-use boxed future"
+)]
+#[async_trait]
+pub trait Executor: Send + Sync {
+    /// Spawn process from ExecRequest.
+    async fn spawn(&self, req: &ExecRequest) -> BoxliteResult<ExecHandle>;
+}
+
+/// Executes commands inside OCI container.
+pub struct ContainerExecutor {
+    container: Arc<Mutex<Container>>,
+}
+
+impl ContainerExecutor {
+    pub fn new(container: Arc<Mutex<Container>>) -> Self {
+        Self { container }
+    }
+
+    /// Get a clone of the container reference for status checking.
+    pub fn container_ref(&self) -> Arc<Mutex<Container>> {
+        self.container.clone()
+    }
+
+    pub(crate) async fn spawn_ssh_workload(
+        &self,
+        req: &ExecRequest,
+        workload: crate::service::ssh::SshWorkload,
+    ) -> BoxliteResult<ExecHandle> {
+        self.spawn_request(req, Some(workload)).await
+    }
+
+    async fn spawn_request(
+        &self,
+        req: &ExecRequest,
+        ssh_workload: Option<crate::service::ssh::SshWorkload>,
+    ) -> BoxliteResult<ExecHandle> {
+        use crate::container::SpawnResult;
+
+        let start = std::time::Instant::now();
+        let pty_config = req.tty.as_ref().map(PtyConfig::try_from).transpose()?;
+
+        // Phase 1 (mutex held): build command + zygote IPC.
+        //
+        // Serialize build+spawn: libcontainer's build() uses process-global
+        // chdir(). Concurrent builds corrupt each other's cwd, causing hangs
+        // in clone3/waitpid. The mutex is released BEFORE the PTY handshake
+        // so a stuck console-socket doesn't block other execs or shutdown.
+        let spawn_result = {
+            let container = self.container.lock().await;
+
+            let mut cmd = container
+                .cmd()
+                .program(&req.program)
+                .args(&req.args)
+                .envs(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+            if let Some(workload) = ssh_workload {
+                cmd = cmd.with_ssh_workload(workload);
+            }
+
+            if !req.workdir.is_empty() {
+                cmd = cmd.current_dir(&req.workdir);
+            }
+
+            if let Some(tty) = pty_config {
+                cmd = cmd.with_pty(tty);
+            }
+
+            if let Some(ref user) = req.user {
+                cmd = cmd.with_user(user.clone());
+            }
+
+            cmd.spawn_build().await?
+            // container mutex dropped here
+        };
+
+        // Phase 2 (no mutex): complete PTY handshake if needed.
+        //
+        // receive_pty_master() blocks on accept() + recvmsg() with a 30s
+        // timeout. This does NOT need the container mutex — chdir() is done.
+        let result = match spawn_result {
+            SpawnResult::Ready(handle) => Ok(handle),
+            SpawnResult::PtyPending(pending) => pending.finish(),
+        };
+
+        tracing::info!(
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            program = %req.program,
+            "exec: spawn completed"
+        );
+
+        result
+    }
+}
+
+#[async_trait]
+impl Executor for ContainerExecutor {
+    async fn spawn(&self, req: &ExecRequest) -> BoxliteResult<ExecHandle> {
+        self.spawn_request(req, None).await
+    }
+}
+
+/// Executes commands directly on guest (no container).
+pub struct GuestExecutor;
+
+#[async_trait]
+impl Executor for GuestExecutor {
+    async fn spawn(&self, req: &ExecRequest) -> BoxliteResult<ExecHandle> {
+        if let Some(tty) = &req.tty {
+            let config = PtyConfig::try_from(tty)?;
+            spawn_with_pty(req, config)
+        } else {
+            spawn_with_pipes(req)
+        }
+    }
+}
+
+/// Spawn process with pipes (standard mode).
+fn spawn_with_pipes(req: &ExecRequest) -> BoxliteResult<ExecHandle> {
+    use nix::unistd::Pid;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    use std::process::Command;
+
+    let mut cmd = Command::new(&req.program);
+    cmd.args(&req.args);
+
+    for (k, v) in &req.env {
+        cmd.env(k, v);
+    }
+
+    if !req.workdir.is_empty() {
+        cmd.current_dir(&req.workdir);
+    }
+
+    // Create pipes for stdin/stdout/stderr
+    let (stdin_read, stdin_write) = nix::unistd::pipe()
+        .map_err(|e| BoxliteError::Internal(format!("Failed to create stdin pipe: {}", e)))?;
+    let (stdout_read, stdout_write) = nix::unistd::pipe()
+        .map_err(|e| BoxliteError::Internal(format!("Failed to create stdout pipe: {}", e)))?;
+    let (stderr_read, stderr_write) = nix::unistd::pipe()
+        .map_err(|e| BoxliteError::Internal(format!("Failed to create stderr pipe: {}", e)))?;
+
+    // Configure command to use our pipes.
+    // into_raw_fd() transfers ownership from OwnedFd to Stdio, preventing double-close.
+    unsafe {
+        cmd.stdin(std::process::Stdio::from_raw_fd(stdin_read.into_raw_fd()));
+        cmd.stdout(std::process::Stdio::from_raw_fd(stdout_write.into_raw_fd()));
+        cmd.stderr(std::process::Stdio::from_raw_fd(stderr_write.into_raw_fd()));
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| BoxliteError::Internal(format!("Failed to spawn '{}': {}", req.program, e)))?;
+
+    let pid = child.id();
+
+    // Non-PTY mode: stdout and stderr are separate pipes
+    match ExecHandle::new(
+        Pid::from_raw(pid as i32),
+        stdin_write,
+        stdout_read,
+        Some(stderr_read),
+    ) {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            terminate_child(&mut child);
+            Err(error)
+        }
+    }
+}
+
+/// Spawn process with PTY (interactive mode).
+fn spawn_with_pty(req: &ExecRequest, config: PtyConfig) -> BoxliteResult<ExecHandle> {
+    use nix::pty::{openpty, OpenptyResult, Winsize};
+    use nix::unistd::{dup, Pid};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    // Create PTY pair
+    let winsize = Winsize {
+        ws_row: config.rows,
+        ws_col: config.cols,
+        ws_xpixel: config.x_pixels,
+        ws_ypixel: config.y_pixels,
+    };
+
+    let OpenptyResult { master, slave } = openpty(Some(&winsize), None)
+        .map_err(|e| BoxliteError::Internal(format!("Failed to create PTY: {}", e)))?;
+    crate::service::exec::tty::apply_modes(&slave, &config.modes)?;
+
+    // Get raw FD for use in pre_exec closure
+    let slave_raw_fd = slave.as_raw_fd();
+
+    // Duplicate slave FD for each stdio (Stdio::from_raw_fd takes ownership and will close)
+    let slave_stdin = dup(slave.as_raw_fd())
+        .map_err(|e| BoxliteError::Internal(format!("Failed to dup slave for stdin: {}", e)))?;
+    let slave_stdout = dup(slave.as_raw_fd())
+        .map_err(|e| BoxliteError::Internal(format!("Failed to dup slave for stdout: {}", e)))?;
+    let slave_stderr = dup(slave.as_raw_fd())
+        .map_err(|e| BoxliteError::Internal(format!("Failed to dup slave for stderr: {}", e)))?;
+
+    // Build command
+    let mut cmd = Command::new(&req.program);
+    cmd.args(&req.args);
+
+    for (k, v) in &req.env {
+        cmd.env(k, v);
+    }
+
+    if !req.workdir.is_empty() {
+        cmd.current_dir(&req.workdir);
+    }
+
+    // Configure child to use PTY slave as stdin/stdout/stderr
+    // Each Stdio takes ownership of its dup'd FD
+    unsafe {
+        cmd.stdin(Stdio::from_raw_fd(slave_stdin));
+        cmd.stdout(Stdio::from_raw_fd(slave_stdout));
+        cmd.stderr(Stdio::from_raw_fd(slave_stderr));
+    }
+
+    // Set up session and controlling terminal in child
+    unsafe {
+        cmd.pre_exec(move || {
+            // Create new session (detach from parent's controlling terminal)
+            nix::unistd::setsid().map_err(std::io::Error::other)?;
+
+            // Set the PTY slave as the controlling terminal
+            if nix::libc::ioctl(slave_raw_fd, nix::libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            Ok(())
+        });
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| BoxliteError::Internal(format!("Failed to spawn '{}': {}", req.program, e)))?;
+
+    let pid = child.id();
+
+    // Close original slave in parent (child has its dup'd copies after fork)
+    drop(slave);
+
+    // Duplicate master FD for stdin and stdout only.
+    // In PTY mode, stderr is merged into stdout at the PTY level - there is only
+    // ONE reader from the PTY master. Creating separate readers would cause a race
+    // condition where data could be captured by the "wrong" reader, resulting in
+    // out-of-order output.
+    let stdin_fd = match dup(master.as_raw_fd()) {
+        Ok(fd) => fd,
+        Err(error) => {
+            terminate_child(&mut child);
+            return Err(BoxliteError::Internal(format!(
+                "Failed to dup PTY for stdin: {error}"
+            )));
+        }
+    };
+    let stdout_fd = match dup(master.as_raw_fd()) {
+        Ok(fd) => fd,
+        Err(error) => {
+            terminate_child(&mut child);
+            return Err(BoxliteError::Internal(format!(
+                "Failed to dup PTY for stdout: {error}"
+            )));
+        }
+    };
+
+    let stdin = unsafe { OwnedFd::from_raw_fd(stdin_fd) };
+    let stdout = unsafe { OwnedFd::from_raw_fd(stdout_fd) };
+
+    // PTY mode: stderr is None (merged into stdout)
+    let mut handle = match ExecHandle::new(Pid::from_raw(pid as i32), stdin, stdout, None) {
+        Ok(handle) => handle,
+        Err(error) => {
+            terminate_child(&mut child);
+            return Err(error);
+        }
+    };
+
+    // Keep master FD for resize operations
+    let pty_controller = {
+        let fd = master.as_raw_fd();
+        std::mem::forget(master); // Transfer ownership
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    };
+    handle.set_pty(pty_controller, config);
+
+    Ok(handle)
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    let _fence = crate::reaper::reap_fence();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminate_child_kills_and_reaps_process() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+
+        terminate_child(&mut child);
+
+        assert!(child.try_wait().unwrap().is_some());
+    }
+}

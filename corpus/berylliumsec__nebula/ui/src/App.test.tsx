@@ -1,0 +1,1921 @@
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { App } from "./App";
+import { DialogProvider } from "./components/DialogSystem";
+import { ThemeProvider } from "./state/ThemeContext";
+import { WorkspaceProvider } from "./state/WorkspaceContext";
+
+vi.mock("./components/CodeMirrorSurface", () => ({
+  CodeMirrorSurface: ({ value, onChange }: { value: string; onChange(value: string): void }) => (
+    <textarea aria-label="Code editor" value={value} onChange={(event) => onChange(event.target.value)} />
+  ),
+}));
+
+function renderApp(route = "/") {
+  return render(
+    <MemoryRouter initialEntries={[route]}>
+      <LocationProbe />
+      <ThemeProvider>
+        <WorkspaceProvider>
+          <DialogProvider>
+            <App />
+          </DialogProvider>
+        </WorkspaceProvider>
+      </ThemeProvider>
+    </MemoryRouter>,
+  );
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="router-location" hidden>{`${location.pathname}${location.search}${location.hash}`}</output>;
+}
+
+function selectElementText(element: HTMLElement) {
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  const selection = document.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+  fireEvent.pointerUp(element);
+}
+
+function unmatchedCoreResponse(input: RequestInfo | URL) {
+  const pathname = new URL(String(input)).pathname;
+  if (pathname.endsWith("/goal")) {
+    return new Response(JSON.stringify({ detail: "Goal not found" }), { status: 404 });
+  }
+  // Core answers null when a chat has no pending turn. A list here would read
+  // as a running turn with no id and replace the loaded transcript.
+  if (pathname.endsWith("/pending-turn")) {
+    return new Response(JSON.stringify(null), { status: 200 });
+  }
+  return new Response(JSON.stringify([]), { status: 200 });
+}
+
+describe("Nebula workspace", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+    window.history.replaceState({}, "", "/");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Core offline")));
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("exposes every primary workspace destination", async () => {
+    renderApp();
+    for (const label of ["Workbench", "Findings", "Reports", "Project", "Settings"]) {
+      expect(screen.getByRole("link", { name: label })).toBeVisible();
+    }
+    expect(await screen.findByRole("tab", { name: "Terminal" }, { timeout: 5_000 })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Application model" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Start in Terminal, edit shared code, browse a target, ask the assistant, or open your project files.")).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Workspace code editor" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Autonomous missions" })).toBeVisible();
+    expect(screen.queryByText(/Acme|Jordan/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("Human controlled")).not.toBeInTheDocument();
+  });
+
+  it("never renders the removed Human controlled badge in any theme", () => {
+    for (const theme of ["light", "dark", "zero-dark"] as const) {
+      localStorage.setItem("nebula.theme", theme);
+      const rendered = renderApp();
+      expect(screen.queryByText("Human controlled")).not.toBeInTheDocument();
+      expect(document.querySelector('[title^="Human controlled"]')).not.toBeInTheDocument();
+      rendered.unmount();
+    }
+  });
+
+  it("opens and restores the dedicated Workbench Code view", async () => {
+    const user = userEvent.setup();
+    renderApp("/?view=code");
+    expect(await screen.findByRole("tab", { name: "Workspace code editor" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("Terminal and Code become available as soon as Nebula finishes creating or loading a project.")).toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "Terminal" }));
+    await user.click(screen.getByRole("tab", { name: "Workspace code editor" }));
+    expect(screen.getByTestId("router-location")).toHaveTextContent("/?view=code");
+    expect(localStorage.getItem("nebula.workbench.view")).toBeNull();
+  });
+
+  it("opens the Workbench full screen and exits with Escape", async () => {
+    const user = userEvent.setup();
+    renderApp();
+    expect(screen.queryByRole("button", { name: "More Workbench actions" })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "Enter focus mode" }));
+    const workbench = document.querySelector(".sessions-page");
+    expect(workbench).toHaveClass("full-screen");
+    expect(screen.getByRole("button", { name: "Exit full screen workbench" })).toBeVisible();
+
+    await user.keyboard("{Escape}");
+    expect(workbench).not.toHaveClass("full-screen");
+    expect(screen.getByRole("button", { name: "Enter focus mode" })).toBeVisible();
+  });
+
+  it("defaults to Quiet Lens and preserves the selected shell preference", () => {
+    const firstRender = renderApp();
+    expect(document.documentElement).toHaveAttribute("data-theme", "quiet-lens");
+    expect(document.querySelector(".app-shell")).toHaveClass("quiet-lens-shell");
+    expect(document.querySelector(".app-shell")).not.toHaveClass("zero-layer-shell");
+    expect(screen.getByRole("complementary", { name: "Primary navigation" })).toHaveAttribute("data-shell", "shared");
+    expect(screen.queryByRole("region", { name: "Zero Layer context" })).not.toBeInTheDocument();
+    expect(localStorage.getItem("nebula.theme")).toBeNull();
+
+    firstRender.unmount();
+    localStorage.setItem("nebula.theme", "light");
+    const lightRender = renderApp();
+    expect(document.documentElement).toHaveAttribute("data-theme", "light");
+    expect(document.querySelector(".app-shell")).not.toHaveClass("zero-layer-shell");
+    expect(localStorage.getItem("nebula.theme")).toBe("light");
+    lightRender.unmount();
+
+    localStorage.setItem("nebula.theme", "dark");
+    const darkRender = renderApp();
+    expect(document.documentElement).toHaveAttribute("data-theme", "dark");
+    expect(document.querySelector(".app-shell")).not.toHaveClass("zero-layer-shell");
+    expect(localStorage.getItem("nebula.theme")).toBe("dark");
+    darkRender.unmount();
+
+    localStorage.setItem("nebula.theme", "zero-light");
+    renderApp();
+    expect(document.documentElement).toHaveAttribute("data-theme", "zero-light");
+    expect(document.documentElement.style.colorScheme).toBe("light");
+    expect(document.querySelector(".app-shell")).toHaveClass("zero-layer-shell");
+    expect(localStorage.getItem("nebula.theme")).toBe("zero-light");
+  });
+
+  it("restores legacy mission links to the Workbench mission view", async () => {
+    renderApp("/missions");
+    expect(await screen.findByRole("tab", { name: "Autonomous missions" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Autonomous missions" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("navigates with the keyboard command palette", async () => {
+    const user = userEvent.setup();
+    renderApp();
+    await user.keyboard("{Control>}k{/Control}");
+    const search = screen.getByRole("textbox", { name: "Search pages, actions, and settings" });
+    await user.type(search, "provider");
+    await user.click(screen.getByRole("option", { name: /Go to Settings/ }));
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+  });
+
+  it("offers the original Zero palette alongside the new color themes", async () => {
+    const user = userEvent.setup();
+    renderApp("/settings");
+    await screen.findByRole("heading", { name: "Settings" });
+    await user.click(screen.getByRole("link", { name: "Advanced settings" }));
+    await user.click(screen.getByText("Identity & Security", { selector: "summary strong" }));
+    const options = screen.getByRole("heading", { name: "Appearance" }).closest("section")!;
+    expect(options.querySelectorAll(".theme-options button")).toHaveLength(9);
+    expect(within(options).getByRole("button", { name: /^Light$/ })).toBeVisible();
+    expect(within(options).getByRole("button", { name: /^Dark$/ })).toBeVisible();
+    expect(within(options).getByRole("button", { name: /^Zero Light$/ })).toBeVisible();
+    expect(within(options).getByRole("button", { name: "Zero Classic" })).toBeVisible();
+    expect(within(options).getByRole("button", { name: "Glacier" })).toBeVisible();
+    expect(within(options).getByRole("button", { name: "Amber" })).toBeVisible();
+    expect(within(options).getByRole("button", { name: "Quiet Lens" })).toBeVisible();
+    await user.click(within(options).getByRole("button", { name: "Zero Dark" }));
+    expect(document.documentElement).toHaveAttribute("data-theme", "zero-dark");
+    expect(localStorage.getItem("nebula.theme")).toBe("zero-dark");
+  });
+
+  it("opens Appearance from universal search, saves Light, and restores the preference", async () => {
+    const user = userEvent.setup();
+    const firstRender = renderApp();
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(screen.getByRole("textbox", { name: "Search pages, actions, and settings" }), "light theme");
+    await user.click(screen.getByRole("option", { name: /Appearance and theme/ }));
+    const lens = screen.getByRole("dialog", { name: "Appearance and theme" });
+    await user.click(await within(lens).findByRole("button", { name: /^Light$/ }));
+    expect(document.documentElement).toHaveAttribute("data-theme", "light");
+    expect(localStorage.getItem("nebula.theme")).toBe("light");
+    await user.click(within(lens).getByRole("button", { name: "Done" }));
+
+    firstRender.unmount();
+    renderApp("/settings");
+    await screen.findByRole("heading", { name: "Settings" });
+    await user.click(screen.getByRole("link", { name: "Advanced settings" }));
+    await user.click(screen.getByText("Identity & Security", { selector: "summary strong" }));
+    expect(screen.getByRole("button", { name: "Light" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("renders the Zero shell without the removed context deck", () => {
+    localStorage.setItem("nebula.theme", "zero-dark");
+    const firstRender = renderApp();
+    expect(document.querySelector(".app-shell")).toHaveClass("zero-layer-shell");
+    expect(screen.queryByRole("region", { name: "Zero Layer context" })).not.toBeInTheDocument();
+
+    firstRender.unmount();
+    localStorage.setItem("nebula.theme", "light");
+    renderApp();
+    expect(screen.queryByRole("region", { name: "Zero Layer context" })).not.toBeInTheDocument();
+    expect(document.querySelector(".app-shell")).not.toHaveClass("zero-layer-shell");
+  });
+
+  it("persists the collapsible sidebar and exposes legacy labels through command search", async () => {
+    localStorage.setItem("nebula.theme", "dark");
+    const user = userEvent.setup();
+    renderApp();
+    await user.click(screen.getByRole("button", { name: "Hide sidebar" }));
+    expect(screen.getByRole("button", { name: "Show sidebar" })).toBeVisible();
+    expect(localStorage.getItem("nebula.sidebar.collapsed")).toBe("true");
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(screen.getByRole("textbox", { name: "Search pages, actions, and settings" }), "Overview");
+    expect(screen.getByRole("option", { name: /Go to Project/ })).toBeVisible();
+  });
+
+  it("opens a focused setting from the top-bar search without leaving the current pane", async () => {
+    const user = userEvent.setup();
+    renderApp("/findings");
+    await screen.findByRole("heading", { name: "Findings" });
+    const searchTrigger = screen.getByRole("button", { name: "Search pages, actions, and settings" });
+    await user.click(searchTrigger);
+    await user.type(screen.getByRole("textbox", { name: "Search pages, actions, and settings" }), "network ports");
+    await user.click(screen.getByRole("option", { name: /Project policy and network scope/ }));
+
+    const lens = screen.getByRole("dialog", { name: "Project policy and network scope" });
+    expect(await within(lens).findByRole("heading", { name: "Project execution policy" })).toBeVisible();
+    expect(within(lens).getByText("Network scope", { selector: "h3" })).toBeVisible();
+    expect(screen.getByTestId("router-location")).toHaveTextContent("/findings");
+
+    await user.click(within(lens).getByRole("button", { name: "Done" }));
+    expect(searchTrigger).toHaveFocus();
+  });
+
+  it("routes browser and desktop global shortcuts through the shared shell commands", async () => {
+    const user = userEvent.setup();
+    renderApp("/findings");
+    expect(await screen.findByRole("heading", { name: "Findings" })).toBeVisible();
+    await user.keyboard("{Control>},{/Control}");
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeVisible();
+    await user.keyboard("{Control>}1{/Control}");
+    expect(await screen.findByRole("tab", { name: "Terminal" })).toBeVisible();
+  });
+
+  it("shows a truthful Core failure without fabricated workspace records", async () => {
+    renderApp();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Nebula Core is unavailable");
+    expect(screen.getByRole("button", {name: "Reconnect"})).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /Show activity inspector/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Acme|Jordan|Gateway applicability/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps diagnostics out of the advanced view while preserving legacy hashes", async () => {
+    // The router location owns the settings section, so a legacy hash has to
+    // arrive through it, as it does from the address bar under BrowserRouter.
+    const user = userEvent.setup();
+    renderApp("/settings#security-settings");
+    expect(await screen.findByRole("link", { name: "Advanced settings" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { name: "Operator profiles" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Model providers" })).not.toBeVisible();
+    expect(screen.getByRole("heading", { name: "Diagnostics", hidden: true })).not.toBeVisible();
+
+    await user.click(screen.getByRole("link", { name: "Diagnostics settings and recent errors" }));
+    expect(screen.getByRole("heading", { name: "Diagnostics" })).toBeVisible();
+
+    await user.click(screen.getByRole("link", { name: "Setup" }));
+    expect(screen.getByRole("link", { name: "Setup" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("selects the newest Core run and opens its replay stream", async () => {
+    class OnlineWebSocket extends EventTarget {
+      static lastUrl = "";
+      static instance: OnlineWebSocket | undefined;
+
+      constructor(url: string | URL) {
+        super();
+        OnlineWebSocket.lastUrl = String(url);
+        OnlineWebSocket.instance = this;
+      }
+
+      close() {}
+    }
+
+    const entity = {
+      created_at: "2026-07-12T10:00:00Z",
+      updated_at: "2026-07-12T11:00:00Z",
+      revision: 1,
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/engagements")) {
+        return new Response(JSON.stringify([{ ...entity, id: "engagement-first", name: "Live engagement", status: "active", metadata: {} }]), { status: 200 });
+      }
+      if (url.pathname.endsWith("/runs")) {
+        return new Response(JSON.stringify([
+          { ...entity, id: "run-oldest", engagement_id: "engagement-first", objective: "Old mission", status: "complete", metadata: {} },
+          { ...entity, id: "run-newest", engagement_id: "engagement-first", objective: "Live mission", status: "running", updated_at: "2026-07-12T12:00:00Z", metadata: {} },
+        ]), { status: 200 });
+      }
+      if (url.pathname.endsWith("/runs/run-newest/context")) {
+        return new Response(JSON.stringify({
+          owner_type: "agent_run", owner_id: "run-newest", status: "ready", context_window: 8192, max_output_tokens: 2048, target_input_tokens: 4608, estimated_input_tokens: 5000, compacted_through: 4,
+          snapshot: { ...entity, id: "snapshot-run", owner_type: "agent_run", owner_id: "run-newest", version: 1, status: "ready", compacted_through: 4, memory: { summary: "Dependency results retained for synthesis.", confirmed_facts: [], decisions: [], constraints: [], corrections: [], open_questions: [], evidence_ids: ["evidence-1"], artifact_ids: [] }, source_references: [{ source_kind: "task_result", source_id: "task-1" }], provider_profile_id: "provider-1", model: "model-1", prompt_version: "nebula-context-v1", usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }, cost_usd: 0.001 },
+        }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/approvals")) {
+        return new Response(JSON.stringify([{ ...entity, id: "approval-first", engagement_id: "engagement-first", run_id: "run-first", status: "pending", risk_class: "active_scan", exact_request: { tool_name: "scan.tcp", arguments: { ports: [443] } }, policy_rationale: "Active scan approval", requested_by: "network-specialist", requested_at: entity.created_at, expected_effects: ["Probe the target"] }]), { status: 200 });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", OnlineWebSocket);
+    renderApp("/project");
+
+    expect(await screen.findByRole("heading", { name: "Live engagement" })).toBeVisible();
+    const emptyActivity = screen.getByText("No mission activity", { exact: true }).closest(".mission-events-empty") as HTMLElement | null;
+    expect(emptyActivity).not.toBeNull();
+    expect(within(emptyActivity!).getByText("Events appear after Core records a transition.", { exact: true })).toBeVisible();
+    expect(emptyActivity!.closest("li")).toBeNull();
+    expect(screen.getByRole("button", { name: /Show activity inspector/ })).toBeVisible();
+    expect(OnlineWebSocket.lastUrl).toContain("/api/v1/runs/run-newest/events/ws?after=0");
+    const approvalLoads = fetchMock.mock.calls.filter(([input]) => new URL(String(input)).pathname.endsWith("/approvals")).length;
+    act(() => OnlineWebSocket.instance?.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ kind: "event", event: { id: "event-live", run_id: "run-newest", sequence: 1, event_type: "approval.requested", payload: { summary: "Approval requested" }, occurred_at: "2026-07-12T12:01:00Z" } }) })));
+    expect(fetchMock.mock.calls.filter(([input]) => new URL(String(input)).pathname.endsWith("/approvals"))).toHaveLength(approvalLoads + 1);
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual(expect.arrayContaining([
+      expect.stringContaining("/api/v1/runs?engagement_id=engagement-first"),
+      expect.stringContaining("/api/v1/approvals?engagement_id=engagement-first"),
+      expect.stringContaining("/api/v1/assets?engagement_id=engagement-first"),
+      expect.stringContaining("/api/v1/findings?engagement_id=engagement-first"),
+      expect.stringMatching(/\/api\/v1\/providers\?limit=1000&offset=0$/),
+    ]));
+  });
+
+  it("opens Assistant without automatically opening a new chat", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Idle assistant", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/sessions");
+
+    expect(await screen.findByRole("tab", { name: "Analyst chat" })).toHaveAttribute("aria-selected", "true");
+    expect((await screen.findAllByText("No conversation open"))[0]).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "Message the analyst assistant" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Conversations")).not.toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "Session inspector" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show session details" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(fetchMock.mock.calls.some(([input, init]) => new URL(String(input)).pathname.endsWith("/chat/completions") && init?.method === "POST")).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Start new chat" }));
+    expect(screen.getByRole("textbox", { name: "Message the analyst assistant" })).toBeVisible();
+    expect(screen.getByTestId("router-location")).toHaveTextContent("/projects/engagement-1/workbench?view=chat");
+  });
+
+  it("lets Assistant settings choose an OpenRouter model outside the provider allowlist", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const provider = {
+      ...entity,
+      id: "provider-1",
+      name: "OpenRouter",
+      provider_type: "openrouter",
+      endpoint: "https://openrouter.ai/api/v1",
+      enabled: true,
+      is_local: false,
+      secret_ref: "env:OPENROUTER_API_KEY",
+      model_allowlist: ["model-1"],
+      capabilities: { streaming: true },
+      privacy: { local_only: false, residency: [], permits_sensitive_data: true },
+      metadata: { default_model: "model-1" },
+    };
+    const discovered = ["model-1", "model-2", "model-3"];
+    const descriptors = [{ id: "model-3", name: "Model Three", context_window: 200_000 }];
+    let allowlist = ["model-1"];
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/providers/provider-1/health")) {
+        // Core reports allowlisted models and the rest of discovery separately.
+        return new Response(JSON.stringify({
+          provider_id: "provider-1",
+          healthy: true,
+          models: discovered.filter((item) => allowlist.includes(item)),
+          model_descriptors: descriptors.filter((item) => allowlist.includes(item.id)),
+          unlisted_models: discovered.filter((item) => !allowlist.includes(item)),
+          unlisted_model_descriptors: descriptors.filter((item) => !allowlist.includes(item.id)),
+          detail: null,
+        }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/providers/provider-1") && init?.method === "PATCH") {
+        const { changes } = JSON.parse(String(init.body));
+        allowlist = changes.model_allowlist;
+        return new Response(JSON.stringify({ ...provider, ...changes, revision: 2 }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Live engagement", status: "active", metadata: {} }]), { status: 200 });
+      if (url.pathname.endsWith("/providers")) return new Response(JSON.stringify([provider]), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    renderApp("/sessions");
+    await user.click(await screen.findByRole("tab", { name: /Analyst chat/ }, { timeout: 5_000 }));
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+    await user.click(screen.getByRole("button", { name: "Assistant settings" }));
+    const modelSelect = await screen.findByRole("combobox", { name: "Chat model" });
+    await waitFor(() => expect(screen.getByRole("option", { name: "Model Three (model-3) · 200,000 context" })).toBeInTheDocument());
+    expect(screen.getByRole("group", { name: "More OpenRouter models · adds to allowed" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "model-2" })).toBeInTheDocument();
+    await user.selectOptions(modelSelect, "model-3");
+
+    await waitFor(() => expect(modelSelect).toHaveValue("model-3"));
+    await waitFor(() => expect(within(screen.getByRole("group", { name: "Allowed models" })).getByRole("option", { name: "Model Three (model-3) · 200,000 context" })).toBeInTheDocument());
+    const patch = fetchMock.mock.calls.find(([input, init]) => new URL(String(input)).pathname.endsWith("/providers/provider-1") && init?.method === "PATCH");
+    expect(JSON.parse(String(patch?.[1]?.body))).toMatchObject({
+      changes: { model_allowlist: ["model-1", "model-3"], secret_ref: "env:OPENROUTER_API_KEY", metadata: { default_model: "model-1" } },
+      expected_revision: 1,
+    });
+  });
+
+  it("switches a saved provider conversation to the first available harness", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const provider = {
+      ...entity,
+      id: "provider-1",
+      name: "Cloud analyst",
+      provider_type: "openai",
+      endpoint: "https://api.openai.com/v1",
+      enabled: true,
+      is_local: false,
+      secret_ref: "env:OPENAI_API_KEY",
+      model_allowlist: ["provider-model"],
+      capabilities: { streaming: true },
+      privacy: { local_only: false, residency: [], permits_sensitive_data: true },
+      metadata: { default_model: "provider-model" },
+    };
+    const harness = {
+      ...entity,
+      id: "harness-1",
+      name: "Codex",
+      kind: "codex_app_server",
+      connection_mode: "spawn",
+      transport: "stdio",
+      auth_mode: "existing_session",
+      default_model: "codex-model",
+      enabled: true,
+      privacy: { local_only: true, permits_sensitive_data: true },
+      native_capabilities: { workspace_access: "write", shell: true },
+      capabilities: {
+        checked_at: "2026-07-12T11:00:00Z",
+        authentication_state: "verified",
+        models: ["codex-model"],
+      },
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Runtime switch", status: "active", metadata: {} }]), { status: 200 });
+      if (path.endsWith("/providers/provider-1/health")) return new Response(JSON.stringify({ provider_id: "provider-1", healthy: true, models: ["provider-model"], detail: null }), { status: 200 });
+      if (path.endsWith("/providers")) return new Response(JSON.stringify([provider]), { status: 200 });
+      if (path.endsWith("/harnesses")) return new Response(JSON.stringify([harness]), { status: 200 });
+      if (path.endsWith("/chat-sessions")) return new Response(JSON.stringify([{
+        ...entity,
+        id: "session-provider",
+        engagement_id: "engagement-1",
+        title: "Provider conversation",
+        backend: "provider",
+        provider_profile_id: "provider-1",
+        model: "provider-model",
+        metadata: { message_count: 0 },
+      }]), { status: 200 });
+      if (path.endsWith("/chat/sessions/session-provider/messages")) return new Response(JSON.stringify([]), { status: 200 });
+      if (path.endsWith("/chat/sessions/session-provider/pending-turn")) return new Response(JSON.stringify({ detail: "No pending turn" }), { status: 404 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/sessions?view=chat&session=session-provider");
+
+    await screen.findByRole("textbox", { name: "Message the analyst assistant" }, { timeout: 5_000 });
+    await user.click(screen.getByRole("button", { name: "Assistant settings" }));
+    expect(await screen.findByRole("combobox", { name: "Chat runtime" })).toHaveValue("provider");
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Chat runtime" }), "harness");
+
+    expect(screen.getByRole("combobox", { name: "Chat harness" })).toHaveValue("harness-1");
+    expect(screen.getByRole("combobox", { name: "Chat harness model" })).toHaveValue("codex-model");
+    expect(screen.getByRole("button", { name: "Assistant settings" })).toHaveTextContent("Codex");
+  });
+
+  // A full App render, the lazy Workbench and typed input take 3-5 s under
+  // load, against vitest's 5 s default (CI passes --testTimeout=15000).
+  it("streams analyst chat with explicit provider/model selection and cloud knowledge consent", async () => {
+    const entity = {
+      created_at: "2026-07-12T10:00:00Z",
+      updated_at: "2026-07-12T11:00:00Z",
+      revision: 1,
+    };
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/providers/provider-1/health")) {
+        return new Response(JSON.stringify({ provider_id: "provider-1", healthy: true, models: ["model-1", "model-2"], detail: null }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/engagements")) {
+        return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Live engagement", status: "active", metadata: {} }]), { status: 200 });
+      }
+      if (url.pathname.endsWith("/providers")) {
+        return new Response(JSON.stringify([{
+          ...entity,
+          id: "provider-1",
+          name: "Cloud analyst",
+          provider_type: "openai",
+          endpoint: "https://api.openai.com/v1",
+          enabled: true,
+          is_local: false,
+          secret_ref: "env:OPENAI_API_KEY",
+          model_allowlist: [],
+          capabilities: { streaming: true },
+          privacy: { local_only: false, residency: [], permits_sensitive_data: true },
+          metadata: {},
+        }]), { status: 200 });
+      }
+      if (url.pathname.endsWith("/knowledge")) {
+        return new Response(JSON.stringify([{
+          ...entity,
+          id: "source-1",
+          engagement_id: "engagement-1",
+          name: "scope.md",
+          source_type: "document",
+          artifact_id: "artifact-1",
+          status: "ready",
+          citation: "scope.md",
+          document_count: 1,
+          metadata: { filename: "scope.md", media_type: "text/markdown", chunk_count: 1 },
+        }]), { status: 200 });
+      }
+      if (url.pathname.endsWith("/chat/turns/turn-1/hooks") || url.pathname.endsWith("/chat/sessions/session-1/hooks")) {
+        return new Response(JSON.stringify([{
+          id: "hook-run-1", hook_id: "audit", event_name: "chat.turn.completed",
+          status: "complete", side_effects: "none", started_at: "2026-09-18T12:00:00Z", completed_at: "2026-09-18T12:00:01Z",
+        }]), { status: 200 });
+      }
+      if (url.pathname.endsWith("/hooks") && !url.pathname.includes("/chat/")) {
+        return new Response(JSON.stringify([{
+          id: "audit", source: "project", path: "/workspace/.agents/hooks/audit",
+          manifest: { version: 1, name: "Audit lifecycle", description: "Record turn outcomes", events: ["chat.turn.started", "chat.turn.completed"], command: ["run.sh"], timeout_seconds: 10, side_effects: "none", failure_policy: "continue" },
+          manifest_sha256: "a".repeat(64), executable_sha256: "b".repeat(64),
+        }]), { status: 200 });
+      }
+      // Since #548 a send first confirms the provider credential with Core.
+      if (url.pathname.endsWith(`/credentials/${encodeURIComponent("env:OPENAI_API_KEY")}/status`)) {
+        return new Response(JSON.stringify({ reference: "env:OPENAI_API_KEY", persistence: "environment", available: true, state: "available" }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/chat/completions")) {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: started\ndata: {"type":"started","provider_id":"provider-1","model":"model-1","session_id":"session-1"}\n\n'));
+            controller.enqueue(encoder.encode('event: delta\ndata: {"type":"delta","provider_id":"provider-1","model":"model-1","delta":"Bounded "}\n\n'));
+            controller.enqueue(encoder.encode('event: done\ndata: {"type":"done","turn_id":"turn-1","session_id":"session-1","provider_id":"provider-1","model":"model-1","message":{"role":"assistant","content":"Bounded answer"},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"finish_reason":"stop","provider_request_id":"request-1","citations":[]}\n\n'));
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    renderApp("/sessions");
+    await user.click(await screen.findByRole("tab", { name: /Analyst chat/ }, { timeout: 5_000 }));
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+    await user.click(screen.getByRole("button", { name: "Assistant settings" }));
+    expect(await screen.findByRole("combobox", { name: "Chat provider" })).toHaveValue("provider-1");
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Chat model" })).toHaveValue("model-1"));
+    expect(screen.getByRole("option", { name: "model-2" })).toBeVisible();
+    const hookToggle = await screen.findByRole("checkbox", { name: /Audit lifecycle/ });
+    await user.click(hookToggle);
+    expect(fetchMock.mock.calls.some(([input, init]) => new URL(String(input)).pathname.endsWith("/providers/provider-1/health") && init?.method === "POST")).toBe(true);
+    const composer = screen.getByRole("textbox", { name: "Message the analyst assistant" });
+    await user.type(composer, "Review the scope");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByText("Bounded answer")).toBeVisible();
+    expect(screen.queryByText("Share cited excerpts?")).not.toBeInTheDocument();
+    expect(composer).toHaveValue("");
+    await user.click(composer);
+    expect(fireEvent.keyDown(composer, { key: "ArrowUp" })).toBe(false);
+    expect(composer).toHaveValue("Review the scope");
+    await user.clear(composer);
+    await user.type(composer, "Keep this draft");
+    await user.keyboard("{ArrowUp}");
+    expect(composer).toHaveValue("Keep this draft");
+    await user.clear(composer);
+    fireEvent.change(composer, { target: { value: "" } });
+    expect(fireEvent.keyDown(composer, { key: "ArrowUp" })).toBe(false);
+    const chatCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/api/v1/chat/completions"));
+    expect(JSON.parse(String(chatCall?.[1]?.body))).toMatchObject({
+      provider_id: "provider-1",
+      model: "model-1",
+      engagement_id: "engagement-1",
+      include_knowledge: true,
+      allow_cloud_knowledge: true,
+      hook_ids: ["audit"],
+      messages: [{ role: "user", content: "Review the scope" }],
+    });
+    expect(await screen.findByText("Lifecycle hooks · 1/1 completed")).toBeVisible();
+  }, 15_000);
+
+  it("reconciles an interrupted provider hook then resumes from Core state", async () => {
+    const entity = {
+      created_at: "2026-09-18T12:00:00Z",
+      updated_at: "2026-09-18T12:01:00Z",
+      revision: 1,
+    };
+    let recoveryBlocked = true;
+    let turnRevision = 3;
+    let hookStatus = "interrupted";
+    let hookReconciliation: Record<string, unknown> | undefined;
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      const path = url.pathname;
+      if (path.endsWith("/health")) {
+        return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      }
+      if (path.endsWith("/engagements")) {
+        return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Hook recovery", status: "active", metadata: {} }]), { status: 200 });
+      }
+      if (path.endsWith("/providers")) {
+        return new Response(JSON.stringify([{
+          ...entity,
+          id: "provider-1",
+          name: "Cloud analyst",
+          provider_type: "openai",
+          endpoint: "https://api.openai.com/v1",
+          enabled: true,
+          is_local: false,
+          secret_ref: "env:OPENAI_API_KEY",
+          model_allowlist: ["model-1"],
+          capabilities: { streaming: true },
+          privacy: { local_only: false, residency: [], permits_sensitive_data: true },
+          metadata: { default_model: "model-1" },
+        }]), { status: 200 });
+      }
+      if (path.endsWith("/chat-sessions")) {
+        return new Response(JSON.stringify([{
+          ...entity,
+          id: "session-hook",
+          engagement_id: "engagement-1",
+          title: "Interrupted hook",
+          backend: "provider",
+          provider_profile_id: "provider-1",
+          model: "model-1",
+          metadata: { message_count: 1 },
+        }]), { status: 200 });
+      }
+      if (path.endsWith("/chat/sessions/session-hook/messages")) {
+        return new Response(JSON.stringify([{
+          ...entity,
+          id: "message-user",
+          engagement_id: "engagement-1",
+          session_id: "session-hook",
+          sequence: 1,
+          role: "user",
+          content: "Audit this turn",
+          citations: [],
+          usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        }]), { status: 200 });
+      }
+      if (path.endsWith("/chat/sessions/session-hook/pending-turn")) {
+        return new Response(JSON.stringify({
+          id: "turn-hook",
+          session_id: "session-hook",
+          started_at: "2026-09-18T12:00:30Z",
+          revision: turnRevision,
+          status: "interrupted",
+          tool_call_ids: [],
+          error: "Core restarted before the hook outcome was known.",
+          recovery_blocked: recoveryBlocked,
+          unresolved_tool_call_ids: [],
+          unresolved_hook_execution_ids: recoveryBlocked ? ["hook-run-1"] : [],
+        }), { status: 200 });
+      }
+      if (path.endsWith("/chat/turns/turn-hook/hooks")) {
+        return new Response(JSON.stringify([{
+          id: "hook-run-1",
+          hook_id: "audit",
+          event_name: "chat.turn.started",
+          status: hookStatus,
+          side_effects: "external",
+          started_at: "2026-09-18T12:00:00Z",
+          completed_at: "2026-09-18T12:01:00Z",
+          error: hookStatus === "interrupted" ? "Core restarted before the hook outcome was known." : undefined,
+          reconciliation: hookReconciliation,
+        }]), { status: 200 });
+      }
+      if (path.endsWith("/hooks") && !path.includes("/chat/")) {
+        return new Response(JSON.stringify([{
+          id: "audit",
+          source: "project",
+          path: "/workspace/.agents/hooks/audit",
+          manifest: {
+            version: 1,
+            name: "Audit lifecycle",
+            description: "Record turn outcomes",
+            events: ["chat.turn.started"],
+            command: ["run.sh"],
+            timeout_seconds: 10,
+            side_effects: "external",
+            failure_policy: "continue",
+          },
+          manifest_sha256: "a".repeat(64),
+          executable_sha256: "b".repeat(64),
+        }]), { status: 200 });
+      }
+      if (path.endsWith("/chat/turns/turn-hook/reconcile-hook") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        recoveryBlocked = false;
+        turnRevision += 1;
+        hookStatus = "reconciled";
+        hookReconciliation = { outcome: body.outcome, detail: body.detail };
+        return new Response(JSON.stringify({
+          id: "turn-hook",
+          session_id: "session-hook",
+          started_at: "2026-09-18T12:00:30Z",
+          revision: turnRevision,
+          status: "interrupted",
+          tool_call_ids: [],
+          error: "Core restarted before the hook outcome was known.",
+          recovery_blocked: false,
+          unresolved_tool_call_ids: [],
+          unresolved_hook_execution_ids: [],
+        }), { status: 200 });
+      }
+      if (path.endsWith("/chat/turns/turn-hook/resume") && init?.method === "POST") {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: done\ndata: {"type":"done","turn_id":"turn-hook","session_id":"session-hook","provider_id":"provider-1","model":"model-1","message":{"role":"assistant","content":"Resumed after hook confirmation"},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"finish_reason":"stop","citations":[]}\n\n'));
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/sessions");
+
+    await user.click(await screen.findByRole("tab", { name: /Analyst chat/ }, { timeout: 5_000 }));
+    await user.click(screen.getByRole("button", { name: "Show conversations" }));
+    const conversationPanel = await screen.findByLabelText("Conversations");
+    await user.click(within(conversationPanel).getByRole("button", { name: /Interrupted hookmodel-1/ }));
+
+    expect(await screen.findByText("Core is recovering this response automatically. Recorded receipts will be adopted; uncertain effects will not be replayed.")).toBeVisible();
+    expect(screen.getByText("Lifecycle hooks · 0/1 completed")).toBeVisible();
+    expect(screen.getByText("Audit lifecycle")).toBeVisible();
+    expect(screen.queryByPlaceholderText("Operator verification note")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Confirm completed" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Mark failed" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume response" })).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([request, requestInit]) =>
+      (String(request).includes("reconcile-hook") || String(request).endsWith("/resume")) && requestInit?.method === "POST"
+    )).toBe(false);
+  });
+
+  it("opens selected text as an editable draft and hashes it only on explicit send", async () => {
+    const entity = {
+      created_at: "2026-07-12T10:00:00Z",
+      updated_at: "2026-07-12T11:00:00Z",
+      revision: 1,
+    };
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "project-1", name: "Selection review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (path.endsWith("/providers/provider-1/health") && init?.method === "POST") return new Response(JSON.stringify({ provider_id: "provider-1", healthy: true, models: ["model-1"], detail: null }), { status: 200 });
+      if (path.endsWith("/providers")) return new Response(JSON.stringify([{
+        ...entity,
+        id: "provider-1",
+        name: "Local assistant",
+        provider_type: "vllm",
+        endpoint: "http://127.0.0.1:8000/v1",
+        enabled: true,
+        is_local: true,
+        secret_ref: null,
+        model_allowlist: ["model-1"],
+        capabilities: { streaming: true },
+        privacy: { local_only: true, residency: [], permits_sensitive_data: false },
+        metadata: { default_model: "model-1" },
+      }]), { status: 200 });
+      if (path.endsWith("/setup/status")) return new Response(JSON.stringify({
+        core: { status: "ready", detail: null },
+        scratch_project_id: null,
+        terminal: { status: "disabled", runner_profile_id: null, candidates: [], detail: null },
+        assistant: { status: "configured", provider_profile_id: "provider-1", detail: null },
+      }), { status: 200 });
+      if (path.endsWith("/chat/completions")) {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: done\ndata: {"type":"done","session_id":"session-selection","provider_id":"provider-1","model":"model-1","message":{"role":"assistant","content":"Selection explained"},"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6},"finish_reason":"stop","citations":[]}\n\n'));
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/project");
+
+    const heading = await screen.findByRole("heading", { name: "Selection review" });
+    selectElementText(heading);
+    await user.click(await screen.findByRole("button", { name: "Add context to chat" }));
+
+    expect(await screen.findByRole("tab", { name: "Analyst chat" })).toHaveAttribute("aria-selected", "true");
+    const attachment = screen.getByRole("region", { name: "Selected context pack" });
+    expect(attachment).toHaveTextContent("Project selection");
+    expect(within(attachment).queryByText("Selection review", { selector: "p" })).toBeNull();
+    const expandQuote = within(attachment).getByRole("button", { name: "Expand Project selection" });
+    expect(expandQuote).toHaveAttribute("aria-expanded", "false");
+    await user.click(expandQuote);
+    expect(within(attachment).getByText("Selection review", { selector: "p" })).toBeVisible();
+    expect(within(attachment).getByRole("button", { name: "Collapse Project selection" })).toHaveAttribute("aria-expanded", "true");
+    const composer = screen.getByRole("textbox", { name: "Message the analyst assistant" });
+    expect(composer).toHaveValue("");
+    expect(fetchMock.mock.calls.some(([input]) => new URL(String(input)).pathname.endsWith("/chat/completions"))).toBe(false);
+
+    await user.clear(composer);
+    await user.type(composer, "Explain this project title.");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText("Selection explained")).toBeVisible();
+
+    const request = fetchMock.mock.calls.find(([input]) => new URL(String(input)).pathname.endsWith("/chat/completions"));
+    const body = JSON.parse(String(request?.[1]?.body));
+    expect(body.context_attachments).toEqual([expect.objectContaining({
+      source_kind: "project",
+      source_label: "Project selection",
+      text: "Selection review",
+      truncated: false,
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })]);
+    expect(body.messages).toEqual([{
+      role: "user",
+      content: "Explain this project title.",
+      content_blocks: [{
+        type: "text",
+        text: "Explain this project title.",
+        metadata: {},
+      }],
+    }]);
+  });
+
+  it("captures selected text as a saved note without unmounting Workbench", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "project-1", name: "Notes review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (path.endsWith("/observations") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        return new Response(JSON.stringify({ ...entity, id: "note-selection", ...body, asset_ids: [], service_ids: [], evidence_ids: [], confidence: 1 }), { status: 201 });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/project");
+
+    const heading = await screen.findByRole("heading", { name: "Notes review" });
+    selectElementText(heading);
+    await user.click(await screen.findByRole("button", { name: "Take note" }));
+
+    expect(await screen.findByRole("tab", { name: "Project notes" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByRole("textbox", { name: "Note title" })).toHaveValue("Note from Project selection");
+    expect(screen.getByRole("textbox", { name: "Note body" })).toHaveValue("Notes review");
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => new URL(String(input)).pathname.endsWith("/observations") && init?.method === "POST")).toBe(true));
+  });
+
+  it("keeps chat drafts durable while saved memory stays behind explicit disclosure", async () => {
+    const entity = {
+      created_at: "2026-07-12T10:00:00Z",
+      updated_at: "2026-07-12T11:00:00Z",
+      revision: 1,
+    };
+    let chatPresent = true;
+    let chatTitle = "Saved context";
+    let chatRevision = 1;
+    let chatMetadata: Record<string, unknown> = { message_count: 3 };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Memory review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (path.endsWith("/providers")) return new Response(JSON.stringify([{ ...entity, id: "provider-1", name: "Local analyst", provider_type: "vllm", endpoint: null, enabled: true, is_local: true, secret_ref: null, model_allowlist: ["model-1"], capabilities: { streaming: true }, privacy: { local_only: true, residency: [], permits_sensitive_data: false }, metadata: { default_model: "model-1" } }]), { status: 200 });
+      if (path.endsWith("/chat-sessions/session-1") && init?.method === "DELETE") { chatPresent = false; return new Response(null, { status: 204 }); }
+      if (path.endsWith("/chat-sessions/session-1") && init?.method === "PATCH") { const body = JSON.parse(String(init.body)); if (body.title) chatTitle = body.title; if (body.archived === true) chatMetadata = { ...chatMetadata, archived_at: "2026-07-12T12:00:00Z" }; if (body.archived === false) { const { archived_at: _archivedAt, ...rest } = chatMetadata; chatMetadata = rest; } chatRevision += 1; return new Response(JSON.stringify({ ...entity, revision: chatRevision, id: "session-1", engagement_id: "engagement-1", title: chatTitle, provider_profile_id: "provider-1", model: "model-1", metadata: chatMetadata }), { status: 200 }); }
+      if (path.endsWith("/chat-sessions")) return new Response(JSON.stringify(chatPresent ? [{ ...entity, revision: chatRevision, id: "session-1", engagement_id: "engagement-1", title: chatTitle, provider_profile_id: "provider-1", model: "model-1", metadata: chatMetadata }] : []), { status: 200 });
+      if (path.endsWith("/chat/sessions/session-1/messages")) return new Response(JSON.stringify([
+        { ...entity, id: "message-1", engagement_id: "engagement-1", session_id: "session-1", sequence: 1, role: "user", content: "Use port 8443", citations: [], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } },
+        { ...entity, id: "message-2", engagement_id: "engagement-1", session_id: "session-1", sequence: 2, role: "assistant", content: "Port retained\n\nUse `nmap` for verification.", citations: [], usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 } },
+        { ...entity, id: "message-3", engagement_id: "engagement-1", session_id: "session-1", sequence: 3, role: "system", content: "I verified the retry is idempotent.", metadata: { kind: "agent_message", sender_session_id: "peer-1", sender_title: "Retry reviewer" }, citations: [], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } },
+      ]), { status: 200 });
+      if (path.endsWith("/chat/sessions/session-1/context")) return new Response(JSON.stringify({
+        owner_type: "chat_session",
+        owner_id: "session-1",
+        status: "ready",
+        context_window: 8192,
+        max_output_tokens: 2048,
+        target_input_tokens: 4608,
+        estimated_input_tokens: 4700,
+        compacted_through: 1,
+        snapshot: {
+          ...entity,
+          id: "snapshot-1",
+          owner_type: "chat_session",
+          owner_id: "session-1",
+          version: 1,
+          status: "ready",
+          compacted_through: 1,
+          memory: { summary: "The selected service uses port 8443.", confirmed_facts: [], decisions: [], constraints: [], corrections: [], open_questions: [], evidence_ids: [], artifact_ids: [] },
+          source_references: [{ source_kind: "chat_message", source_id: "message-1", sequence: 1 }],
+          provider_profile_id: "provider-1",
+          model: "model-1",
+          prompt_version: "nebula-context-v1",
+          usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 },
+          cost_usd: 0,
+        },
+      }), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    const rendered = renderApp("/sessions");
+
+    // The lazy Workbench is the slow part of a full App render under load.
+    await user.click(await screen.findByRole("tab", { name: /Analyst chat/ }, { timeout: 10_000 }));
+    expect(screen.queryByLabelText("Conversations")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Show conversations" }));
+    const conversationPanel = await screen.findByLabelText("Conversations");
+    expect(conversationPanel.closest(".session-layout")).toHaveClass("conversation-panel-open");
+    expect(localStorage.getItem("nebula.conversations.open")).toBe("true");
+    expect(within(conversationPanel).getByTitle("Saved context")).toBeVisible();
+    expect(await screen.findByText("Port retained")).toBeVisible();
+    const peerMessage = await screen.findByText("I verified the retry is idempotent.");
+    expect(peerMessage.closest("article")).toHaveClass("agent-message");
+    expect(screen.getByText("Message from Retry reviewer")).toBeVisible();
+    const conversationSearch = screen.getByRole("searchbox", { name: "Search conversations" });
+    await user.type(conversationSearch, "missing runtime");
+    expect(screen.getByText("No conversations match “missing runtime”.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Clear conversation search" }));
+    expect(within(conversationPanel).getByTitle("Saved context")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: /Saved contextmodel-1/ }));
+    await waitFor(() => expect(screen.getByTestId("router-location")).toHaveTextContent(/session=session-1/));
+    expect(await screen.findByText("Port retained")).toBeVisible();
+    const transcript = screen.getByText("Port retained").closest(".chat-scroll")!;
+    const transcriptMutations: MutationRecord[] = [];
+    const transcriptObserver = new MutationObserver((records) => transcriptMutations.push(...records));
+    transcriptObserver.observe(transcript, { childList: true, subtree: true });
+    await user.type(screen.getByRole("textbox", { name: "Message the analyst assistant" }), "draft");
+    transcriptMutations.push(...transcriptObserver.takeRecords());
+    transcriptObserver.disconnect();
+    expect(transcriptMutations.filter((record) => record.addedNodes.length || record.removedNodes.length)).toEqual([]);
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => new URL(String(input)).pathname.endsWith("/chat/sessions/session-1/context"))).toBe(true));
+    expect(screen.queryByText("The selected service uses port 8443.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Working memory" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Open context details, 100 percent of target input used" }));
+    const inspector = await screen.findByLabelText("Session inspector");
+    expect(within(inspector).getByText("Compacted through message 1. The original messages are unchanged and searchable.")).toBeVisible();
+    await user.click(within(inspector).getByText("Inspect saved memory"));
+    expect(within(inspector).getByText("The selected service uses port 8443.")).toBeVisible();
+    rendered.unmount();
+    renderApp("/sessions");
+    const recoveredComposer = await screen.findByRole("textbox", { name: "Message the analyst assistant" });
+    await waitFor(() => expect(recoveredComposer).toHaveValue("draft"));
+    expect(await screen.findByText("Port retained")).toBeVisible();
+    const assistantMessage = screen.getByText("Port retained").closest("article");
+    expect(assistantMessage).not.toBeNull();
+    await user.click(within(assistantMessage!).getByRole("button", { name: "Quote in composer" }));
+    expect((recoveredComposer as HTMLTextAreaElement).value).toContain("> Port retained");
+    expect(screen.queryByRole("button", { name: "Save Assistant Response" })).not.toBeInTheDocument();
+    for (const forkButton of screen.getAllByRole("button", { name: "Fork conversation here" })) {
+      expect(forkButton.closest(".chat-message-actions")).not.toBeNull();
+      expect(forkButton.closest("header")).toBeNull();
+    }
+    await user.click(screen.getByRole("button", { name: "More actions for Saved context" }));
+    const savedContextMenu = screen.getByRole("menu", { name: "Actions for Saved context" });
+    await user.click(within(savedContextMenu).getByRole("menuitem", { name: "Rename" }));
+    const renameInput = screen.getByRole("textbox", { name: "Rename conversation Saved context" });
+    await user.clear(renameInput);
+    await user.type(renameInput, "Port review");
+    await user.click(screen.getByRole("button", { name: "Save conversation name" }));
+    expect((await screen.findAllByTitle("Port review"))[0]).toBeVisible();
+    const renameCall = fetchMock.mock.calls.find(([input, request]) => new URL(String(input)).pathname.endsWith("/chat-sessions/session-1") && request?.method === "PATCH");
+    expect(JSON.parse(String(renameCall?.[1]?.body))).toEqual({ title: "Port review", expected_revision: 1 });
+    await user.click(screen.getByRole("button", { name: "More actions for Port review" }));
+    await user.click(within(screen.getByRole("menu", { name: "Actions for Port review" })).getByRole("menuitem", { name: "Archive" }));
+    const archivedToggle = await screen.findByRole("button", { name: /Archived\s*1/ });
+    // The group opens for the selected conversation once the list shows it archived.
+    await waitFor(() => expect(archivedToggle).toHaveAttribute("aria-expanded", "true"));
+    expect(screen.getByText("This conversation is archived. Sending a message moves it back to your conversations.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "More actions for Port review" })).toBeVisible();
+    const archiveCall = [...fetchMock.mock.calls].reverse().find(([input, request]) => new URL(String(input)).pathname.endsWith("/chat-sessions/session-1") && request?.method === "PATCH");
+    expect(JSON.parse(String(archiveCall?.[1]?.body))).toEqual({ archived: true, expected_revision: 2 });
+    await user.click(screen.getByRole("button", { name: "More actions for Port review" }));
+    await user.click(within(screen.getByRole("menu", { name: "Actions for Port review" })).getByRole("menuitem", { name: "Unarchive" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Archived\s*1/ })).not.toBeInTheDocument());
+    expect(screen.queryByText("This conversation is archived. Sending a message moves it back to your conversations.")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "More actions for Port review" }));
+    const portReviewMenu = screen.getByRole("menu", { name: "Actions for Port review" });
+    await user.click(within(portReviewMenu).getByRole("menuitem", { name: "Delete" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete Port review?" });
+    await user.click(within(dialog).getByRole("button", { name: "Delete conversation" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "More actions for Port review" })).not.toBeInTheDocument());
+    expect(fetchMock.mock.calls.some(([input, request]) => new URL(String(input)).pathname.endsWith("/chat-sessions/session-1") && request?.method === "DELETE")).toBe(true);
+    expect(new URLSearchParams(window.location.search).get("session")).toBeNull();
+  }, 15_000);
+
+  it("edits a sent message in place instead of branching the conversation", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const message = (id: string, sequence: number, role: "user" | "assistant", content: string, metadata: Record<string, unknown> = {}) => ({
+      ...entity, id, engagement_id: "engagement-1", session_id: "session-1", sequence, role, content, citations: [], metadata,
+    });
+    const session = { ...entity, id: "session-1", engagement_id: "engagement-1", title: "Legacy VPN audit", provider_profile_id: "provider-1", model: "model-1", metadata: {} };
+    let transcript = [
+      message("message-1", 1, "user", "Summarize the open findings."),
+      message("message-2", 2, "assistant", "Two findings remain open."),
+      message("message-3", 3, "user", "Any update on the certificate?"),
+      message("message-4", 4, "assistant", "The certificate expired on 12 August."),
+    ];
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      const path = url.pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Live engagement", status: "active", metadata: {} }]), { status: 200 });
+      if (path.endsWith("/providers")) return new Response(JSON.stringify([{ ...entity, id: "provider-1", name: "Local analyst", provider_type: "vllm", endpoint: null, enabled: true, is_local: true, secret_ref: null, model_allowlist: ["model-1"], capabilities: { streaming: true }, privacy: { local_only: true, residency: [], permits_sensitive_data: false }, metadata: { default_model: "model-1" } }]), { status: 200 });
+      if (path.endsWith("/chat-sessions")) return new Response(JSON.stringify([session]), { status: 200 });
+      if (path.endsWith("/chat/sessions/session-1/rewind")) {
+        const body = JSON.parse(String(init?.body)) as { before_message_id: string };
+        const boundary = transcript.find((item) => item.id === body.before_message_id)!;
+        const replaced = transcript.filter((item) => item.sequence >= boundary.sequence && !item.metadata.retracted_at)
+          .map((item) => ({ ...item, metadata: { retracted_at: "2026-07-12T12:00:00Z", retraction_id: "retraction-1", retracted_reason: "operator_edit" } }));
+        transcript = transcript.map((item) => replaced.find((entry) => entry.id === item.id) ?? item);
+        return new Response(JSON.stringify({ session, messages: transcript.filter((item) => !item.metadata.retracted_at), replaced }), { status: 200 });
+      }
+      if (path.endsWith("/chat/sessions/session-1/messages")) {
+        const visible = url.searchParams.get("include_replaced") === "true"
+          ? transcript
+          : transcript.filter((item) => !item.metadata.retracted_at);
+        return new Response(JSON.stringify(visible), { status: 200 });
+      }
+      if (path.endsWith("/chat/completions")) {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: started\ndata: {"type":"started","provider_id":"provider-1","model":"model-1","session_id":"session-1"}\n\n'));
+            controller.enqueue(encoder.encode('event: done\ndata: {"type":"done","turn_id":"turn-2","session_id":"session-1","provider_id":"provider-1","model":"model-1","message":{"role":"assistant","content":"IKEv1 aggressive mode is still enabled."},"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"finish_reason":"stop","provider_request_id":"request-2","citations":[]}\n\n'));
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/sessions?view=chat&session=session-1");
+
+    const edited = await screen.findByText("Any update on the certificate?", {}, { timeout: 5_000 });
+    await user.click(within(edited.closest("article")!).getByRole("button", { name: "Edit message" }));
+    const editor = screen.getByRole("textbox", { name: "Edit message" });
+    expect(editor).toHaveValue("Any update on the certificate?");
+    await user.clear(editor);
+    await user.type(editor, "Any update on the certificate and IKEv1?");
+    await user.click(screen.getByRole("button", { name: "Resend" }));
+
+    expect(await screen.findByText("IKEv1 aggressive mode is still enabled.")).toBeVisible();
+    const rewindCall = fetchMock.mock.calls.find(([callInput]) => new URL(String(callInput)).pathname.endsWith("/chat/sessions/session-1/rewind"));
+    expect(JSON.parse(String(rewindCall?.[1]?.body))).toEqual({ before_message_id: "message-3" });
+    expect(fetchMock.mock.calls.some(([callInput]) => new URL(String(callInput)).pathname.endsWith("/fork"))).toBe(false);
+    const sendCall = fetchMock.mock.calls.find(([callInput]) => new URL(String(callInput)).pathname.endsWith("/chat/completions"));
+    expect(JSON.parse(String(sendCall?.[1]?.body))).toMatchObject({
+      session_id: "session-1",
+      messages: [{ role: "user", content: "Any update on the certificate and IKEv1?" }],
+    });
+    expect(screen.getByText("Any update on the certificate and IKEv1?").closest(".chat-message.operator")).not.toBeNull();
+    expect(document.querySelectorAll(".chat-message.operator")).toHaveLength(2);
+    // The replaced turns leave the conversation but stay readable behind the disclosure.
+    const replacedDisclosure = screen.getByText(/^2 replaced messages/);
+    const replacedGroup = replacedDisclosure.closest("details")!;
+    expect(replacedGroup).not.toHaveAttribute("open");
+    expect(screen.getByText("Any update on the certificate?").closest(".chat-replaced-group")).toBe(replacedGroup);
+    expect(screen.getByText("The certificate expired on 12 August.").closest(".chat-replaced-group")).toBe(replacedGroup);
+    await user.click(replacedDisclosure);
+    expect(replacedGroup).toHaveAttribute("open");
+    expect(within(replacedGroup).getByText("Replaced by your edit and kept for reference. They are not sent to the model.")).toBeVisible();
+  });
+
+  it("deletes every saved Assistant conversation after one confirmation", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const chats = [
+      { ...entity, id: "session-1", engagement_id: "engagement-1", title: "First conversation", provider_profile_id: null, model: null, metadata: { message_count: 2 } },
+      { ...entity, id: "session-2", engagement_id: "engagement-1", title: "Second conversation", provider_profile_id: null, model: null, metadata: { message_count: 4 } },
+    ];
+    const deleted = new Set<string>();
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Bulk delete review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      const sessionMatch = path.match(/\/chat-sessions\/(session-[12])$/);
+      if (sessionMatch && init?.method === "DELETE") {
+        deleted.add(sessionMatch[1]);
+        return new Response(null, { status: 204 });
+      }
+      if (path.endsWith("/chat-sessions")) return new Response(JSON.stringify(chats.filter((chat) => !deleted.has(chat.id))), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/sessions");
+
+    await user.click(await screen.findByRole("button", { name: "Show conversations" }));
+    const conversationPanel = await screen.findByLabelText("Conversations");
+    expect(within(conversationPanel).getByText("First conversation")).toBeVisible();
+    expect(within(conversationPanel).getByText("Second conversation")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "More conversation actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete all conversations" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete all conversations?" });
+    expect(dialog).toHaveTextContent("including every message and saved working memory");
+    await user.click(within(dialog).getByRole("button", { name: "Delete all conversations" }));
+
+    await waitFor(() => expect(screen.queryByText("First conversation")).not.toBeInTheDocument());
+    expect(screen.queryByText("Second conversation")).not.toBeInTheDocument();
+    expect(deleted).toEqual(new Set(["session-1", "session-2"]));
+    await user.click(screen.getByRole("button", { name: "More conversation actions" }));
+    expect(screen.getByRole("menuitem", { name: "Delete all conversations" })).toBeDisabled();
+  });
+
+  it("reconciles already-deleted conversations with Core during bulk delete", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const chats = [
+      { ...entity, id: "session-1", engagement_id: "engagement-1", title: "Stale first conversation", provider_profile_id: null, model: null, metadata: {} },
+      { ...entity, id: "session-2", engagement_id: "engagement-1", title: "Stale second conversation", provider_profile_id: null, model: null, metadata: {} },
+    ];
+    let listedChats = true;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Stale chat review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (/\/chat-sessions\/session-[12]$/.test(path) && init?.method === "DELETE") {
+        listedChats = false;
+        return new Response(JSON.stringify({ detail: "chat_sessions entity not found", error_id: "err_already_deleted", retryable: false }), { status: 404 });
+      }
+      if (path.endsWith("/chat-sessions")) return new Response(JSON.stringify(listedChats ? chats : []), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/sessions");
+
+    await user.click(await screen.findByRole("button", { name: "Show conversations" }));
+    const conversationPanel = await screen.findByLabelText("Conversations");
+    expect(within(conversationPanel).getByText("Stale first conversation")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "More conversation actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete all conversations" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Delete all conversations?" })).getByRole("button", { name: "Delete all conversations" }));
+
+    await waitFor(() => expect(screen.queryByText("Stale first conversation")).not.toBeInTheDocument());
+    expect(screen.queryByText("Stale second conversation")).not.toBeInTheDocument();
+    expect(screen.queryByText(/conversations could not be deleted/)).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([input, request]) => /\/chat-sessions\/session-[12]$/.test(new URL(String(input)).pathname) && request?.method === "DELETE")).toHaveLength(2);
+  });
+
+  it("keeps the exact Core diagnostic when a bulk delete is genuinely blocked", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const active = { ...entity, id: "session-1", engagement_id: "engagement-1", title: "Active investigation", provider_profile_id: null, model: null, metadata: {} };
+    const stale = { ...entity, id: "session-2", engagement_id: "engagement-1", title: "Already removed", provider_profile_id: null, model: null, metadata: {} };
+    let firstList = true;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Blocked delete review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (path.endsWith("/chat-sessions/session-1") && init?.method === "DELETE") return new Response(JSON.stringify({
+        detail: "conversation cannot be deleted while a harness turn is active",
+        error_id: "err_active_harness_turn",
+        retryable: true,
+        reason_code: "state_conflict",
+        operator_detail: "A harness turn is still running for this conversation.",
+        impact: "The conversation was preserved.",
+        recovery_action: "Stop the response and retry",
+        recovery_destination: "/sessions?session=session-1",
+      }), { status: 409 });
+      if (path.endsWith("/chat-sessions/session-2") && init?.method === "DELETE") return new Response(JSON.stringify({ detail: "chat_sessions entity not found", error_id: "err_already_deleted", retryable: false }), { status: 404 });
+      if (path.endsWith("/chat-sessions")) {
+        const response = firstList ? [active, stale] : [active];
+        firstList = false;
+        return new Response(JSON.stringify(response), { status: 200 });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/sessions");
+
+    await user.click(await screen.findByRole("button", { name: "Show conversations" }));
+    const conversationPanel = await screen.findByLabelText("Conversations");
+    expect(within(conversationPanel).getByText("Already removed")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "More conversation actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete all conversations" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Delete all conversations?" })).getByRole("button", { name: "Delete all conversations" }));
+
+    await waitFor(() => expect(screen.queryByText("Already removed")).not.toBeInTheDocument());
+    expect(within(conversationPanel).getByText("Active investigation")).toBeVisible();
+    expect(screen.getByText(/1 of 2 conversations could not be deleted.*harness turn is active/)).toBeVisible();
+    expect(screen.getByText("Reference: err_active_harness_turn · state conflict")).toBeVisible();
+    expect(screen.getByRole("link", { name: "Stop the response and retry" })).toHaveAttribute("href", "/sessions?session=session-1");
+    const deleteNotice = screen.getByText(/1 of 2 conversations could not be deleted/).closest(".diagnostic-error-notice");
+    expect(deleteNotice).not.toBeNull();
+    expect(within(deleteNotice as HTMLElement).queryByText("Reference: pending local diagnostic")).not.toBeInTheDocument();
+  });
+
+  it("starts Terminal automatically inside the reviewed container boundary", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "ready", human_pty: "unavailable", container_terminal: "configured" }), { status: 200 });
+      if (path.endsWith("/setup/status")) return new Response(JSON.stringify({
+        core: { status: "ready", detail: null },
+        scratch_project_id: "engagement-1",
+        terminal: {
+          status: "ready", runner_profile_id: "runner-1", candidates: [], detail: null,
+          image_preparation: {
+            phase: "ready", operation_id: "00000000-0000-4000-8000-000000000001", project_id: "engagement-1",
+            progress_percent: 100, progress_indeterminate: false, can_cancel: false, can_retry: false,
+            image_digest: `sha256:${"c".repeat(64)}`, detail: "Cached and verified",
+          },
+        },
+        assistant: { status: "needs_model", provider_profile_id: null, detail: null },
+      }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Terminal review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (path.endsWith("/container-terminal/capabilities")) return new Response(JSON.stringify({
+        engagement_id: "engagement-1", ready: true, source_image: "docker.io/kalilinux/kali-rolling:latest", installed_packages: ["kali-linux-headless", "iputils-ping"], workspace: "/workspace",
+        network: { mode: "unrestricted", runtime_network: "bridge", published_ports: [] },
+        security: { container_user: "root", root_filesystem: "writable", linux_capabilities: [], no_new_privileges: true, host_network: false, runtime_socket: false, host_shell: false },
+        limits: { cpu_count: 1, memory_mb: 512, pids: 128, timeout_seconds: 1800, output_bytes_per_stream: 2_000_000 },
+        idle_timeout_seconds: 900, fresh_container: true, detail: null,
+      }), { status: 200 });
+      if (path.endsWith("/container-terminals/recover") && init?.method === "POST") {
+        return new Response(JSON.stringify({ sessions: [] }), { status: 200 });
+      }
+      if (path.endsWith("/container-terminal/capacity")) {
+        return new Response(JSON.stringify({ active_sessions: 0, available_sessions: 32, max_active_sessions: 32 }), { status: 200 });
+      }
+      if (path.endsWith("/container-terminal/preflight") && init?.method === "POST") return new Response(JSON.stringify({
+        allowed: true,
+        detail: "request is confined to the workspace",
+        runtime: {
+          source_image: "docker.io/kalilinux/kali-rolling:latest", interpreter: "/bin/bash", arguments: ["--noprofile", "--norc", "-i"],
+          base_image: `docker.io/kalilinux/kali-rolling@sha256:${"b".repeat(64)}`, base_image_digest: `sha256:${"b".repeat(64)}`,
+          image: `sha256:${"c".repeat(64)}`, image_digest: `sha256:${"c".repeat(64)}`, installed_packages: ["kali-linux-headless", "iputils-ping"],
+          runner_profile_id: "runner-1", runner_profile_revision: 2, runner_runtime: "podman", runner_isolation: "rootless",
+          runner_executable: "/usr/bin/podman", runner_platform: "linux/amd64",
+        },
+        network: { mode: "unrestricted", runtime_network: "bridge", published_ports: [] },
+        security: { container_user: "root", root_filesystem: "writable", linux_capabilities: [], no_new_privileges: true, host_network: false, runtime_socket: false, host_shell: false },
+        limits: { cpu_count: 1, memory_mb: 512, pids: 128, timeout_seconds: 1800, output_bytes_per_stream: 2_000_000 },
+        workspace: "/workspace", policy_rule: "human_terminal_unrestricted",
+        preview_fingerprint: "c".repeat(64), preview_token: "signed.preview", expires_at: "2026-07-13T18:00:00Z",
+        idle_timeout_seconds: 900, fresh_container: true,
+      }), { status: 200 });
+      if (path.endsWith("/container-terminal/sessions") && init?.method === "POST") {
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/projects/engagement-1/workbench");
+
+    expect(await screen.findByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => expect(screen.getByTestId("router-location")).toHaveTextContent("/projects/engagement-1/workbench"));
+    expect(await screen.findByRole("heading", { name: /^Terminal/ })).toBeVisible();
+    expect(screen.getByText("Root · bridge permitted")).toBeVisible();
+    expect(screen.getAllByText("kali-linux-headless").length).toBeGreaterThan(0);
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, request]) => new URL(String(input)).pathname.endsWith("/container-terminal/sessions") && request?.method === "POST")).toBe(true));
+
+    const preflightCall = fetchMock.mock.calls.find(([input, request]) => new URL(String(input)).pathname.endsWith("/container-terminal/preflight") && request?.method === "POST");
+    expect(JSON.parse(String(preflightCall?.[1]?.body))).toEqual({
+      engagement_id: "engagement-1",
+      columns: 100,
+      rows: 30,
+      published_ports: [],
+    });
+    const startCall = fetchMock.mock.calls.find(([input, request]) => new URL(String(input)).pathname.endsWith("/container-terminal/sessions") && request?.method === "POST");
+    expect(JSON.parse(String(startCall?.[1]?.body))).toMatchObject({ engagement_id: "engagement-1", preview_token: "signed.preview", preview_fingerprint: "c".repeat(64) });
+    expect(startCall?.[1]?.signal?.aborted).toBe(false);
+    await user.click(screen.getByRole("tab", { name: "Activity history" }));
+    expect(screen.getByRole("heading", { name: "Terminal audit" })).toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "Analyst chat" }));
+    await user.click(screen.getByRole("tab", { name: "Project notes" }));
+    await user.click(screen.getByRole("tab", { name: "Terminal" }));
+    expect(fetchMock.mock.calls.filter(([input, request]) => new URL(String(input)).pathname.endsWith("/container-terminal/sessions") && request?.method === "POST")).toHaveLength(1);
+    expect(startCall?.[1]?.signal?.aborted).toBe(false);
+  });
+
+  it("creates and activates a new project from the switcher", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    let engagements = [{ ...entity, id: "engagement-old", name: "Old engagement", description: "", client_name: "Old client", status: "active", tags: [], metadata: {} }];
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/workspace-folders")) {
+        const path = url.searchParams.get("path") ?? "/home/agent";
+        return new Response(JSON.stringify({
+          path,
+          parent: path === "/home/agent" ? "/home" : "/home/agent",
+          directories: path === "/home/agent" ? [{ name: "apple_bug_bounty_program", path: "/home/agent/apple_bug_bounty_program" }] : [],
+          truncated: false,
+        }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/engagements")) {
+        if (init?.method === "POST") {
+          const body = JSON.parse(String(init.body));
+          const created = { ...entity, id: "engagement-new", name: body.name, description: body.description, client_name: body.client_name, status: body.status, tags: body.tags, metadata: {} };
+          engagements = [...engagements, created];
+          return new Response(JSON.stringify(created), { status: 201 });
+        }
+        return new Response(JSON.stringify(engagements), { status: 200 });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp();
+
+    expect(await screen.findByTitle("Old engagement")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Switch project" }));
+    await user.click(screen.getByRole("button", { name: "New project" }));
+    await user.type(screen.getByRole("textbox", { name: "Name" }), "New engagement");
+    await user.type(screen.getByRole("textbox", { name: "Client name" }), "New client");
+    await user.click(screen.getByRole("button", { name: "Browse folders" }));
+    const folderDialog = await screen.findByRole("dialog", { name: "Choose project folder" });
+    await user.click(within(folderDialog).getByRole("button", { name: "apple_bug_bounty_program" }));
+    expect(within(folderDialog).getByText("/home/agent/apple_bug_bounty_program")).toBeVisible();
+    await user.click(within(folderDialog).getByRole("button", { name: "Select folder" }));
+    expect(screen.getByRole("textbox", { name: "Project folder" })).toHaveValue("/home/agent/apple_bug_bounty_program");
+    await user.click(screen.getByRole("button", { name: "Create" }));
+
+    expect(await screen.findByTitle("New engagement")).toBeVisible();
+    const createCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith("/api/v1/engagements") && init?.method === "POST");
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({ name: "New engagement", client_name: "New client", status: "draft", workspace_path: "/home/agent/apple_bug_bounty_program" });
+  });
+
+  it("searches, creates, and inspects assets", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const engagement = { ...entity, id: "engagement-1", name: "Asset review", description: "", status: "active", tags: [], metadata: {} };
+    let assets = [{ ...entity, id: "asset-old", engagement_id: "engagement-1", asset_type: "host", name: "old.example.test", address: "192.0.2.1", hostname: "old.example.test", criticality: "medium", exposed: true, tags: ["old"], metadata: {} }];
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/engagements")) return new Response(JSON.stringify([engagement]), { status: 200 });
+      if (url.pathname.endsWith("/assets")) {
+        if (init?.method === "POST") {
+          const body = JSON.parse(String(init.body));
+          const created = { ...entity, id: "asset-new", ...body, exposed: body.exposed, metadata: {} };
+          assets = [created, ...assets];
+          return new Response(JSON.stringify(created), { status: 201 });
+        }
+        return new Response(JSON.stringify(assets), { status: 200 });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/assets");
+    await screen.findByRole("heading", { name: "Assets" });
+
+    const search = screen.getByRole("searchbox", { name: "Search assets" });
+    await user.type(search, "missing");
+    expect(screen.getByText("No assets match the current search and filters.")).toBeVisible();
+    await user.clear(search);
+    await user.keyboard("{Control>}n{/Control}");
+    const dialog = screen.getByRole("dialog", { name: "Add asset" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Name" }), "new.example.test");
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: "Kind" }), "domain");
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: "Criticality" }), "high");
+    await user.click(within(dialog).getByRole("button", { name: "Add asset" }));
+
+    expect(await screen.findByText("new.example.test")).toBeVisible();
+    const row = screen.getByText("new.example.test").closest("tr");
+    expect(row).not.toBeNull();
+    await user.click(within(row!).getByRole("button", { name: "Inspect" }));
+    expect(screen.getByRole("complementary", { name: "new.example.test" })).toBeVisible();
+  });
+
+  it("refreshes operator revisions after activation before editing the former active profile", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z" };
+    let profiles: Array<typeof entity & { id: string; revision: number; display_name: string; email: string | null; role: string; active: boolean; activated_at: string | null; metadata: Record<string, unknown> }> = [
+      { ...entity, id: "operator-alice", revision: 1, display_name: "Alice Analyst", email: "alice@example.test", role: "Lead", active: true, activated_at: entity.updated_at, metadata: {} },
+      { ...entity, id: "operator-bob", revision: 1, display_name: "Bob Reviewer", email: null, role: "Reviewer", active: false, activated_at: null, metadata: {} },
+    ];
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/operator-profiles/operator-bob/activate")) {
+        profiles = [
+          { ...profiles[1], revision: 2, active: true, activated_at: "2026-07-12T12:00:00Z", updated_at: "2026-07-12T12:00:00Z" },
+          { ...profiles[0], revision: 2, active: false, updated_at: "2026-07-12T12:00:00Z" },
+        ];
+        return new Response(JSON.stringify(profiles[0]), { status: 200 });
+      }
+      if (url.pathname.endsWith("/operator-profiles/operator-alice") && init?.method === "PATCH") {
+        const body = JSON.parse(String(init.body));
+        const updated = { ...profiles[1], revision: 3, display_name: body.display_name, email: body.email, role: body.role };
+        profiles = [profiles[0], updated];
+        return new Response(JSON.stringify(updated), { status: 200 });
+      }
+      if (url.pathname.endsWith("/operator-profiles")) return new Response(JSON.stringify(profiles), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/settings");
+    await screen.findByRole("heading", { name: "Settings" });
+    await user.click(screen.getByRole("link", { name: "Advanced settings" }));
+
+    await user.click(await screen.findByRole("button", { name: "Activate" }));
+    await user.click(await screen.findByRole("button", { name: "Edit Alice Analyst" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit operator" });
+    const role = within(dialog).getByRole("textbox", { name: "Role" });
+    await user.clear(role);
+    await user.type(role, "Principal analyst");
+    await user.click(within(dialog).getByRole("button", { name: "Save operator" }));
+
+    const updateCall = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith("/api/v1/operator-profiles/operator-alice") && init?.method === "PATCH");
+    expect(JSON.parse(String(updateCall?.[1]?.body))).toMatchObject({ role: "Principal analyst", expected_revision: 2 });
+  });
+
+  it("collects the required Vertex project and location when adding a provider", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/providers/provider-vertex/health")) return new Response(JSON.stringify({ provider_id: "provider-vertex", healthy: true, models: ["gemini-2.5-pro"], detail: null }), { status: 200 });
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/provider-catalog")) return new Response(JSON.stringify([
+        { flavor: "bedrock", adapter: "bedrock", display_name: "AWS Bedrock", local: false, default_base_url: "https://bedrock-runtime.amazonaws.com", suggested_key_env: null, support_tier: "native", notes: "Uses the AWS credential chain." },
+        { flavor: "vertex", adapter: "gemini", display_name: "Google Vertex AI", local: false, default_base_url: null, suggested_key_env: "GOOGLE_ACCESS_TOKEN", support_tier: "native", notes: "Requires project and location." },
+      ]), { status: 200 });
+      if (url.pathname.endsWith("/providers") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        return new Response(JSON.stringify({ ...entity, id: "provider-vertex", ...body, metadata: body.metadata }), { status: 201 });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/settings");
+    await screen.findByRole("heading", { name: "Settings" });
+    await user.click(screen.getByRole("link", { name: "Advanced settings" }));
+
+    await user.click(screen.getByRole("button", { name: "Add provider" }));
+    const dialog = screen.getByRole("dialog", { name: "Add model provider" });
+    await user.selectOptions(within(dialog).getByLabelText("Provider type"), "vertex");
+    await user.type(within(dialog).getByLabelText("Endpoint"), "https://us-central1-aiplatform.googleapis.com");
+    await user.type(within(dialog).getByLabelText("Context window (tokens)"), "16000");
+    await user.type(within(dialog).getByLabelText("Maximum output tokens"), "1000");
+    await user.type(within(dialog).getByLabelText("Google Cloud project"), "security-project");
+    await user.type(within(dialog).getByLabelText("Vertex location"), "us-central1");
+    await user.click(within(dialog).getByRole("button", { name: "Add provider" }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => new URL(String(input)).pathname.endsWith("/providers") && init?.method === "POST")).toBe(true));
+    const createCall = fetchMock.mock.calls.find(([input, init]) => new URL(String(input)).pathname.endsWith("/providers") && init?.method === "POST");
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({ provider_type: "vertex", metadata: { options: { project: "security-project", location: "us-central1", context_window: 16000, max_output_tokens: 1000 } } });
+  });
+
+  it("offers OrcaRouter with authoritative gateway defaults", async () => {
+    const entity = { created_at: "2026-09-04T10:00:00Z", updated_at: "2026-09-04T10:00:00Z", revision: 1 };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/providers/provider-orcarouter/health")) return new Response(JSON.stringify({ provider_id: "provider-orcarouter", healthy: true, models: ["orcarouter/auto"], detail: null }), { status: 200 });
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/provider-catalog")) return new Response(JSON.stringify([{
+        flavor: "orcarouter",
+        adapter: "openai_compatible",
+        display_name: "OrcaRouter",
+        local: false,
+        default_base_url: "https://api.orcarouter.ai/v1",
+        suggested_key_env: "ORCAROUTER_API_KEY",
+        support_tier: "standard",
+      }]), { status: 200 });
+      if (url.pathname.endsWith("/providers") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        return new Response(JSON.stringify({ ...entity, id: "provider-orcarouter", ...body }), { status: 201 });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/settings");
+    await screen.findByRole("heading", { name: "Settings" });
+    await user.click(screen.getByRole("link", { name: "Advanced settings" }));
+
+    await user.click(screen.getByRole("button", { name: "Add provider" }));
+    const dialog = screen.getByRole("dialog", { name: "Add model provider" });
+    expect(within(dialog).getByLabelText("Provider type")).toHaveValue("orcarouter");
+    expect(within(dialog).getByLabelText("Profile name")).toHaveValue("OrcaRouter");
+    expect(within(dialog).getByLabelText("Endpoint")).toHaveValue("https://api.orcarouter.ai/v1");
+    await user.click(within(dialog).getByText("Advanced provider options"));
+    expect(within(dialog).getByLabelText("Credential environment variable")).toHaveValue("ORCAROUTER_API_KEY");
+    await user.click(within(dialog).getByRole("button", { name: "Add provider" }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => new URL(String(input)).pathname.endsWith("/providers") && init?.method === "POST")).toBe(true));
+    const createCall = fetchMock.mock.calls.find(([input, init]) => new URL(String(input)).pathname.endsWith("/providers") && init?.method === "POST");
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({
+      name: "OrcaRouter",
+      provider_type: "orcarouter",
+      endpoint: "https://api.orcarouter.ai/v1",
+      secret_ref: "env:ORCAROUTER_API_KEY",
+      is_local: false,
+    });
+  });
+
+  it("records a manual finding as an asset-linked, unverified candidate", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const asset = { ...entity, id: "asset-1", engagement_id: "engagement-1", asset_type: "domain", name: "portal.example.test", address: null, hostname: "portal.example.test", criticality: "high", exposed: true, tags: [], metadata: {} };
+    let findings: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Manual review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (url.pathname.endsWith("/assets")) return new Response(JSON.stringify([asset]), { status: 200 });
+      if (url.pathname.endsWith("/findings") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        const created = { ...entity, id: "finding-new", ...body, service_ids: [], evidence_ids: [], observation_ids: [], correlation_ids: [], remediation_id: null, verifier_id: null, verified_at: null };
+        findings = [created];
+        return new Response(JSON.stringify(created), { status: 201 });
+      }
+      if (url.pathname.endsWith("/findings")) return new Response(JSON.stringify(findings), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/findings");
+
+    await screen.findByRole("heading", { name: "Findings" });
+    const open = screen.getByRole("button", { name: "New finding" });
+    await waitFor(() => expect(open).toBeEnabled());
+    await user.click(open);
+    const dialog = screen.getByRole("dialog", { name: "Create candidate finding" });
+    expect(within(dialog).getByText(/unverified candidate only/i)).toBeVisible();
+    await user.type(within(dialog).getByLabelText("Title"), "Reflected script injection");
+    await user.type(within(dialog).getByLabelText("Description"), "Input is reflected without encoding.");
+    await user.selectOptions(within(dialog).getByLabelText("Severity"), "high");
+    await user.type(within(dialog).getByLabelText("Severity rationale"), "Internet reachable session theft risk");
+    await user.click(within(dialog).getByLabelText("portal.example.test"));
+    await user.type(within(dialog).getByLabelText("CVE identifiers"), "not-a-cve");
+    await user.click(within(dialog).getByRole("button", { name: "Create candidate" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("CVE identifiers must look like CVE-2026-1234");
+    expect(fetchMock.mock.calls.filter(([input, init]) => new URL(String(input)).pathname.endsWith("/findings") && init?.method === "POST")).toHaveLength(0);
+    await user.clear(within(dialog).getByLabelText("CVE identifiers"));
+    await user.type(within(dialog).getByLabelText("CVE identifiers"), "cve-2026-1234");
+    await user.type(within(dialog).getByLabelText("CWE identifiers"), "cwe-79");
+    await user.click(within(dialog).getByRole("button", { name: "Create candidate" }));
+
+    expect(await within(screen.getByRole("table")).findByText("Reflected script injection")).toBeVisible();
+    const createCall = fetchMock.mock.calls.find(([input, init]) => new URL(String(input)).pathname.endsWith("/findings") && init?.method === "POST");
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({ engagement_id: "engagement-1", status: "candidate", severity: "high", asset_ids: ["asset-1"], cve_ids: ["CVE-2026-1234"], cwe_ids: ["CWE-79"], metadata: { origin: "manual_operator_entry" } });
+    expect(JSON.parse(String(createCall?.[1]?.body))).not.toHaveProperty("verifier_id");
+  });
+
+  it("edits all analyst-managed finding fields and protects unsaved drafts", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const assets = [
+      { ...entity, id: "asset-1", engagement_id: "engagement-1", asset_type: "domain", name: "old.example.test", address: null, hostname: "old.example.test", criticality: "high", exposed: true, tags: [], metadata: {} },
+      { ...entity, id: "asset-2", engagement_id: "engagement-1", asset_type: "host", name: "new.example.test", address: "192.0.2.10", hostname: "new.example.test", criticality: "critical", exposed: true, tags: [], metadata: {} },
+    ];
+    const evidence = [
+      { ...entity, id: "evidence-1", engagement_id: "engagement-1", evidence_type: "operator_upload", title: "old-proof.txt", description: "Old proof", artifact_id: null, finding_id: "finding-1", asset_ids: ["asset-1"], sha256: "a".repeat(64), captured_at: entity.updated_at, captured_by: null, source_version: null, metadata: {} },
+      { ...entity, id: "evidence-2", engagement_id: "engagement-1", evidence_type: "operator_upload", title: "new-proof.txt", description: "New proof", artifact_id: null, finding_id: null, asset_ids: ["asset-2"], sha256: "b".repeat(64), captured_at: entity.updated_at, captured_by: null, source_version: null, metadata: {} },
+    ];
+    let findings: Record<string, unknown>[] = [
+      { ...entity, id: "finding-1", revision: 2, engagement_id: "engagement-1", title: "Original finding", description: "Original description", severity: "high", severity_rationale: "Original rationale", status: "validated", asset_ids: ["asset-1"], evidence_ids: ["evidence-1"], cve_ids: ["CVE-2025-1111"], cwe_ids: ["CWE-20"], verifier_id: null, verified_at: null },
+      { ...entity, id: "finding-2", engagement_id: "engagement-1", title: "Second finding", description: "Another record", severity: "low", severity_rationale: "Limited impact", status: "candidate", asset_ids: [], evidence_ids: [], cve_ids: [], cwe_ids: [], verifier_id: null, verified_at: null },
+    ];
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Finding review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (url.pathname.endsWith("/assets")) return new Response(JSON.stringify(assets), { status: 200 });
+      if (url.pathname.endsWith("/evidence")) return new Response(JSON.stringify(evidence), { status: 200 });
+      if (url.pathname.endsWith("/findings/finding-1") && init?.method === "PATCH") {
+        const request = JSON.parse(String(init.body));
+        const updated = { ...findings[0], ...request.changes, revision: 3, updated_at: "2026-07-12T12:00:00Z" };
+        findings = [updated, findings[1]];
+        return new Response(JSON.stringify(updated), { status: 200 });
+      }
+      if (url.pathname.endsWith("/findings")) return new Response(JSON.stringify(findings), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/findings");
+
+    await screen.findByRole("heading", { name: "Findings" });
+    await user.click(await screen.findByRole("button", { name: "Edit Original finding" }));
+    let inspector = screen.getByRole("complementary", { name: "Original finding" });
+    expect(within(inspector).getByRole("button", { name: "Save finding" })).toBeDisabled();
+
+    const title = within(inspector).getByLabelText("Title");
+    await user.clear(title);
+    await user.type(title, "  Updated finding  ");
+    const description = within(inspector).getByLabelText("Description");
+    await user.clear(description);
+    await user.type(description, "  Updated description  ");
+    await user.selectOptions(within(inspector).getByLabelText("Severity"), "critical");
+    const rationale = within(inspector).getByLabelText("Severity rationale");
+    await user.clear(rationale);
+    await user.type(rationale, "  Material external impact  ");
+    await user.click(within(inspector).getByLabelText("old.example.test"));
+    await user.click(within(inspector).getByLabelText("new.example.test"));
+    await user.selectOptions(within(inspector).getByLabelText("Finding lifecycle status"), "accepted_risk");
+    await user.click(within(inspector).getByLabelText("old-proof.txt"));
+    await user.click(within(inspector).getByLabelText("new-proof.txt"));
+
+    const cve = within(inspector).getByLabelText("CVE identifiers");
+    await user.clear(cve);
+    await user.type(cve, "not-a-cve");
+    expect(within(inspector).getByRole("button", { name: "Save finding" })).toBeDisabled();
+    expect(within(inspector).getByRole("alert")).toHaveTextContent("CVE identifiers must look like CVE-2026-1234");
+    expect(fetchMock.mock.calls.filter(([input, init]) => new URL(String(input)).pathname.endsWith("/findings/finding-1") && init?.method === "PATCH")).toHaveLength(0);
+    await user.clear(cve);
+    await user.type(cve, "cve-2026-1234, CVE-2026-1234");
+    const cwe = within(inspector).getByLabelText("CWE identifiers");
+    await user.clear(cwe);
+    await user.type(cwe, "cwe-79; CWE-79");
+
+    const save = within(inspector).getByRole("button", { name: "Save finding" });
+    expect(save).toBeEnabled();
+    await user.click(save);
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input, init]) => new URL(String(input)).pathname.endsWith("/findings/finding-1") && init?.method === "PATCH")).toHaveLength(1));
+    const patchCall = fetchMock.mock.calls.find(([input, init]) => new URL(String(input)).pathname.endsWith("/findings/finding-1") && init?.method === "PATCH");
+    expect(JSON.parse(String(patchCall?.[1]?.body))).toEqual({
+      expected_revision: 2,
+      changes: {
+        title: "Updated finding",
+        description: "Updated description",
+        severity: "critical",
+        severity_rationale: "Material external impact",
+        asset_ids: ["asset-2"],
+        cve_ids: ["CVE-2026-1234"],
+        cwe_ids: ["CWE-79"],
+        status: "accepted-risk",
+        evidence_ids: ["evidence-2"],
+      },
+    });
+
+    expect(await within(screen.getByRole("table")).findByText("Updated finding")).toBeVisible();
+    inspector = screen.getByRole("complementary", { name: "Updated finding" });
+    expect(within(inspector).getByText("Saved · revision 3")).toBeVisible();
+    expect(within(inspector).getByRole("button", { name: "Save finding" })).toBeDisabled();
+
+    await user.type(within(inspector).getByLabelText("Title"), " draft");
+    await user.click(screen.getByRole("button", { name: "Edit Second finding" }));
+    let discardDialog = screen.getByRole("dialog", { name: "Discard finding changes?" });
+    await user.click(within(discardDialog).getByRole("button", { name: "Cancel" }));
+    expect(within(screen.getByRole("complementary", { name: "Updated finding" })).getByLabelText("Title")).toHaveValue("Updated finding draft");
+    await user.click(screen.getByRole("button", { name: "Edit Second finding" }));
+    discardDialog = screen.getByRole("dialog", { name: "Discard finding changes?" });
+    await user.click(within(discardDialog).getByRole("button", { name: "Discard changes" }));
+    const secondInspector = screen.getByRole("complementary", { name: "Second finding" });
+    expect(secondInspector).toBeVisible();
+    await user.type(within(secondInspector).getByLabelText("Title"), " draft");
+    await user.click(within(secondInspector).getByRole("button", { name: "Close finding details" }));
+    discardDialog = screen.getByRole("dialog", { name: "Discard finding changes?" });
+    await user.click(within(discardDialog).getByRole("button", { name: "Discard changes" }));
+    // Confirmation and canonical route selection settle asynchronously.
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Second finding" })).not.toBeInTheDocument());
+  });
+
+  it("retains a finding draft after a revision conflict and validates confirmed evidence locally", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 4 };
+    const finding = { ...entity, id: "finding-confirmed", engagement_id: "engagement-1", title: "Confirmed issue", description: "Evidence-backed issue", severity: "high", severity_rationale: "Material impact", status: "confirmed", asset_ids: [], evidence_ids: ["evidence-1"], cve_ids: [], cwe_ids: ["CWE-79"], verifier_id: "operator-reviewer", verified_at: entity.updated_at };
+    const evidence = { ...entity, id: "evidence-1", engagement_id: "engagement-1", evidence_type: "operator_upload", title: "proof.txt", description: "Proof", artifact_id: null, finding_id: finding.id, asset_ids: [], sha256: "a".repeat(64), captured_at: entity.updated_at, captured_by: "operator-reviewer", source_version: null, metadata: {} };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Confirmed review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (url.pathname.endsWith("/findings/finding-confirmed") && init?.method === "PATCH") return new Response(JSON.stringify({ detail: "revision conflict: expected 4, found 5" }), { status: 409 });
+      if (url.pathname.endsWith("/findings")) return new Response(JSON.stringify([finding]), { status: 200 });
+      if (url.pathname.endsWith("/evidence")) return new Response(JSON.stringify([evidence]), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/findings");
+
+    await screen.findByRole("heading", { name: "Findings" });
+    await user.click(await screen.findByRole("button", { name: "Edit Confirmed issue" }));
+    const inspector = screen.getByRole("complementary", { name: "Confirmed issue" });
+    expect(within(inspector).getByText("operator-reviewer")).toBeVisible();
+    expect(within(inspector).getByRole("option", { name: "confirmed" })).toBeInTheDocument();
+    await user.click(within(inspector).getByLabelText("proof.txt"));
+    expect(within(inspector).getByRole("button", { name: "Save finding" })).toBeDisabled();
+    expect(within(inspector).getByRole("alert")).toHaveTextContent("Confirmed findings must retain at least one evidence record");
+    await user.click(within(inspector).getByLabelText("proof.txt"));
+    await user.type(within(inspector).getByLabelText("Description"), " Updated locally.");
+    await user.click(within(inspector).getByRole("button", { name: "Save finding" }));
+    expect(await within(inspector).findByRole("alert")).toHaveTextContent("revision conflict: expected 4, found 5");
+    expect(within(inspector).getByLabelText("Description")).toHaveValue("Evidence-backed issue Updated locally.");
+  });
+
+  it("edits, disables, and deletes provider profiles with current revisions", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z" };
+    let provider: Record<string, unknown> | undefined = { ...entity, id: "provider-anthropic", revision: 3, name: "Anthropic review", provider_type: "anthropic", endpoint: "https://api.anthropic.com", enabled: true, is_local: false, secret_ref: "env:ANTHROPIC_API_KEY", model_allowlist: ["claude-old"], capabilities: { streaming: true }, privacy: { local_only: false, residency: [], permits_sensitive_data: false }, metadata: { default_model: "claude-old" } };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/providers/provider-anthropic/health")) return new Response(JSON.stringify({ provider_id: "provider-anthropic", healthy: true, models: ["claude-old", "claude-new"], detail: null }), { status: 200 });
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/provider-catalog")) return new Response(JSON.stringify([{ flavor: "anthropic", adapter: "anthropic", display_name: "Anthropic", local: false, default_base_url: "https://api.anthropic.com", suggested_key_env: "ANTHROPIC_API_KEY", support_tier: "native", notes: "Models are discovered after authentication." }]), { status: 200 });
+      if (url.pathname.endsWith("/providers/provider-anthropic") && init?.method === "PATCH") {
+        const request = JSON.parse(String(init.body));
+        provider = { ...provider, ...request.changes, revision: Number(provider?.revision) + 1, updated_at: "2026-07-12T12:00:00Z" };
+        return new Response(JSON.stringify(provider), { status: 200 });
+      }
+      if (url.pathname.endsWith("/providers/provider-anthropic") && init?.method === "DELETE") {
+        provider = undefined;
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname.endsWith("/providers")) return new Response(JSON.stringify(provider ? [provider] : []), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/settings");
+
+    await screen.findByRole("heading", { name: "Settings" });
+    await user.click(screen.getByRole("link", { name: "Advanced settings" }));
+    await user.click(await screen.findByRole("button", { name: "Edit Anthropic review" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit Anthropic review" });
+    const defaultModel = within(dialog).getByLabelText("Default model");
+    await waitFor(() => expect(within(defaultModel).getByRole("option", { name: "claude-new" })).toBeInTheDocument());
+    await user.selectOptions(defaultModel, "claude-new");
+    await user.click(within(dialog).getByRole("button", { name: "Save provider" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Edit Anthropic review" })).not.toBeInTheDocument());
+
+    let patchCalls = fetchMock.mock.calls.filter(([input, init]) => new URL(String(input)).pathname.endsWith("/providers/provider-anthropic") && init?.method === "PATCH");
+    expect(JSON.parse(String(patchCalls[0][1]?.body))).toMatchObject({ changes: { model_allowlist: ["claude-new", "claude-old"], metadata: { default_model: "claude-new" } }, expected_revision: 3 });
+    await user.click(screen.getByRole("button", { name: "Disable Anthropic review" }));
+    await screen.findByRole("button", { name: "Enable Anthropic review" });
+    patchCalls = fetchMock.mock.calls.filter(([input, init]) => new URL(String(input)).pathname.endsWith("/providers/provider-anthropic") && init?.method === "PATCH");
+    expect(JSON.parse(String(patchCalls[1][1]?.body))).toEqual({ changes: { enabled: false }, expected_revision: 4 });
+    const deleteProvider = screen.getByRole("button", { name: "Delete Anthropic review" });
+    await user.click(deleteProvider);
+    const confirmDelete = await screen.findByRole("button", { name: "Delete provider" });
+    await waitFor(() => expect(confirmDelete).toHaveFocus());
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(deleteProvider).toHaveFocus());
+    await user.click(deleteProvider);
+    await user.click(await screen.findByRole("button", { name: "Delete provider" }));
+    expect(await screen.findByText("No provider profiles")).toBeVisible();
+    const deleteCall = fetchMock.mock.calls.find(([input, init]) => new URL(String(input)).pathname.endsWith("/providers/provider-anthropic") && init?.method === "DELETE");
+    expect(new Headers(deleteCall?.[1]?.headers).get("If-Match")).toBe("5");
+  });
+
+  it("adds a note section to a report and saves an operator-reviewed AI transform", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const note = { ...entity, id: "note-1", engagement_id: "engagement-1", observation_type: "note", title: "TLS note", body: "443 open; certificate review pending", asset_ids: [], service_ids: [], evidence_ids: [], source: "operator-note", confidence: 1, metadata: {} };
+    const report = { ...entity, id: "report-1", engagement_id: "engagement-1", title: "Draft assessment", status: "draft", executive_summary: "", finding_ids: [], observation_ids: [], note_transforms: [], artifact_ids: [], metadata: {} };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable" }), { status: 200 });
+      if (path.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Writing review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (path.endsWith("/providers")) return new Response(JSON.stringify([{ ...entity, id: "provider-1", name: "Local writer", provider_type: "vllm", endpoint: "http://127.0.0.1:8000/v1", enabled: true, is_local: true, secret_ref: null, model_allowlist: ["model-1"], capabilities: {}, privacy: { local_only: true, residency: [], permits_sensitive_data: false }, metadata: { default_model: "model-1" } }]), { status: 200 });
+      if (path.endsWith("/observations")) return new Response(JSON.stringify([note]), { status: 200 });
+      if (path.endsWith("/reports") && init?.method !== "POST") return new Response(JSON.stringify([report]), { status: 200 });
+      if (path.endsWith("/writing/transform")) return new Response(JSON.stringify({ content: "Port 443 was observed open; certificate posture remains under review.", provenance: { provider_profile_id: "provider-1", model: "model-1", prompt_version: "writing-transform/v1", source_sha256: "a".repeat(64), instruction: "Rewrite for the report.", generated_at: entity.updated_at, provider_request_id: "request-1" }, usage: { input_tokens: 10, output_tokens: 8, total_tokens: 18 } }), { status: 200 });
+      if (path.endsWith("/reports/report-1") && init?.method === "PATCH") {
+        const body = JSON.parse(String(init.body));
+        return new Response(JSON.stringify({ ...report, ...body.changes, revision: 2 }), { status: 200 });
+      }
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/reports");
+
+    await screen.findByRole("heading", { name: "Reports" });
+    await user.click(await screen.findByRole("checkbox", { name: /TLS note/ }));
+    await user.click(screen.getByRole("button", { name: "Transform with AI" }));
+    const dialog = screen.getByRole("dialog", { name: "Transform note into a report section" });
+    await user.clear(within(dialog).getByRole("textbox", { name: "AI writing instruction" }));
+    await user.type(within(dialog).getByRole("textbox", { name: "AI writing instruction" }), "Rewrite for the report.");
+    await user.click(within(dialog).getByRole("button", { name: "Generate draft" }));
+    expect(await within(dialog).findByRole("textbox", { name: "AI writing draft" })).toHaveValue("Port 443 was observed open; certificate posture remains under review.");
+    await user.click(within(dialog).getByRole("button", { name: "Apply draft" }));
+    await user.click(screen.getByRole("button", { name: "Save report" }));
+
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([input, requestInit]) => new URL(String(input)).pathname.endsWith("/reports/report-1") && requestInit?.method === "PATCH");
+      const body = JSON.parse(String(request?.[1]?.body));
+      expect(body.changes.observation_ids).toEqual(["note-1"]);
+      expect(body.changes.note_transforms).toEqual([expect.objectContaining({
+        observation_id: "note-1",
+        source_revision: 1,
+        body: "Port 443 was observed open; certificate posture remains under review.",
+        provenance: expect.objectContaining({ provider_profile_id: "provider-1" }),
+      })]);
+    });
+  });
+
+  it("renders final reports as immutable while keeping export actions available", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 4 };
+    const finding = { ...entity, id: "finding-1", engagement_id: "engagement-1", title: "Verified issue", description: "Evidence-backed issue", severity: "high", severity_rationale: "Material impact", status: "confirmed", asset_ids: [], evidence_ids: ["evidence-1"], cve_ids: [], cwe_ids: ["CWE-79"], verifier_id: "operator-reviewer", verified_at: entity.updated_at };
+    const report = { ...entity, id: "report-final", engagement_id: "engagement-1", title: "Signed assessment", status: "final", executive_summary: "Approved final narrative", finding_ids: ["finding-1"], artifact_ids: ["artifact-report"], signed_off_by: "operator-reviewer", signed_off_at: entity.updated_at, metadata: {} };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Signed review", description: "", status: "complete", tags: [], metadata: {} }]), { status: 200 });
+      if (url.pathname.endsWith("/findings")) return new Response(JSON.stringify([finding]), { status: 200 });
+      if (url.pathname.endsWith("/reports")) return new Response(JSON.stringify([report]), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp("/reports");
+
+    await screen.findByRole("heading", { name: "Reports" });
+    expect(await screen.findByText(/immutable signed record/)).toBeVisible();
+    expect(screen.getByLabelText("Status")).toBeDisabled();
+    expect(screen.getByLabelText("Report title")).toHaveAttribute("readonly");
+    expect(screen.getByLabelText("Executive summary")).toHaveAttribute("readonly");
+    expect(screen.getByRole("checkbox", { name: /Verified issue/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Final report" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Export PDF" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Export engagement bundle" })).toBeEnabled();
+    expect(fetchMock.mock.calls.some(([input, init]) => new URL(String(input)).pathname.endsWith("/reports/report-final") && init?.method === "PATCH")).toBe(false);
+  });
+
+  it("resolves evidence attribution from operator profile IDs", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Evidence review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (url.pathname.endsWith("/operator-profiles")) return new Response(JSON.stringify([{ ...entity, id: "operator-alice", display_name: "Alice Analyst", email: null, role: "Lead", active: true, activated_at: entity.updated_at, metadata: {} }]), { status: 200 });
+      if (url.pathname.endsWith("/evidence")) return new Response(JSON.stringify([{ ...entity, id: "evidence-1", engagement_id: "engagement-1", evidence_type: "operator_upload", title: "proof.txt", description: "Proof", artifact_id: "artifact-1", finding_id: null, asset_ids: [], sha256: "a".repeat(64), captured_at: entity.updated_at, captured_by: "operator-alice", source_version: null, metadata: { filename: "proof.txt", media_type: "text/plain", size: 5, source: "operator_upload" } }]), { status: 200 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp("/evidence");
+
+    expect((await screen.findAllByText("Alice Analyst")).length).toBeGreaterThan(0);
+    expect(screen.queryByText("operator-alice")).not.toBeInTheDocument();
+  });
+
+  it("updates a finding immediately when uploaded evidence links back to it", async () => {
+    const entity = { created_at: "2026-07-12T10:00:00Z", updated_at: "2026-07-12T11:00:00Z", revision: 1 };
+    const finding = { ...entity, id: "finding-1", engagement_id: "engagement-1", title: "Linked finding", description: "Needs proof", severity: "high", severity_rationale: "External exposure", status: "validated", asset_ids: [], evidence_ids: [], cve_ids: [], cwe_ids: [], verifier_id: null, verified_at: null };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/health")) return new Response(JSON.stringify({ status: "ok", version: "3.0.0", mode: "local", runner: "unavailable", human_pty: "unavailable" }), { status: 200 });
+      if (url.pathname.endsWith("/engagements")) return new Response(JSON.stringify([{ ...entity, id: "engagement-1", name: "Evidence review", description: "", status: "active", tags: [], metadata: {} }]), { status: 200 });
+      if (url.pathname.endsWith("/findings")) return new Response(JSON.stringify([finding]), { status: 200 });
+      if (url.pathname.endsWith("/evidence/upload") && init?.method === "POST") return new Response(JSON.stringify({ ...entity, id: "evidence-new", engagement_id: "engagement-1", evidence_type: "operator_upload", title: "proof.txt", description: "", artifact_id: "artifact-new", finding_id: "finding-1", asset_ids: [], sha256: "b".repeat(64), captured_at: entity.updated_at, captured_by: null, source_version: null, metadata: { filename: "proof.txt", media_type: "text/plain", size: 5, source: "operator_upload" } }), { status: 201 });
+      return unmatchedCoreResponse(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderApp("/evidence");
+
+    await screen.findByRole("heading", { name: "Evidence" }, { timeout: 3_000 });
+    await user.click(screen.getByRole("button", { name: "Add evidence" }));
+    const dialog = screen.getByRole("dialog", { name: "Add evidence" });
+    const file = new File(["proof"], "proof.txt", { type: "text/plain" });
+    Object.defineProperty(file, "arrayBuffer", { value: async () => new TextEncoder().encode("proof").buffer });
+    await user.upload(within(dialog).getByLabelText("File"), file);
+    const title = within(dialog).getByLabelText("Title");
+    await user.clear(title);
+    await user.type(title, "proof.txt");
+    await user.selectOptions(within(dialog).getByLabelText("Finding"), "finding-1");
+    const store = within(dialog).getByRole("button", { name: "Store evidence" });
+    expect(store).toBeEnabled();
+    fireEvent.submit(dialog);
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input, init]) => new URL(String(input)).pathname.endsWith("/evidence/upload") && init?.method === "POST")).toHaveLength(1));
+    expect(await screen.findByText("proof.txt")).toBeVisible();
+
+    await user.click(screen.getByRole("link", { name: "Findings" }));
+    const row = (await within(screen.getByRole("table")).findByText("Linked finding")).closest("tr");
+    expect(row).not.toBeNull();
+    expect(within(row!).getAllByRole("cell")[4]).toHaveTextContent("1");
+  });
+
+});

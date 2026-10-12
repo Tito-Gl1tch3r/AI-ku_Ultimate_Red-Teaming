@@ -1,0 +1,108 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+/// <namespacedoc>
+///   <summary>
+///   Provides ELF section name constants through the Section module.
+///   </summary>
+/// </namespacedoc>
+///
+/// <summary>
+/// Provides constants for ELF section names.
+/// </summary>
+[<RequireQualifiedAccess>]
+module B2R2.FrontEnd.BinFile.ELF.Section
+
+/// Represents the name of the section that contains executable code: ".text".
+let [<Literal>] Text = ".text"
+
+/// Represents the name of the section that contains staticly allocated, but not
+/// initialized data: ".bss".
+let [<Literal>] BSS = ".bss"
+
+/// Represents the name of the section that contains initialized read-only data:
+/// ".rodata".
+let [<Literal>] ROData = ".rodata"
+
+/// Represents the name of the section that contains function addresses that are
+/// executed before any other initialization code: ".preinit_array".
+let [<Literal>] PreinitArray = ".preinit_array"
+
+/// Represents the name of the section that contains function addresses that are
+/// executed when a program starts: ".init_array".
+let [<Literal>] InitArray = ".init_array"
+
+/// Represents the name of the section that contains function addresses that are
+/// executed when a program exits: ".fini_array".
+let [<Literal>] FiniArray = ".fini_array"
+
+/// Represents the name of the section holding executable instructions that
+/// contribute to the process initialization code: ".init".
+let [<Literal>] Init = ".init"
+
+/// Represents the name of the section holding executable instructions that
+/// contribute to the process termination code: ".fini".
+let [<Literal>] Fini = ".fini"
+
+/// Represents the name of the section that contains REL type relocation
+/// entries: ".rel.plt".
+let [<Literal>] RelPLT = ".rel.plt"
+
+/// Represents the name of the section that contains RELA type relocation
+/// entries: ".rela.plt".
+let [<Literal>] RelaPLT = ".rela.plt"
+
+/// Represents the name of the section that contains Procedure Linkage Table
+/// (PLT): ".plt".
+let [<Literal>] PLT = ".plt"
+
+/// Represents the name of the section that contains Global Offset Table (GOT):
+/// ".got".
+let [<Literal>] GOT = ".got"
+
+/// Represents the name of the section that contains debugging information:
+/// ".debug_info".
+let [<Literal>] DebugInfo = ".debug_info"
+
+/// Represents the name of the section that contains debugging information about
+/// types: ".debug_types".
+let [<Literal>] DebugTypes = ".debug_types"
+
+/// Represents the name of the section that contains debugging information about
+/// abbreviations: ".debug_abbrev".
+let [<Literal>] DebugAbbrev = ".debug_abbrev"
+
+/// Represents the name of the section that contains DWARF debug strings:
+/// ".debug_str".
+let [<Literal>] DebugStr = ".debug_str"
+
+/// Represents the name of the section that contains DWARF line strings:
+/// ".debug_line_str".
+let [<Literal>] DebugLineStr = ".debug_line_str"
+
+/// Represents the prefix of regular DWARF debug sections: ".debug".
+let [<Literal>] Debug = ".debug"
+
+/// Represents the prefix of compressed DWARF debug sections: ".zdebug".
+let [<Literal>] ZDebug = ".zdebug"

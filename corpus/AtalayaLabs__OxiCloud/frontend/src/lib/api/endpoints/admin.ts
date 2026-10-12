@@ -1,0 +1,1256 @@
+import { client as generatedClient } from '../generated/client.gen';
+/**
+ * Admin endpoints — ported from views/admin/admin.js. Covers users, plugins
+ * (incl. logs/retention/live SSE tail), dashboard, settings (OIDC/storage/SMTP),
+ * and storage migration (incl. the verify integrity check).
+ */
+import { apiFetch, apiJson } from '$lib/api/client';
+import { getCsrfHeaders } from '$lib/api/csrf';
+import type {
+	AdminSessionsPage,
+	AdminUsersPage,
+	Drive,
+	DriveMember,
+	DriveMemberSubject,
+	DrivePolicies,
+	DriveRole,
+	FullUser,
+	PolicyDefaultsImpact,
+	PolicyDrift
+} from '$lib/api/types';
+
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+async function mutate(url: string, method: string, body?: unknown): Promise<void> {
+	const res = await apiFetch(url, {
+		method,
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: body === undefined ? undefined : JSON.stringify(body)
+	});
+	if (!res.ok) {
+		const e = (await res.json().catch(() => ({}))) as { message?: string };
+		throw new Error(e.message || `${method} ${url} failed: ${res.status}`);
+	}
+}
+
+/** POST with no request body that returns a JSON payload (throws on non-2xx). */
+async function postJson<T>(url: string): Promise<T> {
+	const res = await apiFetch(url, {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() }
+	});
+	if (!res.ok) {
+		const e = (await res.json().catch(() => ({}))) as { message?: string };
+		throw new Error(e.message || `POST ${url} failed: ${res.status}`);
+	}
+	return (await res.json()) as T;
+}
+
+// ── Maintenance ───────────────────────────────────────────────────────────
+
+/** Outcome of a bulk metadata re-extraction run. */
+export interface ReextractResult {
+	message: string;
+	total: number;
+	processed: number;
+	failed: number;
+}
+
+/** Re-scan every audio file and backfill its tag metadata (idempotent). */
+export function reextractAudioMetadata(): Promise<ReextractResult> {
+	return postJson<ReextractResult>('/api/admin/audio/metadata/reextract');
+}
+
+/** Backfill EXIF / container capture dates for all media, re-bucketing the
+ *  Photos timeline by real capture date (idempotent). */
+export function reextractPhotoMetadata(): Promise<ReextractResult> {
+	return postJson<ReextractResult>('/api/admin/photos/metadata/reextract');
+}
+
+/** A freshly generated AES-256 at-rest blob-encryption key (base64) plus a
+ *  data-loss warning authored by the server. The `fingerprint` is the
+ *  SSH-style colon-hex render the boot log / admin pair-chain / rotate
+ *  reports all use — admins can paste the key into `.env`, restart, and
+ *  check the fingerprint matches to confirm the key made it in intact. */
+export interface GeneratedKey {
+	key: string;
+	fingerprint: string;
+	warning: string;
+}
+
+/** Generate a random AES-256 key for at-rest blob encryption. */
+export function generateEncryptionKey(): Promise<GeneratedKey> {
+	return postJson<GeneratedKey>('/api/admin/settings/storage/generate-key');
+}
+
+// ── Drives ──────────────────────────────────────────────────────────────
+
+/**
+ * `GET /api/admin/drives` — every drive on the system, admin-only.
+ *
+ * Distinct from `listDrives()` in `$lib/api/endpoints/drives`, which is
+ * the caller's own listing (filtered through `role_grants`). An admin
+ * who creates a shared drive for someone else has no role on it, so
+ * the user-facing listing would skip it — this endpoint returns
+ * everything for the admin panel's "Drives" tab.
+ */
+export function listAllDrives(): Promise<Drive[]> {
+	return apiJson<Drive[]>('/api/admin/drives', { credentials: 'same-origin' });
+}
+
+/**
+ * `GET /api/admin/drives/{id}/members` — every role grant on a drive,
+ * admin-only. The user-facing `/api/drives/{id}/members` requires
+ * `Permission::Read` on the drive; an admin who created the drive
+ * for someone else has no role on it and would hit a 404 there. This
+ * endpoint reuses `list_grants_on_resource` with the admin guard at
+ * the route edge, so the same `DriveMember` shape comes back.
+ */
+export function listDriveMembersAdmin(driveId: string): Promise<DriveMember[]> {
+	return apiJson<DriveMember[]>(`/api/admin/drives/${encodeURIComponent(driveId)}/members`, {
+		credentials: 'same-origin'
+	});
+}
+
+/**
+ * `POST /api/admin/drives/{id}/members` — add (or refresh) a member as
+ * an admin, bypassing the per-drive `Manage` check. Personal-drive
+ * guard + last-owner protection still apply. Throws on non-2xx.
+ */
+export async function addDriveMemberAdmin(
+	driveId: string,
+	subject: DriveMemberSubject,
+	role: DriveRole,
+	expiresAt?: string | null
+): Promise<DriveMember> {
+	const res = await apiFetch(`/api/admin/drives/${encodeURIComponent(driveId)}/members`, {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: JSON.stringify({ subject, role, expires_at: expiresAt ?? null })
+	});
+	if (!res.ok) {
+		let detail = '';
+		try {
+			const parsed = (await res.json()) as { error?: string; message?: string };
+			detail = parsed.error ?? parsed.message ?? '';
+		} catch {
+			/* response body wasn't JSON */
+		}
+		throw new Error(detail || `add member failed: ${res.status}`);
+	}
+	return (await res.json()) as DriveMember;
+}
+
+/**
+ * `DELETE /api/admin/drives/{id}/members/{kind}/{sid}` — remove a
+ * member as an admin. Idempotent (removing a non-member returns 204).
+ * Last-owner protection still applies (400 with `reason='last_owner'`).
+ */
+export async function removeDriveMemberAdmin(
+	driveId: string,
+	subject: DriveMemberSubject
+): Promise<void> {
+	const url =
+		`/api/admin/drives/${encodeURIComponent(driveId)}/members/` +
+		`${encodeURIComponent(subject.type)}/${encodeURIComponent(subject.id)}`;
+	const res = await apiFetch(url, {
+		method: 'DELETE',
+		credentials: 'same-origin',
+		headers: getCsrfHeaders()
+	});
+	if (!res.ok) {
+		let detail = '';
+		try {
+			const parsed = (await res.json()) as { error?: string; message?: string };
+			detail = parsed.error ?? parsed.message ?? '';
+		} catch {
+			/* response body wasn't JSON */
+		}
+		throw new Error(detail || `remove member failed: ${res.status}`);
+	}
+}
+
+/**
+ * `DELETE /api/admin/drives/{id}` — admin-only drive delete (D3b).
+ *
+ * Bypasses the per-drive `Manage` check (the admin guard at the route
+ * edge is the access control). The default-personal-drive guard and
+ * the "drive must be empty" check still fire server-side — admins
+ * can't accidentally wipe a populated drive or a user's home folder.
+ * Throws on non-2xx so the caller can branch on `405` (default
+ * personal) vs `409` (non-empty) when surfacing the failure.
+ */
+/**
+ * `PATCH /api/drives/{id}/quota` — admin-only shared-drive quota
+ * mutation (D4). `quotaBytes = null` or ≤ 0 → unlimited (the backend
+ * normalises 0/negative to NULL).
+ *
+ * **Refuses personal drives** with HTTP 400 — the effective cap
+ * comes from the owner user's `storage_quota_bytes` envelope, edit
+ * via `setUserQuota` (`PUT /api/admin/users/{id}/quota`) instead.
+ * Callers should gate the UI on `drive.kind === 'shared'` so users
+ * never see the refusal.
+ *
+ * **Soft-quota semantic on shrink**: a new cap below current
+ * `used_bytes` is accepted — the write-time gate then blocks new
+ * writes until the drive shrinks back under. No existing content
+ * is retroactively touched. Matches xfs/ext4 quota behaviour.
+ *
+ * Returns the persisted value (the backend's normalisation of the
+ * input) so the caller can update local state without re-fetching.
+ * Throws on non-2xx with the backend's error message when present.
+ */
+export async function updateDriveQuota(
+	driveId: string,
+	quotaBytes: number | null
+): Promise<number | null> {
+	const res = await apiFetch(`/api/drives/${encodeURIComponent(driveId)}/quota`, {
+		method: 'PATCH',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: JSON.stringify({ quota_bytes: quotaBytes })
+	});
+	if (!res.ok) {
+		let detail = '';
+		try {
+			const parsed = (await res.json()) as { error?: string; message?: string };
+			detail = parsed.error ?? parsed.message ?? '';
+		} catch {
+			/* response body wasn't JSON */
+		}
+		throw new Error(detail || `update drive quota failed: ${res.status}`);
+	}
+	const body = (await res.json()) as { quota_bytes: number | null };
+	return body.quota_bytes;
+}
+
+export async function deleteDriveAdmin(driveId: string): Promise<void> {
+	const res = await apiFetch(`/api/admin/drives/${encodeURIComponent(driveId)}`, {
+		method: 'DELETE',
+		credentials: 'same-origin',
+		headers: getCsrfHeaders()
+	});
+	if (!res.ok) {
+		let detail = '';
+		try {
+			const parsed = (await res.json()) as { error?: string; message?: string };
+			detail = parsed.error ?? parsed.message ?? '';
+		} catch {
+			/* response body wasn't JSON */
+		}
+		// 405 / 409 carry actionable messages from the backend; bubble them.
+		throw new Error(detail || `delete drive failed: ${res.status}`);
+	}
+}
+
+// ── Sessions (admin panel) ──────────────────────────────────────────────
+
+/** Options for {@link listAdminSessions}. */
+export interface ListSessionsOpts {
+	/** Narrow to one user's sessions; omit for cross-user listing. */
+	userId?: string;
+	/** Include revoked / expired rows. Default `false` (active-only UX). */
+	includeRevoked?: boolean;
+	/** Page size — server caps at 500. */
+	limit?: number;
+	/** Pagination offset. */
+	offset?: number;
+}
+
+/** Global sessions listing — `GET /api/admin/sessions`. */
+export function listAdminSessions(opts: ListSessionsOpts = {}): Promise<AdminSessionsPage> {
+	const params = new URLSearchParams();
+	if (opts.userId) params.set('user_id', opts.userId);
+	if (opts.includeRevoked) params.set('include_revoked', 'true');
+	if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+	if (opts.offset !== undefined) params.set('offset', String(opts.offset));
+	const qs = params.toString();
+	return apiJson<AdminSessionsPage>(`/api/admin/sessions${qs ? '?' + qs : ''}`, {
+		credentials: 'same-origin'
+	});
+}
+
+/** Revoke a session — `DELETE /api/admin/sessions/{id}`. Sets
+ * `revoked=true`; the row stays in the DB for audit visibility. */
+export function revokeAdminSession(sessionId: string): Promise<void> {
+	return mutate(`/api/admin/sessions/${encodeURIComponent(sessionId)}`, 'DELETE');
+}
+
+// ── Users ───────────────────────────────────────────────────────────────
+
+/** List admin users — always returns `FullUser` rows. The former
+ * `?summary` toggle is retired; a single canonical shape carries
+ * the vignette + admin-visible extras the table needs. Single-user
+ * details still available via {@link getUserAdmin}. */
+export function listUsers(limit: number, offset: number): Promise<AdminUsersPage> {
+	return apiJson<AdminUsersPage>(`/api/admin/users?limit=${limit}&offset=${offset}`, {
+		credentials: 'same-origin'
+	});
+}
+
+/**
+ * Admin-scoped single-user lookup — `GET /api/admin/users/{id}`.
+ * Returns the full `FullUser` DTO (public identity in `.user` +
+ * admin-visible extras like `email_verified_at` / `has_password` /
+ * `opaque_registered` / `last_login_at` / quotas at top level) —
+ * same shape as one row of `/api/admin/users` list. The peer-view
+ * `/api/users/{id}` returns the slim `PublicUser` which omits those
+ * admin-only signals.
+ *
+ * Result promises are cached per id at module scope so multiple
+ * callers for the same user (e.g. the admin drives table with N
+ * personal drives owned by the same person) share one fetch. A
+ * `null` result is cached too so a missing user isn't re-fetched
+ * on every render.
+ *
+ * The cache is process-lifetime; a page navigation away and back
+ * still sees the cached value. Callers that need to refresh (e.g.
+ * after `setUserQuota`) should call `invalidateAdminUserCache`.
+ */
+const adminUserCache = new Map<string, Promise<FullUser | null>>();
+
+export function getUserAdmin(id: string): Promise<FullUser | null> {
+	const hit = adminUserCache.get(id);
+	if (hit) return hit;
+	const pending = (async (): Promise<FullUser | null> => {
+		try {
+			return await apiJson<FullUser>(`/api/admin/users/${encodeURIComponent(id)}`, {
+				credentials: 'same-origin'
+			});
+		} catch {
+			return null;
+		}
+	})();
+	adminUserCache.set(id, pending);
+	return pending;
+}
+
+/** Drop cached admin lookups so mutations (quota change, role change,
+ *  delete) don't return stale data. Called with no arg = clear all,
+ *  or with a specific user id to drop just that entry. */
+export function invalidateAdminUserCache(userId?: string): void {
+	if (userId) adminUserCache.delete(userId);
+	else adminUserCache.clear();
+}
+
+export interface CreateUserInput {
+	username: string;
+	password: string;
+	/** Optional — the backend auto-generates an address when null/empty. */
+	email: string | null;
+	role: string;
+	quota_bytes: number;
+}
+
+export function createUser(input: CreateUserInput): Promise<void> {
+	return mutate('/api/admin/users', 'POST', input);
+}
+
+export function setUserRole(userId: string, role: string): Promise<void> {
+	return mutate(`/api/admin/users/${userId}/role`, 'PUT', { role });
+}
+
+/**
+ * Hand the instance to another user. The caller — who must be the current
+ * owner — is demoted to admin in the same transaction.
+ *
+ * Deliberately not `setUserRole(id, 'owner')`: that endpoint refuses
+ * 'owner', because conferring it there would create a second owner rather
+ * than move the one that exists.
+ */
+export function transferOwnership(newOwnerId: string): Promise<void> {
+	return mutate('/api/admin/transfer-ownership', 'POST', { new_owner_id: newOwnerId });
+}
+
+export function setUserActive(userId: string, active: boolean): Promise<void> {
+	return mutate(`/api/admin/users/${userId}/active`, 'PUT', { active });
+}
+
+export function setUserQuota(userId: string, quotaBytes: number): Promise<void> {
+	return mutate(`/api/admin/users/${userId}/quota`, 'PUT', { quota_bytes: quotaBytes });
+}
+
+export function resetUserPassword(userId: string, newPassword: string): Promise<void> {
+	return mutate(`/api/admin/users/${userId}/password`, 'PUT', { new_password: newPassword });
+}
+
+export function deleteUser(userId: string): Promise<void> {
+	return mutate(`/api/admin/users/${userId}`, 'DELETE');
+}
+
+/**
+ * Promote a currently-external (grant-only) user to an internal
+ * account. The deployment must have magic-link login enabled — the
+ * admin doesn't set the target's password, so the promoted user
+ * needs some way to log in. Backend refuses with:
+ *   * 400 — magic-link disabled deployment-wide
+ *   * 403 — target is OIDC-linked
+ *   * 404 — user not found
+ *   * 409 — user is already internal
+ */
+export function promoteUserToInternal(userId: string): Promise<void> {
+	return mutate(`/api/admin/users/${userId}/promote-to-internal`, 'POST');
+}
+
+// ── Dashboard ───────────────────────────────────────────────────────────
+
+export interface DriveKindUsage {
+	kind: 'personal' | 'shared';
+	used_bytes: number;
+	// null when there are no capped drives of this kind — the FE
+	// hides the ratio and just renders "N unlimited"
+	capped_quota_bytes: number | null;
+	unlimited_count: number;
+	capped_count: number;
+}
+
+export interface AdminDashboard {
+	// ── User accounts (static breakdown of auth.users) ──
+	// All four are counts of the same table under different
+	// predicates. Rendered as one grouped section on the dashboard.
+	total_users: number;
+	active_users: number;
+	admin_users: number;
+	/** Grant-only accounts (magic-link / OIDC-only / OCM recipients).
+	 * Filtered out of `total_users` / `active_users` — those count
+	 * operational seats. Surfaced here as its own metric because
+	 * external-heavy deployments (public-share collab, invited-only
+	 * shops) need the invited population at a glance. */
+	external_users: number;
+	// ── Live activity (projection over auth.sessions) ──
+	// Both change minute-to-minute — a whole different cadence from
+	// the account counts above. Rendered as a separate section on
+	// the dashboard with the presence-dot visual cue.
+	/** Distinct users behind non-revoked sessions active in the last
+	 * 5 min. Same 5-min window as the `oxicloud_sessions_online_users`
+	 * Prometheus gauge; single source of truth on the backend. */
+	online_users: number;
+	/** Non-revoked sessions active in the last 5 min. Ratio
+	 * `online_sessions / online_users` is the multi-device factor
+	 * (browser + desktop + phone). */
+	online_sessions: number;
+	/** Currently-connected message-bus WebSocket sessions — one per
+	 *  open browser tab that reached a folder view. Reported as `0`
+	 *  when `OXICLOUD_MESSAGEBUS_ENABLE=false` (no live sessions
+	 *  possible); the dashboard hides the card in that case since
+	 *  the value would be misleading. */
+	active_ws_sessions: number;
+	server_version: string;
+	drive_usage: DriveKindUsage[];
+	oidc_configured: boolean;
+	registration_enabled?: boolean;
+	users_over_80_percent: number;
+	users_over_quota: number;
+	// Backend physical accounting — omitted when the dedup service
+	// is unavailable. Renders as "—" in that case.
+	total_bytes_stored?: number;
+	dedup_ratio?: number;
+	/** `true` when the active storage backend is remote (S3 / Azure)
+	 *  and the local-disk blob cache is NOT enabled — every blob read
+	 *  pays a round-trip to the remote. The dashboard renders a banner
+	 *  with the mitigation (set OXICLOUD_STORAGE_CACHE_ENABLED=true).
+	 *  `false` on local-filesystem deployments (nothing to cache) and
+	 *  when the cache is already on. */
+	storage_cache_recommended: boolean;
+	/** `true` when NEITHER `OXICLOUD_JOBS_NOTIFY_EMAIL_TO` nor
+	 *  `OXICLOUD_WEBHOOK_URL` is configured — job-failure findings
+	 *  would be invisible to anyone not actively watching
+	 *  `/admin/jobs`. The admin UI shows an advisory banner inviting
+	 *  the operator to set at least one. Flips to `false` the moment
+	 *  either env var is defined. */
+	notification_sink_missing: boolean;
+	/** Live occupancy of the moka in-memory file-content cache.
+	 *  Always present (the content cache runs unconditionally).
+	 *  Entries here are ASSEMBLED files (<10 MB each), NOT chunks —
+	 *  a file physically split into N chunks on-backend still shows
+	 *  as a single moka entry. See `ContentCacheInfo.files`. */
+	content_cache: ContentCacheInfo;
+	/** Live occupancy of the moka in-memory thumbnail cache. Distinct
+	 *  moka instance from `content_cache`: different keys, different
+	 *  budget, different eviction. Always present. */
+	thumbnail_cache: ThumbnailCacheInfo;
+	/** Live occupancy of the on-disk `.blob-cache` tier. Absent when
+	 *  the backend cache wrapper is NOT enabled
+	 *  (OXICLOUD_STORAGE_CACHE_ENABLED=false or a local-only
+	 *  deployment); the admin UI hides the row entirely in that
+	 *  case rather than rendering a disabled bar. Entries here ARE
+	 *  chunks — one per content-addressable blob. The disk tier
+	 *  serves both source-file chunks AND satellite derived blobs
+	 *  (thumbnails, transcodes) via the same unified wrapper. */
+	backend_cache?: BackendCacheInfo;
+}
+
+/** Memory-tier occupancy (moka). `files` because each entry holds
+ *  the assembled bytes of one small file, not a chunk. */
+export interface ContentCacheInfo {
+	size_bytes: number;
+	max_bytes: number;
+	files: number;
+}
+
+/** Memory-tier occupancy for the thumbnail moka cache. Each entry
+ *  is one encoded WebP/AVIF payload keyed by (file_id, size). */
+export interface ThumbnailCacheInfo {
+	size_bytes: number;
+	max_bytes: number;
+	thumbnails: number;
+}
+
+/** Disk-tier occupancy (`.blob-cache`). `chunks` because each entry
+ *  is one content-addressable blob from the dedup registry. Carries
+ *  the on-disk `cache_dir` so operators can point `du`, backups, or
+ *  an SSD mount at it. */
+export interface BackendCacheInfo {
+	size_bytes: number;
+	max_bytes: number;
+	chunks: number;
+	cache_dir: string;
+}
+
+export function getDashboard(): Promise<AdminDashboard> {
+	return apiJson<AdminDashboard>('/api/admin/dashboard', { credentials: 'same-origin' });
+}
+
+export function setRegistrationEnabled(enabled: boolean): Promise<void> {
+	return mutate('/api/admin/settings/registration', 'PUT', { registration_enabled: enabled });
+}
+
+// ── SMTP ────────────────────────────────────────────────────────────────
+
+export interface SmtpInfo {
+	enabled: boolean;
+	host: string;
+	port: number;
+	tls: string;
+	from: string;
+	user_state: string;
+}
+
+export function getSmtpInfo(): Promise<SmtpInfo> {
+	return apiJson<SmtpInfo>('/api/admin/smtp/info', { credentials: 'same-origin' });
+}
+
+export interface SmtpTestResult {
+	success: boolean;
+	code?: string | number;
+	message?: string;
+	error?: string;
+}
+
+/**
+ * Result of POST .../settings/storage/test. Combines reachability
+ * (`connected` — HEAD bucket / statfs) with a full read/write round-
+ * trip (`roundtrip_passed` — PUT + GET + verify + DELETE). Overall
+ * pass = both true. Round-trip fields are absent when the round-trip
+ * wasn't attempted (typically because reachability already failed).
+ * `phase_reached` names the last successful round-trip step:
+ * `initialize` | `put_ok` | `exists_ok` | `get_ok` | `verify_ok` |
+ * `cleanup_ok`.
+ */
+export interface StorageTestResult {
+	connected?: boolean;
+	success?: boolean;
+	backend_type?: string;
+	available_bytes?: number | null;
+	message?: string;
+	roundtrip_passed?: boolean;
+	phase_reached?: string;
+	bytes_written?: number;
+	bytes_read?: number;
+	roundtrip_elapsed_ms?: number;
+	cleanup_ok?: boolean;
+}
+
+export async function sendSmtpTest(to: string): Promise<SmtpTestResult> {
+	const res = await apiFetch('/api/admin/smtp/test', {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: JSON.stringify({ to })
+	});
+	if (res.status === 503)
+		return { success: false, message: 'SMTP is not configured on this server.' };
+	return (await res.json().catch(() => ({ success: false }))) as SmtpTestResult;
+}
+
+/**
+ * Read-only webhook config, from `GET /api/admin/webhook/info`.
+ *
+ * Mirrors `SmtpInfo`: configured through environment variables only, shown
+ * for confirmation rather than editing.
+ */
+export interface WebhookInfo {
+	enabled: boolean;
+	/** `generic`, `slack`, `discord`, `teams`, `telegram`, `ntfy`. */
+	format: string;
+	/** Scheme and host only — never the full URL. A Telegram endpoint
+	 *  carries the bot token in its path, and a Slack webhook URL is itself
+	 *  the credential. */
+	host: string;
+	/** Telegram chat id or ntfy topic. Empty when not applicable. */
+	target: string;
+}
+
+export async function getWebhookInfo(): Promise<WebhookInfo> {
+	return apiJson<WebhookInfo>('/api/admin/webhook/info');
+}
+
+/**
+ * Result of `POST /api/admin/webhook/test`.
+ *
+ * `code` + `message` mirror `SmtpTestResult` on purpose — the admin page
+ * presents both transports together, so the same rendering works for each.
+ */
+export interface WebhookTestResult {
+	success: boolean;
+	/** Transport name, e.g. `webhook`. */
+	sink?: string;
+	/** HTTP status the receiver returned. Absent when nothing answered —
+	 *  DNS failure, refused connection, timeout — which is itself the
+	 *  diagnosis. */
+	code?: number;
+	/** The receiver's own response body (truncated), or the transport
+	 *  error. Usually the useful part: a bare 403 does not distinguish a
+	 *  revoked token from a disabled channel, and the body says which. */
+	message?: string;
+}
+
+/**
+ * Send a synthetic alert through the configured webhook.
+ *
+ * One attempt, no retry — real delivery backs off over ~65s, which is the
+ * wrong behaviour for someone waiting on a button.
+ */
+export async function sendWebhookTest(): Promise<WebhookTestResult> {
+	const res = await apiFetch('/api/admin/webhook/test', {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() }
+	});
+	if (res.status === 503)
+		return { success: false, message: 'No webhook is configured on this server.' };
+	return (await res.json().catch(() => ({ success: false }))) as WebhookTestResult;
+}
+
+/**
+ * Read-only alerting policy, from `GET /api/admin/notify/info`.
+ *
+ * The *what gets sent* half, where `SmtpInfo` and `WebhookInfo` are the
+ * *how it travels* half.
+ */
+export interface NotifyInfo {
+	/** `data_loss`, `inconsistent`, `anomaly`, or `none`. */
+	min_severity: string;
+	/** Channels actually wired, by name. Empty = findings are recorded
+	 *  but nobody is told. */
+	sinks: string[];
+	/** `OXICLOUD_JOBS_NOTIFY_EMAIL_TO`, as parsed. Empty = mail alerting
+	 *  is off. */
+	email_recipients: string[];
+}
+
+export async function getNotifyInfo(): Promise<NotifyInfo> {
+	return apiJson<NotifyInfo>('/api/admin/notify/info');
+}
+
+// ── OIDC settings ─────────────────────────────────────────────────────────
+
+export interface OidcSettings {
+	enabled: boolean;
+	issuer_url: string;
+	client_id: string;
+	scopes: string | null;
+	auto_provision: boolean;
+	admin_groups: string | null;
+	disable_password_login: boolean;
+	provider_name: string | null;
+	callback_url?: string;
+	client_secret_set?: boolean;
+	env_overrides?: string[];
+}
+
+export interface OidcTestResult {
+	success: boolean;
+	message: string;
+	issuer?: string;
+	authorization_endpoint?: string;
+	provider_name_suggestion?: string;
+}
+
+/**
+ * Per-drive-kind default policies.
+ *
+ * New drives inherit these wholesale, and existing drives resolve every
+ * knob they have not explicitly overridden through them — so tightening a
+ * default reaches the whole estate except where someone deliberately
+ * decided otherwise.
+ */
+export function getDrivePolicyDefaults(kind: 'personal' | 'shared'): Promise<DrivePolicies> {
+	return apiJson<DrivePolicies>(`/api/admin/drive-policies/defaults/${kind}`, {
+		credentials: 'same-origin'
+	});
+}
+
+/**
+ * Drives that are currently laxer than their kind's default, both kinds.
+ *
+ * Live, not a consistency-job finding. It reads two small tables, so the
+ * page can afford it on every load — and being live is what makes it
+ * correct: a scan reports a run that has already finished, so a drive the
+ * admin just fixed would stay on the list until someone re-scanned.
+ */
+export function getDrivePolicyDrift(): Promise<PolicyDrift[]> {
+	return apiJson<PolicyDrift[]>('/api/admin/drive-policies/drift', {
+		credentials: 'same-origin'
+	});
+}
+
+/**
+ * Replace the defaults for a kind.
+ *
+ * REPLACE, not merge — a default is a complete statement of posture for the
+ * kind, and merging would leave no way to express "unset this knob".
+ *
+ * Send only knobs that are actually set: omitting a key is how "no default
+ * for this" is expressed, and `null` for the day-cap means no cap.
+ */
+export async function setDrivePolicyDefaults(
+	kind: 'personal' | 'shared',
+	bag: Record<string, unknown>
+): Promise<DrivePolicies> {
+	return putDefaults<DrivePolicies>(kind, bag, false);
+}
+
+/**
+ * What `setDrivePolicyDefaults` WOULD do, without doing it.
+ *
+ * Returns how many drives follow the change, how many override it and stay
+ * put, and how many end up laxer than the new default. This is what makes
+ * the compliance reports a pre-commit check rather than an after-the-fact
+ * audit.
+ */
+export async function previewDrivePolicyDefaults(
+	kind: 'personal' | 'shared',
+	bag: Record<string, unknown>
+): Promise<PolicyDefaultsImpact> {
+	return putDefaults<PolicyDefaultsImpact>(kind, bag, true);
+}
+
+async function putDefaults<T>(
+	kind: 'personal' | 'shared',
+	bag: Record<string, unknown>,
+	dryRun: boolean
+): Promise<T> {
+	// `dry_run` must be the literal `true`/`false`: the backend's query
+	// struct refuses `1`/`yes`/`on` outright and fails the whole request.
+	const res = await apiFetch(
+		`/api/admin/drive-policies/defaults/${kind}?dry_run=${dryRun ? 'true' : 'false'}`,
+		{
+			method: 'PUT',
+			headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+			credentials: 'same-origin',
+			body: JSON.stringify(bag)
+		}
+	);
+	if (!res.ok) {
+		let detail = '';
+		try {
+			const e = (await res.json()) as { message?: string };
+			detail = e.message ?? '';
+		} catch {
+			/* non-JSON error body */
+		}
+		throw new Error(detail || `drive policy defaults failed: ${res.status}`);
+	}
+	return (await res.json()) as T;
+}
+
+export function getOidcSettings(): Promise<OidcSettings> {
+	return apiJson<OidcSettings>('/api/admin/settings/oidc', { credentials: 'same-origin' });
+}
+
+export async function testOidc(issuerUrl: string): Promise<OidcTestResult> {
+	const res = await apiFetch('/api/admin/settings/oidc/test', {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: JSON.stringify({ issuer_url: issuerUrl })
+	});
+	return (await res
+		.json()
+		.catch(() => ({ success: false, message: 'Request failed' }))) as OidcTestResult;
+}
+
+export function saveOidc(body: Record<string, unknown>): Promise<void> {
+	return mutate('/api/admin/settings/oidc', 'PUT', body);
+}
+
+// ── Storage settings + migration ───────────────────────────────────────────
+
+/**
+ * One `<cipher>:<key>` pair rendered for the admin storage panel.
+ * Never carries key material — only cipher name + SSH-style
+ * fingerprint safe to show operators.
+ */
+export interface StorageEncryptionPair {
+	/** `"aes-256-gcm"` for a real-cipher pair, `"none"` for a `none:` sentinel. */
+	cipher: string;
+	/**
+	 * SSH-style colon-hex 8-byte fingerprint of the key. Matches
+	 * `backend_rotate`'s `head_key_fp` and the `oxicloud --fingerprint`
+	 * CLI output — enables one-glance identification of which key is
+	 * which. `undefined` for `none:` pairs (no key material).
+	 */
+	fingerprint?: string;
+	/** True for the LAST pair in the list — the write pair (head). */
+	is_head: boolean;
+}
+
+export interface StorageEntrySummary {
+	name: string;
+	backend: string;
+	is_active: boolean;
+	encryption_enabled: boolean;
+	/** Human-readable physical hint (root_dir / bucket / container). */
+	location_hint?: string | null;
+	/**
+	 * Ordered pair-list summary — oldest first, head last. Empty when
+	 * the entry has no `_ENCRYPTION_KEY` declared at all. Used by the
+	 * entry card to render the pair chain so admins can identify
+	 * which key is the current head + which are safe to remove after
+	 * a completed rotation.
+	 */
+	encryption_pairs: StorageEncryptionPair[];
+}
+
+export interface StorageSettings {
+	// Live stats — what the running process reports.
+	current_backend?: string;
+	total_blobs?: number;
+	total_bytes_stored?: number;
+	dedup_ratio?: number;
+	// Multi-entry view (slice 6 of docs/plan/storage-multi-entry.md).
+	// `entries` is empty for the legacy zero-entries path.
+	entries?: StorageEntrySummary[];
+	active_entry_name?: string;
+	migration_readonly?: boolean;
+}
+
+export function getStorageSettings(): Promise<StorageSettings> {
+	return apiJson<StorageSettings>('/api/admin/settings/storage', { credentials: 'same-origin' });
+}
+
+export function saveStorage(body: Record<string, unknown>): Promise<void> {
+	return mutate('/api/admin/settings/storage', 'PUT', body);
+}
+
+export async function testStorage(body: Record<string, unknown>): Promise<StorageTestResult> {
+	const res = await apiFetch('/api/admin/settings/storage/test', {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: JSON.stringify(body)
+	});
+	return (await res.json().catch(() => ({ connected: false }))) as StorageTestResult;
+}
+
+export interface MigrationStatus {
+	status: 'idle' | 'running' | 'paused' | 'completed' | 'failed';
+	total_blobs: number;
+	migrated_blobs: number;
+	migrated_bytes: number;
+	throughput_bytes_per_sec?: number;
+	failed_blobs?: string[];
+}
+
+export function getMigration(): Promise<MigrationStatus> {
+	return apiJson<MigrationStatus>('/api/admin/storage/migration', { credentials: 'same-origin' });
+}
+
+export function migrationAction(
+	action: 'start' | 'pause' | 'resume',
+	targetName?: string
+): Promise<void> {
+	// `complete` was retired when the migration became a recoverable
+	// job — Completed is the terminal `RunSummary.status`; there's
+	// nothing left to acknowledge. Post-migration cutover happens on
+	// operator restart (server re-boots on active_backend_name = the
+	// new entry; the boot-clear rule drops migration_readonly).
+	//
+	// `start` REQUIRES `targetName` in multi-entry mode — the backend
+	// rejects an unnamed start with 400 (see StartMigrationDto).
+	// `pause` and `resume` take no body (resume reads target_name
+	// from the paused run's params).
+	const body: Record<string, unknown> =
+		action === 'start' ? { target_name: targetName ?? '', concurrency: 4 } : {};
+	return mutate(`/api/admin/storage/migration/${action}`, 'POST', body);
+}
+
+/**
+ * K4 (storage-key-rotation): trigger `backend_rotate` on a specific
+ * storage entry. Normalises every blob on `<name>` to that entry's
+ * head-pair format: legacy → v1, plaintext ↔ encrypted, old-key →
+ * new-key. Fire-and-forget — poll `GET /api/admin/jobs/backend_rotate`
+ * for status.
+ *
+ * Backend: `POST /api/admin/storage/entries/{name}/rotate`
+ * (`admin_handler::trigger_backend_rotate`). Refuses (400) on unknown
+ * entry name or when a `backend_rotate` / `backend_migration` run is
+ * already in flight.
+ */
+export function rotateStorageEntry(name: string): Promise<void> {
+	return mutate(`/api/admin/storage/entries/${encodeURIComponent(name)}/rotate`, 'POST', undefined);
+}
+
+// ── Backend write-lock (operator-driven External variant) ──
+//
+// One primitive, several reasons: the server-side gate can be held
+// by a migration, a backup, a key rotation, or an `External` lock
+// an operator engages for a restic / borg / filesystem snapshot
+// window. The admin UI only exposes the External variant for
+// acquire — the three other variants originate from their own
+// jobs — but release clears whichever variant is held, which is
+// the operator's escape hatch if a `backend_migration` ever
+// wedges.
+//
+// Backend: `src/interfaces/api/handlers/admin_handler.rs`
+// §"Backend write-lock — operator-driven External acquire/release"
+// and the `BackendWriteLockReason` enum shape over the wire.
+
+export type BackendWriteLockHolder =
+	| { kind: 'migration'; source: string; target: string }
+	| { kind: 'backup'; destination: string; started_at: string }
+	| { kind: 'rotation'; entry: string }
+	| {
+			kind: 'external';
+			admin_id: string;
+			label: string;
+			acquired_at: string;
+			expires_at: string;
+	  };
+
+export interface BackendWriteLockStatus {
+	is_held: boolean;
+	holder?: BackendWriteLockHolder;
+}
+
+/**
+ * Current holder of the global backend write-lock. `is_held = false`
+ * means user writes are allowed AND backend-writer jobs
+ * (`backend_reclaim`, `backend_rechunk`, `backend_rotate`,
+ * `*_import`, `satellites_consistency`) run on their normal
+ * cadence. `is_held = true` + a typed `holder` tells the UI which
+ * variant is engaged — the storage card renders a reason-specific
+ * row and (for `external`) a Release button.
+ */
+export function getBackendWriteLock(): Promise<BackendWriteLockStatus> {
+	return apiJson<BackendWriteLockStatus>('/api/admin/storage/write-lock', {
+		credentials: 'same-origin'
+	});
+}
+
+/**
+ * Engage the operator-driven External lock. `label` is required (a
+ * one-line explanation surfaced on the UI banner + audit trail);
+ * `expiresInSeconds` is optional and server-clamped to [60s, 24h].
+ * Caller re-reads status via [`getBackendWriteLock`] after this
+ * resolves (same pattern the migration controls use).
+ */
+export function acquireBackendWriteLock(label: string, expiresInSeconds?: number): Promise<void> {
+	return mutate('/api/admin/storage/write-lock', 'POST', {
+		label,
+		expires_in_seconds: expiresInSeconds
+	});
+}
+
+/**
+ * Release whichever variant currently holds the gate. Admin-only
+ * escape hatch; audit-logged with the previous holder's kind. Safe
+ * to call on a free gate — the server returns the same "not held"
+ * status.
+ */
+export function releaseBackendWriteLock(): Promise<void> {
+	return mutate('/api/admin/storage/write-lock', 'DELETE', undefined);
+}
+
+// ── Ops banners ──────────────────────────────────────────────────
+//
+// Admin CRUD surface for the operator-authored banner messages that
+// appear across every connected user's session. The public read
+// path goes through `/api/config.server_status.banners` (hydrated
+// at boot, refetched on `banners_version` diff from the
+// X-Server-Status header or the WS push); these wrappers only cover
+// the admin edit side.
+
+import type { OpsBanner } from '$lib/api/types';
+
+/** Payload for create / update — the server assigns id /
+ *  created_by / created_at on create, and preserves them on
+ *  update. */
+export interface OpsBannerInput {
+	severity: 'warning' | 'notification';
+	body: Record<string, string>;
+	starts_at?: string | null;
+	/** Optional auto-hide timestamp. Must be strictly after
+	 *  `starts_at` (or `now` if `starts_at` is unset). The server
+	 *  rejects an earlier `expires_at` with 400 — surfaces the typo
+	 *  rather than silently creating a dead banner. */
+	expires_at?: string | null;
+}
+
+/**
+ * `GET /api/admin/banners` — full admin list including
+ * scheduled-but-not-yet-visible entries. The public endpoint on
+ * `/api/config` filters those out so the admin UI can show
+ * "scheduled: visible from 2026-10-16 20:00".
+ */
+export function listOpsBanners(): Promise<OpsBanner[]> {
+	return apiJson<OpsBanner[]>('/api/admin/banners', { credentials: 'same-origin' });
+}
+
+/**
+ * `POST /api/admin/banners` — create a new banner. Rejects with
+ * 409 if the server-side cap (10 banners) is reached, 400 on
+ * validation failure (empty body, body > 2048 bytes, invalid
+ * locale key).
+ */
+export async function createOpsBanner(input: OpsBannerInput): Promise<OpsBanner> {
+	const res = await apiFetch('/api/admin/banners', {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: JSON.stringify(input)
+	});
+	if (!res.ok) {
+		const e = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+		throw new Error(e.message || e.error || `create banner failed: ${res.status}`);
+	}
+	return (await res.json()) as OpsBanner;
+}
+
+/**
+ * `PUT /api/admin/banners/{id}` — full-replacement update. `id`,
+ * `created_by`, `created_at` stay. Severity change on an existing
+ * id does NOT un-dismiss users who already dismissed; the design
+ * note on the backend's `update` recommends DELETE + create for
+ * that case.
+ */
+export async function updateOpsBanner(id: string, input: OpsBannerInput): Promise<OpsBanner> {
+	const res = await apiFetch(`/api/admin/banners/${encodeURIComponent(id)}`, {
+		method: 'PUT',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: JSON.stringify(input)
+	});
+	if (!res.ok) {
+		const e = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+		throw new Error(e.message || e.error || `update banner failed: ${res.status}`);
+	}
+	return (await res.json()) as OpsBanner;
+}
+
+/** `DELETE /api/admin/banners/{id}` — remove one banner. */
+export function deleteOpsBanner(id: string): Promise<void> {
+	return mutate(`/api/admin/banners/${encodeURIComponent(id)}`, 'DELETE', undefined);
+}
+
+// verifyMigration + MigrationVerifyResult retired in slice 7 of
+// docs/plan/storage-multi-entry.md — the corresponding backend
+// endpoint's sample-based check is superseded by
+// `POST /api/admin/jobs/blobs_consistency/trigger?storage=<name>`,
+// which does a full walk against any named entry and integrates
+// with the standard runs / findings admin surface. Trigger from
+// the Jobs tab; the Storage tab drops the "Verify integrity"
+// button.
+
+// ── Plugins ─────────────────────────────────────────────────────────────
+
+export interface PluginInfo {
+	id: string;
+	name: string;
+	version?: string;
+	enabled: boolean;
+	description?: string;
+	abi?: string | number;
+	subscriptions?: string[];
+}
+
+export interface PluginRetention {
+	retention_days: number;
+	max_bytes: number;
+}
+
+/**
+ * Install a plugin from a .zip bundle. The browser sets the multipart
+ * Content-Type (with boundary) — do not override it here.
+ */
+export async function installPlugin(bundle: File): Promise<PluginInfo> {
+	const form = new FormData();
+	form.append('bundle', bundle);
+	const res = await apiFetch('/api/admin/plugins', {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...getCsrfHeaders() },
+		body: form
+	});
+	if (!res.ok) {
+		const e = (await res.json().catch(() => ({}))) as { message?: string };
+		throw new Error(e.message || `install failed: ${res.status}`);
+	}
+	return (await res.json()) as PluginInfo;
+}
+
+export async function getPluginRetention(id: string): Promise<PluginRetention | null> {
+	const res = await apiFetch(`/api/admin/plugins/${encodeURIComponent(id)}/retention`, {
+		credentials: 'same-origin'
+	});
+	if (!res.ok) return null;
+	return (await res.json()) as PluginRetention;
+}
+
+export function savePluginRetention(id: string, r: PluginRetention): Promise<void> {
+	return mutate(`/api/admin/plugins/${encodeURIComponent(id)}/retention`, 'PUT', r);
+}
+
+export function clearPluginLogs(id: string): Promise<void> {
+	return mutate(`/api/admin/plugins/${encodeURIComponent(id)}/logs`, 'DELETE');
+}
+
+export interface PluginsResult {
+	/** false when the plugin subsystem is disabled (server returns 503). */
+	available: boolean;
+	enabled?: boolean;
+	plugins: PluginInfo[];
+}
+
+export async function listPlugins(): Promise<PluginsResult> {
+	const res = await apiFetch('/api/admin/plugins', { credentials: 'same-origin' });
+	if (res.status === 503) return { available: false, plugins: [] };
+	if (!res.ok) throw new Error(`plugins failed: ${res.status}`);
+	const data = (await res.json()) as { enabled?: boolean; plugins?: PluginInfo[] };
+	return { available: true, enabled: data.enabled, plugins: data.plugins ?? [] };
+}
+
+export function setPluginEnabled(id: string, enabled: boolean): Promise<void> {
+	return mutate(`/api/admin/plugins/${encodeURIComponent(id)}/enabled`, 'PUT', { enabled });
+}
+
+export function deletePlugin(id: string): Promise<void> {
+	return mutate(`/api/admin/plugins/${encodeURIComponent(id)}`, 'DELETE');
+}
+
+export interface PluginLogEntry {
+	timestamp?: string;
+	ts?: string;
+	level?: string;
+	message?: string;
+	/** Streamed-entry message field (SSE / persisted logs use `msg`). */
+	msg?: string;
+	/** "outcome" | "log" — outcome entries carry a `reason`. */
+	kind?: string;
+	reason?: string;
+	invocation_id?: string;
+	[k: string]: unknown;
+}
+
+export interface PluginLogPage {
+	total: number;
+	entries: PluginLogEntry[];
+}
+
+export function getPluginLogs(
+	id: string,
+	opts: { limit?: number; offset?: number; level?: string; search?: string } = {}
+): Promise<PluginLogPage> {
+	const params = new URLSearchParams();
+	params.set('limit', String(opts.limit ?? 50));
+	params.set('offset', String(opts.offset ?? 0));
+	if (opts.level) params.set('level', opts.level);
+	if (opts.search) params.set('search', opts.search);
+	return apiJson<PluginLogPage>(`/api/admin/plugins/${encodeURIComponent(id)}/logs?${params}`, {
+		credentials: 'same-origin'
+	});
+}
+
+// ── External file mounts ────────────────────────────────────────────────────
+
+/** A configured external mount as returned by the admin API. */
+export interface ExternalMount {
+	mount_folder_id: string;
+	name: string;
+	kind: string;
+	owner_id: string;
+	read_only: boolean;
+	drive_id: string;
+	mount_path: string;
+	config: Record<string, unknown>;
+}
+
+/** Request body for creating an external mount. */
+export interface CreateExternalMountInput {
+	name: string;
+	host_path: string;
+	drive_id: string;
+	kind?: string;
+	read_only?: boolean;
+}
+
+/** GET /api/admin/external-mounts — list all configured mounts. */
+export function listExternalMounts(): Promise<ExternalMount[]> {
+	return apiJson<ExternalMount[]>('/api/admin/external-mounts', {
+		credentials: 'same-origin'
+	});
+}
+
+/** POST /api/admin/external-mounts — create a mount in the selected drive. */
+export async function createExternalMount(input: CreateExternalMountInput): Promise<ExternalMount> {
+	const res = await apiFetch('/api/admin/external-mounts', {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: { ...JSON_HEADERS, ...getCsrfHeaders() },
+		body: JSON.stringify(input)
+	});
+	if (!res.ok) {
+		const e = (await res.json().catch(() => ({}))) as { message?: string };
+		throw new Error(e.message || `Create mount failed: ${res.status}`);
+	}
+	return (await res.json()) as ExternalMount;
+}
+
+/** DELETE /api/admin/external-mounts/{id} — remove a mount (host content kept). */
+export function deleteExternalMount(mountFolderId: string): Promise<void> {
+	return mutate(`/api/admin/external-mounts/${mountFolderId}`, 'DELETE');
+}
+
+/** Subscribe to plugin logs through the generated client's SSE parser and transport. */
+export function subscribePluginLogs(
+	id: string,
+	onEntry: (entry: PluginLogEntry) => void,
+	onLagged: () => void
+): { close: () => void } {
+	const controller = new AbortController();
+	const consume = async () => {
+		const { stream } = await generatedClient.sse.get({
+			url: '/api/admin/plugins/{id}/logs/stream',
+			path: { id },
+			signal: controller.signal,
+			onSseEvent: ({ data, event }) => {
+				if (controller.signal.aborted) return;
+				if (event === 'lagged') onLagged();
+				else if ((!event || event === 'message') && data && typeof data === 'object') {
+					onEntry(data as PluginLogEntry);
+				}
+			}
+		});
+		for await (const _entry of stream) {
+			/* The callback handles named events too. */
+		}
+	};
+	void consume().catch(() => {
+		/* Closing the view cancels the stream. */
+	});
+	return { close: () => controller.abort() };
+}

@@ -1,0 +1,110 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+module internal B2R2.FrontEnd.BinFile.Wasm.Helper
+
+open B2R2.FrontEnd.BinFile
+
+/// Returns the offset of the function the given index names, or none where the
+/// module holds no such function. A start section is free to name one that is
+/// not there, and an index naming nothing is a fact about the module rather
+/// than an entry point to hand back.
+let private tryFindFuncOffset wm fi =
+  wm.IndexMap
+  |> Array.tryFind (fun ii -> ii.Kind = IndexKind.Function && ii.Index = fi)
+  |> Option.map (fun ii -> uint64 ii.ElemOffset)
+
+let entryPointOf wm =
+  match wm.StartSection with
+  | Some ss -> ss.Contents |> Option.bind (tryFindFuncOffset wm)
+  | None -> None
+
+let importToBinImport (entry: Import) =
+  { Name = entry.Name
+    LibraryName = entry.ModuleName
+    TrampolineAddress = None
+    TableAddress = uint64 entry.Offset }
+
+let private tryFindNameSection wm =
+  wm.CustomSections
+  |> List.tryPick (fun cs ->
+    match cs.Contents with
+    | Some conts -> conts.NameSection
+    | None -> None)
+
+let private exportFuncNames wm =
+  match wm.ExportSection with
+  | Some sec ->
+    match sec.Contents with
+    | Some conts ->
+      conts.Elements
+      |> Array.choose (fun e ->
+        match e.Desc with
+        | ExpFunc idx -> Some(idx, e.Name)
+        | _ -> None)
+    | None ->
+      [||]
+  | None ->
+    [||]
+
+let private nameSecFuncNames wm =
+  match tryFindNameSection wm with
+  | Some ns ->
+    ns.FunctionNames |> Array.map (fun assoc -> assoc.Index, assoc.Name)
+  | None ->
+    [||]
+
+/// Maps each function's element offset (its address) to its name, preferring
+/// the "name" custom section and falling back to the export name.
+let getFunctionNameMap wm =
+  let nameByIdx =
+    Array.append (exportFuncNames wm) (nameSecFuncNames wm) |> Map.ofArray
+  if Map.isEmpty nameByIdx then
+    Map.empty
+  else
+    wm.IndexMap
+    |> Array.choose (fun ii ->
+      if ii.Kind = IndexKind.Function then
+        match Map.tryFind ii.Index nameByIdx with
+        | Some name -> Some(uint64 ii.ElemOffset, name)
+        | None -> None
+      else
+        None)
+    |> Map.ofArray
+
+let getImports wm =
+  match wm.ImportSection with
+  | Some sec ->
+    match sec.Contents with
+    | Some conts ->
+      conts.Elements
+      |> Array.filter (fun ie ->
+          match ie.Desc with
+          | ImpFunc _ -> true
+          | _ -> false)
+      |> Array.map importToBinImport
+    | None ->
+      [||]
+  | None ->
+    [||]

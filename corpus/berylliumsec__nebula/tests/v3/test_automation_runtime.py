@@ -1,0 +1,2277 @@
+import asyncio
+import itertools
+import json
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+from nebula.v3.api import create_app
+from nebula.v3.artifacts import ArtifactStore
+from nebula.v3 import automation_runtime, tool_results
+from nebula.v3.automation_runtime import (
+    AutomationRuntimeManager,
+    AutomationPolicyDenied,
+    CommandApprovalRequired,
+    ContainerRuntimeSession,
+    ProcessIORequest,
+    RunCommandRequest,
+    RuntimeBackendProcess,
+    RuntimeBackendSession,
+)
+from nebula.v3.automation_tools import AutomationBroker, PROCESS_IO_NAME
+from nebula.v3.domain import (
+    AgentRun,
+    Approval,
+    ApprovalStatus,
+    AutomationApprovalPolicy,
+    AutomationNetworkMode,
+    AutomationProjectPolicy,
+    AutomationSession,
+    AutomationSessionStatus,
+    ChatSession,
+    ChatTurn,
+    ChatTurnStatus,
+    CommandExecution,
+    CommandExecutionStatus,
+    Engagement,
+    NativeHookExecution,
+    ProviderProfile,
+    RunnerIsolation,
+    RunnerProfile,
+    RunBudget,
+    RunnerRuntime,
+    RunStatus,
+    ScopePolicy,
+    ToolCall,
+    ToolCallOrigin,
+    ToolCallStatus,
+    VpnProfile,
+    WorkspaceProvenanceObservation,
+    RiskClass,
+    utc_now,
+)
+from nebula.v3.credentials import CredentialCreateRequest, CredentialStore
+from nebula.v3.diagnostics import DiagnosticManager
+from nebula.v3.storage import NebulaStore, NotFoundError
+from nebula.v3.tool_results import (
+    ToolOutputAccessError,
+    ToolOutputQueryError,
+    ToolOutputService,
+    WorkspaceOutputService,
+    sanitize_model_history_result,
+)
+from nebula.v3.tools import (
+    AmbiguousToolState,
+    ApprovalRequired,
+    PolicyDenied,
+    ToolInvocation,
+)
+
+
+IMAGE = "registry.invalid/nebula-automation@sha256:" + "a" * 64
+
+
+class DurableTestKeyring:
+    __module__ = "keyring.backends.SecretService"
+    priority = 1
+
+    def __init__(self):
+        self.values = {}
+
+    def set_password(self, service_name, username, password):
+        self.values[(service_name, username)] = password
+
+    def get_password(self, service_name, username):
+        return self.values.get((service_name, username))
+
+    def delete_password(self, service_name, username):
+        self.values.pop((service_name, username), None)
+
+
+def test_all_target_scope_compiles_to_dual_stack_all_port_egress():
+    rules, domains = AutomationRuntimeManager._network_boundary(
+        AutomationProjectPolicy(engagement_id="eng-1", network_enabled=True),
+        ScopePolicy(engagement_id="eng-1", allow_all_targets=True),
+    )
+
+    assert domains == []
+    assert [(rule.address, rule.all_ports, rule.ports) for rule in rules] == [
+        ("0.0.0.0/0", True, []),
+        ("::/0", True, []),
+    ]
+
+
+class FakeProcess(RuntimeBackendProcess):
+    def __init__(self, output: bytes, *, stays_running: bool = False) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.writes: list[bytes] = []
+        # What the runtime put in the process environment, e.g. the results
+        # URL and key a background command posts with.
+        self.extra_env: dict[str, str] = {}
+        self._done: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        self.stdout.feed_data(output)
+        if not stays_running:
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self._done.set_result(0)
+
+    async def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def wait(self) -> int:
+        return await self._done
+
+    async def terminate(self) -> None:
+        if not self._done.done():
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self._done.set_result(-15)
+
+
+class FakeSession(RuntimeBackendSession):
+    def __init__(self, *, network_granted: bool, workspace: Path) -> None:
+        self._network_enabled = network_granted
+        self.workspace = workspace
+        self.enable_count = 0
+        self.closed = False
+        self.processes: list[FakeProcess] = []
+
+    @property
+    def network_enabled(self) -> bool:
+        return self._network_enabled
+
+    async def enable_network(self) -> None:
+        self._network_enabled = True
+        self.enable_count += 1
+
+    async def run(
+        self,
+        process_id: str,
+        command: str,
+        cwd: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> FakeProcess:
+        del process_id
+        if command == "write-generated-file":
+            (self.workspace / cwd / "generated.txt").write_text(
+                "generated", encoding="utf-8"
+            )
+        output = (
+            b"\x00\xffbinary-output-continues"
+            if command == "binary-output"
+            else f"cwd={cwd} command={command}\n".encode()
+        )
+        process = FakeProcess(
+            output,
+            stays_running=command == "wait-forever",
+        )
+        process.extra_env = dict(extra_env or {})
+        self.processes.append(process)
+        return process
+
+    async def close(self) -> None:
+        self.closed = True
+        for process in self.processes:
+            await process.terminate()
+
+
+def runtime(tmp_path: Path):
+    store = NebulaStore(tmp_path / "nebula.db")
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    engagement = store.create(Engagement(name="Runtime test"))
+    scope = store.create(
+        ScopePolicy(
+            id=f"scope:{engagement.id}",
+            engagement_id=engagement.id,
+            allowed_cidrs=["203.0.113.0/24"],
+            allowed_ports=[443],
+        )
+    )
+    engagement = store.update(
+        Engagement,
+        engagement.id,
+        {"scope_policy_id": scope.id},
+        expected_revision=engagement.revision,
+    )
+    store.create(
+        RunnerProfile(
+            id="runner",
+            name="Docker",
+            runtime=RunnerRuntime.DOCKER,
+            executable="/usr/bin/docker",
+            platform="linux/amd64",
+            isolation=RunnerIsolation.ROOTLESS,
+            healthy=True,
+        )
+    )
+    workspace = tmp_path / "workspaces" / engagement.id
+    workspace.mkdir(parents=True)
+    sessions: list[FakeSession] = []
+
+    async def launch(configuration):
+        session = FakeSession(
+            network_granted=configuration.network_granted,
+            workspace=configuration.workspace,
+        )
+        sessions.append(session)
+        return session
+
+    manager = AutomationRuntimeManager(
+        store=store,
+        artifact_store=artifacts,
+        data_root=tmp_path,
+        workspace_resolver=lambda _engagement_id: workspace,
+        runtime_image=IMAGE,
+        session_factory=launch,
+    )
+    return manager, store, artifacts, engagement, sessions
+
+
+def command_hook(workspace: Path, log: Path, *, block: bool = False) -> None:
+    directory = workspace / ".agents" / "hooks" / "command-policy"
+    directory.mkdir(parents=True)
+    script = directory / "run.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "event = json.load(sys.stdin)\n"
+        f"with open({str(log)!r}, 'a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps(event, sort_keys=True) + '\\n')\n"
+        + (
+            "if event['event'] == 'tool.before':\n    raise SystemExit(9)\n"
+            if block
+            else ""
+        ),
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    (directory / "hook.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "name": "Command policy",
+                "events": ["tool.before", "tool.after"],
+                "command": ["run.py"],
+                "timeout_seconds": 5,
+                "side_effects": "none",
+                "failure_policy": "block",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def tool_invocation(engagement, workspace: Path, name: str, arguments: dict, step: int):
+    return ToolInvocation(
+        engagement_id=engagement.id,
+        run_id="turn-1",
+        origin=ToolCallOrigin.CHAT,
+        chat_session_id="chat-1",
+        chat_turn_id="turn-1",
+        tool_name=name,
+        arguments=arguments,
+        workspace=workspace,
+        idempotency_key=f"chat:turn-1:step:{step}",
+        requested_by="chat-assistant",
+    )
+
+
+def create_tool_chat(store: NebulaStore, engagement: Engagement) -> None:
+    store.create(
+        ChatSession(
+            id="chat-1",
+            engagement_id=engagement.id,
+            title="Command hook test",
+            provider_profile_id="provider-1",
+            model="test-model",
+        )
+    )
+    store.create(
+        ChatTurn(
+            id="turn-1",
+            engagement_id=engagement.id,
+            session_id="chat-1",
+            provider_profile_id="provider-1",
+            model="test-model",
+            status=ChatTurnStatus.ROUTING,
+            tools_enabled=True,
+        )
+    )
+
+
+def test_command_tools_run_automatic_project_hooks_before_and_after(tmp_path):
+    async def scenario():
+        manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+        create_tool_chat(store, engagement)
+        workspace = tmp_path / "workspaces" / engagement.id
+        log = tmp_path / "command-hooks.jsonl"
+        command_hook(workspace, log)
+        broker = AutomationBroker(
+            manager=manager,
+            store=store,
+            output_service=ToolOutputService(store, artifacts),
+        )
+        command = await broker.execute(
+            tool_invocation(
+                engagement, workspace, "run_command", {"command": "echo hook-ok"}, 1
+            ),
+            store.get(ScopePolicy, f"scope:{engagement.id}"),
+        )
+        await broker.execute(
+            tool_invocation(
+                engagement,
+                workspace,
+                PROCESS_IO_NAME,
+                {"process_id": command.receipt.process_id, "action": "poll"},
+                2,
+            ),
+            store.get(ScopePolicy, f"scope:{engagement.id}"),
+        )
+
+        events = [json.loads(line) for line in log.read_text().splitlines()]
+        assert [item["event"] for item in events] == [
+            "tool.before",
+            "tool.after",
+            "tool.before",
+            "tool.after",
+        ]
+        assert [item["payload"]["tool_name"] for item in events] == [
+            "run_command",
+            "run_command",
+            "process_io",
+            "process_io",
+        ]
+        assert events[1]["payload"]["status"] == "completed"
+        assert all(
+            item["workspace_provenance"]["schema"] == "nebula.workspace-provenance/v1"
+            for item in events
+        )
+        assert all(
+            item["workspace_provenance"]["actor_id"] == "chat:chat-1" for item in events
+        )
+        executions = store.list_entities(NativeHookExecution)
+        assert len(executions) == 4
+        assert all(item.owner_id == "chat-1" for item in executions)
+
+    asyncio.run(scenario())
+
+
+def test_blocking_before_hook_denies_command_before_runtime_execution(tmp_path):
+    async def scenario():
+        manager, store, artifacts, engagement, sessions = runtime(tmp_path)
+        create_tool_chat(store, engagement)
+        workspace = tmp_path / "workspaces" / engagement.id
+        command_hook(workspace, tmp_path / "blocked-hooks.jsonl", block=True)
+        broker = AutomationBroker(
+            manager=manager,
+            store=store,
+            output_service=ToolOutputService(store, artifacts),
+        )
+        invocation = tool_invocation(
+            engagement, workspace, "run_command", {"command": "echo must-not-run"}, 1
+        )
+
+        with pytest.raises(PolicyDenied, match="required project hook"):
+            await broker.execute(
+                invocation, store.get(ScopePolicy, f"scope:{engagement.id}")
+            )
+
+        assert sessions == []
+        [call] = store.list_entities(ToolCall)
+        assert call.status == ToolCallStatus.DENIED
+        assert store.list_entities(CommandExecution) == []
+        [observation] = store.list_entities(WorkspaceProvenanceObservation)
+        assert observation.status == "complete"
+
+    asyncio.run(scenario())
+
+
+def test_general_command_reuses_session_and_persists_artifacts(tmp_path):
+    async def scenario():
+        manager, store, artifacts, engagement, sessions = runtime(tmp_path)
+
+        first = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="chat",
+            owner_id="chat-1",
+            request=RunCommandRequest(command="rg needle .", cwd="."),
+        )
+        second = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="chat",
+            owner_id="chat-1",
+            request=RunCommandRequest(command="python -V", cwd="."),
+        )
+
+        assert len(sessions) == 1
+        assert first.session_id == second.session_id
+        assert first.status == CommandExecutionStatus.COMPLETED
+        assert "rg needle" in first.stdout
+        execution = store.get(CommandExecution, first.execution_id)
+        assert execution.command_sha256
+        assert execution.stdout_artifact_id
+        assert execution.redacted_stdout_artifact_id
+        assert artifacts.read(
+            store.get_by_kind("artifacts", execution.stdout_artifact_id)
+        )
+
+        closed = await manager.close_session(first.session_id)
+        assert closed.status == AutomationSessionStatus.CLOSED
+        assert sessions[0].closed is True
+
+    asyncio.run(scenario())
+
+
+def test_process_wrapper_accepts_an_existing_process_group(tmp_path):
+    async def scenario():
+        pid_file = tmp_path / "process.pid"
+        process = await asyncio.create_subprocess_exec(
+            "/usr/bin/python3",
+            "-c",
+            ContainerRuntimeSession._PROCESS_WRAPPER,
+            str(pid_file),
+            "printf wrapper-ok",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        stdout, stderr = await process.communicate()
+
+        assert process.returncode == 0, stderr.decode()
+        assert stdout == b"wrapper-ok"
+        assert int(pid_file.read_text(encoding="ascii")) > 1
+
+    asyncio.run(scenario())
+
+
+def test_communicate_accepts_discarded_stderr():
+    async def scenario():
+        process = await asyncio.create_subprocess_exec(
+            "/usr/bin/python3",
+            "-c",
+            "import sys; print('output'); print('discarded', file=sys.stderr)",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, stderr = await automation_runtime._communicate(process, timeout=5)
+
+        assert stdout == b"output\n"
+        assert stderr == b""
+
+    asyncio.run(scenario())
+
+
+def test_communicate_preserves_timeout_when_process_exits_during_kill():
+    class ExitedProcess:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(60)
+
+        def kill(self):
+            raise ProcessLookupError
+
+        async def wait(self):
+            return 0
+
+    async def scenario():
+        with pytest.raises(
+            automation_runtime.AutomationRuntimeUnavailable,
+            match="container runtime operation timed out",
+        ):
+            await automation_runtime._communicate(ExitedProcess(), timeout=0.001)
+
+    asyncio.run(scenario())
+
+
+def test_startup_removes_exact_orphan_runtime_and_gateway_names(tmp_path, monkeypatch):
+    async def scenario():
+        manager, store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        policy = manager.project_policy(engagement.id)
+        session = store.create(
+            AutomationSession(
+                id="A4D6F5D0-BC17-4A90-8878-21A93F805EB9",
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id="orphan-owner",
+                runtime_image=IMAGE,
+                runtime_digest="sha256:" + "a" * 64,
+                runner_profile_id="runner",
+                runner_profile_revision=1,
+                policy_id=policy.id,
+                policy_revision=policy.revision,
+                status=AutomationSessionStatus.READY,
+            )
+        )
+        store.create(
+            CommandExecution(
+                id=manager._execution_id("orphan-process"),
+                engagement_id=engagement.id,
+                session_id=session.id,
+                process_id="orphan-process",
+                command="sleep 3600",
+                command_sha256="0" * 64,
+                runtime_digest="sha256:" + "a" * 64,
+                policy_revision=policy.revision,
+            )
+        )
+
+        class CleanupRunner:
+            def __init__(self):
+                self.removed = []
+
+            async def available(self):
+                return True, "verified"
+
+            async def _force_remove(self, name):
+                self.removed.append(name)
+
+        cleanup_runner = CleanupRunner()
+        monkeypatch.setattr(
+            manager, "_runner", lambda *_args, **_kwargs: cleanup_runner
+        )
+
+        await manager.startup()
+
+        expected = "nebula-runtime-a4d6f5d0bc174a90887821a93f805eb9"
+        assert cleanup_runner.removed == [expected, f"{expected}-egress"]
+        interrupted_session = store.get(AutomationSession, session.id)
+        assert interrupted_session.status == AutomationSessionStatus.INTERRUPTED
+        assert interrupted_session.failure_detail == (
+            "Core restarted; detached runtime teardown requested"
+        )
+        [execution] = store.list_entities(CommandExecution)
+        assert execution.status == CommandExecutionStatus.INTERRUPTED
+
+    asyncio.run(scenario())
+
+
+def test_session_processes_load_only_that_sessions_records_oldest_first(tmp_path):
+    """Listing one session's processes reads only that session's records.
+
+    It paged through every CommandExecution Core holds (~12.7k on the live
+    database) and filtered them in Python on each request.
+    """
+
+    from datetime import timedelta
+
+    from sqlalchemy import event as orm_event
+
+    from nebula.v3.database import EntityRow
+    from nebula.v3.domain import utc_now
+
+    manager, store, _artifacts, engagement, _sessions = runtime(tmp_path)
+    policy = manager.project_policy(engagement.id)
+
+    def session(owner_id: str) -> AutomationSession:
+        return store.create(
+            AutomationSession(
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id=owner_id,
+                runtime_image=IMAGE,
+                runtime_digest="sha256:" + "a" * 64,
+                runner_profile_id="runner",
+                runner_profile_revision=1,
+                policy_id=policy.id,
+                policy_revision=policy.revision,
+                status=AutomationSessionStatus.READY,
+            )
+        )
+
+    listed = session("listed")
+    busy = session("busy")
+    started = utc_now()
+
+    def execution(owner: AutomationSession, process_id: str, index: int):
+        at = started + timedelta(seconds=index)
+        return CommandExecution(
+            id=manager._execution_id(process_id),
+            engagement_id=owner.engagement_id,
+            session_id=owner.id,
+            process_id=process_id,
+            command="true",
+            command_sha256="0" * 64,
+            runtime_digest="sha256:" + "a" * 64,
+            policy_revision=policy.revision,
+            created_at=at,
+            updated_at=at,
+        )
+
+    with store.transaction() as transaction:
+        transaction.add_all(
+            [
+                # Oldest first by creation, not by process id.
+                execution(listed, "listed-c", 0),
+                *(execution(busy, f"busy-{index}", index) for index in range(1, 1_201)),
+                execution(listed, "listed-a", 1_201),
+                execution(listed, "listed-b", 1_202),
+            ]
+        )
+    loaded: list[str] = []
+
+    def count(target, _context):
+        if target.kind == CommandExecution.entity_kind:
+            loaded.append(target.id)
+
+    orm_event.listen(EntityRow, "load", count)
+    try:
+        processes = manager.list_processes(listed.id)
+    finally:
+        orm_event.remove(EntityRow, "load", count)
+
+    assert [item.process_id for item in processes] == [
+        "listed-c",
+        "listed-a",
+        "listed-b",
+    ]
+    assert all(isinstance(item, CommandExecution) for item in processes)
+    assert len(loaded) == 3
+    assert [item.process_id for item in manager.list_processes(busy.id)][:2] == [
+        "busy-1",
+        "busy-2",
+    ]
+    with pytest.raises(NotFoundError):
+        manager.list_processes("missing-session")
+
+
+def test_historical_process_io_preserves_agent_ownership(tmp_path):
+    async def scenario():
+        manager, _store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="mission",
+            owner_id="owning-mission",
+            request=RunCommandRequest(command="printf done"),
+        )
+        await manager.close_session(result.session_id)
+
+        with pytest.raises(AutomationPolicyDenied, match="unavailable"):
+            await manager.process_io(
+                result.process_id,
+                ProcessIORequest(action="poll"),
+                engagement_id=engagement.id,
+                owner_id="another-mission",
+            )
+        historical = await manager.process_io(
+            result.process_id,
+            ProcessIORequest(action="poll"),
+            engagement_id=engagement.id,
+            owner_id="owning-mission",
+        )
+        assert historical.status == CommandExecutionStatus.COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_command_execution_does_not_walk_workspace(tmp_path, monkeypatch):
+    async def scenario():
+        manager, store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        monkeypatch.setattr(
+            automation_runtime.os,
+            "walk",
+            lambda *_args, **_kwargs: pytest.fail("command execution walked workspace"),
+        )
+
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="api-workspace",
+            request=RunCommandRequest(command="write-generated-file"),
+        )
+
+        assert (tmp_path / "workspaces" / engagement.id / "generated.txt").read_text(
+            encoding="utf-8"
+        ) == "generated"
+        assert result.workspace_changes == []
+        execution = store.get(CommandExecution, result.execution_id)
+        assert execution.workspace_changes == []
+
+    asyncio.run(scenario())
+
+
+def test_command_request_defers_path_boundary_to_selected_backend_and_rejects_nul():
+    assert RunCommandRequest(command="pwd", cwd="../outside").cwd == "../outside"
+    with pytest.raises(ValidationError):
+        RunCommandRequest(command="printf bad\0command")
+
+
+def test_binary_output_is_truncated_for_models_and_retained_as_raw_artifact(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        monkeypatch.setattr(automation_runtime, "MAX_CAPTURE_BYTES", 8)
+        manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="binary-output",
+            request=RunCommandRequest(command="binary-output"),
+        )
+
+        execution = store.get(CommandExecution, result.execution_id)
+        raw = store.get_by_kind("artifacts", execution.stdout_artifact_id)
+        assert result.output_truncated is True
+        assert execution.observed_stdout_bytes > raw.size == 8
+        assert raw.media_type == "application/octet-stream"
+        assert artifacts.read(raw) == b"\x00\xffbinary"
+
+    asyncio.run(scenario())
+
+
+def test_network_boundary_prompts_once_and_enables_whole_project_scope(tmp_path):
+    async def scenario():
+        manager, store, _artifacts, engagement, sessions = runtime(tmp_path)
+        request = RunCommandRequest(
+            command="curl https://example.test",
+            network=AutomationNetworkMode.PROJECT_SCOPE,
+        )
+        with pytest.raises(CommandApprovalRequired) as required:
+            await manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="mission",
+                owner_id="mission-1",
+                request=request,
+            )
+        approval = store.update(
+            Approval,
+            required.value.approval.id,
+            {
+                "status": ApprovalStatus.APPROVED,
+                "decided_by": "operator",
+                "decided_at": utc_now(),
+            },
+            expected_revision=required.value.approval.revision,
+        )
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="mission",
+            owner_id="mission-1",
+            request=request,
+            approval=approval,
+        )
+        again = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="mission",
+            owner_id="mission-1",
+            request=RunCommandRequest(
+                command="curl https://second.example",
+                network=AutomationNetworkMode.PROJECT_SCOPE,
+            ),
+        )
+
+        assert result.network_granted is True
+        assert again.network_granted is True
+        assert sessions[0].enable_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_never_policy_is_automatic_and_background_process_can_be_cancelled(tmp_path):
+    async def scenario():
+        manager, _store, _artifacts, engagement, sessions = runtime(tmp_path)
+        policy = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=True,
+            runner_profile_id="runner",
+            max_timeout_ms=30_000,
+            expected_revision=policy.revision,
+        )
+        started = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="api-1",
+            request=RunCommandRequest(
+                command="wait-forever",
+                background=True,
+                network=AutomationNetworkMode.PROJECT_SCOPE,
+            ),
+        )
+        assert started.status == CommandExecutionStatus.RUNNING
+        assert started.network_granted is True
+        assert sessions[0].enable_count == 1
+
+        polled = await manager.process_io(
+            started.process_id,
+            ProcessIORequest(action="write", input="continue\n"),
+        )
+        assert polled.status == CommandExecutionStatus.RUNNING
+        assert sessions[0].processes[0].writes == [b"continue\n"]
+
+        stopped = await manager.process_io(
+            started.process_id, ProcessIORequest(action="terminate")
+        )
+        assert stopped.status == CommandExecutionStatus.CANCELLED
+
+    asyncio.run(scenario())
+
+
+def test_always_policy_consumes_one_exact_approval_per_command(tmp_path):
+    async def scenario():
+        manager, store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        policy = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=AutomationApprovalPolicy.ALWAYS,
+            network_enabled=False,
+            runner_profile_id="runner",
+            max_timeout_ms=30_000,
+            expected_revision=policy.revision,
+        )
+        request = RunCommandRequest(command="git status")
+        with pytest.raises(CommandApprovalRequired) as required:
+            await manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id="api-2",
+                request=request,
+            )
+        approval = store.update(
+            Approval,
+            required.value.approval.id,
+            {
+                "status": ApprovalStatus.APPROVED,
+                "decided_by": "operator",
+                "decided_at": utc_now(),
+            },
+            expected_revision=required.value.approval.revision,
+        )
+        await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="api-2",
+            request=request,
+            approval=approval,
+        )
+        with pytest.raises(CommandApprovalRequired):
+            await manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id="api-2",
+                request=request,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_command_timeout_terminates_the_process_group(tmp_path):
+    async def scenario():
+        manager, store, _artifacts, engagement, sessions = runtime(tmp_path)
+        started = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="timeout-command",
+            request=RunCommandRequest(
+                command="wait-forever", background=True, timeout_ms=1_000
+            ),
+        )
+
+        await asyncio.sleep(1)
+        for _ in range(100):
+            result = await manager.process_io(
+                started.process_id, ProcessIORequest(action="poll")
+            )
+            if result.status == CommandExecutionStatus.TIMED_OUT:
+                break
+            await asyncio.sleep(0.01)
+        assert result.status == CommandExecutionStatus.TIMED_OUT
+        execution = store.get(CommandExecution, result.execution_id)
+        assert execution.error == "command timed out"
+        assert sessions[0].processes[0]._done.result() == -15
+
+    asyncio.run(scenario())
+
+
+def test_network_request_fails_closed_when_disabled_or_scope_is_url_only(tmp_path):
+    async def scenario():
+        manager, store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        policy = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=False,
+            runner_profile_id="runner",
+            max_timeout_ms=30_000,
+            expected_revision=policy.revision,
+        )
+        request = RunCommandRequest(
+            command="curl https://example.test",
+            network=AutomationNetworkMode.PROJECT_SCOPE,
+        )
+        with pytest.raises(AutomationPolicyDenied, match="networking is disabled"):
+            await manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id="disabled-network",
+                request=request,
+            )
+
+        current = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=True,
+            runner_profile_id="runner",
+            max_timeout_ms=30_000,
+            expected_revision=current.revision,
+        )
+        scope = store.get(ScopePolicy, engagement.scope_policy_id)
+        store.update(
+            ScopePolicy,
+            scope.id,
+            {
+                "allowed_cidrs": [],
+                "allowed_domains": [],
+                "allowed_urls": ["https://example.test/only-this-path"],
+            },
+            expected_revision=scope.revision,
+        )
+        with pytest.raises(AutomationPolicyDenied, match="URL-only scope"):
+            await manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id="url-only-network",
+                request=request,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_cidr_only_scope_keeps_ports_on_cidr_rules(tmp_path):
+    async def scenario():
+        manager, _store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        launches = []
+
+        async def launch(configuration):
+            launches.append(configuration)
+            return FakeSession(
+                network_granted=configuration.network_granted,
+                workspace=configuration.workspace,
+            )
+
+        manager.session_factory = launch
+        await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="cidr-only",
+            request=RunCommandRequest(command="pwd", network="none"),
+        )
+
+        assert len(launches) == 1
+        assert launches[0].egress_domains == ()
+        assert launches[0].egress_ports == ()
+        assert [(rule.address, rule.ports) for rule in launches[0].egress_rules] == [
+            ("203.0.113.0/24", [443])
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_domain_scope_resolver_is_readable_by_the_non_root_runtime(tmp_path):
+    async def scenario():
+        manager, store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        scope = store.get(ScopePolicy, engagement.scope_policy_id)
+        store.update(
+            ScopePolicy,
+            scope.id,
+            {"allowed_cidrs": [], "allowed_domains": ["example.test"]},
+            expected_revision=scope.revision,
+        )
+        launches = []
+
+        async def launch(configuration):
+            launches.append(configuration)
+            return FakeSession(
+                network_granted=configuration.network_granted,
+                workspace=configuration.workspace,
+            )
+
+        manager.session_factory = launch
+        await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="domain-scope",
+            request=RunCommandRequest(command="pwd", network="none"),
+        )
+
+        resolver = launches[0].resolv_conf
+        assert resolver is not None
+        assert resolver.stat().st_mode & 0o777 == 0o644
+        assert resolver.read_text(encoding="ascii").startswith(
+            "nameserver 127.0.0.53\n"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_selected_vpn_is_frozen_and_streamed_only_to_the_namespace_launch(tmp_path):
+    async def scenario():
+        manager, store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        manager.data_root = tmp_path / "core-data"
+        manager.data_root.mkdir()
+        credentials = CredentialStore()
+        secret = credentials.create(
+            CredentialCreateRequest(secret="client\ndev tun0\n", persistence="session")
+        )
+        vpn = store.create(
+            VpnProfile(
+                name="Assessment VPN",
+                filename="assessment.ovpn",
+                remote_host="vpn.example.test",
+                remote_port=1194,
+                protocol="udp",
+                fingerprint="f" * 64,
+                secret_ref=secret.reference,
+            )
+        )
+        manager.credential_store = credentials
+        policy = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=True,
+            runner_profile_id="runner",
+            vpn_profile_id=vpn.id,
+            max_timeout_ms=30_000,
+            expected_revision=policy.revision,
+        )
+        launches = []
+
+        async def launch(configuration):
+            launches.append(configuration)
+            return FakeSession(
+                network_granted=configuration.network_granted,
+                workspace=configuration.workspace,
+            )
+
+        manager.session_factory = launch
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="vpn-session",
+            request=RunCommandRequest(
+                command="curl https://example.test", network="project_scope"
+            ),
+        )
+
+        assert launches[0].vpn_config == "client\ndev tun0"
+        assert launches[0].workspace.resolve() in launches[0].runner.workspace_roots
+        assert tmp_path.resolve() not in launches[0].runner.workspace_roots
+        session = store.get(AutomationSession, result.session_id)
+        assert (session.vpn_profile_id, session.vpn_profile_revision) == (
+            vpn.id,
+            vpn.revision,
+        )
+        assert "client" not in session.model_dump_json()
+
+    asyncio.run(scenario())
+
+
+def test_api_exposes_only_the_fixed_runtime_command_surface(tmp_path):
+    manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+    app = create_app(
+        store,
+        artifact_store=artifacts,
+        auth_token="runtime-test-token",
+        automation_runtime=manager,
+    )
+    headers = {"Authorization": "Bearer runtime-test-token"}
+
+    with TestClient(app) as client:
+        policy = client.get(
+            f"/api/v1/engagements/{engagement.id}/automation-policy",
+            headers=headers,
+        )
+        assert policy.status_code == 200
+        assert policy.json()["approval_policy"] == "on_boundary"
+
+        command = client.post(
+            f"/api/v1/engagements/{engagement.id}/automation-sessions/api/"
+            "api-session/commands",
+            headers=headers,
+            json={"command": "rg needle .", "network": "none"},
+        )
+        assert command.status_code == 200, command.text
+        result = command.json()
+        assert result["status"] == "completed"
+        assert "rg needle" in result["stdout"]
+
+        processes = client.get(
+            f"/api/v1/automation-sessions/{result['session_id']}/processes",
+            headers=headers,
+        )
+        assert processes.status_code == 200
+        assert [item["process_id"] for item in processes.json()] == [
+            result["process_id"]
+        ]
+
+        paths = client.get("/openapi.json").json()["paths"]
+        assert not any(
+            marker in path
+            for path in paths
+            for marker in ("tool-packs", "tool-catalog", "tool-assignment")
+        )
+
+
+def test_api_saves_vpn_secret_outside_public_profile_and_selects_it(tmp_path):
+    manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+    app = create_app(
+        store,
+        artifact_store=artifacts,
+        auth_token="runtime-test-token",
+        automation_runtime=manager,
+    )
+    headers = {"Authorization": "Bearer runtime-test-token"}
+    config = """client
+dev tun
+proto udp
+remote vpn.example.test 1194
+remote-cert-tls server
+ping-timer-rem
+<ca>
+certificate
+</ca>
+"""
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/vpn-profiles",
+            headers=headers,
+            json={
+                "name": "Assessment VPN",
+                "filename": "assessment.ovpn",
+                "config": config,
+                "persistence": "session",
+            },
+        )
+        assert created.status_code == 201, created.text
+        profile = created.json()
+        assert "secret_ref" not in profile
+        assert "config" not in profile
+        assert profile["available"] is True
+        duplicate = client.post(
+            "/api/v1/vpn-profiles",
+            headers=headers,
+            json={
+                "name": "Same VPN again",
+                "filename": "again.ovpn",
+                "config": config,
+                "persistence": "session",
+            },
+        )
+        assert duplicate.status_code == 409, duplicate.text
+        assert len(client.get("/api/v1/vpn-profiles", headers=headers).json()) == 1
+
+        current = client.get(
+            f"/api/v1/engagements/{engagement.id}/automation-policy",
+            headers=headers,
+        ).json()
+        updated = client.put(
+            f"/api/v1/engagements/{engagement.id}/automation-policy",
+            headers=headers,
+            json={
+                "approval_policy": "on_boundary",
+                "network_enabled": True,
+                "runner_profile_id": "runner",
+                "vpn_profile_id": profile["id"],
+                "max_timeout_ms": 30000,
+                "expected_revision": current["revision"],
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["vpn_profile_id"] == profile["id"]
+
+        blocked = client.request(
+            "DELETE",
+            f"/api/v1/vpn-profiles/{profile['id']}",
+            headers=headers,
+            json={"expected_revision": profile["revision"]},
+        )
+        assert blocked.status_code == 409
+
+        policy = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=policy.approval_policy,
+            network_enabled=policy.network_enabled,
+            runner_profile_id=policy.runner_profile_id,
+            vpn_profile_id=None,
+            max_timeout_ms=policy.max_timeout_ms,
+            expected_revision=policy.revision,
+        )
+        removed = client.request(
+            "DELETE",
+            f"/api/v1/vpn-profiles/{profile['id']}",
+            headers=headers,
+            json={"expected_revision": profile["revision"]},
+        )
+        assert removed.status_code == 204
+        assert client.get("/api/v1/vpn-profiles", headers=headers).json() == []
+
+
+def test_project_vpn_selection_and_vault_secret_survive_core_restart(tmp_path):
+    manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+    backend = DurableTestKeyring()
+    credentials = CredentialStore(backend)
+    app = create_app(
+        store,
+        artifact_store=artifacts,
+        auth_token="runtime-test-token",
+        automation_runtime=manager,
+        credential_store=credentials,
+    )
+    headers = {"Authorization": "Bearer runtime-test-token"}
+    config = """client
+dev tun
+proto udp
+remote vpn.example.test 1194
+remote-cert-tls server
+auth-user-pass
+<ca>
+certificate
+</ca>
+"""
+
+    with TestClient(app) as client:
+        profile = client.post(
+            "/api/v1/vpn-profiles",
+            headers=headers,
+            json={
+                "name": "Persistent project VPN",
+                "filename": "project.ovpn",
+                "config": config,
+                "username": "project-user",
+                "password": "project-password",
+                "persistence": "vault",
+            },
+        ).json()
+        policy = client.get(
+            f"/api/v1/engagements/{engagement.id}/automation-policy",
+            headers=headers,
+        ).json()
+        selected = client.put(
+            f"/api/v1/engagements/{engagement.id}/automation-policy",
+            headers=headers,
+            json={
+                "approval_policy": policy["approval_policy"],
+                "network_enabled": True,
+                "runner_profile_id": policy["runner_profile_id"],
+                "vpn_profile_id": profile["id"],
+                "max_timeout_ms": policy["max_timeout_ms"],
+                "expected_revision": policy["revision"],
+            },
+        )
+        assert selected.status_code == 200, selected.text
+
+    restarted_store = NebulaStore(tmp_path / "nebula.db")
+    restarted_credentials = CredentialStore(backend)
+    persisted_profile = restarted_store.get(VpnProfile, profile["id"])
+    persisted_policy = restarted_store.get(
+        AutomationProjectPolicy, selected.json()["id"]
+    )
+
+    assert persisted_policy.engagement_id == engagement.id
+    assert persisted_policy.vpn_profile_id == persisted_profile.id
+    assert restarted_credentials.status(persisted_profile.secret_ref).available is True
+    assert (
+        "project-user\nproject-password"
+        in restarted_credentials.resolve(
+            persisted_profile.secret_ref
+        ).get_secret_value()
+    )
+    assert b"project-password" not in (tmp_path / "nebula.db").read_bytes()
+
+
+def test_default_mission_degrades_to_analysis_when_command_runtime_is_unprepared(
+    tmp_path,
+):
+    manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+    manager.runtime_image = ""
+    manager.runtime_digest = ""
+    provider = store.create(
+        ProviderProfile(
+            name="Local analysis model",
+            provider_type="vllm",
+            endpoint="http://127.0.0.1:9/v1",
+            is_local=True,
+            model_allowlist=["security-model"],
+        )
+    )
+    app = create_app(
+        store,
+        artifact_store=artifacts,
+        auth_token="runtime-test-token",
+        automation_runtime=manager,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/missions",
+            headers={"Authorization": "Bearer runtime-test-token"},
+            json={
+                "engagement_id": engagement.id,
+                "name": "Analysis without command runtime",
+                "objective": "Review the bounded scope",
+                "provider_id": provider.id,
+                "model": "security-model",
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    payload = response.json()
+    assert payload["metadata"]["analysis_only"] is True
+    assert payload["budget"]["max_duration_seconds"] is None
+    assert payload["budget"]["max_tool_calls"] is None
+
+
+def test_api_runtime_lifecycle_uses_registered_diagnostics_feature(tmp_path):
+    manager, store, artifacts, _engagement, _sessions = runtime(tmp_path)
+    diagnostics = DiagnosticManager(
+        tmp_path / "diagnostics", level_override="debug", watch_settings=False
+    )
+    app = create_app(
+        store,
+        artifact_store=artifacts,
+        auth_token="runtime-test-token",
+        automation_runtime=manager,
+        diagnostic_manager=diagnostics,
+    )
+
+    try:
+        with TestClient(app) as client:
+            response = client.get(
+                "/api/v1/automation/runtime",
+                headers={"Authorization": "Bearer runtime-test-token"},
+            )
+            assert response.status_code == 200
+    finally:
+        diagnostics.close()
+
+    runtime_events = (diagnostics.log_dir / "runtime.log").read_text(encoding="utf-8")
+    assert "runtime.runtime.started" in runtime_events
+    assert "runtime.runtime.stopped" in runtime_events
+    assert "runtime.managed-browser-host.stopped" in runtime_events
+
+
+def test_runtime_info_is_not_ready_before_kali_image_preparation(tmp_path):
+    store = NebulaStore(tmp_path / "nebula.db")
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    store.create(
+        RunnerProfile(
+            id="runner",
+            name="Docker",
+            runtime=RunnerRuntime.DOCKER,
+            executable="/usr/bin/docker",
+            platform="linux/amd64",
+            isolation=RunnerIsolation.ROOTLESS,
+            healthy=True,
+        )
+    )
+
+    async def resolve_runtime(_engagement_id: str):
+        raise AssertionError("runtime_info must not prepare the image")
+
+    manager = AutomationRuntimeManager(
+        store=store,
+        artifact_store=artifacts,
+        data_root=tmp_path,
+        workspace_resolver=lambda _engagement_id: tmp_path / "workspace",
+        runtime_resolver=resolve_runtime,
+        cached_runtime_provider=lambda: None,
+    )
+
+    info = asyncio.run(manager.runtime_info())
+
+    assert info.configured is True
+    assert info.ready is False
+    assert info.image is None
+    assert info.digest is None
+    assert info.runner_profile_id == "runner"
+    assert info.detail == "the existing Kali headless runtime has not been prepared"
+
+
+def test_runtime_output_artifacts_are_owner_scoped_searchable_and_bounded(tmp_path):
+    async def scenario():
+        manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+        call = store.create(
+            ToolCall(
+                id="command-call",
+                engagement_id=engagement.id,
+                run_id="mission-owner",
+                origin=ToolCallOrigin.MISSION,
+                tool_name="run_command",
+                status=ToolCallStatus.RUNNING,
+                risk_class=RiskClass.WORKSPACE_WRITE,
+            )
+        )
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="mission",
+            owner_id="mission-owner",
+            request=RunCommandRequest(command="rg unique-needle ."),
+            tool_call_id=call.id,
+        )
+        service = ToolOutputService(store, artifacts)
+        process_receipt = AutomationBroker(
+            manager=manager,
+            store=store,
+            output_service=service,
+        )._receipt("process-io-call", PROCESS_IO_NAME, result)
+        assert process_receipt.tool_call_id == call.id
+
+        search = service.search(
+            engagement_id=engagement.id,
+            owner_id="mission-owner",
+            tool_call_id=call.id,
+            query="unique-needle",
+        )
+        assert search["matches"]
+        assert "untrusted_data" not in search
+        read = service.read(
+            engagement_id=engagement.id,
+            owner_id="mission-owner",
+            artifact_id=result.stdout_artifact_id,
+        )
+        assert "unique-needle" in json.dumps(read)
+        assert len(json.dumps(read).encode()) <= 8 * 1024
+        with pytest.raises(ToolOutputAccessError):
+            service.search(
+                engagement_id=engagement.id,
+                owner_id="another-mission",
+                tool_call_id=call.id,
+                query="unique-needle",
+            )
+        with pytest.raises(ToolOutputQueryError, match="regular-expression"):
+            ToolOutputService(store, artifacts, regex_deadline_seconds=0).search(
+                engagement_id=engagement.id,
+                owner_id="mission-owner",
+                tool_call_id=call.id,
+                query="(a+)+$",
+                mode="regex",
+            )
+
+    asyncio.run(scenario())
+
+
+def _searchable_tool_call(store, artifacts, engagement, *, call_id, body):
+    call = store.create(
+        ToolCall(
+            id=call_id,
+            engagement_id=engagement.id,
+            run_id="mission-owner",
+            origin=ToolCallOrigin.MISSION,
+            tool_name="run_command",
+            status=ToolCallStatus.RUNNING,
+            risk_class=RiskClass.WORKSPACE_WRITE,
+        )
+    )
+    store.create(
+        artifacts.put_bytes(
+            body,
+            engagement_id=engagement.id,
+            filename=f"{call_id}.stdout",
+            media_type="text/plain",
+            metadata={"tool_call_id": call.id, "kind": "stdout", "searchable": True},
+        )
+    )
+    return call
+
+
+def test_tool_output_search_budget_is_separate_from_the_regex_guard(tmp_path):
+    store = NebulaStore(tmp_path / "nebula.db")
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    engagement = store.create(Engagement(name="Large output"))
+    # About 3 MB of scan output with the needle on the last line: a literal
+    # search must finish instead of tripping over the 0.25 s regex guard.
+    body = b"ordinary scan output line with some padding text\n" * 60_000
+    call = _searchable_tool_call(
+        store,
+        artifacts,
+        engagement,
+        call_id="scan-call",
+        body=body + b"admin found here\n",
+    )
+
+    result = ToolOutputService(store, artifacts).search(
+        engagement_id=engagement.id,
+        owner_id="mission-owner",
+        tool_call_id=call.id,
+        query="admin",
+    )
+
+    assert [item["line"] for item in result["matches"]] == [60_001]
+    assert result["truncated"] is False
+    assert result["continuation_cursor"] is None
+    assert result["reason"] is None
+
+
+def test_tool_output_search_reports_budget_exhaustion_with_a_resumable_cursor(
+    tmp_path, monkeypatch
+):
+    store = NebulaStore(tmp_path / "nebula.db")
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    engagement = store.create(Engagement(name="Paged output"))
+    call = _searchable_tool_call(
+        store,
+        artifacts,
+        engagement,
+        call_id="paged-call",
+        body=b"".join(f"needle {number}\n".encode() for number in range(1, 401)),
+    )
+    # Every clock read advances one millisecond, so each page examines about
+    # twenty lines before the budget fires with matches still pending context.
+    ticks = itertools.count()
+    monkeypatch.setattr(tool_results, "monotonic", lambda: next(ticks) * 0.001)
+    service = ToolOutputService(store, artifacts, search_seconds=0.02)
+
+    pages = []
+    cursor = None
+    for _ in range(200):
+        page = service.search(
+            engagement_id=engagement.id,
+            owner_id="mission-owner",
+            tool_call_id=call.id,
+            query="needle",
+            context_lines=2,
+            match_limit=100,
+            cursor=cursor,
+        )
+        pages.append(page)
+        if not page["truncated"]:
+            break
+        assert "time budget" in page["reason"]
+        assert page["continuation_cursor"]
+        cursor = page["continuation_cursor"]
+    else:
+        pytest.fail("the search never completed")
+
+    assert len(pages) > 1
+    assert pages[-1]["reason"] is None
+    reported = [item["line"] for page in pages for item in page["matches"]]
+    assert reported == list(range(1, 401))
+    for page in pages:
+        for item in page["matches"]:
+            if 3 <= item["line"] <= 398:
+                assert [line["line"] for line in item["context"]] == list(
+                    range(item["line"] - 2, item["line"] + 3)
+                )
+
+
+def test_tool_output_search_rejects_a_cursor_that_no_longer_resolves(tmp_path):
+    store = NebulaStore(tmp_path / "nebula.db")
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    engagement = store.create(Engagement(name="Cursor reuse"))
+    first = _searchable_tool_call(
+        store, artifacts, engagement, call_id="first-call", body=b"needle\nneedle\n"
+    )
+    second = _searchable_tool_call(
+        store, artifacts, engagement, call_id="second-call", body=b"needle\n"
+    )
+    service = ToolOutputService(store, artifacts)
+    page = service.search(
+        engagement_id=engagement.id,
+        owner_id="mission-owner",
+        tool_call_id=first.id,
+        query="needle",
+        match_limit=1,
+    )
+    assert page["truncated"] is True
+
+    with pytest.raises(ToolOutputQueryError, match="continuation cursor"):
+        service.search(
+            engagement_id=engagement.id,
+            owner_id="mission-owner",
+            tool_call_id=second.id,
+            query="needle",
+            cursor=page["continuation_cursor"],
+        )
+
+
+def test_legacy_results_without_a_recorded_status_are_not_replayed_as_failed():
+    for payload in ({}, {"detail": "connection refused"}):
+        result = sanitize_model_history_result(
+            payload, tool_call_id="legacy-call", tool_name="run_command"
+        )
+        assert result["schema"] == "nebula.tool-result/v2"
+        assert result["status"] == "completed"
+        assert result["incomplete"] is True
+    denied = sanitize_model_history_result(
+        {"status": "denied", "detail": "blocked by scope", "rule": "scope"},
+        tool_call_id="legacy-call",
+        tool_name="run_command",
+    )
+    assert denied == {
+        "status": "denied",
+        "detail": "blocked by scope",
+        "rule": "scope",
+    }
+
+
+def test_workspace_retrieval_is_bounded_and_rejects_symlink_escape(tmp_path):
+    workspace = tmp_path / "retrieval-workspace"
+    workspace.mkdir()
+    (workspace / "huge.txt").write_text("X" * 100_000 + "\nnext\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (workspace / "link").symlink_to(outside)
+    service = WorkspaceOutputService(workspace)
+
+    result = service.read(path="huge.txt", line_count=200)
+    assert len(json.dumps(result).encode()) <= 8 * 1024
+    assert result["lines"][0]["line_truncated"] is True
+    with pytest.raises(ToolOutputAccessError):
+        service.read(path="link")
+    with pytest.raises(ToolOutputAccessError):
+        service.read(path="../outside.txt")
+
+
+def test_historical_raw_tool_output_fails_closed_to_a_receipt():
+    result = sanitize_model_history_result(
+        {
+            "stdout": "raw historical output must stay out of context",
+            "stderr": "",
+            "exit_code": 0,
+        },
+        tool_call_id="historical-call",
+        tool_name="run_command",
+    )
+
+    assert result["schema"] == "nebula.tool-result/v2"
+    assert result["incomplete"] is True
+    assert "raw historical output" not in json.dumps(result)
+
+
+def test_host_mode_requires_consent_and_reads_external_folder_without_docker(tmp_path):
+    async def scenario():
+        manager, store, _, engagement, containers = runtime(tmp_path)
+        policy = manager.project_policy(engagement.id)
+        update = dict(
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=False,
+            runner_profile_id=None,
+            max_timeout_ms=3000,
+            execution_mode="host",
+        )
+        with pytest.raises(AutomationPolicyDenied, match="Acknowledge"):
+            manager.update_project_policy(engagement.id, **update)
+        manager.update_project_policy(
+            engagement.id, **update, host_access_acknowledged=True
+        )
+        manager.runtime_image = ""
+        manager.runtime_digest = ""
+        assert (await manager.runtime_info(engagement_id=engagement.id)).ready
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        (backup / "marker.txt").write_text("HOST_BACKUP_MARKER")
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="host-test",
+            request=RunCommandRequest(command="cat marker.txt", cwd=str(backup)),
+        )
+        assert result.exit_code == 0
+        execution = store.get(CommandExecution, result.execution_id)
+        assert execution.network == AutomationNetworkMode.HOST
+        assert execution.metadata["execution_mode"] == "host"
+        assert result.session_id
+        assert containers == []
+        # Mode changes never convert the already-created host session to Docker.
+        manager.update_project_policy(
+            engagement.id, **{**update, "execution_mode": "docker"}
+        )
+        retained = await manager.session(
+            engagement_id=engagement.id, owner_kind="api", owner_id="host-test"
+        )
+        assert retained.execution_mode == "host"
+        await manager.close_session(result.session_id)
+        assert policy.execution_mode == "docker"
+
+    asyncio.run(scenario())
+
+
+def test_docker_mode_rejects_host_paths_and_host_network_requests(tmp_path):
+    async def scenario():
+        manager, _, _, engagement, _ = runtime(tmp_path)
+        for request in [
+            RunCommandRequest(command="pwd", cwd="/tmp"),
+            RunCommandRequest(command="pwd", cwd="../outside"),
+            RunCommandRequest(command="pwd", network="host"),
+        ]:
+            with pytest.raises(AutomationPolicyDenied):
+                await manager.run_command(
+                    engagement_id=engagement.id,
+                    owner_kind="api",
+                    owner_id="docker-test",
+                    request=request,
+                )
+        session = await manager.session(
+            engagement_id=engagement.id, owner_kind="api", owner_id="docker-test"
+        )
+        await manager.close_session(session.id)
+
+    asyncio.run(scenario())
+
+
+def test_host_command_timeout_and_exact_approval_are_enforced(tmp_path):
+    async def scenario():
+        manager, store, _, engagement, _ = runtime(tmp_path)
+        manager.update_project_policy(
+            engagement.id,
+            execution_mode="host",
+            host_access_acknowledged=True,
+            approval_policy=AutomationApprovalPolicy.ALWAYS,
+            network_enabled=False,
+            runner_profile_id=None,
+            max_timeout_ms=1000,
+        )
+        request = RunCommandRequest(command="sleep 30", background=True)
+        with pytest.raises(CommandApprovalRequired) as pending:
+            await manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id="host-timeout",
+                request=request,
+            )
+        approval = pending.value.approval
+        assert "host filesystem" in approval.expected_effects[0]
+        approval = store.update(
+            Approval,
+            approval.id,
+            {
+                "status": "approved",
+                "decided_by": "test-operator",
+                "decided_at": utc_now(),
+            },
+            expected_revision=approval.revision,
+        )
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="host-timeout",
+            request=request,
+            approval=approval,
+        )
+        for _ in range(30):
+            result = await manager.process_io(
+                result.process_id,
+                ProcessIORequest(),
+                engagement_id=engagement.id,
+                owner_id="host-timeout",
+            )
+            if result.status == CommandExecutionStatus.TIMED_OUT:
+                break
+            await asyncio.sleep(0.1)
+        assert result.status == CommandExecutionStatus.TIMED_OUT
+        await manager.close_session(result.session_id)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_foreground_command_stops_its_process(tmp_path):
+    """Stop cancels the caller of a foreground command; the command stops too.
+
+    Cancelling the wait used to cancel finalization as well, which also
+    disarmed the timeout, so the process ran on with nobody reading it.
+    """
+
+    async def scenario():
+        manager, store, _, engagement, _ = runtime(tmp_path)
+        manager.update_project_policy(
+            engagement.id,
+            execution_mode="host",
+            host_access_acknowledged=True,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=False,
+            runner_profile_id=None,
+            max_timeout_ms=60_000,
+        )
+        marker = tmp_path / "command-finished"
+        command = asyncio.create_task(
+            manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id="host-cancel",
+                request=RunCommandRequest(command=f"sleep 1; touch {marker}"),
+            )
+        )
+        for _ in range(200):
+            if store.list_entities(CommandExecution):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+        (execution,) = store.list_entities(CommandExecution)
+        for _ in range(200):
+            execution = store.get(CommandExecution, execution.id)
+            if execution.status != CommandExecutionStatus.RUNNING:
+                break
+            await asyncio.sleep(0.01)
+        assert execution.status == CommandExecutionStatus.CANCELLED
+        await asyncio.sleep(1.5)
+        assert not marker.exists()
+        await manager.close_session(execution.session_id)
+
+    asyncio.run(scenario())
+
+
+def test_host_scope_expiry_closes_running_commands(tmp_path):
+    import time
+    from datetime import timedelta
+
+    async def scenario():
+        manager, store, _, engagement, _ = runtime(tmp_path)
+        scope = store.get(ScopePolicy, engagement.scope_policy_id)
+        not_after = utc_now() + timedelta(seconds=0.5)
+        store.update(
+            ScopePolicy,
+            scope.id,
+            {"not_after": not_after},
+            expected_revision=scope.revision,
+        )
+        manager.update_project_policy(
+            engagement.id,
+            execution_mode="host",
+            host_access_acknowledged=True,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=False,
+            runner_profile_id=None,
+            max_timeout_ms=5000,
+        )
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="api",
+            owner_id="expiring-host",
+            request=RunCommandRequest(command="sleep 30", background=True),
+        )
+        # The boundary kills the process at once, but the session reads
+        # closed only after the command's output is stored, which takes
+        # longer on a loaded host. Wait for that, well inside the 30 seconds
+        # the command would otherwise run.
+        deadline = time.monotonic() + 10
+        while (
+            store.get(AutomationSession, result.session_id).status
+            != AutomationSessionStatus.CLOSED
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.05)
+        session = store.get(AutomationSession, result.session_id)
+        execution = store.get(CommandExecution, result.execution_id)
+        assert session.status == AutomationSessionStatus.CLOSED
+        assert execution.status == CommandExecutionStatus.CANCELLED
+        # Closed by the scope boundary, not before it.
+        assert execution.completed_at >= not_after
+        assert session.completed_at >= not_after
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_unreadable_command_receipt_preserves_exit_and_partial_artifacts(tmp_path):
+    from types import SimpleNamespace
+
+    manager, store, artifacts, engagement, _ = runtime(tmp_path)
+    out = store.create(
+        artifacts.put_bytes(
+            b"useful result\n", engagement_id=engagement.id, filename="stdout"
+        )
+    )
+    err = store.create(
+        artifacts.put_bytes(
+            b"rg: private.txt: Permission denied (os error 13)\n",
+            engagement_id=engagement.id,
+            filename="stderr",
+        )
+    )
+    execution = store.create(
+        CommandExecution(
+            engagement_id=engagement.id,
+            session_id="session",
+            process_id="process",
+            command="synthetic fixture only",
+            command_sha256="a" * 64,
+            runtime_digest="sha256:" + "b" * 64,
+            policy_revision=1,
+            status=CommandExecutionStatus.FAILED,
+            exit_code=2,
+            stdout_artifact_id=out.id,
+            stderr_artifact_id=err.id,
+            observed_stdout_bytes=out.size,
+            observed_stderr_bytes=err.size,
+        )
+    )
+    receipt = AutomationBroker(
+        manager=manager, store=store, output_service=ToolOutputService(store, artifacts)
+    )._receipt("call", "run_command", SimpleNamespace(execution_id=execution.id))
+    assert receipt.exit_code == 2
+    assert receipt.status.value == "failed" and receipt.incomplete
+    assert "unreadable" in receipt.summary and "workspace.search" in receipt.summary
+    assert {ref.artifact_id for ref in receipt.artifacts} == {out.id, err.id}
+    with artifacts.open(out) as stream:
+        assert stream.read() == b"useful result\n"
+
+
+def test_small_command_output_is_redacted_in_receipt_without_extra_read(tmp_path):
+    from types import SimpleNamespace
+
+    manager, store, artifacts, engagement, _ = runtime(tmp_path)
+    raw = b"result: ready\nBearer abcdefghijklmnop123456\n"
+    out = store.create(
+        artifacts.put_bytes(
+            raw,
+            engagement_id=engagement.id,
+            filename="stdout",
+            media_type="text/plain",
+        )
+    )
+    execution = store.create(
+        CommandExecution(
+            engagement_id=engagement.id,
+            session_id="session",
+            process_id="process",
+            command="synthetic fixture only",
+            command_sha256="a" * 64,
+            runtime_digest="sha256:" + "b" * 64,
+            policy_revision=1,
+            status=CommandExecutionStatus.COMPLETED,
+            exit_code=0,
+            stdout_artifact_id=out.id,
+            observed_stdout_bytes=out.size,
+        )
+    )
+    receipt = AutomationBroker(
+        manager=manager, store=store, output_service=ToolOutputService(store, artifacts)
+    )._receipt("call", "run_command", SimpleNamespace(execution_id=execution.id))
+    assert receipt.output_preview[0].artifact_id == out.id
+    assert receipt.output_preview[0].text == "result: ready\nBearer [REDACTED]\n"
+    assert receipt.next_actions == []
+    with artifacts.open(out) as stream:
+        assert stream.read() == raw
+
+
+def test_large_or_truncated_command_output_stays_artifact_only(tmp_path):
+    from types import SimpleNamespace
+
+    manager, store, artifacts, engagement, _ = runtime(tmp_path)
+    out = store.create(
+        artifacts.put_bytes(b"x" * 4097, engagement_id=engagement.id, filename="stdout")
+    )
+    execution = store.create(
+        CommandExecution(
+            engagement_id=engagement.id,
+            session_id="session",
+            process_id="process",
+            command="synthetic fixture only",
+            command_sha256="a" * 64,
+            runtime_digest="sha256:" + "b" * 64,
+            policy_revision=1,
+            status=CommandExecutionStatus.COMPLETED,
+            exit_code=0,
+            stdout_artifact_id=out.id,
+            observed_stdout_bytes=out.size,
+        )
+    )
+    broker = AutomationBroker(
+        manager=manager, store=store, output_service=ToolOutputService(store, artifacts)
+    )
+    receipt = broker._receipt(
+        "call", "run_command", SimpleNamespace(execution_id=execution.id)
+    )
+    assert receipt.output_preview == []
+    assert "tool_output.read" in receipt.next_actions
+    truncated = store.update(
+        CommandExecution,
+        execution.id,
+        {"stdout_truncated": True},
+        expected_revision=execution.revision,
+    )
+    assert (
+        broker._receipt(
+            "call", "run_command", SimpleNamespace(execution_id=truncated.id)
+        ).output_preview
+        == []
+    )
+
+
+def test_capture_directory_is_removed_once_output_is_delivered(tmp_path):
+    async def scenario():
+        manager, _store, _artifacts, engagement, _sessions = runtime(tmp_path)
+        result = await manager.run_command(
+            engagement_id=engagement.id,
+            owner_kind="chat",
+            owner_id="capture-cleanup",
+            request=RunCommandRequest(command="echo hi", cwd="."),
+        )
+        assert result.status == CommandExecutionStatus.COMPLETED
+        assert "command=echo hi" in result.stdout
+        assert list(manager.capture_root.glob(f"{result.process_id}-*")) == []
+        await manager.close_session(result.session_id)
+        assert list(manager.capture_root.glob(f"{result.process_id}-*")) == []
+
+    asyncio.run(scenario())
+
+
+def test_startup_sweeps_stale_capture_directories(tmp_path):
+    from uuid import uuid4
+
+    async def scenario():
+        manager, _store, _artifacts, _engagement, _sessions = runtime(tmp_path)
+        stale = manager.capture_root / f"{uuid4()}-ab3_x9zq"
+        stale.mkdir()
+        (stale / "stdout").write_bytes(b"orphaned capture\n")
+        unrelated = manager.capture_root / "resolver-or-other"
+        unrelated.mkdir()
+        await manager.startup()
+        assert not stale.exists()
+        assert unrelated.is_dir()
+
+    asyncio.run(scenario())
+
+
+def test_host_command_returns_when_a_detached_grandchild_keeps_the_pipes(tmp_path):
+    import os
+    import signal
+    import time
+
+    daemon_pid: int | None = None
+
+    async def scenario():
+        nonlocal daemon_pid
+        manager, _store, _, engagement, _ = runtime(tmp_path)
+        manager.update_project_policy(
+            engagement.id,
+            execution_mode="host",
+            host_access_acknowledged=True,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=False,
+            runner_profile_id=None,
+            max_timeout_ms=20_000,
+        )
+        started = time.monotonic()
+        # The detached daemon inherits stdout/stderr and outlives bash.
+        result = await asyncio.wait_for(
+            manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="api",
+                owner_id="detached-daemon",
+                request=RunCommandRequest(
+                    command="setsid sleep 30 </dev/null & echo launched $!"
+                ),
+            ),
+            timeout=10,
+        )
+        elapsed = time.monotonic() - started
+        assert result.status == CommandExecutionStatus.COMPLETED
+        assert result.stdout.startswith("launched ")
+        daemon_pid = int(result.stdout.split()[1])
+        assert elapsed < 8, elapsed
+        await asyncio.wait_for(manager.close_session(result.session_id), timeout=5)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if daemon_pid is not None:
+            try:
+                os.kill(daemon_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_automation_broker_refuses_replay_of_an_unknown_ledger_row(tmp_path):
+    """MIS-2: a call whose ledger row is running/failed/cancelled without a
+    trustworthy receipt is an unknown effect and is never executed again."""
+
+    async def scenario():
+        manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+        policy = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=True,
+            runner_profile_id="runner",
+            max_timeout_ms=30_000,
+            expected_revision=policy.revision,
+        )
+        broker = AutomationBroker(
+            manager=manager,
+            store=store,
+            output_service=ToolOutputService(store, artifacts),
+        )
+        store.create(
+            AgentRun(
+                id="run-ambiguous",
+                engagement_id=engagement.id,
+                objective="x",
+                status=RunStatus.RUNNING,
+                budget=RunBudget(
+                    max_concurrency=1, max_delegation_depth=1, max_tool_calls=10
+                ),
+            )
+        )
+        scope = store.get(ScopePolicy, engagement.scope_policy_id)
+        for prior in (
+            ToolCallStatus.RUNNING,
+            ToolCallStatus.FAILED,
+            ToolCallStatus.CANCELLED,
+        ):
+            invocation = ToolInvocation(
+                engagement_id=engagement.id,
+                run_id="run-ambiguous",
+                origin=ToolCallOrigin.MISSION,
+                tool_name="run_command",
+                arguments={"command": f"echo {prior.value}", "cwd": "."},
+                workspace=manager.workspace_resolver(engagement.id),
+                idempotency_key=f"task:t1:turn:1:call:{prior.value}",
+                requested_by="network_service",
+            )
+            call = await broker.ledger.reserve(invocation, broker.specs["run_command"])
+            running = await broker.ledger.transition(call, ToolCallStatus.RUNNING)
+            if prior != ToolCallStatus.RUNNING:
+                await broker.ledger.transition(running, prior)
+            before = len(store.list_entities(CommandExecution))
+            with pytest.raises(AmbiguousToolState):
+                await broker.execute(invocation, scope)
+            after = len(store.list_entities(CommandExecution))
+            assert after == before
+
+    asyncio.run(scenario())
+
+
+def test_automation_broker_resumes_a_waiting_approval_call_exactly_once(tmp_path):
+    """MIS-2/MIS-3: an approved command parked at WAITING_APPROVAL runs once on
+    resume, and a second resume of that consumed slot is refused."""
+
+    async def scenario():
+        manager, store, artifacts, engagement, _sessions = runtime(tmp_path)
+        policy = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=AutomationApprovalPolicy.ALWAYS,
+            network_enabled=False,
+            runner_profile_id="runner",
+            max_timeout_ms=30_000,
+            expected_revision=policy.revision,
+        )
+        broker = AutomationBroker(
+            manager=manager,
+            store=store,
+            output_service=ToolOutputService(store, artifacts),
+        )
+        store.create(
+            AgentRun(
+                id="run-approve",
+                engagement_id=engagement.id,
+                objective="scan",
+                status=RunStatus.RUNNING,
+                budget=RunBudget(
+                    max_concurrency=1, max_delegation_depth=1, max_tool_calls=10
+                ),
+            )
+        )
+        scope = store.get(ScopePolicy, engagement.scope_policy_id)
+        invocation = ToolInvocation(
+            engagement_id=engagement.id,
+            run_id="run-approve",
+            origin=ToolCallOrigin.MISSION,
+            task_id="task-approve",
+            tool_name="run_command",
+            arguments={"command": "echo scan", "cwd": "."},
+            workspace=manager.workspace_resolver(engagement.id),
+            idempotency_key="task:task-approve:turn:1:call:0",
+            requested_by="network_service",
+        )
+        with pytest.raises(ApprovalRequired) as paused:
+            await broker.execute(invocation, scope)
+        approval = paused.value.approval
+        # The card is bound to this ledger slot and its Mission task.
+        assert approval.tool_call_id is not None
+        assert approval.task_id == "task-approve"
+        parked = store.get(ToolCall, approval.tool_call_id)
+        assert parked.status == ToolCallStatus.WAITING_APPROVAL
+
+        approved = store.update(
+            Approval,
+            approval.id,
+            {
+                "status": ApprovalStatus.APPROVED,
+                "decided_by": "operator",
+                "decided_at": utc_now(),
+            },
+            expected_revision=approval.revision,
+        )
+        result = await broker.execute(invocation, scope, approval=approved)
+        assert result.receipt is not None
+        assert len(store.list_entities(CommandExecution)) == 1
+
+        # The consumed slot is now COMPLETE; resuming it again returns the same
+        # durable receipt instead of running the command a second time.
+        replay = await broker.execute(invocation, scope, approval=approved)
+        assert replay.output == result.output
+        assert len(store.list_entities(CommandExecution)) == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_a_foreground_command_terminates_it_and_records_cancelled(
+    tmp_path,
+):
+    """MIS-4: cancelling the task awaiting a foreground command stops the
+    process and finalizes the execution as cancelled, never leaving it
+    running with the execution stuck in running."""
+
+    async def scenario():
+        manager, store, _artifacts, engagement, sessions = runtime(tmp_path)
+        policy = manager.project_policy(engagement.id)
+        manager.update_project_policy(
+            engagement.id,
+            approval_policy=AutomationApprovalPolicy.NEVER,
+            network_enabled=True,
+            runner_profile_id="runner",
+            max_timeout_ms=60_000,
+            expected_revision=policy.revision,
+        )
+        store.create(
+            AgentRun(
+                id="run-cancel",
+                engagement_id=engagement.id,
+                objective="cancel",
+                status=RunStatus.RUNNING,
+                budget=RunBudget(
+                    max_concurrency=1, max_delegation_depth=1, max_tool_calls=10
+                ),
+            )
+        )
+        worker = asyncio.create_task(
+            manager.run_command(
+                engagement_id=engagement.id,
+                owner_kind="mission",
+                owner_id="run-cancel",
+                request=RunCommandRequest(command="wait-forever"),
+            )
+        )
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if sessions and sessions[0].processes:
+                break
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+        # The process is stopped at once; the (shielded) finalizer then
+        # records the outcome.
+        assert sessions[0].processes[0]._done.done()
+        [execution] = store.list_entities(CommandExecution)
+        for _ in range(200):
+            execution = store.get(CommandExecution, execution.id)
+            if execution.status != CommandExecutionStatus.RUNNING:
+                break
+            await asyncio.sleep(0.01)
+        assert execution.status == CommandExecutionStatus.CANCELLED
+
+    asyncio.run(scenario())

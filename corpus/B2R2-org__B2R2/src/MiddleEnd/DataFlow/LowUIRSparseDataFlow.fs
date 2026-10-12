@@ -1,0 +1,987 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+/// Implements sparse data-flow analysis over the LowUIR representation.
+module B2R2.MiddleEnd.DataFlow.LowUIRSparseDataFlow
+
+open System.Collections.Generic
+open B2R2
+open B2R2.Collections
+open B2R2.BinIR
+open B2R2.BinIR.LowUIR
+open B2R2.FrontEnd
+open B2R2.MiddleEnd.ControlFlowGraph
+open B2R2.MiddleEnd.BinGraph
+
+/// Represents a state used in LowUIR-based sparse dataflow analysis.
+type State<'Lattice when 'Lattice: equality>
+  public(hdl: BinHandle,
+         lattice: ILattice<'Lattice>,
+         scheme: IScheme<'Lattice>) =
+
+  /// Holds the initial stack pointer value in the stack pointer domain.
+  let spInitial = LowUIRStackPointer.initialValue hdl
+
+  /// Caches the statements of every CFG vertex, along with their program
+  /// points.
+  let stmtCache = LowUIRStmtCache()
+
+  /// Maps a VarPoint to its abstract value in the user's domain.
+  let domainAbsValues = Dictionary<VarPoint, 'Lattice>()
+
+  /// Maps a VarPoint to its abstract value in the stack-pointer domain.
+  let spAbsValues = Dictionary<VarPoint, StackPointerDomain.Lattice>()
+
+  let phiInfos = Dictionary<IVertex<LowUIRBasicBlock>, PhiInfo>()
+
+  let perVertexIncomingDefs =
+    Dictionary<IVertex<LowUIRBasicBlock>, Map<VarKind, VarPoint>>()
+
+  let perVertexOutgoingDefs =
+    Dictionary<IVertex<LowUIRBasicBlock>, Map<VarKind, VarPoint>>()
+
+  let defUseMap = Dictionary<VarPoint, HashSet<VarPoint>>()
+
+  let useDefMap = Dictionary<VarPoint, VarPoint>()
+
+  /// Holds the vertices that need to be analyzed for reconstructing data flow
+  /// information.
+  let verticesForProcessing = HashSet<IVertex<LowUIRBasicBlock>>()
+
+  /// Holds the vertices that need to be removed.
+  let verticesForRemoval = Queue<IVertex<LowUIRBasicBlock>>()
+
+  /// Counts up to give every SSA variable a fresh identifier.
+  let mutable ssaVarCounter = 0
+
+  /// Maps a variable point to its corresponding SSA variable.
+  let vpToSSAVar = Dictionary<VarPoint, SSA.Variable>()
+
+  /// Maps an SSA variable to its corresponding variable point.
+  let ssaVarToVp = Dictionary<SSA.Variable, VarPoint>()
+
+  let domainGetAbsValue vp =
+    match domainAbsValues.TryGetValue vp with
+    | true, v -> v
+    | false, _ when vp.ProgramPoint.IsFake -> scheme.GetBaseCase vp.VarKind
+    | false, _ -> lattice.Bottom
+
+  let spGetInitialAbsValue varKind =
+    match spInitial with
+    | Some(stackVar, c) when varKind = stackVar -> c
+    | _ -> StackPointerDomain.Undef
+
+  let spGetAbsValue vp =
+    match spAbsValues.TryGetValue vp with
+    | true, c -> c
+    | false, _ when vp.ProgramPoint.IsFake -> spGetInitialAbsValue vp.VarKind
+    | false, _ -> StackPointerDomain.Undef
+
+  let spEvaluateVar varKind pp =
+    let vp = { ProgramPoint = pp; VarKind = varKind }
+    match useDefMap.TryGetValue vp with
+    | true, defVp -> spGetAbsValue defVp
+    | false, _ -> StackPointerDomain.Undef
+
+  let spEvaluateExpr pp e = LowUIRStackPointer.evalExpr spEvaluateVar pp e
+
+  let getStatements v = stmtCache.GetStmtInfos v
+
+  /// Returns a fresh identifier for the given variable kind and increments the
+  /// identifier.
+  let getNewVarId () =
+    ssaVarCounter <- ssaVarCounter + 1
+    ssaVarCounter
+
+  /// Converts a variable kind to an SSA variable kind.
+  let toSSAVarKind vk =
+    match vk with
+    | Regular rid ->
+      let rt = hdl.RegisterFactory.GetRegType rid
+      let rname = hdl.RegisterFactory.GetRegisterName rid
+      SSA.RegVar(rt, rid, rname)
+    | Memory(Some _) ->
+      SSA.MemVar
+    | Memory None ->
+      SSA.MemVar
+    | StackLocal offset ->
+      SSA.StackVar(0<rt>, offset)
+    | Temporary n ->
+      let rt = 0<rt>
+      SSA.TempVar(rt, n)
+
+  /// Returns an empty SSA variable for the given variable kind.
+  let mkEmptySSAVar vk = { SSA.Kind = toSSAVarKind vk; SSA.Identifier = 0 }
+
+  /// Returns an SSA variable for the given variable point.
+  let getSSAVar vp =
+    match vpToSSAVar.TryGetValue vp with
+    | true, v ->
+      v
+    | false, _ when vp.ProgramPoint.IsFake ->
+      mkEmptySSAVar vp.VarKind
+    | false, _ ->
+      let ssaVarId = getNewVarId ()
+      let ssaVarKind = toSSAVarKind vp.VarKind
+      let ssaVar = { SSA.Kind = ssaVarKind; SSA.Identifier = ssaVarId }
+      vpToSSAVar[vp] <- ssaVar
+      ssaVarToVp[ssaVar] <- vp
+      ssaVar
+
+  /// Returns an SSA variable for the given use.
+  let getSSAVarFromUse pp vk =
+    let vp = { ProgramPoint = pp; VarKind = vk }
+    match useDefMap.TryGetValue vp with
+    | false, _ -> Terminator.impossible ()
+    | true, defVp -> getSSAVar defVp
+
+  /// Translates an IR expression to its SSA expression.
+  let rec translateToSSAExpr (pp: ProgramPoint) e =
+    match e with
+    | Num(Value = bv) ->
+      SSA.Num bv
+    | PCVar(Type = rt) ->
+      assert (Option.isNone pp.CallSite)
+      SSA.Num <| BitVector(pp.Address, rt)
+    | Var _ | TempVar _ ->
+      let vk = VarKind.ofIRExpr e
+      let ssaVar = getSSAVarFromUse pp vk
+      SSA.Var ssaVar
+    | ExprList(Elements = exprs) ->
+      List.map (translateToSSAExpr pp) exprs
+      |> SSA.ExprList
+    | Load(Type = rt; Addr = addr) ->
+      match spEvaluateExpr pp addr with
+      | StackPointerDomain.ConstSP bv ->
+        let offset = bv.ToUInt64() |> LowUIRStackPointer.toFrameOffset
+        let vk = StackLocal offset
+        let ssaVar = getSSAVarFromUse pp vk
+        SSA.Var ssaVar
+      | _ ->
+        let emptyMemVar = mkEmptySSAVar (Memory None)
+        let e = translateToSSAExpr pp addr
+        SSA.Load(emptyMemVar, rt, e)
+    | BinOp(Op = binOpType; Type = rt; Left = e1; Right = e2) ->
+      let e1 = translateToSSAExpr pp e1
+      let e2 = translateToSSAExpr pp e2
+      SSA.BinOp(binOpType, rt, e1, e2)
+    | RelOp(Op = relOpType; Left = e1; Right = e2) ->
+      let rt = Expr.typeOf e1
+      let e1 = translateToSSAExpr pp e1
+      let e2 = translateToSSAExpr pp e2
+      SSA.RelOp(relOpType, rt, e1, e2)
+    | Extract(Operand = e; Type = rt; StartPos = startPos) ->
+      let e = translateToSSAExpr pp e
+      SSA.Extract(e, rt, startPos)
+    | UnOp(Op = unOpType; Operand = e) ->
+      let rt = Expr.typeOf e
+      let e = translateToSSAExpr pp e
+      SSA.UnOp(unOpType, rt, e)
+    | Cast(Kind = castKind; Type = rt; Operand = e) ->
+      let e = translateToSSAExpr pp e
+      SSA.Cast(castKind, rt, e)
+    | RoundCtrl(Mode = mode; Body = body) ->
+      let rt = Expr.typeOf body
+      let mode = translateToSSAExpr pp mode
+      let body = translateToSSAExpr pp body
+      SSA.RoundCtrl(mode, rt, body)
+    | FuncName(Name = s) ->
+      SSA.FuncName s
+    | Undefined(Type = rt; Reason = s) ->
+      SSA.Undefined(rt, s)
+    | Ite(Cond = e1; TrueExpr = e2; FalseExpr = e3) ->
+      let rt = Expr.typeOf e2
+      let e1 = translateToSSAExpr pp e1
+      let e2 = translateToSSAExpr pp e2
+      let e3 = translateToSSAExpr pp e3
+      SSA.Ite(e1, rt, e2, e3)
+    | _ ->
+      Terminator.impossible ()
+
+  let translateLabel addr = function
+    | JmpDest(Target = lbl) -> lbl
+    | Undefined(Reason = s) -> AST.label s -1 addr
+    | _ -> raise InvalidExprException
+
+  /// Translates an ordinary IR statement to an SSA statement. It returns a
+  /// dummy exception statement if the given IR statement is invalid.
+  let translateToSSAStmt pp stmt =
+    match stmt with
+    | Put(Dst = dst; Src = src) ->
+      let vk = VarKind.ofIRExpr dst
+      let vp = { ProgramPoint = pp; VarKind = vk }
+      let v = getSSAVar vp
+      let e = translateToSSAExpr pp src
+      SSA.Def(v, e)
+    | Store(Addr = addr; Value = value) ->
+      match spEvaluateExpr pp addr with
+      | StackPointerDomain.ConstSP bv ->
+        let offset = bv.ToUInt64() |> LowUIRStackPointer.toFrameOffset
+        let vk = StackLocal offset
+        let vp = { ProgramPoint = pp; VarKind = vk }
+        let v = getSSAVar vp
+        let e = translateToSSAExpr pp value
+        SSA.Def(v, e)
+      | _ ->
+        let prevMemVar = mkEmptySSAVar (Memory None) (* empty one *)
+        let newMemVar = getSSAVar { ProgramPoint = pp; VarKind = Memory None }
+        let rt = Expr.typeOf value
+        let e1 = translateToSSAExpr pp addr
+        let e2 = translateToSSAExpr pp value
+        let e = SSA.Store(prevMemVar, rt, e1, e2)
+        SSA.Def(newMemVar, e)
+    | Jmp(Target = expr) ->
+      let addr = 0x0UL (* use dummy address for simplicity *)
+      let label = translateLabel addr expr
+      let e = SSA.IntraJmp label
+      SSA.Jmp e
+    | CJmp(Cond = expr; TrueTarget = label1; FalseTarget = label2) ->
+      let addr = 0x0UL (* use dummy address for simplicity *)
+      let expr = translateToSSAExpr pp expr
+      let label1 = translateLabel addr label1
+      let label2 = translateLabel addr label2
+      let e = SSA.IntraCJmp(expr, label1, label2)
+      SSA.Jmp e
+    | InterJmp(Target = expr) ->
+      let expr = translateToSSAExpr pp expr
+      let e = SSA.InterJmp(expr)
+      SSA.Jmp e
+    | InterCJmp(Cond = expr1; TrueTarget = expr2; FalseTarget = expr3) ->
+      let expr1 = translateToSSAExpr pp expr1
+      let expr2 = translateToSSAExpr pp expr2
+      let expr3 = translateToSSAExpr pp expr3
+      let e = SSA.InterCJmp(expr1, expr2, expr3)
+      SSA.Jmp e
+    | SideEffect(Effect = sideEff) ->
+      SSA.SideEffect sideEff
+    | _ ->
+      SSA.SideEffect UndefinedInstruction
+
+  let convertDefsToIds defs =
+    defs
+    |> Seq.map (fun def ->
+      let v = getSSAVar def
+      v.Identifier)
+    |> Seq.toArray
+
+  /// Generates a phi statement for the given variable point.
+  let generatePhiSSAStmt vp =
+    let _, v = stmtCache.StmtOfBBLs[vp.ProgramPoint]
+    let phiInfo = phiInfos[v]
+    let varKind = vp.VarKind
+    let defs = phiInfo[varKind]
+    let var = getSSAVar vp
+    let ids = convertDefsToIds defs.Values
+    SSA.Phi(var, ids)
+
+  let domainSubState =
+    let flowQueue = UniqueQueue()
+    let defSiteQueue = UniqueQueue()
+    let executedFlows = HashSet()
+    let executedVertices = HashSet()
+    { new ISubState<'Lattice> with
+        member _.FlowQueue = flowQueue
+        member _.DefSiteQueue = defSiteQueue
+        member _.ExecutedFlows = executedFlows
+        member _.ExecutedVertices = executedVertices
+        member _.Bottom = lattice.Bottom
+        member _.GetAbsValue vp = domainGetAbsValue vp
+        member _.SetAbsValue(vp, absVal) = domainAbsValues[vp] <- absVal
+        member _.Join(a, b) = lattice.Join(a, b)
+        member _.Subsume(a, b) = lattice.Subsume(a, b) }
+
+  let spSubState =
+    let flowQueue = UniqueQueue()
+    let defSiteQueue = UniqueQueue()
+    let executedFlows = HashSet()
+    let executedVertices = HashSet()
+    { new ISubState<StackPointerDomain.Lattice> with
+        member _.FlowQueue = flowQueue
+        member _.DefSiteQueue = defSiteQueue
+        member _.ExecutedFlows = executedFlows
+        member _.ExecutedVertices = executedVertices
+        member _.Bottom = StackPointerDomain.Undef
+        member _.GetAbsValue vp = spGetAbsValue vp
+        member _.SetAbsValue(vp, absVal) = spAbsValues[vp] <- absVal
+        member _.Join(a, b) = StackPointerDomain.join a b
+        member _.Subsume(a, b) = StackPointerDomain.subsume a b }
+
+  let resetSubState (subState: ISubState<_>) =
+    subState.FlowQueue.Clear()
+    subState.DefSiteQueue.Clear()
+    subState.ExecutedFlows.Clear()
+    subState.ExecutedVertices.Clear()
+
+  let reset () =
+    stmtCache.Clear()
+    domainAbsValues.Clear()
+    spAbsValues.Clear()
+    phiInfos.Clear()
+    perVertexIncomingDefs.Clear()
+    perVertexOutgoingDefs.Clear()
+    defUseMap.Clear()
+    useDefMap.Clear()
+    verticesForProcessing.Clear()
+    verticesForRemoval.Clear()
+    vpToSSAVar.Clear()
+    ssaVarCounter <- 0
+    ssaVarToVp.Clear()
+    resetSubState spSubState
+    resetSubState domainSubState
+
+  /// Returns the binary handle associated with this state.
+  member _.BinHandle with get() = hdl
+
+  /// Returns the scheme used for this data flow analysis.
+  member _.Scheme with get() = scheme
+
+  /// Maps a CFG vertex to its phi information.
+  member _.PhiInfos with get() = phiInfos :> IReadOnlyDictionary<_, _>
+
+  member internal _.MutablePhiInfos with get() = phiInfos
+
+  /// Maps a CFG vertex to its incoming definitions.
+  member _.PerVertexIncomingDefs
+    with get() = perVertexIncomingDefs :> IReadOnlyDictionary<_, _>
+
+  member internal _.MutablePerVertexIncomingDefs
+    with get() = perVertexIncomingDefs
+
+  /// Maps a CFG vertex to its outgoing definitions.
+  member _.PerVertexOutgoingDefs
+    with get() = perVertexOutgoingDefs :> IReadOnlyDictionary<_, _>
+
+  member internal _.MutablePerVertexOutgoingDefs
+    with get() = perVertexOutgoingDefs
+
+  /// Maps a variable def to its uses.
+  member _.DefUseMap with get() = defUseMap :> IReadOnlyDictionary<_, _>
+
+  member internal _.MutableDefUseMap with get() = defUseMap
+
+  /// Maps a variable use to its definition.
+  member _.UseDefMap with get() = useDefMap :> IReadOnlyDictionary<_, _>
+
+  member internal _.MutableUseDefMap with get() = useDefMap
+
+  /// Maps an SSA variable to its corresponding variable point.
+  member _.SSAVarToVp with get() = ssaVarToVp :> IReadOnlyDictionary<_, _>
+
+  /// Maps a program point to `StmtOfBBL`, which is a pair of a Low-UIR
+  /// statement and its corresponding vertex that contains the statement.
+  member _.StmtOfBBLs with get() = stmtCache.StmtOfBBLs
+
+  /// Returns the sub-state for the stack-pointer domain.
+  member internal _.StackPointerSubState with get() = spSubState
+
+  /// Returns the sub-state for the user's domain.
+  member internal _.DomainSubState with get() = domainSubState
+
+  /// Returns the vertices that are currently pending for processing.
+  member _.PendingVertices with get(): IEnumerable<IVertex<LowUIRBasicBlock>> =
+    verticesForProcessing
+
+  /// Evaluates the given expression at the given program point in the
+  /// stack-pointer domain in order to retrieve a concrete stack pointer value
+  /// if exists.
+  member _.EvaluateStackPointerExpr(pp, e: Expr) = spEvaluateExpr pp e
+
+  /// Marks the given vertex as pending, which means that the vertex needs to be
+  /// processed.
+  member _.MarkVertexAsPending v = verticesForProcessing.Add v |> ignore
+
+  /// Marks the given vertex as removal, which means that the vertex needs to be
+  /// removed.
+  member _.MarkVertexAsRemoval v = verticesForRemoval.Enqueue v |> ignore
+
+  /// Checks if the given vertex is pending for processing.
+  member _.IsVertexPending v = verticesForProcessing.Contains v
+
+  /// Clears the pending vertices.
+  member _.ClearPendingVertices() = verticesForProcessing.Clear()
+
+  /// Enqueues the pending vertices to the given sub-state.
+  member internal _.EnqueuePendingVertices(subState: ISubState<_>) =
+    for v in verticesForProcessing do
+      subState.FlowQueue.Enqueue(null, v)
+
+  /// Dequeues the vertex for removal. When there is no vertex to remove, it
+  /// returns `false`.
+  member _.DequeueVertexForRemoval() = verticesForRemoval.TryDequeue()
+
+  /// Returns the array of StmtInfos of the given vertex.
+  member _.GetStmtInfos v = getStatements v
+
+  /// Forgets the statements of the given vertex.
+  member internal _.RemoveStmtsOf v = stmtCache.Remove v
+
+  /// Returns the terminator statement of the given vertex in an SSA form.
+  member _.GetTerminatorInSSA v =
+    getStatements v
+    |> Array.last
+    |> fun (irStmt, pp) -> translateToSSAStmt pp irStmt
+
+  /// Tries to get the definition of the given SSA variable in an SSA form.
+  member _.TryGetSSADef v =
+    if not <| ssaVarToVp.ContainsKey v then
+      None
+    else
+      let vp = ssaVarToVp[v]
+      let pp = vp.ProgramPoint
+      let stmt, v = stmtCache.StmtOfBBLs[pp]
+      let pp' = v.VData.Internals.PPoint
+      let isPhi = pp = pp'
+      if not isPhi then
+        match translateToSSAStmt pp stmt with
+        | SSA.SideEffect _ -> None
+        | s -> Some s
+      else
+        generatePhiSSAStmt vp |> Some
+
+  /// Returns the abstract value at the given variable point.
+  member _.GetAbsValue vp = domainGetAbsValue vp
+
+  /// Returns the abstract value of the definition that reaches the given use,
+  /// or the bottom of the lattice when no definition reaches it.
+  member _.GetAbsValueOfUse(pp, varKind) =
+    match useDefMap.TryGetValue { ProgramPoint = pp; VarKind = varKind } with
+    | true, defVp -> domainGetAbsValue defVp
+    | false, _ -> lattice.Bottom
+
+  /// Tries to get the abstract value of the given SSA variable. It returns
+  /// None for a variable that the analysis never defined, such as one that
+  /// comes in from outside the function.
+  member _.TryGetAbsValueOfSSAVar v =
+    match ssaVarToVp.TryGetValue v with
+    | true, vp -> Some <| domainGetAbsValue vp
+    | false, _ -> None
+
+  /// Resets this state.
+  member _.Reset() = reset ()
+
+  interface IAbsValProvider<VarPoint, 'Lattice> with
+    member _.GetAbsValue absLoc = domainGetAbsValue absLoc
+
+/// Represents a substate for the LowUIR-based sparse dataflow analysis.
+and ISubState<'Lattice when 'Lattice: equality> =
+  inherit IAbsValProvider<VarPoint, 'Lattice>
+  inherit ILattice<'Lattice>
+
+  /// Returns the edge queue for calculating the data flow.
+  abstract FlowQueue:
+    UniqueQueue<IVertex<LowUIRBasicBlock> | null * IVertex<LowUIRBasicBlock>>
+
+  /// Returns the definition site queue for calculating the data flow.
+  abstract DefSiteQueue: UniqueQueue<ProgramPoint>
+
+  /// Returns the edges executed during the data flow calculation.
+  abstract ExecutedFlows:
+    HashSet<IVertex<LowUIRBasicBlock> * IVertex<LowUIRBasicBlock>>
+
+  /// Returns the vertices executed during the data flow calculation.
+  abstract ExecutedVertices: HashSet<IVertex<LowUIRBasicBlock>>
+
+  /// Sets the abstract value at the given location.
+  abstract SetAbsValue: vp: VarPoint * 'Lattice -> unit
+
+/// Represents a mapping from a variable kind of a phi to its definitions. We
+/// represent each definition as a mapping from a predecessor's program point
+/// to a variable point. This way, a definition from the same predecessor can
+/// be replaced by the latest definition.
+and private PhiInfo = Dictionary<VarKind, Dictionary<ProgramPoint, VarPoint>>
+
+/// Represents how we perform LowUIR-based sparse dataflow analysis.
+and IScheme<'Lattice when 'Lattice: equality> =
+  inherit IExprEvaluatable<ProgramPoint, 'Lattice>
+
+  /// Returns the abstract value of a variable that the function never defines,
+  /// i.e. one that comes in from the outside. Such a variable never receives a
+  /// definition that would raise a bottom, so this must be a sound
+  /// over-approximation.
+  abstract GetBaseCase: VarKind -> 'Lattice
+
+[<AutoOpen>]
+module internal AnalysisCore = begin
+
+  /// Invalidates the dataflow chains of the vertices that are pending
+  /// removal, since a vertex leaving the graph makes its chains invalid.
+  let rec removeInvalidChains (state: State<_>) =
+    match state.DequeueVertexForRemoval() with
+    | true, v when state.PerVertexIncomingDefs.ContainsKey v ->
+      state.RemoveStmtsOf v
+      state.MutablePhiInfos.Remove v |> ignore
+      state.MutablePerVertexIncomingDefs.Remove v |> ignore
+      state.MutablePerVertexOutgoingDefs.Remove v |> ignore
+      removeInvalidChains state
+    | true, _ ->
+      removeInvalidChains state
+    | false, _ ->
+      ()
+
+  let getStackValue (state: State<_>) pp e =
+    match state.EvaluateStackPointerExpr(pp, e) with
+    | StackPointerDomain.ConstSP bv -> Ok <| bv.ToUInt64()
+    | _ -> Error ErrorCase.InvalidExprEvaluation
+
+  /// Computes the inverse dominance frontier in linear time.
+  let computeInverseDF g (dom: IForwardDominance<_>) v =
+    let g: IDiGraph<_, _> = g
+    let s = HashSet()
+    for pred in g.GetPreds v do
+      let mutable x = pred
+      while x <> dom.ImmediateDominator v do
+        s.Add x |> ignore
+        x <- dom.ImmediateDominator x
+    s
+
+  /// Collects the vertices that are candidates for phi insertion at this point.
+  /// We reduce the search space to only those vertices that are possibly
+  /// affected by the changes in the graph.
+  let collectPhiInsertionCandidates g state =
+    let workset = HashSet()
+    for v in (state: State<_>).PendingVertices do
+      if not <| (g: IDiGraph<_, _>).Contains v then
+        ()
+      else
+        workset.Add v |> ignore
+        for succ in g.GetSuccs v do
+          if g.GetPreds succ |> Seq.length > 1 then workset.Add succ |> ignore
+          else ()
+    workset
+
+  let placePhi state v varKind =
+    let phiInfos = (state: State<_>).MutablePhiInfos
+    if not <| phiInfos.ContainsKey v then phiInfos[v] <- PhiInfo () else ()
+    let phiInfo = phiInfos[v]
+    if not <| phiInfo.ContainsKey varKind then phiInfo[varKind] <- Dictionary ()
+    else ()
+
+  let isInnerScopeVarKind (v: IVertex<LowUIRBasicBlock>) = function
+    | Temporary _ when v.VData.Internals.PPoint.Address = 0UL -> true
+    | _ -> false
+
+  let getDefinedVarKinds memo (state: State<_>) v =
+    match (memo: Dictionary<_, _>).TryGetValue v with
+    | true, kinds ->
+      kinds
+    | false, _ ->
+      let varKinds = HashSet()
+      for (stmt, pp) in state.GetStmtInfos v do
+        match stmt with
+        | Put(Dst = dst) ->
+          let vk = VarKind.ofIRExpr dst
+          varKinds.Add vk |> ignore
+        | Store(Addr = addr) ->
+          getStackValue state pp addr
+          |> Result.iter (fun loc ->
+            let offset = LowUIRStackPointer.toFrameOffset loc
+            let vk = StackLocal offset
+            varKinds.Add vk |> ignore)
+        | _ ->
+          ()
+      memo[v] <- varKinds
+      varKinds
+
+  /// Places the phi nodes. We do not calculate all dominance frontier sets,
+  /// but only those that are selectively used to insert phi nodes.
+  let placePhis g state (dom: IForwardDominance<_>) =
+    let memo = Dictionary()
+    for v in collectPhiInsertionCandidates g state do
+      for affectingVertex in computeInverseDF g dom v do
+        for varKind in getDefinedVarKinds memo state affectingVertex do
+          if not (isInnerScopeVarKind v varKind) then placePhi state v varKind
+          else ()
+
+  let updateIncomingDefsWithPhis state (v: IVertex<LowUIRBasicBlock>) ins =
+    match (state: State<_>).PhiInfos.TryGetValue v with
+    | false, _ ->
+      ins
+    | true, phiInfo ->
+      let pp = v.VData.Internals.PPoint
+      phiInfo.Keys
+      |> Seq.fold (fun ins vk ->
+        let vp = { ProgramPoint = pp; VarKind = vk }
+        Map.add vk vp ins) ins
+
+  let removeOldChains state useVp defVp =
+    match (state: State<_>).UseDefMap.TryGetValue useVp with
+    | true, prevDef when prevDef.ProgramPoint <> defVp.ProgramPoint ->
+      (* Erase the old def-use. *)
+      state.MutableDefUseMap[prevDef].Remove useVp |> ignore
+      (* Erase the old use-def which will be overwritten by the new def. *)
+      state.MutableUseDefMap.Remove useVp |> ignore
+    | _ ->
+      ()
+
+  let updateDefUseChain state useVp defVp =
+    match (state: State<_>).MutableDefUseMap.TryGetValue defVp with
+    | false, _ -> state.MutableDefUseMap[defVp] <- HashSet [ useVp ]
+    | true, uses -> uses.Add useVp |> ignore
+
+  let updateUseDefChain state useVp defVp =
+    (state: State<_>).MutableUseDefMap[useVp] <- defVp
+
+  /// Gets a fake variable point for the given variable kind. This is used when
+  /// there is no definition for the given variable kind (e.g., function
+  /// arguments).
+  let getFakeVarPoint vk = { ProgramPoint = ProgramPoint.Fake; VarKind = vk }
+
+  let updateChains state vk defs pp =
+    let defVp = Map.tryFind vk defs |> Option.defaultValue (getFakeVarPoint vk)
+    let useVp = { ProgramPoint = pp; VarKind = vk }
+    removeOldChains state useVp defVp
+    updateDefUseChain state useVp defVp
+    updateUseDefChain state useVp defVp
+
+  let updateWithExpr state defs (pp: ProgramPoint) expr =
+    let onVarRead vk = updateChains state vk defs pp
+    let tryStackOffset e =
+      match getStackValue state pp e with
+      | Ok loc -> Some(LowUIRStackPointer.toFrameOffset loc)
+      | Error _ -> None
+    VarKind.iterUses onVarRead tryStackOffset expr
+
+  let updateWithJmp state defs pp = function
+    | Jmp(Target = expr) ->
+      updateWithExpr state defs pp expr
+    | CJmp(Cond = expr; TrueTarget = target1; FalseTarget = target2) ->
+      updateWithExpr state defs pp expr
+      updateWithExpr state defs pp target1
+      updateWithExpr state defs pp target2
+    | InterJmp(Target = expr; Kind = _jmpKind) ->
+      updateWithExpr state defs pp expr
+    | InterCJmp(Cond = cond; TrueTarget = target1; FalseTarget = target2) ->
+      updateWithExpr state defs pp cond
+      updateWithExpr state defs pp target1
+      updateWithExpr state defs pp target2
+    | _ ->
+      Terminator.impossible ()
+
+  /// Updates DU/UD chains stored in the state as well as the out variables by
+  /// executing the given statement. The `defs` stores every definition
+  /// including temporary variables, but the `outs` only stores the
+  /// non-temporary variables.
+  let updateWithStmt state (outs: byref<_>) (defs: byref<_>) stmt pp =
+    match stmt with
+    | Put(Dst = dst; Src = src) ->
+      updateWithExpr state defs pp src
+      let kind = VarKind.ofIRExpr dst
+      let vp = { ProgramPoint = pp; VarKind = kind }
+      defs <- Map.add kind vp defs
+      if not (VarKind.isTemporary kind) then outs <- Map.add kind vp outs
+      else ()
+    | Store(Addr = addr; Value = value) ->
+      updateWithExpr state defs pp addr
+      updateWithExpr state defs pp value
+      match getStackValue state pp addr with
+      | Ok loc ->
+        let offset = LowUIRStackPointer.toFrameOffset loc
+        let kind = StackLocal offset
+        let vp = { ProgramPoint = pp; VarKind = kind }
+        defs <- Map.add kind vp defs
+        if not (VarKind.isTemporary kind) then outs <- Map.add kind vp outs
+        else ()
+      | _ ->
+        ()
+    | Jmp _
+    | CJmp _
+    | InterJmp _
+    | InterCJmp _ ->
+      updateWithJmp state defs pp stmt
+    | _ ->
+      ()
+
+  let isIntraEdge lbl =
+    match lbl with
+    | IntraCJmpTrueEdge
+    | IntraCJmpFalseEdge
+    | IntraJmpEdge -> true
+    | _ -> false
+
+  /// Updates the DU/UD chains for the given basic block and return the defined
+  /// variables in the block.
+  let updateChainsWithBBLStmts g (state: State<_>) v defs =
+    let blkAddr = (v: IVertex<LowUIRBasicBlock>).VData.Internals.PPoint.Address
+    let intraBlockContinues =
+      (g: IDiGraph<_, _>).GetSuccEdges v
+      |> Array.exists (fun e -> isIntraEdge e.Label)
+    let stmtInfos = state.GetStmtInfos v
+    let mutable outs = defs
+    let mutable defs = defs
+    let mutable prevAddr = blkAddr
+    for i = 0 to stmtInfos.Length - 1 do
+      let stmt, pp = stmtInfos[i]
+      if pp.Address <> prevAddr then defs <- outs else ()
+      updateWithStmt state &outs &defs stmt pp
+      prevAddr <- pp.Address
+    if intraBlockContinues then defs else outs
+
+  /// Updates the def-use/use-def chains for the vertices in the dominator tree.
+  let rec update g state domTree (visited: HashSet<_>) v ins =
+    assert (not <| visited.Contains v)
+    visited.Add v |> ignore
+    let ins = updateIncomingDefsWithPhis state v ins
+    let outs = updateChainsWithBBLStmts g state v ins
+    for child in (domTree: DominatorTree<_>).GetChildren v do
+      update g state domTree visited child outs
+    state.MutablePerVertexIncomingDefs[v] <- ins
+    state.MutablePerVertexOutgoingDefs[v] <- outs
+
+  let getOutgoingDefs (state: State<_>) v =
+    match state.PerVertexOutgoingDefs.TryGetValue v with
+    | false, _ -> Map.empty
+    | true, defs -> defs
+
+  /// Updates the data-flow chains, visiting only the vertices that have
+  /// changed.
+  let rec incrementalUpdate g state visited (dom: IForwardDominance<_>) v =
+    if (visited: HashSet<_>).Contains v then
+      ()
+    elif (state: State<_>).IsVertexPending v
+         && (g: IDiGraph<_, _>).Contains v then
+      let idom = dom.ImmediateDominator v
+      let defs = if isNull idom then Map.empty else getOutgoingDefs state idom
+      update g state dom.DominatorTree visited v defs
+    else
+      for child in dom.DominatorTree.GetChildren v do
+        incrementalUpdate g state visited dom child
+
+  #if DEBUG
+  let hasProperPhiOperandNumbers state g v =
+    match (state: State<_>).PhiInfos.TryGetValue v with
+    | false, _ ->
+      true
+    | true, phiInfo ->
+      let predCount = (g: IDiGraph<_, _>).GetPreds v |> Seq.length
+      phiInfo.Values |> Seq.forall (fun d -> d.Count <= predCount)
+  #endif
+
+  let getEndPP (state: State<_>) v =
+    (state: State<_>).GetStmtInfos v
+    |> Array.last
+    |> snd
+
+  let updatePhiWithPredecessor state inDefs pred incomingDef useSite =
+    let incomingPP = getEndPP state pred
+    match (inDefs: Dictionary<_, _>).TryGetValue incomingPP with
+    | true, oldDef when oldDef = incomingDef ->
+      () (* already added *)
+    | true, oldDef ->
+      (* Remove the old one. *)
+      state.MutableDefUseMap[oldDef].Remove useSite |> ignore
+      inDefs[incomingPP] <- incomingDef
+      updateDefUseChain state useSite incomingDef
+    | false, _ ->
+      inDefs[incomingPP] <- incomingDef
+      updateDefUseChain state useSite incomingDef
+
+  /// Updates the dataflow information of phis. Unlike Cytron's approach though,
+  /// the update process is done **after** the dominator tree traversal. This is
+  /// to ensure that the predecessors of phi insertion points are executed
+  /// before updating the phi information.
+  let updatePhis g (state: State<_>) visited =
+    for v in visited do
+      match state.PhiInfos.TryGetValue v with
+      | true, phiInfo ->
+        for pred in (g: IDiGraph<_, _>).GetPreds v do
+          let outDefs = getOutgoingDefs state pred
+          for (KeyValue(vk, inDefs)) in phiInfo do
+            let def =
+              Map.tryFind vk outDefs |> Option.defaultValue (getFakeVarPoint vk)
+            { ProgramPoint = v.VData.Internals.PPoint; VarKind = vk }
+            |> updatePhiWithPredecessor state inDefs pred def
+      | false, _ ->
+        ()
+  #if DEBUG
+      assert (hasProperPhiOperandNumbers state g v)
+  #endif
+
+  /// Calculates the def-use/use-def chains. This is a modification of
+  /// Cytron's algorithm that uses the dominator tree
+  /// to calculate the def-use/use-def chains. This has theoretically the same
+  /// worst-case time complexity as the original algorithm, but it is more
+  /// efficient for incremental changes in practice since its search space is
+  /// reduced to the affected vertices that are possibly updated.
+  let calculateChains g state dom =
+    let visited = HashSet<IVertex<LowUIRBasicBlock>>()
+    placePhis g state dom
+    for root in g.Roots do incrementalUpdate g state visited dom root
+    updatePhis g state visited
+
+  let isStackRelatedRegister (hdl: BinHandle) rid =
+    hdl.RegisterFactory.IsStackPointer rid
+    || hdl.RegisterFactory.IsFramePointer rid
+
+  let updateAbsValue subState defUseMap vp prev curr =
+    if (subState: ISubState<_>).Subsume(prev, curr) then
+      ()
+    else
+      subState.SetAbsValue(vp, subState.Join(prev, curr))
+      match (defUseMap: IReadOnlyDictionary<_, _>).TryGetValue vp with
+      | false, _ ->
+        ()
+      | true, defs ->
+        defs
+        |> Seq.iter (fun vp -> subState.DefSiteQueue.Enqueue vp.ProgramPoint)
+
+  let spTransfer (state: State<_>) (stmt, pp) =
+    match stmt with
+    | Put(Dst = dst; Src = src) ->
+      let varKind = VarKind.ofIRExpr dst
+      let currConst =
+        match varKind with
+        | Regular rid when isStackRelatedRegister state.BinHandle rid ->
+          state.EvaluateStackPointerExpr(pp, src)
+          |> Some
+        | Regular _ ->
+          StackPointerDomain.NotConstSP |> Some
+        | Temporary _ ->
+          state.EvaluateStackPointerExpr(pp, src) |> Some
+        | _ ->
+          None
+      match currConst with
+      | None ->
+        ()
+      | Some currConst ->
+        let vp = { ProgramPoint = pp; VarKind = varKind }
+        let subState = state.StackPointerSubState
+        let prevConst = subState.GetAbsValue vp
+        let defUseMap = state.DefUseMap
+        updateAbsValue subState defUseMap vp prevConst currConst
+    | _ ->
+      ()
+
+  let domainTransfer (state: State<_>) (stmt, pp) =
+    match stmt with
+    | Put(Dst = dst; Src = src) ->
+      let varKind = VarKind.ofIRExpr dst
+      let vp = { ProgramPoint = pp; VarKind = varKind }
+      let subState = state.DomainSubState
+      let prev = subState.GetAbsValue vp
+      let curr = state.Scheme.EvalExpr(pp, src)
+      let defUseMap = state.DefUseMap
+      updateAbsValue subState defUseMap vp prev curr
+    | Store(Addr = addr; Value = value) ->
+      match state.EvaluateStackPointerExpr(pp, addr) with
+      | StackPointerDomain.ConstSP bv ->
+        let loc = bv.ToUInt64()
+        let offset = LowUIRStackPointer.toFrameOffset loc
+        let varKind = StackLocal offset
+        let vp = { ProgramPoint = pp; VarKind = varKind }
+        let subState = state.DomainSubState
+        let prev = subState.GetAbsValue vp
+        let curr = state.Scheme.EvalExpr(pp, value)
+        let defUseMap = state.DefUseMap
+        updateAbsValue subState defUseMap vp prev curr
+      | _ ->
+        ()
+    | _ ->
+      ()
+
+  let transferPhi state subState phiInfo defPp =
+    phiInfo
+    |> Seq.iter (fun (KeyValue(varKind, defs: Dictionary<_, _>)) ->
+      let vp = { ProgramPoint = defPp; VarKind = varKind }
+      let prev = (subState: ISubState<_>).GetAbsValue vp
+      let curr =
+        defs.Values |> Seq.fold (fun c (def: VarPoint) ->
+          subState.Join(c, subState.GetAbsValue def)) subState.Bottom
+      let defUseMap = (state: State<_>).DefUseMap
+      updateAbsValue subState defUseMap vp prev curr)
+
+  let isExecuted state (subState: ISubState<_>) defPp =
+    match (state: State<_>).StmtOfBBLs.TryGetValue defPp with
+    | false, _ -> false
+    | true, (_, v) -> subState.ExecutedVertices.Contains v
+
+  let processDefSite state (subState: ISubState<_>) fnTransfer =
+    match subState.DefSiteQueue.TryDequeue() with
+    | true, defPp when isExecuted state subState defPp ->
+      if defPp.Position <> 0 then (* non-phi *)
+        let stmt, _ = (state: State<_>).StmtOfBBLs[defPp]
+        fnTransfer state (stmt, defPp)
+      else (* phi *)
+        let _, bbl = state.StmtOfBBLs[defPp]
+        assert (state.PhiInfos.ContainsKey bbl)
+        transferPhi state subState state.PhiInfos[bbl] defPp
+    | _ ->
+      ()
+
+  let transferFlow state subState g v fnTransfer =
+    (subState: ISubState<_>).ExecutedVertices.Add v |> ignore
+    (* Execute phis first. *)
+    match (state: State<_>).PhiInfos.TryGetValue v with
+    | false, _ ->
+      ()
+    | true, phiInfo ->
+      transferPhi state subState phiInfo v.VData.Internals.PPoint
+    for stmt in state.GetStmtInfos v do fnTransfer state stmt done
+    (g: IDiGraph<_, _>).GetSuccs v
+    |> Array.map (fun succ -> v, succ)
+    |> Array.iter subState.FlowQueue.Enqueue
+
+  let processFlow g state subState fnTransfer =
+    match (subState: ISubState<_>).FlowQueue.TryDequeue() with
+    | false, _ ->
+      ()
+    | true, (src, dst) ->
+      (* A flow queued before the graph was rebuilt can name a vertex the
+         graph no longer holds, and such a flow leads nowhere. *)
+      if not <| subState.ExecutedFlows.Add(src, dst) then
+        ()
+      elif not <| (g: IDiGraph<_, _>).Contains dst then
+        ()
+      else
+        transferFlow state subState g dst fnTransfer
+
+  let registerPendingVertices state (subState: ISubState<_>) =
+    (state: State<_>).EnqueuePendingVertices subState
+
+  let propagateAux g state subState fnTransfer =
+    registerPendingVertices state subState
+    while not subState.FlowQueue.IsEmpty
+          || not subState.DefSiteQueue.IsEmpty do
+      processFlow g state subState fnTransfer
+      processDefSite state subState fnTransfer
+
+  let propagateStackPointer g state =
+    propagateAux g state state.StackPointerSubState spTransfer
+
+  let propagateDomain g state =
+    propagateAux g state state.DomainSubState domainTransfer
+
+end (* end of AnalysisCore *)
+
+/// Computes the data flow incrementally.
+[<CompiledName "Compute">]
+let compute g (state: State<_>) =
+  let df = Dominance.CooperDominanceFrontier()
+  let dom = Dominance.LengauerTarjanDominance.create g df
+  removeInvalidChains state
+  calculateChains g state dom
+  propagateStackPointer g state
+  calculateChains g state dom
+  propagateDomain g state
+  state.ClearPendingVertices()
+  state

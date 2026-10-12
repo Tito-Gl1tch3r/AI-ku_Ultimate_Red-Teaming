@@ -1,0 +1,238 @@
+use crate::common::errors::DomainError;
+use crate::domain::entities::user::{User, UserRole};
+use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum UserRepositoryError {
+    #[error("User not found: {0}")]
+    NotFound(String),
+
+    #[error("User already exists: {0}")]
+    AlreadyExists(String),
+
+    #[error("Database error: {0}")]
+    DatabaseError(String),
+
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+
+    #[error("Timeout error: {0}")]
+    Timeout(String),
+
+    #[error("Operation not allowed: {0}")]
+    OperationNotAllowed(String),
+}
+
+pub type UserRepositoryResult<T> = Result<T, UserRepositoryError>;
+
+/// DB-computed booleans about a user that aren't fields on the
+/// [`User`](crate::domain::entities::user::User) entity itself —
+/// either derived from column presence (`password_hash IS NOT NULL`)
+/// or from a cross-table lookup (`auth.sessions.last_seen_at` for
+/// `is_online`). Companion to `User` on the list projection: the
+/// repo computes both, the application layer packs them into
+/// [`FullUserDto`](crate::application::dtos::user_dto::FullUserDto).
+///
+/// Not "admin-only" — every field ends up on `FullUserDto`, which
+/// both admin AND self read. The name reflects "derived from the DB
+/// row, not intrinsic to the User entity".
+///
+/// See `docs/plan/userdto-refactor.md` for the design; this type
+/// replaced the earlier `UserListEntry` narrow projection as of P6.
+#[derive(Debug, Clone, Copy)]
+pub struct UserDerivedFlags {
+    pub has_password: bool,
+    pub opaque_registered: bool,
+    pub opaque_migrated: bool,
+    pub is_online: bool,
+}
+
+// Conversion from UserRepositoryError to DomainError
+impl From<UserRepositoryError> for DomainError {
+    fn from(err: UserRepositoryError) -> Self {
+        match err {
+            UserRepositoryError::NotFound(msg) => DomainError::not_found("User", msg),
+            UserRepositoryError::AlreadyExists(msg) => DomainError::already_exists("User", msg),
+            UserRepositoryError::DatabaseError(msg) => DomainError::internal_error("Database", msg),
+            UserRepositoryError::ValidationError(msg) => DomainError::validation_error(msg),
+            UserRepositoryError::Timeout(msg) => DomainError::timeout("Database", msg),
+            UserRepositoryError::OperationNotAllowed(msg) => {
+                DomainError::access_denied("User", msg)
+            }
+        }
+    }
+}
+
+pub trait UserRepository: Send + Sync + 'static {
+    /// Creates a new user
+    async fn create_user(&self, user: User) -> UserRepositoryResult<User>;
+
+    /// Gets a user by ID
+    async fn get_user_by_id(&self, id: Uuid) -> UserRepositoryResult<User>;
+
+    /// Fetch the full `User` entity + the [`UserDerivedFlags`] in a
+    /// single query. Used by `/api/auth/me` and future admin single-user
+    /// views — anywhere the caller needs both the row itself AND the
+    /// derived booleans (`has_password`, OPAQUE flags, `is_online`) to
+    /// build a [`FullUserDto`](crate::application::dtos::user_dto::FullUserDto)
+    /// or [`SelfUserDto`](crate::application::dtos::user_dto::SelfUserDto).
+    /// Single query is cheaper than `get_user_by_id` + separate lookups
+    /// for OPAQUE state + `is_online`; the EXISTS subquery is cheap
+    /// thanks to the partial index `idx_sessions_last_seen_at`.
+    async fn get_user_with_derived_flags(
+        &self,
+        id: Uuid,
+    ) -> UserRepositoryResult<(User, UserDerivedFlags)>;
+
+    /// Batch-loads a set of users by id, preserving no particular order
+    /// and silently skipping ids that don't match any row. Caller is
+    /// responsible for de-duplicating the input vec. Returns an empty
+    /// vec when given an empty input. Used by group-recipient expansion
+    /// in `RecipientNotificationService` to avoid N+1 queries.
+    async fn get_users_by_ids(&self, ids: Vec<Uuid>) -> UserRepositoryResult<Vec<User>>;
+
+    /// Gets a user by username
+    async fn get_user_by_username(&self, username: &str) -> UserRepositoryResult<User>;
+
+    /// Gets a user by email
+    async fn get_user_by_email(&self, email: &str) -> UserRepositoryResult<User>;
+
+    /// Returns every user whose email normalizes to `normalized_email`.
+    ///
+    /// Normalization matches `common::text::normalize_email_for_link` —
+    /// lowercase + strip `+alias` sub-addressing — so
+    /// `Alice+work@Example.com` and `alice@example.com` collapse to the
+    /// same key. Used by the OIDC auto-link decision tree to detect
+    /// ambiguity: two local rows normalizing to the IdP-returned email
+    /// means we can't safely pick one to auto-link, and the callback
+    /// must refuse (`email_ambiguous`).
+    ///
+    /// Caller passes the already-normalized value; the SQL applies the
+    /// same normalization to the stored side symmetrically so casing
+    /// and `+alias` differences on either side collapse.
+    async fn list_users_by_normalized_email(
+        &self,
+        normalized_email: &str,
+    ) -> UserRepositoryResult<Vec<User>>;
+
+    /// Updates an existing user
+    async fn update_user(&self, user: User) -> UserRepositoryResult<User>;
+
+    /// Updates only a user's storage usage
+    async fn update_storage_usage(
+        &self,
+        user_id: Uuid,
+        usage_bytes: i64,
+    ) -> UserRepositoryResult<()>;
+
+    /// Updates the last login date
+    async fn update_last_login(&self, user_id: Uuid) -> UserRepositoryResult<()>;
+
+    /// Lists users with pagination.
+    ///
+    /// `include_external` controls whether external (grant-only) users
+    /// appear in the result. Default callers should pass `false` so
+    /// external users stay invisible to internal-user surfaces (system
+    /// address book autocomplete, sharee search, etc.). Only the admin
+    /// management UI should request `true`.
+    async fn list_users(
+        &self,
+        limit: i64,
+        offset: i64,
+        include_external: bool,
+    ) -> UserRepositoryResult<Vec<User>>;
+
+    /// Paginated admin user listing — full `User` entity + the derived
+    /// booleans (`has_password`, OPAQUE flags, `is_online`) in one wide
+    /// SELECT. Called by the admin service to build
+    /// `Vec<FullUserDto>` for `/api/admin/users` without paying two
+    /// round-trips per row (once for User, once for derived flags).
+    ///
+    /// Same `include_external` semantics as [`Self::list_users`]:
+    /// admin management UI passes `true`; every other caller passes
+    /// `false` so external / grant-only users stay off internal-user
+    /// surfaces.
+    async fn list_users_with_derived_flags(
+        &self,
+        limit: i64,
+        offset: i64,
+        include_external: bool,
+    ) -> UserRepositoryResult<Vec<(User, UserDerivedFlags)>>;
+
+    /// Searches users by username or email (SQL ILIKE) with a limit.
+    /// See [`list_users`] for the meaning of `include_external`.
+    async fn search_users(
+        &self,
+        query: &str,
+        limit: i64,
+        include_external: bool,
+    ) -> UserRepositoryResult<Vec<User>>;
+
+    /// Activates or deactivates a user
+    async fn set_user_active_status(&self, user_id: Uuid, active: bool)
+    -> UserRepositoryResult<()>;
+
+    /// Changes a user's password
+    async fn change_password(&self, user_id: Uuid, password_hash: &str)
+    -> UserRepositoryResult<()>;
+
+    /// Changes a user's role
+    async fn change_role(&self, user_id: Uuid, role: UserRole) -> UserRepositoryResult<()>;
+
+    /// Lists users by role (admin or user)
+    async fn list_users_by_role(&self, role: &str) -> UserRepositoryResult<Vec<User>>;
+
+    /// Move ownership between two users in one transaction, demoting the
+    /// current owner to admin. Demote-then-promote: the single-owner index
+    /// is checked per statement, so the reverse order trips it.
+    async fn transfer_ownership(
+        &self,
+        from_user_id: Uuid,
+        to_user_id: Uuid,
+    ) -> UserRepositoryResult<()>;
+
+    /// Counts users who can administer the instance — anything ranked above
+    /// a plain user — via a scalar `COUNT(*)`, no row hydration
+    /// (benches/ROUND29.md §G).
+    ///
+    /// Replaced a `count_users_by_role("admin")` whose single caller wanted
+    /// exactly this. Naming one role stopped being the same question the
+    /// moment `owner` existed: a fresh install's first user is the owner, so
+    /// counting `'admin'` returned zero administrators for an instance that
+    /// had one.
+    async fn count_privileged_users(&self) -> UserRepositoryResult<i64>;
+
+    /// Deletes a user
+    async fn delete_user(&self, user_id: Uuid) -> UserRepositoryResult<()>;
+
+    /// Finds a user by federation (issuer, subject) pair.
+    async fn get_user_by_federation_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> UserRepositoryResult<User>;
+
+    /// Updates a user's storage quota
+    async fn update_storage_quota(
+        &self,
+        user_id: Uuid,
+        quota_bytes: i64,
+    ) -> UserRepositoryResult<()>;
+
+    /// Counts the total number of users
+    async fn count_users(&self) -> UserRepositoryResult<i64>;
+
+    /// Gets aggregated storage statistics
+    async fn get_storage_stats(&self) -> UserRepositoryResult<StorageStats>;
+}
+
+/// Aggregated storage statistics
+#[derive(Debug, Clone)]
+pub struct StorageStats {
+    pub total_users: i64,
+    pub active_users: i64,
+    pub total_quota_bytes: i64,
+    pub total_used_bytes: i64,
+    pub users_over_80_percent: i64,
+    pub users_over_quota: i64,
+}

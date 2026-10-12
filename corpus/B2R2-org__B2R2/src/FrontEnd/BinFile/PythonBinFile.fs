@@ -1,0 +1,219 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.BinFile
+
+open System.Collections.Generic
+open System.Collections.Immutable
+open B2R2
+open B2R2.Collections
+open B2R2.FrontEnd.BinLifter
+open B2R2.FrontEnd.BinFile.FileHelper
+open B2R2.FrontEnd.BinFile.Python.Helper
+
+/// Represents a Python binary file. A code object is read by an interpreter
+/// rather than mapped by a loader, so it names no base to be placed at:
+/// every address here is an offset into the file, and there is no base for a
+/// caller to give.
+type PythonBinFile(path, inputBytes: byte[]) =
+  let reader = BinReader.Init Endian.Little
+
+  let magic = reader.ReadUInt32(inputBytes, 0)
+
+  let version = getVersionFromMagicNumber magic
+
+  let parsedCodeObject, _, _ =
+    let hdr = headerSize version
+    parse version inputBytes reader [||] hdr (Dictionary<int, uint64>())
+
+  (* Pre-3.11 only: two distinct functions can share one `co_code` file
+     offset via marshal's own byte-identity dedup -- see
+     deduplicateCodeOffsets's own doc comment. Giving each its own real,
+     distinct address here, before anything else (function
+     identification, CFG recovery, lifting) ever runs, restores the
+     address<->function invariant every one of those already assumes,
+     instead of every downstream consumer having to special-case the
+     collision (or worse, silently picking one of the two at random). *)
+  let bytes, codeObject =
+    match parsedCodeObject with
+    | Python.PyCode co ->
+      let bytes, co = deduplicateCodeOffsets inputBytes co
+      bytes, Python.PyCode co
+    | other ->
+      inputBytes, other
+
+  (* Deliberately the post-dedup buffer, not `inputBytes`: dedup extends
+     the buffer, and that extension is the file's own address space from
+     here on, so `RawBytes` must expose it too. *)
+  let rawBytes = System.ReadOnlyMemory bytes
+
+  let size = bytes.Length
+
+  (* Walked when first asked for, as every other format reads its tables: a
+     file is opened for plenty that never looks at a name or a constant, and
+     each of these walks the whole tree of code objects. *)
+  let consts = lazy (extractConsts codeObject)
+
+  let names = lazy (extractNames codeObject)
+
+  let varnames = lazy (extractVarNames codeObject)
+
+  let freevars = lazy (extractFreeVars codeObject)
+
+  let operator = [||]
+
+  (* Entries of every code object at once. Each one is addressed absolutely and
+     no two code objects share an address range, so a flat array is as
+     queryable as a per-function one would be. *)
+  let exceptionEntries =
+    lazy
+      Python.PyExceptionTable.collect codeObject
+      |> Array.collect snd
+      |> Array.sortBy (fun e -> e.Start)
+
+  let exceptionFrames =
+    lazy
+      (Python.PyExceptionTable.toFrames codeObject |> ImmutableArray.ofArray)
+
+  let exceptionTable =
+    Some { new IExceptionTable with
+      member _.Frames = exceptionFrames.Value
+    }
+
+  /// Python magic
+  member _.Magic with get() = magic
+
+  /// Python version
+  member _.Version with get() = version
+
+  /// Code Object.
+  member _.CodeObj with get() = codeObject
+
+  /// Consts.
+  member _.Consts with get() = consts.Value
+
+  /// Varnames.
+  member _.Varnames with get() = varnames.Value
+
+  /// Pre-3.11 `co_cellvars ++ co_freevars` -- see FreeVars' own doc comment
+  /// on PyCodeObject.
+  member _.FreeVars with get() = freevars.Value
+
+  /// Names.
+  member _.Names with get() = names.Value
+
+  /// Operator.
+  member _.Operator with get() = operator
+
+  /// Exception-table entries of every code object in the file, in address
+  /// order. Empty for pre-3.11 files, which carry no such table.
+  member _.ExceptionEntries with get() = exceptionEntries.Value
+
+  interface IBinFile with
+    member _.Reader with get() = reader
+
+    member _.RawBytes with get() = rawBytes
+
+    member _.RawBytesOffset with get() = 0UL
+
+    member _.Length with get() = bytes.Length
+
+    member _.Path with get() = path
+
+    member _.Format with get() = FileFormat.PythonBinary
+
+    member _.Kind with get() = BinFileKind.Unknown
+
+    member _.ISA with get() = ISA version
+
+    (* A code object runs wherever an interpreter reads it, so it names no
+       operating system. *)
+    member _.OS with get() = OS.UnknownOS
+
+    member _.EntryPoint with get() = Some 0UL
+
+    member _.BaseAddress with get() = 0UL
+
+    member _.InterpreterPath with get() = None
+
+    member _.RPath with get() = ImmutableArray.Empty
+
+    member _.RunPath with get() = ImmutableArray.Empty
+
+    member _.DependencyNames with get() = ImmutableArray.Empty
+
+    member _.SharedObjectName with get() = None
+
+    member _.BuildId with get() = ImmutableArray.Empty
+
+    member _.ProgramHeaderTable with get() = None
+
+    member _.IsNXEnabled with get() = false
+
+    member _.IsPIE with get() = false
+
+    member _.IsBaseRelative with get() = false
+
+    member _.Relro with get() = None
+
+    member _.EncryptedRanges with get() = ImmutableArray.Empty
+
+    member _.NameResolver with get() = None
+
+    member _.SymbolTable with get() = None
+
+    member _.Structure with get() = None
+
+    member _.Relocations with get() = None
+
+    member _.ExceptionTable with get() = exceptionTable
+
+    member _.ImportTable with get() = None
+
+    member _.MemoryLayout with get() = None
+
+    member _.Slice(addr, len) = sliceBySafeOffset bytes addr len
+
+    member _.IsValidAddr(addr) = addr >= 0UL && addr < (uint64 bytes.LongLength)
+
+    member this.IsValidRange range =
+      (this :> IAddressSpace).IsValidAddr range.Min
+      && (this :> IAddressSpace).IsValidAddr range.Max
+
+    member this.IsAddrMappedToFile addr =
+      (this :> IAddressSpace).IsValidAddr addr
+
+    member this.IsRangeMappedToFile range =
+      (this :> IAddressSpace).IsValidRange range
+
+    member this.IsExecutableAddr addr = (this :> IAddressSpace).IsValidAddr addr
+
+    member _.GetBoundedPointer(addr) =
+      if addr < uint64 size then
+        BinFilePointer.CreateFileBacked(addr,
+                                        uint64 size - 1UL,
+                                        int addr,
+                                        size - 1)
+      else
+        BinFilePointer.Null

@@ -1,0 +1,159 @@
+import type { AppPermissionDefinition, AppToolGroup } from "./types";
+
+const githubGroups: AppToolGroup[] = [
+  {
+    category: "read",
+    tools: [
+      {
+        id: "git_clone",
+        name: "Git clone / pull",
+        description: "Clone or pull repository contents via git over HTTPS",
+        hostPattern: "github.com",
+        pathPattern: "/*/*/git-upload-pack",
+        method: "POST",
+      },
+      {
+        id: "get_repo",
+        name: "Read repository",
+        description: "Get repository details, files, and metadata",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*",
+        method: "GET",
+      },
+      {
+        id: "list_repos",
+        name: "List repositories",
+        description: "List repositories for the authenticated user",
+        hostPattern: "api.github.com",
+        pathPattern: "/user/repos",
+        method: "GET",
+      },
+      {
+        id: "list_pulls",
+        name: "List pull requests",
+        description: "List pull requests in a repository",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*/pulls",
+        method: "GET",
+      },
+      {
+        id: "list_issues",
+        name: "List issues",
+        description: "List issues in a repository",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*/issues",
+        method: "GET",
+      },
+      {
+        id: "search",
+        name: "Search",
+        description:
+          "Search issues, pull requests, code, repositories, and users",
+        hostPattern: "api.github.com",
+        pathPattern: "/search/*",
+        method: "GET",
+      },
+      {
+        id: "graphql_query",
+        name: "GraphQL API (queries)",
+        description:
+          "Read-only GraphQL queries (how the gh CLI lists issues, PRs, and repos). Anything that isn't clearly a pure query counts as a mutation.",
+        hostPattern: "api.github.com",
+        pathPattern: "/graphql",
+        method: "POST",
+        graphqlOps: "query",
+      },
+      {
+        id: "read_raw_content",
+        name: "Read raw file content",
+        description: "Fetch raw file contents from raw.githubusercontent.com",
+        hostPattern: "raw.githubusercontent.com",
+        pathPattern: "/*",
+        method: "GET",
+      },
+    ],
+  },
+  {
+    category: "write",
+    tools: [
+      {
+        id: "git_push",
+        name: "Git push",
+        description: "Push commits to a repository via git over HTTPS",
+        hostPattern: "github.com",
+        pathPattern: "/*/*/git-receive-pack",
+        method: "POST",
+      },
+      {
+        id: "create_pull",
+        name: "Create pull request",
+        description: "Create a new pull request",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*/pulls",
+        method: "POST",
+      },
+      {
+        id: "create_comment",
+        name: "Create comment",
+        description: "Comment on an issue or pull request",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*/issues/*/comments",
+        method: "POST",
+      },
+      {
+        id: "create_issue",
+        name: "Create issue",
+        description: "Create a new issue in a repository",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*/issues",
+        method: "POST",
+      },
+      {
+        id: "update_issue",
+        name: "Update issue",
+        description:
+          "Edit, close, or reopen an issue, or edit an issue comment",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*/issues/*",
+        method: "PATCH",
+      },
+      {
+        id: "update_pull",
+        name: "Update pull request",
+        description:
+          "Edit, close, or reopen a pull request, or edit a review comment",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*/pulls/*",
+        method: "PATCH",
+      },
+      {
+        id: "graphql_mutation",
+        name: "GraphQL API (mutations)",
+        description:
+          "GraphQL writes (how the gh CLI creates issues, PRs, and comments). Blocking this blocks every GraphQL request that isn't a pure query.",
+        hostPattern: "api.github.com",
+        pathPattern: "/graphql",
+        method: "POST",
+        graphqlOps: "mutation",
+      },
+      {
+        id: "delete_branch",
+        name: "Delete branch",
+        description: "Delete a git branch reference",
+        hostPattern: "api.github.com",
+        pathPattern: "/repos/*/*/git/refs/*",
+        method: "DELETE",
+      },
+    ],
+  },
+];
+
+export const githubPermissions: AppPermissionDefinition = {
+  provider: "github",
+  groups: githubGroups,
+};
+
+export const githubAppPermissions: AppPermissionDefinition = {
+  provider: "github-app",
+  groups: githubGroups,
+};

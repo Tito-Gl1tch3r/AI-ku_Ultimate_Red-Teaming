@@ -1,0 +1,1368 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.ARM32.Tests
+
+open Microsoft.VisualStudio.TestTools.UnitTesting
+open B2R2
+open B2R2.FrontEnd.BinLifter
+open B2R2.FrontEnd.ARM32
+open B2R2.FrontEnd.ARM32.OperandHelper
+open type Opcode
+open type Register
+
+/// Shortcut for creating operands.
+[<AutoOpen>]
+module private Shortcut =
+  type O =
+    static member Reg(r) = OprReg r
+
+    static member Imm(v) = OprImm v
+
+    static member RegShift(srType, r) = OprRegShift(srType, r)
+
+    static member Shift(srType, v) = OprShift(srType, Imm v)
+
+    static member SpecReg(r, psfFlag) = OprSpecReg(r, Some psfFlag)
+
+    static member Iflag(flag) = OprIflag flag
+
+    static member RegList(lst) = OprRegList lst
+
+    static member Option(barrier) = OprOption barrier
+
+    static member Endian(endian) = OprEndian endian
+
+    static member Cond(cond) = OprCond cond
+
+    static member SimdScalarReg(r, elem) = toSSReg (r, elem)
+
+    static member SimdVectorReg(r) = toSVReg r
+
+    static member MemLabel(v) = memLabel v
+
+    static member MemUnIdx(r, v) = memUnIdxImm (r, v)
+
+    static member MemOffsetImm(offset) = memOffsetImm offset
+
+    static member MemOffsetReg(r1, signOpt, r2, srType, v) =
+      memOffsetReg (r1, signOpt, r2, Some(srType, Imm v))
+
+    static member MemOffsetReg(r1, signOpt, r2) =
+      memOffsetReg (r1, signOpt, r2, None)
+
+    static member MemOffsetAlign(offset) = memOffsetAlign offset
+
+    static member MemPreIdxImm(offset) = memPreIdxImm offset
+
+    static member MemPreIdxReg(r1, signOpt, r2, srType, v) =
+      memPreIdxReg (r1, signOpt, r2, Some(srType, Imm v))
+
+    static member MemPreIdxReg(r1, signOpt, r2) =
+      memPreIdxReg (r1, signOpt, r2, None)
+
+    static member MemPreIdxAlign(offset) = memPreIdxAlign offset
+
+    static member MemPostIdxImm(offset) = memPostIdxImm offset
+
+    static member MemPostIdxReg(r1, signOpt, r2, srType, v) =
+      memPostIdxReg (r1, signOpt, r2, Some(srType, Imm v))
+
+    static member MemPostIdxReg(r1, signOpt, r2) =
+      memPostIdxReg (r1, signOpt, r2, None)
+
+    static member MemPostIdxAlign(offset) = memPostIdxAlign offset
+
+    static member SimdScalarRegs(regList, elem) = getSIMDScalar elem regList
+
+    static member SimdVectorRegs(regList) = getSIMDVector regList
+
+/// - A4.3 Branch instructions
+/// - A4.4 Data-processing instructions
+/// - A4.5 Status register access instructions
+/// - A4.6 Load/store instructions
+/// - A4.7 Load/store multiple instructions
+/// - A4.8 Miscellaneous instructions
+/// - A4.9 Exception-generating and exception-handling instructions
+/// - A4.10 Co-processor instructions
+/// - A4.11 Advanced SIMD and Floating-point load/store instructions
+/// - A4.12 Advanced SIMD and Floating-point register transfer instructions
+/// - A4.13 Advanced SIMD data-processing instructions
+/// - A4.14 Floating-point data-processing instructions
+[<TestClass>]
+type ParserTests() =
+  let parse (isa: ISA) (bytes: byte[]) =
+    let reader = BinReader.Init Endian.Big
+    let parser = Parser(isa, false, reader) :> IInstructionParsable
+    parser.Parse(bytes, 0UL) :?> Instruction
+
+  let assertIns cond op wback simd oprs (ins: Instruction) =
+    Assert.AreEqual<Condition>(cond, ins.Condition)
+    Assert.AreEqual<Opcode>(op, ins.Opcode)
+    Assert.AreEqual<bool>(wback, ins.WriteBack)
+    Assert.AreEqual<SIMDDataTypes option>(simd, ins.SIMDTyp)
+    Assert.AreEqual<Operands>(oprs, ins.Operands)
+
+  let test cond op wback simd oprs bytes =
+    parse (ISA(Architecture.ARMv7, Endian.Big)) bytes
+    |> assertIns cond op wback simd oprs
+
+  /// Parses as AArch32, for the instructions ARMv8 added.
+  let testV8 cond op wback simd oprs bytes =
+    parse (ISA(Architecture.ARMv8, Endian.Big, WordSize.Bit32)) bytes
+    |> assertIns cond op wback simd oprs
+
+  let testNoWbackNoQNoSimd pref (bytes: byte[]) (opcode, operands) =
+    test pref opcode false None operands bytes
+
+  let testV8NoWbackNoQNoSimd pref (bytes: byte[]) (opcode, operands) =
+    testV8 pref opcode false None operands bytes
+
+  let testNoWbackNoQ pref simd (bytes: byte[]) (opcode, operands) =
+    test pref opcode false simd operands bytes
+
+  /// Checks the disassembly, for what no operand carries: the caret that tells
+  /// a transfer of another mode's registers from the ordinary one.
+  let testDisasm (byteString: string) (expected: string) =
+    let bytes = ByteArray.ofHexString byteString
+    let ins = parse (ISA(Architecture.ARMv7, Endian.Big)) bytes
+    Assert.AreEqual<string>(expected, (ins :> IInstruction).Disasm())
+
+  /// Checks that a word the manual calls UNPREDICTABLE is refused rather than
+  /// decoded into whatever its fields happen to say.
+  let testRefused (byteString: string) =
+    let bytes = ByteArray.ofHexString byteString
+    Assert.ThrowsExactly<ParsingFailureException>(fun () ->
+      parse (ISA(Architecture.ARMv7, Endian.Big)) bytes |> ignore)
+    |> ignore
+
+  /// The disassembly of a word under the ISA a name gives, or nothing where
+  /// that ISA leaves the word UNDEFINED.
+  let under (isaName: string) (byteString: string) =
+    let parser = Parser(ISA isaName, false, BinReader.Init Endian.Big)
+    let bytes = ByteArray.ofHexString byteString
+    try Some(((parser :> IInstructionParsable).Parse(bytes, 0UL)).Disasm())
+    with :? ParsingFailureException -> None
+
+  /// Checks that a word reads under each ISA of one list and is refused under
+  /// each of the other, which is what a version and its extensions decide.
+  let readsOnlyUnder word (reads: string list) (refuses: string list) =
+    for name in reads do
+      Assert.AreEqual<bool>(true, (under name word).IsSome, $"{word} {name}")
+    for name in refuses do
+      Assert.AreEqual<string option>(None, under name word, $"{word} {name}")
+
+  let testNoQNoSimd pref wback (bytes: byte[]) (opcode, operands) =
+    test pref opcode wback None operands bytes
+
+  let testNoQ pref wback simd (bytes: byte[]) (opcode, operands) =
+    test pref opcode wback simd operands bytes
+
+  let operandsFromArray oprList =
+    let oprs = Array.ofList oprList
+    match oprs.Length with
+    | 0 -> NoOperand
+    | 1 -> OneOperand oprs[0]
+    | 2 -> TwoOperands(oprs[0], oprs[1])
+    | 3 -> ThreeOperands(oprs[0], oprs[1], oprs[2])
+    | 4 -> FourOperands(oprs[0], oprs[1], oprs[2], oprs[3])
+    | 5 -> FiveOperands(oprs[0], oprs[1], oprs[2], oprs[3], oprs[4])
+    | 6 -> SixOperands(oprs[0], oprs[1], oprs[2], oprs[3], oprs[4], oprs[5])
+    | _ -> Terminator.impossible ()
+
+  let ( ** ) opcode oprList = (opcode, operandsFromArray oprList)
+
+  let ( ++ ) byteString pair = (ByteArray.ofHexString byteString, pair)
+
+  [<TestMethod>]
+  member _.``[ARMv7] Branch Parse Test (1)``() =
+    "ea0000ff"
+    ++ B ** [ O.MemLabel 1020L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Branch Parse Test (2)``() =
+    "fa000010"
+    ++ BLX ** [ O.MemLabel 64L ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Branch Parse Test (3)``() =
+    "e12fff10"
+    ++ BX ** [ O.Reg R0 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.4.1 Standard data-processing instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (1)``() =
+    "e080285e"
+    ++ ADD
+    ** [ O.Reg R2; O.Reg R0; O.Reg LR; O.RegShift(ShiftOp.ASR, R8) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (2)``() =
+    "e28f0ff0"
+    ++ ADD ** [ O.Reg R0; O.Reg PC; O.Imm 960L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (3)``() =
+    "e0000000"
+    ++ AND ** [ O.Reg R0; O.Reg R0; O.Reg R0; O.Shift(ShiftOp.LSL, 0u) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (4)``() =
+    "e15c0262"
+    ++ CMP ** [ O.Reg IP; O.Reg R2; O.Shift(ShiftOp.ROR, 4u) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (5)``() =
+    "e23010fc"
+    ++ EORS ** [ O.Reg R1; O.Reg R0; O.Imm 252L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (6)``() =
+    "e300a00f"
+    ++ MOVW ** [ O.Reg SL; O.Imm 15L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (7)``() =
+    "e1b0800c"
+    ++ MOVS ** [ O.Reg R8; O.Reg IP ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (8)``() =
+    "e1e00819"
+    ++ MVN ** [ O.Reg R0; O.Reg SB; O.RegShift(ShiftOp.LSL, R8) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (9)``() =
+    "e13a0c16"
+    ++ TEQ ** [ O.Reg SL; O.Reg R6; O.RegShift(ShiftOp.LSL, IP) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Standard data-processing Parse Test (10)``() =
+    "e3130004"
+    ++ TST ** [ O.Reg R3; O.Imm 4L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.4.2 Shift instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Shift Parse Test (1)``() =
+    "e1b00113"
+    ++ LSLS ** [ O.Reg R0; O.Reg R3; O.Reg R1 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Shift Parse Test (2)``() =
+    "e1a00e65"
+    ++ ROR ** [ O.Reg R0; O.Reg R5; O.Imm 28L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.4.3 Multiply instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Multiply Parse Test (1)``() =
+    "e0100c99"
+    ++ MULS ** [ O.Reg R0; O.Reg SB; O.Reg IP ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Multiply Parse Test (2)``() =
+    "e100cac5"
+    ++ SMLABT ** [ O.Reg R0; O.Reg R5; O.Reg SL; O.Reg IP ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Multiply Parse Test (3)``() =
+    "e14012e8"
+    ++ SMLALTT ** [ O.Reg R1; O.Reg R0; O.Reg R8; O.Reg R2 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Multiply Parse Test (4)``() =
+    "e700f112"
+    ++ SMUAD ** [ O.Reg R0; O.Reg R2; O.Reg R1 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Multiply Parse Test (5)``() =
+    "e1600e8c"
+    ++ SMULBB ** [ O.Reg R0; O.Reg IP; O.Reg LR ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.4.4 Saturating instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Saturating Parse Test (1)``() =
+    "e6bc03d2"
+    ++ SSAT
+    ** [ O.Reg R0; O.Imm 29L; O.Reg R2; O.Shift(ShiftOp.ASR, 7u) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// The signed saturation counts the width it saturates to from one, and the
+  /// unsigned one holds it as it is.
+  [<TestMethod>]
+  member _.``[ARMv7] Saturating Parse Test (2)``() =
+    "e6a10f31"
+    ++ SSAT16 ** [ O.Reg R0; O.Imm 2L; O.Reg R1 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Saturating Parse Test (3)``() =
+    "e6e10f31"
+    ++ USAT16 ** [ O.Reg R0; O.Imm 1L; O.Reg R1 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.4.5 Saturating addition and subtraction instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Saturating addition and subtraction Parse Test (1)``() =
+    "e1001052"
+    ++ QADD ** [ O.Reg R1; O.Reg R2; O.Reg R0 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.4.6 Packing and unpacking instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Packing and unpacking Parse Test (1)``() =
+    "e6801ad8"
+    ++ PKHTB
+    ** [ O.Reg R1; O.Reg R0; O.Reg R8; O.Shift(ShiftOp.ASR, 21u) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Packing and unpacking Parse Test (2)``() =
+    "e6a01c70"
+    ++ SXTAB
+    ** [ O.Reg R1; O.Reg R0; O.Reg R0; O.Shift(ShiftOp.ROR, 24u) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Packing and unpacking Parse Test (3)``() =
+    "e6bf0073"
+    ++ SXTH ** [ O.Reg R0; O.Reg R3; O.Shift(ShiftOp.ROR, 0u) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.4.7 Parallel addition and subtraction instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Parallel addition and subtraction Parse Test (1)``() =
+    "e6101f37"
+    ++ SASX ** [ O.Reg R1; O.Reg R0; O.Reg R7 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.4.9 Miscellaneous data-processing instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous data-processing Parse Test (1)``() =
+    "e7df019f"
+    ++ BFC ** [ O.Reg R0; O.Imm 3L; O.Imm 29L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous data-processing Parse Test (2)``() =
+    "e7ca0290"
+    ++ BFI ** [ O.Reg R0; O.Reg R0; O.Imm 5L; O.Imm 6L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous data-processing Parse Test (3)``() =
+    "e16f0f11"
+    ++ CLZ ** [ O.Reg R0; O.Reg R1 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous data-processing Parse Test (4)``() =
+    "e7a20e52"
+    ++ SBFX ** [ O.Reg R0; O.Reg R2; O.Imm 28L; O.Imm 3L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+#if !EMULATION
+  (* Refusing a word the manual calls UNPREDICTABLE is one of the checks an
+     emulation build compiles out of the parser, so what follows is only true of
+     a build that compiles them in. *)
+
+  /// The width of a bitfield is how far its top bit sits above its bottom one,
+  /// so a top bit below the bottom one names no field at all.
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous data-processing Parse Test (5)``() =
+    testRefused "e7c12314" (* bfi, msb = 1, lsb = 6 *)
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous data-processing Parse Test (6)``() =
+    testRefused "e7c1231f" (* bfc, msb = 1, lsb = 6 *)
+#endif
+
+  /// The element and structure loads and stores are 1111 0100 with bit 20
+  /// clear; the same word with bit 24 set is no instruction.
+  [<TestMethod>]
+  member _.``[ARMv7] VLD1 of four registers steps by a register``() =
+    testDisasm "f42af2d2" "vld1.64 {d15, d16, d17, d18}, [sl:64], r2"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD element load/store needs bit 24 clear``() =
+    testRefused "f52af2d2"
+
+  /// An A32 VSTR may take the PC as its base: the manual's UNPREDICTABLE is
+  /// for every other instruction set.
+  [<TestMethod>]
+  member _.``[ARMv7] VSTR may take the PC as its base``() =
+    testDisasm "adcf7bcc" "vstrge.64 d23, [pc, #0x330]"
+
+  /// VLD2 of one register a structure steps by one, so d30 and d31 are the
+  /// last pair it can name.
+  [<TestMethod>]
+  member _.``[ARMv7] VLD2 of the last two D registers``() =
+    testDisasm "f46be812" "vld2.8 {d30, d31}, [fp:64], r2"
+
+  /// <summary>
+  /// Which ISAs read each word, and which refuse it. An ARMv7 ISA naming a
+  /// version reads the instructions of the extensions it has and no others:
+  /// the moves and loads of the extension registers are either unit's, the
+  /// fused multiply-adds need VFPv4 and the half-precision conversions FP16
+  /// on top, and what Armv8 added no ARMv7 version reads.
+  /// </summary>
+  [<TestMethod>]
+  member _.``[ARMv7] VADD.F32 is either unit's``() =
+    readsOnlyUnder "ee300a81" [ "armv7-v7+fp"; "armv7-v7+simd" ] [ "armv7-v7" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VADD.I32 is Advanced SIMD's``() =
+    readsOnlyUnder "f2210802" [ "armv7-v7+simd" ] [ "armv7-v7+fp"; "armv7-v7" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VFMA.F32 is VFPv4's``() =
+    readsOnlyUnder "eea00a81" [ "armv7-v7+vfpv4" ]
+      [ "armv7-v7+fp"; "armv7-v7+simd" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VFMA of vectors needs SIMD and VFPv4``() =
+    readsOnlyUnder "f2010c12" [ "armv7-v7+simd+vfpv4" ] [ "armv7-v7+simd" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VCVTB is the half-precision extension's``() =
+    readsOnlyUnder "eeb20a60" [ "armv7-v7+fp+fp16"; "armv7-v7+vfpv4" ]
+      [ "armv7-v7+fp" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VCVT of halves needs SIMD and FP16``() =
+    readsOnlyUnder "f3b60602" [ "armv7-v7+simd+fp16" ] [ "armv7-v7+simd" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] SDIV is the divide extension's``() =
+    readsOnlyUnder "e710f211" [ "armv7-v7+idiv"; "armv7-v7+virt" ]
+      [ "armv7-v7+mp" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] SDIV comes with ARMv7VE``() =
+    readsOnlyUnder "e710f211" [ "armv7-v7ve" ] [ "armv7-v7" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] PLDW is the multiprocessing extension's``() =
+    readsOnlyUnder "f590f000" [ "armv7-v7+mp"; "armv7-v7ve" ] [ "armv7-v7" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] SMC is the security extension's``() =
+    readsOnlyUnder "e1600070" [ "armv7-v7+sec"; "armv7-v7ve" ] [ "armv7-v7" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] HVC is the virtualization extension's``() =
+    readsOnlyUnder "e1400070" [ "armv7-v7+virt"; "armv7-v7ve" ]
+      [ "armv7-v7+idiv" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] MRS (banked) is the virtualization extension's``() =
+    readsOnlyUnder "e1000200" [ "armv7-v7+virt" ] [ "armv7-v7" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VLDM is either unit's``() =
+    readsOnlyUnder "ec900b04" [ "armv7-v7+fp"; "armv7-v7+simd" ] [ "armv7-v7" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VLD1 is Advanced SIMD's``() =
+    readsOnlyUnder "f420070f" [ "armv7-v7+simd" ] [ "armv7-v7+fp" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VMOV of a word to a core register is either unit's``() =
+    readsOnlyUnder "ee300b10" [ "armv7-v7+fp"; "armv7-v7+simd" ] [ "armv7-v7" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VMOV of a byte to a core register is Advanced SIMD's``() =
+    readsOnlyUnder "eed00b30" [ "armv7-v7+simd" ] [ "armv7-v7+fp" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] CRC32B is Armv8's``() =
+    readsOnlyUnder "e1010042" [ "armv7" ] [ "armv7-v7ve+simd+vfpv4" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] VMAXNM is Armv8's``() =
+    readsOnlyUnder "f3010f12" [ "armv7" ] [ "armv7-v7ve+simd+vfpv4" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] LDA is Armv8's``() =
+    readsOnlyUnder "e1910c9f" [ "armv7" ] [ "armv7-v7ve" ]
+
+  [<TestMethod>]
+  member _.``[ARMv7] ADD is every version's``() =
+    readsOnlyUnder "e0810002" [ "armv7-v7" ] []
+
+  /// Armv8's hints are NOPs to an ARMv7 processor, as its unallocated hints
+  /// are, so an ARMv7 version reads them as NOP.
+  [<TestMethod>]
+  member _.``[ARMv7] SEVL reads as NOP under an ARMv7 version``() =
+    Assert.AreEqual<string option>(Some "nop", under "armv7-v7" "e320f005")
+
+  /// An ISA that names no version reads every instruction.
+  [<TestMethod>]
+  member _.``[ARMv7] SEVL reads as SEVL without a version``() =
+    Assert.AreEqual<string option>(Some "sevl", under "armv7" "e320f005")
+
+  /// A register list of no registers is UNPREDICTABLE. A build that checks
+  /// refuses it, and one that does not reads the empty list it names; either
+  /// way the word comes back, rather than being read as every register there
+  /// is.
+  [<TestMethod>]
+  [<Timeout(10000)>]
+  member _.``[ARMv7] VLDM with no registers``() =
+#if EMULATION
+    let bytes = ByteArray.ofHexString "7cba0b00" (* vldmiavc r10!, {} *)
+    let ins = parse (ISA(Architecture.ARMv7, Endian.Big)) bytes
+    let expected = TwoOperands(O.Reg SL, O.RegList [])
+    Assert.AreEqual<Operands>(expected, ins.Operands)
+#else
+    testRefused "7cba0b00" (* vldmiavc r10!, {} *)
+#endif
+
+  [<TestMethod>]
+  member _.``[ARMv7] Status register access Parse Test (1)``() =
+    "e32cf0f0"
+    ++ MSR ** [ O.SpecReg(CPSR, PSRfs); O.Imm 240L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Status register access Parse Test (2)``() =
+    "e12cf002"
+    ++ MSR ** [ O.SpecReg(CPSR, PSRfs); O.Reg R2 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Status register access Parse Test (3)``() =
+    "f10a0142"
+    ++ CPSIE ** [ O.Iflag AF; O.Imm 2L ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Lord) Parse test (1)``() =
+    "e59f000f"
+    ++ LDR ** [ O.Reg R0; O.MemLabel 15L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Lord) Parse test (2)``() =
+    "e09010bc"
+    ++ LDRH ** [ O.Reg R1; O.MemPostIdxReg(R0, Some Plus, IP) ]
+    ||> testNoQNoSimd Condition.AL true
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Lord) Parse test (3)``() =
+    "e75010c2"
+    ++ LDRB
+    ** [ O.Reg R1; O.MemOffsetReg(R0, Some Minus, R2, ShiftOp.ASR, 1u) ]
+    ||> testNoQNoSimd Condition.AL false
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Lord) Parse test (4)``() =
+    "e1701cd3"
+    ++ LDRSB ** [ O.Reg R1; O.MemPreIdxImm(R0, Some Minus, Some 195L) ]
+    ||> testNoQNoSimd Condition.AL true
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Store) Parse test (1)``() =
+    "e50010f3"
+    ++ STR ** [ O.Reg R1; O.MemOffsetImm(R0, Some Minus, Some 243L) ]
+    ||> testNoQNoSimd Condition.AL false
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Store) Parse test (2)``() =
+    "e640122c"
+    ++ STRB
+    ** [ O.Reg R1; O.MemPostIdxReg(R0, Some Minus, IP, ShiftOp.LSR, 4u) ]
+    ||> testNoQNoSimd Condition.AL true
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Store) Parse test (3)``() =
+    "e1a0c0f8"
+    ++ STRD ** [ O.Reg IP; O.Reg SP; O.MemPreIdxReg(R0, Some Plus, R8) ]
+    ||> testNoQNoSimd Condition.AL true
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Load unprivileged) Parse test (1)``() =
+    "e070e0fe"
+    ++ LDRSHT ** [ O.Reg LR; O.MemPostIdxImm(R0, Some Minus, Some 14L) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Store unprivileged) Parse test (1)``() =
+    "e4a0100f"
+    ++ STRT ** [ O.Reg R1; O.MemPostIdxImm(R0, Some Plus, Some 15L) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Store unprivileged) Parse test (2)``() =
+    "e02010b4"
+    ++ STRHT ** [ O.Reg R1; O.MemPostIdxReg(R0, Some Minus, R4) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A post-indexed access keeps a zero offset, which the other addressing
+  /// modes leave out: it is what closes the bracket and says that the base is
+  /// written back. A zero offset has no sign, but one that is not zero keeps
+  /// its own.
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store Disasm test (1)``() =
+    testDisasm "e4910000" "ldr r0, [r1], #0x0"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store Disasm test (2)``() =
+    testDisasm "e4810000" "str r0, [r1], #0x0"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store Disasm test (3)``() =
+    testDisasm "e5910000" "ldr r0, [r1]"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store Disasm test (4)``() =
+    testDisasm "e4110004" "ldr r0, [r1], #-0x4"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Load-Exclusive) Parse test (1)``() =
+    "e190ef9f"
+    ++ LDREX ** [ O.Reg LR; O.MemOffsetImm(R0, None, None) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// The narrower exclusive loads keep the register they read above the field
+  /// the exclusive stores keep it in, and ones below.
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Load-Exclusive) Parse test (2)``() =
+    "e1d12f9f"
+    ++ LDREXB ** [ O.Reg R2; O.MemOffsetImm(R1, None, None) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Load-Exclusive) Parse test (3)``() =
+    "e1f12f9f"
+    ++ LDREXH ** [ O.Reg R2; O.MemOffsetImm(R1, None, None) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Load-Exclusive) Parse test (4)``() =
+    "e1b12f9f"
+    ++ LDREXD ** [ O.Reg R2; O.Reg R3; O.MemOffsetImm(R1, None, None) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store (Store-Exclusive) Parse test (1)``() =
+    "e1a01f92"
+    ++ STREXD ** [ O.Reg R1
+                   O.Reg R2
+                   O.Reg R3
+                   O.MemOffsetImm(R0, None, None) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A store that releases keeps the register it writes below the field a load
+  /// keeps it in, and ones above.
+  [<TestMethod>]
+  member _.``[ARMv8] Load/store (Store-Release) Parse test (1)``() =
+    "e181fc90"
+    ++ STL ** [ O.Reg R0; O.MemOffsetImm(R1, None, None) ]
+    ||> testV8NoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv8] Load/store (Store-Release) Parse test (2)``() =
+    "e1c1fc90"
+    ++ STLB ** [ O.Reg R0; O.MemOffsetImm(R1, None, None) ]
+    ||> testV8NoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv8] Load/store (Store-Release) Parse test (3)``() =
+    "e1e1fc90"
+    ++ STLH ** [ O.Reg R0; O.MemOffsetImm(R1, None, None) ]
+    ||> testV8NoWbackNoQNoSimd Condition.AL
+
+  /// A load that acquires keeps the register it reads where every other load
+  /// keeps it, whatever its width.
+  [<TestMethod>]
+  member _.``[ARMv8] Load/store (Load-Acquire) Parse test (1)``() =
+    "e1d12c9f"
+    ++ LDAB ** [ O.Reg R2; O.MemOffsetImm(R1, None, None) ]
+    ||> testV8NoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv8] Load/store (Load-Acquire) Parse test (2)``() =
+    "e1f12c9f"
+    ++ LDAH ** [ O.Reg R2; O.MemOffsetImm(R1, None, None) ]
+    ||> testV8NoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv8] Load/store (Load-Acquire) Parse test (3)``() =
+    "e1d12e9f"
+    ++ LDAEXB ** [ O.Reg R2; O.MemOffsetImm(R1, None, None) ]
+    ||> testV8NoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv8] Load/store (Load-Acquire) Parse test (4)``() =
+    "e1f12e9f"
+    ++ LDAEXH ** [ O.Reg R2; O.MemOffsetImm(R1, None, None) ]
+    ||> testV8NoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv8] Load/store (Load-Acquire) Parse test (5)``() =
+    "e1b12e9f"
+    ++ LDAEXD ** [ O.Reg R2; O.Reg R3; O.MemOffsetImm(R1, None, None) ]
+    ||> testV8NoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Parse Test (1)``() =
+    "e8100f0c"
+    ++ LDMDA ** [ O.Reg R0; O.RegList [ R2; R3; R8; SB; SL; FP ] ]
+    ||> testNoQNoSimd Condition.AL false
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Parse Test (2)``() =
+    "e8300f0c"
+    ++ LDMDA ** [ O.Reg R0; O.RegList [ R2; R3; R8; SB; SL; FP ] ]
+    ||> testNoQNoSimd Condition.AL true
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Parse Test (3)``() =
+    "e8bd000f"
+    ++ POP ** [ O.RegList [ R0; R1; R2; R3 ] ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+    (*
+    "e52d0004"
+    ++ STR ** [ O.Reg R0; O.MemPreIdxImm(SP, Some Minus, Some 4L) ]
+    ||> testNoQNoSimd Condition.AL (Some true)
+    *)
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Parse Test (4)``() =
+    "e52d0004"
+    ++ PUSH ** [ O.RegList [ R0 ] ]
+    ||> testNoQNoSimd Condition.AL true
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Parse Test (5)``() =
+    "e8c9e000"
+    ++ STM ** [ O.Reg SB; O.RegList [ SP; LR; PC ] ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A transfer of the registers of another mode ends in a caret, and shares
+  /// its mnemonic with the ordinary transfer that it is not.
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Disasm test (1)``() =
+    testDisasm "e8912304" "ldm r1, {r2, r8, sb, sp}"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Disasm test (2)``() =
+    testDisasm "e8d12304" "ldm r1, {r2, r8, sb, sp}^"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Disasm test (3)``() =
+    testDisasm "e8812304" "stm r1, {r2, r8, sb, sp}"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Disasm test (4)``() =
+    testDisasm "e8c12304" "stm r1, {r2, r8, sb, sp}^"
+
+  /// A return from an exception writes its base back when its write-back bit
+  /// says so, which the transfer of another mode's registers has no room for.
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Disasm test (5)``() =
+    testDisasm "e8d1a304" "ldm r1, {r2, r8, sb, sp, pc}^"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Load/store multiple Disasm test (6)``() =
+    testDisasm "e8f1a304" "ldm r1!, {r2, r8, sb, sp, pc}^"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous Parse test (1)``() =
+    "f57ff01f"
+    ++ CLREX ** []
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous Parse test (2)``() =
+    "f57ff05f"
+    ++ DMB ** [ O.Option BarrierOption.SY ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous Parse test (3)``() =
+    "e320f000"
+    ++ NOP ** []
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous Parse test (4)``() =
+    "f55fff00"
+    ++ PLD ** [ O.MemLabel -3840L ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous Parse test (5)``() =
+    "f790f1c0"
+    ++ PLDW ** [ O.MemOffsetReg(R0, Some Plus, R0, ShiftOp.ASR, 3u) ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous Parse test (6)``() =
+    "f450f0f0"
+    ++ PLI ** [ O.MemLabel -240L ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous Parse test (7)``() =
+    "f1010200"
+    ++ SETEND ** [ O.Endian Endian.Big ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Miscellaneous Parse test (8)``() =
+    "e100c09e"
+    ++ SWP ** [ O.Reg IP; O.Reg LR; O.MemOffsetImm(R0, None, None) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Exception-gen and exception-handling Parse Test (1)``() =
+    "e120f07c"
+    ++ BKPT ** [ O.Imm 3852L ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Exception-gen and exception-handling Parse Test (2)``() =
+    "e160007f"
+    ++ SMC ** [ O.Imm 15L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Exception-gen and exception-handling Parse Test (3)``() =
+    "f9bc0a00"
+    ++ RFEIB ** [ O.Reg IP ]
+    ||> testNoQNoSimd Condition.UN true
+
+  [<TestMethod>]
+  member _.``[ARMv7] Exception-gen and exception-handling Parse Test (4)``() =
+    "f96d0504"
+    ++ SRSDB ** [ O.Reg SP; O.Imm 4L ]
+    ||> testNoQNoSimd Condition.UN true
+
+  [<TestMethod>]
+  member _.``[ARMv7] Co-processor Parse test (1)``() =
+    (* Only ARMv7 *)
+    "ee0123e8"
+    ++ CDP ** [ O.Reg P3; O.Imm 0L; O.Reg C2; O.Reg C1; O.Reg C8; O.Imm 7L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Co-processor Parse test (2)``() =
+    "ec401fe3"
+    ++ MCRR ** [ O.Reg P15; O.Imm 14L; O.Reg R1; O.Reg R0; O.Reg C3 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Co-processor Parse test (3)``() =
+    "ee9e9e32"
+    ++ MRC ** [ O.Reg P14; O.Imm 4L; O.Reg SB; O.Reg C14; O.Reg C2; O.Imm 1L ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  [<TestMethod>]
+  member _.``[ARMv7] Co-processor Parse test (4)``() =
+    "ed9f5e30"
+    ++ LDC ** [ O.Reg P14; O.Reg C5; O.MemLabel 192L ]
+    ||> testNoQNoSimd Condition.AL false
+
+  [<TestMethod>]
+  member _.``[ARMv7] Co-processor Parse test (5)``() =
+    "ec905e80"
+    ++ LDC ** [ O.Reg P14; O.Reg C5; O.MemUnIdx(R0, 128L) ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// The coprocessor transfers reach the same post-indexed zero offset.
+  [<TestMethod>]
+  member _.``[ARMv7] Co-processor Disasm test (1)``() =
+    testDisasm "fc200000" "stc2 p0, c0, [r0], #0x0"
+
+  /// A4.11.1 Element and structure load/store instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Parse Test (1)``() =
+    "f4e02f70"
+    ++ VLD4 ** [ O.SimdScalarRegs([ D18; D20; D22; D24 ], None)
+                 O.MemPostIdxAlign(R0, Some 64L, Some R0) ]
+    ||> testNoQ Condition.UN true (Some(OneDT SIMDTyp16))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Parse test (2)``() =
+    "f402c690"
+    ++ VST1 ** [ O.SimdVectorRegs([ D12; D13; D14 ])
+                 O.MemPostIdxAlign(R2, Some 64L, Some R0) ]
+    ||> testNoQ Condition.UN true (Some(OneDT SIMDTyp32))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Parse test (3)``() =
+    "f48eeac3"
+    ++ VST3 ** [ O.SimdScalarRegs([ D14; D16; D18 ], Some 1uy)
+                 O.MemPostIdxReg(LR, None, R3) ]
+    ||> testNoQ Condition.UN true (Some(OneDT SIMDTyp32))
+
+  /// VLD2, VST2, VLD3 and VST3 of multiple structures are the types a pair
+  /// or a triple spaced one or two apart, and two pairs; the one-lane VLD1
+  /// and VST1 name their register with the D bit, and the one-lane and
+  /// all-lane VLD3 and VST3 read their memory operand as the others do.
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (1)``() =
+    testDisasm "f4e110e2" "vld1.8 {d17[7]}, [r1], r2"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (2)``() =
+    testDisasm "f4c110e2" "vst1.8 {d17[7]}, [r1], r2"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (3)``() =
+    testDisasm "f421080f" "vld2.8 {d0, d1}, [r1]"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (4)``() =
+    testDisasm "f4210942" "vld2.16 {d0, d2}, [r1], r2"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (5)``() =
+    testDisasm "f421038d" "vld2.32 {d0, d1, d2, d3}, [r1]!"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (6)``() =
+    testDisasm "f461080f" "vld2.8 {d16, d17}, [r1]"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (7)``() =
+    testDisasm "f4010942" "vst2.16 {d0, d2}, [r1], r2"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (8)``() =
+    testDisasm "f401038d" "vst2.32 {d0, d1, d2, d3}, [r1]!"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (9)``() =
+    testDisasm "f421040f" "vld3.8 {d0, d1, d2}, [r1]"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (10)``() =
+    testDisasm "f4210542" "vld3.16 {d0, d2, d4}, [r1], r2"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (11)``() =
+    testDisasm "f4613582" "vld3.32 {d19, d21, d23}, [r1], r2"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (12)``() =
+    testDisasm "f401050d" "vst3.8 {d0, d2, d4}, [r1]!"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (13)``() =
+    testDisasm "f4a1026f" "vld3.8 {d0[3], d1[3], d2[3]}, [r1]"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (14)``() =
+    testDisasm "f4a10e6d" "vld3.16 {d0[], d2[], d4[]}, [r1]!"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (15)``() =
+    testDisasm "f48106ad" "vst3.16 {d0[2], d2[2], d4[2]}, [r1]!"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Element and structure load/store Disasm test (16)``() =
+    testDisasm "f421004d" "vld4.16 {d0, d1, d2, d3}, [r1]!"
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD and FP register transfer Parse test (1)``() =
+    "ee82ebb0"
+    ++ VDUP ** [ O.SimdVectorReg D18; O.Reg LR ]
+    ||> testNoWbackNoQ Condition.AL (Some(OneDT SIMDTyp16))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD and FP register transfer Parse test (2)``() =
+    "ee42cbb0"
+    ++ VMOV ** [ O.SimdScalarReg(D18, Some 1uy); O.Reg IP ]
+    ||> testNoWbackNoQ Condition.AL (Some(OneDT SIMDTyp8))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD and FP register transfer Parse test (3)``() =
+    "ee108bb0"
+    ++ VMOV ** [ O.Reg R8; O.SimdScalarReg(D16, Some 0uy) ]
+    ||> testNoWbackNoQ Condition.AL (Some(OneDT SIMDTypS16))
+
+  /// A4.13.1 Advanced SIMD parallel addition and subtraction
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD parallel add and sub Parse test (1)``() =
+    "f2c0c18a"
+    ++ VADDW ** [ O.SimdVectorReg Q14; O.SimdVectorReg Q8; O.SimdVectorReg D10 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypS8))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD parallel add and sub Parse test (2)``() =
+    "f320122c"
+    ++ VHSUB ** [ O.SimdVectorReg D1; O.SimdVectorReg D0; O.SimdVectorReg D28 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypU32))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD parallel add and sub Parse test (3)``() =
+    "f3b0028e"
+    ++ VPADDL ** [ O.SimdVectorReg D0; O.SimdVectorReg D14 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypU8))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD parallel add and sub Parse test (4)``() =
+    "f290c682"
+    ++ VSUBHN ** [ O.SimdVectorReg D12; O.SimdVectorReg Q8; O.SimdVectorReg Q1 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypI32))
+
+  /// A4.13.2 Bitwise Advanced SIMD data-processing instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Bitwise Advanced SIMD data-processing Parse test (1)``() =
+    "f242c1f8"
+    ++ VAND ** [ O.SimdVectorReg Q14; O.SimdVectorReg Q9; O.SimdVectorReg Q12 ]
+    ||> testNoWbackNoQNoSimd Condition.UN
+
+  [<TestMethod>]
+  member _.``[ARMv7] Bitwise Advanced SIMD data-processing Parse test (2)``() =
+    "f3c1e57b"
+    ++ VBIC ** [ O.SimdVectorReg Q15; O.Imm 0x9B0000L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypI32))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Bitwise Advanced SIMD data-processing Parse test (3)``() =
+    "ee12ca10"
+    ++ VMOV ** [ O.Reg IP; O.SimdVectorReg S4 ]
+    ||> testNoWbackNoQNoSimd Condition.AL
+
+  /// A4.13.3 Advanced SIMD comparison instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD comparison Parse test (1)``() =
+    "f24c8e40"
+    ++ VCEQ ** [ O.SimdVectorReg Q12; O.SimdVectorReg Q6; O.SimdVectorReg Q0 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypF32))
+
+  /// A4.13.4 Advanced SIMD shift instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD shift Parse test (1)``() =
+    "f3a00950"
+    ++ VQRSHRN ** [ O.SimdVectorReg D0; O.SimdVectorReg Q0; O.Imm 32L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypU64))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD shift Parse test (2)``() =
+    "f3b80830"
+    ++ VQSHRUN ** [ O.SimdVectorReg D0; O.SimdVectorReg Q8; O.Imm 8L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypS64))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD shift Parse test (3)``() =
+    "f2b825d8"
+    ++ VSHL ** [ O.SimdVectorReg Q1; O.SimdVectorReg Q4; O.Imm 56L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypI64))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD shift Parse test (4)``() =
+    "f2a00832"
+    ++ VSHRN ** [ O.SimdVectorReg D0; O.SimdVectorReg Q9; O.Imm 32L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypI64))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD shift Parse test (5)``() =
+    "f3e801f0"
+    ++ VSRA ** [ O.SimdVectorReg Q8; O.SimdVectorReg Q8; O.Imm 24L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypU64))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD shift Parse test (6)``() =
+    "f3b9943a"
+    ++ VSRI ** [ O.SimdVectorReg D9; O.SimdVectorReg D26; O.Imm 7L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTyp32))
+
+  /// A4.13.5 Advanced SIMD multiply instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD multiply Parse test (1)``() =
+    "f3a02a28"
+    ++ VMLSL ** [ O.SimdVectorReg Q1; O.SimdVectorReg D0; O.SimdVectorReg D24 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypU32))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD multiply Parse test (2)``() =
+    "ee202aa8"
+    ++ VMUL ** [ O.SimdVectorReg S4; O.SimdVectorReg S1; O.SimdVectorReg S17 ]
+    ||> testNoWbackNoQ Condition.AL (Some(OneDT SIMDTypF32))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD multiply Parse test (3)``() =
+    "f2c28ca0"
+    ++ VMULL ** [ O.SimdVectorReg Q12
+                  O.SimdVectorReg D18
+                  O.SimdVectorReg D16 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypS8))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD multiply Parse test (4)``() =
+    "f3e24a4a"
+    ++ VMULL ** [ O.SimdVectorReg Q10
+                  O.SimdVectorReg D2
+                  O.SimdScalarReg(D10, Some 0uy) ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypU32))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Advanced SIMD multiply Parse test (5)``() =
+    "f3d02ce8"
+    ++ VQDMULH ** [ O.SimdVectorReg Q9
+                    O.SimdVectorReg Q8
+                    O.SimdScalarReg(D0, Some 3uy) ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypS16))
+
+  /// A4.13.6 Miscellaneous Advanced SIMD data-processing instructions
+  [<TestMethod>]
+  member _.``[ARMv7] Misc Advanced SIMD data-processing Parse test (1)``() =
+    "f3aa0f30"
+    ++ VCVT ** [ O.SimdVectorReg D0; O.SimdVectorReg D16; O.Imm 22L ]
+    ||> testNoWbackNoQ Condition.UN (Some(TwoDT(SIMDTypU32, SIMDTypF32)))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Misc Advanced SIMD data-processing Parse test (2)``() =
+    "eebf0b62"
+    ++ VCVT ** [ O.SimdVectorReg D0; O.SimdVectorReg D0; O.Imm 11L ]
+    ||> testNoWbackNoQ Condition.AL (Some(TwoDT(SIMDTypU16, SIMDTypF64)))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Misc Advanced SIMD data-processing Parse test (3)``() =
+    "f3f0a56e"
+    ++ VCNT ** [ O.SimdVectorReg Q13; O.SimdVectorReg Q15 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTyp8))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Misc Advanced SIMD data-processing Parse test (4)``() =
+    "f2b003ce"
+    ++ VEXT ** [ O.SimdVectorReg Q0
+                 O.SimdVectorReg Q8
+                 O.SimdVectorReg Q7
+                 O.Imm 3L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTyp8))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Misc Advanced SIMD data-processing Parse test (5)``() =
+    "eef10b62"
+    ++ VNEG ** [ O.SimdVectorReg D16; O.SimdVectorReg D18 ]
+    ||> testNoWbackNoQ Condition.AL (Some(OneDT SIMDTypF64))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Misc Advanced SIMD data-processing Parse test (6)``() =
+    "f3409f0f"
+    ++ VPMAX ** [ O.SimdVectorReg D25; O.SimdVectorReg D0; O.SimdVectorReg D15 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypF32))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Misc Advanced SIMD data-processing Parse test (7)``() =
+    "f3b400c2"
+    ++ VREV32 ** [ O.SimdVectorReg Q0; O.SimdVectorReg Q1 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTyp16))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Misc Advanced SIMD data-processing Parse test (8)``() =
+    "f3b35b43"
+    ++ VTBX ** [ O.SimdVectorReg D5
+                 O.SimdVectorRegs [ D3; D4; D5; D6 ]
+                 O.SimdVectorReg D3 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTyp8))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Floating-point data-processing Parse test (1)``() =
+    "eeb50bc0"
+    ++ VCMPE ** [ O.SimdVectorReg D0; O.Imm 0L ]
+    ||> testNoWbackNoQ Condition.AL (Some(OneDT SIMDTypF64))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Floating-point data-processing Parse test (2)``() =
+    "eeb82a68"
+    ++ VCVT ** [ O.SimdVectorReg S4; O.SimdVectorReg S17 ]
+    ||> testNoWbackNoQ Condition.AL (Some(TwoDT(SIMDTypF32, SIMDTypU32)))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Floating-point data-processing Parse test (3)``() =
+    "eeb30a43"
+    ++ VCVTB ** [ O.SimdVectorReg S0; O.SimdVectorReg S6 ]
+    ||> testNoWbackNoQ Condition.AL (Some(TwoDT(SIMDTypF16, SIMDTypF32)))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Floating-point data-processing Parse test (4)``() =
+    "eeb23a02"
+    ++ VMOV ** [ O.SimdVectorReg S6; O.Imm 1091567616L ]
+    ||> testNoWbackNoQ Condition.AL (Some(OneDT SIMDTypF32))
+
+  [<TestMethod>]
+  member _.``[ARMv7] Floating-point data-processing Parse test (5)``() =
+    "f3d2c460"
+    ++ VMLS ** [ O.SimdVectorReg Q14
+                 O.SimdVectorReg Q1
+                 O.SimdScalarReg(D0, Some 2uy) ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypI16))
+
+  /// The narrowing moves are the I<size> forms of the manual: the size names
+  /// the elements READ, which are twice as wide as the ones written, and it
+  /// carries no signedness because the move keeps the low half either way.
+  [<TestMethod>]
+  member _.``[ARMv7] VMOVN names the width it reads``() =
+    "f3b20202"
+    ++ VMOVN ** [ O.SimdVectorReg D0; O.SimdVectorReg Q1 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypI16))
+
+  [<TestMethod>]
+  member _.``[ARMv7] VQSUB names quadwords in its Q form``() =
+    "f2020254"
+    ++ VQSUB ** [ O.SimdVectorReg Q0; O.SimdVectorReg Q1; O.SimdVectorReg Q2 ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypS8))
+
+  /// VQSHLU reads signed elements and saturates into unsigned ones, so the U
+  /// bit its encoding sets says which instruction this is and not how the
+  /// elements are read.
+  [<TestMethod>]
+  member _.``[ARMv7] VQSHLU keeps a signed data type``() =
+    "f3890611"
+    ++ VQSHLU ** [ O.SimdVectorReg D0; O.SimdVectorReg D1; O.Imm 1L ]
+    ||> testNoWbackNoQ Condition.UN (Some(OneDT SIMDTypS8))
+
+  /// TSB CSYNC names its option, which is part of what it is written as.
+  [<TestMethod>]
+  member _.``[ARMv7] TSB CSYNC names its option``() =
+    testDisasm "e320f012" "tsb csync"
+
+  /// RRX rotates by exactly one place and is written with no amount.
+  [<TestMethod>]
+  member _.``[ARMv7] An RRX operand takes no amount``() =
+    testDisasm "e0010064" "and r0, r1, r4, rrx"
+
+  /// VMOV.F32 builds a single-precision number from its eight bits the way
+  /// AdvSIMDExpandImm does (J1-7926): sign, an exponent whose top bit is the
+  /// inverse of the bit below it, and four bits of fraction.
+  [<TestMethod>]
+  member _.``[ARMv7] VMOV.F32 (immediate) expands its constant``() =
+    testDisasm "f2810f14" "vmov.f32 d0, #0x40a00000"
+
+  /// The sign is the i bit, bit 24 of an A32 word.
+  [<TestMethod>]
+  member _.``[ARMv7] VMOV.F32 (immediate) takes its sign from i``() =
+    testDisasm "f3810f14" "vmov.f32 d0, #0xc0a00000"
+
+  /// With the bit the exponent is built from set, the inverted one is clear.
+  [<TestMethod>]
+  member _.``[ARMv7] VMOV.F32 (immediate) inverts its exponent bit``() =
+    testDisasm "f2850f10" "vmov.f32 d0, #0x3e800000"
+
+  /// The quadword form holds the same constant, all four bytes of it.
+  [<TestMethod>]
+  member _.``[ARMv7] VMOV.F32 (immediate) to a quadword keeps the constant``() =
+    testDisasm "f2810f54" "vmov.f32 q0, #0x40a00000"
+
+  /// cmode 1100 shifts the byte in over eight ones, and 1101 over sixteen.
+  [<TestMethod>]
+  member _.``[ARMv7] VMOV.I32 (immediate) shifts in eight ones``() =
+    testDisasm "f2850c1a" "vmov.i32 d0, #0x5aff"
+
+  [<TestMethod>]
+  member _.``[ARMv7] VMOV.I32 (immediate) shifts in sixteen ones``() =
+    testDisasm "f2850d1a" "vmov.i32 d0, #0x5affff"
+
+  /// VMVN builds the same two constants: which one cmode names does not
+  /// depend on op.
+  [<TestMethod>]
+  member _.``[ARMv7] VMVN.I32 (immediate) shifts in eight ones``() =
+    testDisasm "f2850c3a" "vmvn.i32 d0, #0x5aff"
+
+  [<TestMethod>]
+  member _.``[ARMv7] VMVN.I32 (immediate) shifts in sixteen ones``() =
+    testDisasm "f2850d3a" "vmvn.i32 d0, #0x5affff"
+
+  /// DBG names the option it passes to the debug system (F5-4385).
+  [<TestMethod>]
+  member _.``[ARMv7] DBG names its option``() =
+    testDisasm "e320f0f4" "dbg #0x4"
+
+  /// SHA256H2 is written as one word with its data type, as every other SHA
+  /// instruction is.
+  [<TestMethod>]
+  member _.``[ARMv7] SHA256H2 is written as one word``() =
+    testDisasm "f3100c40" "sha256h2.32 q0, q0, q0"
+
+  /// The floating-point instructions are the coprocessor space with 10 in bits
+  /// 11:10: coprocessors 10 and 11, and 9 for half precision. The four above
+  /// them are ordinary coprocessors to ARMv7, so their data-processing words
+  /// are CDP, whatever their low bits would mean to the floating-point unit.
+  [<TestMethod>]
+  member _.``[ARMv7] CDP to coprocessor 12 is not floating-point``() =
+    testDisasm "ee000c00" "cdp p12, #0x0, c0, c0, c0, #0x0"
+
+  [<TestMethod>]
+  member _.``[ARMv7] CDP to coprocessor 13 is not floating-point``() =
+    testDisasm "ee000d00" "cdp p13, #0x0, c0, c0, c0, #0x0"
+
+  [<TestMethod>]
+  member _.``[ARMv7] CDP to coprocessor 14 is not floating-point``() =
+    testDisasm "ee000e00" "cdp p14, #0x0, c0, c0, c0, #0x0"
+
+  [<TestMethod>]
+  member _.``[ARMv7] CDP to coprocessor 15 is not floating-point``() =
+    testDisasm "ee000f00" "cdp p15, #0x0, c0, c0, c0, #0x0"
+
+  /// Coprocessor 9 is where Armv8.2 put the half-precision arithmetic.
+  [<TestMethod>]
+  member _.``[ARMv7] VMLA.F16 is coprocessor 9's``() =
+    testDisasm "ee000900" "vmla.f16 s0, s0, s0"
+
+  /// A register list that runs past the last register names registers that do
+  /// not exist. The manual calls it UNPREDICTABLE, but there is nothing for any
+  /// build to read, so every build refuses it: here d31 and the one after it.
+  [<TestMethod>]
+  member _.``[ARMv7] VLDM past D31 is refused in every build``() =
+    testRefused "ecd0fb04"
+
+  /// The same for the single-precision list, s31 and the one after it.
+  [<TestMethod>]
+  member _.``[ARMv7] VLDM past S31 is refused in every build``() =
+    testRefused "ecd0fa02"
+
+  /// MSR names SPSR with its R bit, bit 22, as MRS does.
+  [<TestMethod>]
+  member _.``[ARMv7] MSR (register) can name SPSR``() =
+    testDisasm "e16ff001" "msr spsr_fsxc, r1"
+
+  [<TestMethod>]
+  member _.``[ARMv7] MSR (immediate) can name SPSR``() =
+    testDisasm "e368f0ff" "msr spsr_f, #0xff"

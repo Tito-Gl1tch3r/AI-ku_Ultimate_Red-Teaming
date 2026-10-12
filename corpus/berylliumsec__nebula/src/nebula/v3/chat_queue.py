@@ -1,0 +1,831 @@
+"""Durable, revisioned follow-ups dispatched by Core rather than a browser tab."""
+
+from __future__ import annotations
+import asyncio
+import json
+from contextlib import suppress
+from hashlib import sha256
+from uuid import uuid4
+from fastapi import APIRouter, Request, Response, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from .chat import ChatCompletionRequest, ChatHistoryConflict, unarchive_chat_session
+from .harnesses import HarnessSkillInvocation
+from .chat_turn_headers import latest_turn_header, turn_header
+from .conditional_reads import conditional, content_etag, revision_etag
+from .database import EntityRow
+from .domain import (
+    ChatQueue,
+    ChatSession,
+    ChatBackend,
+    HarnessProfile,
+    ProviderProfile,
+    PairedDeviceSession,
+    utc_now,
+)
+from .storage import ConflictError, NotFoundError, readable_entities
+from .diagnostics import record_caught_exception, create_diagnostic_task
+
+TERMINAL = {"complete", "failed", "cancelled", "interrupted"}
+EDITABLE = {"queued", "needs_review"}
+# Follow-up item states after which Core never reads the request again.
+RETIRED_ITEM_STATUSES = {"complete", "cancelled"}
+# Settled follow-ups kept, without their request bodies, so a replayed enqueue
+# of the same idempotency key is still recognized and the transcript can link
+# a recent item to its turn. Older settled items are dropped.
+RETAINED_SETTLED_ITEMS = 20
+
+
+def _request_digest(request: object) -> str | None:
+    if request is None:
+        return None
+    encoded = json.dumps(
+        request, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return sha256(encoded.encode()).hexdigest()
+
+
+def _item_request_digest(item: dict) -> str | None:
+    return item.get("request_digest") or _request_digest(item.get("original_request"))
+
+
+def retire_settled_items(items: list[dict]) -> list[dict]:
+    """Bound a queue's history: settled items lose their bodies, then the oldest go.
+
+    A completed or cancelled follow-up is never dispatched, edited or retried
+    again; its request and original request (the whole message and selected
+    context) only kept growing the row that browsers poll every two seconds and
+    the worker reads every half second. Undispatched, sending and reviewable
+    items are always kept whole.
+    """
+
+    settled = [
+        index
+        for index, item in enumerate(items)
+        if item.get("status") in RETIRED_ITEM_STATUSES
+    ]
+    dropped = set(settled[: max(0, len(settled) - RETAINED_SETTLED_ITEMS)])
+    retained: list[dict] = []
+    for index, item in enumerate(items):
+        if index in dropped:
+            continue
+        if item.get("status") in RETIRED_ITEM_STATUSES and (
+            "request" in item or "original_request" in item
+        ):
+            digest = _item_request_digest(item)
+            item = {
+                key: value
+                for key, value in item.items()
+                if key not in {"request", "original_request"}
+            }
+            if digest:
+                item["request_digest"] = digest
+        retained.append(item)
+    return retained
+
+
+def queue_is_dormant(queue: ChatQueue) -> bool:
+    """True when ``step`` cannot act on this queue until the queue itself changes.
+
+    This mirrors ``step``: it reads other records only for a reviewed item
+    linked to a turn, a claiming or sending item, or the latest turn when the
+    next editable item is ready to dispatch. Otherwise nothing but a write to
+    the queue (which bumps its revision) can give it work.
+    """
+
+    if any(
+        item["status"] in {"claiming", "sending"}
+        or (item["status"] == "needs_review" and item.get("turn_id"))
+        for item in queue.items
+    ):
+        return False
+    if queue.paused:
+        return True
+    ready = next((item for item in queue.items if item["status"] in EDITABLE), None)
+    return ready is None or ready["status"] == "needs_review"
+
+
+def link_queue_turn(transaction, claim, turn_id, harness_turn_id=None):
+    """Called inside the same transaction that persists the new turn."""
+    if claim is None:
+        return
+    queue_id, revision, item_id = claim
+    from .domain import ChatQueue
+
+    row = transaction.session.get(EntityRow, queue_id)
+    if row is None:
+        raise ConflictError("Follow-up queue was removed")
+    queue = ChatQueue.model_validate(row.payload)
+    items = [dict(item) for item in queue.items]
+    item = next((item for item in items if item["id"] == item_id), None)
+    if item is None or item["status"] != "claiming" or queue.paused:
+        raise ConflictError("Follow-up changed before dispatch")
+    request = item["request"]
+    profile_id = (
+        request.get("harness_profile_id")
+        if request["backend"] == "harness"
+        else request.get("provider_id")
+    )
+    profile_row = transaction.session.get(EntityRow, profile_id)
+    if (
+        not profile_row
+        or not profile_row.payload.get("enabled")
+        or profile_row.revision != item["profile_revision"]
+    ):
+        raise ConflictError("Runtime authorization changed during preparation")
+    if item.get("device_id"):
+        device_row = transaction.session.get(EntityRow, item["device_id"])
+        if device_row is None:
+            raise ConflictError("Authorizing device was removed")
+        device = PairedDeviceSession.model_validate(device_row.payload)
+        now = utc_now()
+        if (
+            device.revoked_at
+            or device.idle_expires_at <= now
+            or device.absolute_expires_at <= now
+        ):
+            raise ConflictError("Authorizing device expired during preparation")
+    item.update(status="sending", turn_id=turn_id, harness_turn_id=harness_turn_id)
+    transaction.update(
+        ChatQueue, queue_id, {"items": items}, expected_revision=revision
+    )
+
+
+class QueueWrite(BaseModel):
+    expected_revision: int = Field(ge=0)
+    action: str = Field(
+        pattern=r"^(enqueue|edit|remove|reorder|pause|resume|clear|retry)$"
+    )
+    item_id: str | None = Field(default=None, max_length=200)
+    idempotency_key: str | None = Field(default=None, max_length=200)
+    request: ChatCompletionRequest | None = None
+    order: list[str] = Field(default_factory=list, max_length=20)
+    paused: bool = False
+    first: bool = False
+    imported_uncertain: bool = False
+
+
+class ChatQueueService:
+    def __init__(self, store, chat, harness):
+        self.store, self.chat, self.harness = store, chat, harness
+        self.task = None
+        # Item ids whose dispatch this process is running right now. A "claiming"
+        # row outside this set has no owner: its failure review lost a revision
+        # race, or Core restarted mid-dispatch.
+        self._inflight = set()
+        # Queue id -> revision at which ``step`` found nothing to act on.
+        self._dormant = {}
+
+    def get(self, session_id):
+        session = self.store.get(ChatSession, session_id)
+        try:
+            return self.store.get(ChatQueue, "chat-queue-" + session_id)
+        except NotFoundError:  # diagnostic-expected: optional or removed historical record remains unavailable
+            return ChatQueue(
+                id="chat-queue-" + session_id,
+                session_id=session_id,
+                engagement_id=session.engagement_id,
+            )
+
+    def exists(self, session_id):
+        try:
+            self.store.get(ChatQueue, "chat-queue-" + session_id)
+            return True
+        except NotFoundError:  # diagnostic-expected: optional or removed historical record remains unavailable
+            return False
+
+    def latest_turn(self, session_id):
+        """The conversation's newest turn, as a header: the worker asks every
+        half second and needs only its identity and status."""
+        with self.store.database.session() as database:
+            return latest_turn_header(database, session_id)
+
+    def turn(self, session_id, turn_id):
+        with self.store.database.session() as database:
+            header = turn_header(database, session_id, turn_id)
+        if header is None:
+            raise NotFoundError(f"chat turn not found: {turn_id}")
+        return header
+
+    def write(self, session_id, body, device_id=None):
+        session = self.store.get(ChatSession, session_id)
+        present = self.exists(session_id)
+        queue = self.get(session_id)
+        items = [dict(item) for item in queue.items]
+        if body.action == "enqueue" and body.idempotency_key:
+            previous = next(
+                (item for item in items if item.get("key") == body.idempotency_key),
+                None,
+            )
+            if previous:
+                expected = (
+                    body.request.model_dump(mode="json") if body.request else None
+                )
+                # A settled item keeps only its request digest.
+                if _item_request_digest(previous) != _request_digest(expected):
+                    raise ConflictError(
+                        "This follow-up key was already used for different content"
+                    )
+                return queue
+        if body.expected_revision != (queue.revision if present else 0):
+            raise ConflictError(
+                "Queue changed on another device. Reload it before reapplying your edit"
+            )
+        changes = {}
+        if body.action in {"enqueue", "edit"}:
+            request = body.request
+            if (
+                request is None
+                or len(request.messages) != 1
+                or request.messages[0].role.value != "user"
+            ):
+                raise HTTPException(422, "A follow-up requires one user message")
+            if (
+                request.session_id != session_id
+                or request.engagement_id != session.engagement_id
+                or request.backend != session.backend
+            ):
+                raise HTTPException(
+                    422, "Follow-up must use this conversation and project"
+                )
+            expected_profile = (
+                session.harness_profile_id
+                if session.backend == ChatBackend.HARNESS
+                else session.provider_profile_id
+            )
+            actual_profile = (
+                request.harness_profile_id
+                if session.backend == ChatBackend.HARNESS
+                else request.provider_id
+            )
+            # A harness follow-up carries the model picked for its own turn and
+            # Core moves the vendor session over when it differs. A provider
+            # conversation switches model on its own, before anything is queued.
+            if actual_profile != expected_profile or (
+                session.backend != ChatBackend.HARNESS
+                and request.model != session.model
+            ):
+                raise HTTPException(
+                    422, "Follow-up cannot change the conversation runtime"
+                )
+            profile = self.store.get(
+                HarnessProfile
+                if session.backend == ChatBackend.HARNESS
+                else ProviderProfile,
+                expected_profile,
+            )
+            if not profile.enabled:
+                raise HTTPException(409, "The selected runtime is disabled")
+            if request.backend == ChatBackend.HARNESS and any(
+                block.type != "text" for block in request.messages[0].content_blocks
+            ):
+                raise HTTPException(
+                    422,
+                    "This harness queue accepts text and selected context. Image submission is not advertised by its chat path.",
+                )
+            payload = {
+                "request": request.model_dump(mode="json"),
+                "profile_revision": profile.revision,
+                "device_id": device_id,
+            }
+            if body.action == "enqueue":
+                if not body.idempotency_key:
+                    raise HTTPException(422, "An idempotency key is required")
+                if (
+                    sum(
+                        item["status"] not in {"complete", "cancelled"}
+                        for item in items
+                    )
+                    >= 20
+                ):
+                    raise ConflictError(
+                        "The queue is full; remove a follow-up before adding another"
+                    )
+                item = {
+                    "id": str(uuid4()),
+                    "key": body.idempotency_key,
+                    "original_request": request.model_dump(mode="json"),
+                    "status": "queued",
+                    "created_at": utc_now().isoformat(),
+                    **payload,
+                }
+                if body.first:
+                    items.insert(0, item)
+                else:
+                    items.append(item)
+                # A user explicitly enqueueing while idle authorizes moving on from a previous failure.
+                latest = self.latest_turn(session_id)
+                if latest and latest.status in TERMINAL:
+                    changes["resume_after_turn_id"] = latest.id
+                if not present or body.paused or body.imported_uncertain:
+                    changes["paused"] = body.paused or body.imported_uncertain
+                if body.imported_uncertain:
+                    item.update(
+                        status="needs_review",
+                        detail="Imported browser delivery is uncertain. Inspect the conversation before retrying.",
+                    )
+            else:
+                item = next(
+                    (item for item in items if item["id"] == body.item_id), None
+                )
+                if item is None or item["status"] not in EDITABLE:
+                    raise ConflictError("Only undispatched follow-ups can be edited")
+                item.update(payload)
+        elif body.action in {"pause", "resume"}:
+            changes["paused"] = body.action == "pause"
+            latest = self.latest_turn(session_id)
+            if body.action == "resume":
+                changes["resume_after_turn_id"] = latest.id if latest else None
+        elif body.action in {"remove", "clear"}:
+            for item in items:
+                if body.action == "clear" or item["id"] == body.item_id:
+                    if item["status"] in EDITABLE or (
+                        item["status"] == "claiming"
+                        and item["id"] not in self._inflight
+                    ):
+                        # An unowned claim is safe to drop: link_queue_turn refuses
+                        # a claim that is no longer "claiming".
+                        item["status"] = "cancelled"
+                    elif body.action == "remove":
+                        raise ConflictError(
+                            "This follow-up is being dispatched"
+                            if item["status"] == "claiming"
+                            else "This follow-up has already been dispatched"
+                        )
+        elif body.action == "reorder":
+            editable = [item for item in items if item["status"] in EDITABLE]
+            if len(body.order) != len(editable) or set(body.order) != {
+                item["id"] for item in editable
+            }:
+                raise ConflictError("Queue order is stale; reload before reordering")
+            by_id = {item["id"]: item for item in editable}
+            items = [item for item in items if item["status"] not in EDITABLE] + [
+                by_id[key] for key in body.order
+            ]
+        elif body.action == "retry":
+            item = next((item for item in items if item["id"] == body.item_id), None)
+            if not item or item["status"] != "needs_review":
+                raise ConflictError("Only a reviewed failed follow-up can be retried")
+            if (
+                sum(row["status"] not in {"complete", "cancelled"} for row in items)
+                >= 20
+            ):
+                raise ConflictError("Remove a follow-up first")
+            item["status"] = "cancelled"
+            retry = {
+                key: value
+                for key, value in item.items()
+                if key not in {"turn_id", "harness_turn_id", "detail"}
+            }
+            retry.update(
+                id=str(uuid4()),
+                key=str(uuid4()),
+                status="queued",
+                replaces_id=item["id"],
+                device_id=device_id,
+            )
+            items.append(retry)
+            changes["paused"] = True
+        changes["items"] = retire_settled_items(items)
+        if present:
+            return self.store.update(
+                ChatQueue, queue.id, changes, expected_revision=body.expected_revision
+            )
+        return self.store.create(queue.model_copy(update=changes))
+
+    def review(self, queue, item_id, detail):
+        items = [dict(item) for item in queue.items]
+        for item in items:
+            if item["id"] == item_id:
+                item.update(status="needs_review", detail=detail)
+        return self.store.update(
+            ChatQueue,
+            queue.id,
+            {"items": items, "paused": True},
+            expected_revision=queue.revision,
+        )
+
+    def authorization_valid(self, item):
+        device_id = item.get("device_id")
+        if device_id:
+            device = self.store.get(PairedDeviceSession, device_id)
+            now = utc_now()
+            if (
+                device.revoked_at
+                or device.idle_expires_at <= now
+                or device.absolute_expires_at <= now
+            ):
+                raise ConflictError(
+                    "The device that authorized this follow-up has expired or was revoked"
+                )
+        request = ChatCompletionRequest.model_validate(item["request"])
+        profile = self.store.get(
+            HarnessProfile
+            if request.backend == ChatBackend.HARNESS
+            else ProviderProfile,
+            request.harness_profile_id
+            if request.backend == ChatBackend.HARNESS
+            else request.provider_id,
+        )
+        if not profile.enabled or profile.revision != item["profile_revision"]:
+            raise ConflictError(
+                "Runtime configuration changed. Review and edit the follow-up before resuming"
+            )
+        return request
+
+    def _requeue_claim(self, queue_id, item_id):
+        """Return an unlinked claim to the queue so the next poll retries it."""
+        for _ in range(3):
+            current = self.store.get(ChatQueue, queue_id)
+            items = [dict(row) for row in current.items]
+            row = next((row for row in items if row["id"] == item_id), None)
+            if row is None or row["status"] != "claiming":
+                return
+            row["status"] = "queued"
+            try:
+                self.store.update(
+                    ChatQueue,
+                    current.id,
+                    {"items": items},
+                    expected_revision=current.revision,
+                )
+                return
+            except (
+                ConflictError
+            ):  # diagnostic-expected: reread the queue and retry the requeue
+                continue
+
+    def _session_busy(self, session_id, seen):
+        """True when a response the drainer did not start now occupies the session."""
+        current = self.latest_turn(session_id)
+        if current is None:
+            return False
+        if seen is None or current.id != seen.id:
+            return True
+        return current.status not in TERMINAL
+
+    def _review_failed_dispatch(self, queue_id, item_id, exc):
+        record_caught_exception(
+            "chat",
+            "chat.queue.dispatch_failed",
+            "A queued follow-up could not be dispatched",
+            exc,
+            stage="queue",
+        )
+        current = self.store.get(ChatQueue, queue_id)
+        self.review(
+            current,
+            item_id,
+            "Follow-up could not be dispatched. Inspect the conversation before retrying",
+        )
+
+    async def step(self, queue, recovering=False):
+        # Older releases classified deliberate stops as failures needing review,
+        # and a review written while a turn was only parked (waiting_callback
+        # across a restart) is stale once that turn finishes. Reconcile from the
+        # durable turn without re-dispatching its request.
+        settled = {}
+        for item in queue.items:
+            if item["status"] == "needs_review" and item.get("turn_id"):
+                status = self.turn(queue.session_id, item["turn_id"]).status
+                if status in {"cancelled", "complete"}:
+                    settled[item["id"]] = status
+        if settled:
+            items = []
+            for item in queue.items:
+                if item["id"] not in settled:
+                    items.append(item)
+                elif settled[item["id"]] == "cancelled":
+                    items.append(
+                        {**item, "status": "cancelled", "detail": "Stopped by operator"}
+                    )
+                else:
+                    completed = {**item, "status": "complete"}
+                    completed.pop("detail", None)
+                    items.append(completed)
+            self.store.update(
+                ChatQueue,
+                queue.id,
+                {
+                    "items": retire_settled_items(items),
+                    "paused": queue.paused or "cancelled" in settled.values(),
+                },
+                expected_revision=queue.revision,
+            )
+            return
+        sending = next(
+            (item for item in queue.items if item["status"] in {"claiming", "sending"}),
+            None,
+        )
+        if sending:
+            if sending["status"] == "claiming":
+                if sending["id"] not in self._inflight:
+                    self.review(
+                        queue,
+                        sending["id"],
+                        "Core restarted during dispatch. Review before retrying as a new message"
+                        if recovering
+                        else "Dispatch was interrupted before a response was linked. Review before retrying as a new message",
+                    )
+                return
+            turn = self.turn(queue.session_id, sending["turn_id"])
+            if turn.status in TERMINAL:
+                if turn.status not in {"complete", "cancelled"}:
+                    self.review(
+                        queue,
+                        sending["id"],
+                        f"Response stopped or failed: {turn.error or turn.status}. Inspect its source turn before retrying as a new message",
+                    )
+                else:
+                    items = [dict(item) for item in queue.items]
+                    next(item for item in items if item["id"] == sending["id"])[
+                        "status"
+                    ] = turn.status
+                    self.store.update(
+                        ChatQueue,
+                        queue.id,
+                        {
+                            "items": retire_settled_items(items),
+                            "paused": queue.paused or turn.status == "cancelled",
+                        },
+                        expected_revision=queue.revision,
+                    )
+            elif turn.status in {"waiting_approval", "waiting_callback"}:
+                # Pending input or a background result blocks dispatch; resolving
+                # it allows this same turn to finish.
+                return
+            elif (
+                turn.backend == ChatBackend.PROVIDER.value
+                and self.chat.has_active_provider_turn(turn.id)
+            ):
+                # Startup already reclaimed this safe turn. Keep its linked
+                # follow-up sending until the same turn reaches a durable end.
+                return
+            elif recovering:
+                self.review(
+                    queue,
+                    sending["id"],
+                    "Core restarted with a response in progress. Delivery is uncertain; inspect the conversation",
+                )
+            return
+        if queue.paused:
+            return
+        item = next((item for item in queue.items if item["status"] in EDITABLE), None)
+        if not item or item["status"] == "needs_review":
+            return
+        latest = self.latest_turn(queue.session_id)
+        if latest and latest.status not in TERMINAL:
+            return
+        if (
+            latest
+            and latest.status != "complete"
+            and queue.resume_after_turn_id != latest.id
+        ):
+            self.review(
+                queue,
+                item["id"],
+                "Previous response stopped or failed. Review the next message before resuming",
+            )
+            return
+        self._inflight.add(item["id"])
+        try:
+            request = self.authorization_valid(item)
+            if request.backend == ChatBackend.PROVIDER:
+                # Model and effort are conversation settings the operator can
+                # change while earlier work runs; the follow-up is the next turn,
+                # so it uses the current ones. Another provider is a different
+                # authorization, which the operator reviews instead.
+                session = self.store.get(ChatSession, queue.session_id)
+                if session.provider_profile_id != request.provider_id:
+                    self.review(
+                        queue,
+                        item["id"],
+                        "The conversation moved to another provider after this message was queued. Review it before sending",
+                    )
+                    return
+                request = request.model_copy(
+                    update={
+                        "model": session.model,
+                        "reasoning_effort": session.metadata.get(
+                            "reasoning_effort", request.reasoning_effort
+                        ),
+                    }
+                )
+            items = [dict(row) for row in queue.items]
+            next(row for row in items if row["id"] == item["id"])["status"] = "claiming"
+            claimed = self.store.update(
+                ChatQueue, queue.id, {"items": items}, expected_revision=queue.revision
+            )
+            claim = (claimed.id, claimed.revision, item["id"])
+            if request.backend == ChatBackend.PROVIDER:
+                request.stream = True
+                request._queue_claim = claim
+                prepared = await self.chat.prepare_async(request)
+                self.chat.start_provider_turn(prepared)
+            else:
+                context = (
+                    "\n\nNebula-selected context:\n"
+                    + json.dumps(
+                        [
+                            entry.model_dump(mode="json")
+                            for entry in request.context_attachments
+                        ],
+                        ensure_ascii=False,
+                    )
+                    if request.context_attachments
+                    else ""
+                )
+                _, _, turn = self.harness.prepare_chat(
+                    engagement_id=request.engagement_id,
+                    profile_id=request.harness_profile_id,
+                    model=request.model,
+                    prompt=request.messages[-1].content,
+                    chat_session_id=request.session_id,
+                    harness_session_id=None,
+                    mcp_server_ids=request.mcp_server_ids,
+                    runtime_context=context,
+                    context_attachments=[
+                        entry.model_dump(mode="json")
+                        for entry in request.context_attachments
+                    ],
+                    allow_remote_mcp=request.allow_cloud_tool_results,
+                    include_knowledge=request.include_knowledge,
+                    allow_cloud_knowledge=request.allow_cloud_knowledge,
+                    max_artifact_queries=request.max_artifact_queries,
+                    harness_mode=request.harness_mode,
+                    harness_skill=HarnessSkillInvocation.model_validate(
+                        request.harness_skill
+                    )
+                    if request.harness_skill
+                    else None,
+                    harness_reasoning_effort=request.harness_reasoning_effort,
+                    harness_service_tier=request.harness_service_tier,
+                    provider_subagent=request.harness_provider_subagent(),
+                    pending_provider_subagent=request.harness_pending_provider_subagent(),
+                    allow_agent_messaging=request.allow_agent_messaging,
+                    queue_claim=claim,
+                )
+                self.harness.start_chat_turn(turn.id)
+        except (
+            ConflictError
+        ):  # diagnostic-expected: concurrent mutation wins and dispatch is paused
+            # A concurrent edit/pause or turn reservation wins. Do not run a stale request.
+            current = self.store.get(ChatQueue, queue.id)
+            if any(
+                row["id"] == item["id"] and row["status"] == "claiming"
+                for row in current.items
+            ):
+                self.review(
+                    current,
+                    item["id"],
+                    "Queue or runtime changed during dispatch. Reload and review this message",
+                )
+            elif current.revision == queue.revision:
+                self.review(
+                    current,
+                    item["id"],
+                    "Runtime authorization changed. Edit the follow-up to review its configuration",
+                )
+        except ChatHistoryConflict as exc:  # diagnostic-expected: a direct Send that won the race is busy, not a failure
+            # The conversation grew a response this drainer did not start: an
+            # operator's direct Send won the race. That is not a failure of the
+            # follow-up, so leave it queued and let a later poll dispatch it once
+            # the response settles instead of parking the queue for review.
+            if self._session_busy(queue.session_id, latest):
+                self._requeue_claim(queue.id, item["id"])
+            else:
+                self._review_failed_dispatch(queue.id, item["id"], exc)
+        except Exception as exc:  # diagnostic-expected: recorded and parked for review by _review_failed_dispatch
+            self._review_failed_dispatch(queue.id, item["id"], exc)
+        finally:
+            self._inflight.discard(item["id"])
+
+    def queues(self, *, skip_dormant=False):
+        """Every queue, or with ``skip_dormant`` only those ``step`` could act on.
+
+        Row versions are read without payloads; a queue last seen dormant at
+        its current revision is not parsed again until a write changes it.
+        """
+        with self.store.database.session() as database:
+            versions = dict(
+                database.execute(
+                    select(EntityRow.id, EntityRow.revision).where(
+                        EntityRow.kind == "chat_queues"
+                    )
+                ).all()
+            )
+            # Forget queues that were deleted.
+            self._dormant = {
+                key: revision
+                for key, revision in self._dormant.items()
+                if key in versions
+            }
+            wanted = [
+                key
+                for key, revision in versions.items()
+                if not skip_dormant or self._dormant.get(key) != revision
+            ]
+            if not wanted:
+                return []
+            # An unreadable queue is skipped and recorded; it must not stop
+            # Core starting or every other conversation's follow-ups.
+            return readable_entities(
+                database.scalars(
+                    select(EntityRow).where(
+                        EntityRow.kind == "chat_queues", EntityRow.id.in_(wanted)
+                    )
+                ),
+                ChatQueue,
+            )
+
+    def _remember_dormancy(self, queue):
+        if queue_is_dormant(queue):
+            self._dormant[queue.id] = queue.revision
+        else:
+            self._dormant.pop(queue.id, None)
+
+    async def startup(self):
+        for queue in self.queues():
+            try:
+                await self.step(queue, recovering=True)
+            except (
+                ConflictError,
+                NotFoundError,
+            ):  # diagnostic-expected: concurrent queue changes will be reread by the worker
+                continue
+            except Exception as exc:
+                # The worker retries this queue; the others still recover.
+                record_caught_exception(
+                    "chat",
+                    "chat.queue.restart_recovery_failed",
+                    "A conversation's follow-ups could not be recovered at startup; the worker retries.",
+                    exc,
+                    stage="queue",
+                )
+        self.task = create_diagnostic_task(
+            self.run(),
+            feature="chat",
+            event_code="chat.queue.worker_failed",
+            failure_message="Core follow-up dispatch stopped unexpectedly",
+            name="nebula-chat-follow-ups",
+        )
+
+    async def run(self):
+        while True:
+            for queue in self.queues(skip_dormant=True):
+                try:
+                    await self.step(queue)
+                    self._remember_dormancy(queue)
+                except (
+                    ConflictError,
+                    NotFoundError,
+                ):  # diagnostic-expected: reload concurrent queue changes on the next poll
+                    continue  # Concurrent edits/deletion are re-read on the next iteration.
+                except Exception as exc:
+                    record_caught_exception(
+                        "chat",
+                        "chat.queue.poll_failed",
+                        "Follow-up reconciliation failed",
+                        exc,
+                        stage="queue",
+                    )
+            await asyncio.sleep(0.5)
+
+    async def shutdown(self):
+        if self.task:
+            self.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.task
+
+
+def queue_router(service):
+    router = APIRouter(tags=["chat"])
+
+    @router.get("/chat/sessions/{session_id}/queue")
+    def get_queue(session_id: str, request: Request, response: Response):
+        queue = service.get(session_id)
+        value = queue.model_dump(mode="json")
+        present = service.exists(session_id)
+        if not present:
+            value["revision"] = 0
+        # Open conversations poll this; an unchanged queue answers 304. A queue
+        # not created yet is synthesized with fresh timestamps on every read,
+        # so its validator names the absence instead of that content.
+        etag = (
+            content_etag("queue", value)
+            if present
+            else revision_etag("queue", "absent")
+        )
+        unchanged = conditional(request, response, etag)
+        return unchanged or value
+
+    @router.post("/chat/sessions/{session_id}/queue")
+    def write_queue(session_id: str, body: QueueWrite, request: Request):
+        queue = service.write(
+            session_id, body, getattr(request.state, "auth_device_id", None)
+        )
+        if body.action == "enqueue":
+            unarchive_chat_session(service.store, session_id)
+        return queue
+
+    return router

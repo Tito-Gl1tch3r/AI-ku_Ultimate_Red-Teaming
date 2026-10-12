@@ -1,0 +1,216 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { describe, expect, it, vi } from "vitest";
+import type { ApiClient } from "../api/client";
+import type { SecurityBrowserIdentity, SecurityBrowserSession } from "../api/types";
+import { BrowserResearchSuite, parsePayloadDocument, runPayloadScript } from "./BrowserResearchSuite";
+import { DialogProvider } from "./DialogSystem";
+
+const identity = { id: "identity-1", name: "Operator" } as SecurityBrowserIdentity;
+const session = {
+  id: "session-1",
+  activeTabId: "tab-1",
+  tabs: [{ id: "tab-1", url: "https://app.example.test/", title: "App", position: 0 }],
+} as SecurityBrowserSession;
+
+function renderSuite(element: React.ReactElement) {
+  return render(<MemoryRouter><DialogProvider>{element}</DialogProvider></MemoryRouter>);
+}
+
+function api(overrides: Record<string, unknown> = {}): ApiClient {
+  return {
+    getSecurityBrowserResearch: vi.fn().mockResolvedValue({
+      siteNodes: [{
+        id: "node-1", revision: 1, sessionId: session.id, identityId: identity.id,
+        url: "https://app.example.test/api/users?page=1", method: "GET", kind: "api",
+        discoverySource: "proxy", statusCode: 200, parameterNames: ["page"], evidenceIds: [],
+        firstSeenAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(),
+      }],
+      crawlJobs: [], intercepts: [], repeaterTabs: [], repeaterResults: [], attacks: [], attackResults: [], tokenAnalyses: [],
+    }),
+    ...overrides,
+  } as unknown as ApiClient;
+}
+
+describe("BrowserResearchSuite", () => {
+  it("parses bounded text, CSV, and JSON payload documents", () => {
+    expect(parsePayloadDocument("admin\nuser\n", "roles.txt")).toEqual(["admin", "user"]);
+    expect(parsePayloadDocument('"tenant,one",ignored\ntenant-two,ignored', "tenants.csv")).toEqual(["tenant,one", "tenant-two"]);
+    expect(parsePayloadDocument('[0, "admin"]', "values.json")).toEqual(["0", "admin"]);
+    expect(() => parsePayloadDocument('{"value":"admin"}', "values.json")).toThrow(/flat array/i);
+  });
+
+  it("runs only the bounded declarative payload script language", () => {
+    expect(runPayloadScript('range(0, 2)\nvalues("admin", 9)\nprefix("tenant-", 1, 2)')).toEqual(["0", "1", "2", "admin", "9", "tenant-1", "tenant-2"]);
+    expect(() => runPayloadScript("fetch('https://example.test')")).toThrow(/must use values/i);
+    expect(() => runPayloadScript("range(0, 20000)")).toThrow(/10,000-value limit/i);
+  });
+
+  it("renders the durable target map and bounded crawl controls", async () => {
+    renderSuite(<BrowserResearchSuite api={api()} desktop identity={identity} operatorId="operator" projectId="project-1" session={session} view="target" />);
+
+    expect(await screen.findByRole("heading", { name: "Target map" })).toBeInTheDocument();
+    expect(screen.getByText("https://app.example.test/api/users?page=1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create bounded crawl" })).toBeEnabled();
+    expect(screen.getByLabelText("Crawl start URL")).toHaveValue("https://app.example.test/");
+  });
+
+  it("keeps a cleared crawl budget field empty and submits the retyped numbers", async () => {
+    const createSecurityBrowserCrawl = vi.fn().mockResolvedValue({});
+    renderSuite(<BrowserResearchSuite api={api({ createSecurityBrowserCrawl })} desktop identity={identity} operatorId="operator" projectId="project-1" session={session} view="target" />);
+
+    const depth = await screen.findByLabelText("Maximum depth");
+    const budget = screen.getByLabelText("Request budget");
+    fireEvent.change(depth, { target: { value: "" } });
+    expect(depth).toHaveValue(null);
+    fireEvent.change(depth, { target: { value: "3" } });
+    expect(depth).toHaveValue(3);
+    fireEvent.change(budget, { target: { value: "" } });
+    expect(budget).toHaveValue(null);
+
+    fireEvent.click(screen.getByRole("button", { name: "Create bounded crawl" }));
+    expect(await screen.findByText(/Request budget must be a whole number/)).toBeInTheDocument();
+    expect(createSecurityBrowserCrawl).not.toHaveBeenCalled();
+
+    fireEvent.change(budget, { target: { value: "250" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create bounded crawl" }));
+    await waitFor(() => expect(createSecurityBrowserCrawl).toHaveBeenCalledWith("project-1", expect.objectContaining({ maxDepth: 3, maxRequests: 250 })));
+  });
+
+  it("keeps native crawl execution unavailable on a paired browser", async () => {
+    renderSuite(<BrowserResearchSuite api={api()} desktop={false} identity={identity} operatorId="operator" projectId="project-1" session={session} view="target" />);
+
+    expect(await screen.findByRole("button", { name: "Create bounded crawl" })).toBeDisabled();
+    expect(screen.getByText(/desktop owns network execution/i)).toBeInTheDocument();
+  });
+
+  it("edits and queues a durable Repeater request while showing retained results", async () => {
+    const workspace = {
+      siteNodes: [], crawlJobs: [], intercepts: [], attacks: [], attackResults: [], tokenAnalyses: [],
+      repeaterTabs: [{
+        id: "repeater-1", revision: 2, sessionId: session.id, identityId: identity.id,
+        name: "Profile", group: "Ungrouped", notes: "", protocol: "http", method: "POST",
+        url: "https://app.example.test/profile", headers: [["Accept", "application/json"]], bodyTemplate: "{}",
+        historyExchangeIds: ["result-1"], evidenceIds: [], state: "ready", requestCount: 1,
+      }],
+      repeaterResults: [{
+        id: "result-1", revision: 1, tabId: "repeater-1", sequence: 0, statusCode: 200,
+        responseHeaders: [["Content-Type", "application/json"]], responseBytes: 12, durationMs: 4,
+        createdAt: new Date().toISOString(),
+      }],
+    };
+    const saved = { ...workspace.repeaterTabs[0], bodyTemplate: '{"role":"admin"}', revision: 3 };
+    const update = vi.fn().mockResolvedValue(saved);
+    const transition = vi.fn().mockResolvedValue({ ...saved, state: "queued", revision: 4 });
+    const client = api({
+      getSecurityBrowserResearch: vi.fn().mockResolvedValue(workspace),
+      updateSecurityBrowserRepeaterTab: update,
+      transitionSecurityBrowserRepeaterTab: transition,
+    });
+    renderSuite(<BrowserResearchSuite api={client} desktop identity={identity} operatorId="operator" projectId="project-1" session={session} view="repeater" />);
+
+    expect(await screen.findByText("Profile")).toBeVisible();
+    fireEvent.click(screen.getByText("Profile").closest("button")!);
+    expect(screen.getByText("200")).toBeVisible();
+    expect(screen.getByLabelText("Headers")).toHaveValue("Accept: application/json");
+    fireEvent.change(screen.getByLabelText("Body"), { target: { value: '{"role":"admin"}' } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({ id: "repeater-1" }), expect.objectContaining({ bodyTemplate: '{"role":"admin"}' })));
+    expect(transition).toHaveBeenCalledWith(saved, "queue", "operator");
+  });
+
+  it("keeps native Repeater sends disabled on a paired browser", async () => {
+    const workspace = {
+      siteNodes: [], crawlJobs: [], intercepts: [], attacks: [], attackResults: [], tokenAnalyses: [], repeaterResults: [],
+      repeaterTabs: [{
+        id: "repeater-1", revision: 1, sessionId: session.id, identityId: identity.id,
+        name: "Profile", group: "Ungrouped", notes: "", protocol: "http", method: "GET",
+        url: "https://app.example.test/profile", headers: [], bodyTemplate: "", historyExchangeIds: [], evidenceIds: [],
+        state: "ready", requestCount: 0,
+      }],
+    };
+    renderSuite(<BrowserResearchSuite api={api({ getSecurityBrowserResearch: vi.fn().mockResolvedValue(workspace) })} desktop={false} identity={identity} operatorId="operator" projectId="project-1" session={session} view="repeater" />);
+    expect(await screen.findByRole("button", { name: "Send" })).toBeDisabled();
+    expect(screen.getByText(/sends require the paired desktop/i)).toBeVisible();
+  });
+
+  it("copies a paused request into Repeater without deciding the live transaction", async () => {
+    const intercept = {
+      id: "intercept-1", revision: 1, sessionId: session.id, identityId: identity.id, tabId: "tab-1",
+      transactionId: "transaction-1", phase: "request", method: "POST", url: "https://app.example.test/api/profile",
+      headers: [["Content-Type", "application/json"]], editedHeaders: [], state: "paused", expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const created = {
+      id: "repeater-2", revision: 1, sessionId: session.id, identityId: identity.id, name: "POST /api/profile",
+      group: "Ungrouped", notes: "", protocol: "http", method: "POST", url: intercept.url,
+      headers: intercept.headers, bodyTemplate: "", historyExchangeIds: [], evidenceIds: [], state: "draft", requestCount: 0,
+    };
+    const create = vi.fn().mockResolvedValue(created);
+    const decide = vi.fn();
+    const client = api({
+      getSecurityBrowserResearch: vi.fn().mockResolvedValue({ siteNodes: [], crawlJobs: [], intercepts: [intercept], repeaterTabs: [], repeaterResults: [], attacks: [], attackResults: [], tokenAnalyses: [] }),
+      createSecurityBrowserRepeaterTab: create,
+      decideSecurityBrowserIntercept: decide,
+    });
+    renderSuite(<BrowserResearchSuite api={client} desktop identity={identity} operatorId="operator" projectId="project-1" session={session} view="intercepts" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Copy to Repeater" }));
+    await waitFor(() => expect(create).toHaveBeenCalledWith("project-1", expect.objectContaining({ method: "POST", url: intercept.url, headers: intercept.headers })));
+    expect(decide).not.toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent("live intercept is still paused");
+  });
+
+  it("forwards the visible intercept edits instead of a binary theatre decision", async () => {
+    const intercept = {
+      id: "intercept-edit", revision: 1, sessionId: session.id, identityId: identity.id, tabId: "tab-1",
+      transactionId: "transaction-edit", phase: "request", method: "GET", url: "https://app.example.test/api/profile",
+      headers: [["Accept", "application/json"], ["Authorization", "<redacted:sha256:abc>"]], editedHeaders: [], state: "paused",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const decide = vi.fn().mockResolvedValue({ ...intercept, state: "forwarded" });
+    const client = api({
+      getSecurityBrowserResearch: vi.fn().mockResolvedValue({ siteNodes: [], crawlJobs: [], intercepts: [intercept], repeaterTabs: [], repeaterResults: [], attacks: [], attackResults: [], tokenAnalyses: [] }),
+      decideSecurityBrowserIntercept: decide,
+    });
+    renderSuite(<BrowserResearchSuite api={client} desktop identity={identity} operatorId="operator" projectId="project-1" session={session} view="intercepts" />);
+
+    fireEvent.click(await screen.findByText("Edit request before forwarding"));
+    fireEvent.change(screen.getByLabelText("URL"), { target: { value: "https://app.example.test/api/profile?role=admin" } });
+    fireEvent.change(screen.getByLabelText("Intercept headers"), { target: { value: "Accept: text/plain\nAuthorization: <redacted:sha256:abc>" } });
+    fireEvent.click(screen.getByRole("button", { name: "Forward edited request" }));
+    await waitFor(() => expect(decide).toHaveBeenCalledWith(intercept, "forward", "operator", {
+      method: "GET",
+      url: "https://app.example.test/api/profile?role=admin",
+      headers: [["Accept", "text/plain"]],
+    }));
+  });
+
+  it("rejects an Intruder draft whose declared marker is absent", async () => {
+    const create = vi.fn();
+    renderSuite(<BrowserResearchSuite api={api({ createSecurityBrowserAttack: create })} desktop identity={identity} operatorId="operator" projectId="project-1" session={session} view="intruder" />);
+    await screen.findByRole("heading", { name: "Intruder" });
+    fireEvent.change(screen.getByLabelText(/URL template/), { target: { value: "https://app.example.test/static" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save attack draft" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Add §id§");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("maps pitchfork positions to ordered payload sets with an exact request budget", async () => {
+    const create = vi.fn().mockResolvedValue({ id: "attack-1" });
+    renderSuite(<BrowserResearchSuite api={api({ createSecurityBrowserAttack: create })} desktop identity={identity} operatorId="operator" projectId="project-1" session={session} view="intruder" />);
+    await screen.findByRole("heading", { name: "Intruder" });
+    fireEvent.change(screen.getByLabelText("Strategy"), { target: { value: "pitchfork" } });
+    fireEvent.change(screen.getByLabelText(/Position names/), { target: { value: "id, role" } });
+    fireEvent.change(screen.getByLabelText(/URL template/), { target: { value: "https://app.example.test/users/§id§" } });
+    fireEvent.change(screen.getByLabelText("Body template"), { target: { value: '{"role":"§role§"}' } });
+    fireEvent.change(screen.getByLabelText(/Payload sets/), { target: { value: "1\n2\n---\nuser\nadmin" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save attack draft" }));
+    await waitFor(() => expect(create).toHaveBeenCalledWith("project-1", expect.objectContaining({
+      strategy: "pitchfork",
+      positions: ["id", "role"],
+      payloadSets: [["1", "2"], ["user", "admin"]],
+      maxRequests: 2,
+      payloadSource: expect.objectContaining({ kind: "manual", valueCount: 4 }),
+    })));
+  });
+});

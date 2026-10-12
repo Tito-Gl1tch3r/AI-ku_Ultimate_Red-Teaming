@@ -1,0 +1,708 @@
+/*
+ * Copyright 2025 Daytona Platforms Inc.
+ * Modified by BoxLite AI, 2025-2026
+ * SPDX-License-Identifier: AGPL-3.0
+ */
+
+/**
+ * A whole number at least 1, or a hard failure.
+ *
+ * `parseInt` is not usable for a setting that must be right: it reads "1e9" as
+ * 1 and a typo as NaN, and both spellings look deliberate in an env file. A
+ * retry budget of NaN never compares true, so nothing would ever stop retrying;
+ * a budget of 1 gives up on the first blip. Refusing at boot is the only point
+ * where either is still visible.
+ */
+function requiredCount(value: string | undefined, fallback: number, name: string): number {
+  const raw = value?.trim()
+  if (!raw) {
+    return fallback
+  }
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a whole number, got "${value}"`)
+  }
+  const parsed = Number(raw)
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a whole number of at least 1, got "${value}"`)
+  }
+  return parsed
+}
+
+/**
+ * How long a claimed usage-export batch stays invisible to other publishers,
+ * and the TTL of the lock the publish cycle holds.
+ *
+ * Lives here rather than beside the publisher so the timeout validation below
+ * can enforce the one relationship between them that has to hold.
+ */
+export const USAGE_EXPORT_VISIBILITY_TIMEOUT_MS = 60_000
+
+/**
+ * An absolute http(s) URL with no query or fragment, or a hard failure.
+ *
+ * The caller appends its own path to whatever comes back, so `…/api?x=1` would
+ * produce `…/api?x=1/internal/usage-events`, which reaches nothing. Such a
+ * value is rejected rather than stripped, because stripping it would deliver
+ * somewhere other than the configured destination. Rejecting it is also what
+ * keeps the trailing-slash trim below honest: on a raw string that trim would
+ * otherwise eat a slash inside a query value.
+ *
+ * The delimiters are looked for in the raw string rather than in `parsed.search`
+ * and `parsed.hash`, which are both empty for a bare `?` or `#`. Asking the
+ * parsed value would answer "no query" while the delimiter sits in the string
+ * this returns, and `…/api?` would go out as `…/api?/internal/usage-events`.
+ *
+ * Only the trailing slash is normalized. Returning `origin + pathname` instead
+ * would look equivalent and quietly drop userinfo, drop an explicit port and
+ * lowercase the host — and axios builds Basic auth from userinfo and then
+ * deletes the Authorization header, so dropping it would change which
+ * credential the publisher sends.
+ *
+ * The offending value is deliberately not echoed: a URL is the one setting that
+ * can carry credentials in its userinfo, and a boot log is the wrong place to
+ * put them. The variable name is enough to find it.
+ */
+function requiredHttpUrl(value: string, name: string): string {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new Error(`${name} must be an absolute http(s) URL`)
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`${name} must use http or https`)
+  }
+  if (value.includes('?') || value.includes('#')) {
+    throw new Error(`${name} must not carry a query or fragment`)
+  }
+  return value.replace(/\/+$/, '')
+}
+
+/**
+ * Validate the authenticated Commerce read surface when it is enabled.
+ *
+ * Unlike usage export, the presence of BILLING_API_URL itself enables these
+ * reads. A bad URL or missing shared token must therefore fail at startup,
+ * before the first hosted CREATE request discovers the deployment error.
+ */
+function billingApiUrlConfig(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const rawUrl = env.BILLING_API_URL?.trim()
+  if (!rawUrl) {
+    return undefined
+  }
+  if (!env.USAGE_EXPORT_TOKEN?.trim()) {
+    throw new Error('USAGE_EXPORT_TOKEN is required when BILLING_API_URL is set')
+  }
+
+  const url = requiredHttpUrl(rawUrl, 'BILLING_API_URL')
+  const parsed = new URL(url)
+  if (parsed.username || parsed.password) {
+    throw new Error('BILLING_API_URL must not carry credentials')
+  }
+  return url
+}
+
+function validateOidcManagementHttpsUrl(value: string, name: string): void {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new Error(`${name} must be an absolute https URL`)
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`${name} must use https`)
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`${name} must not carry credentials`)
+  }
+}
+
+function requiredOidcManagementBaseUrl(value: string, name: string): string {
+  validateOidcManagementHttpsUrl(value, name)
+  // Management resource paths are appended to this prefix.
+  if (value.includes('?') || value.includes('#')) {
+    throw new Error(`${name} must not carry a query or fragment`)
+  }
+  return value.replace(/\/+$/, '')
+}
+
+function requiredOidcManagementTokenUrl(value: string, name: string): string {
+  validateOidcManagementHttpsUrl(value, name)
+  // OAuth token endpoints are exact URLs, so retain their query and trailing slash.
+  if (value.includes('#')) {
+    throw new Error(`${name} must not carry a fragment`)
+  }
+  return value
+}
+
+/**
+ * Export of finalized usage periods, and snapshots of still-open ones, to the
+ * Commerce service. Kept separate from billingApiUrl on purpose, for the same
+ * reason requirePaymentMethod is: pointing the dashboard at a billing service
+ * and shipping usage to it are different decisions. `enabled` gates the outbox
+ * write as well as delivery, so a stage that never exports accumulates no rows.
+ *
+ * The allocation snapshot cron posts to the same destination with the same
+ * token (it is the same Commerce service, just a different internal route), so
+ * it shares this URL/token pair rather than getting its own — but it can be
+ * turned on independently of finalized-usage export, so either flag alone must
+ * be enough to require them.
+ *
+ * Exported so its rules can be tested directly rather than through an import
+ * whose side effect is reading the process environment.
+ */
+export function usageExportConfig(env: NodeJS.ProcessEnv = process.env) {
+  const enabled = env.USAGE_EXPORT_ENABLED === 'true'
+  const allocationSnapshotEnabled = env.USAGE_ALLOCATION_SNAPSHOT_ENABLED === 'true'
+  const rawUrl = env.USAGE_EXPORT_URL?.trim()
+  const token = env.USAGE_EXPORT_TOKEN?.trim()
+
+  // Counts are checked whether or not export is on: a value like "1e9" or a
+  // typo is malformed in every state, and rejecting it costs a stage nothing it
+  // could legitimately have wanted.
+  const settings = {
+    enabled,
+    allocationSnapshotEnabled,
+    url: rawUrl,
+    token,
+    batchSize: requiredCount(env.USAGE_EXPORT_BATCH_SIZE, 200, 'USAGE_EXPORT_BATCH_SIZE'),
+    timeoutMs: requiredCount(env.USAGE_EXPORT_TIMEOUT_MS, 10_000, 'USAGE_EXPORT_TIMEOUT_MS'),
+    maxAttempts: requiredCount(env.USAGE_EXPORT_MAX_ATTEMPTS, 10, 'USAGE_EXPORT_MAX_ATTEMPTS'),
+  }
+
+  // Everything below describes how delivery must behave, and delivery does not
+  // happen while both flags are off. A stage that leaves a placeholder
+  // destination or an unused timeout behind should keep booting: refusing
+  // would fail it for a setting nothing reads.
+  if (!enabled && !allocationSnapshotEnabled) {
+    return settings
+  }
+
+  // Enabled without a destination would post to "undefined/internal/usage-events",
+  // spend the retry budget, and block the batch — a silent stall dressed up as
+  // delivery failure. A destination that is merely unusable, like "commerce",
+  // fails exactly the same way, so the check has to be the URL's shape rather
+  // than its length.
+  const enabledBy = enabled ? 'USAGE_EXPORT_ENABLED' : 'USAGE_ALLOCATION_SNAPSHOT_ENABLED'
+  if (!rawUrl) {
+    throw new Error(`USAGE_EXPORT_URL is required when ${enabledBy} is true`)
+  }
+  if (!token) {
+    throw new Error(`USAGE_EXPORT_TOKEN is required when ${enabledBy} is true`)
+  }
+  // A request still in flight when its rows become claimable again is delivered
+  // twice — harmless, since the receiver deduplicates, but it doubles the load
+  // exactly when the receiver is already too slow to answer in time. Only the
+  // claim-based outbox export has this failure mode; the snapshot cron is a
+  // stateless full-replace push with no claim to double up.
+  if (enabled && settings.timeoutMs >= USAGE_EXPORT_VISIBILITY_TIMEOUT_MS) {
+    throw new Error(
+      `USAGE_EXPORT_TIMEOUT_MS must be below the ${USAGE_EXPORT_VISIBILITY_TIMEOUT_MS}ms claim visibility window, got "${env.USAGE_EXPORT_TIMEOUT_MS}"`,
+    )
+  }
+
+  return { ...settings, url: requiredHttpUrl(rawUrl, 'USAGE_EXPORT_URL') }
+}
+
+/**
+ * Status sync: pushes component health to incident.io as alert events plus a
+ * heartbeat ping (see status-sync/). Off by default; a stage arms it by
+ * setting the token, and infra derives STATUS_SYNC_ENABLED from that secret so
+ * a stage holding a source id but no token boots dark instead of crash-looping.
+ *
+ * Exported so its rules can be tested directly rather than through an import
+ * whose side effect is reading the process environment.
+ */
+export function incidentIoConfig(env: NodeJS.ProcessEnv = process.env) {
+  const enabled = env.STATUS_SYNC_ENABLED === 'true'
+  const token = env.INCIDENT_IO_TOKEN?.trim()
+  const alertSourceConfigId = env.INCIDENT_IO_ALERT_SOURCE_CONFIG_ID?.trim()
+  const heartbeatId = env.INCIDENT_IO_HEARTBEAT_ID?.trim()
+  const rawApiUrl = env.INCIDENT_IO_API_URL?.trim() || 'https://api.incident.io'
+  const dedupPrefix = env.STATUS_SYNC_DEDUP_PREFIX?.trim() || `boxlite-${env.ENVIRONMENT?.trim() || 'dev'}`
+
+  // Counts are checked whether or not sync is on — same rationale as
+  // usageExportConfig: a malformed number is wrong in every state.
+  const settings = {
+    enabled,
+    token,
+    alertSourceConfigId,
+    heartbeatId,
+    dedupPrefix,
+    apiUrl: rawApiUrl,
+    timeoutMs: requiredCount(env.INCIDENT_IO_TIMEOUT_MS, 10_000, 'INCIDENT_IO_TIMEOUT_MS'),
+    probeTimeoutMs: requiredCount(env.STATUS_SYNC_PROBE_TIMEOUT_MS, 5_000, 'STATUS_SYNC_PROBE_TIMEOUT_MS'),
+  }
+
+  if (!enabled) {
+    return settings
+  }
+
+  // Enabled without credentials would push every tick into a 401 and page
+  // nobody; refusing at boot is the only point where that is still visible.
+  if (!token) {
+    throw new Error('INCIDENT_IO_TOKEN is required when STATUS_SYNC_ENABLED is true')
+  }
+  if (!alertSourceConfigId) {
+    throw new Error('INCIDENT_IO_ALERT_SOURCE_CONFIG_ID is required when STATUS_SYNC_ENABLED is true')
+  }
+  // The prefix leads every deduplication key; a stray space or capital would
+  // fork new alert identities on the incident.io side instead of updating the
+  // existing ones.
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(dedupPrefix)) {
+    throw new Error(`STATUS_SYNC_DEDUP_PREFIX must be a lowercase slug, got "${dedupPrefix}"`)
+  }
+
+  const apiUrl = requiredHttpUrl(rawApiUrl, 'INCIDENT_IO_API_URL')
+  // The client presents INCIDENT_IO_TOKEN as a bearer header on this URL;
+  // plaintext transport would hand the credential to the network (CWE-319).
+  if (new URL(apiUrl).protocol !== 'https:') {
+    throw new Error('INCIDENT_IO_API_URL must use https')
+  }
+  return { ...settings, apiUrl }
+}
+
+function oidcManagementApiConfig(env: NodeJS.ProcessEnv = process.env) {
+  const enabled = env.OIDC_MANAGEMENT_API_ENABLED === 'true'
+  const rawBaseUrl = env.OIDC_MANAGEMENT_API_BASE_URL?.trim()
+  const rawTokenUrl = env.OIDC_MANAGEMENT_API_TOKEN_URL?.trim()
+  const settings = {
+    enabled,
+    clientId: env.OIDC_MANAGEMENT_API_CLIENT_ID,
+    clientSecret: env.OIDC_MANAGEMENT_API_CLIENT_SECRET,
+    audience: env.OIDC_MANAGEMENT_API_AUDIENCE,
+    baseUrl: rawBaseUrl,
+    tokenUrl: rawTokenUrl,
+  }
+
+  if (!enabled) {
+    return settings
+  }
+
+  const issuer = env.OIDC_ISSUER_BASE_URL || env.OID_ISSUER_BASE_URL
+  if (!issuer) {
+    throw new Error('OIDC_ISSUER_BASE_URL is required when OIDC_MANAGEMENT_API_ENABLED is true')
+  }
+
+  const normalizedIssuer = requiredHttpUrl(issuer, 'OIDC_ISSUER_BASE_URL')
+  const issuerUrl = new URL(normalizedIssuer)
+  const hasIssuerPath = issuerUrl.pathname !== '/'
+  if (hasIssuerPath && !rawBaseUrl) {
+    throw new Error(
+      'OIDC_MANAGEMENT_API_BASE_URL is required when OIDC_MANAGEMENT_API_ENABLED is true with a path-based issuer',
+    )
+  }
+  if (hasIssuerPath && !rawTokenUrl) {
+    throw new Error(
+      'OIDC_MANAGEMENT_API_TOKEN_URL is required when OIDC_MANAGEMENT_API_ENABLED is true with a path-based issuer',
+    )
+  }
+
+  const baseUrl = rawBaseUrl || `${issuerUrl.origin}/api/v2`
+  const tokenUrl = rawTokenUrl || `${issuerUrl.origin}/oauth/token`
+  return {
+    ...settings,
+    baseUrl: requiredOidcManagementBaseUrl(baseUrl, 'OIDC_MANAGEMENT_API_BASE_URL'),
+    tokenUrl: requiredOidcManagementTokenUrl(tokenUrl, 'OIDC_MANAGEMENT_API_TOKEN_URL'),
+  }
+}
+
+// The object-store key namespace migration archives land in by default, inside
+// whichever bucket each runner is configured with.
+const DEFAULT_MIGRATION_ARCHIVE_PREFIX = 'box-migrations/'
+
+// An arcPath that names its own bucket instead of using the runner's own
+// (runner: pkg/storage/archive_store.go, resolveArcPath).
+const S3_URI_SCHEME = 's3://'
+
+// One segment of an archive prefix: alphanumeric first, then object-store-safe
+// characters. Requiring the first character is what rejects an empty segment —
+// a leading or doubled slash — along with ".", ".." and anything whitespace.
+const ARCHIVE_PREFIX_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+
+/**
+ * The login-time account link, merging a person's logins into one account.
+ *
+ * The Post-Login Action proves the person holds both accounts and links them
+ * inside Auth0. Moving BoxLite's own rows is the one step it cannot take, so
+ * it asks this API to, and asks whether BoxLite knows a user, signing both
+ * requests with the HS256 key it holds as `ACCOUNT_LINK_SECRET` and this API
+ * reads as `OIDC_ACCOUNT_LINK_SECRET`. Present means on; absent means off.
+ */
+export function oidcAccountLinkConfig(env: NodeJS.ProcessEnv = process.env) {
+  const secret = env.OIDC_ACCOUNT_LINK_SECRET?.trim()
+  if (!secret) {
+    return { enabled: false, secret: undefined as string | undefined }
+  }
+  // RFC 7518 §3.2: an HS256 key must be at least as long as the hash, 256 bits.
+  if (secret.length < 32) {
+    throw new Error('OIDC_ACCOUNT_LINK_SECRET must hold at least 32 characters')
+  }
+  return { enabled: true, secret }
+}
+
+/**
+ * Where a box migration's archive lives in the object store: the prefix the
+ * exporting runner writes under and the importing one reads back.
+ *
+ * A bare prefix keys into the bucket each runner is configured with; an
+ * `s3://<bucket>/…` prefix carries the bucket in the key, which is what lets one
+ * migration span two runners whose own buckets differ. The runner resolves both
+ * forms, so both are accepted here.
+ *
+ * The shape is checked at boot because the alternative is learning about it one
+ * migration at a time: a prefix the runner cannot resolve fails every export job
+ * it is handed, and one with a leading or doubled slash uploads to a key nobody
+ * would look under. Only the trailing slash is normalized, so `box-migrations`
+ * and `box-migrations/` name the same namespace.
+ *
+ * Changing it with migrations in flight is safe: only the export leg derives a
+ * key, and every leg after it acts on the one recorded in `box_migration.arcPath`.
+ *
+ * Exported so its rules can be tested directly rather than through an import
+ * whose side effect is reading the process environment.
+ */
+export function boxMigrationConfig(env: NodeJS.ProcessEnv = process.env) {
+  const raw = env.BOX_MIGRATION_ARCHIVE_PREFIX?.trim()
+  if (!raw) {
+    return { archivePrefix: DEFAULT_MIGRATION_ARCHIVE_PREFIX }
+  }
+
+  const scheme = raw.startsWith(S3_URI_SCHEME) ? S3_URI_SCHEME : ''
+  const segments = raw.slice(scheme.length).replace(/\/+$/, '').split('/')
+  if (!segments.every((segment) => ARCHIVE_PREFIX_SEGMENT.test(segment))) {
+    throw new Error(
+      'BOX_MIGRATION_ARCHIVE_PREFIX must be a slash-separated object-store prefix, optionally ' +
+        `bucket-qualified — "box-migrations" or "s3://bucket/box-migrations" — got "${env.BOX_MIGRATION_ARCHIVE_PREFIX}"`,
+    )
+  }
+
+  return { archivePrefix: `${scheme}${segments.join('/')}/` }
+}
+
+const configuration = {
+  production: process.env.NODE_ENV === 'production',
+  version: process.env.VERSION || '0.0.0-dev',
+  environment: process.env.ENVIRONMENT,
+  runMigrations: process.env.RUN_MIGRATIONS === 'true',
+  port: parseInt(process.env.PORT, 10),
+  appUrl: process.env.APP_URL,
+  database: {
+    host: process.env.DB_HOST,
+    port: parseInt(process.env.DB_PORT || '5432', 10),
+    username: process.env.DB_USERNAME,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_DATABASE,
+    tls: {
+      enabled: process.env.DB_TLS_ENABLED === 'true',
+      rejectUnauthorized: process.env.DB_TLS_REJECT_UNAUTHORIZED !== 'false',
+    },
+    pool: {
+      max: process.env.DB_POOL_MAX && parseInt(process.env.DB_POOL_MAX, 10),
+      min: process.env.DB_POOL_MIN && parseInt(process.env.DB_POOL_MIN, 10),
+      idleTimeoutMillis: process.env.DB_POOL_IDLE_TIMEOUT_MS && parseInt(process.env.DB_POOL_IDLE_TIMEOUT_MS, 10),
+      connectionTimeoutMillis:
+        process.env.DB_POOL_CONNECTION_TIMEOUT_MS && parseInt(process.env.DB_POOL_CONNECTION_TIMEOUT_MS, 10),
+    },
+  },
+  redis: {
+    host: process.env.REDIS_HOST,
+    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD,
+    tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
+  },
+  posthog: {
+    apiKey: process.env.POSTHOG_API_KEY,
+    host: process.env.POSTHOG_HOST,
+    environment: process.env.POSTHOG_ENVIRONMENT,
+  },
+  oidc: {
+    clientId: process.env.OIDC_CLIENT_ID || process.env.OID_CLIENT_ID,
+    issuer: process.env.OIDC_ISSUER_BASE_URL || process.env.OID_ISSUER_BASE_URL,
+    publicIssuer: process.env.PUBLIC_OIDC_DOMAIN,
+    audience: process.env.OIDC_AUDIENCE || process.env.OID_AUDIENCE,
+    endSessionEndpoint: process.env.OIDC_END_SESSION_ENDPOINT,
+    postLogoutRedirectAllowlist: process.env.OIDC_POST_LOGOUT_REDIRECT_ALLOWLIST,
+    managementApi: oidcManagementApiConfig(),
+    accountLink: oidcAccountLinkConfig(),
+  },
+  smtp: {
+    host: process.env.SMTP_HOST,
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    user: process.env.SMTP_USER,
+    password: process.env.SMTP_PASSWORD,
+    secure: process.env.SMTP_SECURE === 'true',
+    from: process.env.SMTP_EMAIL_FROM || 'noreply@mail.boxlite.io',
+  },
+  dashboardUrl: process.env.DASHBOARD_URL,
+  // Default to empty string - dashboard will then hit '/api'
+  dashboardBaseApiUrl: process.env.DASHBOARD_BASE_API_URL || '',
+  // Currently unconsumed (upstream-port residue): nothing reads `systemSourceRegistry`.
+  // Box images are a fixed curated set of tag-pinned ghcr.io refs pulled directly by
+  // the runner (see box/constants/curated-images.constant.ts), not mirrored from a source
+  // registry. Kept as a reserved surface for a future per-org custom-image path.
+  systemSourceRegistry: {
+    name: process.env.BOXLITE_SYSTEM_SOURCE_REGISTRY_NAME || 'BoxLite System Source Registry',
+    url: process.env.BOXLITE_SYSTEM_SOURCE_REGISTRY_URL,
+    username: process.env.BOXLITE_SYSTEM_SOURCE_REGISTRY_USERNAME,
+    password: process.env.BOXLITE_SYSTEM_SOURCE_REGISTRY_PASSWORD,
+    projectId: process.env.BOXLITE_SYSTEM_SOURCE_REGISTRY_PROJECT_ID || '',
+  },
+  s3: {
+    endpoint: process.env.S3_ENDPOINT,
+    stsEndpoint: process.env.S3_STS_ENDPOINT,
+    region: process.env.S3_REGION,
+    accessKey: process.env.S3_ACCESS_KEY,
+    secretKey: process.env.S3_SECRET_KEY,
+    defaultBucket: process.env.S3_DEFAULT_BUCKET,
+    accountId: process.env.S3_ACCOUNT_ID,
+    roleName: process.env.S3_ROLE_NAME,
+  },
+  volume: {
+    // Which object store backs volume buckets. Must match the runner's
+    // VOLUME_STORAGE_BACKEND: the API creates the bucket the runner mounts.
+    storageBackend: process.env.VOLUME_STORAGE_BACKEND || 's3',
+  },
+  gcs: {
+    // Credentials come from Application Default Credentials, never a key file,
+    // so only placement is configured here. Keep the location co-located with
+    // the runner fleet: cross-region reads are billed and slower.
+    location: process.env.GCS_LOCATION?.trim(),
+    projectId: process.env.GCS_PROJECT_ID?.trim(),
+  },
+  notificationGatewayDisabled: process.env.NOTIFICATION_GATEWAY_DISABLED === 'true',
+  skipConnections: process.env.SKIP_CONNECTIONS === 'true',
+  maintananceMode: process.env.MAINTENANCE_MODE === 'true',
+  disableCronJobs: process.env.DISABLE_CRON_JOBS === 'true',
+  appRole: process.env.APP_ROLE || 'all',
+  proxy: {
+    domain: process.env.PROXY_DOMAIN,
+    protocol: process.env.PROXY_PROTOCOL,
+    apiKey: process.env.PROXY_API_KEY,
+    templateUrl: process.env.PROXY_TEMPLATE_URL,
+    toolboxUrl:
+      (process.env.PROXY_TOOLBOX_BASE_URL || `${process.env.PROXY_PROTOCOL}://${process.env.PROXY_DOMAIN}`) +
+      '/toolbox',
+  },
+  audit: {
+    toolboxRequestsEnabled: process.env.AUDIT_TOOLBOX_REQUESTS_ENABLED === 'true',
+    retentionDays: process.env.AUDIT_LOG_RETENTION_DAYS
+      ? parseInt(process.env.AUDIT_LOG_RETENTION_DAYS, 10)
+      : undefined,
+    consoleLogEnabled: process.env.AUDIT_CONSOLE_LOG_ENABLED === 'true',
+    publish: {
+      enabled: process.env.AUDIT_PUBLISH_ENABLED === 'true',
+      batchSize: process.env.AUDIT_PUBLISH_BATCH_SIZE ? parseInt(process.env.AUDIT_PUBLISH_BATCH_SIZE, 10) : 1000,
+      mode: (process.env.AUDIT_PUBLISH_MODE || 'direct') as 'direct' | 'kafka',
+      storageAdapter: process.env.AUDIT_PUBLISH_STORAGE_ADAPTER || 'opensearch',
+      opensearchIndexName: process.env.AUDIT_PUBLISH_OPENSEARCH_INDEX_NAME || 'audit-logs',
+    },
+  },
+  kafka: {
+    enabled: process.env.KAFKA_ENABLED === 'true',
+    brokers: process.env.KAFKA_BROKERS || 'localhost:9092',
+    clientId: process.env.KAFKA_CLIENT_ID,
+    sasl: {
+      mechanism: process.env.KAFKA_SASL_MECHANISM,
+      username: process.env.KAFKA_SASL_USERNAME,
+      password: process.env.KAFKA_SASL_PASSWORD,
+    },
+    tls: {
+      enabled: process.env.KAFKA_TLS_ENABLED === 'true',
+      rejectUnauthorized: process.env.KAFKA_TLS_REJECT_UNAUTHORIZED !== 'false',
+    },
+  },
+  opensearch: {
+    nodes: process.env.OPENSEARCH_NODES || 'https://localhost:9200',
+    username: process.env.OPENSEARCH_USERNAME,
+    password: process.env.OPENSEARCH_PASSWORD,
+    aws: {
+      roleArn: process.env.OPENSEARCH_AWS_ROLE_ARN,
+      region: process.env.OPENSEARCH_AWS_REGION,
+    },
+    tls: {
+      rejectUnauthorized: process.env.OPENSEARCH_TLS_REJECT_UNAUTHORIZED !== 'false',
+    },
+  },
+  cronTimeZone: process.env.CRON_TIMEZONE,
+  maxConcurrentBackupsPerRunner: parseInt(process.env.MAX_CONCURRENT_BACKUPS_PER_RUNNER || '6', 10),
+  webhook: {
+    authToken: process.env.SVIX_AUTH_TOKEN,
+    serverUrl: process.env.SVIX_SERVER_URL,
+  },
+  healthCheck: {
+    apiKey: process.env.HEALTH_CHECK_API_KEY,
+  },
+  billing: {
+    apiKey: process.env.BILLING_API_KEY,
+  },
+  organizationBoxDefaultLimitedNetworkEgress: process.env.ORGANIZATION_BOX_DEFAULT_LIMITED_NETWORK_EGRESS === 'true',
+  pylonAppId: process.env.PYLON_APP_ID,
+  billingApiUrl: billingApiUrlConfig(),
+  analyticsApiUrl: process.env.ANALYTICS_API_URL,
+  usageExport: usageExportConfig(),
+  incidentIo: incidentIoConfig(),
+  defaultRunner: {
+    domain: process.env.DEFAULT_RUNNER_DOMAIN,
+    apiKey: process.env.DEFAULT_RUNNER_API_KEY,
+    proxyUrl: process.env.DEFAULT_RUNNER_PROXY_URL,
+    apiUrl: process.env.DEFAULT_RUNNER_API_URL,
+    cpu: parseInt(process.env.DEFAULT_RUNNER_CPU || '4', 10),
+    memory: parseInt(process.env.DEFAULT_RUNNER_MEMORY || '8', 10),
+    disk: parseInt(process.env.DEFAULT_RUNNER_DISK || '50', 10),
+    apiVersion: (process.env.DEFAULT_RUNNER_API_VERSION || '2') as '0' | '2',
+    name: process.env.DEFAULT_RUNNER_NAME,
+  },
+  runnerScore: {
+    thresholds: {
+      declarativeBuild: parseInt(process.env.RUNNER_DECLARATIVE_BUILD_SCORE_THRESHOLD || '10', 10),
+      availability: parseInt(process.env.RUNNER_AVAILABILITY_SCORE_THRESHOLD || '10', 10),
+      start: parseInt(process.env.RUNNER_START_SCORE_THRESHOLD || '3', 10),
+    },
+    weights: {
+      cpuUsage: parseFloat(process.env.RUNNER_CPU_USAGE_WEIGHT || '0.25'),
+      memoryUsage: parseFloat(process.env.RUNNER_MEMORY_USAGE_WEIGHT || '0.4'),
+      diskUsage: parseFloat(process.env.RUNNER_DISK_USAGE_WEIGHT || '0.4'),
+      allocatedCpu: parseFloat(process.env.RUNNER_ALLOCATED_CPU_WEIGHT || '0.03'),
+      allocatedMemory: parseFloat(process.env.RUNNER_ALLOCATED_MEMORY_WEIGHT || '0.03'),
+      allocatedDisk: parseFloat(process.env.RUNNER_ALLOCATED_DISK_WEIGHT || '0.03'),
+      startedBoxes: parseFloat(process.env.RUNNER_STARTED_BOXES_WEIGHT || '0.1'),
+    },
+    penalty: {
+      exponents: {
+        cpuLoadAvg: parseFloat(process.env.RUNNER_CPU_LOAD_AVG_PENALTY_EXPONENT || '0.1'),
+        cpu: parseFloat(process.env.RUNNER_CPU_PENALTY_EXPONENT || '0.15'),
+        memory: parseFloat(process.env.RUNNER_MEMORY_PENALTY_EXPONENT || '0.15'),
+        disk: parseFloat(process.env.RUNNER_DISK_PENALTY_EXPONENT || '0.15'),
+      },
+      thresholds: {
+        // cpuLoadAvg is a normalized per-CPU load average (e.g. load_avg / num_cpus), not a percentage like the cpu/memory/disk thresholds below.
+        cpuLoadAvg: parseFloat(process.env.RUNNER_CPU_LOAD_AVG_PENALTY_THRESHOLD || '0.7'),
+        cpu: parseInt(process.env.RUNNER_CPU_PENALTY_THRESHOLD || '90', 10),
+        memory: parseInt(process.env.RUNNER_MEMORY_PENALTY_THRESHOLD || '75', 10),
+        disk: parseInt(process.env.RUNNER_DISK_PENALTY_THRESHOLD || '75', 10),
+      },
+    },
+    targetValues: {
+      optimal: {
+        cpu: parseInt(process.env.RUNNER_OPTIMAL_CPU || '0', 10),
+        memory: parseInt(process.env.RUNNER_OPTIMAL_MEMORY || '0', 10),
+        disk: parseInt(process.env.RUNNER_OPTIMAL_DISK || '0', 10),
+        allocCpu: parseInt(process.env.RUNNER_OPTIMAL_ALLOC_CPU || '100', 10),
+        allocMem: parseInt(process.env.RUNNER_OPTIMAL_ALLOC_MEM || '100', 10),
+        allocDisk: parseInt(process.env.RUNNER_OPTIMAL_ALLOC_DISK || '100', 10),
+        startedBoxes: parseInt(process.env.RUNNER_OPTIMAL_STARTED_BOXES || '0', 10),
+      },
+      critical: {
+        cpu: parseInt(process.env.RUNNER_CRITICAL_CPU || '100', 10),
+        memory: parseInt(process.env.RUNNER_CRITICAL_MEMORY || '100', 10),
+        disk: parseInt(process.env.RUNNER_CRITICAL_DISK || '100', 10),
+        allocCpu: parseInt(process.env.RUNNER_CRITICAL_ALLOC_CPU || '500', 10),
+        allocMem: parseInt(process.env.RUNNER_CRITICAL_ALLOC_MEM || '500', 10),
+        allocDisk: parseInt(process.env.RUNNER_CRITICAL_ALLOC_DISK || '500', 10),
+        startedBoxes: parseInt(process.env.RUNNER_CRITICAL_STARTED_BOXES || '100', 10),
+      },
+    },
+  },
+  rateLimit: {
+    anonymous: {
+      ttl: process.env.RATE_LIMIT_ANONYMOUS_TTL ? parseInt(process.env.RATE_LIMIT_ANONYMOUS_TTL, 10) : undefined,
+      limit: process.env.RATE_LIMIT_ANONYMOUS_LIMIT ? parseInt(process.env.RATE_LIMIT_ANONYMOUS_LIMIT, 10) : undefined,
+    },
+    failedAuth: {
+      ttl: process.env.RATE_LIMIT_FAILED_AUTH_TTL ? parseInt(process.env.RATE_LIMIT_FAILED_AUTH_TTL, 10) : undefined,
+      limit: process.env.RATE_LIMIT_FAILED_AUTH_LIMIT
+        ? parseInt(process.env.RATE_LIMIT_FAILED_AUTH_LIMIT, 10)
+        : undefined,
+    },
+    authenticated: {
+      ttl: process.env.RATE_LIMIT_AUTHENTICATED_TTL
+        ? parseInt(process.env.RATE_LIMIT_AUTHENTICATED_TTL, 10)
+        : undefined,
+      limit: process.env.RATE_LIMIT_AUTHENTICATED_LIMIT
+        ? parseInt(process.env.RATE_LIMIT_AUTHENTICATED_LIMIT, 10)
+        : undefined,
+    },
+    boxCreate: {
+      ttl: process.env.RATE_LIMIT_BOX_CREATE_TTL ? parseInt(process.env.RATE_LIMIT_BOX_CREATE_TTL, 10) : undefined,
+      limit: process.env.RATE_LIMIT_BOX_CREATE_LIMIT
+        ? parseInt(process.env.RATE_LIMIT_BOX_CREATE_LIMIT, 10)
+        : undefined,
+    },
+    boxLifecycle: {
+      ttl: process.env.RATE_LIMIT_BOX_LIFECYCLE_TTL
+        ? parseInt(process.env.RATE_LIMIT_BOX_LIFECYCLE_TTL, 10)
+        : undefined,
+      limit: process.env.RATE_LIMIT_BOX_LIFECYCLE_LIMIT
+        ? parseInt(process.env.RATE_LIMIT_BOX_LIFECYCLE_LIMIT, 10)
+        : undefined,
+    },
+  },
+  log: {
+    console: {
+      disabled: process.env.LOG_CONSOLE_DISABLED === 'true',
+    },
+    level: process.env.LOG_LEVEL || 'info',
+    requests: {
+      enabled: process.env.LOG_REQUESTS_ENABLED === 'true',
+    },
+  },
+  defaultRegion: {
+    id: process.env.DEFAULT_REGION_ID || 'us',
+    name: process.env.DEFAULT_REGION_NAME || 'us',
+    enforceQuotas: process.env.DEFAULT_REGION_ENFORCE_QUOTAS === 'true',
+  },
+  admin: {
+    apiKey: process.env.ADMIN_API_KEY,
+  },
+  skipUserEmailVerification: process.env.SKIP_USER_EMAIL_VERIFICATION === 'true',
+  // Whether a newly created non-default organization starts suspended until a
+  // payment method exists. Separate from billingApiUrl on purpose: pointing the
+  // dashboard at a billing service and demanding payment up front are different
+  // decisions, and conflating them means any billing service — including one that
+  // cannot register a card — locks every new organization out permanently.
+  requirePaymentMethod: process.env.REQUIRE_PAYMENT_METHOD === 'true',
+  apiKey: {
+    prefix: process.env.API_KEY_PREFIX || 'blk',
+    validationCacheTtlSeconds: parseInt(process.env.API_KEY_VALIDATION_CACHE_TTL_SECONDS || '10', 10),
+    userCacheTtlSeconds: parseInt(process.env.API_KEY_USER_CACHE_TTL_SECONDS || '60', 10),
+  },
+  runnerHealthTimeout: parseInt(process.env.RUNNER_HEALTH_TIMEOUT_SECONDS || '3', 10),
+  warmPool: {
+    candidateLimit: parseInt(process.env.WARM_POOL_CANDIDATE_LIMIT || '300', 10),
+  },
+  boxOtel: {
+    endpointUrl: process.env.BOX_OTEL_ENDPOINT_URL,
+  },
+  otelCollector: {
+    apiKey: process.env.OTEL_COLLECTOR_API_KEY,
+  },
+  clickhouse: {
+    url: process.env.CLICKHOUSE_READER_URL || process.env.CLICKHOUSE_URL,
+    host: process.env.CLICKHOUSE_HOST,
+    port: parseInt(process.env.CLICKHOUSE_PORT || '8123', 10),
+    database: process.env.CLICKHOUSE_DATABASE || 'otel',
+    username: process.env.CLICKHOUSE_USERNAME || 'default',
+    password: process.env.CLICKHOUSE_PASSWORD,
+    protocol: process.env.CLICKHOUSE_PROTOCOL || 'https',
+  },
+  boxActivity: {
+    throttleTtlSeconds: parseInt(process.env.BOX_ACTIVITY_THROTTLE_TTL_SECONDS || '5', 10),
+    flushBatchSize: parseInt(process.env.BOX_ACTIVITY_FLUSH_BATCH_SIZE || '1000', 10),
+  },
+  boxMigration: boxMigrationConfig(),
+  boxSync: {
+    // How long a claimed startup job may sit without completing before a
+    // runner reporting the box as started is allowed to close it out. This is
+    // a backstop for a lost job-completion callback, not a fast path: raise it
+    // if legitimate startups ever get closed out ahead of their own callback.
+    startConfirmationStallSeconds: parseInt(process.env.BOX_SYNC_START_CONFIRMATION_STALL_SECONDS || '60', 10),
+  },
+  encryption: {
+    key: process.env.ENCRYPTION_KEY,
+    salt: process.env.ENCRYPTION_SALT,
+  },
+}
+
+export { configuration }

@@ -1,0 +1,903 @@
+/**
+ * SimpleBox - Foundation for specialized container types.
+ *
+ * Provides common functionality for all specialized boxes (CodeBox, BrowserBox, etc.)
+ * This class encapsulates common patterns:
+ * 1. Automatic runtime lifecycle management
+ * 2. Command execution with output collection
+ * 3. Try/finally cleanup patterns
+ */
+
+import type { CopyOptions } from "./copy.js";
+import type { ExecResult } from "./exec.js";
+import { getJsBoxlite } from "./native.js";
+import type {
+  JsBox,
+  JsBoxInfo,
+  JsBoxOptions,
+  JsVolumeSpec,
+  NativeBoxConnection,
+  NativeBoxTunnel,
+  NativeTunnelForwarder,
+  SocketAddress,
+  JsExecStderr,
+  JsExecStdout,
+} from "./native-contracts.js";
+
+export type { SocketAddress } from "./native-contracts.js";
+
+type BoxLike = Omit<JsBox, "network"> & {
+  readonly network: {
+    tunnel(port: number): Promise<NativeBoxTunnel>;
+  };
+};
+
+interface BoxRuntime {
+  create(options: JsBoxOptions, name?: string | null): Promise<BoxLike>;
+  getOrCreate(
+    options: JsBoxOptions,
+    name?: string | null,
+  ): Promise<{ readonly created: boolean; readonly box: BoxLike }>;
+}
+
+/**
+ * Security isolation options for a box.
+ */
+export interface SecurityOptions {
+  /** Enable jailer isolation (Linux/macOS). */
+  jailerEnabled?: boolean;
+
+  /** Enable seccomp syscall filtering (Linux only). */
+  seccompEnabled?: boolean;
+
+  /**
+   * Maximum number of open file descriptors.
+   */
+  maxOpenFiles?: number;
+
+  /**
+   * Maximum file size in bytes.
+   */
+  maxFileSize?: number;
+
+  /**
+   * Maximum number of processes.
+   */
+  maxProcesses?: number;
+
+  /**
+   * Maximum virtual memory in bytes.
+   */
+  maxMemory?: number;
+
+  /**
+   * Maximum CPU time in seconds.
+   */
+  maxCpuTime?: number;
+
+  /** Enable network access in sandbox (macOS only). */
+  networkEnabled?: boolean;
+
+  /** Close inherited file descriptors. */
+  closeFds?: boolean;
+}
+
+/**
+ * Secret substitution rule for outbound HTTPS requests.
+ */
+export interface Secret {
+  /** Human-readable name for the secret. */
+  name: string;
+
+  /** Real secret value. Never enters the guest VM. */
+  value: string;
+
+  /** Matching hosts for secret substitution. */
+  hosts?: string[];
+
+  /** Placeholder exposed to guest code. */
+  placeholder?: string;
+}
+
+/**
+ * Structured network configuration for a box.
+ */
+export interface NetworkSpec {
+  /** Outbound guest network policy. */
+  outbound?: OutboundNetworkSpec;
+
+  /** Inbound service access policy. */
+  inbound?: InboundNetworkSpec;
+
+  /**
+   * @deprecated Use `outbound.mode`. Accepted as a legacy alias; supplying it
+   * together with `outbound` is rejected.
+   */
+  mode?: "enabled" | "disabled";
+
+  /**
+   * @deprecated Use `outbound.allowNet`. Accepted as a legacy alias.
+   */
+  allowNet?: string[];
+}
+
+export interface OutboundNetworkSpec {
+  /** Network mode. */
+  mode: "enabled" | "disabled";
+
+  /** Outbound allowlist when network is enabled. */
+  allowNet?: string[];
+}
+
+export interface InboundNetworkSpec {
+  /** Inbound mode: "enabled" (publicly reachable) or "disabled" (private). */
+  mode: "enabled" | "disabled";
+  /**
+   * Not supported yet: a non-empty value is rejected. Exists for shape
+   * symmetry with the outbound spec; inbound access follows `mode` alone.
+   */
+  allowNet?: string[];
+}
+
+const MAX_SAFE_U64_NUMBER = Number.MAX_SAFE_INTEGER;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertNetworkSpecShape(value: unknown): void {
+  if (value === undefined || value === null) {
+    return;
+  }
+  if (!isRecord(value)) {
+    throw new TypeError(
+      "SimpleBoxOptions.network must be an object. Use network: { outbound, inbound }.",
+    );
+  }
+  // The pre-split shape was `{ mode, allowNet }`, which configured the
+  // outbound direction. Still accepted; mixing it with `outbound` is not,
+  // because there would be no single answer for what outbound should be.
+  const hasLegacyFields = "mode" in value || "allowNet" in value;
+  if (hasLegacyFields && "outbound" in value) {
+    throw new TypeError(
+      "SimpleBoxOptions.network cannot mix outbound with the deprecated mode/allowNet. Use network: { outbound: { mode, allowNet }, inbound }.",
+    );
+  }
+  if (!hasLegacyFields && !("outbound" in value) && !("inbound" in value)) {
+    throw new TypeError(
+      "SimpleBoxOptions.network must include outbound or inbound.",
+    );
+  }
+  if ("mode" in value && typeof value.mode !== "string") {
+    throw new TypeError(
+      'SimpleBoxOptions.network.mode must be "enabled" or "disabled".',
+    );
+  }
+  if ("allowNet" in value && !Array.isArray(value.allowNet)) {
+    throw new TypeError("SimpleBoxOptions.network.allowNet must be an array.");
+  }
+  // `mode` is required on each supplied direction. Without this check an
+  // empty `{}` passes here and only fails later, inside lazy native
+  // creation, with a napi deserialization error that does not name the
+  // field the caller got wrong.
+  for (const direction of ["outbound", "inbound"] as const) {
+    if (!(direction in value)) {
+      continue;
+    }
+    const policy = value[direction];
+    if (!isRecord(policy)) {
+      throw new TypeError(
+        `SimpleBoxOptions.network.${direction} must be an object.`,
+      );
+    }
+    if (typeof policy.mode !== "string") {
+      throw new TypeError(
+        `SimpleBoxOptions.network.${direction}.mode is required and must be "enabled" or "disabled".`,
+      );
+    }
+  }
+}
+
+function normalizeU64Limit(
+  value: number | undefined,
+  field: string,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Number.isFinite(value)) {
+    throw new TypeError(
+      `Invalid security option \`${field}\`: number must be finite`,
+    );
+  }
+
+  if (!Number.isInteger(value)) {
+    throw new TypeError(
+      `Invalid security option \`${field}\`: number must be an integer`,
+    );
+  }
+
+  if (value < 0) {
+    throw new TypeError(
+      `Invalid security option \`${field}\`: number must be >= 0`,
+    );
+  }
+
+  if (!Number.isSafeInteger(value) || value > MAX_SAFE_U64_NUMBER) {
+    throw new TypeError(
+      `Invalid security option \`${field}\`: number exceeds Number.MAX_SAFE_INTEGER`,
+    );
+  }
+
+  return value;
+}
+
+function normalizeSecurityOptions(
+  security: SecurityOptions | undefined,
+): SecurityOptions | undefined {
+  if (!security) {
+    return undefined;
+  }
+
+  return {
+    jailerEnabled: security.jailerEnabled,
+    seccompEnabled: security.seccompEnabled,
+    maxOpenFiles: normalizeU64Limit(
+      security.maxOpenFiles,
+      "security.maxOpenFiles",
+    ),
+    maxFileSize: normalizeU64Limit(
+      security.maxFileSize,
+      "security.maxFileSize",
+    ),
+    maxProcesses: normalizeU64Limit(
+      security.maxProcesses,
+      "security.maxProcesses",
+    ),
+    maxMemory: normalizeU64Limit(security.maxMemory, "security.maxMemory"),
+    maxCpuTime: normalizeU64Limit(security.maxCpuTime, "security.maxCpuTime"),
+    networkEnabled: security.networkEnabled,
+    closeFds: security.closeFds,
+  };
+}
+
+/**
+ * Options for creating a SimpleBox.
+ */
+export interface SimpleBoxOptions {
+  /** Container image to use (e.g., 'python:slim', 'alpine:latest') */
+  image?: string;
+
+  /** Path to local OCI layout directory (overrides image if provided) */
+  rootfsPath?: string;
+
+  /** Memory limit in MiB */
+  memoryMib?: number;
+
+  /** Number of CPU cores */
+  cpus?: number;
+
+  /** Disk size in GB for container rootfs (sparse, grows as needed) */
+  diskSizeGb?: number;
+
+  /** Optional runtime instance (uses global default if not provided) */
+  runtime?: BoxRuntime;
+
+  /** Optional name for the box (must be unique) */
+  name?: string;
+
+  /** Remove box when stopped (default: true) */
+  autoRemove?: boolean;
+
+  /** If true, reuse an existing box with the same name instead of failing (default: false) */
+  reuseExisting?: boolean;
+
+  /** Run box in detached mode (survives parent process exit, default: false) */
+  detach?: boolean;
+
+  /** Working directory inside container */
+  workingDir?: string;
+
+  /** Environment variables */
+  env?: Record<string, string>;
+
+  /** Volume mounts: a local hostPath, or a managedVolume by id or name. */
+  volumes?: JsVolumeSpec[];
+
+  /** Port mappings */
+  ports?: Array<{
+    hostPort?: number;
+    guestPort: number;
+    protocol?: string;
+  }>;
+
+  /** Structured network configuration. */
+  network?: NetworkSpec;
+
+  /** Secrets to inject into outbound HTTPS requests. */
+  secrets?: Secret[];
+
+  /**
+   * Override image ENTRYPOINT directive.
+   *
+   * When set, completely replaces the image's ENTRYPOINT.
+   * Use with `cmd` to build the full command:
+   *   Final execution = entrypoint + cmd
+   *
+   * Example: For `docker:dind`, bypass the failing entrypoint script:
+   *   `entrypoint: ["dockerd"]`, `cmd: ["--iptables=false"]`
+   */
+  entrypoint?: string[];
+
+  /**
+   * Override image CMD directive.
+   *
+   * The image ENTRYPOINT is preserved; these args replace the image's CMD.
+   * Final execution = image_entrypoint + cmd.
+   *
+   * Example: For `docker:dind` (ENTRYPOINT=["dockerd-entrypoint.sh"]),
+   * setting `cmd: ["--iptables=false"]` produces:
+   * `["dockerd-entrypoint.sh", "--iptables=false"]`
+   */
+  cmd?: string[];
+
+  /**
+   * Override container user (UID/GID).
+   *
+   * Format: "uid", "uid:gid", or "username".
+   * If not set, uses the image's USER directive (defaults to root "0:0").
+   */
+  user?: string;
+
+  /** Expert-only container process options. */
+  advanced?: AdvancedBoxOptions;
+
+  /** Security isolation options for the box. */
+  security?: SecurityOptions;
+}
+
+export interface ContainerCapabilities {
+  /** Linux capabilities added to BoxLite's Docker-compatible baseline. */
+  add?: string[];
+  /** Linux capabilities removed from the resulting capability set. */
+  drop?: string[];
+}
+
+export interface AdvancedBoxOptions {
+  capabilities?: ContainerCapabilities;
+}
+
+/** Box-scoped network operations for a SimpleBox. */
+export class NetworkHandle {
+  /** @internal */
+  constructor(private readonly ensureBox: () => Promise<BoxLike>) {}
+
+  /** Establish and return a one-shot tunnel for a port inside this box. */
+  async tunnel(port: number): Promise<BoxTunnel> {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new RangeError("port must be an integer between 1 and 65535");
+    }
+    const box = await this.ensureBox();
+    return new BoxTunnel(await box.network.tunnel(port));
+  }
+}
+
+export class TunnelForwarder {
+  constructor(private readonly forwarder: NativeTunnelForwarder) {}
+
+  localAddr(): SocketAddress {
+    return this.forwarder.localAddr();
+  }
+
+  wait(): Promise<void> {
+    return this.forwarder.wait();
+  }
+
+  close(): Promise<void> {
+    return this.forwarder.close();
+  }
+}
+
+export class BoxTunnel {
+  /** Wrap a prepared native tunnel handle. */
+  constructor(private readonly tunnel: NativeBoxTunnel) {}
+
+  /** Public URL of a remotely served tunnel, or null for a local one. */
+  uri(): string | null {
+    return this.tunnel.uri();
+  }
+
+  /** Consume the tunnel and return its bidirectional byte stream. */
+  async connect(): Promise<NativeBoxConnection> {
+    return this.tunnel.connect();
+  }
+
+  async forward(listen: SocketAddress): Promise<TunnelForwarder> {
+    return new TunnelForwarder(await this.tunnel.forward(listen));
+  }
+}
+
+/**
+ * Base class for specialized container types.
+ *
+ * This class provides the foundation for all specialized boxes:
+ * - CodeBox: Python code execution sandbox
+ * - BrowserBox: Browser automation
+ * - ComputerBox: Desktop automation
+ * - InteractiveBox: PTY terminal sessions
+ *
+ * ## Usage
+ *
+ * SimpleBox can be used directly for simple command execution:
+ *
+ * ```typescript
+ * const box = new SimpleBox({ image: 'alpine:latest' });
+ * try {
+ *   const result = await box.exec('ls', '-la', '/');
+ *   console.log(result.stdout);
+ * } finally {
+ *   await box.stop();
+ * }
+ * ```
+ *
+ * Or extended for specialized use cases:
+ *
+ * ```typescript
+ * class MyBox extends SimpleBox {
+ *   constructor() {
+ *     super({ image: 'my-custom-image:latest' });
+ *   }
+ *
+ *   async myMethod() {
+ *     const result = await this.exec('my-command');
+ *     return result.stdout;
+ *   }
+ * }
+ * ```
+ */
+export class SimpleBox {
+  protected _runtime: BoxRuntime;
+  protected _box: BoxLike | null = null;
+  protected _boxPromise: Promise<BoxLike> | null = null;
+  protected _name?: string;
+  protected _boxOpts: JsBoxOptions;
+  protected _reuseExisting: boolean;
+  protected _created: boolean | null = null;
+  readonly network: NetworkHandle;
+
+  /**
+   * Create a new SimpleBox.
+   *
+   * The box is created lazily on first use (first exec() call).
+   *
+   * @param options - Box configuration options
+   *
+   * @example
+   * ```typescript
+   * const box = new SimpleBox({
+   *   image: 'python:slim',
+   *   memoryMib: 512,
+   *   cpus: 2,
+   *   name: 'my-box'
+   * });
+   * ```
+   */
+  constructor(options: SimpleBoxOptions = {}) {
+    const JsBoxlite = getJsBoxlite();
+    const security = normalizeSecurityOptions(options.security);
+    const legacyOptions = options as SimpleBoxOptions & {
+      allowNet?: unknown;
+      network?: unknown;
+    };
+
+    if (legacyOptions.allowNet !== undefined) {
+      throw new TypeError(
+        "SimpleBoxOptions.allowNet was removed. Use network: { outbound: { mode, allowNet } }.",
+      );
+    }
+
+    assertNetworkSpecShape(legacyOptions.network);
+
+    // Use provided runtime or get global default
+    if (options.runtime) {
+      this._runtime = options.runtime;
+    } else {
+      this._runtime = JsBoxlite.withDefaultConfig();
+    }
+
+    // Convert options to BoxOptions format (stored for lazy creation)
+    this._boxOpts = {
+      image: options.image,
+      rootfsPath: options.rootfsPath,
+      cpus: options.cpus,
+      memoryMib: options.memoryMib,
+      diskSizeGb: options.diskSizeGb,
+      autoRemove: options.autoRemove ?? true,
+      detach: options.detach ?? false,
+      workingDir: options.workingDir,
+      env: options.env
+        ? Object.entries(options.env).map(([key, value]) => ({ key, value }))
+        : undefined,
+      volumes: options.volumes,
+      network: options.network,
+      ports: options.ports,
+      entrypoint: options.entrypoint,
+      cmd: options.cmd,
+      user: options.user,
+      advanced: options.advanced
+        ? {
+            capabilities: options.advanced.capabilities
+              ? {
+                  add: [...(options.advanced.capabilities.add ?? [])],
+                  drop: [...(options.advanced.capabilities.drop ?? [])],
+                }
+              : undefined,
+          }
+        : undefined,
+      security,
+      secrets: options.secrets,
+    };
+
+    this._name = options.name;
+    this._reuseExisting = options.reuseExisting ?? false;
+    this.network = new NetworkHandle(() => this._ensureBox());
+  }
+
+  /**
+   * Ensure the box is created (lazy initialization).
+   * @internal
+   */
+  protected async _ensureBox(): Promise<BoxLike> {
+    if (this._box) {
+      return this._box;
+    }
+
+    // Avoid race condition with concurrent calls
+    if (!this._boxPromise) {
+      this._boxPromise = (async () => {
+        if (this._reuseExisting) {
+          const result = await this._runtime.getOrCreate(
+            this._boxOpts,
+            this._name,
+          );
+          this._created = result.created;
+          return result.box;
+        } else {
+          this._created = true;
+          return this._runtime.create(this._boxOpts, this._name);
+        }
+      })();
+    }
+
+    this._box = await this._boxPromise;
+    return this._box;
+  }
+
+  /**
+   * Get the box ID (ULID format).
+   *
+   * Note: Throws if called before the box is created (e.g., before first exec()).
+   */
+  get id(): string {
+    if (!this._box) {
+      throw new Error(
+        "Box not yet created. Call exec() first or use getId() async method.",
+      );
+    }
+    return this._box.id;
+  }
+
+  /**
+   * Get the box ID asynchronously, creating the box if needed.
+   */
+  async getId(): Promise<string> {
+    const box = await this._ensureBox();
+    return box.id;
+  }
+
+  /**
+   * Get the box name (if set).
+   */
+  get name(): string | undefined {
+    return this._name;
+  }
+
+  /**
+   * Whether this box was newly created (true) or an existing box was reused (false).
+   *
+   * Returns null if the box hasn't been created yet.
+   */
+  get created(): boolean | null {
+    return this._created;
+  }
+
+  /**
+   * Get box metadata.
+   *
+   * Note: The promise rejects if called before the box is created.
+   */
+  async info(): Promise<JsBoxInfo> {
+    if (!this._box) {
+      throw new Error("Box not yet created. Call exec() first.");
+    }
+    return this._box.info();
+  }
+
+  /**
+   * Get box metadata asynchronously, creating the box if needed.
+   */
+  async getInfo(): Promise<JsBoxInfo> {
+    const box = await this._ensureBox();
+    return box.info();
+  }
+
+  /**
+   * Execute a command in the box and collect the output.
+   *
+   * This is a convenience method that:
+   * 1. Starts the command
+   * 2. Collects all stdout and stderr
+   * 3. Waits for completion
+   * 4. Returns the result
+   *
+   * For streaming output, use the lower-level `this._box.exec()` directly.
+   *
+   * @param cmd - Command to execute (e.g., 'ls', 'python')
+   * @param args - Arguments to the command
+   * @param env - Environment variables (optional)
+   *
+   * @returns Promise resolving to ExecResult with exit code and output
+   *
+   * @example
+   * ```typescript
+   * // Simple execution
+   * const result = await box.exec('ls', '-la', '/');
+   * console.log(`Exit code: ${result.exitCode}`);
+   * console.log(`Output:\n${result.stdout}`);
+   *
+   * // With environment variables
+   * const result = await box.exec('env', [], { FOO: 'bar' });
+   * console.log(result.stdout);
+   * ```
+   */
+  async exec(cmd: string, ...args: string[]): Promise<ExecResult>;
+  async exec(
+    cmd: string,
+    args: string[],
+    env: Record<string, string>,
+  ): Promise<ExecResult>;
+  async exec(
+    cmd: string,
+    args: string[],
+    env: Record<string, string> | undefined,
+    options?: { cwd?: string; user?: string; timeoutSecs?: number },
+  ): Promise<ExecResult>;
+  async exec(
+    cmd: string,
+    argsOrFirstArg?: string | string[],
+    envOrSecondArg?: Record<string, string> | string,
+    optionsOrThirdArg?:
+      { cwd?: string; user?: string; timeoutSecs?: number } | string,
+    ...restArgs: string[]
+  ): Promise<ExecResult> {
+    // Parse overloaded arguments
+    let args: string[];
+    let env: Record<string, string> | undefined;
+    let cwd: string | undefined;
+    let user: string | undefined;
+    let timeoutSecs: number | undefined;
+
+    if (Array.isArray(argsOrFirstArg)) {
+      // exec(cmd, args[], env?, options?)
+      args = argsOrFirstArg;
+      env = envOrSecondArg as Record<string, string> | undefined;
+      if (optionsOrThirdArg && typeof optionsOrThirdArg === "object") {
+        const opts = optionsOrThirdArg as {
+          cwd?: string;
+          user?: string;
+          timeoutSecs?: number;
+        };
+        cwd = opts.cwd;
+        user = opts.user;
+        timeoutSecs = opts.timeoutSecs;
+      }
+    } else {
+      // exec(cmd, ...args, env?)
+      // Collect all arguments
+      const allArgs: unknown[] = [
+        argsOrFirstArg,
+        envOrSecondArg,
+        optionsOrThirdArg,
+        ...restArgs,
+      ].filter((a) => a !== undefined);
+
+      // Check if last arg is env object (before filtering to strings)
+      const lastArg = allArgs[allArgs.length - 1];
+      if (lastArg && typeof lastArg === "object" && !Array.isArray(lastArg)) {
+        env = lastArg as Record<string, string>;
+        args = allArgs
+          .slice(0, -1)
+          .filter((a): a is string => typeof a === "string");
+      } else {
+        env = undefined;
+        args = allArgs.filter((a): a is string => typeof a === "string");
+      }
+    }
+
+    // Convert env to array of tuples
+    const envArray = env
+      ? Object.entries(env).map(([k, v]) => [k, v] as [string, string])
+      : undefined;
+
+    // Ensure box is created, then execute via Rust (returns Execution)
+    const box = await this._ensureBox();
+    const execution = await box.exec(
+      cmd,
+      args,
+      envArray,
+      false,
+      user,
+      timeoutSecs,
+      cwd,
+    );
+
+    // Collect stdout and stderr
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    // Get streams
+    let stdout: JsExecStdout | null;
+    let stderr: JsExecStderr | null;
+
+    try {
+      stdout = await execution.stdout();
+    } catch (err) {
+      // Stream not available (expected for some commands)
+      stdout = null;
+    }
+
+    try {
+      stderr = await execution.stderr();
+    } catch (err) {
+      // Stream not available (expected for some commands)
+      stderr = null;
+    }
+
+    // Read stdout and stderr concurrently to avoid deadlock.
+    // Sequential reads can deadlock when a process fills one pipe buffer
+    // while the SDK is blocked reading the other.
+    await Promise.all([
+      (async () => {
+        if (!stdout) return;
+        try {
+          while (true) {
+            const line = await stdout.next();
+            if (line === null) break;
+            stdoutLines.push(line);
+          }
+        } catch {
+          // Stream ended or error occurred
+        }
+      })(),
+      (async () => {
+        if (!stderr) return;
+        try {
+          while (true) {
+            const line = await stderr.next();
+            if (line === null) break;
+            stderrLines.push(line);
+          }
+        } catch {
+          // Stream ended or error occurred
+        }
+      })(),
+    ]);
+
+    // Wait for completion
+    const result = await execution.wait();
+
+    return {
+      exitCode: result.exitCode,
+      stdout: stdoutLines.join(""),
+      stderr: stderrLines.join(""),
+    };
+  }
+
+  /**
+   * Copy a file or directory from the host into the container.
+   *
+   * **Note:** Destinations under a container mount (e.g. `/tmp`, `/dev/shm`,
+   * volumes) are refused with an error naming the mount — files written there
+   * would land behind it and be invisible to the container. Use a path outside
+   * the mount, like `/root/`, or pipe a tar through `exec`.
+   *
+   * Files land owned by the box's exec user, so the workload can read them
+   * without any chmod/chown of its own.
+   *
+   * @param hostPath - Absolute path on the host
+   * @param containerDest - Absolute path inside the container
+   * @param options - Copy options (recursive, overwrite, etc.)
+   */
+  async copyIn(
+    hostPath: string,
+    containerDest: string,
+    options?: CopyOptions,
+  ): Promise<void> {
+    const box = await this._ensureBox();
+    await box.copyIn(hostPath, containerDest, options);
+  }
+
+  /**
+   * Copy a file or directory from the container to the host.
+   *
+   * **Note:** a source at or under a container mount (e.g. `/tmp`,
+   * `/dev/shm`, volumes), or a directory containing one, is refused with an
+   * error naming the mount — the archive would carry the files underneath it
+   * rather than the ones the container sees. Copy a path outside the mount,
+   * or pipe a tar through `exec`.
+   *
+   * @param containerSrc - Absolute path inside the container
+   * @param hostDest - Absolute path on the host
+   * @param options - Copy options (recursive, overwrite, etc.)
+   */
+  async copyOut(
+    containerSrc: string,
+    hostDest: string,
+    options?: CopyOptions,
+  ): Promise<void> {
+    const box = await this._ensureBox();
+    await box.copyOut(containerSrc, hostDest, options);
+  }
+
+  /**
+   * Get box metrics (CPU, memory, network stats, etc.).
+   *
+   * @returns Promise resolving to box metrics
+   */
+  async metrics() {
+    const box = await this._ensureBox();
+    return box.metrics();
+  }
+
+  /** Establish and return a one-shot tunnel to a port inside this box. */
+  async tunnel(port: number): Promise<BoxTunnel> {
+    return this.network.tunnel(port);
+  }
+
+  /**
+   * Stop the box.
+   *
+   * Sends a graceful shutdown signal to the VM. If `autoRemove` is true
+   * (default), the box files will be deleted after stopping.
+   *
+   * Does nothing if the box was never created.
+   *
+   * @example
+   * ```typescript
+   * await box.stop();
+   * console.log('Box stopped');
+   * ```
+   */
+  async stop(): Promise<void> {
+    if (!this._box) {
+      // Box was never created, nothing to stop
+      return;
+    }
+    await this._box.stop();
+  }
+
+  /**
+   * Implement async disposable pattern (TypeScript 5.2+).
+   *
+   * Allows using `await using` syntax for automatic cleanup:
+   *
+   * ```typescript
+   * await using box = new SimpleBox({ image: 'alpine' });
+   * // Box automatically stopped when leaving scope
+   * ```
+   */
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.stop();
+  }
+}

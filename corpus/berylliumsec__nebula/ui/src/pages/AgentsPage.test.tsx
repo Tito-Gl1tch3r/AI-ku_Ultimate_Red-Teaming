@@ -1,0 +1,245 @@
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+import { DialogProvider } from "../components/DialogSystem";
+import { AgentsPage } from "./AgentsPage";
+
+const steerRun = vi.fn().mockResolvedValue(undefined);
+const discussRun = vi.fn().mockResolvedValue({ id: "chat-from-mission" });
+const selectMission = vi.fn();
+const workspace = {
+  api: { steerRun, discussRun },
+  approvals: [],
+  coreState: "offline" as const,
+  deleteMission: vi.fn(),
+  engagement: { id: "engagement-1" },
+  events: [{
+    id: "event-command",
+    sequence: 18,
+    kind: "task.completed",
+    actor: "Nebula Core",
+    occurredAt: "2026-07-14T12:00:00Z",
+    summary: "**Summary**\n\n- Scan prepared\n\n```bash\nnmap -sV 192.168.1.1\n```",
+    payload: {},
+  }],
+  previewMode: false,
+  providers: [],
+  reverifyProvider: vi.fn(),
+  startMission: vi.fn(),
+  stopMission: vi.fn(),
+  selectMission,
+  runs: [] as Array<Record<string, unknown>>,
+  run: {
+    id: "run-1",
+    backend: "harness" as const,
+    harnessSessionId: "session-1",
+    title: "Network review",
+    status: "running" as const,
+    completedTasks: 1,
+    totalTasks: 2,
+  },
+};
+
+vi.mock("../state/ChromeContext", () => ({
+  useChrome: () => ({ setActivityOpen: vi.fn() }),
+}));
+
+vi.mock("../state/WorkspaceContext", () => ({
+  useWorkspace: () => workspace,
+}));
+
+describe("mission activity", () => {
+  it("formats mission Markdown and copies fenced commands exactly", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    const activity = screen.getByRole("region", { name: "Mission activity" });
+    await user.click(within(activity).getByRole("button", { name: "Show activity" }));
+    expect(within(activity).getByText("Summary").tagName).toBe("STRONG");
+    const markdownListItem = within(activity).getAllByText("Scan prepared").find((element) => element.tagName === "LI");
+    expect(markdownListItem?.parentElement?.tagName).toBe("UL");
+    expect(within(activity).queryByText(/\*\*Summary\*\*/)).toBeNull();
+
+    await user.click(within(activity).getByRole("button", { name: "Copy exact code" }));
+    expect(writeText).toHaveBeenCalledWith("nmap -sV 192.168.1.1\n");
+    expect(within(activity).queryByRole("button", { name: /Review and run/ })).toBeNull();
+  });
+
+  it("steers the active harness turn", async () => {
+    const user = userEvent.setup();
+    steerRun.mockClear();
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    await user.type(screen.getByLabelText("Steer active harness turn"), "Prioritize the login flow");
+    await user.click(screen.getByRole("button", { name: "Steer" }));
+
+    expect(steerRun).toHaveBeenCalledWith("run-1", "Prioritize the login flow");
+  });
+
+  it("opens the live Mission supervisor conversation", async () => {
+    const user = userEvent.setup();
+    (workspace.run as typeof workspace.run & { supervisorChatSessionId?: string }).supervisorChatSessionId = "supervisor-chat";
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+    expect(screen.queryByLabelText("Steer active harness turn")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Open supervisor chat" }));
+    expect(new URLSearchParams(window.location.search).get("session")).toBe("supervisor-chat");
+    delete (workspace.run as typeof workspace.run & { supervisorChatSessionId?: string }).supervisorChatSessionId;
+  });
+
+  it("keeps mission controls visible and technical activity collapsed", async () => {
+    const user = userEvent.setup();
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    expect(screen.getByRole("region", { name: "Mission controls" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Stop mission" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Delete mission" })).toBeDisabled();
+    expect(screen.getByText("Specialists are actively working through the plan.")).toBeVisible();
+    expect(screen.getByLabelText("50% of recorded mission tasks complete")).toBeVisible();
+    const activity = screen.getByRole("region", { name: "Mission activity" });
+    expect(within(activity).queryByText("Newest first")).toBeNull();
+    await user.click(within(activity).getByRole("button", { name: "Show activity" }));
+    expect(within(activity).getByText(/latest below/)).toBeVisible();
+  });
+
+  it("allows an individual mission to be selected", async () => {
+    const user = userEvent.setup();
+    selectMission.mockClear();
+    workspace.runs = [{ ...workspace.run, updatedAt: "2026-07-14T12:00:00Z" }];
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    await user.click(screen.getByRole("button", { name: /Network review/ }));
+    expect(selectMission).toHaveBeenCalledWith("run-1");
+    workspace.runs = [];
+  });
+
+  it("keeps a hundred-mission history searchable and progressively rendered", async () => {
+    const user = userEvent.setup();
+    workspace.runs = Array.from({ length: 100 }, (_, index) => ({
+      ...workspace.run,
+      id: `run-${index + 1}`,
+      title: `Mission ${index + 1}`,
+      status: index % 2 ? "complete" : "failed",
+      updatedAt: new Date(Date.UTC(2026, 6, 18, 12, index)).toISOString(),
+    }));
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    const history = screen.getByRole("navigation", { name: "Mission history" });
+    expect(within(history).getAllByRole("button")).toHaveLength(12);
+    expect(screen.getByText("Showing 12 of 100")).toBeVisible();
+    await user.type(screen.getByRole("searchbox", { name: "Search missions" }), "Mission 99");
+    expect(within(history).getAllByRole("button")).toHaveLength(1);
+    expect(within(history).getByRole("button", { name: /Mission 99/ })).toBeVisible();
+    workspace.runs = [];
+  });
+
+  it("links a failed mission and its final result to Diagnostics", () => {
+    const previousStatus = workspace.run.status;
+    const previousEvents = workspace.events;
+    (workspace.run as { status: string }).status = "failed";
+    workspace.events = [{
+      id: "event-failed",
+      sequence: 19,
+      kind: "run.failed",
+      actor: "Nebula Core",
+      occurredAt: "2026-07-14T12:05:00Z",
+      summary: "Mission failed during provider execution.",
+      payload: {},
+    }];
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    const links = screen.getAllByRole("link", { name: "View diagnostics" });
+    expect(links).toHaveLength(2);
+    links.forEach((link) => expect(link).toHaveAttribute("href", "/settings#diagnostics-settings"));
+    (workspace.run as { status: string }).status = previousStatus;
+    workspace.events = previousEvents;
+  });
+
+  it("copies a mission result and continues it in durable assistant chat", async () => {
+    const user = userEvent.setup();
+    const previousStatus = workspace.run.status;
+    const previousBackend = workspace.run.backend;
+    const previousEvents = workspace.events;
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    discussRun.mockClear();
+    (workspace.run as { status: string }).status = "complete";
+    (workspace.run as { backend: string }).backend = "native";
+    workspace.events = [{
+      id: "event-completed",
+      sequence: 20,
+      kind: "run.completed",
+      actor: "Nebula Core",
+      occurredAt: "2026-07-14T12:10:00Z",
+      summary: "**Result**\n\nThe bounded review is complete.",
+      payload: {},
+    }];
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    await user.click(screen.getByRole("button", { name: "Copy result" }));
+    expect(writeText).toHaveBeenCalledWith("**Result**\n\nThe bounded review is complete.");
+    expect(screen.getByRole("button", { name: "Copied" })).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Mission result copied to clipboard.");
+
+    await user.click(screen.getByRole("button", { name: "Continue in assistant chat" }));
+    expect(discussRun).toHaveBeenCalledWith("run-1");
+    expect(new URLSearchParams(window.location.search).get("view")).toBe("chat");
+    expect(new URLSearchParams(window.location.search).get("session")).toBe("chat-from-mission");
+
+    (workspace.run as { status: string }).status = previousStatus;
+    (workspace.run as { backend: string }).backend = previousBackend;
+    workspace.events = previousEvents;
+  });
+
+  it("keeps the result usable when clipboard access fails", async () => {
+    const user = userEvent.setup();
+    const previousStatus = workspace.run.status;
+    const previousEvents = workspace.events;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+    });
+    (workspace.run as { status: string }).status = "complete";
+    workspace.events = [{
+      id: "event-copy-failed",
+      sequence: 21,
+      kind: "run.completed",
+      actor: "Nebula Core",
+      occurredAt: "2026-07-14T12:11:00Z",
+      summary: "The result remains selectable.",
+      payload: {},
+    }];
+    render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    await user.click(screen.getByRole("button", { name: "Copy result" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Select the result text and copy it manually.");
+    expect(within(screen.getByRole("region", { name: "Mission result" })).getByText("The result remains selectable.")).toBeVisible();
+
+    (workspace.run as { status: string }).status = previousStatus;
+    workspace.events = previousEvents;
+  });
+
+  it("keeps the filter controls while a filter hides missions from a short history", async () => {
+    const user = userEvent.setup();
+    const mission = (index: number, status: string) => ({
+      ...workspace.run,
+      id: `run-${index}`,
+      title: `Mission ${index}`,
+      status,
+      updatedAt: new Date(Date.UTC(2026, 6, 18, 12, index)).toISOString(),
+    });
+    workspace.runs = Array.from({ length: 8 }, (_, index) => mission(index + 1, index % 2 ? "complete" : "failed"));
+    const { rerender } = render(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Filter missions by status" }), "failed");
+    expect(within(screen.getByRole("navigation", { name: "Mission history" })).getAllByRole("button")).toHaveLength(4);
+
+    workspace.runs = [mission(2, "complete"), mission(4, "complete")];
+    rerender(<DialogProvider><AgentsPage embedded /></DialogProvider>);
+    expect(screen.getByText("No missions match this search.")).toBeVisible();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Filter missions by status" }), "all");
+    expect(within(screen.getByRole("navigation", { name: "Mission history" })).getAllByRole("button")).toHaveLength(2);
+    workspace.runs = [];
+  });
+});

@@ -1,0 +1,202 @@
+"""Leased conversation branches for temporary popups and side chats."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from contextlib import asynccontextmanager, suppress
+from datetime import timedelta
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException, Response
+from pydantic import BaseModel, Field
+
+from .domain import ChatBackend, ChatSession, Engagement, HarnessSession, utc_now
+from .storage import NotFoundError
+
+logger = logging.getLogger(__name__)
+
+
+def is_temporary_chat(chat: ChatSession) -> bool:
+    return (
+        chat.metadata.get("temporary_assistant") is True
+        or chat.metadata.get("side_chat") is True
+    )
+
+
+def temporary_chat_expired(chat: ChatSession) -> bool:
+    # Side chats belong to their parent conversation until the operator closes
+    # them. Only detached Ask Nebula popups have an abandonment lease.
+    return (
+        chat.metadata.get("side_chat") is not True
+        and chat.metadata.get("temporary_assistant") is True
+        and chat.updated_at + timedelta(days=1) < utc_now()
+    )
+
+
+class TemporaryChatRequest(BaseModel):
+    engagement_id: str = Field(min_length=1, max_length=200)
+    session_id: str | None = Field(default=None, min_length=1, max_length=200)
+    backend: ChatBackend = ChatBackend.PROVIDER
+    provider_id: str | None = Field(default=None, min_length=1, max_length=200)
+    harness_profile_id: str | None = Field(default=None, min_length=1, max_length=200)
+    model: str | None = Field(default=None, min_length=1, max_length=500)
+
+
+def temporary_chat_router(store, chat_service, harness_runtime):
+    async def discard(session_id):
+        try:
+            chat = store.get(ChatSession, session_id)
+        except NotFoundError:
+            # diagnostic-expected: an already-discarded temporary chat needs no cleanup.
+            return
+        if not is_temporary_chat(chat):
+            raise HTTPException(
+                409, "Only temporary conversations can be discarded here"
+            )
+        turn = chat_service().pending_turn(chat.id)
+        if turn:
+            if turn.harness_turn_id:
+                await harness_runtime.cancel_turn(
+                    turn.harness_turn_id, reason="Temporary chat discarded"
+                )
+            else:
+                await chat_service().stop_provider_turn(turn.id)
+        if chat.harness_session_id:
+            await harness_runtime.close_session(chat.harness_session_id)
+        store.delete_chat_session(chat.id)
+        # The temporary session owns its vendor runtime, never the source chat.
+        if chat.harness_session_id:
+            with suppress(NotFoundError):
+                store.delete(HarnessSession, chat.harness_session_id)
+
+    async def collect():
+        while True:
+            # An unreadable conversation is skipped and recorded; it must not
+            # end this sweep for good.
+            expired = [
+                row.id
+                for row in store.iter_readable_entities(ChatSession)
+                if temporary_chat_expired(row)
+            ]
+            for session_id in expired:
+                try:
+                    await discard(session_id)
+                except Exception:
+                    # diagnostic-expected: log the cleanup failure and retry on the next sweep.
+                    logger.exception("Temporary assistant cleanup failed; will retry")
+            await asyncio.sleep(60)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        # diagnostic-expected: lifespan owns this task and cancels/awaits it on shutdown.
+        task = asyncio.create_task(collect())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    router = APIRouter(tags=["chat"], lifespan=lifespan)
+
+    @router.get(
+        "/chat/sessions/{session_id}/side-chats", response_model=list[ChatSession]
+    )
+    async def list_side_chats(session_id: str):
+        try:
+            parent = store.get(ChatSession, session_id)
+        except NotFoundError:
+            raise HTTPException(404, "Conversation not found") from None
+        return [
+            chat
+            for chat in store.find_entities(
+                ChatSession,
+                {"parent_session_id": session_id},
+                engagement_id=parent.engagement_id,
+                newest_first=True,
+            )
+            if chat.metadata.get("side_chat") is True
+        ]
+
+    @router.post(
+        "/chat/temporary-sessions", response_model=ChatSession, status_code=201
+    )
+    async def create(request: TemporaryChatRequest):
+        store.get(Engagement, request.engagement_id)
+        source = (
+            store.get(ChatSession, request.session_id) if request.session_id else None
+        )
+        if source and source.engagement_id != request.engagement_id:
+            raise HTTPException(409, "Conversation is not in this project")
+        backend = source.backend if source else request.backend
+        profile_id = source.harness_profile_id if source else request.harness_profile_id
+        model = source.model if source else request.model
+        if not source and backend == ChatBackend.PROVIDER and not request.provider_id:
+            raise HTTPException(
+                422, "Choose an assistant provider before asking a question"
+            )
+        harness = None
+        if backend == ChatBackend.HARNESS:
+            # A fresh vendor session receives the snapshot through the existing
+            # history-handoff path. It never resumes the parent's live runtime.
+            harness = harness_runtime.create_session(
+                engagement_id=request.engagement_id,
+                profile_id=profile_id or "",
+                model=model,
+                mcp_server_ids=[],
+                tools_enabled=False,
+            )
+        messages = chat_service().session_messages(source.id) if source else []
+        chat = ChatSession(
+            id=str(uuid4()),
+            engagement_id=request.engagement_id,
+            title="Ask Nebula",
+            backend=backend,
+            model=model or (harness.model if harness else ""),
+            provider_profile_id=source.provider_profile_id
+            if source
+            else request.provider_id,
+            harness_profile_id=profile_id,
+            harness_session_id=harness.id if harness else None,
+            parent_session_id=source.id if source else None,
+            forked_from_message_id=messages[-1].id if messages else None,
+            metadata={
+                "temporary_assistant": True,
+                "harness_context_handoff_pending": bool(harness and messages),
+            },
+        )
+        # The hidden marker and snapshot are committed together: no visible chat
+        # is created and then hidden, even while another client refreshes.
+        with store.transaction() as transaction:
+            transaction.add(chat)
+            for message in messages:
+                transaction.add(
+                    message.model_copy(
+                        update={
+                            "id": str(uuid4()),
+                            "session_id": chat.id,
+                            "source_message_id": message.id,
+                        }
+                    )
+                )
+        if source and messages:
+            from .chat_decisions import fork_decisions
+
+            fork_decisions(store, source, chat, messages[-1].sequence)
+        return chat
+
+    @router.post("/chat/temporary-sessions/{session_id}/keepalive", status_code=204)
+    async def keepalive(session_id: str):
+        chat = store.get(ChatSession, session_id)
+        if not is_temporary_chat(chat):
+            raise HTTPException(409, "Only temporary conversations can be renewed here")
+        store.update(ChatSession, chat.id, {"metadata": chat.metadata})
+        return Response(status_code=204)
+
+    @router.delete("/chat/temporary-sessions/{session_id}", status_code=204)
+    async def delete(session_id: str):
+        await discard(session_id)
+        return Response(status_code=204)
+
+    return router

@@ -1,0 +1,545 @@
+"""Provider-native lifecycle hooks discovered only from the shared .agents tree."""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+from typing import Any, Literal, TypedDict
+from uuid import uuid4
+
+from pydantic import Field, field_validator
+
+from .diagnostics import record_caught_exception
+from .domain import NativeHookExecution, NativeHookLateOutcome, NebulaModel, utc_now
+from .storage import NebulaStore, NotFoundError
+from .workspace_provenance import (
+    PROVENANCE_SCHEMA,
+    WorkspaceProvenanceService,
+    actor_id_for,
+)
+
+
+HOOK_MANIFEST = "hook.json"
+HOOK_EVENTS = {
+    "chat.turn.started",
+    "chat.turn.completed",
+    "chat.turn.failed",
+    "chat.turn.cancelled",
+    "tool.before",
+    "tool.after",
+}
+MAX_HOOK_OUTPUT_BYTES = 64 * 1024
+
+
+class NativeHookError(RuntimeError):
+    """A safe, operator-actionable native-hook failure."""
+
+
+class NativeHookBlocked(NativeHookError):
+    """A command was denied by a completed project hook attempt."""
+
+    def __init__(self, execution: NativeHookExecution) -> None:
+        self.execution = execution
+        super().__init__(
+            f"required project hook {execution.hook_id!r} did not complete: "
+            f"{execution.error or execution.status}"
+        )
+
+
+class _HookProcessOutcome(TypedDict):
+    status: Literal["complete", "failed", "timed_out"]
+    error: str | None
+    exit_code: int | None
+    stdout: bytes
+    stderr: bytes
+
+
+def _run_hook_process(
+    argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    envelope: bytes,
+    timeout: int,
+) -> _HookProcessOutcome:
+    """Run one hook process to its end; a hook's own failure is data, not an error."""
+
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            env=env,
+            input=envelope,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (
+        subprocess.TimeoutExpired
+    ):  # diagnostic-expected: timeout is persisted on the durable hook execution
+        return {
+            "status": "timed_out",
+            "error": "hook timed out",
+            "exit_code": None,
+            "stdout": b"",
+            "stderr": b"",
+        }
+    except OSError as exc:  # diagnostic-expected: start failure is persisted on the durable hook execution
+        return {
+            "status": "failed",
+            "error": f"hook could not start: {exc}",
+            "exit_code": None,
+            "stdout": b"",
+            "stderr": b"",
+        }
+    succeeded = completed.returncode == 0
+    return {
+        "status": "complete" if succeeded else "failed",
+        "error": None if succeeded else "hook exited unsuccessfully",
+        "exit_code": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+class NativeHookManifest(NebulaModel):
+    version: Literal[1]
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=1_000)
+    events: list[str] = Field(min_length=1, max_length=16)
+    command: list[str] = Field(min_length=1, max_length=64)
+    timeout_seconds: int = Field(default=10, ge=1, le=300)
+    side_effects: Literal["none", "workspace", "external"] = "none"
+    failure_policy: Literal["continue", "block"] = "continue"
+
+    @field_validator("events")
+    @classmethod
+    def supported_events(cls, value: list[str]) -> list[str]:
+        distinct = list(dict.fromkeys(value))
+        unknown = sorted(set(distinct) - HOOK_EVENTS)
+        if unknown:
+            raise ValueError(f"unsupported hook events: {', '.join(unknown)}")
+        return distinct
+
+    @field_validator("command")
+    @classmethod
+    def bounded_command(cls, value: list[str]) -> list[str]:
+        if any(
+            not isinstance(item, str) or not item or len(item) > 2_000 for item in value
+        ):
+            raise ValueError("hook command entries must be non-empty bounded strings")
+        executable = Path(value[0])
+        if executable.is_absolute() or ".." in executable.parts:
+            raise ValueError("hook executable must be relative to its hook directory")
+        return value
+
+
+class NativeHookDescriptor(NebulaModel):
+    id: str
+    source: Literal["project"] = "project"
+    path: str
+    manifest: NativeHookManifest
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    executable_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class NativeHookSnapshot(NativeHookDescriptor):
+    selected_at: str
+
+
+def _read_bounded(path: Path, *, maximum: int) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise NativeHookError(f"hook file is not a regular file: {path.name}")
+    size = path.stat().st_size
+    if size > maximum:
+        raise NativeHookError(f"hook file exceeds {maximum} bytes: {path.name}")
+    return path.read_bytes()
+
+
+def discover_native_hooks(workspace: Path) -> list[NativeHookDescriptor]:
+    root = workspace.resolve() / ".agents" / "hooks"
+    if not root.exists():
+        return []
+    if root.is_symlink() or not root.is_dir():
+        raise NativeHookError(".agents/hooks must be a regular directory")
+    descriptors: list[NativeHookDescriptor] = []
+    for directory in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        manifest_path = directory / HOOK_MANIFEST
+        if not manifest_path.exists():
+            continue
+        raw = _read_bounded(manifest_path, maximum=64 * 1024)
+        try:
+            manifest = NativeHookManifest.model_validate_json(raw)
+        except ValueError as exc:
+            raise NativeHookError(
+                f"invalid hook manifest {directory.name}: {exc}"
+            ) from exc
+        executable_source = directory / manifest.command[0]
+        if executable_source.is_symlink():
+            raise NativeHookError(
+                f"hook executable cannot be a symlink: {directory.name}"
+            )
+        executable = executable_source.resolve()
+        try:
+            executable.relative_to(directory.resolve())
+        except ValueError as exc:
+            raise NativeHookError(
+                f"hook executable escapes its directory: {directory.name}"
+            ) from exc
+        executable_bytes = _read_bounded(executable, maximum=2 * 1024 * 1024)
+        if not os.access(executable, os.X_OK):
+            raise NativeHookError(
+                f"hook executable is not executable: {directory.name}"
+            )
+        descriptors.append(
+            NativeHookDescriptor(
+                id=directory.name,
+                path=str(directory.resolve()),
+                manifest=manifest,
+                manifest_sha256=hashlib.sha256(raw).hexdigest(),
+                executable_sha256=hashlib.sha256(executable_bytes).hexdigest(),
+            )
+        )
+    return descriptors
+
+
+def snapshot_native_hook(
+    hook_id: str, catalog: list[NativeHookDescriptor]
+) -> NativeHookSnapshot:
+    matches = [item for item in catalog if item.id == hook_id]
+    if len(matches) != 1:
+        raise NativeHookError(f"native hook {hook_id!r} is not uniquely available")
+    return NativeHookSnapshot(
+        **matches[0].model_dump(mode="python"), selected_at=utc_now().isoformat()
+    )
+
+
+class NativeHookRunner:
+    def __init__(self, store: NebulaStore) -> None:
+        self.store = store
+
+    async def run(
+        self,
+        snapshot: NativeHookSnapshot,
+        *,
+        engagement_id: str,
+        chat_session_id: str | None,
+        chat_turn_id: str | None,
+        owner_kind: Literal["chat", "mission", "harness", "api"] = "chat",
+        owner_id: str | None = None,
+        event_name: str,
+        payload: dict[str, Any],
+        workspace_provenance: dict[str, Any] | None = None,
+    ) -> NativeHookExecution:
+        if event_name not in snapshot.manifest.events:
+            raise NativeHookError(
+                f"hook {snapshot.id!r} does not subscribe to {event_name}"
+            )
+        directory = Path(snapshot.path)
+        manifest_path = directory / HOOK_MANIFEST
+        executable = (directory / snapshot.manifest.command[0]).resolve()
+        manifest_bytes = _read_bounded(manifest_path, maximum=64 * 1024)
+        executable_bytes = _read_bounded(executable, maximum=2 * 1024 * 1024)
+        if hashlib.sha256(manifest_bytes).hexdigest() != snapshot.manifest_sha256:
+            raise NativeHookError(
+                f"hook {snapshot.id!r} manifest changed after selection"
+            )
+        if hashlib.sha256(executable_bytes).hexdigest() != snapshot.executable_sha256:
+            raise NativeHookError(
+                f"hook {snapshot.id!r} executable changed after selection"
+            )
+        started = utc_now()
+        execution = self.store.create(
+            NativeHookExecution(
+                id=str(uuid4()),
+                engagement_id=engagement_id,
+                chat_session_id=chat_session_id,
+                chat_turn_id=chat_turn_id,
+                owner_kind=owner_kind,
+                owner_id=owner_id or chat_session_id or chat_turn_id,
+                hook_id=snapshot.id,
+                hook_snapshot=snapshot.model_dump(mode="json"),
+                event_name=event_name,
+                side_effects=snapshot.manifest.side_effects,
+                started_at=started,
+            )
+        )
+        envelope = json.dumps(
+            {
+                "schema": "nebula.native-hook-event/v1",
+                "event": event_name,
+                "event_version": 1,
+                "engagement_id": engagement_id,
+                "chat_session_id": chat_session_id,
+                "chat_turn_id": chat_turn_id,
+                "owner_kind": owner_kind,
+                "owner_id": owner_id or chat_session_id or chat_turn_id,
+                "actor": {
+                    "id": (
+                        workspace_provenance.get("actor_id")
+                        if workspace_provenance
+                        else actor_id_for(
+                            self.store,
+                            owner_kind=owner_kind,
+                            owner_id=owner_id,
+                            chat_session_id=chat_session_id,
+                        )
+                    ),
+                    "owner_kind": owner_kind,
+                    "owner_id": owner_id or chat_session_id or chat_turn_id,
+                    "chat_session_id": chat_session_id,
+                    "chat_turn_id": chat_turn_id,
+                },
+                "workspace_provenance": workspace_provenance,
+                "payload": payload,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        environment = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "LANG": "C.UTF-8",
+            "NEBULA_HOOK_EVENT": event_name,
+            "NEBULA_HOOK_EVENT_VERSION": "1",
+        }
+        work = asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                _run_hook_process,
+                [str(executable), *snapshot.manifest.command[1:]],
+                cwd=str(directory),
+                env=environment,
+                envelope=envelope,
+                timeout=snapshot.manifest.timeout_seconds,
+            ),
+        )
+        try:
+            outcome = await asyncio.shield(work)
+        except asyncio.CancelledError:  # diagnostic-expected: the stop propagates to the turn; the hook's outcome is persisted when its process exits
+            # Stopping the turn cannot stop the hook process: it keeps running
+            # in its worker thread. Record its real outcome when it exits
+            # instead of leaving the execution "running" forever.
+            work.add_done_callback(
+                functools.partial(self._persist_late_outcome, execution.id)
+            )
+            raise
+        return self._persist_outcome(execution, outcome)
+
+    def _persist_outcome(
+        self, execution: NativeHookExecution, outcome: _HookProcessOutcome
+    ) -> NativeHookExecution:
+        return self.store.update(
+            NativeHookExecution,
+            execution.id,
+            {
+                "status": outcome["status"],
+                "completed_at": utc_now(),
+                "exit_code": outcome["exit_code"],
+                "stdout": outcome["stdout"][:MAX_HOOK_OUTPUT_BYTES].decode(
+                    "utf-8", "replace"
+                ),
+                "stderr": outcome["stderr"][:MAX_HOOK_OUTPUT_BYTES].decode(
+                    "utf-8", "replace"
+                ),
+                "error": outcome["error"],
+            },
+            expected_revision=execution.revision,
+        )
+
+    def _persist_late_outcome(
+        self, execution_id: str, work: asyncio.Future[_HookProcessOutcome]
+    ) -> None:
+        """Record the outcome of a hook whose turn ended while it ran."""
+
+        if work.cancelled():
+            return
+        try:
+            outcome = work.result()
+            latest = self.store.get(NativeHookExecution, execution_id)
+            # An interrupted turn keeps its fence, but the process can still
+            # finish in the old worker. Save that observation separately so
+            # recovery can adopt a successful outcome without re-running it.
+            if latest.status == "running":
+                self._persist_outcome(latest, outcome)
+            elif latest.status == "interrupted":
+                self.store.update(
+                    NativeHookExecution,
+                    latest.id,
+                    {
+                        "late_outcome": NativeHookLateOutcome(
+                            status=outcome["status"],
+                            exit_code=outcome["exit_code"],
+                            stdout=outcome["stdout"][:MAX_HOOK_OUTPUT_BYTES].decode(
+                                "utf-8", "replace"
+                            ),
+                            stderr=outcome["stderr"][:MAX_HOOK_OUTPUT_BYTES].decode(
+                                "utf-8", "replace"
+                            ),
+                            error=outcome["error"],
+                        )
+                    },
+                    expected_revision=latest.revision,
+                )
+        except Exception as exc:
+            record_caught_exception(
+                "chat",
+                "chat.native_hook.late_outcome_failed",
+                "A hook that outlived its stopped turn could not record its outcome.",
+                exc,
+                stage="native-hook",
+            )
+
+
+async def run_project_tool_hooks(
+    store: NebulaStore,
+    workspace: Path,
+    *,
+    engagement_id: str,
+    event_name: Literal["tool.before", "tool.after"],
+    payload: dict[str, Any],
+    owner_kind: Literal["chat", "mission", "harness", "api"],
+    owner_id: str,
+    chat_session_id: str | None = None,
+    chat_turn_id: str | None = None,
+    enforce_blocking: bool,
+) -> list[NativeHookExecution]:
+    """Run automatically selected project hooks at one command-tool boundary."""
+
+    catalog = discover_native_hooks(workspace)
+    snapshots = [
+        snapshot_native_hook(item.id, catalog)
+        for item in catalog
+        if event_name in item.manifest.events
+    ]
+    if not snapshots:
+        return []
+    actor_id = actor_id_for(
+        store,
+        owner_kind=owner_kind,
+        owner_id=owner_id,
+        chat_session_id=chat_session_id,
+    )
+    provenance = WorkspaceProvenanceService(store)
+    scope_id = str(payload.get("tool_call_id") or "")
+    try:
+        if not scope_id:
+            workspace_receipt = {
+                "schema": PROVENANCE_SCHEMA,
+                "supported": False,
+                "unsupported_reason": "tool_call_id_is_missing",
+                "actor_id": actor_id,
+            }
+        elif event_name == "tool.before":
+            # Git status and dirty-file hashing run off the event loop.
+            observation = await asyncio.to_thread(
+                functools.partial(
+                    provenance.begin,
+                    workspace,
+                    engagement_id=engagement_id,
+                    scope_kind="tool",
+                    scope_id=scope_id,
+                    actor_id=actor_id,
+                    owner_kind=owner_kind,
+                    owner_id=owner_id,
+                    chat_session_id=chat_session_id,
+                    chat_turn_id=chat_turn_id,
+                )
+            )
+            workspace_receipt = provenance.receipt(observation)
+        else:
+            try:
+                observation = await asyncio.to_thread(
+                    functools.partial(
+                        provenance.finish,
+                        workspace,
+                        engagement_id=engagement_id,
+                        scope_kind="tool",
+                        scope_id=scope_id,
+                    )
+                )
+            except NotFoundError:  # diagnostic-expected: an after-only tool hook reports the missing baseline explicitly
+                workspace_receipt = {
+                    "schema": PROVENANCE_SCHEMA,
+                    "supported": False,
+                    "unsupported_reason": "tool_baseline_is_missing",
+                    "actor_id": actor_id,
+                }
+            else:
+                workspace_receipt = provenance.receipt(observation)
+    except Exception as exc:
+        record_caught_exception(
+            "automation",
+            "automation.workspace_provenance.capture_failed",
+            "Workspace provenance could not be captured for a project tool hook.",
+            exc,
+            stage=event_name,
+        )
+        workspace_receipt = {
+            "schema": PROVENANCE_SCHEMA,
+            "supported": False,
+            "unsupported_reason": "capture_failed",
+            "actor_id": actor_id,
+        }
+    runner = NativeHookRunner(store)
+    executions: list[NativeHookExecution] = []
+    for snapshot in snapshots:
+        outcome = await runner.run(
+            snapshot,
+            engagement_id=engagement_id,
+            chat_session_id=chat_session_id,
+            chat_turn_id=chat_turn_id,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            event_name=event_name,
+            payload=payload,
+            workspace_provenance=workspace_receipt,
+        )
+        executions.append(outcome)
+        if (
+            enforce_blocking
+            and snapshot.manifest.failure_policy == "block"
+            and outcome.status != "complete"
+        ):
+            if event_name == "tool.before" and scope_id:
+                try:
+                    await asyncio.to_thread(
+                        functools.partial(
+                            provenance.finish,
+                            workspace,
+                            engagement_id=engagement_id,
+                            scope_kind="tool",
+                            scope_id=scope_id,
+                        )
+                    )
+                except Exception as exc:
+                    record_caught_exception(
+                        "automation",
+                        "automation.workspace_provenance.cleanup_failed",
+                        "A denied tool left its provenance observation unresolved.",
+                        exc,
+                        stage=event_name,
+                    )
+            raise NativeHookBlocked(outcome)
+    return executions
+
+
+__all__ = [
+    "HOOK_EVENTS",
+    "NativeHookDescriptor",
+    "NativeHookError",
+    "NativeHookBlocked",
+    "NativeHookExecution",
+    "NativeHookManifest",
+    "NativeHookRunner",
+    "NativeHookSnapshot",
+    "discover_native_hooks",
+    "snapshot_native_hook",
+    "run_project_tool_hooks",
+]

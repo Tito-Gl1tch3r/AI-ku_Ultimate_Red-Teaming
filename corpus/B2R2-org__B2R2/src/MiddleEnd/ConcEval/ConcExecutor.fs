@@ -1,0 +1,471 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.MiddleEnd.ConcEval
+
+open System.Threading
+open B2R2
+open B2R2.ABI
+open B2R2.Collections
+open B2R2.BinIR
+open B2R2.BinIR.LowUIR
+open B2R2.FrontEnd
+open B2R2.FrontEnd.BinLifter
+open B2R2.MiddleEnd.Executor
+
+type private InstructionEvalResult =
+  | EvalOk
+  | EvalError of ErrorCase
+  | EvalUndef
+  | EvalSideEffect of SideEffect
+  | EvalStopped of ConcStopReason
+
+/// Represents a concrete executor over ConcEval's evaluation state.
+type ConcExecutor(hdl: BinHandle) =
+  let liftCache = LiftCache hdl
+  let regFactory = hdl.RegisterFactory
+  let defaultStateCreationOptions =
+    { Memory = BinSectionBackedMemory
+      Registers = [||] }
+
+  let createState (memory: InitialMemory<IMemory<byte>>) =
+    match memory with
+    | EmptyMemory -> ConcState()
+    | PreinitializedMemory mem -> ConcState mem
+    | BinSectionBackedMemory -> ConcState(BinSectionMemory hdl)
+
+  let initializeState start opts =
+    let st = createState opts.Memory
+    st.InitializeContext(start, opts.Registers)
+    st
+
+  let returnAddressRegister =
+    match hdl.Conventions.Calling.ReturnAddressLocation with
+    | InRegister rid -> Some rid
+    | OnStack -> None
+
+  let isReturnAddressRegister rid = returnAddressRegister = Some rid
+
+  let isCallerContextRegister rid =
+    not (regFactory.IsProgramCounter rid)
+    && not (regFactory.IsStackPointer rid)
+    && not (isReturnAddressRegister rid)
+
+  let zeroRegister rid =
+    regFactory.GetRegType rid
+    |> BitVector.Zero
+
+  let tryGetDefaultRegisterValue opts rid =
+    match opts.UninitializedRegisters with
+    | ConcUninitializedRegisterPolicy.StopOnUninitializedRegister ->
+      None
+    | ConcUninitializedRegisterPolicy.ZeroCallerContext ->
+      if isCallerContextRegister rid then Some(zeroRegister rid) else None
+    | ConcUninitializedRegisterPolicy.ZeroAnyRegister ->
+      Some(zeroRegister rid)
+
+  let mkResult reasons addr n st =
+    { StopReasons = reasons
+      FinalAddress = addr
+      InstructionCount = n
+      State = st }
+
+  let collectStmtReadRegisters rset = function
+    | Put(Src = rhs) ->
+      AST.updateRegsUses rset rhs
+    | Store(Addr = addr; Value = value) ->
+      AST.updateRegsUses rset addr
+      AST.updateRegsUses rset value
+    | CJmp(Cond = cond) ->
+      AST.updateRegsUses rset cond
+    | InterJmp(Target = target) ->
+      AST.updateRegsUses rset target
+    | InterCJmp(Cond = cond; TrueTarget = target1; FalseTarget = target2) ->
+      AST.updateRegsUses rset cond
+      AST.updateRegsUses rset target1
+      AST.updateRegsUses rset target2
+    | ExternalCall(Call = args) ->
+      AST.updateRegsUses rset args
+    | ISMark _
+    | IEMark _
+    | LMark _
+    | Jmp _
+    | SideEffect _ ->
+      ()
+
+  let isUninitializedRegister (st: ConcState) rid =
+    match st.TryGetReg rid with
+    | Undef -> true
+    | Def _ -> false
+
+  let materializeRegister opts (st: ConcState) ridx =
+    let rid = RegisterID.create ridx
+    match tryGetDefaultRegisterValue opts rid with
+    | Some v when isUninitializedRegister st rid -> st.SetReg(rid, v)
+    | _ -> ()
+
+  let materializeReadRegisters opts st stmt =
+    let rset = RegisterSet()
+    collectStmtReadRegisters rset stmt
+    rset.Iterate(materializeRegister opts st)
+
+  let rec hasUndefExpr = function
+    | Undefined _ ->
+      true
+    | ExprList(Elements = exprs) ->
+      List.exists hasUndefExpr exprs
+    | UnOp(Operand = e) ->
+      hasUndefExpr e
+    | BinOp(Left = e1; Right = e2) ->
+      hasUndefExpr e1 || hasUndefExpr e2
+    | RelOp(Left = e1; Right = e2) ->
+      hasUndefExpr e1 || hasUndefExpr e2
+    | Load(Addr = addr) ->
+      hasUndefExpr addr
+    | Ite(Cond = c; TrueExpr = t; FalseExpr = f) ->
+      hasUndefExpr c || hasUndefExpr t || hasUndefExpr f
+    | Cast(Operand = e) ->
+      hasUndefExpr e
+    | RoundCtrl(Mode = m; Body = b) ->
+      hasUndefExpr m || hasUndefExpr b
+    | Extract(Operand = e) ->
+      hasUndefExpr e
+    | Num _
+    | Var _
+    | PCVar _
+    | TempVar _
+    | JmpDest _
+    | FuncName _ ->
+      false
+
+  let isUndefWrite = function
+    | Put(Src = rhs) -> hasUndefExpr rhs
+    | Store(Value = value) -> hasUndefExpr value
+    | _ -> false
+
+  let stopAtSideEffect (opts: ConcRunOptions) =
+    opts.StopConditions |> List.contains ConcStopCondition.StopAtSideEffect
+
+  let hasStopAtReturn (opts: ConcRunOptions) =
+    opts.StopConditions |> List.contains ConcStopCondition.StopAtReturn
+
+  let hasStopAfterReturn (opts: ConcRunOptions) =
+    opts.StopConditions |> List.contains ConcStopCondition.StopAfterReturn
+
+  let tryEvalBranchCondition opts (st: ConcState) = function
+    | CJmp(Cond = cond)
+    | InterCJmp(Cond = cond) ->
+      let rset = RegisterSet()
+      AST.updateRegsUses rset cond
+      rset.Iterate(materializeRegister opts st)
+      match SafeEvaluator.evalExpr st cond with
+      | Ok(Def v) -> Some(v = EvalUtils.tr)
+      | _ -> Some false
+    | _ ->
+      None
+
+  let isConditionalBranchTaken opts st stmts =
+    Array.tryPick (tryEvalBranchCondition opts st) stmts
+    |> Option.defaultValue false
+
+  let isReturnTaken opts (st: ConcState) (ins: IInstruction) stmts =
+    ins.IsRET
+    && (not ins.IsCondBranch || isConditionalBranchTaken opts st stmts)
+
+  let tryGetDirectTarget (ins: IInstruction) =
+    match ins.DirectBranchTarget() with
+    | true, target -> Some target
+    | false, _ -> None
+
+  let stopAtCall (opts: ConcRunOptions) (ins: IInstruction) =
+    ins.IsCall
+    && match opts.Calls with
+       | CallPolicy.StopAtCalls -> true
+       | CallPolicy.FollowDirectInternalCalls -> false
+       | CallPolicy.UseCallHooks _ -> false
+
+  (* A register or temporary with no entry reads back as Undef, so unsetting
+     the target is all it takes to record that it now holds an undefined value.
+     A memory cell has no such encoding: dropping it would expose whatever
+     backs the address underneath, so an undefined store is left alone. *)
+  let unsetUndefTarget (st: ConcState) = function
+    | Put(Dst = Var(RegisterID = n)) -> st.UnsetReg n
+    | Put(Dst = TempVar(Index = n)) -> st.UnsetTmp n
+    | _ -> ()
+
+  let evalStmt (opts: ConcRunOptions) (st: ConcState) stmt =
+    materializeReadRegisters opts st stmt
+    match opts.UndefinedValues with
+    | ConcUndefinedValuePolicy.StopOnUndefinedValue when isUndefWrite stmt ->
+      EvalUndef
+    | ConcUndefinedValuePolicy.IgnoreUndefinedWrites when isUndefWrite stmt ->
+      st.NextStmt()
+      EvalOk
+    | ConcUndefinedValuePolicy.PreserveUndefinedValues when isUndefWrite stmt ->
+      unsetUndefTarget st stmt
+      st.NextStmt()
+      EvalOk
+    | _ ->
+      match SafeEvaluator.evalStmt st stmt with
+      | Ok() -> EvalOk
+      | Result.Error e -> EvalError e
+
+  let step opts st stmt =
+    match stmt with
+    | SideEffect(Effect = eff) when stopAtSideEffect opts ->
+      Result.Error(EvalSideEffect eff)
+    | _ ->
+      match evalStmt opts st stmt with
+      | EvalOk -> Ok()
+      | stop -> Result.Error stop
+
+  let isInstructionLimitReached n (opts: ConcRunOptions) =
+    match opts.MaxInstructions with
+    | limit when limit > 0 && n >= limit -> Some limit
+    | _ -> None
+
+  let collectUserStopReasons point (opts: ConcRunOptions) =
+    opts.StopConditions
+    |> List.choose (function
+      | ConcStopCondition.StopWhen predicate when predicate.Invoke point ->
+        Some(ConcStopReason.UserStopConditionMet point.Address)
+      | _ ->
+        None)
+
+  let collectPreInstrStopReasons point (opts: ConcRunOptions) =
+    let addr, n = point.Address, point.InstructionCount
+    let reasons =
+      opts.StopConditions
+      |> List.choose (function
+        | ConcStopCondition.StopAtAddress stopAddr when stopAddr = addr ->
+          Some(ConcStopReason.StoppedAtAddress addr)
+        | _ ->
+          None)
+    match isInstructionLimitReached n opts with
+    | Some limit ->
+      reasons @ [ ConcStopReason.InstructionLimitReached(addr, limit) ]
+    | None ->
+      reasons
+
+  let collectInstrStopReasons opts st addr (ins: IInstruction) stmts =
+    [ if hasStopAtReturn opts && isReturnTaken opts st ins stmts then
+        ConcStopReason.StoppedAtReturn addr
+      else
+        ()
+      if stopAtCall opts ins then
+        let target = tryGetDirectTarget ins
+        ConcStopReason.StoppedAtCall(addr, target)
+      else
+        () ]
+
+  let collectPostInstrStopReasons opts st addr (ins: IInstruction) stmts =
+    let reasons =
+      opts.StopConditions
+      |> List.choose (function
+        | ConcStopCondition.StopAfterAddress stopAddr when stopAddr = addr ->
+          Some(ConcStopReason.StoppedAfterAddress addr)
+        | _ ->
+          None)
+    if hasStopAfterReturn opts && isReturnTaken opts st ins stmts then
+      reasons @ [ ConcStopReason.StoppedAfterReturn addr ]
+    else
+      reasons
+
+  let evalInstr opts (st: ConcState) stmts =
+    st.PrepareInstrEval stmts
+    match StmtLoop.run (step opts) StmtLoop.whileOk st stmts with
+    | Interrupted(Result.Error stop) -> stop
+    | _ -> EvalOk
+
+  let isInternalTarget target = hdl.File.IsValidAddr target
+
+  let callFailure (ctx: CallContext) msg =
+    ConcStopReason.CallHandlingFailure(ctx.CallSite, Some ctx.Target, msg)
+    |> Result.Error
+
+  let pushReturnAddress (ctx: CallContext) (st: ConcState) =
+    let accessor = ConcStateAccessor(hdl, st)
+    match accessor.TryPushToStack(accessor.WordValue ctx.ReturnAddress) with
+    | Ok _ -> Ok()
+    | Result.Error e -> callFailure ctx $"Cannot push a return address: {e}."
+
+  let finishHook (ctx: CallContext) (st: ConcState) =
+    match ConcStateAccessor(hdl, st).TryPopFromStack() with
+    | Ok v ->
+      let retAddr = v.ToUInt64()
+      if retAddr = ctx.ReturnAddress then
+        st.PC <- ctx.ReturnAddress
+        Ok()
+      else
+        callFailure ctx $"A hook returned to {retAddr:x}."
+    | Result.Error e ->
+      callFailure ctx $"A hook left the stack unbalanced: {e}."
+
+  let dispatchCallHook (ctx: CallContext) hook (st: ConcState) =
+    match pushReturnAddress ctx st with
+    | Result.Error reason ->
+      Result.Error reason
+    | Ok() ->
+      match hook ctx st with
+      | Ok() -> finishHook ctx st
+      | Result.Error msg -> callFailure ctx msg
+
+  let isExternalTarget target = not (isInternalTarget target)
+
+  let callHandlingFailure addr target msg =
+    ConcStopReason.CallHandlingFailure(addr, target, msg)
+    |> Result.Error
+    |> Some
+
+  let tryHandleCall (opts: ConcRunOptions) st addr ins =
+    if not (ins: IInstruction).IsCall then
+      None
+    else
+      let target = tryGetDirectTarget ins
+      match opts.Calls, target with
+      | CallPolicy.FollowDirectInternalCalls, Some t
+        when isExternalTarget t ->
+        let msg = $"A direct call targets {t:x}, outside the binary."
+        callHandlingFailure addr target msg
+      | CallPolicy.UseCallHooks hooks, Some t ->
+        match hooks.TryFind t with
+        | Some hook ->
+          let returnAddress = liftCache.FallThroughAddr(addr, ins.Length)
+          let ctx = CallContext.Create(hdl, addr, t, returnAddress)
+          Some(dispatchCallHook ctx hook st)
+        | None when isInternalTarget t ->
+          None
+        | None ->
+          let msg = $"No call hook is registered for {t:x}."
+          callHandlingFailure addr target msg
+      | CallPolicy.UseCallHooks _, None ->
+        let msg = "Cannot dispatch a call hook without a direct target."
+        callHandlingFailure addr None msg
+      | _ ->
+        None
+
+  let evalCallOrInstr opts st addr ins stmts =
+    match tryHandleCall opts st addr ins with
+    | Some(Ok()) -> EvalOk
+    | Some(Result.Error reason) -> EvalStopped reason
+    | None -> evalInstr opts st stmts
+
+  let invalidInstr (st: ConcState) reasons addr n =
+    let reason = ConcStopReason.InvalidInstructionAddress addr
+    mkResult (reasons @ [ reason ]) addr n st
+
+  let mkStopPoint (st: ConcState) addr n ins stmts =
+    { Address = addr
+      InstructionCount = n
+      Instruction = ins
+      Statements = stmts
+      State = st }
+
+  let rec runLoop
+    (ct: CancellationToken)
+    (st: ConcState)
+    (opts: ConcRunOptions)
+    n =
+    ct.ThrowIfCancellationRequested()
+    let addr = st.PC
+    let parsed = liftCache.TryParse addr
+    let point = mkStopPoint st addr n (Result.toOption parsed) [||]
+    let reasons = collectPreInstrStopReasons point opts
+    match parsed with
+    | Result.Error _ ->
+      let reasons = reasons @ collectUserStopReasons point opts
+      invalidInstr st reasons addr n
+    | Ok ins ->
+      match liftCache.TryLift addr with
+      | Result.Error _ ->
+        let point = mkStopPoint st addr n (Some ins) [||]
+        let reasons = reasons @ collectUserStopReasons point opts
+        invalidInstr st reasons addr n
+      | Ok lifted ->
+        let stmts = lifted.Stmts
+        let point = mkStopPoint st addr n (Some ins) stmts
+        let reasons = reasons @ collectUserStopReasons point opts
+        let reasons = reasons @ collectInstrStopReasons opts st addr ins stmts
+        let postReasons = collectPostInstrStopReasons opts st addr ins stmts
+        if List.isEmpty reasons then
+          match evalCallOrInstr opts st addr ins stmts with
+          | EvalOk ->
+            if List.isEmpty postReasons then runLoop ct st opts (n + 1)
+            else mkResult postReasons st.PC (n + 1) st
+          | EvalStopped reason ->
+            mkResult [ reason ] st.PC n st
+          | EvalError e ->
+            mkResult [ ConcStopReason.EvaluationError(addr, e) ] st.PC n st
+          | EvalUndef ->
+            mkResult [ ConcStopReason.UndefinedValue addr ] st.PC n st
+          | EvalSideEffect eff ->
+            let reason = ConcStopReason.StoppedAtSideEffect(addr, eff)
+            mkResult [ reason ] st.PC n st
+        else
+          mkResult reasons addr n st
+
+  let run (ct: CancellationToken) start (st: ConcState) (opts: ConcRunOptions) =
+    st.PC <- start
+    runLoop ct st opts 0
+
+  /// Create a fresh concrete evaluation state.
+  member _.CreateState() = initializeState 0UL defaultStateCreationOptions
+
+  /// Create a concrete evaluation state with the given initial memory and
+  /// register values. Since the start address is not known yet, initialize
+  /// PC to zero here; Run will set it to the actual start address.
+  member _.CreateState options = initializeState 0UL options
+
+  /// Runs concrete execution from the given address. Besides the configured
+  /// stop conditions, a run always ends when an instruction cannot be parsed
+  /// or lifted, when statement evaluation fails, or when an undefined value is
+  /// observed under StopOnUndefinedValue; the stop reason says which.
+  member _.Run(start, state, options) =
+    run CancellationToken.None start state options
+
+  /// Runs concrete execution while observing the given cancellation token.
+  member _.Run(start, state, options, ct) =
+    run ct start state options
+
+  /// Runs concrete execution from the given address with the default options
+  /// for the given stop condition.
+  member _.Run(start, state, stopCondition: ConcStopCondition) =
+    ConcRunOptions.Default stopCondition
+    |> run CancellationToken.None start state
+
+  interface IExecutor<ConcState,
+                      IMemory<byte>,
+                      BitVector,
+                      ConcRunOptions,
+                      ConcRunResult> with
+    /// Create a fresh concrete evaluation state.
+    member this.CreateState() = this.CreateState()
+
+    /// Create a concrete evaluation state with the given initial memory and
+    /// register values. Since the start address is not known yet, initialize
+    /// PC to zero here; Run will set it to the actual start address.
+    member this.CreateState options = this.CreateState options
+
+    /// Run concrete execution from the given address.
+    member this.Run(start, state, options) = this.Run(start, state, options)

@@ -1,0 +1,223 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+module B2R2.RearEnd.Transformer.Program
+
+open System
+open System.IO
+open B2R2
+open B2R2.RearEnd.Utils
+
+let private usage = $"""[Usage]
+b2r2 transformer [-d file] [action] (-- [action] ...){"\n"}
+Transformer runs a chain of transforming actions (IAction). An action takes in a
+collection of objects as input and returns another collection of objects as
+output. Any number of actions can be chained together as long as their types
+match. Users can define their own action(s) by implementing the IAction
+interface.{"\n"}
+[Options]{"\n"}
+-d <dll file>  : Load a dll file defining custom actions.{"\n"}
+[Actions]
+"""
+
+/// The `help` action.
+type private HelpAction(map: Map<string, IAction>) =
+  interface IAction with
+    member _.ActionID with get() = "help"
+    member _.Signature with get() = "'a -> 'b"
+    member _.Description with get() = ""
+    member _.Transform(_args, _) =
+      printsn ""
+      CmdOpts.writeIntro ()
+      printsn usage
+      map |> Map.iter (fun id act ->
+        let signature =
+          try
+            ActionMetadata.ofAction act |> ActionMetadata.typedSignature
+          with _ ->
+            act.Signature
+        printsn $"- {id}: {signature}"
+        printsn $"{act.Description}")
+      exit 0
+
+let private normalizeActionID (actionID: string) =
+  actionID.ToLowerInvariant()
+
+let private accumulateActions map actions =
+  actions
+  |> Array.fold (fun map t ->
+    let act = Activator.CreateInstance t :?> IAction
+    let actionID = normalizeActionID act.ActionID
+    if Map.containsKey actionID map then
+      invalidOp $"Duplicate action ID: {act.ActionID}"
+    else
+      Map.add actionID act map) map
+
+let inline private filterIActionType types =
+  (types: System.Type[])
+  |> Array.filter (fun t ->
+    t.IsPublic
+    && (t.GetInterface(nameof IAction) |> isNull |> not))
+
+let private loadUserDLL dllPath =
+  TransformerPluginLoader.exportedTypes dllPath
+  |> filterIActionType
+  |> accumulateActions Map.empty
+
+let private retrieveActionMap map =
+  let actionType = typeof<IAction>
+  let map =
+    actionType.Assembly.GetExportedTypes()
+    |> filterIActionType
+    |> accumulateActions map
+  let helpAction = HelpAction map :> IAction
+  Map.add (normalizeActionID helpAction.ActionID) helpAction map
+
+let private splitBySpecialSeparators (args: string list) =
+  args
+  |> List.collect (fun arg ->
+    arg.Replace("--", " -- ").Replace(",", " , ")
+      .Split(' ', StringSplitOptions.RemoveEmptyEntries) |> Array.toList)
+
+let rec private breakCommandByComma cmds cmd = function
+  | [] ->
+    List.rev (List.rev cmd :: cmds)
+  | "," :: rest ->
+    let cmds = if List.isEmpty cmd then cmds else (List.rev cmd) :: cmds
+    breakCommandByComma cmds [] rest
+  | arg :: rest ->
+    breakCommandByComma cmds (arg :: cmd) rest
+
+let private accumulateIfNotEmpty grp acc =
+  if List.isEmpty grp then acc else List.rev grp :: acc
+
+let rec private parseActionCommands grps grp = function
+  | [] ->
+    List.rev (accumulateIfNotEmpty grp grps)
+  | "--" :: rest ->
+    let grps = if List.isEmpty grp then grps else accumulateIfNotEmpty grp grps
+    parseActionCommands grps [] rest
+  | arg :: rest ->
+    parseActionCommands grps (arg :: grp) rest
+
+let private checkValidityOfCommandGroup cmdgrp =
+  let actionIDs =
+    cmdgrp
+    |> List.map (List.tryHead >> Option.map normalizeActionID)
+  let fstActionID = List.head actionIDs
+  if actionIDs |> List.forall (fun actionID -> actionID = fstActionID) then
+    ()
+  else
+    eprintsn "different actions in the same group."
+    exit 1
+
+let private runCommand actionMap input (cmd: string list) =
+  let actionID = List.head cmd
+  let normalizedID = normalizeActionID actionID
+  let args = List.tail cmd
+  let action: IAction =
+    match Map.tryFind normalizedID actionMap with
+    | Some act ->
+      act
+    | None ->
+      eprintsn $"({actionID}) is not a valid action."
+      exit 1
+#if DEBUG
+  if normalizedID <> "help" then
+    printsn $"[*] {actionID}"
+  else
+    ()
+#endif
+  try
+    action.Transform(args, input)
+  with
+    | :? InvalidCastException ->
+      eprintsn $"({actionID}) action type mismatch."
+      exit 1
+    | :? NullReferenceException ->
+      eprintsn $"({actionID}) action should follow another."
+      exit 1
+    | :? ArgumentException as e ->
+      eprintsn $"{e.Message}"
+      exit 1
+    | e ->
+      eprintsn $"({actionID}): {e}"
+      exit 1
+
+let inline private unwrap (c: ObjCollection) = c.Values
+
+let autoPrint actionMap collection =
+  if collection.Values.Length = 0 then
+    ()
+  else
+    runCommand actionMap collection [ "print" ] |> ignore
+
+let private parseActions args actionMap =
+  args
+  |> splitBySpecialSeparators
+  |> parseActionCommands [] []
+  |> List.map (breakCommandByComma [] [])
+  |> List.fold (fun input cmdgrp ->
+    checkValidityOfCommandGroup cmdgrp
+    { Values = cmdgrp
+               |> List.map (fun cmd -> runCommand actionMap input cmd |> unwrap)
+               |> Array.concat }
+  ) { Values = [| () |] }
+  |> autoPrint actionMap
+
+[<EntryPoint>]
+let main argv =
+  match List.ofArray argv with
+  | "script" :: path :: [] ->
+    let code = ActionRegistry.create None |> fun registry ->
+      TransformerRepl.runScript registry path
+    exit code
+  | "script" :: "-d" :: file :: path :: [] ->
+    let code = ActionRegistry.create (Some file) |> fun registry ->
+      TransformerRepl.runScript registry path
+    exit code
+  | "script" :: _ ->
+    eprintsn "Usage: transformer script [-d <dll file>] <script file>"
+    exit 1
+  | "repl" :: [] ->
+    ActionRegistry.create None |> TransformerRepl.run
+  | "repl" :: "-d" :: file :: [] ->
+    ActionRegistry.create (Some file) |> TransformerRepl.run
+  | "repl" :: _ ->
+    eprintsn "Usage: transformer repl [-d <dll file>]"
+    exit 1
+  | [] ->
+    retrieveActionMap Map.empty
+    |> parseActions [ "help" ]
+    |> ignore
+  | "-d" :: file :: args ->
+    loadUserDLL file
+    |> retrieveActionMap
+    |> parseActions args
+    |> ignore
+  | args ->
+    retrieveActionMap Map.empty
+    |> parseActions args
+    |> ignore
+  0

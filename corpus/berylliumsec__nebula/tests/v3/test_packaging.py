@@ -1,0 +1,775 @@
+import ast
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import tomli
+import yaml
+
+from scripts.build_nebula_core import (
+    macos_codesign_arguments,
+    require_runtime_imports,
+    stage_runtime_payload,
+)
+from scripts.nebula3_version import (
+    VersionSyncError,
+    check_versions,
+    read_versions,
+    set_version,
+)
+from scripts.package_audit import (
+    FORBIDDEN_MODULES,
+    REQUIRED_MEMBERS,
+    ArtifactAuditError,
+    inspect_installer_tree,
+    validate_members,
+)
+from scripts.stage_playwright_runtime import (
+    PlaywrightRuntimeStageError,
+    stage_playwright_runtime,
+)
+
+ROOT = Path(__file__).resolve().parents[2]
+CURRENT_VERSION = (ROOT / "NEBULA3_VERSION").read_text(encoding="utf-8").strip()
+
+
+def test_nebula3_version_is_synchronized_across_every_package():
+    assert check_versions(ROOT, expected=CURRENT_VERSION) == CURRENT_VERSION
+
+
+def test_native_launcher_and_admin_command_contract():
+    with (ROOT / "pyproject.toml").open("rb") as stream:
+        scripts = tomli.load(stream)["tool"]["poetry"]["scripts"]
+    assert scripts == {
+        "nebula-core": "nebula.v3.cli:main",
+        "nebula-browserd": "nebula.v3.browserd:main",
+    }
+
+    linux_launcher = (ROOT / "packaging/linux/nebula").read_text(encoding="utf-8")
+    assert 'exec /usr/bin/nebula-ui "$@"' in linux_launcher
+    assert "exec /usr/bin/nebula-core" not in linux_launcher
+
+    assert not (ROOT / "packaging/homebrew/nebula.rb.in").exists()
+
+
+def test_protected_release_distribution_is_linux_x86_64_only():
+    paths = [
+        ROOT / ".github/workflows/nebula3-release.yml",
+        ROOT / ".github/workflows/nebula3-release-finalize.yml",
+        ROOT / ".github/workflows/publish-updater-manifest.yml",
+    ]
+    workflows = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+    assert "Nebula-$VERSION-linux-x86_64.AppImage" in workflows
+    assert "Nebula-$VERSION-linux-x86_64.deb" in workflows
+    for unsupported in (
+        "APPLE_",
+        "darwin-aarch64",
+        "macOS-arm64",
+        "macos-15",
+        "notarytool",
+    ):
+        assert unsupported not in workflows
+
+
+def test_protected_release_jobs_do_not_create_deployment_records():
+    jobs = {
+        "nebula3-release.yml": "build",
+        "nebula3-release-finalize.yml": "draft-release",
+        "publish-updater-manifest.yml": "manifest",
+    }
+    for workflow_name, job_name in jobs.items():
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows" / workflow_name).read_text(encoding="utf-8")
+        )
+        assert workflow["jobs"][job_name]["environment"] == {
+            "name": "desktop-release",
+            "deployment": False,
+        }
+
+
+def test_desktop_release_record_follows_successful_updater_deployment_and_uses_tag():
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/publish-updater-manifest.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    job = workflow["jobs"]["record-desktop-release"]
+    assert job["needs"] == ["manifest", "deploy"]
+    assert job["environment"] == {"name": "desktop-release", "deployment": False}
+    assert job["permissions"] == {"contents": "read", "deployments": "write"}
+    step = job["steps"][0]
+    assert step["env"]["RELEASE_TAG"] == (
+        "${{ github.event.release.tag_name || inputs.release_tag }}"
+    )
+    record = step["run"]
+    assert 'gh release view "$RELEASE_TAG"' in record
+    assert "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" in record
+    assert '-f ref="$RELEASE_TAG"' in record
+    assert "-F auto_merge=false" in record
+    assert "required_contexts" not in record
+    assert "-f state=success" in record
+    assert '-f environment_url="$release_url"' in record
+
+
+def test_release_entry_points_require_an_admin_before_using_release_credentials():
+    for workflow_name in ("nebula3-release.yml", "nebula3-release-finalize.yml"):
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows" / workflow_name).read_text(encoding="utf-8")
+        )
+        steps = workflow["jobs"]["validate"]["steps"]
+        guard = steps[0]
+        assert guard["env"]["RELEASE_ACTOR"] == "${{ github.actor }}"
+        assert "collaborators/$RELEASE_ACTOR/permission" in guard["run"]
+        assert 'test "$permission" = admin' in guard["run"]
+        assert "actions/checkout" in steps[1]["uses"]
+
+
+def test_updater_publication_requires_admin_before_protected_job():
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/publish-updater-manifest.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    guard = workflow["jobs"]["validate-admin"]["steps"][0]
+    assert guard["env"]["RELEASE_ACTOR"] == "${{ github.actor }}"
+    assert "collaborators/$RELEASE_ACTOR/permission" in guard["run"]
+    assert 'test "$permission" = admin' in guard["run"]
+    assert workflow["jobs"]["manifest"]["needs"] == "validate-admin"
+
+
+def test_apt_repository_scaffold_is_secret_free_and_verifies_promotions():
+    repository = ROOT / "packaging/repositories/nebula-apt"
+    required = (
+        ".github/workflows/ci.yml",
+        ".github/workflows/promote.yml",
+        ".github/workflows/publish.yml",
+        "scripts/build-repository.sh",
+        "scripts/channel_policy.py",
+        "scripts/promote.py",
+        "scripts/smoke-test.sh",
+        "scripts/verify_release_checksum.py",
+        "channels.json",
+    )
+    for relative in required:
+        assert (repository / relative).is_file()
+
+    workflows = "\n".join(
+        (repository / relative).read_text(encoding="utf-8")
+        for relative in (
+            ".github/workflows/promote.yml",
+            ".github/workflows/publish.yml",
+        )
+    )
+    assert "gh attestation verify" in workflows
+    assert "APT_SIGNING_SUBKEY" in workflows
+    assert "scripts/verify_release_checksum.py" in workflows
+    assert "test -s nebula-archive-keyring.asc" in workflows
+    assert 'test "$secret_fingerprint" = "$public_fingerprint"' in workflows
+    assert '$1 == "sec" && $15 == "#"' in workflows
+    assert '$1 == "ssb" && $12 ~ /s/ && $15 == "+"' in workflows
+    assert "needs: validate" in workflows
+    smoke = (repository / "scripts/smoke-test.sh").read_text(encoding="utf-8")
+    for image in ("ubuntu:24.04", "debian:12-slim", "kalilinux/kali-rolling:latest"):
+        assert image in smoke
+    builder = (repository / "scripts/build-repository.sh").read_text(encoding="utf-8")
+    assert 'dpkg-scanpackages --multiversion "pool/$channel"' in builder
+    assert "dpkg-scanpackages --arch" not in builder
+    assert "Require repository admin for APT publication" in workflows
+    assert 'test "$permission" = admin' in workflows
+    assert 'dpkg-deb -f "$deb" Architecture' in builder
+    assert 'chmod -R u=rwX,go=rX "$public"' in builder
+    assert "BEGIN PGP PRIVATE KEY BLOCK" not in workflows
+    assert "macos-" not in workflows
+    assert "Homebrew" not in workflows
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            str(repository / "tests"),
+            "-q",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+
+def test_release_stages_and_smoke_tests_bundled_playwright_chromium_only_on_deploy():
+    release = (ROOT / ".github/workflows/nebula3-release.yml").read_text(
+        encoding="utf-8"
+    )
+    continuous_integration = (ROOT / ".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+    playwright_impact = (ROOT / ".github/workflows/playwright-impact.yml").read_text(
+        encoding="utf-8"
+    )
+    command = "python -m scripts.stage_playwright_runtime"
+    assert command in release
+    assert command not in continuous_integration
+    assert "impact-baseline:" in release
+    assert "sandbox-integration:" in release
+    assert "playwright:" in release
+    assert (
+        "needs: [validate, impact-baseline, sandbox-integration, playwright]" in release
+    )
+    assert "npm --prefix ui run test:e2e" in playwright_impact
+    assert (
+        "name: Retain browser failure and retry evidence\n        if: always()"
+        in playwright_impact
+    )
+    assert (
+        "name: playwright-failure-${{ strategy.job-index }}-${{ matrix.project }}"
+        in playwright_impact
+    )
+    assert "path: ui/test-results/" in playwright_impact
+    assert "npm --prefix ui run test:e2e" not in continuous_integration
+    assert "ui/src-tauri/resources/playwright-browsers" in release
+    assert "NO_STRIP=1 NEBULA_DISTRIBUTION=direct" in release
+    assert (
+        "-name chrome -o -name headless_shell -o -name chrome-headless-shell" in release
+    )
+    assert "--dump-dom about:blank" in release
+
+
+def test_linux_deb_declares_bundled_chromium_runtime_dependencies():
+    tauri = json.loads(
+        (ROOT / "ui/src-tauri/tauri.conf.json").read_text(encoding="utf-8")
+    )
+
+    assert set(tauri["bundle"]["linux"]["deb"]["depends"]) >= {
+        "libnspr4",
+        "libnss3",
+    }
+
+
+def test_updater_manifest_supports_validated_recovery_with_native_libraries():
+    workflow = (ROOT / ".github/workflows/publish-updater-manifest.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "workflow_dispatch:" in workflow
+    assert "release_tag:" in workflow
+    assert "Resolve published release metadata" in workflow
+    assert "test \"$(jq -r '.isDraft'" in workflow
+    assert "libwebkit2gtk-4.1-dev" in workflow
+    assert "libappindicator3-dev" in workflow
+    assert "librsvg2-dev" in workflow
+    assert "Prepare compile-time sidecar boundary" in workflow
+    assert "build/nebula-core-metadata/THIRD_PARTY_NOTICES.txt" in workflow
+    assert 'touch "ui/src-tauri/binaries/nebula-core-$target"' in workflow
+
+
+def test_python_source_tree_contains_only_core_namespace():
+    package_root = ROOT / "src/nebula"
+    unexpected = sorted(
+        path.name
+        for path in package_root.iterdir()
+        if path.name not in {"__init__.py", "__pycache__", "v3"}
+    )
+    assert unexpected == []
+
+
+def test_nebula2_publish_workflow_is_removed():
+    assert not (ROOT / ".github/workflows/publish.yml").exists()
+
+
+def test_version_cli_supports_release_check_contract():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/nebula3_version.py",
+            "check",
+            "--expected",
+            CURRENT_VERSION,
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == CURRENT_VERSION
+
+
+def test_core_build_script_supports_direct_path_imports(tmp_path):
+    script = ROOT / "scripts" / "build_nebula_core.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import runpy; "
+                f"runpy.run_path({str(script)!r}, run_name='build_import_check')"
+            ),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def _version_fixture(root: Path) -> None:
+    (root / "src/nebula/v3").mkdir(parents=True)
+    (root / "ui/src-tauri").mkdir(parents=True)
+    (root / "NEBULA3_VERSION").write_text("3.0.0-alpha.1\n", encoding="utf-8")
+    (root / "pyproject.toml").write_text(
+        '[tool.poetry]\nname = "nebula-ai"\nversion = "3.0.0-alpha.1"\n',
+        encoding="utf-8",
+    )
+    (root / "src/nebula/v3/version.py").write_text(
+        '__version__ = "3.0.0-alpha.1"\n', encoding="utf-8"
+    )
+    (root / "ui/src-tauri/tauri.conf.json").write_text(
+        json.dumps({"version": "3.0.0-alpha.1"}), encoding="utf-8"
+    )
+    (root / "ui/src-tauri/Cargo.toml").write_text(
+        '[package]\nname = "nebula-ui"\nversion = "3.0.0-alpha.1"\n',
+        encoding="utf-8",
+    )
+    (root / "ui/src-tauri/Cargo.lock").write_text(
+        'version = 4\n\n[[package]]\nname = "a-dependency"\nversion = "1.0.0"\n\n'
+        '[[package]]\nname = "nebula-ui"\nversion = "3.0.0-alpha.1"\n',
+        encoding="utf-8",
+    )
+    (root / "ui/package.json").write_text(
+        json.dumps({"name": "nebula-ui", "version": "3.0.0-alpha.1"}),
+        encoding="utf-8",
+    )
+    (root / "ui/package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "nebula-ui",
+                "version": "3.0.0-alpha.1",
+                "packages": {"": {"name": "nebula-ui", "version": "3.0.0-alpha.1"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_set_version_updates_every_nebula3_source(tmp_path):
+    _version_fixture(tmp_path)
+    set_version(tmp_path, "3.1.0-rc.2")
+    assert set(read_versions(tmp_path).values()) == {"3.1.0-rc.2"}
+
+
+def test_version_check_reports_all_mismatched_sources(tmp_path):
+    _version_fixture(tmp_path)
+    package = tmp_path / "ui/package.json"
+    package.write_text(
+        json.dumps({"name": "nebula-ui", "version": "3.0.0-alpha.2"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(VersionSyncError, match="package.json='3.0.0-alpha.2'"):
+        check_versions(tmp_path)
+
+
+def test_runtime_dependency_boundary_rejects_removed_stacks():
+    with (ROOT / "pyproject.toml").open("rb") as stream:
+        project = tomli.load(stream)["tool"]["poetry"]
+    runtime = {name.lower() for name in project["dependencies"]}
+    assert {
+        "fastapi",
+        "sqlalchemy",
+        "langgraph",
+        "regex",
+        "boto3",
+        "pypdf",
+        "reportlab",
+        "pillow",
+        "chromadb",
+    } <= runtime
+    assert not ({"pyqt6", "torch", "transformers"} & runtime)
+    assert "legacy" not in project.get("group", {})
+    assert "legacy-dev" not in project.get("group", {})
+    assert "pytest-qt" not in {
+        name.lower() for name in project["group"]["dev"]["dependencies"]
+    }
+    assert "regex" not in {name.lower() for name in FORBIDDEN_MODULES}
+
+
+def test_core_build_bundles_dynamic_chroma_runtime_modules():
+    build_script = (ROOT / "scripts" / "build_nebula_core.py").read_text(
+        encoding="utf-8"
+    )
+    for module in (
+        "chromadb.api.rust",
+        "chromadb.telemetry.product.posthog",
+        "chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2",
+        "onnxruntime",
+        "tokenizers",
+        "tqdm",
+    ):
+        assert module in build_script
+
+
+def test_core_build_fails_before_freezing_when_playwright_is_absent(monkeypatch):
+    def missing_import(name: str):
+        raise ModuleNotFoundError("missing", name=name)
+
+    monkeypatch.setattr(
+        "scripts.build_nebula_core.importlib.import_module", missing_import
+    )
+
+    with pytest.raises(RuntimeError, match=r"poetry install --with dev"):
+        require_runtime_imports()
+
+
+def test_core_archive_rejects_nltk_and_its_pyinstaller_runtime_hook():
+    for member in ("nltk", "nltk/tokenize/casual.py", "pyi_rth_nltk.py"):
+        with pytest.raises(ArtifactAuditError, match="forbidden members"):
+            validate_members([member])
+
+
+def test_core_archive_requires_timeout_capable_regex_runtime():
+    with pytest.raises(ArtifactAuditError, match="required members absent: regex"):
+        validate_members(["nebula.v3.cli", "nebula.v3.mcp_gateway"])
+
+
+def test_core_archive_requires_playwright_module_and_driver():
+    complete = {
+        candidate for alternatives in REQUIRED_MEMBERS for candidate in alternatives[:1]
+    }
+    for missing in ("playwright.sync_api", "playwright/driver/node"):
+        with pytest.raises(ArtifactAuditError, match="required members absent"):
+            validate_members(complete - {missing})
+
+
+def test_nebula3_runtime_has_no_conditional_import_fallbacks():
+    conditional_imports = []
+    for path in sorted((ROOT / "src/nebula/v3").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for statement in node.body:
+                if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    conditional_imports.append(path.name)
+                    break
+    assert conditional_imports == []
+
+
+def test_macos_release_core_requires_embedded_binary_signing():
+    with pytest.raises(RuntimeError, match="APPLE_SIGNING_IDENTITY"):
+        macos_codesign_arguments(
+            platform="darwin", distribution="direct", identity=None
+        )
+    assert macos_codesign_arguments(
+        platform="darwin",
+        distribution="managed",
+        identity="Developer ID Application: Nebula",
+    ) == ["--codesign-identity", "Developer ID Application: Nebula"]
+    assert (
+        macos_codesign_arguments(
+            platform="linux", distribution="managed", identity=None
+        )
+        == []
+    )
+
+
+def test_core_payload_staging_excludes_caches_and_source_maps(tmp_path):
+    migrations = tmp_path / "src/nebula/v3/migrations"
+    frontend = tmp_path / "ui/dist/assets"
+    migrations.mkdir(parents=True)
+    frontend.mkdir(parents=True)
+    (migrations / "env.py").write_text("revision = 1\n", encoding="utf-8")
+    cache = migrations / "__pycache__"
+    cache.mkdir()
+    (cache / "env.cpython-312.pyc").write_bytes(b"cache")
+    (tmp_path / "ui/dist/index.html").write_text("<main></main>", encoding="utf-8")
+    (frontend / "app.js").write_text("export {};", encoding="utf-8")
+    (frontend / "app.js.map").write_text("{}", encoding="utf-8")
+
+    staged_migrations, staged_frontend = stage_runtime_payload(tmp_path)
+
+    assert (staged_migrations / "env.py").is_file()
+    assert not (staged_migrations / "__pycache__").exists()
+    assert (staged_frontend / "assets/app.js").is_file()
+    assert not (staged_frontend / "assets/app.js.map").exists()
+
+
+def test_playwright_runtime_staging_keeps_only_verified_generated_payload(tmp_path):
+    destination = tmp_path / "playwright-browsers"
+    destination.mkdir()
+    (destination / ".gitignore").write_text("*\n", encoding="utf-8")
+    (destination / "stale-browser").write_text("stale\n", encoding="utf-8")
+    commands: list[tuple[list[str], str]] = []
+
+    def install(command, *, env, check, text):
+        assert check is True
+        assert text is True
+        runtime = Path(env["PLAYWRIGHT_BROWSERS_PATH"])
+        executable = runtime / "chromium-test" / "chrome-linux" / "chrome"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"browser")
+        executable.chmod(0o755)
+        (executable.parent / "LICENSE.chromium").write_text(
+            "Chromium license\n",
+            encoding="utf-8",
+        )
+        commands.append((command, env["PLAYWRIGHT_BROWSERS_PATH"]))
+        return subprocess.CompletedProcess(command, 0)
+
+    manifest = stage_playwright_runtime(
+        destination,
+        target="x86_64-unknown-linux-gnu",
+        run=install,
+    )
+
+    assert not (destination / "stale-browser").exists()
+    assert (destination / ".gitignore").is_file()
+    assert manifest["browser"] == "chromium"
+    assert manifest["executables"] == ["chromium-test/chrome-linux/chrome"]
+    assert manifest["licenses"] == ["chromium-test/chrome-linux/LICENSE.chromium"]
+    assert commands[0][0][-3:] == ["install", "--no-shell", "chromium"]
+    assert commands[0][1] == str(destination.resolve())
+
+
+def test_linux_playwright_runtime_normalizes_rpath_before_recording_digest(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "playwright-browsers"
+    normalized: list[Path] = []
+
+    def install(command, *, env, check, text):
+        runtime = Path(env["PLAYWRIGHT_BROWSERS_PATH"])
+        executable = runtime / "chromium-test" / "chrome-linux" / "chrome"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"\x7fELForiginal")
+        executable.chmod(0o755)
+        (executable.parent / "LICENSE").write_text("license\n", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0)
+
+    def normalize(path):
+        normalized.append(path)
+        path.write_bytes(b"\x7fELFnormalized")
+        path.chmod(0o755)
+
+    monkeypatch.setattr(
+        "scripts.stage_playwright_runtime._normalize_linux_executable_rpath",
+        normalize,
+    )
+    manifest = stage_playwright_runtime(
+        destination,
+        target="x86_64-unknown-linux-gnu",
+        run=install,
+    )
+
+    executable = destination / "chromium-test/chrome-linux/chrome"
+    assert normalized == [executable]
+    assert manifest["executable_sha256"]["chromium-test/chrome-linux/chrome"] == (
+        hashlib.sha256(b"\x7fELFnormalized").hexdigest()
+    )
+
+
+def test_playwright_runtime_staging_rejects_a_symlink_destination(tmp_path):
+    target = tmp_path / "outside"
+    target.mkdir()
+    destination = tmp_path / "playwright-browsers"
+    destination.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(
+        PlaywrightRuntimeStageError,
+        match="cannot be a symbolic link",
+    ):
+        stage_playwright_runtime(
+            destination,
+            target="x86_64-unknown-linux-gnu",
+        )
+
+
+def test_desktop_dev_prepares_core_before_tauri_and_starts_vite_in_hook():
+    tauri = json.loads(
+        (ROOT / "ui/src-tauri/tauri.conf.json").read_text(encoding="utf-8")
+    )
+    package = json.loads((ROOT / "ui/package.json").read_text(encoding="utf-8"))
+
+    assert tauri["build"]["beforeDevCommand"] == "npm run dev"
+    assert package["scripts"]["dev:desktop"] == (
+        "npm run build && npm run build:core && tauri dev"
+    )
+    assert package["scripts"]["build:core"] == (
+        "poetry -C .. run python -m scripts.build_nebula_core"
+    )
+    assert tauri["bundle"]["externalBin"] == ["binaries/nebula-core"]
+    assert (
+        "../../build/nebula-core-metadata/THIRD_PARTY_NOTICES.txt"
+        in tauri["bundle"]["resources"]
+    )
+    assert (
+        tauri["bundle"]["resources"]["resources/playwright-browsers"]
+        == "playwright-browsers"
+    )
+
+
+def test_artifact_member_audit_accepts_only_complete_v3_payload():
+    result = validate_members(
+        {
+            "nebula.v3.cli",
+            "nebula.v3.mcp_gateway",
+            "regex",
+            "reportlab",
+            "PIL",
+            "playwright.sync_api",
+            "playwright/driver/node",
+            "nebula/v3/BUILD_INFO.json",
+            "nebula/v3/migrations/script.py.mako",
+            "nebula/v3/kali_tool_inventory.py",
+            "nebula/v3/egress_helper.py",
+            "nebula/v3/public_ip_update.py",
+            "nebula/v3/terminal_entrypoint.sh",
+            "nebula/v3/mcp_gateway.py",
+            "nebula/v3/operator_help.md",
+            "nebula/v3/product_knowledge.sqlite3.b85",
+            "nebula/v3/diagnostic_guidance.json",
+            "nebula/v3/assistant_destinations.json",
+            "nebula/v3/report_assets/fonts/NotoSans-Regular.ttf",
+            "nebula/v3/report_assets/fonts/NotoSans-Bold.ttf",
+            "nebula/v3/report_assets/fonts/NotoSansMono-Regular.ttf",
+            "nebula/v3/report_assets/fonts/NotoSansMono-Bold.ttf",
+            "nebula/v3/report_assets/fonts/OFL.txt",
+            "ui/dist/index.html",
+            "licenses/LICENSE.md",
+            "licenses/THIRD_PARTY_NOTICES.txt",
+        }
+    )
+    assert result["status"] == "ok"
+
+
+def test_core_bundles_and_audits_every_source_file_read_beside_its_module():
+    # sandbox.py copies helper files next to itself into the Kali image build
+    # context; a frozen Core without them cannot prepare the workstation image.
+    source_root = ROOT / "src" / "nebula" / "v3"
+    read_beside_module: set[str] = set()
+    for module in source_root.glob("*.py"):
+        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "with_name"
+                and ast.unparse(node.func.value) == "Path(__file__)"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and (source_root / str(node.args[0].value)).is_file()
+            ):
+                read_beside_module.add(str(node.args[0].value))
+    assert {"public_ip_update.py", "terminal_entrypoint.sh"} <= read_beside_module
+
+    build_script = (ROOT / "scripts" / "build_nebula_core.py").read_text(
+        encoding="utf-8"
+    )
+    audited = {member for aliases in REQUIRED_MEMBERS for member in aliases}
+    for name in sorted(read_beside_module):
+        assert f'"{name}"' in build_script, f"{name} is not bundled"
+        assert f"nebula/v3/{name}" in audited, f"{name} is not audited"
+
+
+@pytest.mark.parametrize(
+    "forbidden", ["PyQt6.QtCore", "PySide6.QtCore", "torch", "_pytest.outcomes"]
+)
+def test_artifact_member_audit_rejects_gui_or_heavy_payload(forbidden):
+    with pytest.raises(ArtifactAuditError, match="forbidden members"):
+        validate_members(
+            {
+                "nebula.v3.cli",
+                "nebula/v3/BUILD_INFO.json",
+                "nebula/v3/migrations/script.py.mako",
+                "ui/dist/index.html",
+                "licenses/LICENSE.md",
+                "licenses/THIRD_PARTY_NOTICES.txt",
+                forbidden,
+            }
+        )
+
+
+def test_artifact_member_audit_fails_when_legal_payload_is_absent():
+    with pytest.raises(ArtifactAuditError, match="THIRD_PARTY_NOTICES"):
+        validate_members(
+            {
+                "nebula.v3.cli",
+                "nebula/v3/BUILD_INFO.json",
+                "nebula/v3/migrations/script.py.mako",
+                "ui/dist/index.html",
+                "licenses/LICENSE.md",
+            }
+        )
+
+
+def test_artifact_member_audit_rejects_build_residue():
+    with pytest.raises(ArtifactAuditError, match="build residue"):
+        validate_members(
+            {
+                "nebula.v3.cli",
+                "nebula/v3/BUILD_INFO.json",
+                "nebula/v3/migrations/script.py.mako",
+                "nebula/v3/migrations/__pycache__/env.cpython-312.pyc",
+                "ui/dist/index.html",
+                "licenses/LICENSE.md",
+                "licenses/THIRD_PARTY_NOTICES.txt",
+            }
+        )
+
+
+def test_installer_tree_gate_requires_legal_files_and_rejects_toolchains(tmp_path):
+    binary = tmp_path / "usr/bin"
+    legal = tmp_path / "usr/share/doc/nebula"
+    playwright_root = tmp_path / "usr/lib/nebula/playwright-browsers"
+    playwright = playwright_root / "chromium-test/chrome-linux"
+    binary.mkdir(parents=True)
+    legal.mkdir(parents=True)
+    playwright.mkdir(parents=True)
+    for name in ("nebula-ui", "nebula-core"):
+        (binary / name).write_bytes(b"binary")
+    (legal / "LICENSE").write_text("BSD\n", encoding="utf-8")
+    (legal / "THIRD_PARTY_NOTICES.txt").write_text("Notices\n", encoding="utf-8")
+    browser = playwright / "chrome"
+    browser.write_bytes(b"browser")
+    browser.chmod(0o755)
+    browser_sha256 = hashlib.sha256(b"browser").hexdigest()
+    (playwright / "LICENSE.chromium").write_text(
+        "Chromium license\n",
+        encoding="utf-8",
+    )
+    (playwright_root / "nebula-playwright-sbom.spdx.json").write_text(
+        json.dumps({"spdxVersion": "SPDX-2.3"}),
+        encoding="utf-8",
+    )
+    (
+        tmp_path / "usr/lib/nebula/playwright-browsers/nebula-playwright-runtime.json"
+    ).write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "browser": "chromium",
+                "playwright_version": "1.61.0",
+                "target": "x86_64-unknown-linux-gnu",
+                "payload_bytes": 7,
+                "executables": ["chromium-test/chrome-linux/chrome"],
+                "executable_sha256": {
+                    "chromium-test/chrome-linux/chrome": browser_sha256
+                },
+                "licenses": ["chromium-test/chrome-linux/LICENSE.chromium"],
+                "sbom": "nebula-playwright-sbom.spdx.json",
+                "provenance": {
+                    "installer": "python -m playwright install chromium",
+                    "browser_revision": "chromium-test",
+                    "target": "x86_64-unknown-linux-gnu",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert inspect_installer_tree(tmp_path)["status"] == "ok"
+
+    (binary / "python3").write_bytes(b"toolchain")
+    with pytest.raises(ArtifactAuditError, match="forbidden installer content"):
+        inspect_installer_tree(tmp_path)

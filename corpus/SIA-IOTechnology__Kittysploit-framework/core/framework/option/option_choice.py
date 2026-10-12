@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from core.framework.option.base_option import Option
+from core.utils.exceptions import OptionValidationError
+
+class OptChoice(Option):
+    """Option for selecting from a list of choices"""
+    
+    def __init__(self, default="", description="", required=False, choices=None, advanced=False):
+        """
+        Initialize a choice option
+        
+        Args:
+            default: Default value
+            description: Option description
+            required: Whether the option is required
+            choices: List of valid choices
+            advanced: Whether the option is advanced (hidden from basic show options)
+        """
+        self.choices = choices or []
+        
+        # Validate default value if provided
+        if default and self.choices and default not in self.choices:
+            raise OptionValidationError(f"Invalid default choice '{default}'. Valid choices: {', '.join(self.choices)}")
+        
+        super().__init__(default, description, required, advanced=advanced)
+    
+    def __get__(self, instance, owner):
+        """Get the value directly (returns the value, not the option object)"""
+        # If accessed via class (instance is None), return the descriptor
+        if instance is None:
+            return self
+        
+        # Get the value using parent's __get__ which already returns the value directly
+        return super().__get__(instance, owner)
+    
+    def __set__(self, instance, value):
+        # Validate the value before storing it (only if choices are defined)
+        if self.choices and value not in self.choices:
+            raise OptionValidationError(f"Invalid choice '{value}'. Valid choices: {', '.join(self.choices)}")
+        
+        # Store the value for this specific instance
+        instance_id = id(instance)
+        display_value = str(value) if value is not None else ""
+        
+        self._instance_values[instance_id] = {
+            'value': value,
+            'display_value': display_value
+        }
+        
+        # Update the default value for compatibility
+        self._default_value = value
+        self._default_display_value = display_value
+    
+    def validate(self, value):
+        if self.choices and value not in self.choices:
+            raise OptionValidationError(f"Invalid choice '{value}'. Valid choices: {', '.join(self.choices)}")
+        return value
+    
+    def display_value(self):
+        return str(self.value)

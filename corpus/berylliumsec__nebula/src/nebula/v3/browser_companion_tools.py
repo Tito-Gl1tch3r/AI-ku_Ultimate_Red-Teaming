@@ -1,0 +1,545 @@
+"""Identical provider and MCP dispatch for the operator-attached browser."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+from datetime import datetime, timezone
+from pathlib import Path
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
+from pydantic import ValidationError as PydanticValidationError
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+from .application_model.workflow import BROWSER_MODEL_WORKFLOW
+from .browser_companion import (
+    AssistantControlPaused,
+    BrowserCompanion,
+    CompanionRequest,
+    CompanionRequestRefused,
+)
+from .artifacts import ArtifactStore
+from .browser_engine import BrowserEngineRegistry
+from .domain import (
+    BrowserSession,
+    AutomationApprovalPolicy,
+    Artifact,
+    CompanionAction,
+    Engagement,
+    RiskClass,
+    ScopePolicy,
+    ToolCallStatus,
+)
+from .runtime_platform import RuntimeToolComponents
+from .storage import NebulaStore, NotFoundError
+from .policy import PolicyDecision, PolicyEffect
+from .tools import (
+    AmbiguousToolState,
+    InvalidToolArguments,
+    PolicyDenied,
+    StoreToolLedger,
+    ToolBrokerError,
+    ToolExecutionResult,
+    ToolSpec,
+    refused_before_execution,
+)
+
+
+# Operations that change the page: each is proposed for the operator's inline
+# approval unless the project policy approves scoped changes.
+PROPOSED_OPERATIONS = frozenset({"click", "fill", "select", "press", "upload"})
+
+
+def _paused_denial(reason: str) -> PolicyDenied:
+    """The operator withheld control: a denial to ask about, not an argument to
+    correct, and refused before the browser acted."""
+
+    denial = PolicyDenied(
+        PolicyDecision(
+            effect=PolicyEffect.DENY,
+            reason=reason,
+            rule="browser_companion_paused",
+        )
+    )
+    setattr(denial, "_nebula_before_execution", True)
+    return denial
+
+
+def _request_refusal(exc: CompanionRequestRefused) -> ToolBrokerError:
+    """The tool failure for a request the browser service refused unsent.
+
+    A named argument is one to correct; otherwise the project's scope refused
+    the page, a rule the model must not repeat against.
+    """
+
+    if exc.argument is not None:
+        return refused_before_execution(
+            InvalidToolArguments(f"Invalid value for {exc.argument}: {exc}")
+        )
+    return refused_before_execution(
+        PolicyDenied(
+            PolicyDecision(
+                effect=PolicyEffect.DENY,
+                reason=str(exc),
+                rule="browser_companion_scope",
+            )
+        )
+    )
+
+
+def _unavailable(message: str) -> NotFoundError:
+    """This browser is unavailable to the call, described as a missing
+    resource is, and nothing has run yet."""
+
+    return refused_before_execution(NotFoundError(message))
+
+
+def model_browser_result(value: Any) -> Any:
+    """Do not carry URL credentials, query tokens, or fragments into model results."""
+    if isinstance(value, list):
+        return [model_browser_result(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: model_browser_result(item) for key, item in value.items()}
+    if isinstance(result.get("url"), str):
+        parsed = urlsplit(result["url"])
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host += f":{parsed.port}"
+        result["url"] = urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    return result
+
+
+def companion_spec(
+    *, image_supported: bool = False, approval_policy: str = "on_boundary"
+) -> ToolSpec:
+    schema = CompanionRequest.model_json_schema()
+    schema["properties"]["operation"]["enum"] = [
+        operation
+        for operation in schema["properties"]["operation"]["enum"]
+        if operation not in {"new_tab", "close_tab"}
+    ]
+    schema["properties"]["url"] = {"type": "string", "minLength": 1, "maxLength": 16384}
+    schema["required"] = list(dict.fromkeys([*schema.get("required", []), "url"]))
+    if not image_supported:
+        schema["properties"]["capture_kind"]["enum"].remove("region")
+    return ToolSpec(
+        name="browser.companion",
+        version="1",
+        description=BROWSER_MODEL_WORKFLOW
+        + "Use the operator-attached visible browser. List tabs; navigate within project scope; capture bounded page or element text; highlight or scroll. "
+        + (
+            "The project policy allows scoped changes without an additional inline prompt. "
+            if approval_policy == "never"
+            else "Changes (click, fill, select, press, upload) create an inline operator approval and do not execute until approved. "
+        )
+        + "Read fresh page context before selecting element IDs. Credentials use credential_ref and uploads use file_ref. "
+        + (
+            "For a screenshot use capture with capture_kind region and viewport x, y, width, height. Captures are retained without field masking and can contain secrets."
+            if image_supported
+            else "Screenshot tools are unavailable for this runtime; page text remains available."
+        ),
+        input_schema=schema,
+        output_schema={"type": "object"},
+        risk_class=RiskClass.PASSIVE,
+        network_access=True,
+        target_argument="url",
+    )
+
+
+def attached_session(
+    store: NebulaStore, project_id: str, conversation_id: str | None
+) -> str | None:
+    if not conversation_id:
+        return None
+    sessions = store.find_entities(
+        BrowserSession,
+        {"metadata.conversation_id": conversation_id},
+        engagement_id=project_id,
+    )
+    return next(
+        (
+            item.id
+            for item in sessions
+            if item.metadata.get("browser_companion_version") == 1
+        ),
+        None,
+    )
+
+
+class CompanionBroker:
+    def __init__(
+        self,
+        store: NebulaStore,
+        session_id: str,
+        *,
+        artifact_store: ArtifactStore | None = None,
+        image_supported: bool = False,
+    ):
+        self.store = store
+        self.session_id = session_id
+        self.service = BrowserCompanion(
+            store, BrowserEngineRegistry(), artifact_store=artifact_store
+        )
+        self.artifact_store = artifact_store
+        self.image_supported = image_supported and artifact_store is not None
+        session = self._available_session()
+        self.spec = companion_spec(
+            image_supported=self.image_supported,
+            approval_policy=self.service.approval_policy(session.engagement_id).value,
+        )
+        self.ledger = StoreToolLedger(store)
+
+    def _available_session(self) -> BrowserSession:
+        """The session, or a refusal: closed, removed, native or revoked."""
+
+        try:
+            return self.service.session(self.session_id)
+        except (NotFoundError, ValueError) as exc:
+            # diagnostic-expected: re-raised as the unavailable resource it is,
+            # keeping the service's wording for the operator's view.
+            raise _unavailable(str(exc)) from exc
+
+    def approval_policy(self) -> AutomationApprovalPolicy:
+        session = self.service.session(self.session_id)
+        return self.service.approval_policy(session.engagement_id)
+
+    async def execute(
+        self, invocation: Any, scope: ScopePolicy, *, approval: Any = None
+    ) -> ToolExecutionResult:
+        session = self._available_session()
+        if (
+            invocation.tool_name != self.spec.name
+            or invocation.engagement_id != session.engagement_id
+            or scope.engagement_id != session.engagement_id
+        ):
+            # Another project's browser is unavailable to this call, described
+            # as a missing resource is, and nothing has run yet.
+            elsewhere = NotFoundError("Browser capability belongs to another project.")
+            setattr(elsewhere, "_nebula_before_execution", True)
+            raise elsewhere
+        if (
+            not invocation.chat_session_id
+            or session.metadata.get("conversation_id") != invocation.chat_session_id
+        ):
+            # The operator detached or moved the browser: the resource is
+            # unavailable to this conversation, and nothing has run yet. The
+            # harness gateway refuses the same state the same way.
+            detached = NotFoundError(
+                "This browser is no longer attached to this conversation."
+            )
+            setattr(detached, "_nebula_before_execution", True)
+            raise detached
+        if session.metadata.get("assistant_paused", True):
+            raise _paused_denial(
+                "Browser control is paused. Ask the operator to resume it beside the page."
+            )
+        if approval is not None:
+            # Browser changes are approved only in the browser's inline panel,
+            # so a Nebula approval grants nothing here, and nothing has run.
+            inline = PolicyDenied(
+                PolicyDecision(
+                    effect=PolicyEffect.DENY,
+                    reason="Review browser actions in the browser's inline approval panel.",
+                    rule="browser_companion_inline_approval",
+                )
+            )
+            setattr(inline, "_nebula_before_execution", True)
+            raise inline
+        try:
+            Draft202012Validator(self.spec.input_schema).validate(invocation.arguments)
+            try:
+                request = CompanionRequest.model_validate(invocation.arguments)
+            except PydanticValidationError as exc:
+                # diagnostic-expected: raised as the argument error it is. A
+                # value the schema cannot express (a NaN coordinate) is an
+                # argument to correct too, not a failed browser operation.
+                raise InvalidToolArguments(
+                    "Browser arguments do not match the browser request."
+                ) from exc
+            if request.capture_kind == "region" and not self.image_supported:
+                raise InvalidToolArguments(
+                    "Invalid value for capture_kind: ask the operator to select "
+                    "and attach a screenshot region."
+                )
+        except (ValidationError, InvalidToolArguments) as exc:
+            # diagnostic-expected: re-raised to the chat or mission tool loop,
+            # which reports it. Refused before the call is recorded, so
+            # nothing reached the browser.
+            setattr(exc, "_nebula_before_execution", True)
+            raise
+        call = await self.ledger.reserve(invocation, self.spec)
+        if call.status == ToolCallStatus.COMPLETE and isinstance(call.result, dict):
+            return self.execution_result(call.result, invocation)
+        if call.status != ToolCallStatus.PROPOSED:
+            raise AmbiguousToolState(
+                "A previous browser operation will not be replayed automatically."
+            )
+        proposal = request.operation in PROPOSED_OPERATIONS
+        if proposal:
+            # A change is checked against fresh page context and the operator's
+            # control before the call is marked running: a refusal here ran
+            # nothing, and says so.
+            try:
+                await self._check_proposal(request, invocation)
+            except asyncio.CancelledError:
+                await self.ledger.transition(
+                    call,
+                    ToolCallStatus.CANCELLED,
+                    error="Browser request cancelled before the change was proposed.",
+                )
+                raise
+            except Exception as exc:
+                refused = (
+                    _paused_denial(str(exc))
+                    if isinstance(exc, AssistantControlPaused)
+                    else _request_refusal(exc)
+                    if isinstance(exc, CompanionRequestRefused)
+                    else exc
+                )
+                setattr(refused, "_nebula_before_execution", True)
+                await self.ledger.transition(
+                    call,
+                    ToolCallStatus.DENIED
+                    if isinstance(refused, PolicyDenied)
+                    else ToolCallStatus.FAILED,
+                    error=refused.decision.reason
+                    if isinstance(refused, PolicyDenied)
+                    else "Browser operation failed. Refresh page context before retrying.",
+                )
+                if refused is exc:
+                    raise
+                raise refused from exc
+        running = await self.ledger.transition(call, ToolCallStatus.RUNNING)
+        try:
+            if proposal:
+                result = self.service.propose(
+                    self.session_id, request, chat_turn_id=invocation.chat_turn_id
+                )
+                if self.approval_policy() == AutomationApprovalPolicy.NEVER:
+                    result = await self.service.decide(
+                        self.session_id, result.id, "approve"
+                    )
+                try:
+                    while result.status in {"pending", "running"}:
+                        if result.status == "pending" and (
+                            result.expires_at <= datetime.now(timezone.utc)
+                            or not self.service.turn_active(result.chat_turn_id)
+                        ):
+                            result = await self.service.decide(
+                                self.session_id, result.id, "reject"
+                            )
+                            break
+                        await asyncio.sleep(0.25)
+                        result = self.store.get(CompanionAction, result.id)
+                except asyncio.CancelledError:
+                    latest = self.store.get(CompanionAction, result.id)
+                    if latest.status == "pending":
+                        self.store.update(
+                            CompanionAction,
+                            latest.id,
+                            {"status": "revoked"},
+                            expected_revision=latest.revision,
+                        )
+                    raise
+                output = {
+                    "action_id": result.id,
+                    "status": result.status,
+                    "result": result.result,
+                    "message": "The action completed."
+                    if result.status == "complete"
+                    else "The action did not complete. Ask the operator before retrying.",
+                }
+            else:
+                output = await self.service.request(
+                    self.session_id,
+                    request,
+                    assistant=True,
+                    chat_turn_id=invocation.chat_turn_id,
+                )
+            output = model_browser_result(output)
+            image_data = output.pop("image", None)
+            if image_data is not None:
+                if not self.image_supported or self.artifact_store is None:
+                    raise InvalidToolArguments(
+                        "This runtime cannot receive screenshots."
+                    )
+                data = base64.b64decode(image_data, validate=True)
+                if len(data) > 4 * 1024 * 1024:
+                    # A capture changes nothing on the page and the image is
+                    # dropped, so the refusal leaves no effect to check.
+                    raise refused_before_execution(
+                        InvalidToolArguments(
+                            "Invalid value for width: select a smaller "
+                            "screenshot region."
+                        )
+                    )
+                artifact = self.artifact_store.put_bytes(
+                    data,
+                    engagement_id=session.engagement_id,
+                    filename="browser-screenshot.png",
+                    media_type="image/png",
+                    source="browser.companion",
+                    metadata={
+                        "browser_companion_session_id": self.session_id,
+                        "chat_session_id": invocation.chat_session_id,
+                        "tool_call_id": call.id,
+                    },
+                )
+                self.store.create(artifact)
+                output["screenshot_artifact_id"] = artifact.id
+                output["artifacts"] = [
+                    {"artifact_id": artifact.id, "media_type": "image/png"}
+                ]
+        except asyncio.CancelledError:
+            await self.ledger.transition(
+                running,
+                ToolCallStatus.FAILED,
+                error="Browser request cancelled. An already executing action may have completed; inspect the page before retrying.",
+            )
+            raise
+        except AssistantControlPaused as exc:
+            # The operator paused control after the call started; Core refused
+            # before the browser acted.
+            denial = _paused_denial(str(exc))
+            await self.ledger.transition(
+                running, ToolCallStatus.DENIED, error=denial.decision.reason
+            )
+            raise denial from exc
+        except CompanionRequestRefused as exc:
+            # The service refused the request before sending it: a stale tab,
+            # a misplaced reference or a page outside the project's scope.
+            refused = _request_refusal(exc)
+            await self.ledger.transition(
+                running,
+                ToolCallStatus.DENIED
+                if isinstance(refused, PolicyDenied)
+                else ToolCallStatus.FAILED,
+                error=str(exc),
+            )
+            raise refused from exc
+        except Exception:
+            await self.ledger.transition(
+                running,
+                ToolCallStatus.FAILED,
+                error="Browser operation failed. Refresh page context before retrying.",
+            )
+            raise
+        await self.ledger.transition(running, ToolCallStatus.COMPLETE, result=output)
+        return self.execution_result(output, invocation)
+
+    async def _check_proposal(self, request: CompanionRequest, invocation: Any) -> None:
+        """Refuse a change the current page or the operator's control rules out."""
+
+        current = await self.service.request(
+            self.session_id,
+            CompanionRequest(operation="capture", tab_id=request.tab_id),
+            assistant=True,
+            chat_turn_id=invocation.chat_turn_id,
+        )
+        if request.page_revision != current["page_revision"]:
+            raise InvalidToolArguments(
+                "The page changed. Capture fresh context before proposing a change."
+            )
+        element = next(
+            (item for item in current["elements"] if item["id"] == request.element_id),
+            None,
+        )
+        protected_fill = bool(
+            request.operation == "fill"
+            and request.credential_ref
+            and not request.text
+            and any(
+                item["reference"] == request.credential_ref and item["available"]
+                for item in self.service.credential_catalog(self.session_id)
+            )
+        )
+        if element is None or (element["sensitive"] and not protected_fill):
+            raise InvalidToolArguments(
+                "Select a current page control. Sensitive fields require an available browser credential_ref; ask the operator to save one beside the page."
+            )
+        if request.credential_ref and not protected_fill:
+            raise InvalidToolArguments(
+                "Protected fills require an available browser credential_ref and no plain text."
+            )
+        if request.operation == "upload" and element["type"] != "file":
+            raise InvalidToolArguments("Choose a file input from fresh page context.")
+        # The operator may have paused control while the page was read.
+        self.service.require_assistant_control(self.session_id)
+
+    def execution_result(
+        self, output: dict[str, Any], invocation: Any
+    ) -> ToolExecutionResult:
+        blocks = []
+        artifact_id = output.get("screenshot_artifact_id")
+        if (
+            self.image_supported
+            and self.artifact_store is not None
+            and isinstance(artifact_id, str)
+        ):
+            # A replayed result names its screenshot; one this conversation
+            # cannot read is unavailable, and replaying runs nothing.
+            try:
+                artifact = self.store.get(Artifact, artifact_id)
+            except NotFoundError as exc:
+                raise _unavailable(
+                    "The screenshot is no longer available to this conversation."
+                ) from exc
+            if (
+                artifact.engagement_id != invocation.engagement_id
+                or artifact.metadata.get("browser_companion_session_id")
+                != self.session_id
+                or artifact.metadata.get("chat_session_id")
+                != invocation.chat_session_id
+            ):
+                raise _unavailable("Screenshot does not belong to this conversation.")
+            blocks.append(
+                {
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": base64.b64encode(
+                        self.artifact_store.read(artifact)
+                    ).decode(),
+                }
+            )
+        return ToolExecutionResult(output=output, mcp_content_blocks=blocks)
+
+
+def companion_components(
+    store: NebulaStore,
+    project_id: str,
+    session_id: str,
+    *,
+    artifact_store: ArtifactStore | None = None,
+    image_supported: bool = False,
+) -> RuntimeToolComponents:
+    engagement = store.get(Engagement, project_id)
+    broker = CompanionBroker(
+        store,
+        session_id,
+        artifact_store=artifact_store,
+        image_supported=image_supported,
+    )
+    session = broker.service.session(session_id)
+    if session.engagement_id != project_id:
+        # As the broker refuses another project's call: unavailable to this
+        # project, described as a missing resource is, and nothing has run.
+        raise _unavailable("Browser session belongs to another project.")
+    scope = broker.service.security._scope(project_id)
+    result = RuntimeToolComponents(
+        broker=broker,
+        scope=scope,
+        workspace=Path(engagement.workspace_path or ".").resolve(),
+        specs={broker.spec.name: broker.spec},
+        runtime_digest="browser-companion-v1",
+    )
+
+    from .application_model.tools import components
+    from .browser_tools import combine_tool_components
+
+    return combine_tool_components(
+        result, components(store, session, scope, result.workspace)
+    )

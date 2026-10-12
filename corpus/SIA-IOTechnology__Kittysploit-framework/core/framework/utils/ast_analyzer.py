@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+AST Analyzer - Analyseur statique avancé pour détecter les patterns dangereux
+"""
+
+import ast
+import re
+from typing import Dict, List, Any, Set, Optional
+from enum import Enum
+from core.framework.utils.policy_engine import PolicyLevel
+
+
+_BASE_CLASSES_WITH_RUN = {
+    "DockerEnvironment", "VagrantEnvironment", "Exploit", "Auxiliary", "Analysis", "Listener",
+    "Post", "Scanner", "Encoder", "Transform", "Backdoor", "Prestage",
+    "BrowserExploit", "BrowserAuxiliary", "LocalExploit", "Shortcut", "Workflow",
+}
+
+_RUN_INHERITANCE_SUFFIXES = (
+    "Transform", "Module", "ReverseTcp", "Listener", "Exploit", "Auxiliary", "Post",
+)
+
+
+def _base_class_inherits_run(name: str, module_aliases: Optional[Set[str]] = None) -> bool:
+    if name in _BASE_CLASSES_WITH_RUN:
+        return True
+    if module_aliases and name in module_aliases:
+        return True
+    return any(name.endswith(suffix) for suffix in _RUN_INHERITANCE_SUFFIXES)
+
+
+class RiskLevel(Enum):
+    """Niveaux de risque"""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class ASTAnalyzer:
+    """Analyseur AST statique pour détecter les patterns dangereux"""
+    
+    # Patterns dangereux à détecter
+    DANGEROUS_IMPORTS = {
+        'os.system', 'os.popen', 'os.exec', 'subprocess', 'eval', 'exec',
+        'compile', '__import__', 'importlib', 'ctypes', 'pickle', 'marshal'
+    }
+    
+    DANGEROUS_FUNCTIONS = {
+        'eval', 'exec', 'compile', '__import__', 'open', 'file',
+        'input', 'raw_input', 'execfile', 'reload'
+    }
+    
+    DANGEROUS_ATTRIBUTES = {
+        '__builtins__', '__globals__', '__dict__', '__code__', '__class__'
+    }
+    
+    NETWORK_OPERATIONS = {
+        'socket', 'urllib', 'requests', 'httplib', 'ftplib', 'smtplib'
+    }
+    
+    FILE_OPERATIONS = {
+        'open', 'file', 'os.remove', 'os.unlink', 'shutil', 'tempfile'
+    }
+    
+    def __init__(self, policy_level: PolicyLevel = PolicyLevel.STANDARD):
+        """
+        Initialise l'analyseur AST
+        
+        Args:
+            policy_level: Niveau de politique de sécurité
+        """
+        self.policy_level = policy_level
+        self.visitor = SecurityASTVisitor(self)
+    
+    def analyze(self, code: str, module_path: str) -> Dict[str, Any]:
+        """
+        Analyse le code source avec l'AST
+        
+        Args:
+            code: Code source à analyser
+            module_path: Chemin du module
+            
+        Returns:
+            Résultats de l'analyse
+        """
+        result = {
+            "valid": True,
+            "errors": [],
+            "warnings": [],
+            "dangerous_patterns": [],
+            "declared_capabilities": [],
+            "dependencies": [],
+            "declared_restrictions": [],
+            "risk_factors": []
+        }
+        
+        try:
+            # Parse AST
+            tree = ast.parse(code)
+            
+            # Visiter l'AST
+            self.visitor.reset()
+            self.visitor.visit(tree)
+            
+            # Détecter si c'est un payload
+            is_payload = module_path.replace("\\", "/").lower().startswith("payloads/") or self.visitor.is_payload
+            
+            # Collecter les résultats
+            result["dangerous_patterns"] = self.visitor.dangerous_patterns
+            result["dependencies"] = list(self.visitor.imports)
+            result["declared_capabilities"] = self.visitor.declared_capabilities
+            result["declared_restrictions"] = self.visitor.declared_restrictions
+            result["risk_factors"] = self.visitor.risk_factors
+            
+            # Vérifier les patterns dangereux selon le niveau de politique
+            if self.policy_level in [PolicyLevel.STRICT, PolicyLevel.PARANOID]:
+                for pattern in self.visitor.dangerous_patterns:
+                    if pattern["risk"] in [RiskLevel.HIGH, RiskLevel.CRITICAL]:
+                        result["errors"].append(
+                            f"Pattern dangereux détecté: {pattern['description']}"
+                        )
+                        result["valid"] = False
+            
+            # Vérifier la structure du module
+            if not self.visitor.has_module_class:
+                result["errors"].append("Module doit définir une classe 'Module'")
+                result["valid"] = False
+            
+            # Pour les payloads, vérifier generate() au lieu de run()
+            if is_payload:
+                if not self.visitor.has_generate_method:
+                    result["errors"].append("Payload modules must define a 'generate()' method")
+                    result["valid"] = False
+            else:
+                # Vérifier run() seulement si la classe n'hérite pas d'une classe de base avec run()
+                if not self.visitor.inherits_from_base_with_run and not self.visitor.has_run_method:
+                    result["errors"].append("Module doit définir une méthode 'run()'")
+                    result["valid"] = False
+            
+            if not self.visitor.has_info:
+                result["warnings"].append("Module devrait définir '__info__'")
+            
+            # Analyser les imports
+            for imp in self.visitor.imports:
+                if any(dangerous in imp for dangerous in self.DANGEROUS_IMPORTS):
+                    risk = RiskLevel.HIGH if self.policy_level == PolicyLevel.PARANOID else RiskLevel.MEDIUM
+                    result["dangerous_patterns"].append({
+                        "type": "dangerous_import",
+                        "description": f"Import dangereux: {imp}",
+                        "risk": risk.value,
+                        "location": imp
+                    })
+                    if self.policy_level == PolicyLevel.PARANOID:
+                        result["warnings"].append(f"Import potentiellement dangereux: {imp}")
+            
+        except SyntaxError as e:
+            result["valid"] = False
+            result["errors"].append(f"Erreur de syntaxe: {e}")
+        except Exception as e:
+            result["valid"] = False
+            result["errors"].append(f"Erreur d'analyse: {e}")
+        
+        return result
+
+
+class SecurityASTVisitor(ast.NodeVisitor):
+    """Visiteur AST pour détecter les patterns de sécurité"""
+    
+    def __init__(self, analyzer: ASTAnalyzer):
+        self.analyzer = analyzer
+        self.reset()
+    
+    def reset(self):
+        """Réinitialise l'état du visiteur"""
+        self.dangerous_patterns: List[Dict[str, Any]] = []
+        self.imports: Set[str] = set()
+        self.declared_capabilities: List[str] = []
+        self.declared_restrictions: List[str] = []
+        self.risk_factors: List[str] = []
+        self.has_module_class = False
+        self.has_run_method = False
+        self.has_generate_method = False
+        self.has_info = False
+        self.is_payload = False
+        self.inherits_from_base_with_run = False
+        self.module_aliases: Set[str] = set()
+    
+    def visit_Import(self, node: ast.Import):
+        for alias in node.names:
+            self.imports.add(alias.name)
+            if alias.asname:
+                self.imports.add(f"{alias.name} as {alias.asname}")
+        self.generic_visit(node)
+    
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        if node.module:
+            for alias in node.names:
+                if alias.name == "*":
+                    # Import wildcard - on ne peut pas savoir quelles classes sont importées
+                    # mais on note le module pour référence
+                    self.imports.add(f"{node.module}.*")
+                else:
+                    full_import = f"{node.module}.{alias.name}"
+                    self.imports.add(full_import)
+                    alias_name = alias.asname or alias.name
+                    if node.module.startswith("modules.") and (
+                        alias.name == "Module" or alias_name.endswith("Module")
+                    ):
+                        self.module_aliases.add(alias_name)
+        self.generic_visit(node)
+    
+    def visit_ClassDef(self, node: ast.ClassDef):
+        """Visite les définitions de classe"""
+        if node.name == "Module":
+            self.has_module_class = True
+            # Vérifier si la classe hérite de Payload ou d'autres classes de base
+            for base in node.bases:
+                if isinstance(base, ast.Name):
+                    if base.id == "Payload":
+                        self.is_payload = True
+                        break
+                    elif _base_class_inherits_run(base.id, self.module_aliases):
+                        self.inherits_from_base_with_run = True
+                        break
+                elif isinstance(base, ast.Attribute):
+                    # Pour les imports comme "from module import Class", base.attr contient le nom de la classe
+                    if base.attr == "Payload":
+                        self.is_payload = True
+                        break
+                    elif _base_class_inherits_run(base.attr, self.module_aliases):
+                        self.inherits_from_base_with_run = True
+                        break
+                # Gérer aussi les cas où la base est un nom simple (imports wildcard)
+                # Quand on fait "from kittysploit import *", DockerEnvironment sera un ast.Name
+                # Ce cas est déjà géré ci-dessus avec isinstance(base, ast.Name)
+        self.generic_visit(node)
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """Visite les définitions de fonction"""
+        if node.name == "run":
+            self.has_run_method = True
+        elif node.name == "generate":
+            self.has_generate_method = True
+        
+        # Détecter les appels dangereux dans les fonctions
+        self._check_dangerous_calls(node)
+        self.generic_visit(node)
+    
+    def visit_Call(self, node: ast.Call):
+        """Visite les appels de fonction"""
+        # Détecter eval, exec, etc.
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name in self.analyzer.DANGEROUS_FUNCTIONS:
+                self.dangerous_patterns.append({
+                    "type": "dangerous_call",
+                    "description": f"Appel à fonction dangereuse: {func_name}",
+                    "risk": RiskLevel.CRITICAL.value,
+                    "function": func_name
+                })
+        
+        # Détecter les appels à des méthodes dangereuses
+        if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name):
+                module_name = node.func.value.id
+                attr_name = node.func.attr
+                full_name = f"{module_name}.{attr_name}"
+                
+                if full_name in self.analyzer.DANGEROUS_IMPORTS:
+                    self.dangerous_patterns.append({
+                        "type": "dangerous_method_call",
+                        "description": f"Appel à méthode dangereuse: {full_name}",
+                        "risk": RiskLevel.HIGH.value,
+                        "method": full_name
+                    })
+        
+        self.generic_visit(node)
+    
+    def visit_Assign(self, node: ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                # Détecter __info__
+                if target.id == "__info__":
+                    self.has_info = True
+                    # Extraire les capacités déclarées
+                    if isinstance(node.value, ast.Dict):
+                        self._extract_info_dict(node.value)
+        
+        self.generic_visit(node)
+    
+    def _extract_info_dict(self, node: ast.Dict):
+        """Extrait les informations du dictionnaire __info__"""
+        for key_node, value_node in zip(node.keys, node.values):
+                if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                    key = key_node.value
+                else:
+                    continue
+                
+                if key == "capabilities" and isinstance(value_node, (ast.List, ast.Tuple)):
+                    for item in value_node.elts:
+                        if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                            self.declared_capabilities.append(item.value)
+                
+                elif key == "restrictions" and isinstance(value_node, (ast.List, ast.Tuple)):
+                    for item in value_node.elts:
+                        if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                            self.declared_restrictions.append(item.value)
+    
+    def _check_dangerous_calls(self, node: ast.FunctionDef):
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                if isinstance(child.func, ast.Name):
+                    if child.func.id in ['eval', 'exec', 'compile']:
+                        self.risk_factors.append(
+                            f"Utilisation de {child.func.id} dans {node.name}"
+                        )
+

@@ -1,0 +1,937 @@
+use axum::{
+    body::Body,
+    extract::{Json, Path, State},
+    http::{Response, StatusCode, header},
+    response::IntoResponse,
+};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::common::di::AppState;
+use crate::interfaces::middleware::auth::AuthUser;
+use std::sync::Arc;
+
+/// Upper bound on siblings returned by `GET /api/dedup/check/{hash}` on a
+/// single response (§9b Layer 2 of `docs/plan/photos-resources-migration.md`).
+/// 500 covers every realistic photo-dedup fan-out — the §9 within-drive
+/// `DISTINCT ON` already collapses massive copy sets at the gallery level,
+/// so this surface sees the long tail, not the pathological case. The
+/// cap caps per-row permission evaluations (up to 3 authz checks per
+/// sibling); above it, the response flips `truncated: true` and the FE
+/// falls back to its "trash this one copy" default rather than painting a
+/// 1000-row chooser.
+const MAX_SIBLINGS: usize = 500;
+
+/// Global application state for dependency injection
+type GlobalState = Arc<AppState>;
+
+/// Upper bound on hashes accepted in one batch ownership check — keeps a single
+/// request from pinning the DB with a pathologically large `ANY(...)` array.
+/// ~10k covers any realistic folder upload; clients fall back to plain uploads
+/// for whatever doesn't fit.
+const MAX_BATCH_HASHES: usize = 10_000;
+
+/// A well-formed BLAKE3 hash is 64 hex characters.
+fn is_valid_blob_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Response for the user-facing `GET /api/dedup/check/{hash}`.
+///
+/// 404 — not just a 200 with `exists: false` — is the signal that the
+/// caller has no visible reference to this blob. The pre-split shape
+/// carried an `exists: bool` + an `Option<u32> ref_count` whose
+/// presence depended on the caller's role; both are gone from this
+/// route. The admin accounting field lives at
+/// `GET /api/admin/dedup/check/{hash}` instead (`HashCheckAdminResponse`),
+/// which is middleware-gated and never readable to a non-admin — the
+/// split prevents cross-user content inference by construction, with no
+/// per-handler role branch left to drift. See §9b of
+/// `docs/plan/photos-resources-migration.md`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HashCheckResponse {
+    /// The BLAKE3 hash that was checked.
+    pub hash: String,
+    /// Size of the existing blob in bytes. Always populated on a 200 —
+    /// a 200 implies the caller holds at least one visible reference,
+    /// and the metadata row is read under the same guard.
+    pub existing_size: u64,
+    /// Count of siblings returned in `siblings[]` below — equal to the
+    /// visible fan-out when `truncated == false`, equal to `MAX_SIBLINGS`
+    /// when `truncated == true`. Includes the file the caller is probing
+    /// FROM when that file is itself a sibling (same drive, same blob) —
+    /// the FE already knows which row that is and can mark it.
+    pub count: u32,
+    /// True when more visible siblings exist than this response returned.
+    /// Signals the FE to fall back to its single-copy delete default
+    /// rather than paint a 1000-row chooser.
+    pub truncated: bool,
+    /// Up to `MAX_SIBLINGS` files the caller has Read access to that
+    /// reference this blob hash, each enriched with the per-row
+    /// permissions needed by the delete-UX (`can_delete`, `can_update`,
+    /// `can_share`). Rows the caller cannot Read are filtered out at the
+    /// authz boundary — the siblings list never discloses the existence
+    /// of files behind drive grants the caller doesn't hold.
+    pub siblings: Vec<HashSiblingDto>,
+}
+
+/// One entry in `HashCheckResponse::siblings` — a file the caller can see
+/// that references the probed blob. Carries the ids the FE needs to drive
+/// `POST /api/batch/trash` on the user's chosen subset, plus the per-row
+/// permission bits the delete-UX reads to decide which actions the chooser
+/// may offer against this specific row (e.g. a sibling in a drive the
+/// caller only has Comment on is listed but not trashable from here).
+///
+/// `is_trashed` is TRUE for a sibling that currently sits in trash: the
+/// row still holds a blob reference until the trash entry is purged, so
+/// the UX surfaces it as "to free these bytes, purge this from trash
+/// too". Non-trashed and trashed rows share the same shape — the flag
+/// is the only discriminator so clients can colour or group them without
+/// a second round trip.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HashSiblingDto {
+    pub file_id: Uuid,
+    pub name: String,
+    pub drive_id: Uuid,
+    pub folder_id: Option<Uuid>,
+    /// Display name of the parent folder — the chooser uses this to
+    /// disambiguate siblings that share a filename (e.g. the same
+    /// screenshot filename copied across several folders). `None`
+    /// when the file lives at the drive root (`folder_id` is `None`).
+    pub folder_name: Option<String>,
+    pub is_trashed: bool,
+    pub can_delete: bool,
+    pub can_update: bool,
+    pub can_share: bool,
+}
+
+/// Response for the admin-facing `GET /api/admin/dedup/check/{hash}`.
+///
+/// `ref_count` is REQUIRED on this shape — a 200 means the blob is known
+/// to the dedup store, and the test suites (`refcount_same_content_rewrite.hurl`,
+/// `derived_blob_copy.hurl`) assert on it unconditionally. A 404 means
+/// the blob is not stored.
+///
+/// The route is registered under `/api/admin/*` so the admin middleware
+/// layer is the one authority on access (AuthZ audit #24/#25 pattern —
+/// no bespoke role check in this handler). See §9b of
+/// `docs/plan/photos-resources-migration.md` for the user/admin split
+/// rationale.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HashCheckAdminResponse {
+    /// The BLAKE3 hash that was checked.
+    pub hash: String,
+    /// Size of the existing blob in bytes.
+    pub existing_size: u64,
+    /// Global reference count across every user, every drive.
+    pub ref_count: u32,
+}
+
+/// Request body for the batch hash-ownership check (`POST /api/dedup/check-batch`).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct HashBatchRequest {
+    /// Candidate BLAKE3 hashes (64 hex chars each) to test for ownership.
+    pub hashes: Vec<String>,
+}
+
+/// Response for the batch hash-ownership check.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HashBatchResponse {
+    /// The subset of the submitted `hashes` the authenticated user already owns.
+    pub owned: Vec<String>,
+}
+
+/// Response for dedup stats endpoint
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StatsResponse {
+    /// Total number of unique blobs stored
+    pub unique_blobs: u64,
+    /// Total number of references (files pointing to blobs)
+    pub total_references: u64,
+    /// Total bytes saved by deduplication
+    pub bytes_saved: u64,
+    /// Total logical bytes (what users think they have)
+    pub total_logical_bytes: u64,
+    /// Total physical bytes (actual disk usage)
+    pub total_physical_bytes: u64,
+    /// Deduplication ratio (logical / physical)
+    pub dedup_ratio: f64,
+    /// Percentage of storage saved
+    pub savings_percentage: f64,
+}
+
+/// Handler for deduplication-related endpoints.
+///
+/// All route functions are free functions at module scope — see the section
+/// below the impl block for the reason (utoipa 5.4.0 limitation).
+/// Provides endpoints for:
+/// - Checking if content already exists (by hash)
+/// - Uploading files with automatic deduplication
+/// - Getting deduplication statistics
+pub struct DedupHandler;
+
+impl DedupHandler {
+    // ── Why no #[utoipa::path] here? ─────────────────────────────────────────────
+    // Same utoipa 5.4.0 limitation as ChunkedUploadHandler: the macro generates
+    // helper structs inside its expansion and Rust forbids structs inside impl blocks.
+    // All route handlers are free functions below; they delegate to these *_impl methods.
+    // TODO: collapse back into the impl block after a utoipa upgrade.
+
+    /// Check whether the authenticated user holds a visible reference to
+    /// the blob with the given hash.
+    ///
+    /// User-scoped. 200 means the caller owns at least one file that
+    /// references the blob and carries the blob size. 404 — not a 200
+    /// with `exists: false` — is the "no visible reference" answer, so
+    /// that a non-admin probing arbitrary hashes gets the same wire
+    /// shape as probing a hash that doesn't exist at all. This is also
+    /// the response for a public-share visitor (`is_anonymous()`): the
+    /// endpoint is for the authenticated owner's dedup pre-check, not
+    /// for the share recipient. The `ref_count` field is NOT exposed
+    /// here — see `admin_check_hash_impl` and §9b of
+    /// `docs/plan/photos-resources-migration.md` for the route split.
+    ///
+    /// GET /api/dedup/check/{hash}
+    pub(super) async fn check_hash_impl(
+        State(state): State<GlobalState>,
+        auth_user: AuthUser,
+        Path(hash): Path<String>,
+    ) -> impl IntoResponse {
+        let dedup = &state.core.blob_handler;
+
+        // Validate hash format (BLAKE3 = 64 hex chars). A malformed hash
+        // can't match anything, so it collapses to the same 404 the
+        // "unknown blob" branch returns — no shape disclosure between
+        // the two failure modes.
+        if !is_valid_blob_hash(&hash) {
+            return Self::not_found_json();
+        }
+
+        // Public-share visitors have no auth.users row, so they can
+        // never "own" a reference. Short-circuit here instead of
+        // relying on `user_owns_blob_reference` to miss by chance —
+        // the token-subject guard is an explicit statement that this
+        // endpoint is not reachable to a share-link caller.
+        if auth_user.is_anonymous() {
+            return Self::not_found_json();
+        }
+
+        let user_has_it = dedup
+            .user_owns_blob_reference(&hash, &auth_user.id.to_string())
+            .await;
+        if !user_has_it {
+            return Self::not_found_json();
+        }
+
+        // Owner confirmed — fetch size from the blob metadata row.
+        let size = match dedup.get_blob_metadata(&hash).await {
+            Some(m) => m.size,
+            // Should not happen (owner reference without a blob row would
+            // be a dedup-store inconsistency), but keep the external
+            // shape unambiguous rather than returning 200 with an
+            // optional size.
+            None => return Self::not_found_json(),
+        };
+
+        // §9b Layer 2 — siblings list. Fetch at most `MAX_SIBLINGS + 1`
+        // rows so the response can distinguish "complete fan-out" from
+        // "there is more, FE falls back to the single-copy default".
+        // Rows are filtered through the authz engine (Read on each file)
+        // so the response never discloses files behind drive grants the
+        // caller doesn't hold — same anti-enum guarantee the handler
+        // leads with for the 404 path.
+        let raw_siblings = dedup
+            .list_files_by_blob_hash(&hash, (MAX_SIBLINGS as i64) + 1)
+            .await;
+        let truncated = raw_siblings.len() > MAX_SIBLINGS;
+        let candidate: Vec<_> = raw_siblings.into_iter().take(MAX_SIBLINGS).collect();
+
+        // Batch Read-visibility — the engine's `check_files_read_batch`
+        // resolves every file's drive in ONE query and reuses the
+        // per-drive role cache, so a 500-row page costs 1 round-trip
+        // instead of 500 sequential ones. Falling back to the "nothing
+        // visible" empty set on an infrastructure error preserves the
+        // engine's `?Err -> Hidden` default.
+        let subject = crate::domain::services::authorization::Subject::User(auth_user.id);
+        let candidate_ids: Vec<_> = candidate.iter().map(|row| row.id).collect();
+        let readable: std::collections::HashSet<Uuid> = {
+            use crate::application::ports::authorization_ports::AuthorizationEngine;
+            state
+                .authorization
+                .check_files_read_batch(subject, &candidate_ids)
+                .await
+                .unwrap_or_default()
+        };
+
+        // Enrich each Read-visible row with the three per-row permission
+        // bits the delete-UX reads. Checks are sequential per row (3 ×
+        // visible-count) but each hits the engine's decision cache
+        // after the batch Read above seeded the per-drive role rows.
+        use crate::application::ports::authorization_ports::AuthorizationEngine;
+        use crate::domain::services::authorization::{Permission, Resource};
+        let mut siblings = Vec::with_capacity(candidate.len().min(readable.len()));
+        for row in candidate {
+            if !readable.contains(&row.id) {
+                continue;
+            }
+            let resource = Resource::File(row.id);
+            let can_delete = state
+                .authorization
+                .check(subject, Permission::Delete, resource)
+                .await
+                .unwrap_or(false);
+            let can_update = state
+                .authorization
+                .check(subject, Permission::Update, resource)
+                .await
+                .unwrap_or(false);
+            let can_share = state
+                .authorization
+                .check(subject, Permission::Share, resource)
+                .await
+                .unwrap_or(false);
+            siblings.push(HashSiblingDto {
+                file_id: row.id,
+                name: row.name,
+                drive_id: row.drive_id,
+                folder_id: row.folder_id,
+                folder_name: row.folder_name,
+                is_trashed: row.is_trashed,
+                can_delete,
+                can_update,
+                can_share,
+            });
+        }
+
+        let count = siblings.len() as u32;
+        let response = HashCheckResponse {
+            hash,
+            existing_size: size,
+            count,
+            truncated,
+            siblings,
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&response).unwrap()))
+            .unwrap()
+            .into_response()
+    }
+
+    /// Admin-only global hash lookup: size and `ref_count` across every
+    /// user. 404 when no blob with the hash is stored. Role gating lives
+    /// in the `/api/admin/*` middleware layer (AuthZ audit #24/#25 pattern),
+    /// so this handler carries no bespoke role check.
+    ///
+    /// GET /api/admin/dedup/check/{hash}
+    pub(super) async fn admin_check_hash_impl(
+        State(state): State<GlobalState>,
+        _auth_user: AuthUser,
+        Path(hash): Path<String>,
+    ) -> impl IntoResponse {
+        let dedup = &state.core.blob_handler;
+
+        if !is_valid_blob_hash(&hash) {
+            return Self::not_found_json();
+        }
+
+        let metadata = match dedup.get_blob_metadata(&hash).await {
+            Some(m) => m,
+            None => return Self::not_found_json(),
+        };
+
+        let response = HashCheckAdminResponse {
+            hash,
+            existing_size: metadata.size,
+            ref_count: metadata.ref_count,
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&response).unwrap()))
+            .unwrap()
+            .into_response()
+    }
+
+    /// Opaque 404 body shared by both user and admin check-hash paths.
+    /// A single string so the two routes can't drift into disclosing
+    /// different "why" wording for the same observable outcome.
+    fn not_found_json() -> axum::response::Response {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"error": "Not found"}"#))
+            .unwrap()
+            .into_response()
+    }
+
+    /// Batch variant of [`Self::check_hash_impl`]: return the subset of the
+    /// submitted hashes the authenticated user already owns, in one round trip.
+    /// Lets a client hash a whole upload set up front and learn which files it
+    /// can skip with ONE request instead of one probe per file.
+    ///
+    /// User-scoped (anti-enumeration): only the caller's own blobs are echoed
+    /// back — never reveals whether other users hold a blob. Malformed hashes
+    /// are silently dropped (they can't be owned anyway).
+    ///
+    /// POST /api/dedup/check-batch
+    pub(super) async fn check_hashes_batch_impl(
+        State(state): State<GlobalState>,
+        auth_user: AuthUser,
+        Json(request): Json<HashBatchRequest>,
+    ) -> impl IntoResponse {
+        if request.hashes.len() > MAX_BATCH_HASHES {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error": "Too many hashes in one batch"}"#))
+                .unwrap()
+                .into_response();
+        }
+
+        let valid: Vec<String> = request
+            .hashes
+            .into_iter()
+            .filter(|h| is_valid_blob_hash(h))
+            .collect();
+
+        let owned = state
+            .core
+            .blob_handler
+            .user_owned_blob_references(&valid, &auth_user.id.to_string())
+            .await;
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&HashBatchResponse { owned }).unwrap(),
+            ))
+            .unwrap()
+            .into_response()
+    }
+
+    /// Get deduplication statistics
+    ///
+    /// GET /api/dedup/stats
+    ///
+    /// Returns comprehensive statistics about the deduplication system including:
+    /// - Number of unique blobs
+    /// - Total references
+    /// - Bytes saved
+    /// - Deduplication ratio
+    pub(super) async fn get_stats_impl(
+        State(state): State<GlobalState>,
+        _auth_user: AuthUser,
+    ) -> impl IntoResponse {
+        // AuthZ audit #24 (2026-07-17): admin check moved to the
+        // `/api/admin/*` middleware layer. Reaching this handler means
+        // the caller is admin by construction — the bespoke role
+        // string comparison here (`auth_user.role != "admin"` → 403
+        // with a hand-rolled JSON body, no audit line) is gone. The
+        // route is registered at `admin_handler::admin_routes()`;
+        // moving the URL to `/api/admin/dedup/stats` also declares
+        // the admin intent up front.
+        let dedup = &state.core.blob_handler;
+        let stats = dedup.get_stats().await;
+
+        // Calculate savings percentage
+        let savings_pct = if stats.total_bytes_referenced > 0 {
+            (stats.bytes_saved as f64 / stats.total_bytes_referenced as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let response = StatsResponse {
+            unique_blobs: stats.total_blobs,
+            total_references: stats.dedup_hits + stats.total_blobs, // Approximation
+            bytes_saved: stats.bytes_saved,
+            total_logical_bytes: stats.total_bytes_referenced,
+            total_physical_bytes: stats.total_bytes_stored,
+            dedup_ratio: stats.dedup_ratio,
+            savings_percentage: savings_pct,
+        };
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&response).unwrap()))
+            .unwrap()
+            .into_response()
+    }
+
+    /// Retrieve content by hash (user-scoped).
+    ///
+    /// GET /api/dedup/blob/{hash}
+    ///
+    /// Returns the raw content of a blob **only if** the authenticated user
+    /// owns at least one file that references it. Returns 404 otherwise
+    /// (does not reveal whether the blob exists globally).
+    pub(super) async fn get_blob_impl(
+        State(state): State<GlobalState>,
+        auth_user: AuthUser,
+        Path(hash): Path<String>,
+    ) -> impl IntoResponse {
+        let dedup = &state.core.blob_handler;
+
+        // Validate hash format
+        if !is_valid_blob_hash(&hash) {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error": "Invalid hash format"}"#))
+                .unwrap()
+                .into_response();
+        }
+
+        // Verify the user owns at least one file referencing this blob
+        if !dedup
+            .user_owns_blob_reference(&hash, &auth_user.id.to_string())
+            .await
+        {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error": "Blob not found"}"#))
+                .unwrap()
+                .into_response();
+        }
+
+        // Get metadata first for content-type
+        let metadata = dedup.get_blob_metadata(&hash).await;
+        let content_type = metadata
+            .as_ref()
+            .and_then(|m| m.content_type.clone())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        // Stream blob in 64 KB chunks — constant memory regardless of size
+        let size = match dedup.blob_size(&hash).await {
+            Ok(s) => s,
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error": "Blob not found"}"#))
+                    .unwrap()
+                    .into_response();
+            }
+        };
+
+        match dedup.read_blob_stream(&hash).await {
+            Ok(stream) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, size.to_string())
+                .header("X-Dedup-Hash", &hash)
+                .body(Body::from_stream(stream))
+                .unwrap()
+                .into_response(),
+            Err(_) => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error": "Blob not found"}"#))
+                .unwrap()
+                .into_response(),
+        }
+    }
+
+    /// Force recalculation of statistics from disk
+    ///
+    /// POST /api/dedup/recalculate
+    ///
+    /// Verifies integrity and returns current statistics.
+    /// Useful for health checks and auditing.
+    pub(super) async fn recalculate_stats_impl(
+        State(state): State<GlobalState>,
+        auth_user: AuthUser,
+    ) -> impl IntoResponse {
+        // AuthZ audit #25 (2026-07-17): admin check moved to the
+        // `/api/admin/*` middleware layer — see the sibling
+        // `get_stats_impl` comment. `auth_user` is kept so the
+        // success-side audit line carries the caller id.
+        let dedup = &state.core.blob_handler;
+
+        // Verify integrity first
+        match dedup.verify_integrity().await {
+            Ok(issues) => {
+                if !issues.is_empty() {
+                    tracing::warn!("Dedup integrity issues found: {:?}", issues);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Dedup integrity verification failed: {}", e);
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error": "Verification failed"}"#))
+                    .unwrap()
+                    .into_response();
+            }
+        }
+
+        let stats = dedup.get_stats().await;
+
+        // Calculate savings percentage
+        let savings_pct = if stats.total_bytes_referenced > 0 {
+            (stats.bytes_saved as f64 / stats.total_bytes_referenced as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let response = StatsResponse {
+            unique_blobs: stats.total_blobs,
+            total_references: stats.dedup_hits + stats.total_blobs,
+            bytes_saved: stats.bytes_saved,
+            total_logical_bytes: stats.total_bytes_referenced,
+            total_physical_bytes: stats.total_bytes_stored,
+            dedup_ratio: stats.dedup_ratio,
+            savings_percentage: savings_pct,
+        };
+
+        // AuthZ audit #25 (2026-07-17): integrity recalculation is a
+        // low-frequency privileged operation — landing an audit event
+        // so security reviews can see who ran verify + integrity
+        // sweeps and when. The pre-fix path emitted no audit line at
+        // all (the accepted 200 was silent from the security POV).
+        tracing::info!(
+            target: "audit",
+            event = "dedup.integrity_recalculated",
+            caller_id = %auth_user.id,
+            unique_blobs = response.unique_blobs,
+            total_references = response.total_references,
+            bytes_saved = response.bytes_saved,
+            "🧮 dedup integrity verified and stats recomputed by admin",
+        );
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&response).unwrap()))
+            .unwrap()
+            .into_response()
+    }
+}
+
+// ── Route handlers (free functions) ──────────────────────────────────────────
+//
+// Same utoipa 5.4.0 limitation as ChunkedUploadHandler: #[utoipa::path] cannot
+// be applied to methods on DedupHandler because the macro generates helper structs
+// that Rust forbids inside impl blocks. All logic lives in the DedupHandler::*_impl
+// methods above; these thin wrappers carry the OpenAPI annotation at module scope.
+//
+// routes.rs calls these free functions directly instead of DedupHandler::method.
+// TODO: collapse back into the impl block after a utoipa upgrade resolves the issue.
+
+#[utoipa::path(
+    get,
+    path = "/api/dedup/check/{hash}",
+    params(
+        ("hash" = String, Path, description = "BLAKE3 hash (64 hex characters)"),
+    ),
+    responses(
+        (status = 200, description = "Caller holds a visible reference", body = HashCheckResponse),
+        (status = 404, description = "No visible reference, unknown hash, or malformed input"),
+    ),
+    tag = "dedup",
+    security(("bearerAuth" = []))
+)]
+pub async fn check_hash(
+    state: State<GlobalState>,
+    auth_user: AuthUser,
+    path: Path<String>,
+) -> impl IntoResponse {
+    DedupHandler::check_hash_impl(state, auth_user, path).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/dedup/check/{hash}",
+    params(
+        ("hash" = String, Path, description = "BLAKE3 hash (64 hex characters)"),
+    ),
+    responses(
+        (status = 200, description = "Admin blob accounting: size + global ref_count", body = HashCheckAdminResponse),
+        (status = 401, description = "Missing or invalid token"),
+        (status = 403, description = "Caller is not an admin"),
+        (status = 404, description = "No blob with this hash is stored (or malformed input)"),
+    ),
+    tag = "admin",
+    security(("bearerAuth" = []))
+)]
+pub async fn admin_check_hash(
+    state: State<GlobalState>,
+    auth_user: AuthUser,
+    path: Path<String>,
+) -> impl IntoResponse {
+    DedupHandler::admin_check_hash_impl(state, auth_user, path).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/dedup/check-batch",
+    request_body = HashBatchRequest,
+    responses(
+        (status = 200, description = "The subset of the submitted hashes the caller already owns", body = HashBatchResponse),
+        (status = 400, description = "Too many hashes in one batch"),
+    ),
+    tag = "dedup",
+    security(("bearerAuth" = []))
+)]
+pub async fn check_hashes_batch(
+    state: State<GlobalState>,
+    auth_user: AuthUser,
+    body: Json<HashBatchRequest>,
+) -> impl IntoResponse {
+    DedupHandler::check_hashes_batch_impl(state, auth_user, body).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/dedup/stats",
+    responses(
+        (status = 200, description = "Deduplication statistics", body = StatsResponse),
+        (status = 401, description = "Missing or invalid token"),
+        (status = 403, description = "Caller is not an admin"),
+    ),
+    tag = "admin",
+    security(("bearerAuth" = []))
+)]
+pub async fn get_stats(state: State<GlobalState>, auth_user: AuthUser) -> impl IntoResponse {
+    DedupHandler::get_stats_impl(state, auth_user).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/dedup/blob/{hash}",
+    params(
+        ("hash" = String, Path, description = "BLAKE3 hash of the blob (64 hex characters)"),
+    ),
+    responses(
+        (status = 200, content_type = "application/octet-stream", description = "Raw blob content (user-scoped)"),
+        (status = 400, description = "Invalid hash format"),
+        (status = 404, description = "Blob not found or not owned by this user"),
+    ),
+    tag = "dedup",
+    security(("bearerAuth" = []))
+)]
+pub async fn get_blob(
+    state: State<GlobalState>,
+    auth_user: AuthUser,
+    path: Path<String>,
+) -> impl IntoResponse {
+    DedupHandler::get_blob_impl(state, auth_user, path).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/dedup/recalculate",
+    responses(
+        (status = 200, description = "Statistics after integrity verification", body = StatsResponse),
+        (status = 401, description = "Missing or invalid token"),
+        (status = 403, description = "Caller is not an admin"),
+        (status = 500, description = "Integrity verification failed"),
+    ),
+    tag = "admin",
+    security(("bearerAuth" = []))
+)]
+pub async fn recalculate_stats(
+    state: State<GlobalState>,
+    auth_user: AuthUser,
+) -> impl IntoResponse {
+    DedupHandler::recalculate_stats_impl(state, auth_user).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// Verify that the hash-on-write pattern produces the same BLAKE3 hash
+    /// as hashing the entire content at once.
+    #[tokio::test]
+    async fn hash_on_write_matches_full_hash() {
+        let content = b"Hello, OxiCloud dedup streaming upload!";
+
+        // 1. Full-content hash (reference)
+        let full_hash = blake3::hash(content).to_hex().to_string();
+
+        // 2. Incremental hash-on-write (what the handler does)
+        let mut hasher = blake3::Hasher::new();
+        // Simulate multiple chunks
+        hasher.update(&content[..10]);
+        hasher.update(&content[10..25]);
+        hasher.update(&content[25..]);
+        let incremental_hash = hasher.finalize().to_hex().to_string();
+
+        assert_eq!(full_hash, incremental_hash);
+    }
+
+    /// Verify BLAKE3 incremental hashing produces a valid 64-char hex hash.
+    #[tokio::test]
+    async fn incremental_hash_format_is_valid() {
+        let content = vec![0xABu8; 1024 * 1024]; // 1 MB of data
+
+        let mut hasher = blake3::Hasher::new();
+        // Feed in 64 KB chunks like real uploads
+        for chunk in content.chunks(65_536) {
+            hasher.update(chunk);
+        }
+        let hash = hasher.finalize().to_hex().to_string();
+
+        assert_eq!(hash.len(), 64, "BLAKE3 hash should be 64 hex characters");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should only contain hex characters"
+        );
+    }
+
+    /// Verify spool-to-disk + BLAKE3 hash-on-write writes correct content
+    /// and produces the correct hash.
+    #[tokio::test]
+    async fn spool_to_temp_file_preserves_content_and_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().join("test-upload.tmp");
+
+        let content = b"The quick brown fox jumps over the lazy dog";
+        let expected_hash = blake3::hash(content).to_hex().to_string();
+
+        // Simulate the handler's hash-on-write spool loop
+        let mut hasher = blake3::Hasher::new();
+        let mut total_size: u64 = 0;
+        {
+            let file = tokio::fs::File::create(&temp_path).await.unwrap();
+            let mut writer = tokio::io::BufWriter::with_capacity(524_288, file);
+
+            // Simulate 3 incoming chunks
+            let chunks: &[&[u8]] = &[&content[..10], &content[10..30], &content[30..]];
+            for chunk in chunks {
+                total_size += chunk.len() as u64;
+                hasher.update(chunk);
+                writer.write_all(chunk).await.unwrap();
+            }
+            writer.flush().await.unwrap();
+        }
+
+        let hash = hasher.finalize().to_hex().to_string();
+
+        // Verify hash matches
+        assert_eq!(hash, expected_hash);
+
+        // Verify total size
+        assert_eq!(total_size, content.len() as u64);
+
+        // Verify file content on disk is identical
+        let disk_content = tokio::fs::read(&temp_path).await.unwrap();
+        assert_eq!(disk_content, content);
+    }
+
+    /// Verify that an empty upload produces total_size == 0.
+    #[tokio::test]
+    async fn empty_upload_detected_before_store() {
+        let hasher = blake3::Hasher::new();
+        let total_size: u64 = 0;
+
+        // No chunks fed — simulates empty file
+        let _hash = hasher.finalize().to_hex().to_string();
+
+        // The handler checks total_size == 0 and returns 400
+        assert_eq!(total_size, 0);
+    }
+
+    /// Verify large payload streaming produces consistent hash
+    /// without buffering all content in memory.
+    #[tokio::test]
+    async fn large_payload_streaming_hash_consistency() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().join("large-upload.tmp");
+
+        // 5 MB of patterned data
+        let chunk_size = 65_536usize; // 64 KB chunks
+        let total_chunks = 80; // 80 × 64 KB = 5 MB
+        let mut reference_data = Vec::with_capacity(chunk_size * total_chunks);
+
+        let mut hasher = blake3::Hasher::new();
+        let mut total_size: u64 = 0;
+        {
+            let file = tokio::fs::File::create(&temp_path).await.unwrap();
+            let mut writer = tokio::io::BufWriter::with_capacity(524_288, file);
+
+            for i in 0..total_chunks {
+                // Patterned data: each chunk filled with its index byte
+                let chunk = vec![(i % 256) as u8; chunk_size];
+                reference_data.extend_from_slice(&chunk);
+                total_size += chunk.len() as u64;
+                hasher.update(&chunk);
+                writer.write_all(&chunk).await.unwrap();
+            }
+            writer.flush().await.unwrap();
+        }
+
+        let streaming_hash = hasher.finalize().to_hex().to_string();
+        let reference_hash = blake3::hash(&reference_data).to_hex().to_string();
+
+        // Hashes match
+        assert_eq!(streaming_hash, reference_hash);
+
+        // File on disk matches
+        let file_size = tokio::fs::metadata(&temp_path).await.unwrap().len();
+        assert_eq!(file_size, total_size);
+        assert_eq!(total_size, (chunk_size * total_chunks) as u64);
+
+        // Verify file content matches (read back)
+        let disk_data = tokio::fs::read(&temp_path).await.unwrap();
+        assert_eq!(disk_data, reference_data);
+    }
+
+    /// Verify temp file is cleaned up when spool fails partway through.
+    #[tokio::test]
+    async fn temp_file_cleanup_on_partial_write() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path().join("partial-upload.tmp");
+
+        // Create the file and write some data
+        {
+            let file = tokio::fs::File::create(&temp_path).await.unwrap();
+            let mut writer = tokio::io::BufWriter::with_capacity(524_288, file);
+            writer.write_all(b"partial data").await.unwrap();
+            writer.flush().await.unwrap();
+        }
+
+        // File exists before cleanup
+        assert!(tokio::fs::try_exists(&temp_path).await.unwrap());
+
+        // Simulate the handler's error cleanup path
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        // File is gone after cleanup
+        assert!(!tokio::fs::try_exists(&temp_path).await.unwrap_or(true));
+    }
+
+    #[test]
+    fn valid_blob_hash_accepts_64_hex_only() {
+        assert!(is_valid_blob_hash(&"abcdef0123456789".repeat(4))); // 64 hex chars
+        assert!(!is_valid_blob_hash(&"a".repeat(63))); // too short
+        assert!(!is_valid_blob_hash(&"a".repeat(65))); // too long
+        assert!(!is_valid_blob_hash(&"g".repeat(64))); // non-hex
+        assert!(!is_valid_blob_hash("")); // empty
+    }
+
+    #[test]
+    fn hash_batch_request_deserializes() {
+        let req: HashBatchRequest = serde_json::from_str(r#"{"hashes":["aa","bb"]}"#).unwrap();
+        assert_eq!(req.hashes, vec!["aa".to_string(), "bb".to_string()]);
+    }
+
+    #[test]
+    fn hash_batch_response_serializes_owned_subset() {
+        let r = HashBatchResponse {
+            owned: vec!["a".repeat(64), "b".repeat(64)],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(parsed["owned"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["owned"][0], "a".repeat(64));
+    }
+}

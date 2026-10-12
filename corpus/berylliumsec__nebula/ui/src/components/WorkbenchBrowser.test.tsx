@@ -1,0 +1,859 @@
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
+import { useState } from "react";
+import type { EngagementScopePolicy } from "../api/types";
+import type { ApiClient } from "../api/client";
+import { ChromeProvider, type ChromeContextValue } from "../state/ChromeContext";
+import { DialogProvider, useDialogPresence } from "./DialogSystem";
+import { boundSessionHistory, largestUnoccludedBrowserRect, WorkbenchBrowser } from "./WorkbenchBrowser";
+
+const runtimeMocks = vi.hoisted(() => ({
+  isTauriRuntime: vi.fn(),
+  desktopDeviceId: vi.fn(),
+}));
+
+const browserMocks = vi.hoisted(() => ({
+  applyProxyScope: vi.fn(),
+  bounds: vi.fn(),
+  capabilities: vi.fn(),
+  captureContext: vi.fn(),
+  clear: vi.fn(),
+  close: vi.fn(),
+  control: vi.fn(),
+  create: vi.fn(),
+  discardDownload: vi.fn(),
+  importDownload: vi.fn(),
+  navigate: vi.fn(),
+  visible: vi.fn(),
+}));
+
+type EventHandler = (event: { payload: unknown }) => void;
+const eventMocks = vi.hoisted(() => ({
+  handlers: new Map<string, EventHandler>(),
+  registrations: [] as string[],
+}));
+
+vi.mock("../api/runtime", () => ({
+  isTauriRuntime: runtimeMocks.isTauriRuntime,
+  desktopDeviceId: runtimeMocks.desktopDeviceId,
+}));
+
+vi.mock("../api/workbenchBrowser", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../api/workbenchBrowser")>();
+  return { ...actual, workbenchBrowser: browserMocks };
+});
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (event: string, handler: EventHandler) => {
+    eventMocks.handlers.set(event, handler);
+    eventMocks.registrations.push(event);
+    return Promise.resolve(() => eventMocks.handlers.delete(event));
+  },
+}));
+
+const chrome: ChromeContextValue = {
+  activityOpen: false,
+  paletteOpen: false,
+  settingLensOpen: false,
+  sidebarCollapsed: true,
+  toolbarHost: null,
+  openPalette: () => undefined,
+  setActivityOpen: () => undefined,
+  setPaletteOpen: () => undefined,
+  setToolbarHost: () => undefined,
+  toggleActivity: () => undefined,
+  toggleSidebar: () => undefined,
+};
+
+const scope: EngagementScopePolicy = {
+  engagementId: "project-1",
+  allowedCidrs: [],
+  allowedDomains: ["docs.example.com"],
+  allowedUrls: [],
+  allowedPorts: [443],
+  allowAllTargets: false,
+  prohibitedActions: [],
+  localOnly: true, toolSuggestions: false, webSearch: false, webSearchDisclosesScope: false, alwaysLoadedTools: [],
+  maxConcurrency: 1,
+  grants: [],
+  revision: 4,
+};
+
+function browserApi(): ApiClient {
+  const identity = {
+    id: "identity-1",
+    name: "Default identity",
+    description: "Project-isolated browser profile",
+    color: "#7c6cff",
+    storagePartition: "browser-00000000-0000-0000-0000-000000000000",
+    ephemeral: false,
+    isDefault: true,
+    revision: 1,
+  };
+  const session = {
+    id: "browser-session-1",
+    name: "Research session",
+    identityId: identity.id,
+    status: "active" as const,
+    captureMode: "headers" as const,
+    proxyEnabled: false,
+    proxyTrustAcknowledged: false,
+    tabs: [{ id: "tab-durable", title: "New tab", position: 0, lastScopeState: "unknown" as const }],
+    activeTabId: "tab-durable",
+    upstreamProxyEnabled: false,
+    interceptionEnabled: false,
+    lastSeenAt: "2026-08-24T00:00:00Z",
+    revision: 1,
+  };
+  return {
+    getSecurityBrowserWorkspace: vi.fn(async () => ({ identities: [identity], sessions: [session], traffic: [], frames: [], actions: [], handoffs: [] })),
+    syncSecurityBrowserSession: vi.fn(async (_session, tabs, activeTabId) => ({ ...session, tabs, activeTabId, revision: 2 })),
+    getEngagementScope: vi.fn(async () => scope),
+    updateEngagementScope: vi.fn(async (_projectId, request) => ({
+      ...scope,
+      ...request,
+      engagementId: scope.engagementId,
+      revision: request.expectedRevision + 1,
+    })),
+  } as unknown as ApiClient;
+}
+
+function BlockingSurfaceControl() {
+  const [open, setOpen] = useState(false);
+  useDialogPresence(open);
+  return <button type="button" onClick={() => setOpen((value) => !value)}>{open ? "Close blocking surface" : "Open blocking surface"}</button>;
+}
+
+function renderBrowser(
+  onAddKnowledgeUrl = vi.fn(async () => ({ id: "source-1", name: "Guide" })),
+  onAskNebula = vi.fn(),
+  scopeValue: EngagementScopePolicy | undefined = scope,
+  onScopeUpdated = vi.fn(),
+  api = browserApi(),
+  onAskSelection?: (
+    request: { question: string; context: { text: string; sourceKind: string; sourceId?: string; sourceLabel: string; truncated?: boolean } },
+    signal: AbortSignal,
+    onDelta: (answer: string) => void,
+  ) => Promise<{ sessionId: string; answer: string }>,
+  onContinueConversation = vi.fn(),
+  initialOpenUrl?: string,
+) {
+  return {
+    onAddKnowledgeUrl,
+    onAskNebula,
+    onScopeUpdated,
+    api,
+    onContinueConversation,
+    ...render(
+      <MemoryRouter>
+        <DialogProvider>
+          <ChromeProvider value={chrome}>
+            <BlockingSurfaceControl />
+            <WorkbenchBrowser
+              active
+              initialOpenUrl={initialOpenUrl}
+              api={api}
+              projectId="project-1"
+              scope={scopeValue}
+              onAddKnowledgeUrl={onAddKnowledgeUrl}
+              onAskNebula={onAskNebula}
+              assistantRuntimeLabel={onAskSelection ? "Local harness · gpt-test" : undefined}
+              onAskSelection={onAskSelection}
+              onContinueConversation={onContinueConversation}
+              onOpenFiles={() => undefined}
+              onScopeUpdated={onScopeUpdated}
+            />
+          </ChromeProvider>
+        </DialogProvider>
+      </MemoryRouter>,
+    ),
+  };
+}
+
+async function openPage(finalUrl = "https://docs.example.com/guide") {
+  await waitFor(() => expect(screen.getByRole("button", { name: "Go" })).not.toBeDisabled());
+  fireEvent.input(screen.getByLabelText("Start browsing"), { target: { value: "https://docs.example.com/start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Go" }));
+  await waitFor(() => expect(browserMocks.create).toHaveBeenCalled());
+  const tabId = browserMocks.create.mock.calls[0][0] as string;
+  await waitFor(() => expect(eventMocks.handlers.has("nebula-browser-page")).toBe(true));
+  act(() => {
+    eventMocks.handlers.get("nebula-browser-page")?.({
+      payload: { tabId, url: finalUrl, state: "loaded" },
+    });
+  });
+}
+
+describe("WorkbenchBrowser", () => {
+  beforeEach(() => {
+    eventMocks.handlers.clear();
+    eventMocks.registrations.length = 0;
+    chrome.settingLensOpen = false;
+    runtimeMocks.isTauriRuntime.mockReset();
+    runtimeMocks.isTauriRuntime.mockReturnValue(false);
+    runtimeMocks.desktopDeviceId.mockReset();
+    runtimeMocks.desktopDeviceId.mockResolvedValue("desktop-test");
+    for (const mock of Object.values(browserMocks)) {
+      mock.mockReset();
+      mock.mockResolvedValue(undefined);
+    }
+    browserMocks.capabilities.mockResolvedValue({ engine: "test-webview", projectStorage: "persistent" });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("keeps the native browser in the largest region not covered by Ask Nebula", () => {
+    expect(largestUnoccludedBrowserRect(
+      { x: 20, y: 100, width: 1000, height: 700 },
+      [{ x: 700, y: 60, width: 400, height: 520 }],
+    )).toEqual({ x: 20, y: 100, width: 680, height: 700 });
+    expect(largestUnoccludedBrowserRect(
+      { x: 20, y: 100, width: 1000, height: 700 },
+      [{ x: 250, y: 180, width: 560, height: 500 }],
+    )).toEqual({ x: 20, y: 100, width: 230, height: 700 });
+  });
+
+  it("passes fresh scope into tab creation before the first page request", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600); });
+    const api = browserApi();
+    const fresh = {...scope, revision: 9};
+    vi.mocked(api.getEngagementScope).mockResolvedValue(fresh);
+    renderBrowser(undefined, undefined, scope, undefined, api);
+    await openPage();
+    expect(browserMocks.create.mock.calls[0][10]).toEqual(fresh);
+  });
+
+  it("opens an assistant link in the scoped native browser after the durable session loads", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600); });
+    renderBrowser(undefined, undefined, scope, undefined, browserApi(), undefined, undefined, "https://docs.example.com/review");
+    await waitFor(() => expect(browserMocks.create).toHaveBeenCalledTimes(1));
+    expect(browserMocks.create.mock.calls[0][5]).toBe("https://docs.example.com/review");
+  });
+
+  it("refreshes native scope before reload and blocks the reload when installation fails", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600); });
+    const api = browserApi();
+    const workspace = await api.getSecurityBrowserWorkspace("project-1");
+    workspace.sessions[0].proxyEnabled = true;
+    vi.mocked(api.getSecurityBrowserWorkspace).mockResolvedValue(workspace);
+    vi.mocked(api.syncSecurityBrowserSession).mockImplementation(async (session, tabs, activeTabId) => ({...session, tabs, activeTabId}));
+    renderBrowser(undefined, undefined, scope, undefined, api);
+    await openPage();
+    browserMocks.applyProxyScope.mockRejectedValueOnce(new Error("Scope installation failed"));
+    fireEvent.click(screen.getByRole("button", {name: "Reload"}));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Scope installation failed"));
+    expect(browserMocks.control).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", {name: "Reload"}));
+    await waitFor(() => expect(browserMocks.control).toHaveBeenCalled());
+    expect(browserMocks.applyProxyScope).toHaveBeenLastCalledWith("project-1", "browser-session-1", scope);
+    expect(browserMocks.applyProxyScope.mock.invocationCallOrder.at(-1)).toBeLessThan(browserMocks.control.mock.invocationCallOrder[0]);
+  });
+
+  it("keeps captured traffic bounded per session by dropping the oldest entries", () => {
+    const entry = (id: string, sessionId: string) => ({ id, sessionId });
+    let items = [entry("other-1", "session-b")];
+    for (let index = 0; index < 4; index += 1) items = boundSessionHistory(items, entry(`a-${index}`, "session-a"), 3);
+    expect(items.map((item) => item.id)).toEqual(["other-1", "a-1", "a-2", "a-3"]);
+    expect(boundSessionHistory(items, entry("a-3", "session-a"), 3)).toBe(items);
+  });
+
+  it("keeps a blocked navigation visible on a live tab", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600); });
+    const api = browserApi();
+    renderBrowser(undefined, undefined, scope, undefined, api);
+    await openPage();
+    expect(screen.queryByLabelText("Start browsing")).not.toBeInTheDocument();
+
+    vi.mocked(api.getEngagementScope).mockResolvedValue({...scope, allowedDomains: [], revision: 10});
+    const address = screen.getByLabelText("Address or search");
+    fireEvent.change(address, {target: {value: "https://docs.example.com/next"}});
+    fireEvent.submit(address.closest("form")!);
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Navigation blocked"));
+    expect(browserMocks.navigate).not.toHaveBeenCalled();
+  });
+
+  it("does not open a page after Core revokes its previously allowed scope", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600); });
+    const api = browserApi();
+    vi.mocked(api.getEngagementScope).mockResolvedValue({...scope, allowedDomains: [], revision: 10});
+    renderBrowser(undefined, undefined, scope, undefined, api);
+    await waitFor(() => expect(screen.getByRole("button", {name: "Go"})).not.toBeDisabled());
+    fireEvent.input(screen.getByLabelText("Start browsing"), {target: {value: "https://docs.example.com/"}});
+    fireEvent.click(screen.getByRole("button", {name: "Go"}));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Navigation blocked"));
+    expect(browserMocks.create).not.toHaveBeenCalled();
+  });
+
+  it("shows missing native scope without claiming research state is unavailable", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600); });
+    const api = browserApi();
+    api.recordSecurityBrowserTraffic = vi.fn(async (sessionId, event) => ({...event, sessionId, id: "blocked-scope-event"} as never));
+    renderBrowser(undefined, undefined, {...scope, allowAllTargets: true}, undefined, api);
+    await openPage();
+    expect(screen.getByText("Project: all targets")).toBeVisible();
+    const tabId = browserMocks.create.mock.calls[0][0] as string;
+    await act(async () => eventMocks.handlers.get("nebula-browser-traffic")?.({payload: {
+      sessionId: "browser-session-1", tabId, url: "https://docs.example.com/guide", method: "GET", protocol: "http/1.1",
+      requestHeaders: {}, responseHeaders: {}, blocked: true, error: "no compiled Project scope is active for this browser session",
+    }}));
+    expect(screen.getByText("Browser scope unavailable")).toBeVisible();
+    expect(screen.getByText(/Navigation blocked: browser scope unavailable/)).toBeVisible();
+    expect(screen.queryByText("Research state is unavailable")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", {name: "Reload"})).toBeEnabled();
+    await act(async () => eventMocks.handlers.get("nebula-browser-traffic")?.({payload: {
+      sessionId: "browser-session-1", tabId, url: "https://docs.example.com/guide", method: "GET", protocol: "http/1.1",
+      requestHeaders: {}, responseHeaders: {}, blocked: false, statusCode: 200,
+    }}));
+    expect(screen.queryByText(/Navigation blocked: browser scope unavailable/)).not.toBeInTheDocument();
+    expect(screen.getByText("Project: all targets")).toBeVisible();
+  });
+
+  it("ignores a saved missing-scope block from an older Project revision", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    const api = browserApi();
+    const workspace = await api.getSecurityBrowserWorkspace("project-1");
+    workspace.sessions[0].proxyEnabled = true;
+    workspace.traffic = [{
+      id: "old-block", sessionId: "browser-session-1", tabId: "tab-durable",
+      startedAt: "2026-09-12T13:21:24Z", scopePolicyRevision: 2,
+      blocked: true, error: "no compiled Project scope is active for this browser session",
+    } as never];
+    let resolveWorkspace!: (value: typeof workspace) => void;
+    vi.mocked(api.getSecurityBrowserWorkspace).mockImplementation(() => new Promise(resolve => { resolveWorkspace = resolve; }));
+    const currentScope = {...scope, revision: 3, allowAllTargets: true};
+    renderBrowser(undefined, undefined, currentScope, undefined, api);
+    await act(async () => { resolveWorkspace(workspace); });
+    expect(screen.queryByText("Browser scope unavailable")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Navigation blocked: browser scope unavailable/)).not.toBeInTheDocument();
+  });
+
+  it("clears a live missing-scope warning after native scope is installed on reload", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600); });
+    const api = browserApi();
+    const workspace = await api.getSecurityBrowserWorkspace("project-1");
+    workspace.sessions[0].proxyEnabled = true;
+    vi.mocked(api.getSecurityBrowserWorkspace).mockResolvedValue(workspace);
+    renderBrowser(undefined, undefined, {...scope, allowAllTargets: true}, undefined, api);
+    await openPage();
+    const tabId = browserMocks.create.mock.calls[0][0] as string;
+    await act(async () => eventMocks.handlers.get("nebula-browser-traffic")?.({payload: {
+      sessionId: "browser-session-1", tabId, url: "https://docs.example.com/guide", method: "GET", protocol: "http/1.1",
+      requestHeaders: {}, responseHeaders: {}, blocked: true, error: "no compiled Project scope is active for this browser session",
+    }}));
+    expect(screen.getByText(/Navigation blocked: browser scope unavailable/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", {name: "Reload"}));
+    await waitFor(() => expect(browserMocks.applyProxyScope).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText(/Navigation blocked: browser scope unavailable/)).not.toBeInTheDocument());
+  });
+
+  it("hides the native browser while a settings lens is open and restores the active tab", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    renderBrowser();
+    await openPage();
+    await waitFor(() => expect(browserMocks.visible).toHaveBeenLastCalledWith(expect.any(String), "project-1", true));
+
+    chrome.settingLensOpen = true;
+    fireEvent.change(screen.getByLabelText("Address or search"), {
+      target: { value: "https://docs.example.com/hidden" },
+    });
+    await waitFor(() => expect(browserMocks.visible).toHaveBeenLastCalledWith(expect.any(String), "project-1", false));
+
+    chrome.settingLensOpen = false;
+    fireEvent.change(screen.getByLabelText("Address or search"), {
+      target: { value: "https://docs.example.com/restored" },
+    });
+    await waitFor(() => expect(browserMocks.visible).toHaveBeenLastCalledWith(expect.any(String), "project-1", true));
+  });
+
+  it("opens web addresses externally and can add them directly to Project Sources", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue({} as Window);
+    const { onAddKnowledgeUrl, api } = renderBrowser();
+    await waitFor(() => expect(api.getSecurityBrowserWorkspace).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    const address = screen.getByRole("textbox", { name: "Web address" });
+    fireEvent.change(address, { target: { value: "docs.example.com/guide" } });
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(open).toHaveBeenCalledWith("https://docs.example.com/guide", "_blank", "noopener,noreferrer");
+    expect(await screen.findByRole("status")).toHaveTextContent("New tab requested.");
+    expect(screen.getByText(/In scope · Matches Project scope revision 4/)).toBeVisible();
+
+    const addToSources = screen.getByRole("button", { name: "Add to Sources" });
+    await waitFor(() => expect(addToSources).toBeEnabled());
+    fireEvent.click(addToSources);
+    await waitFor(() => expect(onAddKnowledgeUrl).toHaveBeenCalledWith("https://docs.example.com/guide"));
+    expect(screen.getByRole("status")).toHaveTextContent("Guide is ready for cited retrieval.");
+  });
+
+  it("retains the device-browser address while durable desktop tabs finish loading", async () => {
+    const api = browserApi();
+    const workspace = await api.getSecurityBrowserWorkspace("project-1");
+    let resolveWorkspace!: (value: typeof workspace) => void;
+    vi.mocked(api.getSecurityBrowserWorkspace).mockImplementation(() => new Promise(resolve => { resolveWorkspace = resolve; }));
+    const open = vi.spyOn(window, "open").mockReturnValue({} as Window);
+    renderBrowser(undefined, undefined, scope, undefined, api);
+    const address = screen.getByRole("textbox", { name: "Web address" });
+    fireEvent.change(address, { target: { value: "docs.example.com/unsent" } });
+    await act(async () => { resolveWorkspace(workspace); });
+    expect(address).toHaveValue("docs.example.com/unsent");
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(open).toHaveBeenCalledWith("https://docs.example.com/unsent", "_blank", "noopener,noreferrer");
+    expect(address).toHaveValue("https://docs.example.com/unsent");
+  });
+
+  it("does not confuse an isolated popup's null handle with a blocked popup", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    renderBrowser();
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.change(screen.getByRole("textbox", { name: "Web address" }), { target: { value: "docs.example.com/guide" } });
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(open).toHaveBeenCalledWith("https://docs.example.com/guide", "_blank", "noopener,noreferrer");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("If no tab appeared, allow pop-ups for Nebula and choose Open again.");
+  });
+
+  it("retains a requested device URL and scope when desktop history arrives later", async () => {
+    const api = browserApi();
+    const workspace = await api.getSecurityBrowserWorkspace("project-1");
+    let resolveWorkspace!: (value: typeof workspace) => void;
+    vi.mocked(api.getSecurityBrowserWorkspace).mockImplementation(() => new Promise(resolve => { resolveWorkspace = resolve; }));
+    vi.spyOn(window, "open").mockReturnValue(null);
+    renderBrowser(undefined, undefined, scope, undefined, api);
+    fireEvent.change(screen.getByRole("textbox", { name: "Web address" }), { target: { value: "docs.example.com/guide" } });
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    await act(async () => { resolveWorkspace(workspace); });
+    expect(screen.getByRole("textbox", { name: "Web address" })).toHaveValue("https://docs.example.com/guide");
+    expect(screen.getByText(/In scope · Matches Project scope revision 4/)).toBeVisible();
+    expect(api.syncSecurityBrowserSession).not.toHaveBeenCalled();
+  });
+
+  it("retains the address and offers an explicit retry when requesting a tab throws", async () => {
+    const open = vi.spyOn(window, "open").mockImplementationOnce(() => { throw new Error("Local popup policy"); }).mockReturnValue(null);
+    renderBrowser();
+    await act(async () => { await Promise.resolve(); });
+    const address = screen.getByRole("textbox", { name: "Web address" });
+    fireEvent.change(address, { target: { value: "docs.example.com/guide" } });
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not request a new tab.");
+    expect(address).toHaveValue("https://docs.example.com/guide");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(open).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("New tab requested.");
+  });
+
+  it("hides and restores the native browser while a blocking application surface is open", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    renderBrowser();
+    await openPage();
+    const tabId = browserMocks.create.mock.calls[0][0] as string;
+    await waitFor(() => expect(browserMocks.visible).toHaveBeenCalledWith(tabId, "project-1", true));
+
+    fireEvent.click(screen.getByRole("button", { name: "Open blocking surface" }));
+    await waitFor(() => expect(browserMocks.visible).toHaveBeenCalledWith(tabId, "project-1", false));
+
+    fireEvent.click(screen.getByRole("button", { name: "Close blocking surface" }));
+    await waitFor(() => expect(browserMocks.visible).toHaveBeenLastCalledWith(tabId, "project-1", true));
+  });
+
+  it("adds the final URL of the current page to Project Sources and links to it", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const { onAddKnowledgeUrl } = renderBrowser();
+    await openPage("https://docs.example.com/final-guide");
+
+    expect(screen.getByText("In scope")).toBeVisible();
+
+    const addButton = screen.getByRole("button", { name: "Add current page to Project Sources" });
+    expect(addButton).toBeEnabled();
+    fireEvent.click(addButton);
+
+    await waitFor(() => expect(onAddKnowledgeUrl).toHaveBeenCalledWith("https://docs.example.com/final-guide"));
+    expect(await screen.findByText("Guide is ready for cited retrieval.")).toBeVisible();
+    expect(screen.getByRole("link", { name: "View source" })).toHaveAttribute(
+      "href",
+      "/project?view=sources&source=source-1",
+    );
+  });
+
+  it("captures the live authenticated page only on request and opens a reviewed chat attachment", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const { onAskNebula } = renderBrowser();
+    await openPage("https://docs.example.com/account");
+
+    expect(browserMocks.captureContext).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Ask Nebula about the live page" }));
+    await waitFor(() => expect(browserMocks.captureContext).toHaveBeenCalledTimes(1));
+    const [tabId, projectId, requestId] = browserMocks.captureContext.mock.calls[0];
+    expect(projectId).toBe("project-1");
+
+    act(() => {
+      eventMocks.handlers.get("nebula-browser-context")?.({
+        payload: {
+          requestId,
+          tabId,
+          state: "ready",
+          context: {
+            url: "https://docs.example.com/account",
+            title: "Account portal",
+            selectedText: "role=analyst",
+            text: "Authenticated account page",
+            truncated: false,
+            forms: [{ method: "POST", action: "https://docs.example.com/profile", fields: [{ name: "display_name", id: "name", type: "text", autocomplete: "name", required: true }] }],
+            links: [{ text: "Billing", href: "https://docs.example.com/billing" }],
+          },
+        },
+      });
+    });
+
+    expect(onAskNebula).toHaveBeenCalledTimes(1);
+    expect(onAskNebula.mock.calls[0][0]).toMatchObject({
+      sourceKind: "browser_page",
+      sourceLabel: "Browser · Account portal",
+      truncated: false,
+    });
+    expect(onAskNebula.mock.calls[0][0].text).toContain("LIVE BROWSER CAPTURE");
+    expect(onAskNebula.mock.calls[0][0].text).toContain("Project scope: In scope (revision 4)");
+    expect(onAskNebula.mock.calls[0][0].text).toContain("role=analyst");
+    expect(onAskNebula.mock.calls[0][0].text).not.toContain('"value"');
+  });
+
+  it("registers native listeners once per project and delivers events to the latest callbacks", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const api = browserApi();
+    // SessionsPage passes fresh arrow functions on every render, exactly like this.
+    const tree = (onAskNebula: (request: unknown) => void) => (
+      <MemoryRouter>
+        <DialogProvider>
+          <ChromeProvider value={chrome}>
+            <WorkbenchBrowser
+              active
+              api={api}
+              projectId="project-1"
+              scope={{ ...scope }}
+              onAddKnowledgeUrl={vi.fn(async () => ({ id: "source-1", name: "Guide" }))}
+              onAskNebula={onAskNebula}
+              onAttachContext={(request) => onAskNebula(request)}
+              onOpenFiles={() => undefined}
+              onScopeUpdated={vi.fn()}
+            />
+          </ChromeProvider>
+        </DialogProvider>
+      </MemoryRouter>
+    );
+    const first = vi.fn();
+    const { rerender } = render(tree(first));
+    await openPage("https://docs.example.com/account");
+    await waitFor(() => expect(api.getSecurityBrowserWorkspace).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+
+    const second = vi.fn();
+    for (let pass = 0; pass < 3; pass += 1) {
+      rerender(tree(second));
+      await act(async () => { await Promise.resolve(); });
+    }
+    expect(eventMocks.registrations.filter((event) => event === "nebula-browser-context")).toHaveLength(1);
+    expect(eventMocks.registrations.filter((event) => event === "nebula-browser-page")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Ask Nebula about the live page" }));
+    await waitFor(() => expect(browserMocks.captureContext).toHaveBeenCalledTimes(1));
+    const [tabId, , requestId] = browserMocks.captureContext.mock.calls[0];
+    act(() => {
+      eventMocks.handlers.get("nebula-browser-context")?.({
+        payload: {
+          requestId,
+          tabId,
+          state: "ready",
+          context: { url: "https://docs.example.com/account", title: "Account portal", selectedText: "", text: "Authenticated account page", truncated: false, forms: [], links: [] },
+        },
+      });
+    });
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(second.mock.calls[0][0]).toMatchObject({ sourceKind: "browser_page", sourceId: "browser-session-1" });
+  });
+
+  it("keeps a cleared autonomous budget field empty and refuses to start with it", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const api = browserApi();
+    const workspace = await api.getSecurityBrowserWorkspace("project-1");
+    const pairedSession = { ...workspace.sessions[0], deviceOwner: "desktop-test" };
+    api.getSecurityBrowserWorkspace = vi.fn(async () => ({ ...workspace, sessions: [pairedSession] }));
+    api.syncSecurityBrowserSession = vi.fn(async (_session, tabs, activeTabId) => ({ ...pairedSession, tabs, activeTabId, revision: 2 }));
+    api.getSecurityBrowserAssessments = vi.fn(async () => ({ assessments: [], steps: [], profiles: [], engines: [], candidates: [], validationGrants: [] }));
+    api.listProviders = vi.fn(async () => ({ items: [{
+      id: "provider-1", revision: 1, name: "Local runtime", providerType: "openai_compatible", kind: "local", local: true,
+      state: "healthy", enabled: true, models: ["gpt-test"], modelAllowlist: [], capabilities: [], permitsSensitiveData: true,
+    }], total: 1 })) as unknown as ApiClient["listProviders"];
+    api.listHarnesses = vi.fn(async () => []);
+    const createMission = vi.fn(async (_request: Parameters<ApiClient["createMission"]>[0]) => ({ id: "mission-123456789" }));
+    api.createMission = createMission as unknown as ApiClient["createMission"];
+    renderBrowser(undefined, undefined, scope, undefined, api);
+    await openPage();
+    fireEvent.click(screen.getByRole("button", { name: "Security research workbench" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Session" }));
+    await waitFor(() => expect(screen.getByLabelText("Research session")).toHaveValue("browser-session-1"));
+    fireEvent.click(screen.getByRole("button", { name: "Start autonomous web test" }));
+    await waitFor(() => expect(screen.getByLabelText("Investigation runtime")).toHaveValue("provider:provider-1"));
+    await waitFor(() => expect(screen.getByLabelText("Model")).toHaveValue("gpt-test"));
+    fireEvent.change(screen.getByLabelText("Target subset"), { target: { value: "https://docs.example.com/guide" } });
+    fireEvent.click(screen.getByLabelText("Credential use by reference"));
+
+    const duration = screen.getByLabelText("Duration (minutes)");
+    expect(duration).toHaveValue(30);
+    fireEvent.change(duration, { target: { value: "" } });
+    expect(duration).toHaveValue(null);
+    fireEvent.change(duration, { target: { value: "4" } });
+    expect(duration).toHaveValue(4);
+    fireEvent.change(screen.getByLabelText("Request budget"), { target: { value: "" } });
+    expect(screen.getByLabelText("Request budget")).toHaveValue(null);
+
+    fireEvent.submit(duration.closest("form")!);
+    await act(async () => { await Promise.resolve(); });
+    expect(createMission).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Request budget must be a whole number from 1 through 1000000.");
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.getByLabelText("Duration (minutes)")).toHaveValue(4));
+    fireEvent.change(screen.getByLabelText("Request budget"), { target: { value: "250" } });
+    fireEvent.submit(screen.getByLabelText("Duration (minutes)").closest("form")!);
+    await waitFor(() => expect(createMission).toHaveBeenCalledTimes(1));
+    expect(createMission.mock.calls[0][0]).toMatchObject({
+      maxDurationSeconds: 240,
+      maxToolCalls: 100,
+      browserAutonomy: { durationSeconds: 240, maxCommands: 100, maxRequests: 250 },
+    });
+  });
+
+  it("answers a native page selection inline and continues the same durable conversation", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const onAskSelection = vi.fn(async (_request, _signal, onDelta: (answer: string) => void) => {
+      onDelta("This header rotates ");
+      onDelta("This header rotates for each request.");
+      return { sessionId: "chat-selection-1", answer: "This header rotates for each request." };
+    });
+    const onContinueConversation = vi.fn();
+    renderBrowser(undefined, undefined, scope, undefined, undefined, onAskSelection, onContinueConversation);
+    await openPage("https://docs.example.com/account");
+    const tabId = browserMocks.create.mock.calls[0][0] as string;
+    await waitFor(() => expect(eventMocks.handlers.has("nebula-browser-selection-request")).toBe(true));
+
+    act(() => {
+      eventMocks.handlers.get("nebula-browser-selection-request")?.({
+        payload: { tabId, projectId: "project-1", url: "https://docs.example.com/account" },
+      });
+    });
+    await waitFor(() => expect(browserMocks.captureContext).toHaveBeenCalledTimes(1));
+    const requestId = browserMocks.captureContext.mock.calls[0][2];
+    await waitFor(() => expect(eventMocks.handlers.has("nebula-browser-context")).toBe(true));
+    act(() => {
+      eventMocks.handlers.get("nebula-browser-context")?.({
+        payload: {
+          requestId,
+          tabId,
+          state: "ready",
+          context: {
+            url: "https://docs.example.com/account",
+            title: "Account portal",
+            selectedText: "X-CSRF-Token: rotating-value",
+            text: "Other page content is not attached.",
+            truncated: false,
+            forms: [],
+            links: [],
+          },
+        },
+      });
+    });
+
+    expect(await screen.findByRole("heading", { name: "Ask Nebula" })).toBeVisible();
+    expect(screen.getByText("X-CSRF-Token: rotating-value")).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Question about selected text"), { target: { value: "What does this imply?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ask question" }));
+
+    await waitFor(() => expect(onAskSelection).toHaveBeenCalled());
+    expect(onAskSelection.mock.calls[0][0]).toMatchObject({
+      question: "What does this imply?",
+      context: { sourceKind: "browser_selection", sourceLabel: "Browser selection · Account portal" },
+    });
+    expect(onAskSelection.mock.calls[0][0].context.text).toContain("LIVE BROWSER SELECTION");
+    expect(onAskSelection.mock.calls[0][0].context.text).not.toContain("Other page content is not attached.");
+    expect(await screen.findByText("This header rotates for each request.")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Continue in Assistant" }));
+    expect(onContinueConversation).toHaveBeenCalledWith("chat-selection-1");
+  });
+
+  it("fails closed when the live page or its final capture is outside durable Project scope", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const first = renderBrowser();
+    await openPage("https://outside.example.net/account");
+
+    const ask = screen.getByRole("button", { name: "Ask Nebula about the live page" });
+    expect(ask).toBeDisabled();
+    expect(ask).toHaveAttribute("title", expect.stringContaining("confirmed in scope"));
+    expect(browserMocks.captureContext).not.toHaveBeenCalled();
+
+    first.unmount();
+    browserMocks.create.mockClear();
+    browserMocks.captureContext.mockClear();
+    const { onAskNebula } = renderBrowser();
+    await openPage("https://docs.example.com/account");
+    fireEvent.click(screen.getByRole("button", { name: "Ask Nebula about the live page" }));
+    await waitFor(() => expect(browserMocks.captureContext).toHaveBeenCalledTimes(1));
+    const [tabId, , requestId] = browserMocks.captureContext.mock.calls[0];
+    act(() => {
+      eventMocks.handlers.get("nebula-browser-context")?.({
+        payload: {
+          requestId,
+          tabId,
+          state: "ready",
+          context: {
+            url: "https://outside.example.net/redirected",
+            title: "Redirected page",
+            selectedText: "",
+            text: "This content must not enter Chat.",
+            truncated: false,
+            forms: [],
+            links: [],
+          },
+        },
+      });
+    });
+
+    expect(onAskNebula).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("final page is not confirmed in scope");
+  });
+
+  it("keeps live-page capture failures actionable in the Browser", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    renderBrowser();
+    await openPage();
+    fireEvent.click(screen.getByRole("button", { name: "Ask Nebula about the live page" }));
+    await waitFor(() => expect(browserMocks.captureContext).toHaveBeenCalledTimes(1));
+    const [tabId, , requestId] = browserMocks.captureContext.mock.calls[0];
+
+    act(() => {
+      eventMocks.handlers.get("nebula-browser-context")?.({
+        payload: { requestId, tabId, state: "failed", detail: "The page changed during capture." },
+      });
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("The page changed during capture.");
+    expect(screen.getByRole("button", { name: "Ask Nebula about the live page" })).toBeEnabled();
+  });
+
+  it("adds the right-clicked origin to durable Project scope after confirmation", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const api = browserApi();
+    const onScopeUpdated = vi.fn();
+    renderBrowser(vi.fn(async () => ({ id: "source-1", name: "Guide" })), vi.fn(), scope, onScopeUpdated, api);
+    await openPage("https://outside.example.net/account?view=security");
+    const tabId = browserMocks.create.mock.calls[0][0] as string;
+
+    act(() => {
+      eventMocks.handlers.get("nebula-browser-scope-request")?.({
+        payload: {
+          tabId,
+          projectId: "project-1",
+          url: "https://outside.example.net/account?view=security",
+          state: "ready",
+        },
+      });
+    });
+
+    expect(await screen.findByText("Add https://outside.example.net/ to scope?")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Add to scope" }));
+
+    await waitFor(() => expect(api.updateEngagementScope).toHaveBeenCalledWith("project-1", expect.objectContaining({
+      allowedUrls: ["https://outside.example.net/"],
+      allowedDomains: ["docs.example.com"],
+      expectedRevision: 4,
+    })));
+    expect(onScopeUpdated).toHaveBeenCalledWith(expect.objectContaining({ revision: 5 }));
+    const notice = await screen.findByRole("status");
+    expect(notice).toHaveTextContent("was added to Project scope revision 5");
+    expect(notice.querySelector(".browser-notice-icon")).toHaveAttribute("aria-hidden", "true");
+    expect(notice.querySelector(".browser-notice-message")).toHaveTextContent("was added to Project scope revision 5");
+    expect(screen.getByRole("button", { name: "Dismiss browser notice" })).toHaveClass("browser-notice-dismiss");
+    expect(screen.getByRole("button", { name: "Dismiss browser notice" })).toHaveAttribute("title", "Dismiss");
+  });
+
+  it("loads a concurrent scope revision without overwriting it and explains the retry", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const api = browserApi();
+    vi.mocked(api.updateEngagementScope).mockRejectedValueOnce(new Error("revision conflict"));
+    const onScopeUpdated = vi.fn();
+    renderBrowser(vi.fn(async () => ({ id: "source-1", name: "Guide" })), vi.fn(), scope, onScopeUpdated, api);
+    await openPage("https://outside.example.net/account");
+    vi.mocked(api.getEngagementScope).mockResolvedValueOnce({ ...scope, allowedDomains: ["docs.example.com", "new.example"], revision: 5 });
+    const tabId = browserMocks.create.mock.calls[0][0] as string;
+    act(() => {
+      eventMocks.handlers.get("nebula-browser-scope-request")?.({
+        payload: { tabId, projectId: "project-1", url: "https://outside.example.net/account", state: "ready" },
+      });
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Add to scope" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Project scope changed before this addition could be saved");
+    expect(onScopeUpdated).toHaveBeenCalledWith(expect.objectContaining({ revision: 5 }));
+    expect(api.updateEngagementScope).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps ingestion failures in the browser without a success notice", async () => {
+    runtimeMocks.isTauriRuntime.mockReturnValue(true);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 900, this.classList.contains("browser-toolbar") ? 48 : 600);
+    });
+    const onAddKnowledgeUrl = vi.fn(async () => {
+      throw new Error("Only public pages can be added.");
+    });
+    renderBrowser(onAddKnowledgeUrl);
+    await openPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add current page to Project Sources" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Only public pages can be added.");
+    expect(screen.queryByRole("link", { name: "View source" })).not.toBeInTheDocument();
+  });
+});

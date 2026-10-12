@@ -1,0 +1,515 @@
+import type { CopyOptions } from "./copy.js";
+
+/**
+ * Checked-in TypeScript contracts for the native N-API module.
+ *
+ * The generated declarations under `sdks/node/native/` are build artifacts and
+ * are intentionally not part of the checked-in TypeScript dependency graph.
+ */
+
+export interface ImageInfo {
+  reference: string;
+  repository: string;
+  tag: string;
+  id: string;
+  cachedAt: string;
+  sizeBytes?: number;
+}
+
+export interface ImagePullResult {
+  reference: string;
+  configDigest: string;
+  layerCount: number;
+}
+
+export interface ImageHandle {
+  pull(reference: string): Promise<ImagePullResult>;
+  list(): Promise<ImageInfo[]>;
+}
+
+/** Metadata for a managed volume returned by the native runtime. */
+export interface VolumeInfo {
+  /** Server-assigned volume id used by get and remove operations. */
+  id: string;
+  /** Volume name, mountable in place of the id. Defaults to the id. */
+  name: string;
+  /** Creation timestamp formatted as an RFC 3339 string. */
+  createdAt: string;
+  /** Volume size in bytes when the backend can report it. */
+  sizeBytes?: number;
+}
+
+/** Runtime-scoped handle for named-volume operations. */
+export interface VolumeHandle {
+  /**
+   * Creates a new managed volume.
+   *
+   * @param name Optional volume name, mountable in place of the returned id.
+   * The server names the volume after its id when omitted.
+   * @returns Metadata for the created volume.
+   * @throws A native BoxLite error when the backend does not support volumes or
+   * the volume cannot be created.
+   */
+  create(name?: string): Promise<VolumeInfo>;
+  /**
+   * Lists named volumes visible to this runtime.
+   *
+   * @returns Volume metadata entries in backend-defined order.
+   * @throws A native BoxLite error when the backend does not support volumes.
+   */
+  list(): Promise<VolumeInfo[]>;
+  /**
+   * Gets metadata for a volume by id.
+   *
+   * @param id Server-assigned volume id.
+   * @returns Metadata for the requested volume.
+   * @throws A native BoxLite error when the id is unknown or volumes are unsupported.
+   */
+  get(id: string): Promise<VolumeInfo>;
+  /**
+   * Removes a volume by id.
+   *
+   * @param id Server-assigned volume id.
+   * @param force Treat a missing volume as success when supported by the backend.
+   * @throws A native BoxLite error when removal fails or volumes are unsupported.
+   */
+  remove(id: string, force?: boolean | null): Promise<void>;
+}
+
+export interface JsEnvVar {
+  key: string;
+  value: string;
+}
+
+export type JsVolumeSpec = JsManagedVolumeSpec | JsHostPathVolumeSpec;
+
+export interface JsManagedVolumeSpec {
+  /** Managed volume, by server-assigned id or by name — the server resolves either. */
+  managedVolume: string;
+  guestPath: string;
+  /**
+   * Read-only managed mounts are not implemented yet; `true` is rejected
+   * rather than silently downgraded to read-write.
+   */
+  readOnly?: false;
+}
+
+export interface JsHostPathVolumeSpec {
+  /** Path on the local host for host-path mounts. Local runtimes only. */
+  hostPath: string;
+  guestPath: string;
+  readOnly?: boolean;
+}
+
+export interface JsNetworkSpec {
+  outbound?: JsOutboundNetworkSpec;
+  inbound?: JsInboundNetworkSpec;
+  /**
+   * @deprecated Use `outbound.mode`. Accepted as a legacy alias; supplying it
+   * together with `outbound` is rejected.
+   */
+  mode?: "enabled" | "disabled";
+  /**
+   * @deprecated Use `outbound.allowNet`. Accepted as a legacy alias; supplying
+   * it together with `outbound` is rejected.
+   */
+  allowNet?: string[];
+}
+
+export interface JsOutboundNetworkSpec {
+  mode: "enabled" | "disabled";
+  allowNet?: string[];
+}
+
+export interface JsInboundNetworkSpec {
+  /** Inbound mode: "enabled" (publicly reachable) or "disabled" (private). */
+  mode: "enabled" | "disabled";
+  /**
+   * Not supported yet: a non-empty value is rejected. Exists for shape
+   * symmetry with the outbound spec; inbound access follows `mode` alone.
+   */
+  allowNet?: string[];
+}
+
+export interface JsPortSpec {
+  hostPort?: number;
+  guestPort: number;
+  protocol?: string;
+  hostIp?: string;
+}
+
+export interface JsSecret {
+  name: string;
+  value: string;
+  hosts?: string[];
+  placeholder?: string;
+}
+
+export interface JsSecurityOptions {
+  jailerEnabled?: boolean;
+  seccompEnabled?: boolean;
+  maxOpenFiles?: number;
+  maxFileSize?: number;
+  maxProcesses?: number;
+  maxMemory?: number;
+  maxCpuTime?: number;
+  networkEnabled?: boolean;
+  closeFds?: boolean;
+}
+
+export interface JsHealthCheckOptions {
+  interval: number;
+  timeout: number;
+  retries: number;
+  startPeriod: number;
+}
+
+export interface JsContainerCapabilities {
+  add?: string[];
+  drop?: string[];
+}
+
+export interface JsAdvancedBoxOptions {
+  capabilities?: JsContainerCapabilities;
+}
+
+export interface JsBoxOptions {
+  image?: string;
+  rootfsPath?: string;
+  cpus?: number;
+  memoryMib?: number;
+  diskSizeGb?: number;
+  workingDir?: string;
+  env?: JsEnvVar[];
+  volumes?: JsVolumeSpec[];
+  network?: JsNetworkSpec;
+  ports?: JsPortSpec[];
+  /**
+   * @deprecated Use autoDelete. Preserved for embedded remove-on-stop
+   * compatibility; an explicit autoDelete value takes precedence. Remote
+   * runtimes preserve server lifecycle defaults when autoDelete is omitted.
+   */
+  autoRemove?: boolean;
+  detach?: boolean;
+  /** Idle time in seconds before AutoStop; 0 disables AutoStop. */
+  autoStop?: number;
+  /** Time in seconds after stop before AutoDelete; 0 disables AutoDelete. */
+  autoDelete?: number;
+  /** Whether access automatically resumes an auto-stopped box. */
+  autoResume?: boolean;
+  entrypoint?: string[];
+  cmd?: string[];
+  user?: string;
+  advanced?: JsAdvancedBoxOptions;
+  security?: JsSecurityOptions;
+  healthCheck?: JsHealthCheckOptions;
+  secrets?: JsSecret[];
+}
+
+export interface JsOptions {
+  homeDir?: string;
+  imageRegistries?: JsImageRegistry[];
+}
+
+export interface JsImageRegistryAuth {
+  username?: string;
+  password?: string;
+  bearerToken?: string;
+}
+
+export interface JsImageRegistry {
+  host: string;
+  transport?: "https" | "http";
+  skipVerify?: boolean;
+  search?: boolean;
+  auth?: JsImageRegistryAuth;
+}
+
+/** A bearer token plus its expiry. `expiresAt` is epoch seconds, or
+ *  `null` for non-expiring tokens (e.g. API keys). */
+export interface JsAccessToken {
+  token: string;
+  expiresAt?: number | null;
+}
+
+/** Native API-key credential class. Concrete implementation of the
+ *  `Credential` interface (see ./credential). */
+export interface ApiKeyCredential {
+  getToken(): JsAccessToken;
+}
+
+export interface ApiKeyCredentialConstructor {
+  new (key: string): ApiKeyCredential;
+  /** Build from `BOXLITE_API_KEY`; returns `null` when unset/empty. */
+  fromEnv(): ApiKeyCredential | null;
+}
+
+/** Native REST options class. Internal binding twin — the *public*
+ *  `BoxliteRestOptions` is the pure-TS class in ./options; this opaque
+ *  handle is constructed from it and consumed by `JsBoxlite.rest`. */
+export type NativeBoxliteRestOptions = object;
+
+export interface NativeBoxliteRestOptionsConstructor {
+  new (
+    url: string,
+    credential?: ApiKeyCredential | null,
+    prefix?: string | null,
+  ): NativeBoxliteRestOptions;
+}
+
+export type JsHealthState = "None" | "Starting" | "Healthy" | "Unhealthy";
+
+export interface JsHealthStatus {
+  state: JsHealthState;
+  failures: number;
+  lastCheck?: string;
+}
+
+export interface JsBoxStateInfo {
+  status: string;
+  running: boolean;
+  pid?: number;
+  /**
+   * How the box's main command ended, present once the runtime recorded it.
+   * Stopping a box signals that command, so this carries what the stop
+   * produced too. `0` is a real value; check for `undefined`, not falsiness.
+   */
+  exitCode?: number;
+}
+
+export interface JsPublishedPort {
+  guestPort: number;
+  hostIp: string;
+  hostPort: number;
+  protocol: "tcp" | "udp";
+}
+
+export interface JsOutboundNetworkInfo {
+  mode: "enabled" | "disabled";
+  allowNet: string[];
+}
+
+export interface JsInboundNetworkInfo {
+  mode: "enabled" | "disabled";
+  allowNet: string[];
+}
+
+export interface JsNetworkInfo {
+  outbound: JsOutboundNetworkInfo;
+  inbound: JsInboundNetworkInfo;
+  /** @deprecated Use `outbound.mode`. Mirrors it for legacy readers. */
+  mode: "enabled" | "disabled";
+  /** @deprecated Use `outbound.allowNet`. Mirrors it for legacy readers. */
+  allowNet: string[];
+  /** `null` means unknown to this handle; `[]` means no active publications. */
+  publishedPorts: JsPublishedPort[] | null;
+}
+
+export interface JsBoxInfo {
+  id: string;
+  name?: string;
+  state: JsBoxStateInfo;
+  createdAt: string;
+  startedAt?: string;
+  lastActivityAt?: string;
+  image: string;
+  cpus: number;
+  memoryMib: number;
+  network: JsNetworkInfo | null;
+  autoStop: number;
+  autoDelete: number;
+  autoResume: boolean;
+  healthStatus: JsHealthStatus;
+}
+
+export interface JsRuntimeMetrics {
+  boxesCreatedTotal: number;
+  boxesFailedTotal: number;
+  numRunningBoxes: number;
+  totalCommandsExecuted: number;
+  totalExecErrors: number;
+}
+
+export interface JsBoxMetrics {
+  commandsExecutedTotal: number;
+  execErrorsTotal: number;
+  bytesSentTotal: number;
+  bytesReceivedTotal: number;
+  totalCreateDurationMs?: number;
+  guestBootDurationMs?: number;
+  cpuPercent?: number;
+  memoryBytes?: number;
+  networkBytesSent?: number;
+  networkBytesReceived?: number;
+  networkTcpConnections?: number;
+  networkTcpErrors?: number;
+  stageFilesystemSetupMs?: number;
+  stageImagePrepareMs?: number;
+  stageGuestRootfsMs?: number;
+  stageBoxConfigMs?: number;
+  stageBoxSpawnMs?: number;
+  stageContainerInitMs?: number;
+}
+
+export interface JsExecResult {
+  exitCode: number;
+  errorMessage?: string;
+}
+
+export interface JsExecStdout {
+  next(): Promise<string | null>;
+}
+
+export interface JsExecStderr {
+  next(): Promise<string | null>;
+}
+
+export interface JsExecStdin {
+  write(data: Buffer): Promise<void>;
+  writeString(text: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface JsExecution {
+  id(): Promise<string>;
+  stdin(): Promise<JsExecStdin>;
+  stdout(): Promise<JsExecStdout>;
+  stderr(): Promise<JsExecStderr>;
+  wait(): Promise<JsExecResult>;
+  kill(): Promise<void>;
+  resizeTty(rows: number, cols: number): Promise<void>;
+  signal(signal: number): Promise<void>;
+}
+
+export interface JsSnapshotInfo {
+  id: string;
+  boxId: string;
+  name: string;
+  createdAt: number;
+  containerDiskBytes: number;
+  sizeBytes: number;
+}
+
+export type JsSnapshotOptions = Record<string, never>;
+
+export interface JsSnapshotHandle {
+  create(
+    name: string,
+    options?: JsSnapshotOptions | null,
+  ): Promise<JsSnapshotInfo>;
+  list(): Promise<JsSnapshotInfo[]>;
+  get(name: string): Promise<JsSnapshotInfo | null>;
+  remove(name: string): Promise<void>;
+  restore(name: string): Promise<void>;
+}
+
+export interface JsNetworkHandle {
+  /** Prepare a one-shot tunnel to a service port inside the box. */
+  tunnel(port: number): Promise<NativeBoxTunnel>;
+}
+
+export type SocketAddress =
+  { type: "tcp"; host?: string; port: number } | { type: "unix"; path: string };
+
+export interface NativeTunnelForwarder {
+  localAddr(): SocketAddress;
+  wait(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/** Internal contract implemented by the native N-API tunnel binding. */
+export interface NativeBoxTunnel {
+  /** Public URL of a remotely served tunnel, or null for a local one. */
+  uri(): string | null;
+  /** Consume the tunnel and return its bidirectional byte stream. */
+  connect(): Promise<NativeBoxConnection>;
+  forward(listen: SocketAddress): Promise<NativeTunnelForwarder>;
+}
+
+export interface NativeBoxConnection {
+  read(maxBytes: number): Promise<Buffer>;
+  write(data: Buffer): Promise<number>;
+  shutdownWrite(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export type JsCloneOptions = Record<string, never>;
+
+export type JsExportOptions = Record<string, never>;
+
+export interface JsBox {
+  readonly id: string;
+  readonly name: string | null;
+  info(): Promise<JsBoxInfo>;
+  exec(
+    command: string,
+    args?: string[] | null,
+    env?: Array<[string, string]> | null,
+    tty?: boolean | null,
+    user?: string | null,
+    timeoutSecs?: number | null,
+    workingDir?: string | null,
+  ): Promise<JsExecution>;
+  readonly snapshot: JsSnapshotHandle;
+  readonly network: JsNetworkHandle;
+  cloneBox(
+    options?: JsCloneOptions | null,
+    name?: string | null,
+  ): Promise<JsBox>;
+  export(dest: string, options?: JsExportOptions | null): Promise<string>;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  metrics(): Promise<JsBoxMetrics>;
+  copyIn(
+    hostPath: string,
+    containerDest: string,
+    options?: CopyOptions | null,
+  ): Promise<void>;
+  copyOut(
+    containerSrc: string,
+    hostDest: string,
+    options?: CopyOptions | null,
+  ): Promise<void>;
+}
+
+export interface JsGetOrCreateResult {
+  readonly created: boolean;
+  readonly box: JsBox;
+}
+
+export interface JsBoxlite {
+  importBox(archivePath: string, name?: string | null): Promise<JsBox>;
+  create(options: JsBoxOptions, name?: string | null): Promise<JsBox>;
+  getOrCreate(
+    options: JsBoxOptions,
+    name?: string | null,
+  ): Promise<JsGetOrCreateResult>;
+  listInfo(): Promise<JsBoxInfo[]>;
+  getInfo(idOrName: string): Promise<JsBoxInfo | null>;
+  get(idOrName: string): Promise<JsBox | null>;
+  metrics(): Promise<JsRuntimeMetrics>;
+  readonly images: ImageHandle;
+  readonly volumes: VolumeHandle;
+  remove(idOrName: string, force?: boolean | null): Promise<void>;
+  close(): void;
+  shutdown(timeout?: number | null): Promise<void>;
+}
+
+export interface JsBoxliteConstructor {
+  new (options: JsOptions): JsBoxlite;
+  withDefaultConfig(): JsBoxlite;
+  initDefault(options: JsOptions): void;
+  /** Connect to a remote BoxLite REST server. Takes the native
+   *  `BoxliteRestOptions` class (see `NativeBoxliteRestOptions`). */
+  rest(options: NativeBoxliteRestOptions): JsBoxlite;
+}
+
+export interface NativeModule {
+  JsBoxlite: JsBoxliteConstructor;
+  JsBoxTunnel: {
+    readonly prototype: NativeBoxTunnel & { connect?: () => Promise<unknown> };
+  };
+  ApiKeyCredential: ApiKeyCredentialConstructor;
+  JsBoxliteRestOptions: NativeBoxliteRestOptionsConstructor;
+  [key: string]: unknown;
+}

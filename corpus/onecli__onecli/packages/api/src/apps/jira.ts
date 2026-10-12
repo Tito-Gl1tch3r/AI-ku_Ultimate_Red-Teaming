@@ -1,0 +1,59 @@
+import type { AppDefinition } from "./types";
+import {
+  buildAtlassianAuthUrl,
+  exchangeAtlassianCode,
+  atlassianConfigFields,
+  atlassianEnvDefaults,
+} from "./oauth/atlassian";
+
+export const jira: AppDefinition = {
+  id: "jira",
+  setupGuideUrl: "https://onecli.sh/docs/integrations/jira",
+  name: "Jira",
+  icon: "/icons/jira.svg",
+  apiDocsUrl:
+    "https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/",
+  description: "Projects, issues, and workflows in Jira Cloud.",
+  connectionMethod: {
+    type: "oauth",
+    defaultScopes: [
+      "read:me",
+      "offline_access",
+      "read:jira-work",
+      "write:jira-work",
+      "read:jira-user",
+    ],
+    permissions: [
+      {
+        scope: "read:jira-work",
+        name: "Read issues",
+        description: "View projects, issues, and search results",
+        access: "read",
+      },
+      {
+        scope: "write:jira-work",
+        name: "Manage issues",
+        description: "Create and edit issues, comments, and worklogs",
+        access: "write",
+      },
+      {
+        scope: "read:jira-user",
+        name: "User profiles",
+        description: "View user profiles and email addresses",
+        access: "read",
+      },
+      {
+        scope: "read:me",
+        name: "Profile",
+        description: "Your Atlassian account name and avatar",
+        access: "read",
+      },
+    ],
+    buildAuthUrl: buildAtlassianAuthUrl,
+    exchangeCode: exchangeAtlassianCode,
+  },
+  configurable: {
+    fields: atlassianConfigFields,
+    envDefaults: atlassianEnvDefaults,
+  },
+};

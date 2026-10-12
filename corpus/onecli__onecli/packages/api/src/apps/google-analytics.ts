@@ -1,0 +1,50 @@
+import type { AppDefinition } from "./types";
+import {
+  buildGoogleAuthUrl,
+  exchangeGoogleCode,
+  googleConfigFields,
+} from "./oauth/google";
+
+export const googleAnalytics: AppDefinition = {
+  id: "google-analytics",
+  setupGuideUrl: "https://onecli.sh/docs/integrations/google-analytics",
+  name: "Google Analytics",
+  apiDocsUrl:
+    "https://developers.google.com/analytics/devguides/reporting/data/v1/rest",
+  icon: "/icons/google-analytics.svg",
+  description: "Access report data and run analytics queries.",
+  connectionMethod: {
+    type: "oauth",
+    defaultScopes: [
+      "openid",
+      "email",
+      "profile",
+      "https://www.googleapis.com/auth/analytics",
+    ],
+    permissions: [
+      {
+        scope: "https://www.googleapis.com/auth/analytics",
+        name: "Analytics",
+        description: "Access analytics data and reports",
+        access: "write",
+      },
+      {
+        scope: "https://www.googleapis.com/auth/userinfo.email",
+        name: "Email address",
+        description: "View your email address",
+        access: "read",
+      },
+      {
+        scope: "https://www.googleapis.com/auth/userinfo.profile",
+        name: "Profile",
+        description: "Name and profile picture",
+        access: "read",
+      },
+    ],
+    buildAuthUrl: buildGoogleAuthUrl,
+    exchangeCode: exchangeGoogleCode,
+  },
+  configurable: {
+    fields: googleConfigFields,
+  },
+};

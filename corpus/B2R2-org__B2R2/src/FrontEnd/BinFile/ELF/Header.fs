@@ -1,0 +1,323 @@
+(*
+  B2R2 - the Next-Generation Reversing Platform
+
+  Copyright (c) SoftSec Lab. @ KAIST, since 2016
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*)
+
+namespace B2R2.FrontEnd.BinFile.ELF
+
+open System
+open B2R2
+open B2R2.FrontEnd.BinLifter
+open B2R2.FrontEnd.BinFile
+open B2R2.FrontEnd.BinFile.FileHelper
+
+/// Represents the ELF header. This type corresponds to "struct ElfN_Ehdr" in
+/// the ELF specification.
+type internal Header =
+  { /// 32-bit or 64-bit.
+    Class: WordSize
+    /// Little or big endian.
+    Endian: Endian
+    /// ELF version.
+    Version: uint32
+    /// OS ABI.
+    OSABI: OSABI
+    /// ABI version.
+    OSABIVersion: uint32
+    /// ELF file type (e_type).
+    ELFType: ELFType
+    /// Target instruction set architecture (e_machine).
+    MachineType: MachineType
+    /// Entry point address (e_entry).
+    EntryPoint: uint64
+    /// Program header table offset (e_phoff).
+    PHdrTblOffset: uint64
+    /// Section header table offset (e_shoff).
+    SHdrTblOffset: uint64
+    /// Processor-specific flags (e_flags).
+    ELFFlags: uint32
+    /// ELF header size (e_ehsize).
+    HeaderSize: uint16
+    /// Size of a program header table entry (e_phentsize).
+    PHdrEntrySize: uint16
+    /// Number of entries in the program header table (e_phnum), resolved
+    /// through PN_XNUM where the field carries that escape.
+    PHdrNum: int
+    /// Size of a section header table entry (e_shentsize).
+    SHdrEntrySize: uint16
+    /// Number of entries in the section header table (e_shnum), resolved
+    /// through the zero that stands in for the extended count.
+    SHdrNum: int
+    /// Section header string table index (e_shstrndx), resolved through
+    /// SHN_XINDEX where the field carries that escape.
+    SHdrStrIdx: int }
+
+[<RequireQualifiedAccess>]
+module internal Header =
+  /// Checks if the file has a valid ELF header.
+  let private isELF (span: ByteSpan) =
+    let elfMagicNumber = [| 0x7fuy; 0x45uy; 0x4cuy; 0x46uy |]
+    span.Length > 4
+    && span.Slice(0, 4).SequenceEqual(ReadOnlySpan elfMagicNumber)
+
+  let private getEndianness (span: ByteSpan) =
+    match span[5] with
+    | 0x1uy -> Endian.Little
+    | 0x2uy -> Endian.Big
+    | _ -> raise InvalidEndianException
+
+  let private getClass (span: ByteSpan) =
+    match span[4] with
+    | 0x1uy -> WordSize.Bit32
+    | 0x2uy -> WordSize.Bit64
+    | _ -> raise InvalidWordSizeException
+
+  let private getELFType (span: ByteSpan) (reader: IBinReader) =
+    reader.ReadUInt16(span, 16)
+    |> LanguagePrimitives.EnumOfValue: ELFType
+
+  let private computeNewBaseAddr etype baseAddr =
+    match etype with
+    | ELFType.ET_EXEC -> 0UL (* Non-PIEs must have zero base. *)
+    | _ -> defaultArg baseAddr 0UL
+
+  let private getELFMachineType (span: ByteSpan) (reader: IBinReader) =
+    reader.ReadInt16(span, 18)
+    |> LanguagePrimitives.EnumOfValue: MachineType
+
+  /// Reads a half-word header field as the count or index it holds.
+  let private readHalf (span: ByteSpan) (reader: IBinReader) cls off32 off64 =
+    reader.ReadUInt16(span, selectByWordSize cls off32 off64) |> int
+
+  let private parseFromSpan span (reader: IBinReader) endian baseAddrOpt =
+    let cls = getClass span
+    let etype = getELFType span reader
+    let baseAddr = computeNewBaseAddr etype baseAddrOpt
+    let hdr =
+      { Class = cls
+        Endian = endian
+        Version = reader.ReadUInt32(span, 6)
+        OSABI = span[7] |> LanguagePrimitives.EnumOfValue
+        OSABIVersion = span[8] |> uint32
+        ELFType = etype
+        MachineType = getELFMachineType span reader
+        EntryPoint = readUIntByWordSize span reader cls 24 + baseAddr
+        PHdrTblOffset = readUIntByWordSizeAndOffset span reader cls 28 32
+        SHdrTblOffset = readUIntByWordSizeAndOffset span reader cls 32 40
+        ELFFlags = reader.ReadUInt32(span, selectByWordSize cls 36 48)
+        HeaderSize = reader.ReadUInt16(span, selectByWordSize cls 40 52)
+        PHdrEntrySize = reader.ReadUInt16(span, selectByWordSize cls 42 54)
+        PHdrNum = readHalf span reader cls 44 56
+        SHdrEntrySize = reader.ReadUInt16(span, selectByWordSize cls 46 58)
+        SHdrNum = readHalf span reader cls 48 60
+        SHdrStrIdx = readHalf span reader cls 50 62 }
+    struct (hdr, baseAddr)
+
+  /// The value e_shstrndx and e_phnum carry where what they index or count is
+  /// too large for the sixteen bits they have, which is what sends a reader to
+  /// the initial section header for it.
+  let [<Literal>] private ExtendedNum = 0xffff
+
+  /// Returns the three fields of the initial section header that the extended
+  /// numbering hides the real values in: sh_size stands in for e_shnum,
+  /// sh_link for e_shstrndx, and sh_info for e_phnum.
+  let private readExtendedNums (span: ByteSpan) (reader: IBinReader) cls =
+    let shnum = readUIntByWordSizeAndOffset span reader cls 20 32
+    let strIdx = reader.ReadUInt32(span, selectByWordSize cls 24 40)
+    let phnum = reader.ReadUInt32(span, selectByWordSize cls 28 44)
+    int shnum, int strIdx, int phnum
+
+  /// Returns the field as it stands where it holds a value of its own, and
+  /// what the initial section header holds where it carries the escape.
+  let private orExtended escape extended value =
+    if value = escape then extended else value
+
+  /// Returns the header with every field of the extended numbering resolved.
+  /// A file whose section header table is gone has nowhere to have hidden one,
+  /// and its fields stand as they are.
+  let private resolveExtendedNums bytes reader hdr =
+    let offset, entSize = hdr.SHdrTblOffset, int hdr.SHdrEntrySize
+    if offset = 0UL || countTableEntries bytes offset entSize 1 = 0 then
+      hdr
+    else
+      let span = ReadOnlySpan(bytes, int offset, entSize)
+      let shnum, strIdx, phnum = readExtendedNums span reader hdr.Class
+      { hdr with
+          SHdrNum = orExtended 0 shnum hdr.SHdrNum
+          SHdrStrIdx = orExtended ExtendedNum strIdx hdr.SHdrStrIdx
+          PHdrNum = orExtended ExtendedNum phnum hdr.PHdrNum }
+
+  let private getELFFlags span (reader: IBinReader) cls =
+    reader.ReadUInt32(span = span, offset = selectByWordSize cls 36 48)
+
+  /// The bit a MIPS image's processor-specific flags carry when it holds
+  /// microMIPS code, which binutils calls EF_MIPS_ARCH_ASE_MICROMIPS. It sits
+  /// apart from the architecture level because it is not one: microMIPS is
+  /// another encoding of the same instruction set, and every level has both.
+  let [<Literal>] private MIPSMicroMIPS = 0x02000000u
+
+  /// <summary>
+  /// The same for MIPS16e, which binutils calls EF_MIPS_ARCH_ASE_M16.
+  ///
+  /// A separate bit rather than another value of the one above, because they
+  /// are separate announcements: an image says which extensions it uses and
+  /// not which one of them it uses. No processor implements both, so an image
+  /// that set both would be for no processor there is, and the microMIPS bit
+  /// is read first.
+  /// </summary>
+  let [<Literal>] private MIPSM16 = 0x04000000u
+
+  /// <summary>
+  /// The ISA of a MIPS image, from the processor-specific flags.
+  ///
+  /// The architecture level -- binutils calls it EF_MIPS_ARCH, and it is the
+  /// top nibble -- settles two things, and this used to read only the first:
+  /// how wide a register is, and which RELEASE the code belongs to. The width
+  /// is the level's to say and not the ELF class's, n32 being 64-bit in a
+  /// 32-bit file. Release 6 reassigned primary opcodes, the one ADDI had being
+  /// POP10 there, so a decoder that is not told cannot be right for both. The
+  /// release was being discarded here, which is why Release 6 images could not
+  /// be decoded at all. Which ENCODING the code is in is announced separately,
+  /// by the two ASE bits above.
+  /// </summary>
+  let private getMIPSISA span (reader: IBinReader) cls =
+    let flags = getELFFlags span reader cls
+    let mode =
+      if flags &&& MIPSMicroMIPS <> 0u then MIPSISAMode.MicroMIPS
+      elif flags &&& MIPSM16 <> 0u then MIPSISAMode.MIPS16
+      else MIPSISAMode.MIPS
+    let mips ws release =
+      ISA(Architecture.MIPS, reader.Endianness, ws, int release ||| int mode)
+    match flags &&& 0xf0000000u with
+    | 0x00000000u   (* none  *)
+    | 0x10000000u   (* MIPS2 *)
+    | 0x20000000u   (* MIPS3 *)
+    | 0x30000000u   (* MIPS4 *)
+    | 0x40000000u   (* MIPS5 *)
+    | 0x50000000u   (* 32    *)
+    | 0x70000000u   (* 32R2  *) ->
+      mips WordSize.Bit32 MIPSRelease.PreR6
+    | 0x90000000u   (* 32R6  *) ->
+      mips WordSize.Bit32 MIPSRelease.R6
+    | 0x60000000u   (* 64    *)
+    | 0x80000000u   (* 64R2  *) ->
+      mips WordSize.Bit64 MIPSRelease.PreR6
+    | 0xa0000000u   (* 64R6  *) ->
+      mips WordSize.Bit64 MIPSRelease.R6
+    | _ ->
+      raise InvalidISAException
+
+  /// The part of an AVR image's processor-specific flags naming its core,
+  /// which binutils calls EF_AVR_MACH.
+  let [<Literal>] private AVRMachMask = 0x7Fu
+
+  /// The value that field takes on avr6.
+  let [<Literal>] private AVRMachAvr6 = 6u
+
+  /// The core an AVR image was built for, taken from the mach field of its
+  /// processor-specific flags. Only avr6 is told apart, that being the one core
+  /// whose call frame differs (see AVRCore); every other value is a core whose
+  /// program counter fits in two bytes.
+  let private getAVRISA span reader cls =
+    if getELFFlags span reader cls &&& AVRMachMask = AVRMachAvr6 then
+      ISA AVRCore.Avr6
+    else
+      ISA AVRCore.Classic
+
+  let private toISA (span: ByteSpan) (reader: IBinReader) cls = function
+    | MachineType.EM_386 ->
+      ISA(Architecture.Intel, WordSize.Bit32)
+    | MachineType.EM_X86_64 ->
+      ISA(Architecture.Intel, WordSize.Bit64)
+    | MachineType.EM_ARM ->
+      ISA(Architecture.ARMv7, reader.Endianness, WordSize.Bit32)
+    | MachineType.EM_AARCH64 ->
+      ISA(Architecture.ARMv8, reader.Endianness, WordSize.Bit64)
+    | MachineType.EM_MIPS
+    | MachineType.EM_MIPS_RS3_LE ->
+      getMIPSISA span reader cls
+    | MachineType.EM_PPC ->
+      ISA(Architecture.PPC, reader.Endianness, WordSize.Bit32)
+    | MachineType.EM_PPC64 ->
+      ISA(Architecture.PPC, reader.Endianness, WordSize.Bit64)
+    | MachineType.EM_RISCV ->
+      ISA(Architecture.RISCV, reader.Endianness, cls)
+    (* V8+ is the 32-bit ISA with the V9 registers made visible to it, so it
+       decodes as V9 does and differs only in the width of a word. *)
+    | MachineType.EM_SPARC
+    | MachineType.EM_SPARC32PLUS ->
+      ISA(Architecture.SPARC, reader.Endianness, WordSize.Bit32)
+    | MachineType.EM_SPARCV9 ->
+      ISA(Architecture.SPARC, reader.Endianness, WordSize.Bit64)
+    | MachineType.EM_S390 ->
+      ISA(Architecture.S390, reader.Endianness, cls)
+    | MachineType.EM_SH ->
+      ISA(Architecture.SH4, reader.Endianness)
+    | MachineType.EM_PARISC ->
+      ISA(Architecture.PARISC, cls)
+    | MachineType.EM_68K ->
+      (* The ELF header of an m68k image says nothing about which member of the
+         family it was built for, so this is a choice rather than anything the
+         file claims. *)
+      ISA M68KModel.M68040
+    | MachineType.EM_ALPHA
+    | MachineType.EM_OLD_ALPHA ->
+      ISA Architecture.Alpha
+    | MachineType.EM_AVR ->
+      getAVRISA span reader cls
+    (* Every member of the family shares one instruction set, so the header
+       naming the family is all there is to go on. *)
+    | MachineType.EM_TI_C6000 ->
+      ISA Architecture.TMS320C6000
+    (* A program is stored in the order the machine running it stores a word,
+       and the header says which that was; nothing else about the ISA is left
+       to say, every eBPF register being a quadword whatever the host is. *)
+    | MachineType.EM_BPF ->
+      ISA(Architecture.BPF, reader.Endianness, WordSize.Bit64)
+    | _ ->
+      raise InvalidISAException
+
+  /// Parses the ELF header and return the parsed header information along with
+  /// other data types to read the rest of the ELF file, such as BinReader, its
+  /// base address, and the ISA.
+  let parse baseAddrOpt (bytes: byte[]) =
+    let span = ReadOnlySpan bytes
+    if not <| isELF span then
+      raise InvalidFileFormatException
+    else
+      let endian = getEndianness span
+      let reader = BinReader.Init endian
+      let struct (hdr, baseAddr) = parseFromSpan span reader endian baseAddrOpt
+      let hdr = resolveExtendedNums bytes reader hdr
+      let isa = toISA span reader hdr.Class hdr.MachineType
+      struct (hdr, reader, baseAddr, isa)
+
+  /// Checks if the file has a valid ELF header and returns the ISA if it does.
+  let getISA (bytes: byte[]) =
+    let span = ReadOnlySpan bytes
+    if isELF span then
+      let endian = getEndianness span
+      let reader = BinReader.Init endian
+      let cls = getClass span
+      Ok(toISA span reader cls (getELFMachineType span reader))
+    else
+      Error ErrorCase.InvalidFormat

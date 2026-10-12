@@ -1,0 +1,216 @@
+"""
+Unit tests for box management API surface (no VM required).
+
+These tests verify that the box management types and methods are properly
+exported and structured without requiring a working libkrun/VM setup.
+Requires the native Rust extension to be compiled (maturin develop).
+"""
+
+from typing import ClassVar
+
+import pytest
+
+import boxlite
+
+# Native extension types are only available when the Rust extension is compiled.
+# In CI unit-test jobs the extension is not built, so skip gracefully.
+_NATIVE_AVAILABLE = hasattr(boxlite, "Boxlite")
+
+pytestmark = pytest.mark.skipif(
+    not _NATIVE_AVAILABLE, reason="native Rust extension not available"
+)
+
+
+class TestExports:
+    """Test that key types are importable from boxlite."""
+
+    def test_boxlite_importable(self):
+        from boxlite import Boxlite
+
+        assert Boxlite is not None
+
+    def test_box_importable(self):
+        from boxlite import Box
+
+        assert Box is not None
+
+    def test_box_info_importable(self):
+        from boxlite import BoxInfo
+
+        assert BoxInfo is not None
+
+    def test_image_handle_importable(self):
+        from boxlite import ImageHandle
+
+        assert ImageHandle is not None
+
+    def test_image_info_importable(self):
+        from boxlite import ImageInfo
+
+        assert ImageInfo is not None
+
+    def test_image_pull_result_importable(self):
+        from boxlite import ImagePullResult
+
+        assert ImagePullResult is not None
+
+    def test_box_state_info_importable(self):
+        from boxlite import BoxStateInfo
+
+        assert BoxStateInfo is not None
+
+    def test_network_info_types_importable(self):
+        from boxlite import NetworkInfo, PublishedPort
+
+        assert NetworkInfo is not None
+        assert PublishedPort is not None
+
+    def test_all_contains_key_types(self):
+        """Key management types are listed in __all__."""
+        assert hasattr(boxlite, "__all__")
+        for name in (
+            "Boxlite",
+            "Box",
+            "BoxInfo",
+            "BoxStateInfo",
+            "NetworkInfo",
+            "PublishedPort",
+            "ImageHandle",
+            "ImageInfo",
+            "ImagePullResult",
+        ):
+            assert name in boxlite.__all__, f"{name} missing from __all__"
+
+
+class TestBoxInfoStructure:
+    """Test BoxInfo has expected attributes and repr."""
+
+    @pytest.fixture()
+    def box_info_cls(self):
+        return boxlite.BoxInfo
+
+    def test_has_id(self, box_info_cls):
+        assert "id" in dir(box_info_cls)
+
+    def test_has_name(self, box_info_cls):
+        assert "name" in dir(box_info_cls)
+
+    def test_has_state(self, box_info_cls):
+        assert "state" in dir(box_info_cls)
+
+    def test_has_created_at(self, box_info_cls):
+        assert "created_at" in dir(box_info_cls)
+
+    def test_has_started_at(self, box_info_cls):
+        assert "started_at" in dir(box_info_cls)
+
+    def test_has_last_activity_at(self, box_info_cls):
+        assert "last_activity_at" in dir(box_info_cls)
+
+    def test_has_image(self, box_info_cls):
+        assert "image" in dir(box_info_cls)
+
+    def test_has_cpus(self, box_info_cls):
+        assert "cpus" in dir(box_info_cls)
+
+    def test_has_memory_mib(self, box_info_cls):
+        assert "memory_mib" in dir(box_info_cls)
+
+    def test_has_network(self, box_info_cls):
+        assert "network" in dir(box_info_cls)
+
+    def test_has_repr(self, box_info_cls):
+        assert hasattr(box_info_cls, "__repr__")
+
+
+class TestNetworkInfoStructure:
+    """Test that resolved publications use named Python objects."""
+
+    @pytest.mark.parametrize("field", ["mode", "allow_net", "published_ports"])
+    def test_network_info_fields(self, field):
+        assert field in dir(boxlite.NetworkInfo)
+
+    @pytest.mark.parametrize(
+        "field", ["guest_port", "host_ip", "host_port", "protocol"]
+    )
+    def test_published_port_fields(self, field):
+        assert field in dir(boxlite.PublishedPort)
+
+
+class TestBoxStateInfoStructure:
+    """Test BoxStateInfo has expected attributes and repr."""
+
+    @pytest.fixture()
+    def state_info_cls(self):
+        return boxlite.BoxStateInfo
+
+    def test_has_status(self, state_info_cls):
+        assert "status" in dir(state_info_cls)
+
+    def test_has_running(self, state_info_cls):
+        assert "running" in dir(state_info_cls)
+
+    def test_has_pid(self, state_info_cls):
+        assert "pid" in dir(state_info_cls)
+
+    def test_has_repr(self, state_info_cls):
+        assert hasattr(state_info_cls, "__repr__")
+
+
+class TestBoxliteManagementMethods:
+    """Test that Boxlite exposes box management methods."""
+
+    @pytest.fixture()
+    def cls(self):
+        return boxlite.Boxlite
+
+    @pytest.mark.parametrize(
+        "method",
+        ["list_info", "get_info", "get", "remove", "create", "get_or_create", "images"],
+    )
+    def test_method_exists(self, cls, method):
+        assert hasattr(cls, method), f"Boxlite missing method: {method}"
+
+    def test_rest_runtime_images_unsupported(self):
+        runtime = boxlite.Boxlite.rest(
+            boxlite.BoxliteRestOptions(url="http://localhost:1")
+        )
+        with pytest.raises(RuntimeError, match="Image operations not supported"):
+            _ = runtime.images
+
+
+class TestSyncBoxliteManagementMethods:
+    """Test SyncBoxlite's sync-capable management methods."""
+
+    @pytest.fixture()
+    def cls(self):
+        sync = getattr(boxlite, "SyncBoxlite", None)
+        if sync is None:
+            pytest.skip("SyncBoxlite not available (greenlet not installed)")
+        return sync
+
+    @pytest.mark.parametrize(
+        "method",
+        ["get", "remove", "create", "get_or_create", "images"],
+    )
+    def test_method_exists(self, cls, method):
+        assert hasattr(cls, method), f"SyncBoxlite missing method: {method}"
+
+    @pytest.mark.parametrize("method", ["list_info", "get_info"])
+    def test_async_metadata_method_is_absent(self, cls, method):
+        assert not hasattr(cls, method), f"SyncBoxlite unexpectedly exposes: {method}"
+
+
+class TestModuleMetadata:
+    """Test module-level metadata (always available, even without native ext)."""
+
+    # Override the module-level skip — version is always available.
+    pytestmark: ClassVar = []
+
+    def test_version_exists(self):
+        assert hasattr(boxlite, "__version__")
+        assert isinstance(boxlite.__version__, str)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

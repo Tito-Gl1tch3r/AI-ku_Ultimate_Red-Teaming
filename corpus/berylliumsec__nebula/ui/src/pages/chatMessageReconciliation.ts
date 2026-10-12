@@ -1,0 +1,161 @@
+import type { ChatCitation, ChatMessage, ChatUsage, ToolSuggestionSummary } from "../api/types";
+import { finalAssistantContent } from "./harnessActivity";
+import { elapsedSince } from "./turnElapsed";
+
+export type ConversationMessageState = "complete" | "streaming" | "waiting_approval" | "error" | "cancelled";
+
+export interface ReconciledConversationMessage extends ChatMessage {
+  id: string;
+  /** Stable UI identity retained while a temporary message receives its durable Core ID. */
+  runtimeId?: string;
+  createdAt: string;
+  citations: ChatCitation[];
+  usage?: ChatUsage;
+  /** How long the turn ran, and how much of that waited on an approval. */
+  elapsedMs?: number;
+  approvalWaitMs?: number;
+  state: ConversationMessageState;
+  durable: boolean;
+  /** Present on history copied into a fork, including a side chat. */
+  sourceMessageId?: string;
+  recoveredHarnessTurn?: boolean;
+  detail?: string;
+  sequence?: number;
+  harnessTurnId?: string;
+  /** The provider turn whose failed or stopped outcome this saved note records. */
+  outcomeTurnId?: string;
+  toolSuggestions?: ToolSuggestionSummary;
+}
+
+interface CompletedAssistantMessage {
+  temporaryAssistantId: string;
+  durableAssistantId?: string;
+  userId: string;
+  content: string;
+  reasoning?: string;
+  citations: ChatCitation[];
+  usage?: ChatUsage;
+  elapsedMs?: number;
+  approvalWaitMs?: number;
+  harnessTurnId?: string;
+  toolSuggestions?: ToolSuggestionSummary;
+  createdAt: string;
+  progressPrefixUtf16Length?: number;
+}
+
+/** A saved answer Core kept from a stopped or interrupted turn still reads as stopped after reload. */
+export function savedAssistantState(finishReason?: string): ConversationMessageState {
+  return finishReason === "interrupted" ? "cancelled" : "complete";
+}
+
+/**
+ * Leave out Core's saved outcome note for a turn the page shows as its own
+ * unfinished response, so one failed turn does not read twice. Finishing the
+ * answer replaces the note in Core as well.
+ */
+export function withoutTurnOutcome<T extends ReconciledConversationMessage>(messages: T[], turnId: string): T[] {
+  return messages.filter((message) => message.outcomeTurnId !== turnId);
+}
+
+/** Settles the live response Core reported as stopped, keeping the partial content it streamed. */
+export function cancelStreamingAssistantMessage<T extends ReconciledConversationMessage>(
+  messages: T[],
+  assistantId: string,
+  detail = "Response stopped by the operator.",
+  now = Date.now(),
+): T[] {
+  return messages.map((message) => message.id === assistantId
+    ? { ...message, state: "cancelled" as const, elapsedMs: elapsedSince(message.createdAt, now), detail }
+    : message);
+}
+
+/** Settle the newest live assistant bubble when an operator stop wins the stream race. */
+export function cancelActiveAssistantMessage<T extends ReconciledConversationMessage>(
+  messages: T[],
+  detail = "Response stopped by the operator.",
+  now = Date.now(),
+): T[] {
+  const active = [...messages].reverse().find((message) => (
+    message.role === "assistant"
+    && (message.state === "streaming" || message.state === "waiting_approval")
+  ));
+  return active
+    ? cancelStreamingAssistantMessage(messages, active.id, detail, now)
+    : messages;
+}
+
+export function reconcileCompletedAssistantMessage(
+  messages: ReconciledConversationMessage[],
+  completed: CompletedAssistantMessage,
+): ReconciledConversationMessage[] {
+  const durableId = completed.durableAssistantId ?? completed.temporaryAssistantId;
+  const durable = messages.find((message) => message.id === durableId);
+  const temporary = messages.find((message) => message.id === completed.temporaryAssistantId);
+  const existing = durable ?? temporary;
+  const finalized: ReconciledConversationMessage = {
+    ...(existing ?? {
+      id: durableId,
+      role: "assistant",
+      content: "",
+      createdAt: completed.createdAt,
+      citations: [],
+      state: "streaming",
+      durable: false,
+    }),
+    id: durableId,
+    runtimeId: existing?.runtimeId
+      ?? (existing?.id === completed.temporaryAssistantId && durableId !== completed.temporaryAssistantId
+        ? completed.temporaryAssistantId
+        : undefined),
+    role: "assistant",
+    content: finalAssistantContent(existing?.content ?? "", completed.content),
+    metadata: completed.progressPrefixUtf16Length !== undefined
+      ? { ...existing?.metadata, progress_prefix_utf16_length: completed.progressPrefixUtf16Length }
+      : existing?.metadata,
+    reasoning: completed.reasoning || existing?.reasoning,
+    citations: completed.citations,
+    usage: completed.usage,
+    elapsedMs: completed.elapsedMs ?? existing?.elapsedMs,
+    approvalWaitMs: completed.approvalWaitMs ?? existing?.approvalWaitMs,
+    state: "complete",
+    durable: Boolean(completed.durableAssistantId),
+    harnessTurnId: completed.harnessTurnId ?? existing?.harnessTurnId,
+    toolSuggestions: completed.toolSuggestions ?? existing?.toolSuggestions,
+  };
+
+  const reconciled = messages
+    .filter((message) => (
+      message.id !== durableId && message.id !== completed.temporaryAssistantId
+    ))
+    .map((message) => message.id === completed.userId ? { ...message, durable: true } : message);
+  const insertionIndex = existing
+    ? messages.findIndex((message) => message.id === existing.id)
+    : reconciled.length;
+  reconciled.splice(Math.min(insertionIndex, reconciled.length), 0, finalized);
+  return reconciled;
+}
+
+/** Restore event-owned turns that ended before Core saved a final chat message. */
+export async function recoverHarnessHistory(
+  messages: ReconciledConversationMessage[],
+  getTurn: (id: string) => Promise<{id: string; status: string; error?: string}>,
+): Promise<ReconciledConversationMessage[]> {
+  const represented = new Set(messages.filter(message => message.role === "assistant").map(message => message.harnessTurnId));
+  const result: ReconciledConversationMessage[] = [];
+  for (const message of messages) {
+    result.push(message);
+    const turnId = message.harnessTurnId;
+    if (message.role !== "user" || !turnId || represented.has(turnId)) continue;
+    const turn = await getTurn(turnId);
+    if (!["failed", "cancelled", "interrupted"].includes(turn.status)) continue;
+    represented.add(turnId);
+    result.push({
+      id: `assistant-harness-recovery-${turnId}`,
+      role: "assistant", content: "", createdAt: message.createdAt, citations: [],
+      state: turn.status === "cancelled" ? "cancelled" : "error",
+      durable: false, recoveredHarnessTurn: true, harnessTurnId: turnId,
+      detail: turn.status === "cancelled" ? undefined : turn.error ?? "The harness turn was interrupted before its outcome was known.",
+    });
+  }
+  return result;
+}
