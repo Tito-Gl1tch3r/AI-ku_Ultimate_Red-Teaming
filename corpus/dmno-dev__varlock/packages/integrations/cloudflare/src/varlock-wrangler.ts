@@ -1,0 +1,849 @@
+/* eslint-disable no-console */
+
+import {
+  writeFileSync, unlinkSync, watch, existsSync, statSync,
+} from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomBytes } from 'node:crypto';
+import { spawn, execSync } from 'node:child_process';
+
+import { execSyncVarlock, VarlockExecError } from 'varlock/exec-sync-varlock';
+import { encryptEnvBlobSync, generateEncryptionKeyHex } from 'varlock/encrypt-env';
+import { formatEnvLine } from './format-env-line';
+import {
+  isPreviewDeployCommand, withInjectedArgs, wranglerCommandArgs, wranglerFlagValue, wranglerProjectDir,
+} from './wrangler-command-detection';
+
+const isWindows = process.platform === 'win32';
+const debugEnabled = !!process.env.VARLOCK_DEBUG;
+function debug(...args: Array<any>) {
+  if (debugEnabled) console.log('[varlock-wrangler]', ...args);
+}
+
+/** Detect the package manager exec command from npm_config_user_agent */
+function getExecPrefix(): string {
+  const ua = process.env.npm_config_user_agent || '';
+  if (ua.startsWith('pnpm/')) return 'pnpm exec ';
+  if (ua.startsWith('yarn/')) return 'yarn exec ';
+  if (ua.startsWith('bun/')) return 'bunx ';
+  if (ua.startsWith('npm/')) return 'npx ';
+  return '';
+}
+
+// --- shared helpers ---
+
+function spawnWrangler(args: Array<string>): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('wrangler', args, {
+      stdio: 'inherit',
+      shell: isWindows,
+    });
+    child.on('error', (err) => {
+      if ((err as any).code === 'ENOENT') {
+        console.error('Error: wrangler not found. Install it with your package manager:');
+        console.error('  Install it with your package manager, e.g.: npm install wrangler');
+      }
+      reject(err);
+    });
+    child.on('exit', (code, signal) => {
+      resolve(code ?? (signal ? 1 : 0));
+    });
+  });
+}
+
+/**
+ * Runs wrangler and captures its output instead of inheriting stdio.
+ * Used to ask wrangler how it parses a command (see wrangler-command-detection).
+ */
+function captureWrangler(args: Array<string>, timeoutMs = 20_000): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    debug('capture: wrangler', args.join(' '));
+    const child = spawn('wrangler', args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: isWindows,
+    });
+    let output = '';
+    const timer = setTimeout(() => {
+      debug('capture: timed out');
+      child.kill();
+      resolve(undefined);
+    }, timeoutMs);
+    timer.unref();
+    const collect = (chunk: Buffer) => {
+      output += chunk.toString();
+    };
+    child.stdout?.on('data', collect);
+    child.stderr?.on('data', collect);
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(undefined);
+    });
+    child.on('close', () => {
+      clearTimeout(timer);
+      resolve(output || undefined);
+    });
+  });
+}
+
+/**
+ * `cwd` mirrors wrangler's own `--cwd` flag: wrangler runs as if started there, so
+ * varlock has to resolve the same project's .env files rather than the caller's.
+ */
+function loadSerializedGraph(cwd?: string) {
+  const { stdout } = execSyncVarlock('load --format json-full --compact', {
+    fullResult: true,
+    ...cwd && { cwd },
+    integrationTelemetry: {
+      name: __VARLOCK_INTEGRATION_NAME__,
+      version: __VARLOCK_INTEGRATION_VERSION__,
+    },
+  });
+  return {
+    json: stdout,
+    graph: JSON.parse(stdout) as {
+      basePath?: string,
+      sources: Array<{ label: string, enabled: boolean, path?: string, contentHash?: string }>,
+      settings?: { encryptInjectedEnv?: boolean },
+      config: Record<string, { value: unknown, isSensitive: boolean, isDynamic?: boolean }>,
+    },
+  };
+}
+
+type SerializedGraph = ReturnType<typeof loadSerializedGraph>['graph'];
+
+/**
+ * Comparison key used to decide whether a reload actually changed the env.
+ *
+ * `sources[].contentHash` fingerprints the raw bytes of each env file so injected-env
+ * reuse can spot edits. It also moves on cosmetic saves (a reordered comment, a trailing
+ * newline) that leave every resolved value identical, so it must not count as a change
+ * here, or every save would restart wrangler.
+ */
+function envComparisonKey(graph: SerializedGraph): string {
+  return JSON.stringify({
+    ...graph,
+    sources: (graph.sources ?? []).map((source) => {
+      const withoutHash: Partial<typeof source> = { ...source };
+      delete withoutHash.contentHash;
+      return withoutHash;
+    }),
+  });
+}
+
+function tmpPath(prefix: string) {
+  return join(tmpdir(), `${prefix}-${randomBytes(8).toString('hex')}`);
+}
+
+/**
+ * Creates a named pipe (FIFO) for long-running commands (dev).
+ * On Unix: data only exists in a kernel buffer — secrets never touch disk.
+ * On Windows: falls back to a regular temp file.
+ */
+function createServingTempFile(prefix: string) {
+  const filePath = tmpPath(prefix);
+
+  if (!isWindows) {
+    execSync(`mkfifo -m 0600 "${filePath}"`);
+  }
+
+  function cleanup() {
+    try {
+      unlinkSync(filePath);
+    } catch {
+      // may already be deleted
+    }
+  }
+
+  type ServingHandle = {
+    update: (content: string) => Promise<void>,
+    stop: () => void,
+  };
+
+  /**
+   * Start serving content via the FIFO (or write a regular file on Windows).
+   *
+   * On Unix: spawns a child process that writes the content to the FIFO exactly
+   * once, then exits ("single-shot"). A FIFO is an unframed byte stream and the
+   * reader (`fs.readFileSync`) reads until EOF — which only occurs once *no*
+   * writer has the pipe open. Serving in a loop (re-opening a writer immediately)
+   * means a reader can read several concatenated copies before it ever sees EOF,
+   * which surfaced as wrangler reporting `--secrets-file` contents as invalid
+   * JSON in Linux CI (intermittent, scheduling-dependent). Writing one copy then
+   * closing guarantees a clean EOF after exactly one copy.
+   *
+   * Once that copy is consumed (the writer exits cleanly), a fresh single-shot
+   * writer is re-armed so the next reader has content. This is required because
+   * wrangler reads these files more than once — `wrangler types` re-reads the
+   * `--env-file`, and deploy/upload can re-read the `--secrets-file` — so a
+   * pure one-shot writer would leave the second read hanging. Only ever one
+   * writer is armed at a time, so copies never overlap (no concatenation). The
+   * FIFO is kept (rather than a temp file) so resolved secrets never exist as a
+   * file at rest — a failed/aborted deploy leaves no plaintext secrets on disk.
+   *
+   * Using a child process means the blocked libuv thread (the FIFO open() blocks
+   * until a reader appears) lives in the child — killing it cleanly releases it.
+   *
+   * On Windows: writes a regular file, with update() to refresh it.
+   *
+   * Returns a promise that resolves once the FIFO server is ready to accept a
+   * reader — this prevents racing with downstream consumers (e.g. wrangler).
+   */
+  async function startServing(getContent: () => string): Promise<ServingHandle> {
+    if (isWindows) {
+      writeFileSync(filePath, getContent());
+      return {
+        async update(content: string) { writeFileSync(filePath, content); },
+        stop() {
+          /* noop on Windows */
+        },
+      };
+    }
+
+    let stopped = false;
+    // bumped on update()/stop() to invalidate any in-flight re-arm chain
+    let generation = 0;
+    let currentChild: ReturnType<typeof spawn> | undefined;
+    let getContentFn = getContent;
+
+    // spawn a single-shot writer: buffer content from stdin, signal 'ready',
+    // write exactly one copy to the FIFO, then exit. fd 3 is a control pipe:
+    // 'ready\n' once buffered and about to open the FIFO, 'err:<message>\n' on
+    // write failure so the parent can surface it instead of dying silently.
+    function spawnWriter(content: string, gen: number): Promise<ReturnType<typeof spawn>> {
+      const child = spawn(process.execPath, [
+        '-e', `
+        const fs = require('fs');
+        const path = ${JSON.stringify(filePath)};
+        const ctrl = fs.createWriteStream(null, { fd: 3 });
+        const chunks = [];
+        process.stdin.on('data', d => chunks.push(d));
+        process.stdin.on('end', () => {
+          // concat Buffers once at end — '+=' on a Buffer corrupts split UTF-8
+          const content = Buffer.concat(chunks).toString('utf8');
+          // signal readiness *before* the blocking FIFO open so the parent
+          // knows it's safe to spawn the reader (e.g. wrangler).
+          ctrl.write('ready\\n');
+          try {
+            // write exactly one copy then exit — closing the fd delivers a
+            // clean EOF after one copy (no concatenation race).
+            fs.writeFileSync(path, content);
+            process.exit(0);
+          } catch (e) {
+            try { ctrl.write('err:' + (e && e.code || '') + ' ' + (e && e.message || String(e)) + '\\n'); } catch {}
+            try { process.stderr.write('[varlock-wrangler:fifo-server] write failed: ' + (e && e.stack || e) + '\\n'); } catch {}
+            process.exit(1);
+          }
+        });
+      `,
+      ], {
+        // stdio: stdin=pipe (content), stdout=ignored, stderr=piped (forwarded),
+        // fd 3 = control pipe for ready/error signals
+        stdio: ['pipe', 'ignore', 'pipe', 'pipe'],
+      });
+      child.stdin!.write(content);
+      child.stdin!.end();
+
+      // forward child stderr so we don't lose diagnostic output on crashes
+      child.stderr?.on('data', (d) => process.stderr.write(d));
+
+      // re-arm: when this writer's single copy is consumed (clean exit), spawn a
+      // fresh writer so the next reader has content. guarded by generation so a
+      // stale chain from before an update()/stop() doesn't resurrect a writer.
+      child.once('exit', (code) => {
+        if (stopped || code !== 0 || gen !== generation) return;
+        currentChild = undefined;
+        spawnWriter(getContentFn(), gen).then((c) => {
+          if (stopped || gen !== generation) c.kill();
+          else currentChild = c;
+        }).catch(() => { /* surfaced via stderr/control pipe */ });
+      });
+
+      // surface any control-pipe messages (errors after readiness)
+      const controlPipe = (child.stdio as Array<any>)[3] as NodeJS.ReadableStream;
+
+      // wait for child to signal it's ready (i.e. has buffered the content and
+      // is about to open the FIFO). without this, the parent can race ahead and
+      // spawn wrangler before the child even starts.
+      return new Promise<ReturnType<typeof spawn>>((resolve, reject) => {
+        let buf = '';
+        const onData = (d: Buffer) => {
+          buf += d.toString('utf8');
+          if (buf.includes('ready\n')) {
+            controlPipe.off('data', onData);
+            // keep listening for post-ready error messages
+            controlPipe.on('data', (more: Buffer) => {
+              const msg = more.toString('utf8').trim();
+              if (msg) process.stderr.write(`[varlock-wrangler] fifo-server: ${msg}\n`);
+            });
+            resolve(child);
+          } else if (buf.startsWith('err:')) {
+            reject(new Error(`fifo-server failed before ready: ${buf.trim()}`));
+          }
+        };
+        controlPipe.on('data', onData);
+        child.once('exit', (code, signal) => {
+          if (!buf.includes('ready\n')) {
+            reject(new Error(`fifo-server exited before ready (code=${code}, signal=${signal})`));
+          }
+        });
+      });
+    }
+
+    currentChild = await spawnWriter(getContentFn(), generation);
+
+    const handle: ServingHandle = {
+      /** Swap the served content and re-arm a fresh writer with it */
+      async update(content: string) {
+        getContentFn = () => content;
+        generation++; // invalidate the previous re-arm chain
+        const previous = currentChild;
+        currentChild = undefined;
+        previous?.kill();
+        currentChild = await spawnWriter(content, generation);
+      },
+      stop() {
+        stopped = true;
+        generation++; // stop any in-flight re-arm
+        currentChild?.kill();
+      },
+    };
+    return handle;
+  }
+
+  return {
+    filePath, cleanup, startServing,
+  };
+}
+
+// Cloudflare secrets are limited to 5KB each.
+// __VARLOCK_ENV can exceed this, so we split it into chunks.
+const CF_SECRET_MAX_BYTES = 5120;
+
+/**
+ * Split a string into chunks where each chunk's UTF-8 byte length ≤ maxBytes.
+ * Unlike slicing a Buffer, this never splits a multi-byte character.
+ */
+function chunkString(str: string, maxBytes: number): Array<string> {
+  const chunks: Array<string> = [];
+  let current = '';
+  let currentBytes = 0;
+  for (const char of str) {
+    const charBytes = Buffer.byteLength(char);
+    if (currentBytes + charBytes > maxBytes && current) {
+      chunks.push(current);
+      current = '';
+      currentBytes = 0;
+    }
+    current += char;
+    currentBytes += charBytes;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Adds __VARLOCK_ENV to a key-value record, splitting into chunks if needed.
+ * If the value fits in one secret: sets __VARLOCK_ENV directly.
+ * If too large: sets __VARLOCK_ENV_CHUNKS=N and __VARLOCK_ENV_0, __VARLOCK_ENV_1, etc.
+ */
+function addVarlockEnvToRecord(record: Record<string, string>, json: string) {
+  if (Buffer.byteLength(json) <= CF_SECRET_MAX_BYTES) {
+    record.__VARLOCK_ENV = json;
+    return;
+  }
+  const chunks = chunkString(json, CF_SECRET_MAX_BYTES);
+  record.__VARLOCK_ENV_CHUNKS = String(chunks.length);
+  for (let i = 0; i < chunks.length; i++) {
+    record[`__VARLOCK_ENV_${i}`] = chunks[i];
+  }
+  debug(`__VARLOCK_ENV split into ${chunks.length} chunks (${Buffer.byteLength(json)} bytes)`);
+}
+
+/**
+ * Adds __VARLOCK_ENV lines to a dotenv-format array, splitting into chunks if needed.
+ */
+function addVarlockEnvToLines(lines: Array<string>, json: string) {
+  if (Buffer.byteLength(json) <= CF_SECRET_MAX_BYTES) {
+    lines.push(formatEnvLine('__VARLOCK_ENV', json));
+    return;
+  }
+  const chunks = chunkString(json, CF_SECRET_MAX_BYTES);
+  lines.push(formatEnvLine('__VARLOCK_ENV_CHUNKS', String(chunks.length)));
+  for (let i = 0; i < chunks.length; i++) {
+    lines.push(formatEnvLine(`__VARLOCK_ENV_${i}`, chunks[i]));
+  }
+  debug(`__VARLOCK_ENV split into ${chunks.length} chunks (${Buffer.byteLength(json)} bytes)`);
+}
+
+function formatEnvFileContent(graph: ReturnType<typeof loadSerializedGraph>) {
+  // dotenv/Wrangler-compatible quoting via formatEnvLine (prefer a quote char
+  // absent from the value; no backslash escapes dotenv will leave literal).
+  const lines: Array<string> = [
+    '# ⚠️  AUTO-GENERATED BY VARLOCK — DO NOT EDIT',
+    `# ${isWindows ? 'This is a temporary file and will be cleaned up automatically.' : 'This file is served via a named pipe (FIFO) and exists only in memory.'}`,
+    '# Your .env files and .env.schema are the source of truth.',
+    '# See https://varlock.dev/integrations/cloudflare/ for details.',
+    '',
+  ];
+  for (const key in graph.graph.config) {
+    const item = graph.graph.config[key];
+    if (item.value === undefined) continue;
+    const strValue = typeof item.value === 'string' ? item.value : JSON.stringify(item.value);
+    lines.push(formatEnvLine(key, strValue));
+  }
+  // include __VARLOCK_ENV for the varlock runtime (compact JSON, no newlines)
+  // encrypt the blob if @encryptInjectedEnv is enabled or _VARLOCK_ENV_KEY is set
+  const encryptionRequired = !!graph.graph.settings?.encryptInjectedEnv;
+  let encryptionKey = process.env._VARLOCK_ENV_KEY;
+  if (encryptionRequired && !encryptionKey) {
+    encryptionKey = generateEncryptionKeyHex();
+  }
+  let envBlob = graph.json;
+  if (encryptionKey) {
+    envBlob = encryptEnvBlobSync(envBlob, encryptionKey);
+    lines.push(formatEnvLine('_VARLOCK_ENV_KEY', encryptionKey));
+  }
+  // split into chunks if it exceeds CF's 5KB secret limit
+  addVarlockEnvToLines(lines, envBlob);
+  return lines.join('\n');
+}
+
+// --- command detection ---
+
+function isVersionsUploadCommand(args: Array<string>) {
+  const command = wranglerCommandArgs(args);
+  return command[0] === 'versions' && command[1] === 'upload';
+}
+
+function isPlainDeployCommand(args: Array<string>) {
+  return wranglerCommandArgs(args)[0] === 'deploy';
+}
+
+async function isDeployCommand(args: Array<string>) {
+  if (isPlainDeployCommand(args)) return true;
+  if (isVersionsUploadCommand(args)) return true;
+  if (await isPreviewDeployCommand(args, captureWrangler)) return true;
+  return false;
+}
+
+function isTypesCommand(args: Array<string>) {
+  return wranglerCommandArgs(args)[0] === 'types';
+}
+
+// --- command handlers ---
+
+async function handleDeploy(args: Array<string>) {
+  if (args.includes('--secrets-file')) {
+    console.error('Error: --secrets-file is managed automatically by varlock-wrangler.');
+    console.error('Remove --secrets-file from your command and let varlock handle it.');
+    process.exitCode = 1;
+    return;
+  }
+
+  let loaded;
+  try {
+    loaded = loadSerializedGraph(wranglerFlagValue(args, '--cwd'));
+  } catch (err) {
+    if (err instanceof VarlockExecError && err.stderr) process.stderr.write(err.stderr);
+    console.error('\n[varlock-wrangler] Failed to resolve environment variables\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  // split resolved vars into:
+  // - non-sensitive → --var flags (visible in CF dashboard as environment variables)
+  // - sensitive → --secrets-file (stored as CF secrets)
+  // - __VARLOCK_ENV blob → always a secret (contains full graph including sensitive values)
+  const varFlags: Array<string> = [];
+  const secretsObj: Record<string, string> = {};
+
+  for (const key in loaded.graph.config) {
+    const item = loaded.graph.config[key];
+    if (item.value === undefined) continue;
+    const strValue = typeof item.value === 'string' ? item.value : JSON.stringify(item.value);
+
+    if (item.isSensitive) {
+      secretsObj[key] = strValue;
+    } else {
+      // wrangler splits KEY:VALUE on the first `:` only, so colons in values are safe
+      // spawn args array passes newlines/special chars without shell escaping issues
+      varFlags.push('--var', `${key}:${strValue}`);
+    }
+  }
+  // encrypt the blob if @encryptInjectedEnv is enabled or _VARLOCK_ENV_KEY is set
+  const encryptionRequired = !!loaded.graph.settings?.encryptInjectedEnv;
+  let encryptionKey = process.env._VARLOCK_ENV_KEY;
+  if (encryptionRequired && !encryptionKey) {
+    // auto-generate a key for Cloudflare since we control the deploy pipeline
+    encryptionKey = generateEncryptionKeyHex();
+    console.log('[varlock-wrangler] auto-generated _VARLOCK_ENV_KEY for encrypted deployment');
+  }
+  let envBlob = loaded.json;
+  if (encryptionKey) {
+    envBlob = encryptEnvBlobSync(envBlob, encryptionKey);
+    secretsObj._VARLOCK_ENV_KEY = encryptionKey;
+  }
+  // split into chunks if it exceeds CF's 5KB secret limit
+  addVarlockEnvToRecord(secretsObj, envBlob);
+
+  const tmp = createServingTempFile('varlock-secrets');
+  const content = JSON.stringify(secretsObj);
+  debug('deploy: starting FIFO serve');
+  const handle = await tmp.startServing(() => content);
+  debug('deploy: FIFO serve ready');
+
+  process.on('SIGINT', () => {
+    handle.stop();
+    tmp.cleanup();
+    process.exit(1);
+  });
+  process.on('SIGTERM', () => {
+    handle.stop();
+    tmp.cleanup();
+    process.exit(1);
+  });
+
+  const varCount = varFlags.length / 2; // each var is two entries: --var, KEY:VALUE
+  // count only user secrets (exclude __VARLOCK_ENV and chunk keys)
+  const secretCount = Object.keys(secretsObj).filter((k) => !k.startsWith('__VARLOCK_ENV')).length;
+  console.log(`\x1b[36m✨ Deploying with varlock: ${varCount} var${varCount !== 1 ? 's' : ''}, ${secretCount} secret${secretCount !== 1 ? 's' : ''} 🧙🔒\x1b[0m`);
+
+  let exitCode = process.exitCode ?? 0;
+  try {
+    debug('deploy: spawning wrangler');
+    const injectedArgs = [...varFlags, '--secrets-file', tmp.filePath];
+    // --keep-vars only applies to `deploy` (not `versions upload` or `preview`)
+    if (isPlainDeployCommand(args)) injectedArgs.push('--keep-vars=false');
+    const wranglerArgs = withInjectedArgs(args, injectedArgs);
+    exitCode = await spawnWrangler(wranglerArgs);
+    debug('deploy: wrangler exited with code', exitCode);
+  } finally {
+    debug('deploy: cleaning up');
+    handle.stop();
+    tmp.cleanup();
+  }
+  process.exitCode = exitCode;
+}
+
+async function handleTypes(args: Array<string>) {
+  debug('types: resolving env');
+  let loaded;
+  try {
+    loaded = loadSerializedGraph(wranglerFlagValue(args, '--cwd'));
+  } catch (err) {
+    if (err instanceof VarlockExecError && err.stderr) process.stderr.write(err.stderr);
+    console.error('\n[varlock-wrangler] Failed to resolve environment variables\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  debug('types: resolved', Object.keys(loaded.graph.config).length, 'env vars');
+  // generate a temp env file with just key names (no real values)
+  // wrangler types reads this to discover which vars to include in the Env interface
+  const envFileLines: Array<string> = [];
+  for (const key in loaded.graph.config) {
+    envFileLines.push(`${key}=`);
+  }
+
+  const tmp = createServingTempFile('varlock-types-env');
+  debug('types: starting FIFO serve');
+  const handle = await tmp.startServing(() => envFileLines.join('\n'));
+  debug('types: FIFO serve ready');
+
+  let exitCode = process.exitCode ?? 0;
+  try {
+    debug('types: spawning wrangler');
+    exitCode = await spawnWrangler(withInjectedArgs(args, ['--env-file', tmp.filePath]));
+    debug('types: wrangler exited with code', exitCode);
+  } finally {
+    debug('types: cleaning up');
+    handle.stop();
+    tmp.cleanup();
+  }
+  process.exitCode = exitCode;
+}
+
+async function handleDev(args: Array<string>) {
+  // .dev.vars would conflict with our env injection via --env-file, so warn about it
+  if (existsSync(join(wranglerProjectDir(args), '.dev.vars'))) {
+    console.error([
+      'Error: a .dev.vars file was detected in your project.',
+      'This conflicts with varlock-wrangler which manages env vars automatically.',
+      'Remove .dev.vars and define your variables in .env files with a .env.schema instead.',
+    ].join('\n'));
+    process.exitCode = 1;
+    return;
+  }
+
+  debug('dev: resolving env');
+  let loaded: ReturnType<typeof loadSerializedGraph> | undefined;
+  let configIsValid = false;
+  try {
+    loaded = loadSerializedGraph(wranglerFlagValue(args, '--cwd'));
+    configIsValid = true;
+  } catch (err) {
+    if (err instanceof VarlockExecError) {
+      if (err.stderr) process.stderr.write(err.stderr);
+      // Parse stdout even on failure — we need sources for file watchers
+      if (err.stdout) {
+        try {
+          const parsed = JSON.parse(err.stdout);
+          loaded = { json: err.stdout, graph: parsed };
+        } catch { /* not parseable */ }
+      }
+    }
+    console.error('\n[varlock-wrangler] ⚠️ config is invalid — fix the error(s) above and save to reload\n');
+  }
+
+  if (!loaded) {
+    console.error('[varlock-wrangler] Failed to parse env — cannot start dev server');
+    process.exitCode = 1;
+    return;
+  }
+  debug('dev: resolved', Object.keys(loaded.graph.config).length, 'env vars, valid =', configIsValid);
+
+  const tmp = createServingTempFile('varlock-dev-env');
+  debug('dev: created FIFO at', tmp.filePath);
+
+  // When config is invalid, serve a minimal env file with __VARLOCK_ENV containing
+  // the error JSON — this lets the worker's initVarlockEnv() succeed (with configHasErrors=true)
+  // instead of throwing "initVarlockEnv failed"
+  let cachedContent = configIsValid
+    ? formatEnvFileContent(loaded)
+    : `${formatEnvLine('__VARLOCK_ENV', loaded.json)}\n`;
+  let wranglerChild: ReturnType<typeof spawn> | undefined;
+  const watchers: Array<ReturnType<typeof watch>> = [];
+
+  debug('dev: starting FIFO serve');
+  const handle = await tmp.startServing(() => cachedContent);
+  debug('dev: FIFO serve ready');
+
+  function cleanup() {
+    handle.stop();
+    for (const w of watchers) w.close();
+    tmp.cleanup();
+  }
+
+  process.on('SIGINT', () => {
+    wranglerChild?.kill();
+    cleanup();
+    process.exit(1);
+  });
+  process.on('SIGTERM', () => {
+    wranglerChild?.kill();
+    cleanup();
+    process.exit(1);
+  });
+
+  // watch env source files for changes and restart wrangler with fresh data
+  const DEBOUNCE_MS = 300;
+  let restartTimeout: ReturnType<typeof setTimeout> | undefined;
+  let cachedEnvKey = envComparisonKey(loaded.graph);
+  const changedFiles = new Set<string>();
+  function scheduleRestart(changedFilePath?: string) {
+    if (changedFilePath) changedFiles.add(changedFilePath);
+    // debounce — multiple files may change at once (e.g. editor saves multiple files,
+    // or macOS fs.watch() emits extra events for unchanged files)
+    if (restartTimeout) clearTimeout(restartTimeout);
+    restartTimeout = setTimeout(async () => {
+      const changedFileList = [...changedFiles];
+      changedFiles.clear();
+      try {
+        const freshLoaded = loadSerializedGraph(wranglerFlagValue(args, '--cwd'));
+        const freshEnvKey = envComparisonKey(freshLoaded.graph);
+        if (freshEnvKey === cachedEnvKey) {
+          const changedMsg = changedFileList.length
+            ? `change detected in ${changedFileList.length} env source file${changedFileList.length === 1 ? '' : 's'}`
+            : 'change detected in env source files';
+          console.log(`[varlock-wrangler] ${changedMsg}; reloaded env, no changes found, skipping restart.`);
+          restartTimeout = undefined;
+          return;
+        }
+        cachedEnvKey = freshEnvKey;
+        loaded = freshLoaded;
+        configIsValid = true;
+        cachedContent = formatEnvFileContent(freshLoaded);
+        // await readiness so wrangler doesn't restart before the new FIFO server is serving
+        await handle.update(cachedContent);
+        const changedMsg = changedFileList.length
+          ? `change detected in ${changedFileList.length} env source file${changedFileList.length === 1 ? '' : 's'}`
+          : 'change detected in env source files';
+        console.log(`[varlock-wrangler] ${changedMsg}; reloaded env, changes found, restarting wrangler...`);
+        wranglerChild?.kill();
+        // NOTE: restartTimeout stays truthy so the exit handler knows this was a restart-kill
+      } catch (err) {
+        configIsValid = false;
+        if (err instanceof VarlockExecError) {
+          if (err.stderr) process.stderr.write(err.stderr);
+          // Update FIFO with error-state env and restart wrangler so the
+          // worker picks up configHasErrors=true and warns on ENV access
+          if (err.stdout) {
+            try {
+              const parsed = JSON.parse(err.stdout);
+              loaded = { json: err.stdout, graph: parsed };
+              cachedEnvKey = envComparisonKey(parsed);
+              cachedContent = `${formatEnvLine('__VARLOCK_ENV', err.stdout)}\n`;
+              await handle.update(cachedContent);
+              console.error('\n[varlock-wrangler] \u26a0\ufe0f config is invalid \u2014 fix the error(s) above and save to reload\n');
+              wranglerChild?.kill();
+              // restartTimeout stays truthy so the exit handler knows this was a restart-kill
+              return;
+            } catch { /* not parseable */ }
+          }
+        }
+        restartTimeout = undefined;
+        console.error('\n[varlock-wrangler] \u26a0\ufe0f config is invalid \u2014 fix the error(s) above and save to reload\n');
+      }
+    }, DEBOUNCE_MS);
+  }
+
+  // set up watchers on env source files
+  if (loaded.graph.basePath) {
+    for (const source of loaded.graph.sources) {
+      if (!source.enabled || !source.path) continue;
+      const fullPath = join(loaded.graph.basePath, source.path);
+      try {
+        // Sources that are not regular files (e.g. a FIFO served by 1Password
+        // Environments) cannot be watched: their stat churns whenever they are
+        // read, and each reload re-reads every source, so watching one creates
+        // an endless reload loop. Live reload is disabled for those sources.
+        const initialStat = statSync(fullPath);
+        if (!initialStat.isFile()) {
+          console.log(`ℹ️ [varlock-wrangler] ${source.path} is not a regular file (FIFO/pipe), live reload is disabled for it`);
+          continue;
+        }
+        let lastMtimeMs = initialStat.mtimeMs;
+        const w = watch(fullPath, () => {
+          // macOS fs.watch emits spurious change events when another local tool
+          // merely opens/inspects the file (issue #845). A real save always
+          // updates mtime, so ignore events where mtime is unchanged.
+          try {
+            const currentMtimeMs = statSync(fullPath).mtimeMs;
+            if (currentMtimeMs === lastMtimeMs) {
+              debug('dev: ignoring watch event with unchanged mtime', fullPath);
+              return;
+            }
+            lastMtimeMs = currentMtimeMs;
+          } catch {
+            // file may have been deleted/renamed — treat as a change
+          }
+          scheduleRestart(fullPath);
+        });
+        watchers.push(w);
+        debug('dev: watching', fullPath);
+      } catch {
+        // file may not exist yet (e.g., optional env-specific file)
+      }
+    }
+  }
+
+  try {
+    // outer loop: (re)spawn wrangler each time it exits
+    // on env file changes, the watcher kills wrangler, which causes it to respawn
+    // with the fresh data (FIFO serves fresh content, Windows file is refreshed)
+    while (true) {
+      debug('dev: spawning wrangler');
+      wranglerChild = spawn('wrangler', withInjectedArgs(args, ['--env-file', tmp.filePath]), {
+        stdio: ['inherit', 'pipe', 'pipe'],
+        shell: isWindows,
+        // force color output since piped stdio loses TTY detection
+        env: { ...process.env, FORCE_COLOR: '1' },
+      });
+
+      // pipe wrangler output with rewrites:
+      // - replace FIFO path reference with a friendlier message
+      // - strip env var binding rows (other bindings like KV, D1 are preserved)
+      const tmpBasename = tmp.filePath.split(/[/\\]/).pop()!;
+      const loadCmd = `${getExecPrefix()}varlock load`;
+      const envVarCount = Object.keys(loaded.graph.config).length;
+      let shownVarlockNotice = false;
+      const varlockNotice = `\x1b[36m✨ ${envVarCount} env var${envVarCount !== 1 ? 's' : ''} managed by varlock 🧙🔒\x1b[0m\n`
+        + `\x1b[2m   run \`${loadCmd}\` to inspect\x1b[0m\n`;
+      const rewriteOutput = (stream: NodeJS.WriteStream) => (chunk: Buffer) => {
+        let str = chunk.toString();
+        // strip the FIFO path line entirely
+        if (str.includes(tmpBasename)) {
+          str = str.replace(/.*varlock-dev-env-[a-f0-9]+.*\n?/g, '');
+        }
+        // replace env var binding rows with a single varlock notice
+        // (other bindings like KV, D1 are preserved)
+        if (str.includes('Environment Variable')) {
+          if (!shownVarlockNotice) {
+            str = str.replace(/.*Environment Variable.*\n?/, varlockNotice);
+            shownVarlockNotice = true;
+          }
+          str = str.replace(/.*Environment Variable.*\n?/g, '');
+        }
+        // rewrite wrangler types hint to use varlock-wrangler
+        if (str.includes('wrangler types')) {
+          str = str.replace(/wrangler types/g, 'varlock-wrangler types');
+        }
+        if (str) stream.write(str);
+      };
+      wranglerChild.stdout?.on('data', rewriteOutput(process.stdout));
+      wranglerChild.stderr?.on('data', rewriteOutput(process.stderr));
+
+      const child = wranglerChild;
+      const exitCode = await new Promise<number>((resolve) => {
+        child.on('error', (err) => {
+          if ((err as any).code === 'ENOENT') {
+            console.error('Error: wrangler not found. Install it with your package manager:');
+            console.error('  Install it with your package manager, e.g.: npm install wrangler');
+          }
+          resolve(1);
+        });
+        child.on('exit', (code, signal) => {
+          resolve(code ?? (signal ? 1 : 0));
+        });
+      });
+
+      // if wrangler exited on its own (not killed by us for restart), stop
+      if (!restartTimeout) {
+        debug('dev: wrangler exited with code', exitCode);
+        process.exitCode = exitCode;
+        break;
+      }
+      debug('dev: restarting wrangler due to env change');
+    }
+  } finally {
+    cleanup();
+  }
+}
+
+// --- main ---
+
+async function main() {
+  const args = process.argv.slice(2);
+
+  if (args.length === 0) {
+    console.log('varlock-wrangler: a drop-in replacement for `wrangler` that injects resolved env');
+    console.log('Usage: varlock-wrangler <wrangler-command> [options]');
+    console.log('');
+    console.log('Enhanced commands:');
+    console.log('  dev                      - injects resolved env via named pipe (no secrets on disk)');
+    console.log('  deploy / versions upload - uploads env as Cloudflare vars and secrets');
+    console.log('  preview                  - deploys a branch preview with env as vars and secrets');
+    console.log('  types                    - generates types including varlock-managed env vars');
+    console.log('');
+    console.log('All other commands are passed through to wrangler unchanged.');
+    return;
+  }
+
+  if (await isDeployCommand(args)) {
+    await handleDeploy(args);
+  } else if (isTypesCommand(args)) {
+    await handleTypes(args);
+  } else if (wranglerCommandArgs(args)[0] === 'dev') {
+    await handleDev(args);
+  } else {
+    // pass through to wrangler unchanged
+    const exitCode = await spawnWrangler(args);
+    process.exitCode = exitCode;
+  }
+}
+
+main().catch((err) => {
+  console.error('varlock-wrangler: unexpected error:', err);
+  process.exitCode = 1;
+});

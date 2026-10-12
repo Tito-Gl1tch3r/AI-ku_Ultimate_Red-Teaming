@@ -1,0 +1,55 @@
+package sys
+
+import (
+	"fmt"
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	"github.com/chainreactors/IoM-go/proto/services/clientrpc"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/spf13/cobra"
+)
+
+func BypassCmd(cmd *cobra.Command, con *core.Console) error {
+	bypass_amsi, _ := cmd.Flags().GetBool("amsi")
+	bypass_etw, _ := cmd.Flags().GetBool("etw")
+	session := con.GetInteractive()
+	task, err := Bypass(con.Rpc, session, bypass_amsi, bypass_etw)
+	if err != nil {
+		return err
+	}
+	session.Console(task, string(*con.App.Shell().Line()))
+	return nil
+}
+
+func Bypass(rpc clientrpc.MaliceRPCClient, session *client.Session, bypass_amsi, bypass_etw bool) (*clientpb.Task, error) {
+	return rpc.Bypass(session.Context(), &implantpb.BypassRequest{
+		ETW:      bypass_etw,
+		AMSI:     bypass_amsi,
+		BlockDll: false,
+	})
+}
+
+func RegisterBypassFunc(con *core.Console) {
+	con.RegisterImplantFunc(
+		consts.ModuleBypass,
+		Bypass,
+		"",
+		nil,
+		output.ParseStatus,
+		nil,
+	)
+
+	con.AddCommandFuncHelper(
+		consts.ModuleBypass,
+		consts.ModuleBypass,
+		fmt.Sprintf("%s(active(), true, true)", consts.ModuleBypass),
+		[]string{
+			"sess: special session",
+			"bypass_amsi: bypass amsi",
+			"bypass_etw: bypass etw",
+		},
+		[]string{"task"})
+}

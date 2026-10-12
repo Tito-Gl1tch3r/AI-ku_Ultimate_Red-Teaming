@@ -1,0 +1,492 @@
+import {
+  describe, test, vi, expect,
+} from 'vitest';
+import outdent from 'outdent';
+import { envFilesTest } from './helpers/generic-test';
+import { EnvGraph, DotEnvFileDataSource } from '../index';
+
+// We need to mock the child_process module used by builtin-vars.ts
+// to verify git is/isn't called
+const execMock = vi.fn();
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    exec: (...args: Array<any>) => {
+      execMock(...args);
+      return actual.exec(...(args as Parameters<typeof actual.exec>));
+    },
+  };
+});
+
+describe('VARLOCK_* builtin variables', () => {
+  describe('lazy registration', () => {
+    test('builtin vars are not in schema unless referenced', envFilesTest({
+      envFile: 'OTHER_VAR=foo',
+      expectValues: { OTHER_VAR: 'foo' },
+      expectNotInSchema: ['VARLOCK_ENV', 'VARLOCK_IS_CI'],
+    }));
+
+    test('builtin vars are registered when referenced via $VARLOCK_*', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV\nIS_CI=$VARLOCK_IS_CI',
+      processEnv: {},
+      expectValues: {
+        VARLOCK_ENV: 'development',
+        VARLOCK_IS_CI: false,
+      },
+      expectSensitive: {
+        VARLOCK_ENV: false,
+        VARLOCK_IS_CI: false,
+      },
+      expectRequired: {
+        VARLOCK_ENV: false,
+        VARLOCK_IS_CI: false,
+      },
+    }));
+  });
+
+  describe('type preservation', () => {
+    // Regression: when a typed builtin (e.g. boolean VARLOCK_IS_CI) is registered
+    // early via a root-decorator reference, the finishLoad process() pass used to
+    // recompute its type and default it back to 'string', stringifying `false` to
+    // "false" — which made not()/if() see a truthy string. The builtin resolver now
+    // advertises its declared type via inferredType so the type is preserved.
+    test('boolean builtin referenced in a root decorator keeps its boolean type', envFilesTest({
+      files: {
+        '.env.schema': outdent`
+          # @import(./.env.imported, enabled=not($VARLOCK_IS_CI))
+          # ---
+          LOCAL_VAR=local
+        `,
+        '.env.imported': 'IMPORTED_VAR=imported',
+      },
+      processEnv: {},
+      expectValues: {
+        VARLOCK_IS_CI: false, // boolean false, not the string "false"
+        IMPORTED_VAR: 'imported', // import is enabled because not(false) === true
+      },
+    }));
+
+    test('same root-decorator reference disables the import when in CI', envFilesTest({
+      files: {
+        '.env.schema': outdent`
+          # @import(./.env.imported, enabled=not($VARLOCK_IS_CI))
+          # ---
+          LOCAL_VAR=local
+        `,
+        '.env.imported': 'IMPORTED_VAR=imported',
+      },
+      processEnv: { CI: 'true', GITHUB_ACTIONS: 'true' },
+      expectValues: { VARLOCK_IS_CI: true },
+      expectNotInSchema: ['IMPORTED_VAR'],
+    }));
+  });
+
+  describe('VARLOCK_ENV environment detection', () => {
+    test('detects test environment from NODE_ENV=test', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: { NODE_ENV: 'test' },
+      expectValues: { VARLOCK_ENV: 'test' },
+    }));
+
+    test('detects test environment from VITEST', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: { VITEST: 'true' },
+      expectValues: { VARLOCK_ENV: 'test' },
+    }));
+
+    test('detects test environment from JEST_WORKER_ID', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: { JEST_WORKER_ID: '1' },
+      expectValues: { VARLOCK_ENV: 'test' },
+    }));
+
+    test('detects development when not in CI', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: {},
+      expectValues: { VARLOCK_ENV: 'development' },
+    }));
+
+    test('infers production from main branch', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REF: 'refs/heads/main',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_ENV: 'production' },
+    }));
+
+    test('infers production from master branch', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REF: 'refs/heads/master',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_ENV: 'production' },
+    }));
+
+    test('infers staging from develop branch', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REF: 'refs/heads/develop',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_ENV: 'staging' },
+    }));
+
+    test('infers preview from feature branch', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REF: 'refs/heads/feature/my-feature',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_ENV: 'preview' },
+    }));
+
+    test('uses platform-provided environment (Vercel)', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: {
+        VERCEL: '1',
+        VERCEL_ENV: 'production',
+      },
+      expectValues: { VARLOCK_ENV: 'production' },
+    }));
+
+    test('defaults to preview when in CI but unknown branch', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: { CI: 'true' },
+      expectValues: { VARLOCK_ENV: 'preview' },
+    }));
+
+    test('test detection takes priority over platform env', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: {
+        NODE_ENV: 'test',
+        VERCEL: '1',
+        VERCEL_ENV: 'production',
+      },
+      expectValues: { VARLOCK_ENV: 'test' },
+    }));
+  });
+
+  describe('VARLOCK_IS_CI', () => {
+    test('returns false when not in CI', envFilesTest({
+      envFile: 'MY_VAR=$VARLOCK_IS_CI',
+      processEnv: {},
+      expectValues: { VARLOCK_IS_CI: false },
+    }));
+
+    test('returns true when in CI', envFilesTest({
+      envFile: 'MY_VAR=$VARLOCK_IS_CI',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_IS_CI: true },
+    }));
+
+    // Regression (#899): empty-static skip used truthiness (`!staticValue`), which
+    // also skipped boolean false / number 0 when a builtin internal resolver exists.
+    test('schema override VARLOCK_IS_CI=false wins over CI detection', envFilesTest({
+      envFile: 'VARLOCK_IS_CI=false',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_IS_CI: false },
+    }));
+
+    test('schema override VARLOCK_IS_CI=0 is not skipped as empty', envFilesTest({
+      envFile: 'VARLOCK_IS_CI=0',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      // Number 0 must not be treated as empty; schema wins over builtin true.
+      // The builtin's declared boolean type also wins over the value's inferred
+      // number type, so 0 coerces to false.
+      expectValues: { VARLOCK_IS_CI: false },
+    }));
+  });
+
+  describe('CI platform variables', () => {
+    test('VARLOCK_BRANCH returns branch name', envFilesTest({
+      envFile: 'MY_VAR=$VARLOCK_BRANCH',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REF: 'refs/heads/feature-branch',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_BRANCH: 'feature-branch' },
+    }));
+
+    test('VARLOCK_BRANCH falls back to git branch in non-CI env', async () => {
+      execMock.mockClear();
+
+      await envFilesTest({
+        envFile: 'MY_VAR=$VARLOCK_BRANCH',
+        processEnv: {},
+      })();
+
+      // verify exec was called with git branch command
+      const gitCalls = execMock.mock.calls.filter(
+        (call: Array<any>) => typeof call[0] === 'string' && call[0].includes('git branch'),
+      );
+      expect(gitCalls).toHaveLength(1);
+    });
+
+    test('VARLOCK_BRANCH does not shell out to git when branch is detected via CI env vars', async () => {
+      execMock.mockClear();
+
+      await envFilesTest({
+        envFile: 'MY_VAR=$VARLOCK_BRANCH',
+        processEnv: {
+          CI: 'true',
+          GITHUB_ACTIONS: 'true',
+          GITHUB_REF: 'refs/heads/feature-branch',
+          GITHUB_REPOSITORY: 'owner/repo',
+        },
+        expectValues: { VARLOCK_BRANCH: 'feature-branch' },
+      })();
+
+      // exec should NOT have been called with the git branch command
+      const gitCalls = execMock.mock.calls.filter(
+        (call: Array<any>) => typeof call[0] === 'string' && call[0].includes('git branch'),
+      );
+      expect(gitCalls).toHaveLength(0);
+    });
+
+    test('VARLOCK_BRANCH returns PR head branch name in GitHub Actions PR context', envFilesTest({
+      envFile: 'MY_VAR=$VARLOCK_BRANCH',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REF: 'refs/pull/123/merge',
+        GITHUB_HEAD_REF: 'feat-init-infra',
+        GITHUB_EVENT_NAME: 'pull_request',
+        GITHUB_EVENT_NUMBER: '123',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_BRANCH: 'feat-init-infra' },
+    }));
+
+    test('VARLOCK_COMMIT_SHA and VARLOCK_COMMIT_SHA_SHORT', envFilesTest({
+      envFile: 'SHA=$VARLOCK_COMMIT_SHA\nSHA_SHORT=$VARLOCK_COMMIT_SHA_SHORT',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_SHA: 'abc1234567890def1234567890abcdef12345678',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: {
+        VARLOCK_COMMIT_SHA: 'abc1234567890def1234567890abcdef12345678',
+        VARLOCK_COMMIT_SHA_SHORT: 'abc1234',
+      },
+    }));
+
+    test('VARLOCK_PLATFORM returns CI platform name', envFilesTest({
+      envFile: 'MY_VAR=$VARLOCK_PLATFORM',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { VARLOCK_PLATFORM: 'GitHub Actions' },
+    }));
+
+    test('VARLOCK_REPO returns owner/repo format', envFilesTest({
+      envFile: 'MY_VAR=$VARLOCK_REPO',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_REPOSITORY: 'my-org/my-repo',
+      },
+      expectValues: { VARLOCK_REPO: 'my-org/my-repo' },
+    }));
+
+    test('VARLOCK_OS returns the current process platform', envFilesTest({
+      envFile: 'MY_VAR=$VARLOCK_OS',
+      processEnv: {},
+      expectValues: { VARLOCK_OS: process.platform },
+    }));
+
+    test('VARLOCK_RUNTIME returns a JS runtime name', envFilesTest({
+      envFile: 'MY_VAR=$VARLOCK_RUNTIME',
+      processEnv: {},
+      expectValues: { VARLOCK_RUNTIME: expect.stringMatching(/^(node|bun|deno)$/) },
+    }));
+  });
+
+  describe('builtin vars in string interpolation', () => {
+    test('can use VARLOCK_* in concat expressions', envFilesTest({
+      envFile: 'DEBUG_INFO="SHA: $VARLOCK_COMMIT_SHA_SHORT"',
+      processEnv: {
+        CI: 'true',
+        GITHUB_ACTIONS: 'true',
+        GITHUB_SHA: 'abc1234567890',
+        GITHUB_REPOSITORY: 'owner/repo',
+      },
+      expectValues: { DEBUG_INFO: 'SHA: abc1234' },
+    }));
+  });
+
+  describe('explicit definition with empty value', () => {
+    test('defining VARLOCK_ENV= still uses builtin auto-detection', envFilesTest({
+      envFile: 'VARLOCK_ENV=',
+      processEnv: { NODE_ENV: 'test' },
+      expectValues: { VARLOCK_ENV: 'test' },
+    }));
+
+    test('defining VARLOCK_ENV with explicit value overrides auto-detection', envFilesTest({
+      envFile: 'VARLOCK_ENV=production',
+      processEnv: {},
+      expectValues: { VARLOCK_ENV: 'production' },
+    }));
+
+    // the env flag is resolved early, before finishLoad attaches builtin defs to declared items
+    test('defining VARLOCK_ENV= works when the env flag depends on it', envFilesTest({
+      files: {
+        '.env.schema': outdent`
+          # @currentEnv=$APP_ENV
+          # ---
+          VARLOCK_ENV=
+          APP_ENV=remap($VARLOCK_ENV, preview, development)
+        `,
+      },
+      processEnv: { NODE_ENV: 'test' },
+      expectValues: { VARLOCK_ENV: 'test', APP_ENV: 'test' },
+    }));
+
+    test('defining VARLOCK_ENV= in an imported file works when the env flag depends on it', envFilesTest({
+      files: {
+        '.env.schema': '# @import(./.env.common)\n# ---\nITEM1=foo',
+        '.env.common': outdent`
+          # @currentEnv=$APP_ENV
+          # ---
+          VARLOCK_ENV=
+          APP_ENV=remap($VARLOCK_ENV, preview, development)
+        `,
+      },
+      processEnv: { NODE_ENV: 'test' },
+      expectValues: { VARLOCK_ENV: 'test', APP_ENV: 'test' },
+    }));
+
+    test('process.env override still takes precedence over builtin', envFilesTest({
+      envFile: 'MY_ENV=$VARLOCK_ENV',
+      processEnv: {},
+      overrideValues: { VARLOCK_ENV: 'staging' },
+      expectValues: { VARLOCK_ENV: 'staging' },
+    }));
+  });
+
+  describe('@currentEnv=$VARLOCK_ENV', () => {
+    test('VARLOCK_ENV works with @currentEnv and env-specific files', envFilesTest({
+      files: {
+        '.env.schema': '# @currentEnv=$VARLOCK_ENV\n# ---\nITEM1=default-value',
+        '.env.test': 'ITEM1=test-value',
+        '.env.development': 'ITEM1=dev-value',
+      },
+      processEnv: { NODE_ENV: 'test' },
+      expectValues: {
+        VARLOCK_ENV: 'test',
+        ITEM1: 'test-value',
+      },
+    }));
+
+    test('VARLOCK_ENV works with @currentEnv for development', envFilesTest({
+      files: {
+        '.env.schema': '# @currentEnv=$VARLOCK_ENV\n# ---\nITEM1=default-value',
+        '.env.development': 'ITEM1=dev-value',
+      },
+      processEnv: {},
+      expectValues: {
+        VARLOCK_ENV: 'development',
+        ITEM1: 'dev-value',
+      },
+    }));
+  });
+
+  describe('guessed VARLOCK_ENV warning', () => {
+    const FLY_ENV = { FLY_APP_NAME: 'my-app', FLY_MACHINE_ID: 'abc123' };
+    const GUESS_MSG = 'VARLOCK_ENV guessed "preview"';
+
+    async function getVarlockEnvWarnings(
+      envFile: string,
+      processEnv: Record<string, string>,
+      overrideValues?: Record<string, string>,
+    ) {
+      const g = new EnvGraph();
+      g.processEnvOverride = processEnv;
+      if (overrideValues) g.overrideValues = overrideValues;
+      await g.setRootDataSource(new DotEnvFileDataSource('.env.schema', { overrideContents: envFile }));
+      await g.finishLoad();
+      await g.resolveEnvValues();
+      const item = g.configSchema.VARLOCK_ENV;
+      return {
+        value: item?.resolvedValue,
+        warnings: (item?.errors ?? [])
+          .filter((e) => e.isWarning && e.message.startsWith('VARLOCK_ENV guessed'))
+          .map((e) => e.message),
+      };
+    }
+
+    test('warns when a derived flag uses the bare fallback on a platform', async () => {
+      const r = await getVarlockEnvWarnings('APP_ENV=$VARLOCK_ENV', FLY_ENV);
+      expect(r.value).toBe('preview');
+      expect(r.warnings).toEqual([expect.stringContaining(GUESS_MSG)]);
+      expect(r.warnings[0]).toContain('Fly.io');
+    });
+
+    test('warns when used as @currentEnv', async () => {
+      const r = await getVarlockEnvWarnings('# @currentEnv=$VARLOCK_ENV\n# ---\nFOO=bar', FLY_ENV);
+      expect(r.warnings).toEqual([expect.stringContaining(GUESS_MSG)]);
+    });
+
+    test('warns for generic CI with no platform or branch', async () => {
+      const r = await getVarlockEnvWarnings('APP_ENV=$VARLOCK_ENV', { CI: 'true' });
+      expect(r.warnings).toEqual([expect.stringContaining('this CI environment')]);
+    });
+
+    test('no warning when the platform reports an environment', async () => {
+      const r = await getVarlockEnvWarnings('APP_ENV=$VARLOCK_ENV', { VERCEL: '1', VERCEL_ENV: 'production' });
+      expect(r.warnings).toEqual([]);
+    });
+
+    test('no warning when inferred from a branch', async () => {
+      const r = await getVarlockEnvWarnings('APP_ENV=$VARLOCK_ENV', {
+        GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_REPOSITORY: 'owner/repo',
+      });
+      expect(r.value).toBe('production');
+      expect(r.warnings).toEqual([]);
+    });
+
+    test('no warning locally', async () => {
+      const r = await getVarlockEnvWarnings('APP_ENV=$VARLOCK_ENV', {});
+      expect(r.value).toBe('development');
+      expect(r.warnings).toEqual([]);
+    });
+
+    test('no warning when VARLOCK_ENV is set explicitly', async () => {
+      const r = await getVarlockEnvWarnings('APP_ENV=$VARLOCK_ENV', FLY_ENV, { VARLOCK_ENV: 'production' });
+      expect(r.value).toBe('production');
+      expect(r.warnings).toEqual([]);
+    });
+
+    test('no warning when the derived flag is overridden', async () => {
+      const r = await getVarlockEnvWarnings('APP_ENV=$VARLOCK_ENV', FLY_ENV, { APP_ENV: 'production' });
+      expect(r.warnings).toEqual([]);
+    });
+  });
+});

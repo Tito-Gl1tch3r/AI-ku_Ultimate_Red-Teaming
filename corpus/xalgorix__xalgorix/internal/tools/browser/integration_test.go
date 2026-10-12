@@ -1,0 +1,829 @@
+package browser
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+)
+
+// action is a shorthand for browserActionWithContext using the test's context ID.
+func action(ctxID string, args map[string]string) (string, error) {
+	res, err := browserActionWithContext(ctxID, args)
+	return res.Output, err
+}
+
+// launchCtx launches a browser for the given context with optional URL, registers cleanup.
+func launchCtx(t *testing.T, ctxID, url string) {
+	t.Helper()
+	args := map[string]string{"command": "launch"}
+	if url != "" {
+		args["url"] = url
+	}
+	_, err := browserActionWithContext(ctxID, args)
+	if err != nil {
+		t.Fatalf("launch failed: %v", err)
+	}
+	t.Cleanup(func() {
+		browserActionWithContext(ctxID, map[string]string{"command": "close"})
+	})
+}
+
+// injectHTML injects HTML into the current page body via execute_js.
+func injectHTML(t *testing.T, ctxID, html string) {
+	t.Helper()
+	code := fmt.Sprintf(`() => { document.body.innerHTML = '%s'; }`, html)
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "execute_js", "code": code})
+	if err != nil {
+		t.Fatalf("inject HTML failed: %v", err)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.1 Core Lifecycle
+// ═══════════════════════════════════════════════════════════
+
+func TestLaunch_NoURL(t *testing.T) {
+	ctxID := "int-launch-nourl"
+	launchCtx(t, ctxID, "")
+	s := getBrowserStoreByID(ctxID)
+	if s.browser == nil {
+		t.Error("browser should not be nil after launch")
+	}
+}
+
+func TestLaunch_WithURL(t *testing.T) {
+	ctxID := "int-launch-url"
+	launchCtx(t, ctxID, "https://example.com")
+	out, _ := action(ctxID, map[string]string{"command": "get_url"})
+	if !strings.Contains(out, "example.com") {
+		t.Errorf("URL = %q, want contains 'example.com'", out)
+	}
+}
+
+func TestBrowserActionInfersOnlyUnambiguousCommand(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<input name='username'>"))
+	}))
+	defer server.Close()
+	ctxID := "int-infer-unambiguous"
+	t.Cleanup(func() { _, _ = browserActionWithContext(ctxID, map[string]string{"command": "close"}) })
+
+	if _, err := action(ctxID, map[string]string{"url": server.URL}); err != nil {
+		t.Fatalf("URL-only call should launch: %v", err)
+	}
+	if _, err := action(ctxID, map[string]string{"url": server.URL + "/next"}); err != nil {
+		t.Fatalf("URL-only call should navigate after launch: %v", err)
+	}
+	if got, err := action(ctxID, map[string]string{"code": "() => 42"}); err != nil || !strings.Contains(got, "42") {
+		t.Fatalf("code-only call should execute JS: output=%q err=%v", got, err)
+	}
+	if _, err := action(ctxID, map[string]string{"selector": "input"}); err == nil || !strings.Contains(err.Error(), "requires command") {
+		t.Fatalf("ambiguous selector-only call should fail clearly: %v", err)
+	}
+}
+
+func TestDiscoverClientRoutesFromSameOriginBundle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`/* angular.module */ window.routes = [{path:"/invite/:code"},{path:'/static'}];`))
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html ng-cloak><body><script src="/app.js"></script></body></html>`))
+		}
+	}))
+	defer server.Close()
+
+	ctxID := "int-discover-client-routes"
+	t.Cleanup(func() { _, _ = browserActionWithContext(ctxID, map[string]string{"command": "close"}) })
+	result, err := discoverClientRoutesAtURL(ctxID, server.URL, "")
+	if err != nil || result.Error != "" {
+		t.Fatalf("route discovery failed: result=%+v err=%v", result, err)
+	}
+	routes, ok := result.Metadata["routes"].([]discoveredClientRoute)
+	if !ok {
+		t.Fatalf("route metadata has unexpected type: %T", result.Metadata["routes"])
+	}
+	if len(routes) != 1 || routes[0].Pattern != "/invite/:code" || routes[0].CandidateURL != server.URL+"/invite/" {
+		t.Fatalf("unexpected discovered routes: %+v", routes)
+	}
+	if angular, _ := result.Metadata["angularjs_signals"].(bool); !angular {
+		t.Fatalf("expected AngularJS signal in discovery: %+v", result.Metadata)
+	}
+}
+
+func TestClientRouteTestPriority(t *testing.T) {
+	if clientRouteTestPriority("/invite/:code") >= clientRouteTestPriority("/admin/settings/:id") {
+		t.Fatal("public invitation route should sort before privileged configuration route")
+	}
+}
+
+func TestAutomaticPathXSSCandidatesAreBoundedAndPublic(t *testing.T) {
+	routes := []discoveredClientRoute{
+		{Pattern: "/invite/:code", CandidateURL: "https://app.test/invite/"},
+		{Pattern: "/dashboard/snapshot/:key", CandidateURL: "https://app.test/dashboard/snapshot/"},
+		{Pattern: "/share/:id", CandidateURL: "https://app.test/share/"},
+		{Pattern: "/preview/:id", CandidateURL: "https://app.test/preview/"},
+		{Pattern: "/admin/settings/:id", CandidateURL: "https://app.test/admin/settings/"},
+		{Pattern: "/d/:uid/:slug", CandidateURL: "https://app.test/d/"},
+	}
+	got := automaticPathXSSCandidates(routes)
+	if len(got) != maxAutomaticPathXSSCandidates {
+		t.Fatalf("got %d candidates, want bounded maximum %d: %+v", len(got), maxAutomaticPathXSSCandidates, got)
+	}
+	for _, route := range got {
+		if strings.Contains(route.Pattern, "admin") || route.Pattern == "/d/:uid/:slug" {
+			t.Fatalf("ambiguous or privileged route entered automatic verifier set: %+v", route)
+		}
+	}
+}
+
+func TestClose_NotLaunched(t *testing.T) {
+	ctxID := "int-close-noop"
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "close"})
+	if err != nil {
+		t.Errorf("close on unlaunched should not error: %v", err)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.2 Navigation
+// ═══════════════════════════════════════════════════════════
+
+func TestGoto_ValidURL(t *testing.T) {
+	ctxID := "int-goto"
+	launchCtx(t, ctxID, "")
+	out, err := action(ctxID, map[string]string{"command": "goto", "url": "https://example.com"})
+	if err != nil {
+		t.Fatalf("goto failed: %v", err)
+	}
+	if !strings.Contains(out, "example.com") {
+		t.Errorf("output = %q, want 'example.com'", out)
+	}
+}
+
+func TestGetURL(t *testing.T) {
+	ctxID := "int-geturl"
+	launchCtx(t, ctxID, "https://example.com")
+	out, _ := action(ctxID, map[string]string{"command": "get_url"})
+	if !strings.Contains(out, "example.com") {
+		t.Errorf("get_url = %q, want 'example.com'", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.3 Element Interaction
+// ═══════════════════════════════════════════════════════════
+
+func TestSnapshot_ElementDiscovery(t *testing.T) {
+	ctxID := "int-snapshot"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<input type="text" placeholder="Username"><button>Click</button>`)
+
+	out, err := action(ctxID, map[string]string{"command": "snapshot"})
+	if err != nil {
+		t.Fatalf("snapshot failed: %v", err)
+	}
+	if !strings.Contains(out, "[@e1]") || !strings.Contains(out, "input") {
+		t.Errorf("snapshot missing input element: %s", out)
+	}
+	if !strings.Contains(out, "[@e2]") || !strings.Contains(out, "button") {
+		t.Errorf("snapshot missing button element: %s", out)
+	}
+}
+
+func TestSnapshot_HiddenElements(t *testing.T) {
+	ctxID := "int-snapshot-hidden"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<button>Visible</button><a href="#" style="display:none;">Hidden</a>`)
+
+	out, _ := action(ctxID, map[string]string{"command": "snapshot"})
+	if strings.Contains(out, "Hidden") {
+		t.Errorf("snapshot should not contain hidden elements: %s", out)
+	}
+}
+
+func TestClick_SemanticID(t *testing.T) {
+	ctxID := "int-click-semantic"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<button>Click Me</button>`)
+	action(ctxID, map[string]string{"command": "snapshot"})
+
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "click", "selector": "@e1"})
+	if err != nil {
+		t.Errorf("click @e1 failed: %v", err)
+	}
+}
+
+func TestClick_NotFound(t *testing.T) {
+	ctxID := "int-click-nf"
+	launchCtx(t, ctxID, "https://example.com")
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "click", "selector": "#nonexistent"})
+	if err == nil {
+		t.Error("expected error for nonexistent selector")
+	}
+}
+
+func TestType_SemanticID(t *testing.T) {
+	ctxID := "int-type-semantic"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<input type="text" placeholder="Name">`)
+	action(ctxID, map[string]string{"command": "snapshot"})
+
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "type", "selector": "@e1", "text": "hello"})
+	if err != nil {
+		t.Errorf("type @e1 failed: %v", err)
+	}
+}
+
+func TestType_NotFound(t *testing.T) {
+	ctxID := "int-type-nf"
+	launchCtx(t, ctxID, "https://example.com")
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "type", "selector": "#nope", "text": "x"})
+	if err == nil {
+		t.Error("expected error for nonexistent selector")
+	}
+}
+
+func TestSubmit_AutoDetect(t *testing.T) {
+	ctxID := "int-submit-auto"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<form><input type="text" name="q"><button type="submit">Go</button></form>`)
+
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "submit"})
+	if err != nil {
+		t.Errorf("submit auto-detect failed: %v", err)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.4 Scroll
+// ═══════════════════════════════════════════════════════════
+
+func TestScroll_Down(t *testing.T) {
+	ctxID := "int-scroll-down"
+	launchCtx(t, ctxID, "https://example.com")
+	out, err := action(ctxID, map[string]string{"command": "scroll", "direction": "down"})
+	if err != nil {
+		t.Fatalf("scroll failed: %v", err)
+	}
+	if !strings.Contains(out, "Scrolled") {
+		t.Errorf("output = %q, want 'Scrolled'", out)
+	}
+}
+
+func TestScroll_Up(t *testing.T) {
+	ctxID := "int-scroll-up"
+	launchCtx(t, ctxID, "https://example.com")
+	out, _ := action(ctxID, map[string]string{"command": "scroll", "direction": "up"})
+	if !strings.Contains(out, "Scrolled") {
+		t.Errorf("output = %q, want 'Scrolled'", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.5 Screenshot
+// ═══════════════════════════════════════════════════════════
+
+func TestScreenshot_Capture(t *testing.T) {
+	ctxID := "int-screenshot"
+	launchCtx(t, ctxID, "https://example.com")
+	res, err := browserActionWithContext(ctxID, map[string]string{"command": "screenshot"})
+	if err != nil {
+		t.Fatalf("screenshot failed: %v", err)
+	}
+	if res.Metadata == nil || res.Metadata["screenshot"] == nil {
+		t.Error("screenshot metadata missing")
+	}
+	if size, ok := res.Metadata["size_bytes"].(int); ok && size == 0 {
+		t.Error("screenshot size is 0")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.6 HTML & JavaScript
+// ═══════════════════════════════════════════════════════════
+
+func TestGetHTML_FullPage(t *testing.T) {
+	ctxID := "int-html-full"
+	launchCtx(t, ctxID, "https://example.com")
+	out, _ := action(ctxID, map[string]string{"command": "get_html"})
+	if !strings.Contains(strings.ToLower(out), "<html") {
+		t.Errorf("get_html should contain <html, got: %.100s", out)
+	}
+}
+
+func TestGetHTML_SelectorNotFound(t *testing.T) {
+	ctxID := "int-html-nf"
+	launchCtx(t, ctxID, "https://example.com")
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "get_html", "selector": "#nope"})
+	if err == nil {
+		t.Error("expected error for nonexistent selector")
+	}
+}
+
+func TestExecuteJS_ReturnValue(t *testing.T) {
+	ctxID := "int-js-return"
+	launchCtx(t, ctxID, "https://example.com")
+	out, err := action(ctxID, map[string]string{"command": "execute_js", "code": "() => 2 + 2"})
+	if err != nil {
+		t.Fatalf("execute_js failed: %v", err)
+	}
+	if !strings.Contains(out, "4") {
+		t.Errorf("execute_js = %q, want '4'", out)
+	}
+}
+
+func TestExecuteJS_RepairsConsoleStyleBareReturn(t *testing.T) {
+	ctxID := "int-js-bare-return"
+	launchCtx(t, ctxID, "")
+	out, err := action(ctxID, map[string]string{"command": "execute_js", "code": "const answer = 6 * 7; return answer;"})
+	if err != nil {
+		t.Fatalf("execute_js bare-return repair failed: %v", err)
+	}
+	if !strings.Contains(out, "42") {
+		t.Errorf("execute_js repaired result = %q, want '42'", out)
+	}
+	out, err = action(ctxID, map[string]string{"command": "execute_js", "code": `JSON.stringify({answer: 42})`})
+	if err != nil {
+		t.Fatalf("execute_js console-expression repair failed: %v", err)
+	}
+	if !strings.Contains(out, `"answer":42`) {
+		t.Errorf("execute_js repaired expression = %q, want JSON answer", out)
+	}
+}
+
+func TestExecuteJS_EmptyCode(t *testing.T) {
+	ctxID := "int-js-empty"
+	launchCtx(t, ctxID, "https://example.com")
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "execute_js", "code": ""})
+	if err == nil {
+		t.Error("expected error for empty code")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.7 Cookies
+// ═══════════════════════════════════════════════════════════
+
+func TestSetCookie_MissingName(t *testing.T) {
+	ctxID := "int-cookie-noname"
+	launchCtx(t, ctxID, "https://example.com")
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "set_cookie", "text": "val"})
+	if err == nil {
+		t.Error("expected error for missing cookie name")
+	}
+}
+
+func TestSetCookie_MissingValue(t *testing.T) {
+	ctxID := "int-cookie-noval"
+	launchCtx(t, ctxID, "https://example.com")
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "set_cookie", "name": "test"})
+	if err == nil {
+		t.Error("expected error for missing cookie value")
+	}
+}
+
+func TestSetAndGetCookies(t *testing.T) {
+	ctxID := "int-cookie-roundtrip"
+	launchCtx(t, ctxID, "https://example.com")
+
+	_, err := browserActionWithContext(ctxID, map[string]string{
+		"command": "set_cookie", "name": "testcookie", "text": "testvalue", "domain": "example.com",
+	})
+	if err != nil {
+		t.Fatalf("set_cookie failed: %v", err)
+	}
+
+	out, err := action(ctxID, map[string]string{"command": "get_cookies"})
+	if err != nil {
+		t.Fatalf("get_cookies failed: %v", err)
+	}
+	if !strings.Contains(out, "testcookie") {
+		t.Errorf("get_cookies should contain 'testcookie', got: %s", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.8 Session Save/Load
+// ═══════════════════════════════════════════════════════════
+
+func TestSaveSession_InMemory(t *testing.T) {
+	ctxID := "int-session-mem"
+	launchCtx(t, ctxID, "https://example.com")
+	browserActionWithContext(ctxID, map[string]string{
+		"command": "set_cookie", "name": "sess", "text": "val", "domain": "example.com",
+	})
+	out, err := action(ctxID, map[string]string{"command": "save_session"})
+	if err != nil {
+		t.Fatalf("save_session failed: %v", err)
+	}
+	if !strings.Contains(out, "Session") || !strings.Contains(out, "saved") {
+		t.Errorf("output = %q, want session saved confirmation", out)
+	}
+}
+
+func TestLoadSession_NoSaved(t *testing.T) {
+	ctxID := "int-session-nosaved"
+	launchCtx(t, ctxID, "https://example.com")
+	out, _ := action(ctxID, map[string]string{"command": "load_session"})
+	if !strings.Contains(out, "No session named") {
+		t.Errorf("output = %q, want 'No session named'", out)
+	}
+}
+
+func TestSaveSession_ToDisk(t *testing.T) {
+	ctxID := "int-session-disk"
+	tmpDir := t.TempDir()
+	SetSessionPathForCtx(ctxID, tmpDir)
+
+	launchCtx(t, ctxID, "https://example.com")
+	browserActionWithContext(ctxID, map[string]string{
+		"command": "set_cookie", "name": "disk", "text": "val", "domain": "example.com",
+	})
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "save_session"})
+	if err != nil {
+		t.Fatalf("save_session failed: %v", err)
+	}
+
+	path := filepath.Join(tmpDir, "session.json")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Errorf("session.json not created at %s", path)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.9 Wait
+// ═══════════════════════════════════════════════════════════
+
+func TestWait_SelectorFound(t *testing.T) {
+	ctxID := "int-wait-found"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<div id="target">Here</div>`)
+
+	out, err := action(ctxID, map[string]string{"command": "wait", "selector": "#target", "timeout": "5"})
+	if err != nil {
+		t.Fatalf("wait failed: %v", err)
+	}
+	if !strings.Contains(out, "Element found") {
+		t.Errorf("output = %q, want 'Element found'", out)
+	}
+}
+
+func TestWait_SelectorTimeout(t *testing.T) {
+	ctxID := "int-wait-timeout"
+	launchCtx(t, ctxID, "https://example.com")
+
+	out, _ := action(ctxID, map[string]string{"command": "wait", "selector": "#nonexistent", "timeout": "1"})
+	if !strings.Contains(out, "did not appear") {
+		t.Errorf("output = %q, want 'did not appear'", out)
+	}
+}
+
+func TestWait_PageStabilize(t *testing.T) {
+	ctxID := "int-wait-stable"
+	launchCtx(t, ctxID, "https://example.com")
+
+	out, _ := action(ctxID, map[string]string{"command": "wait"})
+	if !strings.Contains(out, "stabilized") {
+		t.Errorf("output = %q, want 'stabilized'", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.10 Fill Form
+// ═══════════════════════════════════════════════════════════
+
+func TestFillForm_EmptyFields(t *testing.T) {
+	ctxID := "int-form-empty"
+	launchCtx(t, ctxID, "https://example.com")
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "fill_form", "fields": ""})
+	if err == nil {
+		t.Error("expected error for empty fields")
+	}
+}
+
+func TestFillForm_FieldNotFound(t *testing.T) {
+	ctxID := "int-form-nf"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<form><input name="email"></form>`)
+
+	out, _ := action(ctxID, map[string]string{"command": "fill_form", "fields": "nonexistent=val"})
+	if !strings.Contains(out, "NOT FOUND") {
+		t.Errorf("output = %q, want 'NOT FOUND'", out)
+	}
+}
+
+func TestFillForm_MultipleFields(t *testing.T) {
+	ctxID := "int-form-multi"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<form><input name="email"><input name="password"></form>`)
+
+	out, err := action(ctxID, map[string]string{"command": "fill_form", "fields": "email=test@mail.com|password=Pass123"})
+	if err != nil {
+		t.Fatalf("fill_form failed: %v", err)
+	}
+	if !strings.Contains(out, "email") || !strings.Contains(out, "password") {
+		t.Errorf("output = %q, want both fields", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.11 Tabs
+// ═══════════════════════════════════════════════════════════
+
+func TestNewTab(t *testing.T) {
+	ctxID := "int-newtab"
+	launchCtx(t, ctxID, "https://example.com")
+
+	out, err := action(ctxID, map[string]string{"command": "new_tab"})
+	if err != nil {
+		t.Fatalf("new_tab failed: %v", err)
+	}
+	if !strings.Contains(out, "tab_2") {
+		t.Errorf("output = %q, want 'tab_2'", out)
+	}
+}
+
+func TestSwitchTab(t *testing.T) {
+	ctxID := "int-switchtab"
+	launchCtx(t, ctxID, "https://example.com")
+	action(ctxID, map[string]string{"command": "new_tab"})
+
+	out, err := action(ctxID, map[string]string{"command": "switch_tab", "tab_id": "tab_1"})
+	if err != nil {
+		t.Fatalf("switch_tab failed: %v", err)
+	}
+	if !strings.Contains(out, "tab_1") {
+		t.Errorf("output = %q, want 'tab_1'", out)
+	}
+}
+
+func TestSwitchTab_NotFound(t *testing.T) {
+	ctxID := "int-switchtab-nf"
+	launchCtx(t, ctxID, "https://example.com")
+	_, err := browserActionWithContext(ctxID, map[string]string{"command": "switch_tab", "tab_id": "tab_99"})
+	if err == nil {
+		t.Error("expected error for nonexistent tab")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.12 Extract Links
+// ═══════════════════════════════════════════════════════════
+
+func TestExtractLinks_WithLinks(t *testing.T) {
+	ctxID := "int-links"
+	launchCtx(t, ctxID, "https://example.com")
+	injectHTML(t, ctxID, `<a href="https://a.com">A</a><a href="https://b.com">B</a>`)
+
+	out, err := action(ctxID, map[string]string{"command": "extract_links"})
+	if err != nil {
+		t.Fatalf("extract_links failed: %v", err)
+	}
+	if !strings.Contains(out, "a.com") || !strings.Contains(out, "b.com") {
+		t.Errorf("output = %q, want both links", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.13 Context Isolation & Cleanup
+// ═══════════════════════════════════════════════════════════
+
+func TestCleanupContext_NonExistent(t *testing.T) {
+	// Should not panic
+	CleanupContext("nonexistent-ctx-1234")
+}
+
+func TestContextIsolation(t *testing.T) {
+	ctxA := "int-iso-a"
+	ctxB := "int-iso-b"
+
+	launchCtx(t, ctxA, "https://example.com")
+	launchCtx(t, ctxB, "https://example.com")
+
+	// Inject different content into each context
+	injectHTML(t, ctxA, `<div id="ctx-a">A</div>`)
+	injectHTML(t, ctxB, `<div id="ctx-b">B</div>`)
+
+	htmlA, _ := action(ctxA, map[string]string{"command": "get_html"})
+	htmlB, _ := action(ctxB, map[string]string{"command": "get_html"})
+
+	if !strings.Contains(htmlA, "ctx-a") {
+		t.Error("context A should contain 'ctx-a'")
+	}
+	if !strings.Contains(htmlB, "ctx-b") {
+		t.Error("context B should contain 'ctx-b'")
+	}
+	if strings.Contains(htmlA, "ctx-b") {
+		t.Error("context A should NOT contain 'ctx-b'")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.14 Existing test from browser_test.go (keeping for compat)
+// ═══════════════════════════════════════════════════════════
+
+func TestBrowserSnapshot_Full(t *testing.T) {
+	ctxID := scanctx.Default().ID
+
+	// Launch
+	_, err := browserActionWithContext(ctxID, map[string]string{
+		"command": "launch", "url": "https://example.com",
+	})
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	t.Cleanup(func() {
+		browserActionWithContext(ctxID, map[string]string{"command": "close"})
+	})
+
+	// Inject
+	injectHTML(t, ctxID, `<h1>Test Page</h1><input type="text" placeholder="Username"><button>Click Me</button><a href="#" style="display:none;">Hidden Link</a>`)
+
+	// Snapshot
+	res, err := browserActionWithContext(ctxID, map[string]string{"command": "snapshot"})
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	out := res.Output
+	if !strings.Contains(out, "[@e1]") || !strings.Contains(out, "input(text)") {
+		t.Errorf("Snapshot missing input element: %s", out)
+	}
+	if !strings.Contains(out, "[@e2]") || !strings.Contains(out, "button") {
+		t.Errorf("Snapshot missing button element: %s", out)
+	}
+	if strings.Contains(out, "Hidden Link") {
+		t.Errorf("Snapshot captured hidden elements: %s", out)
+	}
+
+	// Semantic type
+	_, err = browserActionWithContext(ctxID, map[string]string{"command": "type", "selector": "@e1", "text": "admin_user"})
+	if err != nil {
+		t.Fatalf("Semantic type failed: %v", err)
+	}
+
+	// Semantic click
+	_, err = browserActionWithContext(ctxID, map[string]string{"command": "click", "selector": "@e2"})
+	if err != nil {
+		t.Fatalf("Semantic click failed: %v", err)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3.10 verify_xss POST path (POST-based reflected XSS)
+// ═══════════════════════════════════════════════════════════
+
+// TestVerifyXSS_POST_Reflected exercises the POST path of verify_xss end-to-end
+// against a local endpoint that reflects the POSTed `q` parameter unescaped —
+// a POST-based reflected XSS. The endpoint reflects ONLY on POST (a GET yields a
+// benign page), so a pass proves the real form-POST navigation, not a GET
+// fallback. This is the exact shape that previously forced the agent to
+// hand-drive dozens of browser_action steps because verify_xss was GET-only.
+func TestVerifyXSS_POST_Reflected(t *testing.T) {
+	nonce := "XV-post-42"
+	payload := "<script>alert('" + nonce + "')</script>"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reflected := ""
+		if r.Method == http.MethodPost {
+			_ = r.ParseForm()
+			reflected = r.PostFormValue("q") // reflected unescaped, POST only
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, "<!doctype html><html><body>results for: %s</body></html>", reflected)
+	}))
+	defer srv.Close()
+
+	ctxID := "int-verifyxss-post"
+	sc := scanctx.New(ctxID, srv.URL)
+	scanctx.Activate(sc)
+	defer scanctx.Deactivate(ctxID)
+	launchCtx(t, ctxID, "")
+
+	res, err := browserActionWithContext(ctxID, map[string]string{
+		"command":   "verify_xss",
+		"url":       srv.URL + "/search",
+		"data":      "q=" + payload,
+		"nonce":     nonce,
+		"parameter": "q",
+	})
+	if err != nil {
+		t.Fatalf("verify_xss POST returned error: %v", err)
+	}
+	if ok, _ := res.Metadata["xss_confirmed"].(bool); !ok {
+		t.Fatalf("expected POST-reflected XSS to be confirmed; output=%q error=%q", res.Output, res.Error)
+	}
+	// The confirmation must be recorded as browser-origin exploit evidence so the
+	// reporting bridge can fold it into the finding.
+	found := false
+	for _, h := range sc.Ledger.All() {
+		if strings.EqualFold(h.VulnClass, "xss") && h.Origin == "verify_xss" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a verify_xss xss hypothesis in the ledger, got %d", sc.Ledger.Len())
+	}
+}
+
+// Opt-in black-box oracle for the digest-pinned vulnerable/fixed Grafana pair.
+// The scanner never receives this URL or payload; this only validates the
+// benchmark's ground truth and browser execution proof against the local stack.
+func TestDiscoverClientRoutes_GrafanaPair(t *testing.T) {
+	vulnerable := os.Getenv("XALGORIX_GRAFANA_VULN_URL")
+	fixed := os.Getenv("XALGORIX_GRAFANA_FIXED_URL")
+	if vulnerable == "" && fixed == "" {
+		t.Skip("set both XALGORIX_GRAFANA_VULN_URL and XALGORIX_GRAFANA_FIXED_URL for the local Docker oracle")
+	}
+	for _, tc := range []struct {
+		name, base    string
+		wantConfirmed bool
+	}{
+		{"vulnerable", vulnerable, true},
+		{"fixed", fixed, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctxID := "int-grafana-route-discovery-" + tc.name
+			t.Cleanup(func() { _, _ = browserActionWithContext(ctxID, map[string]string{"command": "close"}) })
+			result, err := discoverClientRoutesAtURL(ctxID, strings.TrimRight(tc.base, "/")+"/login", "")
+			if err != nil || result.Error != "" {
+				t.Fatalf("route discovery failed: result=%+v err=%v", result, err)
+			}
+			if angular, _ := result.Metadata["angularjs_signals"].(bool); !angular {
+				t.Fatalf("expected live Grafana bundle/page to expose AngularJS signals: %+v", result.Metadata)
+			}
+			routes, ok := result.Metadata["routes"].([]discoveredClientRoute)
+			if !ok {
+				t.Fatalf("route metadata has unexpected type: %T", result.Metadata["routes"])
+			}
+			foundAt := -1
+			for i, route := range routes {
+				if route.Pattern == "/invite/:code" && route.CandidateURL == strings.TrimRight(tc.base, "/")+"/invite/" {
+					foundAt = i
+					break
+				}
+			}
+			if foundAt < 0 {
+				t.Fatalf("expected the live client bundle to expose /invite/:code, got %d routes", len(routes))
+			}
+			if foundAt >= 20 {
+				t.Fatalf("expected public invitation route in the first 20 ranked candidates, got index %d of %d", foundAt, len(routes))
+			}
+			confirmed, _ := result.Metadata["path_xss_auto_confirmed"].(bool)
+			if confirmed != tc.wantConfirmed {
+				t.Fatalf("automatic path-XSS confirmation=%v, want %v; output=%s metadata=%+v", confirmed, tc.wantConfirmed, result.Output, result.Metadata)
+			}
+			checked, _ := result.Metadata["path_xss_auto_checked"].([]string)
+			if len(checked) == 0 || checked[0] != strings.TrimRight(tc.base, "/")+"/invite/" {
+				t.Fatalf("expected /invite/ to be the first deterministic check, got %+v", checked)
+			}
+		})
+	}
+}
+
+func TestVerifyXSS_GrafanaPathPair(t *testing.T) {
+	vulnerable := os.Getenv("XALGORIX_GRAFANA_VULN_URL")
+	fixed := os.Getenv("XALGORIX_GRAFANA_FIXED_URL")
+	if vulnerable == "" && fixed == "" {
+		t.Skip("set both XALGORIX_GRAFANA_VULN_URL and XALGORIX_GRAFANA_FIXED_URL for the local Docker oracle")
+	}
+	for _, tc := range []struct {
+		name, base string
+		want       bool
+	}{
+		{"vulnerable", vulnerable, true},
+		{"fixed", fixed, false},
+	} {
+		for _, route := range []string{"/dashboard/snapshot/?orgId=1", "/invite/"} {
+			t.Run(tc.name+route, func(t *testing.T) {
+				u, err := url.Parse(tc.base)
+				if err != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" {
+					t.Fatalf("Grafana oracle must target loopback HTTP, got %q", tc.base)
+				}
+				ctxID := "int-grafana-path-xss-" + tc.name
+				sc := scanctx.New(ctxID, tc.base)
+				scanctx.Activate(sc)
+				defer scanctx.Deactivate(ctxID)
+				launchCtx(t, ctxID, "")
+				result, err := browserActionWithContext(ctxID, map[string]string{
+					"command": "verify_path_template_xss", "url": strings.TrimRight(tc.base, "/") + route,
+				})
+				if err != nil || result.Error != "" {
+					t.Fatalf("browser oracle failed: result=%+v err=%v", result, err)
+				}
+				if got, _ := result.Metadata["xss_confirmed"].(bool); got != tc.want {
+					t.Fatalf("unexpected path-XSS oracle result=%+v, want confirmed=%v", result, tc.want)
+				}
+			})
+		}
+	}
+}

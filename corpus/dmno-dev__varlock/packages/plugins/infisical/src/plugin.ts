@@ -1,0 +1,709 @@
+import {
+  type Resolver, type PluginCacheAccessor, plugin, resolveCacheTtl,
+} from 'varlock/plugin-lib';
+import { BUNDLED_ICONS } from './bundled-icons.gen';
+import { createHash } from 'node:crypto';
+import { InfisicalSDK } from '@infisical/sdk';
+import { getOidcToken } from '@env-spec/utils/oidc-tokens';
+
+const { SchemaError, ResolutionError } = plugin.ERRORS;
+
+const INFISICAL_ICON = 'custom:infisical';
+
+plugin.name = 'infisical';
+const { debug } = plugin;
+debug('init - version =', plugin.version);
+// capture cache accessor while plugin proxy context is active
+let pluginCache: PluginCacheAccessor | undefined;
+try {
+  pluginCache = plugin.cache;
+} catch {
+  // cache unavailable in this runtime context
+}
+plugin.icon = INFISICAL_ICON;
+plugin.bundledIcons = BUNDLED_ICONS;
+plugin.standardVars = {
+  initDecorator: '@initInfisical',
+  params: {
+    clientId: { key: 'INFISICAL_CLIENT_ID' },
+    clientSecret: { key: 'INFISICAL_CLIENT_SECRET' },
+  },
+};
+
+class InfisicalPluginInstance {
+  /** Infisical project ID */
+  private projectId?: string;
+  /** Environment (dev, staging, production, etc.) */
+  private environment?: string;
+  /** Optional custom Infisical instance URL */
+  private siteUrl?: string;
+  /** Client ID for Universal Auth */
+  private clientId?: string;
+  /** Client Secret for Universal Auth */
+  private clientSecret?: string;
+  /** Identity ID for OIDC auth */
+  private identityId?: string;
+  /** Explicit OIDC token override */
+  private oidcToken?: string;
+  /** Optional default secret path */
+  private secretPath?: string;
+  /** If true, missing secrets return undefined instead of throwing */
+  allowMissing?: boolean;
+  /** optional cache TTL - when set, resolved values are cached */
+  cacheTtl?: string | number;
+
+  constructor(
+    readonly id: string,
+  ) {}
+
+  private _cacheKeyIdentity?: string;
+  /** short hash identifying which Infisical instance/project/environment is being read, used to namespace cache keys */
+  get cacheKeyIdentity() {
+    this._cacheKeyIdentity ??= createHash('sha256')
+      .update(JSON.stringify([this.siteUrl, this.projectId, this.environment]))
+      .digest('hex')
+      .slice(0, 12);
+    return this._cacheKeyIdentity;
+  }
+
+  setAuth(
+    projectId: any,
+    environment: any,
+    clientId: any,
+    clientSecret: any,
+    siteUrl?: any,
+    secretPath?: string,
+    identityId?: any,
+    oidcToken?: any,
+    allowMissing?: boolean,
+  ) {
+    if (projectId && typeof projectId === 'string') this.projectId = projectId;
+    if (environment && typeof environment === 'string') this.environment = environment;
+    if (clientId && typeof clientId === 'string') this.clientId = clientId;
+    if (clientSecret && typeof clientSecret === 'string') this.clientSecret = clientSecret;
+    if (identityId && typeof identityId === 'string') this.identityId = identityId;
+    if (oidcToken && typeof oidcToken === 'string') this.oidcToken = oidcToken;
+    if (siteUrl && typeof siteUrl === 'string') this.siteUrl = siteUrl;
+    this.secretPath = secretPath;
+    if (allowMissing !== undefined) this.allowMissing = allowMissing;
+    debug('infisical instance', this.id, 'set auth - projectId:', projectId, 'environment:', environment, 'hasIdentityId:', !!identityId);
+  }
+
+  /** @internal telemetry: which auth method this instance is configured for (fixed enum, never raw values) */
+  get telemetryAuthMethod(): 'universal' | 'oidc' | 'none' {
+    if (this.clientId) return 'universal';
+    if (this.identityId) return 'oidc';
+    return 'none';
+  }
+
+  /** @internal telemetry: whether a custom site URL is set (self-hosted vs cloud) — boolean only, never the URL */
+  get telemetrySelfHosted() { return this.siteUrl != null; }
+
+  private infisicalClientPromise?: Promise<InfisicalSDK>;
+  private static readonly defaultSiteUrl = 'https://app.infisical.com';
+
+  private async exchangeOidcToken(identityId: string, jwt: string): Promise<string> {
+    const response = await fetch(
+      `${this.siteUrl || InfisicalPluginInstance.defaultSiteUrl}/api/v1/auth/oidc-auth/login`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          identityId,
+          jwt,
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const responseText = await response.text().catch(() => '');
+      throw new Error(responseText || `OIDC login failed with status ${response.status}`);
+    }
+
+    const payload = await response.json() as { accessToken?: string };
+    if (!payload.accessToken) {
+      throw new Error('OIDC login response did not include accessToken');
+    }
+
+    return payload.accessToken;
+  }
+
+  private async initClient() {
+    if (this.infisicalClientPromise) return this.infisicalClientPromise;
+
+    if (!this.clientId && !this.identityId) {
+      throw new SchemaError('Infisical authentication is required', {
+        tip: [
+          'Use one of the following:',
+          '  1. Universal Auth: @initInfisical(clientId=..., clientSecret=...)',
+          '  2. OIDC Auth: @initInfisical(identityId=...) for deployed environments',
+        ].join('\n'),
+      });
+    }
+
+    this.infisicalClientPromise = (async () => {
+      try {
+        const clientConfig: any = {};
+        if (this.siteUrl) {
+          clientConfig.siteUrl = this.siteUrl;
+        }
+
+        const client = new InfisicalSDK(clientConfig);
+
+        if (this.clientId && this.clientSecret) {
+          // Authenticate using Universal Auth
+          await client.auth().universalAuth.login({
+            clientId: this.clientId,
+            clientSecret: this.clientSecret,
+          });
+          debug('Infisical client initialized with Universal Auth');
+        } else if (this.identityId) {
+          // Authenticate using OIDC
+          let jwt: string | undefined = this.oidcToken;
+          if (!jwt) {
+            const result = await getOidcToken();
+            jwt = result?.token;
+          }
+
+          if (!jwt) {
+            throw new SchemaError('OIDC auth configured but no token available', {
+              tip: [
+                'Ensure you are running in an environment that provides OIDC tokens:',
+                '  - Vercel, GitHub Actions, Fly.io, GCP Cloud Run, GitLab CI',
+                'Or provide an explicit token via @initInfisical(oidcToken=...)',
+              ].join('\n'),
+            });
+          }
+
+          const accessToken = await this.exchangeOidcToken(this.identityId, jwt);
+          client.auth().accessToken(accessToken);
+          debug('Infisical client initialized with OIDC Auth');
+        }
+
+        return client;
+      } catch (err: any) {
+        if (err instanceof SchemaError) throw err;
+        const errorMsg = err?.message || String(err);
+        throw new SchemaError(`Failed to initialize Infisical client: ${errorMsg}`, {
+          tip: [
+            'Verify your authentication credentials are correct',
+            'Check if your machine identity has access to the project',
+            'If using self-hosted Infisical, verify siteUrl is correct',
+          ].join('\n'),
+        });
+      }
+    })();
+
+    return this.infisicalClientPromise;
+  }
+
+  async getSecret(secretName: string, secretPath?: string): Promise<string> {
+    if (!this.projectId || !this.environment) {
+      throw new ResolutionError('Project ID and environment must be configured');
+    }
+
+    const client = await this.initClient();
+
+    try {
+      const result = await client.secrets().getSecret({
+        secretName,
+        projectId: this.projectId,
+        environment: this.environment,
+        secretPath: secretPath || this.secretPath || '/',
+        expandSecretReferences: true,
+        viewSecretValue: true,
+        includeImports: true,
+      });
+
+      if (!result?.secretValue) {
+        throw new ResolutionError(`Secret "${secretName}" has no value`);
+      }
+
+      return result.secretValue;
+    } catch (err: any) {
+      return this.handleInfisicalError(err, secretName, secretPath);
+    }
+  }
+
+  async listSecrets(secretPath?: string, tagSlugs?: Array<string>): Promise<string> {
+    if (!this.projectId || !this.environment) {
+      throw new ResolutionError('Project ID and environment must be configured');
+    }
+
+    const client = await this.initClient();
+
+    try {
+      const opts: any = {
+        projectId: this.projectId,
+        environment: this.environment,
+        secretPath: secretPath || this.secretPath || '/',
+        expandSecretReferences: true,
+        viewSecretValue: true,
+      };
+      if (tagSlugs?.length) opts.tagSlugs = tagSlugs;
+
+      const secrets = await client.secrets().listSecretsWithImports(opts);
+
+      const result: Record<string, string> = {};
+      for (const secret of secrets) {
+        result[secret.secretKey] = secret.secretValue;
+      }
+      return JSON.stringify(result);
+    } catch (err: any) {
+      const errorMsg = err?.message || String(err);
+      const statusCode = err?.statusCode || err?.response?.status;
+      const pathInfo = secretPath || this.secretPath
+        ? ` at path "${secretPath || this.secretPath}"`
+        : '';
+      const location = `project "${this.projectId}" environment "${this.environment}"${pathInfo}`;
+
+      if (statusCode === 403 || statusCode === 401) {
+        throw new ResolutionError(`Access denied listing secrets in ${location}`, {
+          tip: [
+            'Verify your machine identity has the correct permissions',
+            'Check that the machine identity has access to this project and environment',
+          ].join('\n'),
+        });
+      }
+      throw new ResolutionError(`Failed to list secrets in ${location}: ${errorMsg}`);
+    }
+  }
+
+  private handleInfisicalError(err: any, secretName: string, secretPath?: string): never {
+    const errorMsg = err?.message || String(err);
+    const statusCode = err?.statusCode || err?.response?.status;
+
+    const pathInfo = secretPath || this.secretPath ? ` at path "${secretPath || this.secretPath}"` : '';
+    const location = `"${secretName}"${pathInfo} in project "${this.projectId}" environment "${this.environment}"`;
+
+    if (statusCode === 404 || errorMsg.includes('not found') || errorMsg.includes('NotFound')) {
+      throw new ResolutionError(`Secret ${location} not found`, {
+        tip: [
+          'Check the secret exists in Infisical console:',
+          this.siteUrl ? `${this.siteUrl}/project/${this.projectId}` : `https://app.infisical.com/project/${this.projectId}`,
+          'Verify the secret name, path, and environment are correct',
+        ].join('\n'),
+      });
+    }
+
+    if (statusCode === 403 || statusCode === 401 || errorMsg.includes('Unauthorized') || errorMsg.includes('Forbidden')) {
+      throw new ResolutionError(`Access denied for secret ${location}`, {
+        tip: [
+          'Verify your machine identity has the correct permissions',
+          'Check that the machine identity has access to this project and environment',
+          'Review the role assignments in Infisical console',
+        ].join('\n'),
+      });
+    }
+
+    if (errorMsg.includes('auth') || errorMsg.includes('credential')) {
+      throw new ResolutionError(`Authentication failed: ${errorMsg}`, {
+        tip: [
+          'Verify clientId and clientSecret are correct',
+          'Check if the machine identity credentials have expired',
+          'Ensure the machine identity is not disabled',
+        ].join('\n'),
+      });
+    }
+
+    // Generic error
+    throw new ResolutionError(`Failed to fetch secret ${location}: ${errorMsg}`, {
+      tip: 'Check Infisical service status and your network connection',
+    });
+  }
+}
+
+const pluginInstances: Record<string, InfisicalPluginInstance> = {};
+
+/** Returns true if the error represents a missing Infisical secret */
+function isNotFoundError(err: any): boolean {
+  if (err instanceof ResolutionError) {
+    const msg = err.message || '';
+    return msg.includes('not found') || msg.includes('NotFound');
+  }
+  const errorMsg = err?.message || String(err);
+  const statusCode = err?.statusCode || err?.response?.status;
+  return statusCode === 404
+    || errorMsg.includes('not found')
+    || errorMsg.includes('NotFound');
+}
+
+plugin.registerRootDecorator({
+  name: 'initInfisical',
+  description: 'Initialize an Infisical plugin instance for infisical() resolver',
+  isFunction: true,
+  async process(argsVal) {
+    const objArgs = argsVal.objArgs;
+    if (!objArgs) throw new SchemaError('Expected configuration arguments');
+
+    // Validate id (must be static if provided)
+    if (objArgs.id && !objArgs.id.isStatic) {
+      throw new SchemaError('Expected id to be static');
+    }
+    const id = String(objArgs?.id?.staticValue || '_default');
+
+    if (pluginInstances[id]) {
+      throw new SchemaError(`Instance with id "${id}" already initialized`);
+    }
+
+    // Validate required fields
+    if (!objArgs.projectId) {
+      throw new SchemaError('projectId is required', {
+        tip: 'Add projectId parameter: @initInfisical(projectId=your-project-id, ...)',
+      });
+    }
+
+    if (!objArgs.environment) {
+      throw new SchemaError('environment is required', {
+        tip: 'Add environment parameter: @initInfisical(environment=dev, ...)',
+      });
+    }
+
+    // Either clientId+clientSecret OR identityId is required
+    if (!objArgs.clientId && !objArgs.identityId) {
+      throw new SchemaError('Authentication is required: provide clientId+clientSecret or identityId for OIDC', {
+        tip: [
+          'Option 1 - Universal Auth: @initInfisical(clientId=$INFISICAL_CLIENT_ID, clientSecret=$INFISICAL_CLIENT_SECRET, ...)',
+          'Option 2 - OIDC Auth: @initInfisical(identityId=your-identity-id, ...)',
+        ].join('\n'),
+      });
+    }
+
+    if (objArgs.clientId && !objArgs.clientSecret) {
+      throw new SchemaError('clientSecret is required when using clientId', {
+        tip: 'Add clientSecret parameter: @initInfisical(clientSecret=$INFISICAL_CLIENT_SECRET, ...)',
+      });
+    }
+
+    // Validate secretPath is static if provided
+    if (objArgs.secretPath && !objArgs.secretPath.isStatic) {
+      throw new SchemaError('Expected secretPath to be static');
+    }
+    const secretPath = objArgs.secretPath ? String(objArgs.secretPath.staticValue) : undefined;
+
+    // Create instance
+    pluginInstances[id] = new InfisicalPluginInstance(id);
+
+    return {
+      id,
+      cacheTtlResolver: objArgs.cacheTtl,
+      allowMissingResolver: objArgs.allowMissing,
+      siteUrlResolver: objArgs.siteUrl,
+      secretPath,
+      projectIdResolver: objArgs.projectId,
+      environmentResolver: objArgs.environment,
+      clientIdResolver: objArgs.clientId,
+      clientSecretResolver: objArgs.clientSecret,
+      identityIdResolver: objArgs.identityId,
+      oidcTokenResolver: objArgs.oidcToken,
+    };
+  },
+  async execute({
+    id,
+    cacheTtlResolver,
+    allowMissingResolver,
+    siteUrlResolver,
+    secretPath,
+    projectIdResolver,
+    environmentResolver,
+    clientIdResolver,
+    clientSecretResolver,
+    identityIdResolver,
+    oidcTokenResolver,
+  }) {
+    // even if these are empty, we can't throw errors yet
+    // in case the instance is never actually used
+    const projectId = await projectIdResolver?.resolve();
+    const environment = await environmentResolver?.resolve();
+    const clientId = await clientIdResolver?.resolve();
+    const clientSecret = await clientSecretResolver?.resolve();
+    const identityId = await identityIdResolver?.resolve();
+    const oidcToken = await oidcTokenResolver?.resolve();
+    const siteUrl = await siteUrlResolver?.resolve();
+    const allowMissing = await allowMissingResolver?.resolve();
+
+    pluginInstances[id].setAuth(
+      projectId,
+      environment,
+      clientId,
+      clientSecret,
+      siteUrl,
+      secretPath,
+      identityId,
+      oidcToken,
+      allowMissing as boolean | undefined,
+    );
+    const cacheTtl = await resolveCacheTtl(cacheTtlResolver);
+    if (cacheTtl !== undefined) {
+      pluginInstances[id].cacheTtl = cacheTtl;
+    }
+  },
+});
+
+plugin.registerDataType({
+  name: 'infisicalClientId',
+  sensitive: false, // Client ID is not typically sensitive
+  typeDescription: 'Client ID for Infisical Universal Auth (machine identity)',
+  docs: [
+    {
+      description: 'Infisical Machine Identities',
+      url: 'https://infisical.com/docs/documentation/platform/identities/machine-identities',
+    },
+  ],
+});
+
+plugin.registerDataType({
+  name: 'infisicalClientSecret',
+  sensitive: true,
+  internal: true,
+  typeDescription: 'Client Secret for Infisical Universal Auth (machine identity)',
+  docs: [
+    {
+      description: 'Infisical Universal Auth',
+      url: 'https://infisical.com/docs/documentation/platform/identities/universal-auth',
+    },
+  ],
+});
+
+plugin.registerResolverFunction({
+  name: 'infisical',
+  label: 'Fetch secret value from Infisical',
+  argsSchema: {
+    type: 'mixed',
+    arrayMinLength: 0,
+  },
+  process() {
+    let instanceId = '_default';
+    let secretNameResolver: Resolver | undefined;
+    let secretPathResolver: Resolver | undefined;
+
+    const argCount = this.arrArgs?.length ?? 0;
+
+    if (argCount === 0) {
+      // infisical() - use item key as secret name
+    } else if (argCount === 1) {
+      secretNameResolver = this.arrArgs![0];
+    } else if (argCount === 2) {
+      // Could be: infisical(instanceId, "secretName") OR infisical("secretName", "path")
+      // Check if first arg is static (would be instance ID)
+      if (this.arrArgs![0].isStatic) {
+        instanceId = String(this.arrArgs![0].staticValue);
+        secretNameResolver = this.arrArgs![1];
+      } else {
+        // Assume first is secret name, second is path
+        secretNameResolver = this.arrArgs![0];
+        secretPathResolver = this.arrArgs![1];
+      }
+    } else if (argCount === 3) {
+      // infisical(instanceId, "secretName", "path")
+      if (!this.arrArgs![0].isStatic) {
+        throw new SchemaError('Expected instance id (first argument) to be a static value');
+      }
+      instanceId = String(this.arrArgs![0].staticValue);
+      secretNameResolver = this.arrArgs![1];
+      secretPathResolver = this.arrArgs![2];
+    } else {
+      throw new SchemaError('Expected 0-3 arguments');
+    }
+
+    // If no secret name provided, get it from the config item key
+    let itemKey: string | undefined;
+    if (!secretNameResolver) {
+      // Access parent via type assertion since it's private but we need it for this feature
+      const parent = (this as any).parent;
+      if (parent && typeof parent.key === 'string') {
+        itemKey = parent.key;
+      } else {
+        throw new SchemaError('When called without arguments, infisical() must be used on a config item', {
+          tip: 'Either provide a secret name: infisical("secretName") or use it on a config item',
+        });
+      }
+    }
+
+    // Validate instance exists
+    if (!Object.values(pluginInstances).length) {
+      throw new SchemaError('No Infisical plugin instances found', {
+        tip: 'Initialize at least one Infisical plugin instance using @initInfisical() decorator',
+      });
+    }
+
+    const selectedInstance = pluginInstances[instanceId];
+    if (!selectedInstance) {
+      if (instanceId === '_default') {
+        throw new SchemaError('Infisical plugin instance (without id) not found', {
+          tip: [
+            'Either remove the `id` param from your @initInfisical call',
+            'or use `infisical(id, secretName)` to select an instance by id',
+            `Available ids: ${Object.keys(pluginInstances).join(', ')}`,
+          ].join('\n'),
+        });
+      } else {
+        throw new SchemaError(`Infisical plugin instance id "${instanceId}" not found`, {
+          tip: `Available ids: ${Object.keys(pluginInstances).join(', ')}`,
+        });
+      }
+    }
+
+    const allowMissingResolver = this.objArgs?.allowMissing;
+
+    return {
+      instanceId, itemKey, secretNameResolver, secretPathResolver, allowMissingResolver,
+    };
+  },
+  async resolve({
+    instanceId, itemKey, secretNameResolver, secretPathResolver, allowMissingResolver,
+  }) {
+    const selectedInstance = pluginInstances[instanceId];
+
+    // Resolve secret name - either from resolver or use item key
+    let secretName: string;
+    if (secretNameResolver) {
+      const resolved = await secretNameResolver.resolve();
+      if (typeof resolved !== 'string') {
+        throw new SchemaError('Expected secret name to resolve to a string');
+      }
+      secretName = resolved;
+    } else if (itemKey) {
+      secretName = itemKey;
+    } else {
+      throw new SchemaError('No secret name provided');
+    }
+
+    let secretPath: string | undefined;
+    if (secretPathResolver) {
+      const resolvedPath = await secretPathResolver.resolve();
+      if (typeof resolvedPath !== 'string') {
+        throw new SchemaError('Expected secret path to resolve to a string');
+      }
+      secretPath = resolvedPath;
+    }
+
+    const allowMissing = allowMissingResolver ? !!(await allowMissingResolver.resolve()) : undefined;
+    const shouldAllowMissing = allowMissing ?? selectedInstance.allowMissing;
+
+    const fetchSecret = async () => {
+      try {
+        return await selectedInstance.getSecret(secretName, secretPath);
+      } catch (err) {
+        if (shouldAllowMissing && isNotFoundError(err)) {
+          return undefined;
+        }
+        throw err;
+      }
+    };
+
+    if (selectedInstance.cacheTtl !== undefined && pluginCache) {
+      const cacheKey = `infisical:${instanceId}:${selectedInstance.cacheKeyIdentity}:${secretPath || ''}:${secretName}`;
+      return await pluginCache.getOrSet(
+        cacheKey,
+        selectedInstance.cacheTtl,
+        fetchSecret,
+      );
+    }
+
+    return await fetchSecret();
+  },
+});
+
+plugin.registerResolverFunction({
+  name: 'infisicalBulk',
+  label: 'Load all secrets from an Infisical project environment',
+  argsSchema: {
+    type: 'mixed',
+    arrayMaxLength: 1,
+  },
+  process() {
+    // Optional positional arg = instance id
+    let instanceId = '_default';
+    if (this.arrArgs?.length) {
+      if (!this.arrArgs[0].isStatic) {
+        throw new SchemaError('Expected instance id to be a static value');
+      }
+      instanceId = String(this.arrArgs[0].staticValue);
+    }
+
+    // Named params: path, tag
+    const pathResolver = this.objArgs?.path;
+    const tagResolver = this.objArgs?.tag;
+
+    if (!Object.values(pluginInstances).length) {
+      throw new SchemaError('No Infisical plugin instances found', {
+        tip: 'Initialize at least one Infisical plugin instance using @initInfisical() decorator',
+      });
+    }
+
+    const selectedInstance = pluginInstances[instanceId];
+    if (!selectedInstance) {
+      if (instanceId === '_default') {
+        throw new SchemaError('Infisical plugin instance (without id) not found', {
+          tip: [
+            'Either remove the `id` param from your @initInfisical call',
+            'or use `infisicalBulk(id, path=..., tag=...)` to select an instance by id',
+            `Available ids: ${Object.keys(pluginInstances).join(', ')}`,
+          ].join('\n'),
+        });
+      } else {
+        throw new SchemaError(`Infisical plugin instance id "${instanceId}" not found`, {
+          tip: `Available ids: ${Object.keys(pluginInstances).join(', ')}`,
+        });
+      }
+    }
+
+    return { instanceId, pathResolver, tagResolver };
+  },
+  async resolve({ instanceId, pathResolver, tagResolver }) {
+    const selectedInstance = pluginInstances[instanceId];
+
+    let secretPath: string | undefined;
+    if (pathResolver) {
+      const resolvedPath = await pathResolver.resolve();
+      if (typeof resolvedPath !== 'string') {
+        throw new SchemaError('Expected path to resolve to a string');
+      }
+      secretPath = resolvedPath;
+    }
+
+    let tagSlugs: Array<string> | undefined;
+    if (tagResolver) {
+      const resolvedTag = await tagResolver.resolve();
+      if (typeof resolvedTag !== 'string') {
+        throw new SchemaError('Expected tag to resolve to a string');
+      }
+      tagSlugs = [resolvedTag];
+    }
+
+    if (selectedInstance.cacheTtl !== undefined && pluginCache) {
+      const tagsKey = tagSlugs?.join(',') || '';
+      const cacheKey = `infisicalBulk:${instanceId}:${selectedInstance.cacheKeyIdentity}:${secretPath || ''}:${tagsKey}`;
+      const cachedOrFetched = await pluginCache.getOrSet(
+        cacheKey,
+        selectedInstance.cacheTtl,
+        async () => JSON.parse(await selectedInstance.listSecrets(secretPath, tagSlugs)),
+      );
+      if (cachedOrFetched !== undefined) {
+        if (typeof cachedOrFetched === 'string') return cachedOrFetched;
+        return JSON.stringify(cachedOrFetched);
+      }
+      throw new ResolutionError('Expected Infisical bulk response object');
+    }
+
+    return await selectedInstance.listSecrets(secretPath, tagSlugs);
+  },
+});
+
+// Anonymous, non-sensitive usage signals. Strictly sanitized before send.
+plugin.registerTelemetryAttributes(() => {
+  const instances = Object.values(pluginInstances);
+  const authMethods = new Set(instances.map((i) => i.telemetryAuthMethod));
+  return {
+    // standard attributes
+    instance_count: instances.length,
+    cache_enabled: instances.some((i) => i.cacheTtl != null),
+    // custom attributes
+    auth_universal: authMethods.has('universal'),
+    auth_oidc: authMethods.has('oidc'),
+    self_hosted: instances.some((i) => i.telemetrySelfHosted),
+  };
+});

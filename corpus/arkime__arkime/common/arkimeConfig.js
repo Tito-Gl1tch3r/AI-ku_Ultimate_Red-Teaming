@@ -1,0 +1,814 @@
+/* arkimeConfig.js  -- Shared config
+ *
+ * Copyright Yahoo Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+'use strict';
+
+const ArkimeUtil = require('./arkimeUtil');
+const fs = require('fs');
+const axios = require('axios');
+const yaml = require('js-yaml');
+const https = require('https');
+
+class ArkimeConfig {
+  static debug = 0;
+  static regressionTests = false;
+  static insecure = false;
+
+  static exit = Symbol('ArkimeConfig - exit');
+  static throw = Symbol('ArkimeConfig - throw');
+
+  // ----------------------------------------------------------------------------
+
+  static #override = new Map();
+  static #debugged = new Map();
+  static #config;
+  static #configImpl;
+  static #schemes = {};
+  static #configFile;
+  static #uri;
+  static #dumpConfig;
+  static #defaultSections;
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Initialize the ArkimeConfig subsystem
+   * @param {string} options.defaultConfigFile what the default config file path is
+   * @param {string} options.defaultSections what section to use when undefined
+   */
+  static async initialize (options) {
+    ArkimeConfig.#configFile ??= options.defaultConfigFile;
+
+    if (ArkimeConfig.debug > 1) {
+      console.log('ArkimeConfig.initialize', ArkimeConfig.#configFile, options);
+    }
+
+    if (options.defaultSections === undefined) {
+      console.trace('defaultSections option must be set');
+      process.exit(1);
+    } else if (Array.isArray(options.defaultSections)) {
+      ArkimeConfig.#defaultSections = options.defaultSections;
+    } else {
+      ArkimeConfig.#defaultSections = [options.defaultSections];
+    }
+
+    // The config is actually hidden
+    if (ArkimeConfig.#configFile.endsWith('.hiddenconfig')) {
+      ArkimeConfig.#configFile = fs.readFileSync(ArkimeConfig.#configFile).toString().split('\n')[0].trim();
+    }
+    if (ArkimeConfig.#configFile.startsWith('urlinfile://')) {
+      ArkimeConfig.#configFile = fs.readFileSync(ArkimeConfig.#configFile.substring(12)).toString().split('\n')[0].trim();
+    }
+
+    ArkimeConfig.#uri = ArkimeConfig.#configFile;
+
+    // If ARKIME__usersElasticsearch is set then create a temp config
+    if (process.env.ARKIME__usersElasticsearch) {
+      ArkimeConfig.#config = {
+        [ArkimeConfig.#defaultSections[ArkimeConfig.#defaultSections.length - 1]]: {
+          usersElasticsearch: process.env.ARKIME__usersElasticsearch,
+          usersElasticsearchBasicAuth: process.env.ARKIME__usersElasticsearchBasicAuth,
+          usersPrefix: process.env.ARKIME__usersPrefix
+        }
+      };
+    }
+
+    const parts = ArkimeConfig.#uri.split('://');
+
+    if (parts.length === 1) {
+      let missing = false;
+      try { // check if the file exists
+        fs.accessSync(ArkimeConfig.#uri, fs.constants.F_OK);
+      } catch (err) { // if the file doesn't exist, create it
+        console.log(`WARNING - ${ArkimeConfig.#uri} doesn't exist`);
+        missing = true;
+      }
+
+      if (missing) {
+        ArkimeConfig.#configImpl = ArkimeConfig.#schemes.missing;
+      } else if (ArkimeConfig.#uri.endsWith('json')) {
+        ArkimeConfig.#configImpl = ArkimeConfig.#schemes.json;
+      } else if (ArkimeConfig.#uri.endsWith('yaml') || ArkimeConfig.#uri.endsWith('yml')) {
+        ArkimeConfig.#configImpl = ArkimeConfig.#schemes.yaml;
+      } else {
+        ArkimeConfig.#configImpl = ArkimeConfig.#schemes.ini;
+      }
+    } else {
+      ArkimeConfig.#configImpl = ArkimeConfig.#schemes[parts[0]];
+    }
+
+    await ArkimeConfig.reload();
+
+    // Load includes, currently must be ini
+    ArkimeConfig.#loadIncludes(ArkimeConfig.get('includes'));
+
+    // Setup any defaults
+    //
+    if (ArkimeConfig.debug === 0) {
+      ArkimeConfig.debug = parseInt(ArkimeConfig.get('debug', 0));
+    }
+
+    if (ArkimeConfig.debug) {
+      console.log('Debug Level', ArkimeConfig.debug);
+    }
+
+    // Tell everything waiting on config we are done
+    const loadedCbs = ArkimeConfig.#loadedCbs;
+    ArkimeConfig.#loadedCbs = undefined; // Mark as loaded
+    for (const cb of loadedCbs) {
+      cb();
+    }
+
+    // After the callbacks: viewer splices its [nodeClass] section into
+    // defaultSections from one, so earlier would read a shorter list
+    ArkimeConfig.#validateSettings();
+  }
+
+  // ----------------------------------------------------------------------------
+  static get configFile () {
+    return ArkimeConfig.#configFile;
+  }
+
+  // ----------------------------------------------------------------------------
+  static isInsecure (urls) {
+    if (ArkimeConfig.insecure) {
+      return true;
+    }
+
+    if (!urls) {
+      return false;
+    }
+
+    for (let url of urls) {
+      if (!url) {
+        continue;
+      }
+      if (Array.isArray(url)) {
+        url = url[0];
+      }
+      const u = ArkimeUtil.parseUrl(url);
+      if (u === undefined) { continue; } // reported by the config validation
+      if (u.origin?.startsWith('https://localhost') || u.origin?.startsWith('https://127.0.0.1') || u.origin?.startsWith('https://[::1]')) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Reload the config file
+   */
+  static async reload () {
+    ArkimeConfig.#config = await ArkimeConfig.#configImpl.load(ArkimeConfig.#uri);
+
+    /* Setup any environment variable
+     * ARKIME__var - will convert to default var=value
+     * ARKIME_section__var - convert to section var=value
+     * Replace DASH, COLON, DOT, SLASH with -, :, ., /
+     */
+    for (const e of Object.keys(process.env).filter(e2 => e2.startsWith('ARKIME_'))) {
+      let section, key;
+      if (e.startsWith('ARKIME__')) {
+        section = ArkimeConfig.#defaultSections[ArkimeConfig.#defaultSections.length - 1];
+        key = e.substring(8);
+      } else {
+        const parts = e.substring(7).split('__');
+        section = parts[0].replace(/DASH/g, '-').replace(/COLON/g, ':').replace(/DOT/g, '.').replace(/SLASH/g, '/');
+        key = parts[1];
+      }
+      if (section === undefined || key === undefined) { continue; }
+      key = key.replace(/DASH/g, '-').replace(/COLON/g, ':').replace(/DOT/g, '.').replace(/SLASH/g, '/');
+
+      if (ArkimeUtil.isPP(section) || ArkimeUtil.isPP(key)) {
+        console.log(`WARNING - Ignoring environment variable ${e}: section/key looks like prototype pollution`);
+        continue;
+      }
+
+      if (ArkimeConfig.#config[section] === undefined) {
+        ArkimeConfig.#config[section] = {};
+      }
+      ArkimeConfig.#config[section][key] = process.env[e];
+    }
+
+    if (ArkimeConfig.#dumpConfig) {
+      console.error(JSON.stringify({ OVERRIDE: Object.fromEntries(ArkimeConfig.#override), CONFIG: ArkimeConfig.#config }, null, 2));
+      if (ArkimeConfig.regressionTests) { process.exit(); }
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Set a config override value
+   * @param {string} key The section.key to override
+   * @param {string} value The value for the key
+   */
+  static setOverride (key, value) {
+    ArkimeConfig.#override.set(key, value);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Get a config value
+   * @param {string[] | string} sections The sections the key lives in, can also be a string
+   * @param {string} sectionKey The key in the section to get the value for
+   * @param {*} d=undefined The default value to return if sectionKey isn't found, returned as-is
+   */
+  static getFull (sections, sectionKey, d) {
+    sections ??= ArkimeConfig.#defaultSections;
+    if (!Array.isArray(sections)) { sections = [sections]; }
+
+    let value;
+    let key;
+
+    for (const section of sections) {
+      if (section === undefined) { continue; }
+      key = `${section}.${sectionKey}`;
+      value = ArkimeConfig.#override.get(key) ?? ArkimeConfig.#config?.[section]?.[sectionKey];
+      if (value === null) { value = undefined; } // yaml `key:` gave no value, so not set
+      if (value !== undefined) { break; }
+    }
+
+    if (value === undefined) {
+      if (d === ArkimeConfig.exit) {
+        console.log(`ERROR - ${sectionKey} not found in sections: ${sections}`);
+        process.exit(1);
+      }
+      if (d === ArkimeConfig.throw) {
+        throw new Error(`${sectionKey} not found in sections: ${sections}`);
+      }
+      key = `defaultValue ${sectionKey}`;
+      value = d;
+    }
+
+    if (ArkimeConfig.debug > 0 && !ArkimeConfig.#debugged.has(key)) {
+      console.log(`CONFIG - ${key} is ${value}`);
+      ArkimeConfig.#debugged.set(key, true);
+    }
+
+    if (value === 'false') { return false; }
+    if (value === 'true') { return true; }
+
+    return value;
+  }
+
+  // ----------------------------------------------------------------------------
+  static get (sectionKey, d) {
+    return ArkimeConfig.getFull(ArkimeConfig.#defaultSections, sectionKey, d);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Get an array config value
+   * @param {string[] | string} sections The sections the key lives in, can also be a string
+   * @param {string} sectionKey The key in the section to get the value for
+   * @param {*} d=undefined The default value to return if sectionKey isn't found
+   * @param {string|RegExp} sep The separator to split string values on, defaults to ; or ,
+   */
+  static getFullArray (sections, sectionKey, d, sep) {
+    const value = ArkimeConfig.getFull(sections, sectionKey, d);
+
+    // Just return directly
+    if (value === undefined) { return value; }
+    if (Array.isArray(value)) { return value.filter(s => s !== '' && s !== null && s !== undefined); } // like the split below
+    if (typeof value !== 'string') { return [value]; }
+
+    // Need to split ourselves
+    sep ??= /[;,]/;
+    return value.split(sep).map(s => s.trim()).filter(s => s !== '');
+  }
+
+  // ----------------------------------------------------------------------------
+  static getArray (sectionKey, d, sep) {
+    return ArkimeConfig.getFullArray(ArkimeConfig.#defaultSections, sectionKey, d, sep);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * The url users open this app at, from the arkimeWebURL setting - used to
+   * build links back to the web ui (eg MCP tool result uiUrls).
+   * @param {function} defaultHost () => the host[:port][/basePath] to fall back
+   *        to when arkimeWebURL isn't set. A function so the fallback (which
+   *        may be non-trivial to compute) is only evaluated when actually needed.
+   * @param {boolean} isHttps Whether to default to https when the value has no scheme
+   */
+  static webURL (defaultHost, isHttps) {
+    let webUrl = ArkimeConfig.get('arkimeWebURL');
+    if (webUrl === undefined) { webUrl = defaultHost(); }
+    if (!webUrl.startsWith('http')) {
+      webUrl = `${isHttps ? 'https' : 'http'}://${webUrl}`;
+    }
+    return webUrl;
+  }
+
+  // ----------------------------------------------------------------------------
+  /* Parse a config value as a number, undefined if it isn't one. parseInt
+   * would take '10k' as 10, and json/yaml hand us real numbers, so 2.9 must
+   * not pass as an integer either. Empty means unset. */
+  static #parseNumeric (value, isInt) {
+    if (value === undefined || value === '') { return undefined; }
+
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value) || (isInt && !Number.isInteger(value))) { return undefined; }
+      return value;
+    }
+
+    if (!ArkimeUtil.isString(value)) { return undefined; }
+    const str = value.trim();
+    if (!(isInt ? /^-?[0-9]+$/ : /^-?[0-9]*\.?[0-9]+$/).test(str)) { return undefined; }
+    return isInt ? parseInt(str, 10) : parseFloat(str);
+  }
+
+  // ----------------------------------------------------------------------------
+  static #getNumeric (sectionKey, d, isInt) {
+    const raw = ArkimeConfig.get(sectionKey);
+    const value = ArkimeConfig.#parseNumeric(raw, isInt);
+    if (value !== undefined) { return value; }
+
+    // Falling back silently is the same class of bug as coercing badly
+    if (raw !== undefined && raw !== '') {
+      console.log(`WARNING - ${sectionKey} is '${ArkimeUtil.sanitizeStr(raw)}', not ${isInt ? 'an integer' : 'a number'}, using ${d}`);
+    }
+    return d;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * An integer setting, the default if it isn't one.
+   */
+  static getInt (sectionKey, d) {
+    return ArkimeConfig.#getNumeric(sectionKey, d, true);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * A float setting, fractions allowed.
+   */
+  static getFloat (sectionKey, d) {
+    return ArkimeConfig.#getNumeric(sectionKey, d, false);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * A boolean setting, the default if it isn't true/false. Anything else in
+   * an if() would be truthy, so 'multiES=no' must not turn multiES on.
+   */
+  static getBool (sectionKey, d) {
+    const raw = ArkimeConfig.get(sectionKey);
+    if (raw === undefined || raw === '') { return d; }
+    if (raw === true || raw === false) { return raw; }
+    console.log(`WARNING - ${sectionKey} is '${ArkimeUtil.sanitizeStr(raw)}', not true or false, using ${d}`);
+    return d;
+  }
+
+  // ----------------------------------------------------------------------------
+  static #VALIDATED = {};
+
+  /**
+   * Register settings to validate at config load, so a broken access control
+   * or resource bound stops the process instead of being ignored. Owners
+   * register their own. Call before initialize().
+   *
+   *   int/float  - must parse and satisfy min. `unlimited` names the one value
+   *                allowed below min, eg -1 for no limit.
+   *   cidrs      - every entry must be a usable CIDR
+   *   urls       - every entry must be a url, the scheme may be left off
+   */
+  static registerValidated (specs) {
+    Object.assign(ArkimeConfig.#VALIDATED, specs);
+  }
+
+  // ----------------------------------------------------------------------------
+  static #validateSetting (key, spec) {
+    if (spec.type === 'cidrs') {
+      const list = ArkimeConfig.getArray(key);
+      // An empty list is how 'not set' looks, leave that to the caller
+      if (list === undefined || list.length === 0) { return undefined; }
+
+      const { bad } = ArkimeUtil.buildIpTrie(list);
+      if (bad.length) {
+        return `${key} has ${bad.length} unusable entr${bad.length === 1 ? 'y' : 'ies'}: ` +
+          bad.map(b => `'${ArkimeUtil.sanitizeStr(b)}'`).join(', ') +
+          ". Each entry must be a full address with an optional in range prefix length, eg '10.0.0.1/32' or '10.0.0.0/8'.";
+      }
+      return undefined;
+    }
+
+    if (spec.type === 'urls') {
+      const list = ArkimeConfig.getArray(key);
+      if (list === undefined || list.length === 0) { return undefined; }
+
+      const bad = list.filter(url => ArkimeUtil.parseUrl(url) === undefined);
+      if (bad.length) {
+        return `${key} has ${bad.length} unusable entr${bad.length === 1 ? 'y' : 'ies'}: ` +
+          bad.map(b => `'${ArkimeUtil.sanitizeStr(b)}'`).join(', ') +
+          ". Each entry must be a url, eg 'http://localhost:9200' or 'localhost:9200'.";
+      }
+      return undefined;
+    }
+
+    const raw = ArkimeConfig.get(key);
+    if (raw === undefined || raw === '') { return undefined; } // empty is unset
+
+    const value = ArkimeConfig.#parseNumeric(raw, spec.type === 'int');
+    if (value === undefined) {
+      return `${key} is '${ArkimeUtil.sanitizeStr(raw)}', which is not ${spec.type === 'int' ? 'an integer' : 'a number'}.`;
+    }
+    if (value < spec.min && value !== spec.unlimited) {
+      return `${key} is ${value}, which is below the minimum of ${spec.min}` +
+        (spec.unlimited !== undefined ? `. Use ${spec.unlimited} for no limit.` : '.');
+    }
+    return undefined;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Check every access control and resource bound in one pass so the operator
+   * sees all of them at once, then refuse to start if any is broken.
+   * @ignore
+   */
+  static #validateSettings () {
+    const errors = [];
+
+    for (const [key, spec] of Object.entries(ArkimeConfig.#VALIDATED)) {
+      const error = ArkimeConfig.#validateSetting(key, spec);
+      if (error) { errors.push(error); }
+    }
+
+    if (errors.length === 0) { return; }
+
+    console.log(`ERROR - ${errors.length} bad setting${errors.length === 1 ? '' : 's'} in the config file, the environment or -o, refusing to start:`);
+    for (const error of errors) {
+      console.log('  -', error);
+    }
+    process.exit(1);
+  }
+
+  // ----------------------------------------------------------------------------
+  static registerScheme (str, parser) {
+    ArkimeConfig.#schemes[str] = parser;
+  }
+
+  // ----------------------------------------------------------------------------
+  static replace (config) {
+    ArkimeConfig.#config = config;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Does the config implementation support saving
+   */
+  static canSave () {
+    return ArkimeConfig.#configImpl.save !== undefined;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Save the config
+   */
+  static save (cb) {
+    if (ArkimeConfig.#configImpl.save) {
+      ArkimeConfig.#configImpl.save(ArkimeConfig.#uri, ArkimeConfig.#config, cb);
+    } else {
+      console.log('WARNING - Saving config is not supported by', ArkimeConfig.#uri);
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * @private
+   * Load include files, currently these must be local in ini format
+   */
+  static #loadIncludes (includes) {
+    if (!includes) {
+      return;
+    }
+    for (let file of includes.split(';')) {
+      const ignoreError = file[0] === '-';
+      if (ignoreError) {
+        file = file.substring(1);
+      }
+
+      if (!fs.existsSync(file)) {
+        if (ignoreError) {
+          continue;
+        }
+        console.log("ERROR - Couldn't open config includes file '%s'", file);
+        process.exit(1);
+      }
+      const config = ArkimeUtil.parseIniSync(file);
+      for (const group in config) {
+        if (!ArkimeConfig.#config[group]) {
+          ArkimeConfig.#config[group] = config[group];
+        } else {
+          for (const key in config[group]) {
+            ArkimeConfig.#config[group][key] = config[group][key];
+          }
+        }
+      }
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Get a list of all the sections in the config file
+   *
+   * @returns {Array} - A list of all the sections in the config file
+   */
+  static getSections () {
+    return Object.keys(ArkimeConfig.#config);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Get the full config for a section
+   *
+   * @param {string} section - The section of the config file to return
+   * @returns {object} - The config object for the given section
+   */
+  static getSection (section) {
+    return ArkimeConfig.#config[section];
+  }
+
+  // ----------------------------------------------------------------------------
+  static #loadedCbs = [];
+  static loaded (cb, front) {
+    if (ArkimeConfig.#loadedCbs === undefined) {
+      cb(); // Loaded already, call right away
+    } else if (front) {
+      ArkimeConfig.#loadedCbs.unshift(cb);
+    } else {
+      ArkimeConfig.#loadedCbs.push(cb);
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  static processArgs () {
+    const args = [];
+    for (let i = 0, ilen = process.argv.length; i < ilen; i++) {
+      if (process.argv[i] === '-c' || process.argv[i] === '--config') {
+        i++;
+        ArkimeConfig.#configFile = process.argv[i];
+      } else if (process.argv[i] === '--debug') {
+        ArkimeConfig.debug++;
+      } else if (process.argv[i] === '--insecure') {
+        ArkimeConfig.insecure = true;
+      } else if (process.argv[i] === '--regressionTests') {
+        ArkimeConfig.regressionTests = true;
+      } else if (process.argv[i] === '--dumpConfig') {
+        ArkimeConfig.#dumpConfig = true;
+      } else {
+        args.push(process.argv[i]);
+      }
+    }
+    process.argv = args;
+  }
+}
+
+ArkimeConfig.processArgs();
+
+// ----------------------------------------------------------------------------
+// Config Schemes - For each scheme supported implement a load/save function
+// ----------------------------------------------------------------------------
+class ConfigIni {
+  static async load (uri) {
+    return ArkimeUtil.parseIniSync(uri);
+  }
+
+  static save (uri, config, cb) {
+    // Coerce first, a non-string (array from JSON) can still contain newlines
+    function encode (value) {
+      return String(value).replace(/[\n\r]/g, '\\n');
+    }
+
+    let output = '';
+    for (const section of Object.keys(config)) {
+      if (/[\n\r]/.test(section)) {
+        return cb(`Invalid section name ${JSON.stringify(section)}`);
+      }
+      output += `[${section}]\n`;
+      for (const key of Object.keys(config[section])) {
+        // The loader trims lines, a key with = or a leading [ # ; would be read back as a
+        // different key, a section or a comment
+        if (/[\n\r=]/.test(key) || /^\s*[[#;]/.test(key)) {
+          return cb(`Invalid key name ${JSON.stringify(key)} in section ${JSON.stringify(section)}`);
+        }
+        output += `${key}=${encode(config[section][key])}\n`;
+      }
+    }
+
+    try {
+      fs.writeFileSync(uri, output);
+      cb(null);
+    } catch (e) {
+      cb(e.message);
+    }
+  }
+}
+ArkimeConfig.registerScheme('ini', ConfigIni);
+
+// ----------------------------------------------------------------------------
+class ConfigMissing {
+  static async load (uri) {
+    return {};
+  }
+}
+ArkimeConfig.registerScheme('missing', ConfigMissing);
+
+// ----------------------------------------------------------------------------
+
+class ConfigJson {
+  static async load (uri) {
+    return JSON.parse(fs.readFileSync(uri, 'utf8'));
+  }
+
+  static save (uri, config, cb) {
+    try {
+      fs.writeFileSync(uri, JSON.stringify(config, null, 1));
+      cb();
+    } catch (e) {
+      cb(e.message);
+    }
+  }
+}
+ArkimeConfig.registerScheme('json', ConfigJson);
+
+// ----------------------------------------------------------------------------
+
+class ConfigYaml {
+  static async load (uri) {
+    return yaml.load(fs.readFileSync(uri, 'utf8'));
+  }
+
+  static save (uri, config, cb) {
+    try {
+      fs.writeFileSync(uri, yaml.dump(config));
+      cb();
+    } catch (e) {
+      cb(e.message);
+    }
+  }
+}
+ArkimeConfig.registerScheme('yaml', ConfigYaml);
+ArkimeConfig.registerScheme('yml', ConfigYaml);
+
+// ----------------------------------------------------------------------------
+// redis://[:pass]@host:port/db/key
+class ConfigRedis {
+  static #redisKey;
+  static #redis;
+  static async load (uri) {
+    const redisParts = uri.split('/');
+    if (redisParts.length !== 5) {
+      throw new Error(`Invalid redis url - ${redisParts[0]}//[:pass@]redishost[:redisport]/redisDbNum/key`);
+    }
+    ConfigRedis.#redisKey = redisParts.pop();
+    ConfigRedis.#redis = ArkimeUtil.createRedisClient(redisParts.join('/'), 'config');
+
+    const result = await ConfigRedis.#redis.get(ConfigRedis.#redisKey);
+    if (result === null) {
+      return {};
+    } else {
+      return JSON.parse(result);
+    }
+  }
+
+  static save (uri, config, cb) {
+    ConfigRedis.#redis.set(ConfigRedis.#redisKey, JSON.stringify(config), function (err, result) {
+      cb(err);
+    });
+  }
+}
+ArkimeConfig.registerScheme('redis', ConfigRedis);
+
+// ----------------------------------------------------------------------------
+// rediss://pass@host:port/db/key
+ArkimeConfig.registerScheme('rediss', ConfigRedis);
+
+// redis-sentinel://sentinelPassword:redisPassword@host:port/name/db/key
+class ConfigRedisSentinel {
+  static #redisKey;
+  static #redis;
+  static async load (uri) {
+    const redisParts = uri.split('/');
+    redisParts[1] = 'stoperror';
+    if (redisParts.length !== 6 || redisParts.some(p => p === '')) {
+      throw new Error(`Invalid redis-sentinel url - ${redisParts[0]}//[sentinelPassword:redisPassword@]sentinelHost[:sentinelPort][,sentinelHostN:sentinelPortN]/redisName/redisDbNum/key`);
+    }
+    ConfigRedisSentinel.#redisKey = redisParts[5];
+    ConfigRedisSentinel.#redis = ArkimeUtil.createRedisClient(uri, 'config');
+
+    const result = await ConfigRedisSentinel.#redis.get(ConfigRedisSentinel.#redisKey);
+    if (result === null) {
+      return {};
+    } else {
+      return JSON.parse(result);
+    }
+  }
+
+  static save (uri, config, cb) {
+    ConfigRedisSentinel.#redis.set(ConfigRedisSentinel.#redisKey, JSON.stringify(config), function (err, result) {
+      cb(err);
+    });
+  }
+}
+ArkimeConfig.registerScheme('redis-sentinel', ConfigRedisSentinel);
+
+// ----------------------------------------------------------------------------
+// redis-cluster://[:pass]@host:port/db/key
+class ConfigRedisCluster {
+  static #redisKey;
+  static #redis;
+  static async load (uri) {
+    const redisParts = uri.split('/');
+    redisParts[1] = 'stoperror';
+    if (redisParts.length !== 5 || redisParts.some(p => p === '')) {
+      throw new Error(`Invalid redis-cluster url - ${redisParts[0]}//[:redisPassword@]redishost[:redisport]/redisDbNum/key`);
+    }
+    ConfigRedisCluster.#redisKey = redisParts[4];
+    ConfigRedisCluster.#redis = ArkimeUtil.createRedisClient(uri, 'config');
+
+    const result = await ConfigRedisCluster.#redis.get(ConfigRedisCluster.#redisKey);
+    if (result === null) {
+      return {};
+    } else {
+      return JSON.parse(result);
+    }
+  }
+
+  static save (uri, config, cb) {
+    ConfigRedisCluster.#redis.set(ConfigRedisCluster.#redisKey, JSON.stringify(config), function (err, result) {
+      cb(err);
+    });
+  }
+}
+ArkimeConfig.registerScheme('redis-cluster', ConfigRedisCluster);
+
+// ----------------------------------------------------------------------------
+class ConfigElasticsearch {
+  static async load (uri) {
+    const info = ArkimeUtil.createElasticsearchInfo(uri);
+    const httpsAgent = ArkimeConfig.isInsecure([info.url]) ? new https.Agent({ rejectUnauthorized: false }) : undefined;
+
+    if (!info.url.includes('/_doc/')) {
+      throw new Error('Missing _doc in url, should be format elasticsearch://user:pass@host:port/INDEX/_doc/DOC');
+    }
+
+    try {
+      const response = await axios.get(info.url, { auth: info.auth, httpsAgent });
+      return response.data._source;
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        return {};
+      }
+      throw error;
+    }
+  }
+
+  static save (uri, config, cb) {
+    const info = ArkimeUtil.createElasticsearchInfo(uri);
+    const httpsAgent = ArkimeConfig.isInsecure([info.url]) ? new https.Agent({ rejectUnauthorized: false }) : undefined;
+
+    axios.post(info.url, JSON.stringify(config), { headers: { 'Content-Type': 'application/json' }, auth: info.auth, httpsAgent })
+      .then((response) => {
+        cb(null);
+      })
+      .catch((error) => {
+        cb(error);
+      });
+  }
+}
+ArkimeConfig.registerScheme('elasticsearch', ConfigElasticsearch);
+ArkimeConfig.registerScheme('opensearch', ConfigElasticsearch);
+ArkimeConfig.registerScheme('elasticsearchs', ConfigElasticsearch);
+ArkimeConfig.registerScheme('opensearchs', ConfigElasticsearch);
+
+// ----------------------------------------------------------------------------
+class ConfigHttp {
+  static async load (uri) {
+    try {
+      const response = await axios.get(uri);
+      if (typeof response.data === 'object') {
+        return response.data;
+      } else if (uri.endsWith('.ini')) {
+        return ArkimeUtil.parseIniString(response.data);
+      } else if (uri.endsWith('.yaml') || uri.endsWith('.yml')) {
+        return yaml.load(response.data);
+      } else {
+        return JSON.parse(response.data);
+      }
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        return {};
+      }
+      throw error;
+    }
+  }
+}
+ArkimeConfig.registerScheme('http', ConfigHttp);
+ArkimeConfig.registerScheme('https', ConfigHttp);
+
+module.exports = ArkimeConfig;

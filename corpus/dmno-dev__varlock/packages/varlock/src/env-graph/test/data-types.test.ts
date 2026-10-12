@@ -1,0 +1,2330 @@
+/*
+  Test data type coercion and validation
+
+  These tests exercise the @type decorator with various data type options,
+  ensuring values are correctly coerced and validated through the full
+  env-graph pipeline.
+*/
+
+import { describe, it, expect } from 'vitest';
+import { outdent } from 'outdent';
+import { DotEnvFileDataSource, EnvGraph, CoercionError } from '../index';
+import { createEnvGraphDataType } from '../lib/data-types';
+
+async function loadAndResolve(
+  envFileContent: string,
+  opts?: { overrideValues?: Record<string, string> },
+) {
+  const g = new EnvGraph();
+  if (opts?.overrideValues) g.overrideValues = opts.overrideValues;
+  const testDataSource = new DotEnvFileDataSource('.env.schema', {
+    overrideContents: outdent`
+      # @defaultRequired=false
+      # these fixtures exercise coercion/validation, not secrets - and their throwaway
+      # values are short enough to trip the short-sensitive-value check
+      # @defaultSensitive=false
+      # ---
+      ${envFileContent}
+    `,
+  });
+  await g.setRootDataSource(testDataSource);
+  await g.finishLoad();
+  await g.resolveEnvValues();
+  return g;
+}
+
+describe('number data type - Infinity coercion', () => {
+  const numberType = () => new EnvGraph().dataTypesRegistry.number();
+
+  it('rejects numeric Infinity', () => {
+    expect(() => numberType().coerce(Infinity)).toThrow(CoercionError);
+    expect(() => numberType().coerce(Infinity)).toThrow(/Infinity is not a valid number/);
+  });
+
+  it('rejects numeric -Infinity', () => {
+    expect(() => numberType().coerce(-Infinity)).toThrow(CoercionError);
+    expect(() => numberType().coerce(-Infinity)).toThrow(/Infinity is not a valid number/);
+  });
+
+  it('rejects string Infinity and -Infinity', () => {
+    expect(() => numberType().coerce('Infinity')).toThrow(CoercionError);
+    expect(() => numberType().coerce('-Infinity')).toThrow(CoercionError);
+  });
+});
+
+describe('enum data type - process.env string overrides', () => {
+  it('accepts numeric enum members from schema file values', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=enum(1, 2, 3)
+      LEVEL=2
+    `);
+    expect(g.configSchema.LEVEL.isValid).toBe(true);
+    expect(g.configSchema.LEVEL.resolvedValue).toBe(2);
+  });
+
+  it('accepts numeric enum members from string overrides', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=enum(1, 2, 3)
+      LEVEL=2
+    `, { overrideValues: { LEVEL: '1' } });
+    expect(g.configSchema.LEVEL.isValid).toBe(true);
+    expect(g.configSchema.LEVEL.resolvedValue).toBe(1);
+  });
+
+  it('accepts boolean enum members from string overrides', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=enum(true, false)
+      FLAG=false
+    `, { overrideValues: { FLAG: 'true' } });
+    expect(g.configSchema.FLAG.isValid).toBe(true);
+    expect(g.configSchema.FLAG.resolvedValue).toBe(true);
+  });
+});
+
+describe('port data type', () => {
+  it('accepts integer ports', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=port
+      P=8080
+    `);
+    expect(g.configSchema.P.isValid).toBe(true);
+    expect(g.configSchema.P.resolvedValue).toBe(8080);
+  });
+
+  it('rejects non-integer numeric ports from schema auto-coerce', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=port
+      P=80.5
+    `);
+    expect(g.configSchema.P.isValid).toBe(false);
+  });
+
+  it('rejects non-integer string ports', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=port
+      P="80.5"
+    `);
+    expect(g.configSchema.P.isValid).toBe(false);
+  });
+});
+
+describe('url data type', () => {
+  describe('prependHttps', () => {
+    it('prepends https:// when missing', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(prependHttps=true)
+        MY_URL=example.com/foobar
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+      expect(g.configSchema.MY_URL.resolvedValue).toBe('https://example.com/foobar');
+    });
+
+    it('does not prepend when https:// already present', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(prependHttps=true)
+        MY_URL=https://example.com
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+      expect(g.configSchema.MY_URL.resolvedValue).toBe('https://example.com');
+    });
+  });
+
+  describe('allowedProtocols', () => {
+    it('accepts URLs with a listed protocol', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedProtocols=[postgres, postgresql])
+        DATABASE_URL=postgres://root:password@localhost:5432/local
+      `);
+      expect(g.configSchema.DATABASE_URL.isValid).toBe(true);
+    });
+
+    it('rejects URLs with an unlisted protocol', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedProtocols=[http, https])
+        DATABASE_URL=postgres://root:password@localhost:5432/local
+      `);
+      expect(g.configSchema.DATABASE_URL.isValid).toBe(false);
+      expect(g.configSchema.DATABASE_URL.validationErrors?.[0]?.message).toContain('Protocol (postgres) is not in allowed list');
+    });
+
+    it('matches protocol names case-insensitively with an optional trailing colon', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedProtocols=[POSTGRES:])
+        DATABASE_URL=postgres://root:password@localhost:5432/local
+      `);
+      expect(g.configSchema.DATABASE_URL.isValid).toBe(true);
+    });
+
+    it('accepts any valid URL protocol when omitted', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url
+        DATABASE_URL=postgres://root:password@localhost:5432/local
+      `);
+      expect(g.configSchema.DATABASE_URL.isValid).toBe(true);
+    });
+
+    it('requires an array of protocols', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedProtocols=postgres)
+        DATABASE_URL=postgres://root:password@localhost:5432/local
+      `);
+      expect(g.configSchema.DATABASE_URL.isValid).toBe(false);
+      expect(g.configSchema.DATABASE_URL.validationErrors?.[0]?.message).toContain('allowedProtocols must be an array of strings');
+    });
+
+    it('does not prepend HTTPS when the URL already has an allowed protocol', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(prependHttps=true, allowedProtocols=[postgres])
+        DATABASE_URL=postgres://root:password@localhost:5432/local
+      `);
+      expect(g.configSchema.DATABASE_URL.isValid).toBe(true);
+      expect(g.configSchema.DATABASE_URL.resolvedValue).toBe('postgres://root:password@localhost:5432/local');
+    });
+  });
+
+  describe('allowedDomains', () => {
+    it('accepts a host listed in an array allowlist', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[example.com, api.example.com])
+        MY_URL=https://api.example.com/v1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('rejects a host missing from an array allowlist', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[example.com, api.example.com])
+        MY_URL=https://evil.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toMatch(/not in allowed list/);
+    });
+
+    it('matches hosts in an array allowlist case-insensitively', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[Example.COM])
+        MY_URL=https://example.com/v1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('rejects a host that is only a substring of an array allowlist entry', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[example.com])
+        MY_URL=https://ample.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('errors when the allowlist array holds non-strings', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[example.com, true])
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('allowedDomains must be an array of strings');
+    });
+
+    it('ignores a port on the value', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[localhost, example.com])
+        MY_URL=http://localhost:3000/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('still rejects a disallowed host that carries a port', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[localhost])
+        MY_URL=http://evil.com:3000/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('Domain (evil.com:3000) is not in allowed list');
+    });
+
+    it('pins the port when an entry names one', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["localhost:3000"])
+        MY_URL=http://localhost:3000/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('rejects a different port when an entry names one', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["localhost:3000"])
+        MY_URL=http://localhost:9999/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('Domain (localhost:9999) is not in allowed list');
+    });
+
+    it('matches an entry naming the protocol default port', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["example.com:443"])
+        MY_URL=https://example.com/v1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('matches an entry naming a port against a value with no port', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["localhost:3000"])
+        MY_URL=http://localhost/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('does not let a default-port entry match another protocol', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["example.com:443"])
+        MY_URL=http://example.com/v1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('allows any port when a bare entry sits alongside one naming a port', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[localhost, "localhost:3000"])
+        MY_URL=http://localhost:5000/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('matches a port entry case-insensitively', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["LOCALHOST:3000"])
+        MY_URL=http://localhost:3000/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('matches a bracketed IPv6 entry, which names no port', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["[::1]"])
+        MY_URL=http://[::1]:3000/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('rejects rather than throws on an entry with an unparseable port', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["localhost:99999"])
+        MY_URL=http://localhost:3000/api
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('Domain (localhost:3000) is not in allowed list');
+    });
+
+    it('trims entries and ignores empty ones', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["", " example.com "])
+        MY_URL=https://example.com/v1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('leaves an empty entry out of the rejection message', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["", example.com])
+        MY_URL=https://evil.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('is not in allowed list: example.com');
+    });
+
+    it('errors on an entry that includes a path', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["example.com/path"])
+        MY_URL=https://example.com/path
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message)
+        .toContain('allowedDomains entries must be a hostname with an optional port - use example.com');
+    });
+
+    it('errors on an entry that includes a scheme', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["https://example.com"])
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message)
+        .toContain('allowedDomains entries must be a hostname with an optional port - use example.com');
+    });
+
+    it('errors on a bad entry even when another entry would have matched', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[example.com, "example.com/path"])
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('must be a hostname with an optional port');
+    });
+
+    it('omits the suggestion when a path entry has no host to suggest', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["/"])
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toBe('allowedDomains entries must be a hostname with an optional port');
+    });
+
+    it('rejects an entry whose credentials hide a different host', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["trusted.example:443@evil.example:8443"])
+        MY_URL=https://evil.example:8443/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      // no suggestion: which host was meant is ambiguous, and the one the entry would
+      // have authorized is the attacker's
+      expect(g.configSchema.MY_URL.errors[0]?.message)
+        .toBe('allowedDomains entries must be a hostname with an optional port');
+    });
+
+    it('rejects an entry with a non-numeric port', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["example.com:not-a-port"])
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('must be a hostname with an optional port');
+    });
+
+    it('pins the port on a bracketed IPv6 entry', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["[::1]:3000"])
+        MY_URL=http://[::1]:9999/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('normalizes an internationalized entry to punycode', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["MÜNCHEN.de"])
+        MY_URL=https://xn--mnchen-3ya.de/v1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('rejects an entry using a backslash as a path separator', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["trusted.example\\path"])
+        MY_URL=https://trusted.example/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('must be a hostname with an optional port');
+    });
+
+    it('errors on an empty allowlist rather than rejecting every url', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=[])
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toBe('allowedDomains must not be empty');
+    });
+
+    it('errors when every entry is empty', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=["", "  "])
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toBe('allowedDomains must not be empty');
+    });
+
+    it('errors when allowedDomains is neither an array nor a string', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains=true)
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('allowedDomains must be an array of strings');
+    });
+
+    it('accepts a bare string as a single allowed host', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains="example.com")
+        MY_URL=https://example.com/v1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('errors on a comma-string, pointing at the array form', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains="example.com,api.example.com")
+        MY_URL=https://api.example.com/v1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message)
+        .toContain('allowedDomains must be an array of strings - use allowedDomains=[example.com, api.example.com]');
+    });
+
+    it('rejects a host that is only a substring of a single-host allowlist', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains="example.com")
+        MY_URL=https://ample.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toMatch(/not in allowed list/);
+    });
+
+    it('rejects a disallowed host without throwing on the error message', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(allowedDomains="example.com")
+        MY_URL=https://evil.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+      expect(g.configSchema.MY_URL.errors[0]?.message).toContain('example.com');
+    });
+  });
+
+  describe('noTrailingSlash', () => {
+    it('accepts url without trailing slash', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true)
+        MY_URL=https://example.com/path
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('rejects url with trailing slash', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true)
+        MY_URL=https://example.com/path/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('rejects bare domain with trailing slash', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true)
+        MY_URL=https://example.com/
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('rejects a trailing slash followed by a query string', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true)
+        MY_URL=https://example.com/path/?q=1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('rejects a trailing slash followed by a hash', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true)
+        MY_URL="https://example.com/path/#frag"
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('accepts a hash on a path with no trailing slash', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true)
+        MY_URL="https://example.com/path#frag"
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('accepts a query string on a path with no trailing slash', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true)
+        MY_URL=https://example.com/path?q=1
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('accepts bare domain without trailing slash', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true)
+        MY_URL=https://example.com
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+  });
+
+  describe('matches', () => {
+    it('accepts url matching quoted regex pattern', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(matches="^https://api\\.")
+        MY_URL=https://api.example.com
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('rejects url not matching quoted regex pattern', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(matches="^https://api\\.")
+        MY_URL=https://example.com
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+
+    it('accepts url matching unquoted regex-like pattern', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(matches=/^https://api\\./)
+        MY_URL=https://api.example.com
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(true);
+    });
+
+    it('rejects url not matching unquoted regex-like pattern', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(matches=/^https://api\\./)
+        MY_URL=https://example.com
+      `);
+      expect(g.configSchema.MY_URL.isValid).toBe(false);
+    });
+  });
+
+  describe('combined options', () => {
+    it('applies prependHttps and noTrailingSlash together', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(prependHttps=true, noTrailingSlash=true)
+        GOOD_URL=example.com/path
+        # @type=url(prependHttps=true, noTrailingSlash=true)
+        BAD_URL=example.com/path/
+      `);
+      expect(g.configSchema.GOOD_URL.isValid).toBe(true);
+      expect(g.configSchema.GOOD_URL.resolvedValue).toBe('https://example.com/path');
+      expect(g.configSchema.BAD_URL.isValid).toBe(false);
+    });
+
+    it('applies noTrailingSlash and matches together', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=url(noTrailingSlash=true, matches="^https://api\\.")
+        GOOD_URL=https://api.example.com/v1
+        # @type=url(noTrailingSlash=true, matches="^https://api\\.")
+        BAD_SLASH=https://api.example.com/v1/
+        # @type=url(noTrailingSlash=true, matches="^https://api\\.")
+        BAD_DOMAIN=https://example.com/v1
+      `);
+      expect(g.configSchema.GOOD_URL.isValid).toBe(true);
+      expect(g.configSchema.BAD_SLASH.isValid).toBe(false);
+      expect(g.configSchema.BAD_DOMAIN.isValid).toBe(false);
+    });
+  });
+});
+
+describe('url data type - path values', () => {
+  it('accepts url with path segments', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=url
+      MY_URL=https://example.com/foo/bar/baz
+    `);
+    expect(g.configSchema.MY_URL.isValid).toBe(true);
+    expect(g.configSchema.MY_URL.resolvedValue).toBe('https://example.com/foo/bar/baz');
+  });
+
+  it('accepts url with path and quoted regex pattern', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=url(matches="^https://example\\.com/api/")
+      MY_URL=https://example.com/api/v1
+    `);
+    expect(g.configSchema.MY_URL.isValid).toBe(true);
+  });
+
+  it('rejects url not matching path-based quoted regex pattern', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=url(matches="^https://example\\.com/api/")
+      MY_URL=https://other.com/api/v1
+    `);
+    expect(g.configSchema.MY_URL.isValid).toBe(false);
+  });
+});
+
+describe('ip data type', () => {
+  it('accepts IPv4', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=ip(version=4)
+      IP=192.168.1.1
+    `);
+    expect(g.configSchema.IP.isValid).toBe(true);
+  });
+
+  it('accepts plain IPv6', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=ip(version=6)
+      IP=2001:db8::1
+    `);
+    expect(g.configSchema.IP.isValid).toBe(true);
+  });
+
+  it('accepts IPv4-mapped IPv6 addresses', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=ip(version=6)
+      IP=::ffff:192.168.1.1
+    `);
+    expect(g.configSchema.IP.isValid).toBe(true);
+  });
+});
+
+describe('uuid data type', () => {
+  it.each([
+    ['v1', 'c232ab00-9414-11ec-b3c8-9f6bdeced846'],
+    ['v4', '123e4567-e89b-42d3-a456-426614174000'],
+    ['v6', '1ec9414c-232a-6b00-b3c8-9f6bdeced846'],
+    ['v7', '01890a5d-ac96-774b-bcce-b302099a8057'],
+    ['v8', '2489e9ad-2ee2-8e00-8ec9-32d5f69181c0'],
+    ['NIL', '00000000-0000-0000-0000-000000000000'],
+    ['MAX', 'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF'],
+  ])('accepts %s', async (_label, value) => {
+    const g = await loadAndResolve(outdent`
+      # @type=uuid
+      ID=${value}
+    `);
+    expect(g.configSchema.ID.isValid).toBe(true);
+  });
+
+  it.each([
+    ['version 0', '123e4567-e89b-02d3-a456-426614174000'],
+    ['version 9', '123e4567-e89b-92d3-a456-426614174000'],
+    ['bad variant', '123e4567-e89b-42d3-c456-426614174000'],
+    ['not a uuid', 'not-a-uuid'],
+  ])('rejects %s', async (_label, value) => {
+    const g = await loadAndResolve(outdent`
+      # @type=uuid
+      ID=${value}
+    `);
+    expect(g.configSchema.ID.isValid).toBe(false);
+  });
+
+  it('restricts to a single version via `version`', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=uuid(version=7)
+      V7=01890a5d-ac96-774b-bcce-b302099a8057
+      # @type=uuid(version=7)
+      V4=123e4567-e89b-42d3-a456-426614174000
+      # @type=uuid(version=7)
+      NIL=00000000-0000-0000-0000-000000000000
+    `);
+    expect(g.configSchema.V7.isValid).toBe(true);
+    expect(g.configSchema.V4.isValid).toBe(false);
+    expect(g.configSchema.NIL.isValid).toBe(false);
+  });
+
+  it.each(['true', '0', '9', '7.5', '"7"'])('rejects invalid `version` option (%s)', async (version) => {
+    const g = await loadAndResolve(outdent`
+      # @type=uuid(version=${version})
+      ID=c232ab00-9414-11ec-b3c8-9f6bdeced846
+    `);
+    expect(g.configSchema.ID.isValid).toBe(false);
+  });
+});
+
+describe('md5 data type', () => {
+  it('accepts lowercase md5', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=md5
+      H=d41d8cd98f00b204e9800998ecf8427e
+    `);
+    expect(g.configSchema.H.isValid).toBe(true);
+    expect(g.configSchema.H.resolvedValue).toBe('d41d8cd98f00b204e9800998ecf8427e');
+  });
+
+  it('accepts uppercase md5 and normalizes to lowercase', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=md5
+      H=D41D8CD98F00B204E9800998ECF8427E
+    `);
+    expect(g.configSchema.H.isValid).toBe(true);
+    expect(g.configSchema.H.resolvedValue).toBe('d41d8cd98f00b204e9800998ecf8427e');
+  });
+});
+
+describe('domain data type', () => {
+  it('accepts a basic domain', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=domain
+      MY_DOMAIN=example.com
+    `);
+    expect(g.configSchema.MY_DOMAIN.isValid).toBe(true);
+    expect(g.configSchema.MY_DOMAIN.resolvedValue).toBe('example.com');
+  });
+
+  it('accepts nested subdomains', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=domain
+      MY_DOMAIN=api.internal.example.co.uk
+    `);
+    expect(g.configSchema.MY_DOMAIN.isValid).toBe(true);
+  });
+
+  it.each([
+    ['protocol', 'https://example.com'],
+    ['path', 'example.com/foo'],
+    ['port', 'example.com:8080'],
+    ['credentials', 'user@example.com'],
+    ['spaces', '"exam ple.com"'],
+    ['empty label', 'example..com'],
+    ['leading dot', '.example.com'],
+    ['trailing dot', 'example.com.'],
+    ['leading hyphen in label', '-foo.example.com'],
+    ['ip address', '192.168.1.1'],
+  ])('rejects a value with %s', async (_desc, value) => {
+    const g = await loadAndResolve(outdent`
+      # @type=domain
+      MY_DOMAIN=${value}
+    `);
+    expect(g.configSchema.MY_DOMAIN.isValid).toBe(false);
+  });
+
+  describe('allowWildcard', () => {
+    it('rejects wildcard domains by default', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain
+        MY_DOMAIN=*.example.com
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(false);
+    });
+
+    it('accepts wildcard domains when enabled', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowWildcard=true)
+        MY_DOMAIN=*.example.com
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(true);
+    });
+
+    it('counts the wildcard label toward the 253-char total length limit', async () => {
+      // suffix is exactly 253 chars (valid alone), so the wildcard form is 255 and must fail
+      const suffix = ['a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(61)].join('.');
+      expect(suffix.length).toBe(253);
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowWildcard=true)
+        OK_DOMAIN=${suffix}
+        # @type=domain(allowWildcard=true)
+        TOO_LONG_DOMAIN=*.${suffix}
+      `);
+      expect(g.configSchema.OK_DOMAIN.isValid).toBe(true);
+      expect(g.configSchema.TOO_LONG_DOMAIN.isValid).toBe(false);
+    });
+
+    it('rejects a bare wildcard even when enabled', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowWildcard=true)
+        MY_DOMAIN=*.
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(false);
+    });
+  });
+
+  describe('allowSingleLabel', () => {
+    it('rejects single-label hostnames by default', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain
+        MY_DOMAIN=localhost
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(false);
+    });
+
+    it('accepts single-label hostnames when enabled', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowSingleLabel=true)
+        MY_DOMAIN=localhost
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(true);
+    });
+  });
+
+  describe('allowIp', () => {
+    it('accepts an IPv4 address when enabled', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIp=true)
+        MY_HOST=192.168.1.1
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(true);
+      expect(g.configSchema.MY_HOST.resolvedValue).toBe('192.168.1.1');
+    });
+
+    it('still accepts domains when enabled', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIp=true)
+        MY_HOST=db.internal.example.com
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(true);
+    });
+
+    it('rejects a malformed IPv4 address', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIp=true)
+        MY_HOST=192.168.1.999
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(false);
+    });
+
+    it('rejects an IPv6 address', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIp=true)
+        MY_HOST=::1
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(false);
+    });
+
+    it('rejects an IP with a port', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIp=true)
+        MY_HOST=192.168.1.1:5432
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(false);
+    });
+  });
+
+  describe('allowIpV6', () => {
+    it('accepts a bare IPv6 address when enabled', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIpV6=true)
+        MY_HOST=::1
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(true);
+      expect(g.configSchema.MY_HOST.resolvedValue).toBe('::1');
+    });
+
+    it('accepts the bracketed form used in urls', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIpV6=true)
+        MY_HOST=[2001:db8::1]
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(true);
+    });
+
+    it('still accepts domains when enabled', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIpV6=true)
+        MY_HOST=db.internal.example.com
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(true);
+    });
+
+    it('rejects a malformed IPv6 address', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIpV6=true)
+        MY_HOST=":::1"
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(false);
+    });
+
+    it('still applies matches to an accepted IPv6 address', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIpV6=true, matches="^2001:")
+        MY_HOST=::1
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(false);
+    });
+
+    it('does not accept an IPv4 address on its own', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(allowIpV6=true)
+        MY_HOST=192.168.1.1
+      `);
+      expect(g.configSchema.MY_HOST.isValid).toBe(false);
+    });
+  });
+
+  describe('normalize', () => {
+    it('lowercases the value when enabled', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(normalize=true)
+        MY_DOMAIN=App.Example.COM
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(true);
+      expect(g.configSchema.MY_DOMAIN.resolvedValue).toBe('app.example.com');
+    });
+
+    it('accepts mixed case without normalize (domains are case-insensitive)', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain
+        MY_DOMAIN=App.Example.COM
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(true);
+      expect(g.configSchema.MY_DOMAIN.resolvedValue).toBe('App.Example.COM');
+    });
+  });
+
+  describe('matches', () => {
+    it('accepts a domain matching the pattern', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(matches=/\\.example\\.com$/)
+        MY_DOMAIN=api.example.com
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(true);
+    });
+
+    it('rejects a domain not matching the pattern', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=domain(matches=/\\.example\\.com$/)
+        MY_DOMAIN=api.other.com
+      `);
+      expect(g.configSchema.MY_DOMAIN.isValid).toBe(false);
+    });
+  });
+});
+
+describe('string data type - matches option', () => {
+  it('accepts string matching regex literal', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=/^[A-Z]+$/)
+      MY_VAR=HELLO
+    `);
+    expect(g.configSchema.MY_VAR.isValid).toBe(true);
+  });
+
+  it('rejects string not matching regex literal', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=/^[A-Z]+$/)
+      MY_VAR=hello
+    `);
+    expect(g.configSchema.MY_VAR.isValid).toBe(false);
+  });
+
+  it('supports regex flags in literal', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=/^hello$/i)
+      MY_VAR=HELLO
+    `);
+    expect(g.configSchema.MY_VAR.isValid).toBe(true);
+  });
+
+  it('accepts a comma-containing pattern via regex()', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=regex("^[0-9a-f]{7,40}$"))
+      GOOD_SHA=abc1234
+      # @type=string(matches=regex("^[0-9a-f]{7,40}$"))
+      BAD_SHA=nope
+    `);
+    expect(g.configSchema.GOOD_SHA.isValid).toBe(true);
+    expect(g.configSchema.GOOD_SHA.errors).toHaveLength(0);
+    expect(g.configSchema.BAD_SHA.isValid).toBe(false);
+  });
+
+  it('accepts flags as a second regex() arg', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=regex("^[0-9A-F]{7,40}$", "i"))
+      GOOD_SHA=abc1234
+      # @type=string(matches=regex("^[0-9A-F]{7,40}$", "i"))
+      BAD_SHA=nope
+    `);
+    expect(g.configSchema.GOOD_SHA.isValid).toBe(true);
+    expect(g.configSchema.BAD_SHA.isValid).toBe(false);
+  });
+
+  it('rejects a /.../ literal passed to regex()', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=regex("/^abc$/"))
+      MY_VAR=abc
+    `);
+    const err = g.configSchema.MY_VAR.errors[0];
+    expect(err.message).toContain('regex() in option "matches" - expects the pattern itself');
+    expect(err.tip).toContain('drop the surrounding slashes');
+  });
+
+  it('matches a slash at each end when the source escapes them', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=regex("^\\/usr\\/lib\\/$"))
+      EXACT=/usr/lib/
+      # @type=string(matches=regex("^\\/usr\\/lib\\/$"))
+      LOOSE=xxx/usr/lib/xxx
+    `);
+    expect(g.configSchema.EXACT.isValid).toBe(true);
+    expect(g.configSchema.LOOSE.isValid).toBe(false);
+  });
+
+  it('rejects invalid regex() flags', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=regex("^abc$", "zz"))
+      MY_VAR=abc
+    `);
+    expect(g.configSchema.MY_VAR.isValid).toBe(false);
+  });
+
+  it('tips off a bare pattern split by its own comma', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=/^[0-9a-f]{7,40}$/)
+      MY_VAR=abc1234
+    `);
+    const err = g.configSchema.MY_VAR.errors[0];
+    expect(err.message).toContain('cannot mix positional args and named options');
+    expect(err.tip).toContain('regex("^[0-9a-f]{7,40}$")');
+  });
+
+  describe('deprecated /.../ regex strings', () => {
+    it('still interprets a bare /.../ string, with a warning', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=string(matches=/^[A-Z]+$/)
+        GOOD=ABC
+        # @type=string(matches=/^[A-Z]+$/)
+        BAD=abc
+      `);
+      expect(g.configSchema.GOOD.isValid).toBe(true);
+      expect(g.configSchema.GOOD.validationState).toBe('warn');
+      expect(g.configSchema.GOOD.errors[0].message).toContain('deprecated, use regex()');
+      expect(g.configSchema.GOOD.errors[0].tip).toContain('write it as regex("^[A-Z]+$")');
+      expect(g.configSchema.BAD.isValid).toBe(false);
+    });
+
+    it('a quoted /.../ string is the same thing, and warns the same way', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=string(matches="/^[0-9a-f]{7,40}$/i")
+        GOOD=ABC1234
+      `);
+      expect(g.configSchema.GOOD.isValid).toBe(true);
+      expect(g.configSchema.GOOD.validationState).toBe('warn');
+      expect(g.configSchema.GOOD.errors[0].tip).toContain('write it as regex("^[0-9a-f]{7,40}$", "i")');
+    });
+
+    it('reaches a nested element type', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string(matches=/^[a-z]+$/))
+        ITEMS=["abc"]
+      `);
+      expect(g.configSchema.ITEMS.validationState).toBe('warn');
+    });
+
+    it('a plain string pattern on matches warns too', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=string(matches="^[a-z]+$")
+        GOOD=abc
+      `);
+      expect(g.configSchema.GOOD.isValid).toBe(true);
+      expect(g.configSchema.GOOD.validationState).toBe('warn');
+      expect(g.configSchema.GOOD.errors[0].tip).toContain('write it as regex("^[a-z]+$")');
+    });
+
+    it('warns on a remap() match value', async () => {
+      const g = await loadAndResolve(outdent`
+        SRC=dev-branch
+        R=remap($SRC, /^dev.*/i, HIT, MISS)
+      `);
+      expect(g.configSchema.R.resolvedValue).toBe('HIT');
+      expect(g.configSchema.R.validationState).toBe('warn');
+      expect(g.configSchema.R.errors[0].tip).toContain('write it as regex("^dev.*", "i")');
+    });
+
+    it('warns on a resolver-valued matches once it resolves to a string', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=string(matches=if(true, "/^[A-Z]+$/", "/^[a-z]+$/"))
+        GOOD=ABC
+        # @type=string(matches=if(true, "/^[A-Z]+$/", "/^[a-z]+$/"))
+        BAD=abc
+      `);
+      expect(g.configSchema.GOOD.isValid).toBe(true);
+      expect(g.configSchema.GOOD.validationState).toBe('warn');
+      expect(g.configSchema.GOOD.errors).toHaveLength(1);
+      expect(g.configSchema.GOOD.errors[0].tip).toContain('write it as regex("^[A-Z]+$")');
+      expect(g.configSchema.BAD.isValid).toBe(false);
+    });
+
+    it('warns on a pattern referenced from another variable, even when the item is empty', async () => {
+      const g = await loadAndResolve(outdent`
+        PATTERN=/^[A-Z]+$/
+        # @type=string(matches=$PATTERN)
+        SET=ABC
+        # @type=string(matches=$PATTERN)
+        EMPTY=
+      `);
+      for (const key of ['SET', 'EMPTY'] as const) {
+        expect(g.configSchema[key].isValid).toBe(true);
+        expect(g.configSchema[key].validationState).toBe('warn');
+        expect(g.configSchema[key].errors).toHaveLength(1);
+        expect(g.configSchema[key].errors[0].tip).toContain('there is no dynamic form');
+      }
+    });
+
+    it('does not warn on a resolver-valued matches that resolves to a regex()', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=string(matches=if(true, regex("^[A-Z]+$"), regex("^[a-z]+$")))
+        GOOD=ABC
+      `);
+      expect(g.configSchema.GOOD.isValid).toBe(true);
+      expect(g.configSchema.GOOD.validationState).toBe('valid');
+    });
+
+    it('warns on a resolver-valued remap() match once it resolves to a /.../ string', async () => {
+      const g = await loadAndResolve(outdent`
+        PAT=/^dev.*/i
+        SRC=dev-branch
+        R=remap($SRC, $PAT, HIT, MISS)
+      `);
+      expect(g.configSchema.R.resolvedValue).toBe('HIT');
+      expect(g.configSchema.R.validationState).toBe('warn');
+      expect(g.configSchema.R.errors[0].tip).toContain('write it as regex("^dev.*", "i")');
+    });
+
+    it('leaves a plugin-defined type with its own `matches` option alone', async () => {
+      const g = new EnvGraph();
+      // a plugin type where `matches` is a plain string setting, not a pattern
+      g.registerDataType(createEnvGraphDataType((settings?: { matches?: string }) => ({
+        name: 'label',
+        validate: (val: any) => (settings?.matches && val !== settings.matches
+          ? [new (Error as any)(`must equal ${settings.matches}`)]
+          : true),
+      })));
+      await g.setRootDataSource(new DotEnvFileDataSource('.env.schema', {
+        overrideContents: outdent`
+          # @defaultRequired=false @defaultSensitive=false
+          # ---
+          # @type=label(matches="exact")
+          L=exact
+        `,
+      }));
+      await g.finishLoad();
+      await g.resolveEnvValues();
+      expect(g.configSchema.L.isValid).toBe(true);
+      expect(g.configSchema.L.validationState).toBe('valid');
+    });
+
+    it('does not warn on a remap() regex() call or a plain path', async () => {
+      const g = await loadAndResolve(outdent`
+        SRC=dev-branch
+        R=remap($SRC, regex("^dev.*", "i"), HIT, MISS)
+        P=remap($SRC, /usr/local, HIT, MISS)
+      `);
+      expect(g.configSchema.R.resolvedValue).toBe('HIT');
+      expect(g.configSchema.R.validationState).toBe('valid');
+      expect(g.configSchema.P.validationState).toBe('valid');
+    });
+  });
+
+  it('does not tip when the mixup has nothing to do with a regex', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(somePositional, minLength=2)
+      MY_VAR=hello
+    `);
+    const err = g.configSchema.MY_VAR.errors[0];
+    expect(err.message).toContain('cannot mix positional args and named options');
+    expect(err.tip).toBeUndefined();
+  });
+
+  it('does not tip on a path-shaped arg list that happens to look similar', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(/usr/local/, matches=/etc/, minLength=2)
+      MY_VAR=hello
+    `);
+    const err = g.configSchema.MY_VAR.errors[0];
+    expect(err.message).toContain('cannot mix positional args and named options');
+    expect(err.tip).toBeUndefined();
+  });
+});
+
+describe('duration data type', () => {
+  describe('output unit', () => {
+    it('defaults to milliseconds', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration
+        TIMEOUT=1h
+      `);
+      expect(g.configSchema.TIMEOUT.isValid).toBe(true);
+      expect(g.configSchema.TIMEOUT.resolvedValue).toBe(3_600_000);
+    });
+
+    it('supports seconds output', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration(output="seconds")
+        TIMEOUT=1h
+      `);
+      expect(g.configSchema.TIMEOUT.isValid).toBe(true);
+      expect(g.configSchema.TIMEOUT.resolvedValue).toBe(3600);
+    });
+
+    it('supports minutes output', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration(output="minutes")
+        TIMEOUT=2h
+      `);
+      expect(g.configSchema.TIMEOUT.resolvedValue).toBe(120);
+    });
+
+    it('supports days output for week input', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration(output="days")
+        EXPIRY=2w
+      `);
+      expect(g.configSchema.EXPIRY.resolvedValue).toBe(14);
+    });
+
+    it('rejects invalid output unit', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration(output="lightyears")
+        BAD=1h
+      `);
+      expect(g.configSchema.BAD.isValid).toBe(false);
+    });
+  });
+
+  describe('input formats', () => {
+    it('accepts long-form units', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration(output="minutes")
+        T=2hours
+      `);
+      expect(g.configSchema.T.resolvedValue).toBe(120);
+    });
+
+    it('accepts bare-number ms strings', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration
+        T=5000
+      `);
+      expect(g.configSchema.T.resolvedValue).toBe(5000);
+    });
+
+    it('rejects garbage', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration
+        T=banana
+      `);
+      expect(g.configSchema.T.isValid).toBe(false);
+    });
+  });
+
+  describe('min/max validation', () => {
+    it('enforces min', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration(min="5m")
+        T=1m
+      `);
+      expect(g.configSchema.T.isValid).toBe(false);
+    });
+
+    it('accepts value within bounds', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration(min="5m", max="1h")
+        T=10m
+      `);
+      expect(g.configSchema.T.isValid).toBe(true);
+    });
+
+    it('enforces max', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=duration(max="1h")
+        T=2h
+      `);
+      expect(g.configSchema.T.isValid).toBe(false);
+    });
+
+    it('compares bounds in the output unit', async () => {
+      // 1500ms input → output 1.5s, max 2s → should pass
+      const g = await loadAndResolve(outdent`
+        # @type=duration(output="seconds", max="2s")
+        T=1500ms
+      `);
+      expect(g.configSchema.T.isValid).toBe(true);
+      expect(g.configSchema.T.resolvedValue).toBe(1.5);
+    });
+  });
+});
+
+describe('array data type', () => {
+  describe('input forms', () => {
+    it('coerces native array literal values', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string)
+        ITEM=[alpha, beta]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['alpha', 'beta']);
+    });
+
+    it('parses JSON array strings', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string)
+        ITEM='["a", "b"]'
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['a', 'b']);
+    });
+
+    it('splits plain strings on the default comma separator', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(email)
+        ITEM="one@example.com, two@example.com"
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['one@example.com', 'two@example.com']);
+    });
+
+    it('splits on a custom separator', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string, separator=";")
+        ITEM="a;b;c"
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['a', 'b', 'c']);
+    });
+
+    it('errors on malformed JSON array strings instead of splitting them', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string)
+        ITEM='["a", "b"'
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.coercionError?.message).toContain('JSON');
+    });
+
+    it('resolves refs within array literal elements', async () => {
+      const g = await loadAndResolve(outdent`
+        OTHER=bravo
+        # @type=array(string)
+        ITEM=[alpha, \${OTHER}]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['alpha', 'bravo']);
+    });
+  });
+
+  describe('element validation', () => {
+    it('validates each element with the element type', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(email)
+        ITEM=[good@example.com, not-an-email]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.validationErrors?.[0]?.message).toContain('[1]');
+    });
+
+    it('reports ALL invalid elements, not just the first', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(email)
+        ITEM=[bad-one, good@example.com, bad-two]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      const messages = (g.configSchema.ITEM.validationErrors ?? []).map((e) => e.message).join('\n');
+      expect(messages).toContain('[0]');
+      expect(messages).toContain('[2]');
+    });
+
+    it('supports element type options via nested call', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(email(normalize=true))
+        ITEM=[User@Example.com]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['user@example.com']);
+    });
+
+    it('supports nested enum element type', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(enum(sandbox, whitelist, production))
+        ITEM=[sandbox, whitelist]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['sandbox', 'whitelist']);
+    });
+
+    it('rejects invalid enum values in array', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(enum(sandbox, whitelist, production))
+        ITEM=[sandbox, invalid]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+    });
+
+    it('coerces array of numbers from literals', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(number)
+        PORTS=[8080, 3000, 443]
+      `);
+      expect(g.configSchema.PORTS.isValid).toBe(true);
+      expect(g.configSchema.PORTS.resolvedValue).toEqual([8080, 3000, 443]);
+    });
+
+    it('coerces array of booleans', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(boolean)
+        FLAGS=[true, false, 1, 0]
+      `);
+      expect(g.configSchema.FLAGS.isValid).toBe(true);
+      expect(g.configSchema.FLAGS.resolvedValue).toEqual([true, false, true, false]);
+    });
+
+    it('rejects ports outside nested port constraints', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(port(min=1024))
+        PORTS=[8080, 80]
+      `);
+      expect(g.configSchema.PORTS.isValid).toBe(false);
+      expect(g.configSchema.PORTS.validationErrors?.[0]?.message).toContain('[1]');
+    });
+  });
+
+  describe('array options', () => {
+    it('rejects empty arrays by default', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string)
+        ITEM=[]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      const err = g.configSchema.ITEM.validationErrors?.[0];
+      expect(err?.message).toContain('must not be empty');
+      expect(err?.tip).toContain('minLength=0');
+    });
+
+    it('allows empty arrays with explicit minLength=0', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string, minLength=0)
+        ITEM=[]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual([]);
+    });
+
+    it('enforces minLength', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string, minLength=1)
+        ITEM=[]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+    });
+
+    it('enforces maxLength', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string, maxLength=2)
+        ITEM=[a, b, c]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+    });
+
+    it('enforces isLength (exact element count)', async () => {
+      const good = await loadAndResolve(outdent`
+        # @type=array(string, isLength=2)
+        ITEM=[a, b]
+      `);
+      expect(good.configSchema.ITEM.isValid).toBe(true);
+
+      const bad = await loadAndResolve(outdent`
+        # @type=array(string, isLength=2)
+        ITEM=[a, b, c]
+      `);
+      expect(bad.configSchema.ITEM.isValid).toBe(false);
+      expect(bad.configSchema.ITEM.validationErrors?.[0]?.message).toContain('exactly 2');
+    });
+
+    it('enforces unique elements', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string, unique=true)
+        ITEM=[dup, other, dup]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      const messages = (g.configSchema.ITEM.validationErrors ?? []).map((e) => e.message).join('\n');
+      expect(messages).toContain('[2]');
+    });
+
+    it('rejects unknown array options with a helpful message', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(email, normalize=true)
+        ITEM=[a@example.com]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.errors[0].message).toContain('normalize');
+      expect(g.configSchema.ITEM.errors[0].tip).toContain('nested call');
+    });
+
+    it('rejects elements containing the separator (no silent bad round-trip)', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string)
+        ITEM=["has,comma", other]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.validationErrors?.[0]?.message).toContain('separator');
+    });
+
+    it('allows elements containing the separator when format=json', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string, format=json)
+        ITEM=["has,comma", other]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['has,comma', 'other']);
+    });
+  });
+
+  describe('type inference', () => {
+    it('infers array type from an untyped array literal', async () => {
+      const g = await loadAndResolve(outdent`
+        ITEM=[a, b]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.dataType?.name).toBe('array');
+      expect(g.configSchema.ITEM.resolvedValue).toEqual(['a', 'b']);
+    });
+
+    it('infers element type when all elements share a scalar type', async () => {
+      const g = await loadAndResolve(outdent`
+        PORTS=[8080, 3000]
+      `);
+      expect(g.configSchema.PORTS.isValid).toBe(true);
+      expect(g.configSchema.PORTS.resolvedValue).toEqual([8080, 3000]);
+    });
+
+    it('falls back to string elements for mixed literals', async () => {
+      const g = await loadAndResolve(outdent`
+        MIXED=[1, two]
+      `);
+      expect(g.configSchema.MIXED.isValid).toBe(true);
+      expect(g.configSchema.MIXED.resolvedValue).toEqual(['1', 'two']);
+    });
+  });
+
+  describe('interplay with other decorators', () => {
+    it('works with conditional required', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=enum(sandbox, restricted, production)
+        APP_MODE=sandbox
+        # @type=array(email(normalize=true))
+        # @required=eq($APP_MODE, restricted)
+        ALLOWED_EMAILS=[admin@example.com, support@example.com]
+      `);
+      expect(g.configSchema.ALLOWED_EMAILS.isValid).toBe(true);
+      expect(g.configSchema.ALLOWED_EMAILS.resolvedValue).toEqual([
+        'admin@example.com',
+        'support@example.com',
+      ]);
+    });
+
+    it('required array with no value fails as usual', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(string)
+        # @required
+        ITEM=
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+    });
+  });
+});
+
+describe('record data type', () => {
+  describe('input forms', () => {
+    it('coerces native object literal values', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record
+        ITEM={k=v, n=2}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual({ k: 'v', n: 2 });
+    });
+
+    it('parses JSON object strings', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record
+        ITEM='{"k": "v", "n": 2}'
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual({ k: 'v', n: 2 });
+    });
+
+    it('resolves refs within object literal values', async () => {
+      const g = await loadAndResolve(outdent`
+        BASE=https://example.com
+        # @type=record(url)
+        ENDPOINTS={api=\${BASE}, other=https://other.com}
+      `);
+      expect(g.configSchema.ENDPOINTS.isValid).toBe(true);
+      expect(g.configSchema.ENDPOINTS.resolvedValue).toEqual({
+        api: 'https://example.com',
+        other: 'https://other.com',
+      });
+    });
+  });
+
+  describe('value validation', () => {
+    it('validates every value with the value type', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(url)
+        ITEM={good=https://example.com, bad=not-a-url}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.validationErrors?.[0]?.message).toContain('"bad"');
+    });
+
+    it('coerces values with the value type', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(number)
+        LIMITS={low=1, high=100}
+      `);
+      expect(g.configSchema.LIMITS.isValid).toBe(true);
+      expect(g.configSchema.LIMITS.resolvedValue).toEqual({ low: 1, high: 100 });
+    });
+  });
+
+  describe('key validation', () => {
+    it('validates keys against an enum', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(url, keyType=enum(us, eu))
+        REGIONS={us=https://us.example.com, eu=https://eu.example.com}
+      `);
+      expect(g.configSchema.REGIONS.isValid).toBe(true);
+    });
+
+    it('rejects keys not in the enum', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(url, keyType=enum(us, eu))
+        REGIONS={us=https://us.example.com, apac=https://apac.example.com}
+      `);
+      expect(g.configSchema.REGIONS.isValid).toBe(false);
+      expect(g.configSchema.REGIONS.validationErrors?.[0]?.message).toContain('"apac"');
+    });
+
+    it('validates keys with a pattern via string type options', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(string, keyType=string(matches="[a-z]+"))
+        ITEM={lower=ok, UPPER=bad}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.validationErrors?.[0]?.message).toContain('"UPPER"');
+    });
+  });
+
+  describe('record options', () => {
+    it('rejects unknown record options', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(string, whatever=true)
+        ITEM={k=v}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.errors[0].message).toContain('whatever');
+    });
+
+    it('rejects empty objects by default', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(string)
+        ITEM={}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      const err = g.configSchema.ITEM.validationErrors?.[0];
+      expect(err?.message).toContain('must not be empty');
+      expect(err?.tip).toContain('entriesMinLength=0');
+    });
+
+    it('allows empty objects with explicit entriesMinLength=0', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(string, entriesMinLength=0)
+        ITEM={}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.resolvedValue).toEqual({});
+    });
+
+    it('enforces entriesMinLength', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(string, entriesMinLength=2)
+        ITEM={only=one}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.validationErrors?.[0]?.message).toContain('at least 2');
+    });
+
+    it('enforces entriesMaxLength', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(string, entriesMaxLength=1)
+        ITEM={a=1, b=2}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.validationErrors?.[0]?.message).toContain('at most 1');
+    });
+
+    it('enforces entriesIsLength (exact entry count)', async () => {
+      const good = await loadAndResolve(outdent`
+        # @type=record(string, entriesIsLength=2)
+        ITEM={a=1, b=2}
+      `);
+      expect(good.configSchema.ITEM.isValid).toBe(true);
+
+      const bad = await loadAndResolve(outdent`
+        # @type=record(string, entriesIsLength=2)
+        ITEM={a=1}
+      `);
+      expect(bad.configSchema.ITEM.isValid).toBe(false);
+      expect(bad.configSchema.ITEM.validationErrors?.[0]?.message).toContain('exactly 2');
+    });
+
+    it('entry count options support dynamic values', async () => {
+      const g = await loadAndResolve(outdent`
+        STRICT=true
+        # @type=record(string, entriesMinLength=if($STRICT, 2, 0))
+        ITEM={only=one}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+    });
+  });
+
+  describe('type inference', () => {
+    it('infers object type from an untyped object literal', async () => {
+      const g = await loadAndResolve(outdent`
+        ITEM={k=v, n=2}
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(true);
+      expect(g.configSchema.ITEM.dataType?.name).toBe('record');
+      expect(g.configSchema.ITEM.resolvedValue).toEqual({ k: 'v', n: 2 });
+    });
+  });
+
+  describe('nesting composites', () => {
+    it('supports arrays of objects (forced JSON serialization)', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=array(record)
+        ITEMS=[{name=a}, {name=b}]
+      `);
+      expect(g.configSchema.ITEMS.isValid).toBe(true);
+      expect(g.configSchema.ITEMS.resolvedValue).toEqual([{ name: 'a' }, { name: 'b' }]);
+    });
+
+    it('supports objects of arrays', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=record(array(number))
+        GROUPS={a=[1, 2], b=[3]}
+      `);
+      expect(g.configSchema.GROUPS.isValid).toBe(true);
+      expect(g.configSchema.GROUPS.resolvedValue).toEqual({ a: [1, 2], b: [3] });
+    });
+  });
+});
+
+describe('@type arg handling (scalar types)', () => {
+  it('rejects enum with no members', async () => {
+    for (const typeSpec of ['enum', 'enum()', 'array(enum)', 'array(enum())', 'record(string, keyType=enum())']) {
+      const g = await loadAndResolve(outdent`
+        # @type=${typeSpec}
+        ITEM=a
+      `);
+      expect(g.configSchema.ITEM.isValid, typeSpec).toBe(false);
+      expect(g.configSchema.ITEM.errors[0].message, typeSpec).toContain('enum must have at least one member');
+    }
+  });
+
+  it('rejects named options on enum', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=enum(a, b, someOpt=true)
+      ITEM=a
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    expect(g.configSchema.ITEM.errors[0].message).toContain('does not take named options');
+  });
+
+  it('rejects unknown functions in option values with a clear error', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=notAFunction(a, b))
+      ITEM=x
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    expect(g.configSchema.ITEM.errors[0].message).toContain('not a static value or a known resolver function');
+  });
+
+  it('rejects nested type calls on scalar types', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(enum(a, b))
+      ITEM=x
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    expect(g.configSchema.ITEM.errors[0].message).toContain('only supported as array/object element types');
+  });
+
+  it('still supports regex-like string patterns in options', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=/^[A-Z]+$/)
+      GOOD=ABC
+      # @type=string(matches=/^[A-Z]+$/)
+      BAD=abc
+    `);
+    expect(g.configSchema.GOOD.isValid).toBe(true);
+    expect(g.configSchema.BAD.isValid).toBe(false);
+  });
+});
+
+describe('dynamic @type parts (resolver-valued)', () => {
+  describe('dynamic option values', () => {
+    it('resolves option values via if() with refs to other items', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=enum(sandbox, production)
+        APP_MODE=production
+        # @type=array(email, minLength=if(eq($APP_MODE, production), 2, 0))
+        ALLOWED_EMAILS=[only-one@example.com]
+      `);
+      expect(g.configSchema.ALLOWED_EMAILS.isValid).toBe(false);
+      const messages = (g.configSchema.ALLOWED_EMAILS.validationErrors ?? []).map((e) => e.message).join('\n');
+      expect(messages).toContain('at least 2');
+    });
+
+    it('dynamic option values pass when the resolved constraint is satisfied', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=enum(sandbox, production)
+        APP_MODE=sandbox
+        # @type=array(email, minLength=if(eq($APP_MODE, production), 2, 0))
+        ALLOWED_EMAILS=[only-one@example.com]
+      `);
+      expect(g.configSchema.ALLOWED_EMAILS.isValid).toBe(true);
+    });
+
+    it('supports dynamic options on scalar types', async () => {
+      const g = await loadAndResolve(outdent`
+        STRICT=true
+        # @type=string(minLength=if($STRICT, 10, 1))
+        TOKEN=short
+      `);
+      expect(g.configSchema.TOKEN.isValid).toBe(false);
+    });
+
+    it('rejects dynamic options that would change the generated type', async () => {
+      const g = await loadAndResolve(outdent`
+        FLAG=true
+        # @type=number(isInt=if($FLAG, true, false))
+        VAL=1.5
+      `);
+      expect(g.configSchema.VAL.isValid).toBe(false);
+      const messages = (g.configSchema.VAL.validationErrors ?? []).map((e) => e.message).join('\n');
+      expect(messages).toContain('generate the same type');
+    });
+  });
+
+  describe('dynamic whole types', () => {
+    it('switches the type via if() when candidates generate the same type', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=enum(dev, production)
+        APP_ENV=production
+        # @type=if(eq($APP_ENV, production), url, string)
+        SERVICE_HOST=not-a-url
+      `);
+      // in production the value must be a url
+      expect(g.configSchema.SERVICE_HOST.isValid).toBe(false);
+    });
+
+    it('relaxes validation when the dynamic type resolves to the looser candidate', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=enum(dev, production)
+        APP_ENV=dev
+        # @type=if(eq($APP_ENV, production), url, string)
+        SERVICE_HOST=not-a-url
+      `);
+      expect(g.configSchema.SERVICE_HOST.isValid).toBe(true);
+    });
+
+    it('keeps typegen deterministic - provisional type comes from static candidates', async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=enum(dev, production)
+        APP_ENV=production
+        # @type=if(eq($APP_ENV, production), url, string)
+        SERVICE_HOST=https://example.com
+      `);
+      // the provisional (typegen-facing) instance stays the first candidate regardless of env
+      expect(g.configSchema.SERVICE_HOST.dataType?.name).toBe('url');
+      expect(g.configSchema.SERVICE_HOST.effectiveDataType?.name).toBe('url');
+      expect(g.configSchema.SERVICE_HOST.isValid).toBe(true);
+    });
+
+    it('rejects candidate types that generate different types at load time', async () => {
+      const g = await loadAndResolve(outdent`
+        FLAG=true
+        # @type=if($FLAG, number, string)
+        VAL=123
+      `);
+      expect(g.configSchema.VAL.isValid).toBe(false);
+      expect(g.configSchema.VAL.errors[0].message).toContain('do not all generate the same type');
+    });
+
+    it('rejects an opaque dynamic type resolving to a non-string-generating type', async () => {
+      const g = await loadAndResolve(outdent`
+        TYPE_NAME=number
+        # @type=fallback($TYPE_NAME, string)
+        VAL=123
+      `);
+      // fallback($TYPE_NAME, string) resolves to "number", whose generated type (number)
+      // differs from the provisional candidate (string) - rejected at resolution time
+      expect(g.configSchema.VAL.isValid).toBe(false);
+      const messages = (g.configSchema.VAL.validationErrors ?? []).map((e) => e.message).join('\n');
+      expect(messages).toContain('does not generate the same type');
+    });
+
+    it('rejects enum as a dynamic type candidate', async () => {
+      const g = await loadAndResolve(outdent`
+        FLAG=true
+        # @type=if($FLAG, enum, string)
+        VAL=x
+      `);
+      expect(g.configSchema.VAL.isValid).toBe(false);
+      expect(g.configSchema.VAL.errors[0].message).toContain('enum must have at least one member');
+    });
+
+    it('errors when an opaque dynamic type resolves to enum', async () => {
+      const g = await loadAndResolve(outdent`
+        TYPE_NAME=enum
+        # @type=fallback($TYPE_NAME, string)
+        VAL=x
+      `);
+      expect(g.configSchema.VAL.isValid).toBe(false);
+      const messages = (g.configSchema.VAL.validationErrors ?? []).map((e) => e.message).join('\n');
+      expect(messages).toContain('enum must have at least one member');
+    });
+
+    it('errors when the dynamic type resolves to an unknown type name', async () => {
+      const g = await loadAndResolve(outdent`
+        TYPE_NAME=not-a-real-type
+        # @type=fallback($TYPE_NAME, string)
+        VAL=x
+      `);
+      expect(g.configSchema.VAL.isValid).toBe(false);
+      const messages = (g.configSchema.VAL.validationErrors ?? []).map((e) => e.message).join('\n');
+      expect(messages).toContain('invalid data type');
+    });
+  });
+});
+
+describe('composite coercion error paths', () => {
+  it('reports ALL invalid elements during coercion, not just the first', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(number)
+      NUMS=[abc, 2, xyz]
+    `);
+    expect(g.configSchema.NUMS.isValid).toBe(false);
+    const msg = g.configSchema.NUMS.coercionError?.message ?? '';
+    expect(msg).toContain('[0]');
+    expect(msg).toContain('[2]');
+    expect(msg).not.toContain('[1]');
+  });
+
+  it('rejects a scalar non-string value for an array type', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      ITEM=123
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    expect(g.configSchema.ITEM.coercionError?.message).toContain('Cannot coerce');
+  });
+
+  it('rejects a scalar value for an object type', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=record(string)
+      ITEM=123
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+  });
+
+  it('errors on malformed JSON object strings', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=record(string)
+      ITEM='{"a": '
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    expect(g.configSchema.ITEM.coercionError?.message).toContain('JSON');
+  });
+
+  it('reports ALL invalid object values during coercion', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=record(number)
+      LIMITS={a=x, b=2, c=y}
+    `);
+    expect(g.configSchema.LIMITS.isValid).toBe(false);
+    const msg = g.configSchema.LIMITS.coercionError?.message ?? '';
+    expect(msg).toContain('"a"');
+    expect(msg).toContain('"c"');
+    expect(msg).not.toContain('"b"');
+  });
+
+  it('empty/whitespace string input resolves to missing, never an empty array', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      WHITESPACE=" "
+      # @type=array(string)
+      QUOTED_EMPTY=""
+    `);
+    expect(g.configSchema.WHITESPACE.isValid).toBe(true);
+    expect(g.configSchema.WHITESPACE.resolvedValue).toBe(undefined);
+    expect(g.configSchema.QUOTED_EMPTY.isValid).toBe(true);
+    expect(g.configSchema.QUOTED_EMPTY.resolvedValue).toBe(undefined);
+  });
+
+  it('required items reject empty/whitespace string input as missing', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      # @required
+      ITEM=" "
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    expect(g.configSchema.ITEM.validationErrors?.[0]?.message).toContain('required but is currently empty');
+  });
+
+  it('required items accept an explicitly non-empty array', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      # @required
+      ITEM=[a]
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(true);
+  });
+});
+
+describe('@type option validation error paths', () => {
+  const badSpecs = [
+    ['array(string, separator=7)', 'separator must be a non-empty string'],
+    ['array(string, separator="")', 'separator must be a non-empty string'],
+    ['array(string, format=yaml)', 'format must be "separator" or "json"'],
+    ['array(string, minLength=abc)', 'minLength must be a number'],
+    ['array(string, isLength=abc)', 'isLength must be a number'],
+    ['array(string, unique=maybe)', 'unique must be a boolean'],
+    ['array(string, number)', 'single element type argument'],
+    ['record(string, number)', 'single value type argument'],
+    ['record(string, keyType={a=b})', 'keyType must be a type name or type call'],
+    ['record(string, keys=enum(a, b))', 'unknown record option "keys"'],
+    ['record(string, entriesMinLength=abc)', 'entriesMinLength must be a number'],
+  ] as const;
+
+  for (const [spec, expectedError] of badSpecs) {
+    it(`rejects ${spec}`, async () => {
+      const g = await loadAndResolve(outdent`
+        # @type=${spec}
+        ITEM=[a]
+      `);
+      expect(g.configSchema.ITEM.isValid).toBe(false);
+      expect(g.configSchema.ITEM.errors[0].message).toContain(expectedError);
+    });
+  }
+
+  it('points object users at record', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=object(url)
+      ITEM={k=v}
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    expect(g.configSchema.ITEM.errors[0].message).toContain('unknown data type: object');
+    expect(g.configSchema.ITEM.errors[0].tip).toContain('record(...)');
+  });
+
+  it('rejects a fn call that is neither a type nor a resolver', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=notARealThing(a, b)
+      ITEM=x
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    expect(g.configSchema.ITEM.errors[0].message).toContain('unknown data type: notARealThing');
+  });
+
+  it('supports the regex() option form', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=string(matches=regex("^[A-Z]+$"))
+      GOOD=ABC
+      # @type=string(matches=regex("^[A-Z]+$"))
+      BAD=abc
+    `);
+    expect(g.configSchema.GOOD.isValid).toBe(true);
+    expect(g.configSchema.BAD.isValid).toBe(false);
+  });
+
+  it('surfaces schema errors from resolver-valued options (bad arg counts)', async () => {
+    const g = await loadAndResolve(outdent`
+      OTHER=x
+      # @type=string(minLength=eq($OTHER))
+      ITEM=abc
+    `);
+    expect(g.configSchema.ITEM.isValid).toBe(false);
+    const messages = g.configSchema.ITEM.errors.map((e) => e.message).join('\n');
+    expect(messages).toContain('eq()');
+  });
+});
+
+describe('dynamic options within nested element types', () => {
+  it('resolves dynamic options inside array element types', async () => {
+    const g = await loadAndResolve(outdent`
+      STRICT=true
+      # @type=array(string(minLength=if($STRICT, 5, 1)))
+      ITEMS=[ok, toolongisfine, x]
+    `);
+    expect(g.configSchema.ITEMS.isValid).toBe(false);
+    const messages = (g.configSchema.ITEMS.validationErrors ?? []).map((e) => e.message).join('\n');
+    expect(messages).toContain('[0]');
+    expect(messages).toContain('[2]');
+  });
+
+  it('relaxes nested element constraints when the condition flips', async () => {
+    const g = await loadAndResolve(outdent`
+      STRICT=false
+      # @type=array(string(minLength=if($STRICT, 5, 1)))
+      ITEMS=[ok, toolongisfine, x]
+    `);
+    expect(g.configSchema.ITEMS.isValid).toBe(true);
+  });
+});
+
+describe('per-environment dynamic types via forEnv', () => {
+  async function loadWithEnv(appEnv: string) {
+    const g = new EnvGraph();
+    const testDataSource = new DotEnvFileDataSource('.env.schema', {
+      overrideContents: outdent`
+        # @currentEnv=$APP_ENV @defaultRequired=false
+        # ---
+        # @type=enum(dev, production)
+        APP_ENV=${appEnv}
+        # @type=string(minLength=if(forEnv(production), 10, 1))
+        API_TOKEN=short
+        # @type=if(forEnv(production), url, string)
+        SERVICE_HOST=not a url
+      `,
+    });
+    await g.setRootDataSource(testDataSource);
+    await g.finishLoad();
+    await g.resolveEnvValues();
+    return g;
+  }
+
+  it('applies strict constraints in production', async () => {
+    const g = await loadWithEnv('production');
+    expect(g.configSchema.API_TOKEN.isValid).toBe(false);
+    expect(g.configSchema.SERVICE_HOST.isValid).toBe(false);
+  });
+
+  it('relaxes constraints outside production', async () => {
+    const g = await loadWithEnv('dev');
+    expect(g.configSchema.API_TOKEN.isValid).toBe(true);
+    expect(g.configSchema.SERVICE_HOST.isValid).toBe(true);
+  });
+});
+
+describe('enum members sourced from other items', () => {
+  it('validates against members spread from a referenced array item', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      ALLOWED_MODES=[dev, staging, prod]
+      # @type=enum($ALLOWED_MODES)
+      APP_MODE=staging
+    `);
+    expect(g.configSchema.APP_MODE.isValid).toBe(true);
+    expect(g.configSchema.APP_MODE.resolvedValue).toBe('staging');
+  });
+
+  it('rejects values not in the referenced array', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      ALLOWED_MODES=[dev, staging, prod]
+      # @type=enum($ALLOWED_MODES)
+      APP_MODE=nope
+    `);
+    expect(g.configSchema.APP_MODE.isValid).toBe(false);
+    const err = g.configSchema.APP_MODE.validationErrors?.[0];
+    expect(err?.message).toContain('not in list of possible values');
+    expect(err?.tip).toContain('dev');
+  });
+
+  it('supports mixing static members with referenced arrays', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      EXTRA_MODES=[staging, preview]
+      # @type=enum(dev, $EXTRA_MODES, prod)
+      APP_MODE=preview
+    `);
+    expect(g.configSchema.APP_MODE.isValid).toBe(true);
+  });
+
+  it('a scalar reference contributes a single member', async () => {
+    const g = await loadAndResolve(outdent`
+      DEFAULT_MODE=dev
+      # @type=enum($DEFAULT_MODE, prod)
+      APP_MODE=dev
+    `);
+    expect(g.configSchema.APP_MODE.isValid).toBe(true);
+  });
+
+  it('the provisional (typegen-facing) type is a plain string', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      ALLOWED_MODES=[dev, prod]
+      # @type=enum($ALLOWED_MODES)
+      APP_MODE=dev
+    `);
+    expect(g.configSchema.APP_MODE.dataType?.name).toBe('string');
+    expect(g.configSchema.APP_MODE.effectiveDataType?.name).toBe('enum');
+  });
+
+  it('rejects non-string dynamic members (typegen saw string)', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(number)
+      LEVELS=[1, 2, 3]
+      # @type=enum($LEVELS)
+      LEVEL=2
+    `);
+    expect(g.configSchema.LEVEL.isValid).toBe(false);
+    const messages = (g.configSchema.LEVEL.validationErrors ?? []).map((e) => e.message).join('\n');
+    expect(messages).toContain('must resolve to strings');
+  });
+
+  it('rejects an empty resolved member list', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string, minLength=0)
+      ALLOWED_MODES=[]
+      # @type=enum($ALLOWED_MODES)
+      APP_MODE=dev
+    `);
+    expect(g.configSchema.APP_MODE.isValid).toBe(false);
+    const messages = (g.configSchema.APP_MODE.validationErrors ?? []).map((e) => e.message).join('\n');
+    expect(messages).toContain('empty list');
+  });
+
+  it('works as an array element type (array(enum($MODES)))', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(string)
+      ALLOWED_MODES=[dev, staging, prod]
+      # @type=array(enum($ALLOWED_MODES))
+      ACTIVE_MODES=[dev, prod]
+      # @type=array(enum($ALLOWED_MODES))
+      BAD_MODES=[dev, nope]
+    `);
+    expect(g.configSchema.ACTIVE_MODES.isValid).toBe(true);
+    expect(g.configSchema.ACTIVE_MODES.resolvedValue).toEqual(['dev', 'prod']);
+    expect(g.configSchema.BAD_MODES.isValid).toBe(false);
+    expect(g.configSchema.BAD_MODES.validationErrors?.[0]?.message).toContain('[1]');
+  });
+});
+
+describe('multi-line composite literal values', () => {
+  it('resolves multi-line array literals (trailing comma, comments, blank lines)', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(email)
+      ALLOWED_EMAILS=[
+        admin@example.com, # the boss
+        # ops folks
+        ops@example.com,
+
+        support@example.com,
+      ]
+      AFTER=still-parses
+    `);
+    expect(g.configSchema.ALLOWED_EMAILS.isValid).toBe(true);
+    expect(g.configSchema.ALLOWED_EMAILS.resolvedValue).toEqual([
+      'admin@example.com',
+      'ops@example.com',
+      'support@example.com',
+    ]);
+    expect(g.configSchema.AFTER.resolvedValue).toBe('still-parses');
+  });
+
+  it('resolves multi-line record literals with refs', async () => {
+    const g = await loadAndResolve(outdent`
+      BASE=https://api.example.com
+      # @type=record(url)
+      ENDPOINTS={
+        api=${'$'}{BASE},
+        docs=https://docs.example.com,
+      }
+    `);
+    expect(g.configSchema.ENDPOINTS.isValid).toBe(true);
+    expect(g.configSchema.ENDPOINTS.resolvedValue).toEqual({
+      api: 'https://api.example.com',
+      docs: 'https://docs.example.com',
+    });
+  });
+
+  it('resolves multi-line arrays of records', async () => {
+    const g = await loadAndResolve(outdent`
+      # @type=array(record)
+      ITEMS=[
+        {name=a, weight=1},
+        {name=b, weight=2},
+      ]
+    `);
+    expect(g.configSchema.ITEMS.isValid).toBe(true);
+    expect(g.configSchema.ITEMS.resolvedValue).toEqual([
+      { name: 'a', weight: 1 },
+      { name: 'b', weight: 2 },
+    ]);
+  });
+});

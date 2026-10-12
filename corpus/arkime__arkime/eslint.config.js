@@ -1,0 +1,157 @@
+const {
+    defineConfig,
+    globalIgnores,
+} = require("eslint/config");
+
+const globals = require("globals");
+const vue = require("eslint-plugin-vue");
+const js = require("@eslint/js");
+const vueParser = require('vue-eslint-parser');
+
+// Shared JavaScript syntax rules for both JS and Vue files
+const commonJavaScriptRules = {
+    "generator-star-spacing": "off",
+    "no-debugger": process.env.NODE_ENV === "production" ? "error" : "off",
+    "semi": ["error", "always"],
+    "no-extra-semi": "error",
+    "handle-callback-err": ["error", "never"],
+    "prefer-promise-reject-errors": 0,
+    "standard/no-callback-literal": "off",
+
+    "no-labels": ["error", {
+        "allowLoop": true,
+    }],
+
+    "no-new-func": "off",
+
+    "indent": ["error", 2, {
+        "SwitchCase": 0,
+    }],
+
+    "no-useless-return": "off",
+    "n/no-callback-literal": "off",
+    "n/handle-callback-err": "off",
+    "no-case-declarations": "off",
+    "no-empty": "off",
+    "default-case-last": "off",
+
+    "no-shadow": ["error", {
+        "builtinGlobals": true,
+        "hoist": "all",
+        "allow": ["err", "req", "res", "stop", "self"],
+    }],
+
+    "quotes": ["error", "single", {
+        "avoidEscape": true,
+        "allowTemplateLiterals": true,
+    }],
+
+    "no-multiple-empty-lines": ["error", {
+        "max": 1,
+        "maxEOF": 0,
+        "maxBOF": 0,
+    }],
+
+    "no-trailing-spaces": "error",
+
+    "no-multi-spaces": ["error", {
+        "ignoreEOLComments": true
+    }],
+
+    "no-unused-vars": ["error", {
+        "args": "none",
+        "caughtErrors": "none"
+    }],
+
+    "no-control-regex": "off",
+
+    "object-curly-spacing": ["error", "always"],
+
+    "space-infix-ops": "error",
+
+    // Ban |, &, and |= in regular code - bitwise on booleans is a footgun
+    // (true|true === 1 breaks === true checks). Genuine bitfield/byte work
+    // opts back in with an inline eslint-disable or a per-file override.
+    "no-bitwise": ["error", {
+        "allow": ["^", "<<", ">>", ">>>", "~", "^=", "&=", "<<=", ">>=", ">>>="],
+    }],
+
+    "preserve-caught-error": "off",
+};
+
+// Vue-specific rule overrides (applied after extending recommended configs)
+const vueRuleOverrides = {
+    "vue/multi-word-component-names": "off",
+    "vue/space-infix-ops": "error",
+    "vue/valid-v-slot": ["error", {
+        allowModifiers: true,
+    }],
+    'vue/html-closing-bracket-newline': ['error', {
+        'singleline': 'never', // Ensures single-line tags don't force a newline
+        'multiline': 'never'   // Prevents the closing bracket from moving to a new line in multi-line tags
+    }],
+};
+
+module.exports = defineConfig([
+    // Configuration for JavaScript files
+    {
+        files: ["**/*.js"],
+        languageOptions: {
+            parserOptions: {
+                ecmaVersion: "latest",
+                sourceType: "module",
+            },
+            globals: {
+                ...globals.browser,
+                ...globals.node,
+                ...globals.jquery,
+            },
+        },
+        rules: {
+            ...js.configs.recommended.rules,
+            ...commonJavaScriptRules,
+        },
+    },
+    // Configuration for Vue files using flat config
+    ...vue.configs['flat/strongly-recommended'],
+    {
+        files: ["**/*.vue"],
+        languageOptions: {
+            parser: vueParser,
+            parserOptions: {
+                ecmaVersion: "latest",
+                sourceType: "module",
+            },
+            globals: {
+                ...globals.browser,
+                ...globals.jquery,
+            },
+        },
+        rules: {
+            ...commonJavaScriptRules,
+            ...vueRuleOverrides,
+        },
+    },
+    // pcap.js is low-level packet byte parsing - allow | and & there
+    {
+        files: ["viewer/pcap.js"],
+        rules: {
+            "no-bitwise": ["error", {
+                "allow": ["^", "|", "&", "<<", ">>", ">>>", "~", "^=", "&=", "<<=", ">>=", ">>>="],
+            }],
+        },
+    },
+    globalIgnores([
+    "parliament/vueapp/dist/",
+    "parliament/node_modules",
+    "wiseService/vueapp/dist/",
+    "wiseService/node_modules",
+    "wiseService/sprintf.js",
+    "viewer/vueapp/dist/",
+    "viewer/arkimeparser.js",
+    "viewer/node_modules",
+    "viewer/public",
+    "common/version.js",
+    "cont3xt/vueapp/dist/",
+    "cont3xt/node_modules",
+])]);

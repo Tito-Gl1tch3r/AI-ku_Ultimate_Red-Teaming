@@ -1,0 +1,126 @@
+use crate::transport::bind_tcp_listener;
+use crate::workers::{Addresses, TcpRecvProcessor};
+use crate::{TcpConnectionMode, TcpListenerInfo, TcpListenerOptions, TcpRegistry, TcpSendWorker};
+use ockam_core::{async_trait, compat::net::SocketAddr};
+use ockam_core::{Address, Processor, Result};
+use ockam_node::{Context, ProcessorBuilder, WorkerShutdownPriority};
+use ockam_transport_core::TransportError;
+use tokio::net::TcpListener;
+use tracing::{debug, instrument, Level};
+
+/// A TCP Listen processor
+///
+/// TCP listen processors are created by `TcpTransport`
+/// after a call is made to
+/// [`TcpTransport::listen`](crate::TcpTransport::listen).
+pub(crate) struct TcpListenProcessor {
+    registry: TcpRegistry,
+    inner: TcpListener,
+    socket_address: SocketAddr,
+    options: TcpListenerOptions,
+}
+
+impl TcpListenProcessor {
+    #[instrument(skip_all, name = "TcpListenProcessor::start", level = Level::TRACE)]
+    pub(crate) async fn start(
+        ctx: &Context,
+        registry: TcpRegistry,
+        addr: SocketAddr,
+        options: TcpListenerOptions,
+    ) -> Result<(SocketAddr, Address)> {
+        debug!("Binding TcpListener to {}", addr);
+        let inner = bind_tcp_listener(addr, options.enable_mptcp, options.buffer_size).await?;
+        let saddr = inner.local_addr().map_err(TransportError::from)?;
+
+        let address = Address::random_tagged("TcpListenProcessor");
+        options.setup_flow_control_for_listener(ctx.flow_controls(), &address);
+
+        let processor = Self {
+            registry,
+            inner,
+            socket_address: saddr,
+            options,
+        };
+
+        ProcessorBuilder::new(processor)
+            .with_address(address.clone())
+            .with_shutdown_priority(WorkerShutdownPriority::Priority5)
+            .start(ctx)?;
+
+        Ok((saddr, address))
+    }
+}
+
+#[async_trait]
+impl Processor for TcpListenProcessor {
+    type Context = Context;
+
+    #[instrument(skip_all, name = "TcpListenProcessor::initialize", level = Level::TRACE)]
+    async fn initialize(&mut self, ctx: &mut Context) -> Result<()> {
+        self.registry.add_listener_processor(TcpListenerInfo::new(
+            ctx.primary_address().clone(),
+            self.socket_address,
+            self.options.flow_control_id.clone(),
+        ));
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, name = "TcpListenProcessor::shutdown", level = Level::TRACE)]
+    async fn shutdown(&mut self, ctx: &mut Self::Context) -> Result<()> {
+        self.registry
+            .remove_listener_processor(ctx.primary_address());
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, name = "TcpListenProcessor::process", level = Level::TRACE)]
+    async fn process(&mut self, ctx: &mut Self::Context) -> Result<bool> {
+        debug!("Waiting for incoming TCP connection...");
+
+        // Wait for an incoming connection
+        let (stream, peer) = self.inner.accept().await.map_err(TransportError::from)?;
+
+        stream.set_nodelay(true).map_err(TransportError::from)?;
+        debug!("TCP connection accepted");
+
+        let mode = TcpConnectionMode::Incoming;
+        let addresses = Addresses::generate(mode);
+
+        let receiver_flow_control_id = self
+            .options
+            .setup_flow_control_for_connection(ctx.flow_controls(), &addresses);
+        let receiver_outgoing_access_control =
+            self.options.create_receiver_outgoing_access_control(
+                ctx.flow_controls(),
+                receiver_flow_control_id.clone(),
+            );
+
+        let (read_half, write_half) = stream.into_split();
+
+        // Worker to receive messages from the Node and send them over the wire
+        TcpSendWorker::start(
+            ctx,
+            self.registry.clone(),
+            write_half,
+            &addresses,
+            peer,
+            mode,
+            &receiver_flow_control_id,
+        )?;
+
+        // Processor to receive messages over the wire and forward them to the node
+        TcpRecvProcessor::start(
+            ctx,
+            self.registry.clone(),
+            read_half,
+            &addresses,
+            peer,
+            mode,
+            &receiver_flow_control_id,
+            receiver_outgoing_access_control,
+        )?;
+
+        Ok(true)
+    }
+}

@@ -1,0 +1,650 @@
+# MIT License
+#
+# Copyright (c) [2025] [c3rb3ru5d3d53c]
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Binary format wrappers for files and executable containers."""
+
+from binlex_bindings.binlex.formats import COFF as _COFFBinding
+from binlex_bindings.binlex.formats import ELF as _ELFBinding
+from binlex_bindings.binlex.formats import File as _FileBinding
+from binlex_bindings.binlex.formats import Image as _ImageBinding
+from binlex_bindings.binlex.formats import MACHO as _MACHOBinding
+from binlex_bindings.binlex.formats import PE as _PEBinding
+from binlex_bindings.binlex.formats import SymbolKind as _SymbolKindBinding
+
+from binlex.core.architecture import Architecture
+from binlex.hashing import SHA256, TLSH
+from binlex.core.magic import Magic
+
+
+class Image:
+    """Writable binary image helper backed by the native image implementation."""
+
+    def __init__(self, path, cache):
+        """Open or create an image file at `path`."""
+        self._inner = _ImageBinding(path, cache)
+
+    @classmethod
+    def _from_binding(cls, binding):
+        """Wrap an existing native image binding in the Python helper class."""
+        result = cls.__new__(cls)
+        result._inner = binding
+        return result
+
+    def is_cached(self):
+        """Return whether the image is backed by a cache file."""
+        return self._inner.is_cached()
+
+    def path(self):
+        """Return the filesystem path backing the image."""
+        return self._inner.path()
+
+    def base(self):
+        """Return the virtual base address represented by offset zero in the image mapping."""
+        return self._inner.base()
+
+    def write(self, data):
+        """Write raw bytes at the current file position."""
+        return self._inner.write(data)
+
+    def write_padding(self, length):
+        """Write `length` bytes of padding at the current file position."""
+        return self._inner.write_padding(length)
+
+    def seek_to_end(self):
+        """Seek to the end of the image and return the resulting offset."""
+        return self._inner.seek_to_end()
+
+    def seek(self, offset):
+        """Seek to an absolute offset in the image."""
+        return self._inner.seek(offset)
+
+    def size(self):
+        """Return the current size of the image in bytes."""
+        return self._inner.size()
+
+    def __len__(self):
+        """Return the current size of the image in bytes."""
+        return self.size()
+
+    def __getitem__(self, key):
+        """Access image bytes using standard Python indexing and slicing."""
+        view = self.mmap()
+        base = self.base()
+        if isinstance(key, slice):
+            start = None if key.start is None else key.start - base
+            stop = None if key.stop is None else key.stop - base
+            return bytes(view[slice(start, stop, key.step)])
+        return view[key - base]
+
+    def mmap(self):
+        """Return a read-only memory view over the image bytes."""
+        return self._inner.mmap()
+
+    def mmap_mut(self):
+        """Return a writable memory view over the image bytes."""
+        return self._inner.mmap_mut()
+
+
+class SymbolKind:
+    Function = _SymbolKindBinding.Function
+    Import = _SymbolKindBinding.Import
+    Export = _SymbolKindBinding.Export
+    Unknown = _SymbolKindBinding.Unknown
+
+
+class Symbol:
+    """First-class binary symbol with typed kind classification."""
+
+    def __init__(self, binding):
+        self._inner = binding
+
+    def name(self):
+        return self._inner.name()
+
+    def file_offset(self):
+        return self._inner.file_offset()
+
+    def virtual_address(self):
+        return self._inner.virtual_address()
+
+    def relative_virtual_address(self):
+        return self._inner.relative_virtual_address()
+
+    def kind(self):
+        return self._inner.kind()
+
+
+class ELF:
+    """Executable and Linkable Format wrapper with address translation helpers."""
+
+    def __init__(self, data, config):
+        """Parse an ELF image from an in-memory byte sequence."""
+        self._inner = _ELFBinding(data, config)
+
+    def architecture(self):
+        """Return the architecture declared by the ELF image."""
+        return Architecture.from_binding(self._inner.architecture())
+
+    def executable_virtual_address_ranges(self):
+        """Return executable virtual address ranges as `{start: end}` mappings."""
+        return self._inner.executable_virtual_address_ranges()
+
+    def relative_virtual_address_to_virtual_address(self, relative_virtual_address):
+        """Translate a relative virtual address into a virtual address."""
+        return self._inner.relative_virtual_address_to_virtual_address(
+            relative_virtual_address
+        )
+
+    def file_offset_to_virtual_address(self, file_offset):
+        """Translate a file offset into a virtual address when a mapping exists."""
+        return self._inner.file_offset_to_virtual_address(file_offset)
+
+    def entrypoint_virtual_addresses(self):
+        """Return all discovered entrypoint virtual addresses."""
+        return self._inner.entrypoint_virtual_addresses()
+
+    def entrypoint_virtual_address(self):
+        """Return the primary ELF entrypoint virtual address."""
+        return self._inner.entrypoint_virtual_address()
+
+    def image(self):
+        """Return an `Image` wrapper over the ELF contents."""
+        return Image._from_binding(self._inner.image())
+
+    def tlsh(self):
+        """Return the TLSH helper for the image when available."""
+        return self._inner.tlsh()
+
+    def sha256(self):
+        """Return the SHA-256 helper for the image when available."""
+        return self._inner.sha256()
+
+    def size(self):
+        """Return the ELF image size in bytes."""
+        return self._inner.size()
+
+    def bytes(self):
+        """Return the original unmapped ELF container bytes."""
+        return bytes(self._inner.bytes())
+
+    def symbols(self):
+        """Return typed symbols extracted from the ELF image."""
+        return [Symbol(item) for item in self._inner.symbols()]
+
+    def virtual_address_to_symbol(self, virtual_address):
+        """Return the symbol exactly matching `virtual_address`, if present."""
+        result = self._inner.virtual_address_to_symbol(virtual_address)
+        return None if result is None else Symbol(result)
+
+    def symbol_name_to_virtual_address(self, name):
+        """Return the virtual address for symbol `name`, if present."""
+        return self._inner.symbol_name_to_virtual_address(name)
+
+    def symbol_name_to_file_offset(self, name):
+        """Return the file offset for symbol `name`, if present."""
+        return self._inner.symbol_name_to_file_offset(name)
+
+    def relative_virtual_address_to_symbol(self, relative_virtual_address):
+        """Return the symbol exactly matching `relative_virtual_address`, if present."""
+        result = self._inner.relative_virtual_address_to_symbol(relative_virtual_address)
+        return None if result is None else Symbol(result)
+
+    def file_offset_to_symbol(self, file_offset):
+        """Return the symbol exactly matching `file_offset`, if present."""
+        result = self._inner.file_offset_to_symbol(file_offset)
+        return None if result is None else Symbol(result)
+
+    def export_virtual_addresses(self):
+        """Return exported symbol virtual addresses."""
+        return self._inner.export_virtual_addresses()
+
+    def entropy(self):
+        """Return the image entropy, or `None` when it cannot be computed."""
+        return self._inner.entropy()
+
+    def file(self):
+        """Return the associated `binlex.formats.File` wrapper."""
+        return File._from_binding(self._inner.file())
+
+    def __getattr__(self, name):
+        """Delegate unknown attributes to the underlying native ELF object."""
+        return getattr(self._inner, name)
+
+
+class COFF:
+    """COFF object wrapper with section/symbol oriented helpers."""
+
+    def __init__(self, data, config):
+        """Parse a COFF object from an in-memory byte sequence."""
+        self._inner = _COFFBinding(data, config)
+
+    def architecture(self):
+        """Return the architecture declared by the COFF object."""
+        return Architecture.from_binding(self._inner.architecture())
+
+    def executable_file_offset_ranges(self):
+        """Return executable file offset ranges as `{start: end}` mappings."""
+        return self._inner.executable_file_offset_ranges()
+
+    def bytes(self):
+        """Return the original unmapped COFF object bytes."""
+        return bytes(self._inner.bytes())
+
+    def size(self):
+        """Return the COFF object size in bytes."""
+        return self._inner.size()
+
+    def symbols(self):
+        """Return typed symbols extracted from the COFF object."""
+        return [Symbol(item) for item in self._inner.symbols()]
+
+    def file_offset_to_symbol(self, file_offset):
+        """Return the symbol exactly matching `file_offset`, if present."""
+        result = self._inner.file_offset_to_symbol(file_offset)
+        return None if result is None else Symbol(result)
+
+    def symbol_name_to_file_offset(self, name):
+        """Return the file offset for symbol `name`, if present."""
+        return self._inner.symbol_name_to_file_offset(name)
+
+    def tlsh(self):
+        """Return the TLSH helper for the object when available."""
+        return self._inner.tlsh()
+
+    def sha256(self):
+        """Return the SHA-256 helper for the object when available."""
+        return self._inner.sha256()
+
+    def ssdeep(self):
+        """Return the ssdeep helper for the object when available."""
+        return self._inner.ssdeep()
+
+    def entropy(self):
+        """Return the object entropy, or `None` when it cannot be computed."""
+        return self._inner.entropy()
+
+    def file(self):
+        """Return the associated `binlex.formats.File` wrapper."""
+        return File._from_binding(self._inner.file())
+
+    def __getattr__(self, name):
+        """Delegate unknown attributes to the underlying native COFF object."""
+        return getattr(self._inner, name)
+
+
+class File:
+    """High-level wrapper around a file binding with typed helpers."""
+
+    def __init__(self, path, config):
+        """Open a file using the supplied binlex configuration."""
+        self._inner = _FileBinding(path, config)
+
+    @classmethod
+    def _from_binding(cls, binding):
+        """Wrap an existing native file binding in the Python helper class."""
+        result = cls.__new__(cls)
+        result._inner = binding
+        return result
+
+    def magic(self):
+        """Return the detected file type as a `binlex.Magic` value."""
+        return Magic.from_binding(self._inner.magic())
+
+    def __getattr__(self, name):
+        """Delegate unknown attributes to the underlying native file object."""
+        return getattr(self._inner, name)
+
+
+class PE:
+    """Portable Executable wrapper with address translation helpers."""
+
+    def __init__(self, data, config):
+        """Construct a PE image from an in-memory byte sequence."""
+        self._inner = _PEBinding(data, config)
+
+    def architecture(self):
+        """Return the architecture declared by the PE image."""
+        return Architecture.from_binding(self._inner.architecture())
+
+    def file_offset_to_relative_virtual_address(self, file_offset):
+        """Translate a file offset into a relative virtual address when a mapping exists."""
+        return self._inner.file_offset_to_relative_virtual_address(file_offset)
+
+    def relative_virtual_address_to_file_offset(self, relative_virtual_address):
+        """Translate a relative virtual address into a file offset when a mapping exists."""
+        return self._inner.relative_virtual_address_to_file_offset(relative_virtual_address)
+
+    def file(self):
+        """Return the associated `binlex.formats.File` wrapper."""
+        return File._from_binding(self._inner.file())
+
+    def symbols(self):
+        """Return typed symbols extracted from the PE image."""
+        return [Symbol(item) for item in self._inner.symbols()]
+
+    def bytes(self):
+        """Return the original unmapped PE container bytes."""
+        return bytes(self._inner.bytes())
+
+    def native_symbols(self):
+        """Return native PE symbols only."""
+        return [Symbol(item) for item in self._inner.native_symbols()]
+
+    def dotnet_symbols(self):
+        """Return .NET method symbols only."""
+        return [Symbol(item) for item in self._inner.dotnet_symbols()]
+
+    def virtual_address_to_symbol(self, virtual_address):
+        """Return the symbol exactly matching `virtual_address`, if present."""
+        result = self._inner.virtual_address_to_symbol(virtual_address)
+        return None if result is None else Symbol(result)
+
+    def symbol_name_to_virtual_address(self, name):
+        """Return the virtual address for symbol `name`, if present."""
+        return self._inner.symbol_name_to_virtual_address(name)
+
+    def symbol_name_to_file_offset(self, name):
+        """Return the file offset for symbol `name`, if present."""
+        return self._inner.symbol_name_to_file_offset(name)
+
+    def relative_virtual_address_to_symbol(self, relative_virtual_address):
+        """Return the symbol exactly matching `relative_virtual_address`, if present."""
+        result = self._inner.relative_virtual_address_to_symbol(relative_virtual_address)
+        return None if result is None else Symbol(result)
+
+    def file_offset_to_symbol(self, file_offset):
+        """Return the symbol exactly matching `file_offset`, if present."""
+        result = self._inner.file_offset_to_symbol(file_offset)
+        return None if result is None else Symbol(result)
+
+    def dotnet_metadata_token_to_virtual_address(self, metadata_token):
+        """Resolve a .NET metadata token to its method body virtual address."""
+        return self._inner.dotnet_metadata_token_to_virtual_address(metadata_token)
+
+    def dotnet_metadata_token_to_relative_virtual_address(self, metadata_token):
+        """Resolve a .NET metadata token to its method body relative virtual address."""
+        return self._inner.dotnet_metadata_token_to_relative_virtual_address(metadata_token)
+
+    def dotnet_metadata_token_to_file_offset(self, metadata_token):
+        """Resolve a .NET metadata token to its method body file offset."""
+        return self._inner.dotnet_metadata_token_to_file_offset(metadata_token)
+
+    def dotnet_virtual_address_to_metadata_token(self, virtual_address):
+        """Resolve a .NET method body virtual address back to its metadata token."""
+        return self._inner.dotnet_virtual_address_to_metadata_token(virtual_address)
+
+    def dotnet_relative_virtual_address_to_metadata_token(self, relative_virtual_address):
+        """Resolve a .NET method body relative virtual address back to its metadata token."""
+        return self._inner.dotnet_relative_virtual_address_to_metadata_token(relative_virtual_address)
+
+    def dotnet_file_offset_to_metadata_token(self, file_offset):
+        """Resolve a .NET method body file offset back to its metadata token."""
+        return self._inner.dotnet_file_offset_to_metadata_token(file_offset)
+
+    def native_executable_virtual_address_ranges(self):
+        """Return native executable ranges without .NET-specific remapping."""
+        return self._inner.native_executable_virtual_address_ranges()
+
+    def executable_virtual_address_ranges(self):
+        """Return executable ranges, using .NET ranges automatically when applicable."""
+        return self._inner.executable_virtual_address_ranges()
+
+    def native_entrypoint_virtual_addresses(self):
+        """Return native PE entrypoints without .NET-specific remapping."""
+        return self._inner.native_entrypoint_virtual_addresses()
+
+    def entrypoint_virtual_addresses(self):
+        """Return effective entrypoints, using .NET method entrypoints automatically when applicable."""
+        return self._inner.entrypoint_virtual_addresses()
+
+    def __getattr__(self, name):
+        """Delegate unknown attributes to the underlying native PE object."""
+        return getattr(self._inner, name)
+
+
+class MACHO:
+    """Mach-O wrapper for single-arch and fat binaries with slice-aware helpers."""
+
+    class Section:
+        """Wrapper for a Mach-O section."""
+
+        def __init__(self, binding):
+            self._inner = binding
+
+        def name(self):
+            return self._inner.name()
+
+        def segment_name(self):
+            return self._inner.segment_name()
+
+        def file_offset(self):
+            return self._inner.file_offset()
+
+        def size(self):
+            return self._inner.size()
+
+        def virtual_address(self):
+            return self._inner.virtual_address()
+
+        def bytes(self):
+            return bytes(self._inner.bytes())
+
+    class Slice:
+        """Wrapper for a single Mach-O slice."""
+
+        def __init__(self, binding):
+            self._inner = binding
+
+        def bytes(self):
+            """Return the original unmapped Mach-O container bytes for this slice context."""
+            return bytes(self._inner.bytes())
+
+        def index(self):
+            return self._inner.index()
+
+        def relative_virtual_address_to_virtual_address(self, relative_virtual_address):
+            return self._inner.relative_virtual_address_to_virtual_address(
+                relative_virtual_address
+            )
+
+        def file_offset_to_virtual_address(self, file_offset):
+            return self._inner.file_offset_to_virtual_address(file_offset)
+
+        def entrypoint_virtual_address(self):
+            return self._inner.entrypoint_virtual_address()
+
+        def imagebase(self):
+            return self._inner.imagebase()
+
+        def sizeofheaders(self):
+            return self._inner.sizeofheaders()
+
+        def architecture(self):
+            return Architecture.from_binding(self._inner.architecture())
+
+        def symbols(self):
+            return [Symbol(item) for item in self._inner.symbols()]
+
+        def sections(self):
+            return [MACHO.Section(item) for item in self._inner.sections()]
+
+        def section_name_to_section(self, name):
+            result = self._inner.section_name_to_section(name)
+            return None if result is None else MACHO.Section(result)
+
+        def segment_and_section_name_to_section(self, segment_name, section_name):
+            result = self._inner.segment_and_section_name_to_section(
+                segment_name, section_name
+            )
+            return None if result is None else MACHO.Section(result)
+
+        def virtual_address_to_symbol(self, virtual_address):
+            result = self._inner.virtual_address_to_symbol(virtual_address)
+            return None if result is None else Symbol(result)
+
+        def symbol_name_to_virtual_address(self, name):
+            return self._inner.symbol_name_to_virtual_address(name)
+
+        def symbol_name_to_file_offset(self, name):
+            return self._inner.symbol_name_to_file_offset(name)
+
+        def relative_virtual_address_to_symbol(self, relative_virtual_address):
+            result = self._inner.relative_virtual_address_to_symbol(
+                relative_virtual_address
+            )
+            return None if result is None else Symbol(result)
+
+        def file_offset_to_symbol(self, file_offset):
+            result = self._inner.file_offset_to_symbol(file_offset)
+            return None if result is None else Symbol(result)
+
+        def entrypoint_virtual_addresses(self):
+            return self._inner.entrypoint_virtual_addresses()
+
+        def export_virtual_addresses(self):
+            return self._inner.export_virtual_addresses()
+
+        def executable_virtual_address_ranges(self):
+            return self._inner.executable_virtual_address_ranges()
+
+        def image(self):
+            return Image._from_binding(self._inner.image())
+
+    def __init__(self, data, config):
+        """Parse a Mach-O image from an in-memory byte sequence."""
+        self._inner = _MACHOBinding(data, config)
+
+    def bytes(self):
+        """Return the original unmapped Mach-O container bytes."""
+        return bytes(self._inner.bytes())
+
+    def relative_virtual_address_to_virtual_address(
+        self, relative_virtual_address, slice
+    ):
+        """Translate a slice-relative virtual address into a virtual address."""
+        return self._inner.relative_virtual_address_to_virtual_address(
+            relative_virtual_address, slice
+        )
+
+    def file_offset_to_virtual_address(self, file_offset, slice):
+        """Translate a file offset into a virtual address for `slice` when possible."""
+        return self._inner.file_offset_to_virtual_address(file_offset, slice)
+
+    def number_of_slices(self):
+        """Return the number of slices contained in the Mach-O image."""
+        return self._inner.number_of_slices()
+
+    def slice(self, index):
+        """Return the Mach-O slice wrapper for `index`, if present."""
+        result = self._inner.slice(index)
+        return None if result is None else MACHO.Slice(result)
+
+    def slices(self):
+        """Return all Mach-O slices."""
+        return [MACHO.Slice(item) for item in self._inner.slices()]
+
+    def entrypoint_virtual_address(self, slice):
+        """Return the primary entrypoint virtual address for `slice`."""
+        return self._inner.entrypoint_virtual_address(slice)
+
+    def imagebase(self, slice):
+        """Return the image base for `slice` when available."""
+        return self._inner.imagebase(slice)
+
+    def sizeofheaders(self, slice):
+        """Return the header size for `slice` when available."""
+        return self._inner.sizeofheaders(slice)
+
+    def architecture(self, slice):
+        """Return the architecture declared for `slice`."""
+        return Architecture.from_binding(self._inner.architecture(slice))
+
+    def symbols(self, slice):
+        """Return typed symbols extracted from `slice`."""
+        return [Symbol(item) for item in self._inner.symbols(slice)]
+
+    def virtual_address_to_symbol(self, virtual_address, slice):
+        """Return the symbol exactly matching `virtual_address` in `slice`, if present."""
+        result = self._inner.virtual_address_to_symbol(virtual_address, slice)
+        return None if result is None else Symbol(result)
+
+    def symbol_name_to_virtual_address(self, name, slice):
+        """Return the virtual address for symbol `name` in `slice`, if present."""
+        return self._inner.symbol_name_to_virtual_address(name, slice)
+
+    def symbol_name_to_file_offset(self, name, slice):
+        """Return the file offset for symbol `name` in `slice`, if present."""
+        return self._inner.symbol_name_to_file_offset(name, slice)
+
+    def relative_virtual_address_to_symbol(self, relative_virtual_address, slice):
+        """Return the symbol exactly matching `relative_virtual_address` in `slice`, if present."""
+        result = self._inner.relative_virtual_address_to_symbol(
+            relative_virtual_address, slice
+        )
+        return None if result is None else Symbol(result)
+
+    def file_offset_to_symbol(self, file_offset, slice):
+        """Return the symbol exactly matching `file_offset` in `slice`, if present."""
+        result = self._inner.file_offset_to_symbol(file_offset, slice)
+        return None if result is None else Symbol(result)
+
+    def entrypoint_virtual_addresses(self, slice):
+        """Return all discovered entrypoint virtual addresses for `slice`."""
+        return self._inner.entrypoint_virtual_addresses(slice)
+
+    def export_virtual_addresses(self, slice):
+        """Return exported symbol virtual addresses for `slice`."""
+        return self._inner.export_virtual_addresses(slice)
+
+    def executable_virtual_address_ranges(self, slice):
+        """Return executable virtual address ranges for `slice` as `{start: end}`."""
+        return self._inner.executable_virtual_address_ranges(slice)
+
+    def image(self, slice):
+        """Return an `Image` wrapper over the contents of `slice`."""
+        return Image._from_binding(self._inner.image(slice))
+
+    def size(self):
+        """Return the full Mach-O container size in bytes."""
+        return self._inner.size()
+
+    def tlsh(self):
+        """Return the TLSH helper for the image when available."""
+        return self._inner.tlsh()
+
+    def sha256(self):
+        """Return the SHA-256 helper for the image when available."""
+        return self._inner.sha256()
+
+    def entropy(self):
+        """Return the image entropy, or `None` when it cannot be computed."""
+        return self._inner.entropy()
+
+    def file(self):
+        """Return the associated `binlex.formats.File` wrapper."""
+        return File._from_binding(self._inner.file())
+
+    def __getattr__(self, name):
+        """Delegate unknown attributes to the underlying native Mach-O object."""
+        return getattr(self._inner, name)
+
+__all__ = ["COFF", "ELF", "File", "Image", "MACHO", "PE", "Symbol", "SymbolKind"]

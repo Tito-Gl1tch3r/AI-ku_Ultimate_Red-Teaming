@@ -1,0 +1,79 @@
+#!/bin/ksh
+MEMD="{{db.host}}"
+DBHOST="127.0.0.1"
+DBUSER="{{db.user}}"
+DBPASS="{{db.pass}}"
+NCOPTS="-N"
+WEBHOOK="{{discord_webhook}}"
+
+# Discord notification for a churn rate-limit hit, one per player per window
+# Backgrounded so the connect/disconnect path never waits on the network
+notify_churn() {
+  curl -s -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' \
+    -d "{\"content\":\"$(hostname): CN=${common_name} hit the VPN churn limit on ${1} (remote=${untrusted_ip})\"}" \
+    "$WEBHOOK" &
+}
+
+# Stop users from connecting when the event is not active
+#EVENT_ACTIVE=$(echo "get sysconfig:event_active"|nc -N ${MEMD} 11211 |egrep -v "(VALUE|END)")
+#if [ "$EVENT_ACTIVE" == "0" ] || [ "$EVENT_ACTIVE" == "" ]; then
+#  exit 2
+#fi
+
+# Capture all output that may escape us into /tmp/logging of the chroot
+exec 1>>/tmp/openvpn-updown.log
+exec 2>&1
+
+echo "------------"
+date
+
+if [ "$script_type" == "client-connect" ]; then
+    /usr/local/bin/vpn_churn_check -s /var/run/memcached/memcached.sock "$common_name" connect
+    CHURN_RC=$?
+    if [ $CHURN_RC -ne 0 ]; then
+      echo "client-connect[$$]: ERROR CN=${common_name} hit the rate-limit"
+      if [ $CHURN_RC -eq 2 ]; then
+        notify_churn connect
+      fi
+      exit 1
+    fi
+    echo "client-connect[$$]: CN=${common_name}"
+    NETWORKS=$(mysql --connect-timeout=10 -h ${DBHOST} -u"${DBUSER}" -p"${DBPASS}" echoCTF -NBe "CALL VPN_LOGIN(${common_name},INET_ATON('${ifconfig_pool_remote_ip}'),INET_ATON('${untrusted_ip}'))")
+    if [ "$NETWORKS" == "LOGGEDIN" ]; then
+      echo "client-connect[$$]: ERROR CN=${common_name}, local=${ifconfig_pool_remote_ip}, remote=${untrusted_ip} already logged in"
+      exit 1
+    elif [ "${NETWORKS}"x != "x" ]; then
+      echo "client-connect[$$]: CN=${common_name} networks="${NETWORKS}
+      if [ -x /sbin/pfctl ]; then
+        for network in ${NETWORKS};do
+          /sbin/pfctl -t "${network}_clients" -T add ${ifconfig_pool_remote_ip}
+        done
+      fi
+    else
+      echo "client-connect[$$]: CN=${common_name} no networks"
+    fi
+    echo "client-connect[$$]: CN=${common_name}, local=${ifconfig_pool_remote_ip}, remote=${untrusted_ip}"
+elif [ "$script_type" == "client-disconnect" ]; then
+  /usr/local/bin/vpn_churn_check -s /var/run/memcached/memcached.sock "$common_name" disconnect
+  CHURN_RC=$?
+  if [ $CHURN_RC -ne 0 ]; then
+    echo "client-disconnect[$$]: ERROR CN=${common_name} hit the rate-limit"
+    if [ $CHURN_RC -eq 2 ]; then
+      notify_churn disconnect
+    fi
+  fi
+
+  mysql --connect-timeout=10 -h ${DBHOST} -u"${DBUSER}" -p"${DBPASS}" echoCTF -NBe \
+    "CALL VPN_BANDWIDTH_LOG(${common_name}, INET_ATON('${ifconfig_pool_remote_ip}'), ${bytes_received:-0}, ${bytes_sent:-0}, ${time_duration:-0})"
+  echo "client-disconnect[$$]: CN=${common_name}, bandwidth logged: rx=${bytes_received:-0} tx=${bytes_sent:-0} duration=${time_duration:-0}s"
+
+  NETWORKS=$(mysql --connect-timeout=10 -h ${DBHOST} -u"${DBUSER}" -p"${DBPASS}" -NBe "CALL VPN_LOGOUT(${common_name},INET_ATON('${ifconfig_pool_remote_ip}'),INET_ATON('${untrusted_ip}'))" echoCTF)
+  if [ -x /sbin/pfctl ]; then
+    for network in ${NETWORKS};do
+      /sbin/pfctl -t "${network}_clients" -T delete ${ifconfig_pool_remote_ip}
+    done
+  fi
+  echo "client-disconnect[$$]: CN=${common_name}, local=${ifconfig_pool_remote_ip}, remote=${untrusted_ip}"
+fi
+
+exit 0

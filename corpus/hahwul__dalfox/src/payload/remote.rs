@@ -1,0 +1,459 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
+
+use reqwest::Client;
+use tokio::task::JoinSet;
+
+/// Default timeout for remote fetch operations.
+const DEFAULT_TIMEOUT_SECS: u64 = 15;
+
+/// Ceiling on distinct provider sets held in one cache.
+///
+/// Provider names are caller-supplied (a REST/MCP scan request carries
+/// `remote_payloads` / `remote_wordlists` verbatim), so the number of distinct
+/// *sets* a long-lived daemon can be asked to remember is unbounded — including
+/// sets naming providers that do not exist, which cache an empty list without
+/// ever touching the network. A real deployment uses a handful of sets, so this
+/// bound is only ever reached by someone spraying names.
+///
+/// Reaching it is reported to the caller as a fetch failure rather than
+/// silently leaving the entry uncached: the getters are keyed, so an uncached
+/// set reads back as "no remote list" and the scan would otherwise run without
+/// what it asked for and still report success. The callers already turn that
+/// error into the operator-facing "scanning without the requested remote lists"
+/// warning, which is exactly what happens.
+const MAX_CACHED_PROVIDER_SETS: usize = 64;
+
+/// A process-wide cache of fetched remote lists, keyed by provider set.
+///
+/// This used to be a bare `OnceLock<Arc<Vec<String>>>` — "fetch once per
+/// process", which is right for the one-scan-per-process CLI and wrong for the
+/// `dalfox server` / MCP daemon, where every job brings its own provider list:
+///
+/// * The first job to ask for *any* remote list won the cell for the life of
+///   the process. A later job asking for a different provider silently scanned
+///   with the first job's payloads and still reported `done`.
+/// * A job naming only unrecognized providers took the `urls.is_empty()` path
+///   and cached an **empty** list, poisoning every later job in the same way —
+///   they short-circuited on the already-set cell and scanned with nothing.
+///
+/// Keying by the provider set fixes both: an entry can only ever be read back
+/// by a job that asked for exactly the same providers.
+struct ProviderCache(OnceLock<Mutex<CachedLists>>);
+
+/// Fetched lists indexed by the normalized provider set that produced them.
+type CachedLists = HashMap<Vec<String>, CachedList>;
+
+/// One cached list. `retry_at` marks a fetch where some provider URL failed:
+/// the surviving entries are served, and the set is fetched again once that
+/// instant ([`PARTIAL_RETRY_AFTER`] later) has passed rather than pinning the
+/// degraded list for the process lifetime (or re-fetching on every job when a
+/// URL is dead).
+struct CachedList {
+    lines: Arc<Vec<String>>,
+    retry_at: Option<std::time::Instant>,
+}
+
+/// Backoff before a partially fetched provider set is fetched again.
+const PARTIAL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+impl ProviderCache {
+    const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    fn map(&self) -> &Mutex<CachedLists> {
+        self.0.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn get(&self, key: &[String]) -> Option<Arc<Vec<String>>> {
+        let m = self.map().lock().unwrap_or_else(PoisonError::into_inner);
+        m.get(key).map(|e| e.lines.clone())
+    }
+
+    /// Whether `key` needs no fetch: fully fetched, or partial but retried
+    /// recently enough.
+    fn is_fresh(&self, key: &[String]) -> bool {
+        let m = self.map().lock().unwrap_or_else(PoisonError::into_inner);
+        m.get(key)
+            .is_some_and(|e| e.retry_at.is_none_or(|at| std::time::Instant::now() < at))
+    }
+
+    /// Make a partial entry due for a retry now. (Not by subtracting the
+    /// backoff from an `Instant`: that underflows on a freshly booted Windows
+    /// host, whose monotonic clock starts near zero.)
+    #[cfg(test)]
+    fn expire_partial(&self, key: &[String]) {
+        let mut m = self.map().lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(e) = m.get_mut(key)
+            && let Some(at) = e.retry_at.as_mut()
+        {
+            *at = std::time::Instant::now();
+        }
+    }
+
+    /// Cache `lines` under `key`. Returns `false` when the cache is full and
+    /// this is a new set — never evicting a live entry, which a job mid-scan
+    /// may still be reading.
+    #[must_use]
+    fn store(&self, key: Vec<String>, lines: Vec<String>, partial: bool) -> bool {
+        let mut m = self.map().lock().unwrap_or_else(PoisonError::into_inner);
+        if m.len() >= MAX_CACHED_PROVIDER_SETS && !m.contains_key(&key) {
+            return false;
+        }
+        m.insert(
+            key,
+            CachedList {
+                lines: Arc::new(lines),
+                retry_at: partial.then(|| std::time::Instant::now() + PARTIAL_RETRY_AFTER),
+            },
+        );
+        true
+    }
+
+    /// The single cached entry, or `None` when the cache holds zero or more
+    /// than one provider set. Backs the legacy provider-less getters, which
+    /// have no way to say *which* list they mean; see [`get_remote_payloads`].
+    fn sole_entry(&self) -> Option<Arc<Vec<String>>> {
+        let m = self.map().lock().unwrap_or_else(PoisonError::into_inner);
+        if m.len() == 1 {
+            m.values().next().map(|e| e.lines.clone())
+        } else {
+            None
+        }
+    }
+}
+
+/// Error returned when a fetch succeeded but the cache had no room for it. The
+/// callers already render this as "scanning without the requested remote
+/// lists", which is what the keyed getters will now report for this set.
+fn cache_full_error(kind: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "remote {kind} cache is full ({MAX_CACHED_PROVIDER_SETS} distinct provider sets); \
+         this set was fetched but not cached"
+    )
+    .into()
+}
+
+/// Normalize a caller-supplied provider list into a cache key: each name
+/// lowercased, then deduplicated and sorted, so `["Burp","assetnote"]` and
+/// `["assetnote","burp","burp"]` name the same entry. Both normalizations are
+/// safe because the fetched list is order-independent — `RemoteKind::collect_urls`
+/// dedupes URLs and the result is sorted before caching.
+///
+/// The lowercasing is exactly what `RemoteKind::collect_urls` applies when it
+/// looks a name up in the registry, and nothing more: a key normalization the
+/// lookup does not share (trimming, say) would let two provider lists that
+/// resolve to *different* URL sets share one cache entry — `[" burp "]` misses
+/// the registry and caches an empty list, which `["burp"]` would then read back.
+///
+/// A `Vec<String>` key rather than a joined string, so a provider name
+/// containing the separator cannot collide with a two-provider set.
+fn provider_cache_key(providers: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = providers.iter().map(|p| p.to_ascii_lowercase()).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The provider registry of one [`RemoteKind`]: lowercased name -> URLs.
+type Registry = HashMap<String, Vec<String>>;
+
+/// One remote list family (payloads or wordlists): its provider registry, its
+/// fetched-list cache keyed by provider set, and the noun its errors use.
+struct RemoteKind {
+    cache: ProviderCache,
+    registry: OnceLock<Mutex<Registry>>,
+    /// Built-in providers, seeded when the registry is first touched. A caller
+    /// registering a custom provider first must never suppress these.
+    defaults: &'static [(&'static str, &'static str)],
+    noun: &'static str,
+}
+
+/// Remote XSS payloads (deduplicated, sorted).
+static PAYLOADS: RemoteKind = RemoteKind {
+    cache: ProviderCache::new(),
+    registry: OnceLock::new(),
+    defaults: &[
+        ("payloadbox", "https://assets.hahwul.com/xss-payloadbox.txt"),
+        (
+            "portswigger",
+            "https://assets.hahwul.com/xss-portswigger.txt",
+        ),
+    ],
+    noun: "payload",
+};
+
+/// Remote parameter wordlists (deduplicated, sorted).
+static WORDLISTS: RemoteKind = RemoteKind {
+    cache: ProviderCache::new(),
+    registry: OnceLock::new(),
+    defaults: &[
+        (
+            "assetnote",
+            "https://assets.hahwul.com/wl-assetnote-params.txt",
+        ),
+        ("burp", "https://assets.hahwul.com/wl-params.txt"),
+    ],
+    noun: "wordlist",
+};
+
+impl RemoteKind {
+    fn registry(&self) -> MutexGuard<'_, Registry> {
+        self.registry
+            .get_or_init(|| {
+                Mutex::new(
+                    self.defaults
+                        .iter()
+                        .map(|(name, url)| (name.to_string(), vec![url.to_string()]))
+                        .collect(),
+                )
+            })
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn register(&self, name: &str, urls: Vec<String>) {
+        self.registry().insert(name.to_ascii_lowercase(), urls);
+    }
+
+    fn list(&self) -> Vec<String> {
+        self.registry().keys().cloned().collect()
+    }
+
+    /// Build the list of remote URLs for the given providers.
+    fn collect_urls(&self, providers: &[String]) -> Vec<String> {
+        let m = self.registry();
+        let mut urls: Vec<String> = Vec::new();
+        for p in providers {
+            if let Some(lst) = m.get(&p.to_ascii_lowercase()) {
+                urls.extend(lst.clone());
+            }
+        }
+        dedup_urls(urls)
+    }
+
+    /// Fetch and cache the list for `providers`. Idempotent per provider set.
+    async fn init_with(
+        &self,
+        providers: &[String],
+        opts: RemoteFetchOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = provider_cache_key(providers);
+        if self.cache.is_fresh(&key) {
+            return Ok(());
+        }
+
+        let urls = self.collect_urls(providers);
+        if urls.is_empty() {
+            // No recognized providers: cache an empty list for *this* set only.
+            let _ = self.cache.store(key, Vec::new(), false);
+            return Ok(());
+        }
+
+        let client = build_remote_client(&opts)?;
+
+        let (lines, failed) = fetch_multiple_text_lists(&client, &urls).await;
+        let mut sanitized = sanitize_lines(&lines);
+        // A retry of a previously partial set that fails again must not lose
+        // what an earlier attempt already got: keep the union.
+        if failed > 0
+            && let Some(prior) = self.cache.get(&key)
+        {
+            sanitized.extend(prior.iter().cloned());
+        }
+        let dedup_sorted = dedup_and_sort(sanitized);
+
+        // Never cache "we got nothing" for a provider set that named real URLs: a
+        // transient egress blip would otherwise pin an empty list to this provider
+        // set for the daemon's lifetime, and every later job asking for the same
+        // providers would scan with nothing while still reporting `done`. Leaving
+        // the entry unset costs one retry and keeps the failure transient.
+        if dedup_sorted.is_empty() {
+            return Err(format!("remote {} fetch returned no usable entries", self.noun).into());
+        }
+
+        // Some URLs failed: serve what survived, but leave the set marked
+        // partial so a later job fetches again after the backoff.
+        if !self.cache.store(key, dedup_sorted, failed > 0) {
+            return Err(cache_full_error(self.noun));
+        }
+        Ok(())
+    }
+}
+
+// Public registration APIs
+pub fn register_payload_provider<N: AsRef<str>>(name: N, urls: Vec<String>) {
+    PAYLOADS.register(name.as_ref(), urls);
+}
+
+pub fn register_wordlist_provider<N: AsRef<str>>(name: N, urls: Vec<String>) {
+    WORDLISTS.register(name.as_ref(), urls);
+}
+
+// Optional helpers to enumerate providers
+pub fn list_payload_providers() -> Vec<String> {
+    PAYLOADS.list()
+}
+
+pub fn list_wordlist_providers() -> Vec<String> {
+    WORDLISTS.list()
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RemoteFetchOptions {
+    pub timeout_secs: Option<u64>,
+    pub proxy: Option<String>,
+}
+
+/// Build a reqwest Client with the given remote fetch options (timeout, proxy).
+fn build_remote_client(opts: &RemoteFetchOptions) -> Result<Client, Box<dyn std::error::Error>> {
+    crate::ensure_crypto_provider();
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(
+            opts.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        ))
+        .danger_accept_invalid_certs(true);
+    if let Some(pxy) = opts.proxy.as_ref()
+        && let Ok(proxy) = reqwest::Proxy::all(pxy)
+    {
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder.build()?)
+}
+
+/// Initialize and cache remote XSS payloads with explicit options (timeout/proxy).
+/// This is idempotent: subsequent calls are no-ops once initialized.
+pub async fn init_remote_payloads_with(
+    providers: &[String],
+    opts: RemoteFetchOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    PAYLOADS.init_with(providers, opts).await
+}
+
+/// Initialize and cache remote parameter wordlists with explicit options (timeout/proxy).
+/// This is idempotent: subsequent calls are no-ops once initialized.
+pub async fn init_remote_wordlists_with(
+    providers: &[String],
+    opts: RemoteFetchOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    WORDLISTS.init_with(providers, opts).await
+}
+
+/// Public API: the cached remote XSS payloads fetched for `providers`.
+///
+/// Returns `None` when this provider set has not been initialized. Prefer this
+/// over [`get_remote_payloads`] anywhere more than one scan can run in the same
+/// process (the server and MCP daemons): the cache holds one entry per provider
+/// set, and only the caller knows which one it asked for.
+pub fn get_remote_payloads_for(providers: &[String]) -> Option<Arc<Vec<String>>> {
+    PAYLOADS.cache.get(&provider_cache_key(providers))
+}
+
+/// Public API: Get a clone of the cached remote XSS payloads (if initialized).
+///
+/// Legacy provider-less accessor for single-scan processes (the CLI). It names
+/// no provider set, so it can only answer when exactly one has been fetched;
+/// with zero or several cached it returns `None` rather than guessing. Callers
+/// that know their provider list should use [`get_remote_payloads_for`].
+pub fn get_remote_payloads() -> Option<Arc<Vec<String>>> {
+    PAYLOADS.cache.sole_entry()
+}
+
+/// Public API: the cached remote parameter words fetched for `providers`.
+///
+/// Returns `None` when this provider set has not been initialized.
+pub fn get_remote_words_for(providers: &[String]) -> Option<Arc<Vec<String>>> {
+    WORDLISTS.cache.get(&provider_cache_key(providers))
+}
+
+/// Collapse a provider->URL expansion to the set of distinct URLs, preserving
+/// first-seen order. Without this, a caller (e.g. an authenticated server/MCP
+/// scan request) that repeats the same provider name N times — `remote_payloads:
+/// ["payloadbox","payloadbox",...]` — expands 1:1 into N copies of each URL,
+/// every one of which `fetch_multiple_text_lists` fetches concurrently and
+/// concatenates: a deterministic memory / file-descriptor amplification from a
+/// single request. Deduping makes name-spam inert (distinct providers are
+/// unaffected, since their URLs differ).
+fn dedup_urls(mut urls: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(urls.len());
+    urls.retain(|u| seen.insert(u.clone()));
+    urls
+}
+
+/// Concurrently fetch multiple text endpoints and concatenate their contents.
+/// Any individual fetch failure will be logged to stderr and skipped; the
+/// returned count is how many URLs failed.
+async fn fetch_multiple_text_lists(client: &Client, urls: &[String]) -> (String, usize) {
+    let mut set = JoinSet::new();
+    for url in urls.iter() {
+        let url = url.clone();
+        let client = client.clone();
+        set.spawn(async move {
+            match client.get(&url).send().await {
+                // A moved or failing provider answers with an HTML 404 / 503 or
+                // a login page, and every non-comment line of that page used
+                // to be ingested as a payload or wordlist entry — cached for
+                // the provider set, with the fetch still reported as a success.
+                Ok(resp) if !resp.status().is_success() => {
+                    eprintln!(
+                        "[remote] {} returned HTTP {}; ignoring it",
+                        url,
+                        resp.status()
+                    );
+                    None
+                }
+                Ok(resp) => match crate::utils::http::read_body(resp).await {
+                    Ok(text) => Some(text),
+                    Err(e) => {
+                        eprintln!("[remote] failed to read body from {}: {}", url, e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[remote] failed to fetch {}: {}", url, e);
+                    None
+                }
+            }
+        });
+    }
+
+    let mut out = String::new();
+    let mut failed = 0;
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(text)) = res {
+            out.push('\n');
+            out.push_str(&text);
+        } else {
+            failed += 1;
+        }
+    }
+    (out, failed)
+}
+
+/// Sanitize a blob of text into lines:
+/// - split on newlines
+/// - trim whitespace
+/// - drop empty lines
+/// - drop comment lines starting with '#', '//', or ';'
+fn sanitize_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| !l.starts_with('#'))
+        .filter(|l| !l.starts_with("//"))
+        .filter(|l| !l.starts_with(';'))
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
+/// Deduplicate and sort lines (case-sensitive).
+fn dedup_and_sort(mut lines: Vec<String>) -> Vec<String> {
+    lines.sort();
+    lines.dedup();
+    lines
+}
+
+#[cfg(test)]
+mod tests;

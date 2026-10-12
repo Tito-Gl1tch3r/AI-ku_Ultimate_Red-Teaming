@@ -1,0 +1,104 @@
+package context
+
+import (
+	"fmt"
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/evertras/bubble-table/table"
+	"github.com/spf13/cobra"
+
+	"github.com/chainreactors/tui"
+)
+
+func GetCredentialsCmd(cmd *cobra.Command, con *core.Console) error {
+	credentials, err := GetCredentials(con)
+	if err != nil {
+		return err
+	}
+
+	// Map for deduplication: key = "type:username:password", value = first occurrence context
+	seen := make(map[string]*clientpb.Context)
+	var rowEntries []table.Row
+
+	for _, ctx := range credentials {
+		cred, err := output.ToContext[*output.CredentialContext](ctx)
+		if err != nil {
+			return err
+		}
+
+		// Create deduplication key
+		dedupKey := fmt.Sprintf("%s:%s:%s:%s", cred.CredentialType, cred.Target, cred.Params["username"], cred.Params["password"])
+
+		// Check if we've already seen this combination
+		if _, exists := seen[dedupKey]; exists {
+			continue // Skip duplicate
+		}
+
+		// Mark as seen
+		seen[dedupKey] = ctx
+
+		row := table.NewRow(table.RowData{
+			"ID":       ctx.Id,
+			"Session":  getSessionID(ctx.Session),
+			"Task":     getTaskId(ctx.Task),
+			"Target":   cred.Target,
+			"Type":     cred.CredentialType,
+			"Username": cred.Params["username"],
+			"Password": cred.Params["password"],
+		})
+		rowEntries = append(rowEntries, row)
+	}
+
+	tableModel := tui.NewTable([]table.Column{
+		table.NewFlexColumn("ID", "ID", 1),
+		table.NewColumn("Session", "Session", 10),
+		table.NewColumn("Task", "Task", 6),
+		table.NewFlexColumn("Target", "Target", 2),
+		table.NewColumn("Type", "Type", 10),
+		table.NewColumn("Username", "Username", 15),
+		table.NewFlexColumn("Password", "Password", 2),
+	}, true)
+
+	tableModel.SetRows(rowEntries)
+	con.Log.Console(tableModel.View())
+	return nil
+}
+
+func GetCredentials(con *core.Console) ([]*clientpb.Context, error) {
+	contexts, err := GetContextsByType(con, consts.ContextCredential)
+	if err != nil {
+		return nil, err
+	}
+	return contexts.Contexts, nil
+}
+
+func AddCredential(con *core.Console, sess *client.Session, task *clientpb.Task, credType string, params map[string]string) (bool, error) {
+	if err := requireContextTask(sess, task); err != nil {
+		return false, err
+	}
+
+	_, err := con.Rpc.AddCredential(con.Context(), &clientpb.Context{
+		Session: sess.Session,
+		Task:    task,
+		Type:    consts.ContextCredential,
+		Value:   output.MarshalContext(&output.CredentialContext{CredentialType: credType, Params: params}),
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func RegisterCredential(con *core.Console) {
+	con.RegisterServerFunc("credentials", func(con *core.Console) ([]*output.CredentialContext, error) {
+		ctxs, err := GetCredentials(con)
+		if err != nil {
+			return nil, err
+		}
+		return output.ToContexts[*output.CredentialContext](ctxs)
+	}, nil)
+	con.RegisterServerFunc("add_credential", AddCredential, nil)
+}

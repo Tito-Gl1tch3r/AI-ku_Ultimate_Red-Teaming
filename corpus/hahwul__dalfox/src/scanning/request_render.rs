@@ -1,0 +1,207 @@
+//! human-readable request text (PoC).
+//!
+//! Extracted from the scanning hub; see `mod.rs` for the pipeline overview.
+
+use super::*;
+
+pub(crate) fn build_request_text(target: &Target, param: &Param, payload: &str) -> String {
+    use crate::parameter_analysis::Location;
+    // The scan applies `apply_param_encoding` to every injected value before it
+    // goes on the wire (see `check_reflection`/`check_dom_verification`), so a
+    // param that requires pre-encoding (e.g. an auto-detected base64 field) is
+    // sent encoded and the server decodes it back to the raw payload. Every arm
+    // below must embed that same encoded value, or a pasted request would carry
+    // un-encoded bytes the sink never reflects. A param with no pre-encoding
+    // gets the raw payload back unchanged.
+    let field_value = crate::encoding::pre_encoding::apply_param_encoding(payload, param);
+    let url = match param.location {
+        Location::Query | Location::Path => {
+            // Render the exact URL `build_url_inject_request` sends: the same
+            // base (form action for a form-discovered query param) and the
+            // same `build_injected_url`, so the PoC carries the wire name of a
+            // nested-field param (not its display name), the key-injection
+            // shape, and the pre-encoded value. A hand-rolled copy of the
+            // query/path rewrite here had drifted on all three.
+            let base = crate::scanning::url_inject::effective_query_base(&target.url, param);
+            let injected =
+                crate::scanning::url_inject::build_injected_url(&base, param, &field_value);
+            url::Url::parse(&injected).unwrap_or(base)
+        }
+        Location::Body
+        | Location::JsonBody
+        | Location::MultipartBody
+        | Location::GraphqlBody
+        | Location::XmlBody => {
+            // Body params use the form action URL when discovered from a form,
+            // so the displayed request matches the POST actually sent.
+            crate::scanning::url_inject::effective_query_base(&target.url, param)
+        }
+        _ => target.url.clone(),
+    };
+
+    let method = crate::scanning::url_inject::effective_method(&target.method, param);
+    // Body-bearing locations always send a body; synthesize one when the
+    // target has no original `data`, so the displayed PoC isn't an empty POST.
+    let (body, content_type): (Option<String>, Option<String>) = match param.location {
+        Location::Body => {
+            let body = crate::scanning::url_inject::urlencoded_body(
+                target.data.as_deref(),
+                &param.name,
+                &field_value,
+            );
+            (
+                Some(body),
+                Some("application/x-www-form-urlencoded".to_string()),
+            )
+        }
+        Location::JsonBody => {
+            let body = crate::scanning::url_inject::json_body(
+                target.data.as_deref(),
+                &param.name,
+                &param.value,
+                &field_value,
+            );
+            (Some(body), Some("application/json".to_string()))
+        }
+        Location::MultipartBody => {
+            // Mirror the multipart form actually sent (`build_multipart_request`
+            // → `multipart_form`): inject the (pre-encoded) value into the named
+            // field and frame it with a real boundary. Cloning `target.data`
+            // shipped the original, payload-free, urlencoded body under a
+            // boundary-less `multipart/form-data` type — a PoC that reproduced
+            // nothing.
+            let (body, content_type) = crate::scanning::url_inject::multipart_poc_body(
+                target.data.as_deref(),
+                &param.name,
+                &field_value,
+            );
+            (Some(body), Some(content_type))
+        }
+        // GraphQL / XML rebuild the whole body from the param's pipeline
+        // (`JsonField` into the GraphQL request / `Splice` around the XML
+        // injection point). For these, `apply_param_encoding` (already computed
+        // as `field_value`) runs that pipeline on the raw `payload` and yields
+        // the complete body — exactly what goes on the wire.
+        Location::GraphqlBody => (
+            Some(field_value.clone()),
+            Some("application/json".to_string()),
+        ),
+        Location::XmlBody => (
+            Some(field_value.clone()),
+            Some(crate::scanning::url_inject::xml_request_content_type(
+                target,
+            )),
+        ),
+        _ => (target.data.clone(), None),
+    };
+
+    let mut buf = String::with_capacity(512);
+
+    // Request line
+    buf.push_str(&method);
+    buf.push(' ');
+    buf.push_str(url.path());
+    if let Some(q) = url.query() {
+        buf.push('?');
+        buf.push_str(q);
+    }
+    buf.push_str(" HTTP/1.1\r\nHost: ");
+    buf.push_str(url.host_str().unwrap_or(""));
+    // `Host` is host *and port*. Dropping it made every PoC against a
+    // non-default port replay to :80/:443 — a different service, or nothing.
+    // `Url::port()` is already `None` for the scheme's default port, which is
+    // exactly when the Host header should omit it.
+    if let Some(port) = url.port() {
+        buf.push(':');
+        buf.push_str(&port.to_string());
+    }
+
+    // A `Location::Header` param is injected into the request itself, not the
+    // URL — as a header of its own name, or, when the name is one of the
+    // target's cookies, into `Cookie` (see `url_inject::build_header_request`,
+    // which this must mirror or the PoC does not reproduce what was sent).
+    let header_param = matches!(param.location, Location::Header);
+    let cookie_param = header_param && crate::scanning::url_inject::param_is_cookie(target, param);
+    let injected_header = header_param && !cookie_param;
+
+    for (k, v) in &target.headers {
+        // `apply_header_overrides` replaces rather than appends, so a
+        // same-named original is not on the wire and must not be shown here.
+        if injected_header && k.eq_ignore_ascii_case(&param.name) {
+            continue;
+        }
+        // Same for the composed `Cookie` a cookie param is injected through
+        // (`build_request_with_cookie` overrides any captured Cookie header),
+        // and for a captured `Content-Type` on a body injection, which
+        // `build_body_request_base` drops in favour of the injector's.
+        if cookie_param && k.eq_ignore_ascii_case("cookie") {
+            continue;
+        }
+        if content_type.is_some() && k.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        buf.push_str("\r\n");
+        buf.push_str(k);
+        buf.push_str(": ");
+        buf.push_str(v);
+    }
+    if injected_header {
+        buf.push_str("\r\n");
+        buf.push_str(&param.name);
+        buf.push_str(": ");
+        buf.push_str(&field_value);
+    }
+    // Body injectors always set their own `Content-Type` on the wire; a
+    // Query/Path injector re-sends the original body verbatim and passes
+    // `None` here, keeping whatever the target captured.
+    if let Some(ct) = &content_type {
+        buf.push_str("\r\nContent-Type: ");
+        buf.push_str(ct);
+    }
+
+    // Cookies. For a cookie param the injected value is written first and the
+    // target's other cookies follow, matching `build_header_request` — those
+    // neighbours often carry the session state the sink needs to render at all.
+    if cookie_param {
+        buf.push_str("\r\nCookie: ");
+        buf.push_str(&param.name);
+        buf.push('=');
+        buf.push_str(&field_value);
+        if let Some(rest) =
+            crate::utils::compose_cookie_header_excluding(&target.cookies, Some(&param.name))
+            && !rest.is_empty()
+        {
+            buf.push_str("; ");
+            buf.push_str(&rest);
+        }
+    } else if !target.cookies.is_empty()
+        && !target
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+    {
+        // Mirrors `apply_headers_ua_cookies`: `target.cookies` are auto-attached
+        // only when the target does not already carry its own Cookie header
+        // (already emitted above), never as a second Cookie line.
+        buf.push_str("\r\nCookie: ");
+        for (i, (k, v)) in target.cookies.iter().enumerate() {
+            if i > 0 {
+                buf.push_str("; ");
+            }
+            buf.push_str(k);
+            buf.push('=');
+            buf.push_str(v);
+        }
+    }
+
+    if let Some(data) = &body {
+        buf.push_str("\r\nContent-Length: ");
+        buf.push_str(&data.len().to_string());
+        buf.push_str("\r\n\r\n");
+        buf.push_str(data);
+    } else {
+        buf.push_str("\r\n");
+    }
+
+    buf
+}

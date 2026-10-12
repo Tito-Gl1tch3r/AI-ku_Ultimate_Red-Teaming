@@ -1,0 +1,2453 @@
+use super::*;
+use crate::parameter_analysis::{Location, Param};
+use crate::target_parser::Target;
+use crate::target_parser::parse_target;
+use axum::{
+    Router,
+    extract::{Form, Json, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse},
+    routing::get,
+};
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
+use tokio::time::{Duration, sleep};
+
+#[derive(Clone)]
+struct TestState {
+    stored_payload: String,
+}
+
+/// DOM-verify through a default client; `(verified, response_text)`.
+async fn dom_verify(
+    target: &Target,
+    param: &Param,
+    payload: &str,
+    args: &crate::cmd::scan::ScanArgs,
+) -> (bool, Option<String>) {
+    let client = target.build_client_or_default();
+    let outcome = check_dom_verification_with_evidence(&client, target, param, payload, args)
+        .await
+        .outcome;
+    (outcome.verified, outcome.response_text)
+}
+
+fn make_param() -> Param {
+    Param::new("q".to_string(), "seed".to_string(), Location::Query)
+}
+
+fn default_scan_args() -> crate::cmd::scan::ScanArgs {
+    crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        silence: true,
+        workers: 10,
+        max_concurrent_targets: 10,
+        encoders: vec!["url".to_string(), "html".to_string(), "base64".to_string()],
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    }
+}
+
+fn make_target(addr: SocketAddr, path: &str) -> Target {
+    let target = format!("http://{}:{}{}?q=seed", addr.ip(), addr.port(), path);
+    parse_target(&target).expect("valid target")
+}
+
+async fn html_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<div>{}</div>", q))
+}
+
+async fn html_uppercase_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<div>{}</div>", q.to_uppercase()))
+}
+
+async fn xhtml_handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::OK,
+        [("content-type", "application/xhtml+xml")],
+        format!(
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{}</body></html>",
+            q
+        ),
+    )
+}
+
+async fn json_handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        format!("{{\"echo\":\"{}\"}}", q),
+    )
+}
+
+async fn html_without_payload_handler() -> Html<&'static str> {
+    Html("<div>no payload</div>")
+}
+
+async fn decoded_payload_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    let decoded = urlencoding::decode(&q)
+        .map(|value| value.into_owned())
+        .unwrap_or(q);
+    Html(format!("<div>{}</div>", decoded))
+}
+
+async fn header_reflection_handler(headers: HeaderMap) -> Html<String> {
+    let value = headers
+        .get("x-test")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    Html(format!("<div>{}</div>", value))
+}
+
+async fn cookie_reflection_handler(headers: HeaderMap) -> Html<String> {
+    let value = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    Html(format!("<div>{}</div>", value))
+}
+
+async fn form_reflection_handler(Form(params): Form<HashMap<String, String>>) -> Html<String> {
+    let value = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<div>{}</div>", value))
+}
+
+async fn json_reflection_handler(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+    let value = body
+        .get("q")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    (
+        StatusCode::OK,
+        [("content-type", "text/html")],
+        format!("<div>{}</div>", value),
+    )
+}
+
+async fn url_attribute_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<iframe src=\"{}\"></iframe>", q))
+}
+
+/// Reflects the payload into `<img src=…>`. Modern browsers do not execute
+/// a `javascript:` URL in `img@src` (it's a resource fetch, not a
+/// navigation), so DOM verification must not promote this to Verified
+/// purely on the basis that the scheme reached the attribute value.
+async fn url_attribute_img_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<img src=\"{}\">", q))
+}
+
+/// Returns a 307 whose body echoes the payload verbatim. Browsers never render
+/// the body of a 3xx response, so this is the canonical "DOM evidence inside a
+/// redirect body" false-positive case — verification must not fire here.
+async fn redirect_body_echo_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [
+            ("content-type", "text/html"),
+            ("location", "/dom/no-payload"),
+        ],
+        format!("<html><body><div>{}</div></body></html>", q),
+    )
+}
+
+/// Always returns 503 with an empty body — a server that consistently fails
+/// (or hard-blocks). Used to verify the `status` signal is threaded out of
+/// DOM verification for the issue #1156 blocked-streak early exit.
+async fn server_error_handler() -> impl IntoResponse {
+    (StatusCode::SERVICE_UNAVAILABLE, Html(String::new()))
+}
+
+/// HTML-escape every structural character, the way a correctly-templating
+/// server does. The reflection can never execute, but our exact bytes do come
+/// back — the *escaped echo* the inert-echo budget needs to see.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// The uniformly-escaping endpoint: `html.escape()` over the reflected value.
+async fn escaped_echo_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<div id=\"out\">{}</div>", escape_html(&q)))
+}
+
+/// A WAF block page that *echoes* the escaped payload back with a 403. A later
+/// payload variant may still bypass the rule, so this must not consume the
+/// inert-echo budget (same reasoning that scopes `BLOCKED_STREAK_LIMIT` to 5xx).
+async fn waf_block_echo_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::FORBIDDEN,
+        Html(format!("<div>Request blocked: {}</div>", escape_html(&q))),
+    )
+}
+
+/// A block page that echoes the payload RAW with a 403 (an error template that
+/// reflects the request). Parses to a marker element, so only `--ignore-return`
+/// keeps it from verifying.
+async fn waf_block_raw_echo_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::FORBIDDEN,
+        Html(format!("<div>Request blocked: {}</div>", q)),
+    )
+}
+
+/// `--sxss` retrieval page that answers with the stored payload but a 403.
+async fn sxss_blocked_handler(State(state): State<TestState>) -> impl IntoResponse {
+    (
+        StatusCode::FORBIDDEN,
+        Html(format!("<div>{}</div>", state.stored_payload)),
+    )
+}
+
+/// A whitelisting sanitizer: it *removes* the markup instead of escaping it, so
+/// our bytes never come back whole. Counting this would let the DOM phase
+/// retire before a late whitelisted verifier is reached.
+async fn sanitizing_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    let stripped: String = q.chars().filter(|c| *c != '<' && *c != '>').collect();
+    Html(format!("<div id=\"out\">{}</div>", stripped))
+}
+
+async fn sxss_html_handler(State(state): State<TestState>) -> Html<String> {
+    Html(format!("<div>{}</div>", state.stored_payload))
+}
+
+/// Echo the raw request body so tests can assert what fields a multipart
+/// request actually carried.
+async fn multipart_echo_handler(body: String) -> impl IntoResponse {
+    (StatusCode::OK, body)
+}
+
+async fn sxss_json_handler(State(state): State<TestState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        format!("{{\"stored\":\"{}\"}}", state.stored_payload),
+    )
+}
+
+async fn start_mock_server(stored_payload: &str) -> SocketAddr {
+    let app = Router::new()
+        .route("/dom/html", get(html_handler))
+        .route("/dom/html-upper", get(html_uppercase_handler))
+        .route("/dom/decoded", get(decoded_payload_handler))
+        .route("/dom/url-attribute", get(url_attribute_handler))
+        .route("/dom/url-attribute-img", get(url_attribute_img_handler))
+        .route("/dom/redirect-body", get(redirect_body_echo_handler))
+        .route("/dom/xhtml", get(xhtml_handler))
+        .route("/dom/json", get(json_handler))
+        .route("/dom/no-payload", get(html_without_payload_handler))
+        .route("/dom/header", get(header_reflection_handler))
+        .route("/dom/cookie", get(cookie_reflection_handler))
+        .route("/dom/form", axum::routing::post(form_reflection_handler))
+        .route(
+            "/dom/json-body",
+            axum::routing::post(json_reflection_handler),
+        )
+        .route("/dom/server-error", get(server_error_handler))
+        .route("/dom/escaped", get(escaped_echo_handler))
+        .route("/dom/waf-block", get(waf_block_echo_handler))
+        .route("/dom/waf-block-raw", get(waf_block_raw_echo_handler))
+        .route("/sxss/blocked", get(sxss_blocked_handler))
+        .route("/dom/sanitized", get(sanitizing_handler))
+        .route("/sxss/html", get(sxss_html_handler))
+        .route("/sxss/json", get(sxss_json_handler))
+        .route(
+            "/dom/multipart-echo",
+            axum::routing::post(multipart_echo_handler),
+        )
+        .with_state(TestState {
+            stored_payload: stored_payload.to_string(),
+        });
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_early_return_when_skip() {
+    let target = parse_target("https://example.com/?q=1").unwrap();
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.skip_xss_scanning = true;
+    let res = dom_verify(&target, &param, "PAY", &args).await;
+    assert_eq!(res, (false, None));
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_detects_html_reflection() {
+    let payload = format!(
+        "<svg onload=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/html");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(found, "text/html responses with payload should be detected");
+    assert!(body.unwrap_or_default().contains(&payload));
+}
+
+/// `build_multipart_request` must inject the scanned param even when it is
+/// absent from the captured body — otherwise the verification request carries
+/// no payload and the finding can never be confirmed (false negative).
+#[tokio::test]
+async fn test_build_multipart_request_injects_absent_param() {
+    let addr = start_mock_server("stored").await;
+    // Captured body carries a different field; the scanned param `q` is absent.
+    let mut target = make_target(addr, "/dom/multipart-echo");
+    target.method = "POST".to_string();
+    target.data = Some("other=seed".to_string());
+    let mut param = make_param();
+    param.location = Location::MultipartBody;
+
+    let client = target.build_client_or_default();
+    let rb = build_multipart_request(&client, &target, &param, "PAYLOAD_MARKER");
+    let body = rb
+        .send()
+        .await
+        .expect("send multipart")
+        .text()
+        .await
+        .expect("read echo body");
+    assert!(
+        body.contains("PAYLOAD_MARKER"),
+        "absent multipart param must still be injected, got body: {body}"
+    );
+    assert!(body.contains("name=\"q\""), "form field q must be present");
+}
+
+/// `build_json_body_request` must not run `str::replace` with an empty
+/// `param.value`: an empty pattern splices the payload between every byte of the
+/// body, sending a garbled request. When the captured body isn't valid JSON and
+/// the value is empty, it must re-serialize as a clean `{name: payload}` object.
+#[tokio::test]
+async fn test_build_json_body_request_empty_value_not_garbled() {
+    let addr = start_mock_server("stored").await;
+    let mut target = make_target(addr, "/dom/multipart-echo");
+    target.method = "POST".to_string();
+    // Non-JSON captured body forces the fallback branch; empty param value would
+    // otherwise trigger `"abc".replace("", p)` == "papbpcp".
+    target.data = Some("abc".to_string());
+    let mut param = make_param();
+    param.location = Location::JsonBody;
+    param.value = String::new();
+
+    let client = target.build_client_or_default();
+    let rb = build_json_body_request(&client, &target, &param, "PAYMARK");
+    let body = rb
+        .send()
+        .await
+        .expect("send json")
+        .text()
+        .await
+        .expect("read echo body");
+    // Clean object, not the garbled empty-pattern splice ("aPAYMARKbPAYMARKc").
+    assert_eq!(
+        body, "{\"q\":\"PAYMARK\"}",
+        "empty-value JSON body must be a clean object, got: {body}"
+    );
+    assert!(
+        !body.contains("aPAYMARKb"),
+        "payload must not be spliced between body bytes, got: {body}"
+    );
+}
+
+// ── Issue #1156: DomVerifyOutcome threads reflected + status signals ───────
+
+#[tokio::test]
+async fn test_dom_outcome_verified_threads_reflected_and_status() {
+    let payload = format!(
+        "<svg onload=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/html");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(outcome.verified, "executable reflection must verify");
+    assert!(
+        outcome.reflected,
+        "a verified reflection is by definition reflected"
+    );
+    assert_eq!(outcome.status, 200);
+    assert!(
+        outcome.response_text.unwrap_or_default().contains(&payload),
+        "verified outcome must carry the response body"
+    );
+}
+
+#[tokio::test]
+async fn test_dom_outcome_inert_echo_reflected_but_not_verified() {
+    // A plain-text payload reflects (classify_reflection = Some) but carries no
+    // executable DOM evidence: reflected=true, verified=false. This is the
+    // "reflected-but-inert echo" signal that drives the inert-echo early exit.
+    let payload = "harmless-inert-dlxmarker-text".to_string();
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/html");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(!outcome.verified, "plain text must not verify");
+    assert!(
+        outcome.reflected,
+        "the payload bytes are echoed, so the response must be flagged reflected"
+    );
+    assert_eq!(outcome.status, 200);
+    assert!(
+        outcome.response_text.is_none(),
+        "non-verified outcomes must not retain the body (memory bound)"
+    );
+}
+
+#[tokio::test]
+async fn test_dom_outcome_escaped_echo_counts_as_reflected() {
+    // A correctly-templating server escapes every structural character. The
+    // payload can never execute, but our exact bytes DID come back — so the
+    // response must advance the inert-echo budget. Before this signal existed,
+    // `classify_reflection` returned None here (rightly — it is not a finding)
+    // and the DOM phase ran its entire catalog against a body that can never
+    // verify.
+    let payload = format!(
+        "<svg onload=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/escaped");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(!outcome.verified, "an escaped echo must never verify");
+    assert!(
+        outcome.reflected,
+        "an escaped echo of the whole payload must advance the inert-echo budget"
+    );
+    assert_eq!(outcome.status, 200);
+    assert!(
+        outcome.response_text.is_none(),
+        "non-verified outcomes must not retain the body (memory bound)"
+    );
+}
+
+#[tokio::test]
+async fn test_dom_outcome_sanitized_strip_is_not_reflected() {
+    // A whitelisting sanitizer REMOVES markup rather than escaping it, so the
+    // payload never comes back whole. Counting it would let the phase retire
+    // before a late whitelisted verifier (the `<a href=javascript:>` class) is
+    // reached — the recall guarantee `INERT_ECHO_BUDGET` rests on.
+    let payload = format!(
+        "<svg onload=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/sanitized");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(!outcome.verified, "stripped markup must not verify");
+    assert!(
+        !outcome.reflected,
+        "a sanitizer that strips markup must not advance the inert-echo budget"
+    );
+    assert_eq!(outcome.status, 200);
+}
+
+#[tokio::test]
+async fn test_dom_outcome_4xx_block_echo_is_not_reflected() {
+    // A WAF block page that echoes the escaped payload is a *block*: a later
+    // payload variant may still bypass the rule, so it must not consume the
+    // budget that keeps the bypass surface alive.
+    let payload = format!(
+        "<svg onload=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/waf-block");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(!outcome.verified, "a 403 block page must not verify");
+    assert!(
+        !outcome.reflected,
+        "a 4xx block page that echoes the payload must not advance the inert-echo budget"
+    );
+    assert_eq!(outcome.status, 403, "the 4xx status must be threaded out");
+}
+
+#[tokio::test]
+async fn test_dom_verification_honors_ignore_return() {
+    // The reflection phase drops `--ignore-return` statuses; the DOM phase used
+    // to verify (High severity) straight from the excluded response's body.
+    let payload = format!(
+        "<svg onload=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/waf-block-raw");
+    let param = make_param();
+    let mut args = default_scan_args();
+
+    let (verified, _) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(
+        verified,
+        "control: without --ignore-return the 403 echo verifies"
+    );
+
+    args.ignore_return = vec![403];
+    let client = target.build_client_or_default();
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(!outcome.verified, "an ignored status must not verify");
+    assert!(outcome.response_text.is_none());
+    assert_eq!(outcome.status, 403, "the status is still threaded out");
+}
+
+#[tokio::test]
+async fn test_dom_verification_sxss_honors_ignore_return() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server(&payload).await;
+    let target = make_target(addr, "/dom/no-payload");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{}:{}/sxss/blocked", addr.ip(), addr.port()));
+
+    let (verified, _) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(
+        verified,
+        "control: the 403 retrieval page verifies by default"
+    );
+
+    args.ignore_return = vec![403];
+    let (verified, _) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(!verified, "an ignored retrieval status must not verify");
+}
+
+#[tokio::test]
+async fn test_dom_outcome_blocked_threads_5xx_status() {
+    let payload = format!(
+        "<svg onload=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/server-error");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(!outcome.verified, "a 503 must not verify");
+    assert!(!outcome.reflected, "an empty 503 body reflects nothing");
+    assert_eq!(outcome.status, 503, "the 5xx status must be threaded out");
+}
+
+// Server uppercases every reflected byte; the marker survives as a
+// case-folded class value. The standard CSS class selector is case-
+// sensitive so it misses the match, but the case-insensitive
+// attribute walk added to `has_marker_evidence_in_doc` recovers V.
+#[tokio::test]
+async fn test_check_dom_verification_marker_survives_case_fold() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/html-upper");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(
+        found,
+        "uppercased marker class should still satisfy DOM evidence via case-insensitive scan"
+    );
+    let body = body.unwrap_or_default();
+    let marker = crate::scanning::markers::class_marker();
+    assert!(
+        body.to_ascii_lowercase().contains(marker),
+        "marker should appear in the body under ASCII case fold"
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_accepts_xhtml_content_type() {
+    let payload = format!(
+        "<img src=\"x\" onerror=\"alert(1)\" id=\"{}\" />",
+        crate::scanning::markers::id_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/xhtml");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, _) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(
+        found,
+        "well-formed XHTML with an executable payload should verify"
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_rejects_non_html_without_marker() {
+    // Non-HTML responses without marker evidence should still be rejected
+    let payload = "<script>alert(1)</script>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/json");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, payload, &args).await;
+    assert!(
+        !found,
+        "application/json without marker should not pass DOM verification"
+    );
+    assert!(
+        body.is_none(),
+        "non-html responses without marker should not be returned"
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_rejects_json_with_marker() {
+    // Marker-like HTML inside a JSON string is data in a top-level navigation.
+    let _counter_lock = crate::REQUEST_COUNTER_TEST_LOCK.lock().await;
+    let payload = format!(
+        "<script class={}>alert(1)</script>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/json");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, _body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(
+        !found,
+        "JSON is not parsed as HTML even when its string contains marker markup"
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_returns_false_when_payload_missing() {
+    let payload = format!(
+        "<script class={}>alert(1)</script>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/no-payload");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(!found);
+    assert!(body.is_none());
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_injects_header_params() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = parse_target(&format!("http://{}:{}/dom/header", addr.ip(), addr.port()))
+        .expect("valid target");
+    let param = Param::new("X-Test".to_string(), "seed".to_string(), Location::Header);
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(found);
+    assert!(body.unwrap_or_default().contains(&payload));
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_injects_cookie_params() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let mut target = parse_target(&format!("http://{}:{}/dom/cookie", addr.ip(), addr.port()))
+        .expect("valid target");
+    target
+        .cookies
+        .push(("session".to_string(), "seed".to_string()));
+    let param = Param::new("session".to_string(), "seed".to_string(), Location::Header);
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(found);
+    assert!(
+        body.unwrap_or_default()
+            .contains(&format!("session={}", payload))
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_injects_form_body_params() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let mut target = parse_target(&format!("http://{}:{}/dom/form", addr.ip(), addr.port()))
+        .expect("valid target");
+    target.method = "POST".to_string();
+    target.data = Some("q=seed".to_string());
+    let param = Param::new("q".to_string(), "seed".to_string(), Location::Body);
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(found);
+    assert!(body.unwrap_or_default().contains(&payload));
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_injects_json_body_params() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let mut target = parse_target(&format!(
+        "http://{}:{}/dom/json-body",
+        addr.ip(),
+        addr.port()
+    ))
+    .expect("valid target");
+    target.method = "POST".to_string();
+    target.data = Some("{\"q\":\"seed\"}".to_string());
+    let param = Param::new("q".to_string(), "seed".to_string(), Location::JsonBody);
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(found);
+    assert!(body.unwrap_or_default().contains(&payload));
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_sxss_uses_secondary_url() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server(&payload).await;
+    let target = make_target(addr, "/dom/no-payload");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{}:{}/sxss/html", addr.ip(), addr.port()));
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(found, "sxss should verify stored payload at secondary URL");
+    assert!(body.unwrap_or_default().contains(&payload));
+}
+
+/// Issue #1156 invariant: under `--sxss`, the outcome must report
+/// `reflected == false` and `status == 0` regardless of the verdict, so the
+/// DOM-phase early exit never engages on a stored-XSS scan (whose verification
+/// fans out across secondary URLs the inert/blocked signals can't observe).
+#[tokio::test]
+async fn test_dom_outcome_sxss_never_drives_early_exit() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server(&payload).await;
+    let target = make_target(addr, "/dom/no-payload");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{}:{}/sxss/html", addr.ip(), addr.port()));
+    let client = target.build_client_or_default();
+
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(
+        outcome.verified,
+        "sxss should still verify the stored payload"
+    );
+    assert!(
+        !outcome.reflected,
+        "sxss outcome must not set reflected (would feed the inert-echo budget)"
+    );
+    assert_eq!(
+        outcome.status, 0,
+        "sxss outcome must report status 0 (non-blocking) so it can't feed the blocked streak"
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_sxss_rejects_non_html_secondary_content() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server(&payload).await;
+    let target = make_target(addr, "/dom/no-payload");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{}:{}/sxss/json", addr.ip(), addr.port()));
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(!found);
+    assert!(body.is_none());
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_sxss_without_url_returns_false() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server(&payload).await;
+    let target = make_target(addr, "/dom/html");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = None;
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(!found);
+    assert!(body.is_none());
+}
+
+#[test]
+fn test_has_marker_evidence_requires_payload_marker() {
+    let body = format!(
+        "<html><body><div class=\"{}\">x</div></body></html>",
+        crate::scanning::markers::class_marker()
+    );
+    assert!(!has_marker_evidence("<img src=x onerror=alert(1)>", &body));
+}
+
+#[test]
+fn test_has_marker_evidence_detects_class_marker_element() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("<img src=x onerror=alert(1) class={}>", marker);
+    // The payload attaches its sink (onerror) to the marker element, so the
+    // marker class is evidence only when the handler also survives (issue #1118).
+    let body = format!(
+        "<html><body><img src=x onerror=alert(1) class=\"{}\"></body></html>",
+        marker
+    );
+    assert!(has_marker_evidence(&payload, &body));
+}
+
+#[test]
+fn test_has_marker_evidence_detects_legacy_dalfox_class_marker_element() {
+    let payload = "<img class=\"dalfox\" src=x onerror=alert(1)>";
+    let body = "<html><body><img class=\"dalfox\" src=x onerror=alert(1)></body></html>";
+    assert!(has_marker_evidence(payload, body));
+}
+
+/// Issue #1118: a server that reflects a *truncated* copy of the payload can
+/// preserve the marker class while dropping the `on*` handler. The marker
+/// element parses, but the handler never survives, so this is NOT exploitable
+/// and must not count as marker evidence.
+#[test]
+fn test_has_marker_evidence_demoted_when_handler_truncated() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("'\"><svg/class={} onload=alert()//", marker);
+    // ASP.NET ValidateRequest-style error page: the raw reflection is cut off
+    // right before `onload`, so the parsed svg carries the marker class but no
+    // handler.
+    let body = format!(
+        "<html><body><header>A potentially dangerous Request.Form value was \
+         detected (q=\"...&gt;&lt;svg/class={} onlo...\").</header>\
+         <svg class=\"{}\"></svg></body></html>",
+        marker, marker
+    );
+    assert!(
+        !has_marker_evidence(&payload, &body),
+        "marker class without the payload's surviving handler must not be evidence"
+    );
+}
+
+/// Issue #1118 (counter-case): when the same payload's handler DOES survive on
+/// the marker element, the finding is genuinely exploitable and stays evidence.
+#[test]
+fn test_has_marker_evidence_kept_when_handler_survives() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("'\"><svg/class={} onload=alert()//", marker);
+    let body = format!(
+        "<html><body><svg class=\"{}\" onload=\"alert()\"></svg></body></html>",
+        marker
+    );
+    assert!(has_marker_evidence(&payload, &body));
+}
+
+/// Issue #1118 (no regression): structural markers whose exploit is the
+/// element's mere presence — base-href injection, DOM-clobbering containers —
+/// carry no on*/script sink on the marker element, so presence-only evidence is
+/// preserved.
+#[test]
+fn test_has_marker_evidence_kept_for_structural_markers() {
+    let id = crate::scanning::markers::id_marker();
+    let class = crate::scanning::markers::class_marker();
+
+    // base-href injection — no sink on the marker element.
+    let base_payload = format!("<base href=//evil.example/ id={}>", id);
+    let base_body = format!(
+        "<html><head><base href=\"//evil.example/\" id=\"{}\"></head></html>",
+        id
+    );
+    assert!(
+        has_marker_evidence(&base_payload, &base_body),
+        "base-href marker presence is the exploit; must stay evidence"
+    );
+
+    // DOM-clobbering form container — the sink lives in a child input, not on
+    // the marker element itself.
+    let form_payload = format!(
+        "<form id={} class={}><input name=\"action\" value=\"javascript:alert(1)\"></form>",
+        id, class
+    );
+    let form_body = format!(
+        "<html><body><form id=\"{}\" class=\"{}\"><input name=\"action\" \
+         value=\"javascript:alert(1)\"></form></body></html>",
+        id, class
+    );
+    assert!(
+        has_marker_evidence(&form_payload, &form_body),
+        "clobbering container marker presence is the exploit; must stay evidence"
+    );
+}
+
+/// Issue #1118 (script-body family): a `<script class=marker>sink</script>`
+/// payload whose body is truncated away leaves the marker class on an empty
+/// script — no sink survives, so it is not evidence.
+#[test]
+fn test_has_marker_evidence_demoted_when_script_body_truncated() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("<script class={}>alert(1)</script>", marker);
+    let body = format!(
+        "<html><body><script class=\"{}\"></script></body></html>",
+        marker
+    );
+    assert!(
+        !has_marker_evidence(&payload, &body),
+        "marker class on an empty script (sink body dropped) must not be evidence"
+    );
+}
+
+/// Issue #1118 (script-body counter-case): when the `<script>` body sink
+/// survives on the marker element, the finding stays evidence.
+#[test]
+fn test_has_marker_evidence_kept_when_script_body_survives() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("<script class={}>alert(1)</script>", marker);
+    let body = format!(
+        "<html><body><script class=\"{}\">alert(1)</script></body></html>",
+        marker
+    );
+    assert!(has_marker_evidence(&payload, &body));
+}
+
+/// Issue #1118 (id-marker symmetry): the handler-survival gate applies to id
+/// markers too, not only class markers.
+#[test]
+fn test_has_marker_evidence_demoted_when_id_handler_truncated() {
+    let id = crate::scanning::markers::id_marker();
+    let payload = format!("<svg onload=alert() id={}>", id);
+    let truncated = format!("<html><body><svg id=\"{}\"></svg></body></html>", id);
+    assert!(
+        !has_marker_evidence(&payload, &truncated),
+        "id-marker element without the surviving handler must not be evidence"
+    );
+    let survived = format!(
+        "<html><body><svg id=\"{}\" onload=\"alert()\"></svg></body></html>",
+        id
+    );
+    assert!(has_marker_evidence(&payload, &survived));
+}
+
+/// Issue #1118 (WAF-bypass): payloads entity-encode the sink chars
+/// (`alert&#40;1&#41;`); scraper decodes the parsed handler back to `alert(1)`.
+/// The co-survival check must compare against the decoded value too — a genuine
+/// breakout stays evidence, while a truncated one is still demoted.
+#[test]
+fn test_has_marker_evidence_entity_encoded_sink() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("<svg onload=alert&#40;1&#41; class={}>", marker);
+    let survived = format!(
+        "<html><body><svg onload=\"alert(1)\" class=\"{}\"></svg></body></html>",
+        marker
+    );
+    assert!(
+        has_marker_evidence(&payload, &survived),
+        "decoded handler sink on the marker element should still be evidence"
+    );
+    let truncated = format!("<html><body><svg class=\"{}\"></svg></body></html>", marker);
+    assert!(
+        !has_marker_evidence(&payload, &truncated),
+        "entity-encoded payload with the handler dropped must be demoted"
+    );
+}
+
+/// A JSONP-callback payload reflected as the callable identifier of a JS body
+/// (`callback=…` → `…({"data":1})`) must classify as JS-context evidence — the
+/// genuine JSONP XSS — and NOT rely on an HTML marker.
+#[test]
+fn test_jsonp_callback_payload_yields_js_context_evidence() {
+    for payload in crate::scanning::get_jsonp_callback_payloads() {
+        let body = format!("{payload}({{\"data\":1}})");
+        assert_eq!(
+            classify_dom_evidence_for_response(&payload, &body, "application/javascript"),
+            Some(super::DomEvidenceKind::JsContext),
+            "JSONP payload {payload:?} should verify via JS-context AST in body {body:?}"
+        );
+    }
+}
+
+#[test]
+fn response_type_gates_dom_evidence_before_html_parsing() {
+    let class_marker = crate::scanning::markers::class_marker();
+    let payload = format!("<svg class=\"{class_marker}\" onload=\"alert(1)\" />");
+    let marked_html = format!("<html><body>{payload}</body></html>");
+    let json = format!("{{\"echo\":\"{}\"}}", payload.replace('"', "\\\""));
+
+    assert_eq!(
+        classify_dom_evidence_for_response(&payload, &json, "application/json"),
+        None
+    );
+    assert_eq!(
+        classify_dom_evidence_for_response(&payload, &json, ""),
+        None,
+        "an unknown-type JSON body does not match an HTML sniff signature"
+    );
+    assert_eq!(
+        classify_dom_evidence_for_response(&payload, &marked_html, "text/plain; charset=utf-8"),
+        None,
+        "a supplied text/plain stays plain text, with or without nosniff"
+    );
+    assert_eq!(
+        classify_dom_evidence_for_response(&payload, &marked_html, "text/csv"),
+        None
+    );
+    assert_eq!(
+        classify_dom_evidence_for_response(&payload, &marked_html, "application/xml"),
+        None
+    );
+    assert_eq!(
+        classify_dom_evidence_for_response(&payload, &marked_html, "text/html"),
+        Some(DomEvidenceKind::Marker)
+    );
+    assert_eq!(
+        classify_dom_evidence_for_response(&payload, &marked_html, ""),
+        Some(DomEvidenceKind::Marker),
+        "an HTML sniff signature without Content-Type remains eligible"
+    );
+}
+
+#[test]
+fn response_type_gates_require_well_formed_xhtml_and_svg() {
+    let marker = crate::scanning::markers::class_marker();
+    let xhtml_payload = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"{marker}\" onload=\"alert(1)\" />"
+    );
+    let xhtml =
+        format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{xhtml_payload}</body></html>");
+    let malformed_xhtml = xhtml.replace("</body>", "");
+    let svg_payload = format!("<svg class=\"{marker}\" onload=\"alert(1)\" />");
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{svg_payload}</svg>");
+    let malformed_svg = svg.replace("</svg>", "");
+
+    assert!(
+        classify_dom_evidence_for_response(
+            &xhtml_payload,
+            &xhtml,
+            "application/xhtml+xml; charset=utf-8"
+        )
+        .is_some()
+    );
+    assert_eq!(
+        classify_dom_evidence_for_response(
+            &xhtml_payload,
+            &malformed_xhtml,
+            "application/xhtml+xml"
+        ),
+        None
+    );
+    assert!(classify_dom_evidence_for_response(&svg_payload, &svg, "image/svg+xml").is_some());
+    assert_eq!(
+        classify_dom_evidence_for_response(&svg_payload, &malformed_svg, "image/svg+xml"),
+        None
+    );
+
+    let case_sensitive_payload = format!("<SCRIPT class=\"{marker}\" ONLOAD=\"alert(1)\" />");
+    let case_sensitive_xhtml = format!(
+        "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{case_sensitive_payload}</body></html>"
+    );
+    assert_eq!(
+        classify_dom_evidence_for_response(
+            &case_sensitive_payload,
+            &case_sensitive_xhtml,
+            "application/xhtml+xml"
+        ),
+        None,
+        "XML tag and event attribute names are case-sensitive"
+    );
+}
+
+#[test]
+fn xml_dtd_entities_and_malformed_tails_recover_dom_verification() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("<script class=\"{marker}\">alert(1)</script>");
+    let xhtml_with_dtd_and_unknown_entity = format!(
+        concat!(
+            "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" ",
+            "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">",
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{payload}&nbsp;</body></html>"
+        ),
+        payload = payload
+    );
+    let xhtml_with_entity_before_payload = format!(
+        concat!(
+            "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" ",
+            "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">",
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>&nbsp;{payload}</body></html>"
+        ),
+        payload = payload
+    );
+    let malformed_xhtml = format!(
+        "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{payload}<broken></body></html>"
+    );
+    let svg_with_dtd = format!(
+        concat!(
+            "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" ",
+            "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\">{payload}</svg>"
+        ),
+        payload = payload
+    );
+
+    for (content_type, body) in [
+        ("application/xhtml+xml", xhtml_with_dtd_and_unknown_entity),
+        ("application/xhtml+xml", xhtml_with_entity_before_payload),
+        ("application/xhtml+xml", malformed_xhtml),
+        ("image/svg+xml", svg_with_dtd),
+    ] {
+        assert_eq!(
+            classify_dom_evidence_for_response(&payload, &body, content_type),
+            Some(DomEvidenceKind::Marker),
+            "{content_type} should preserve the executable marker before parser recovery"
+        );
+    }
+}
+
+#[test]
+fn xml_dom_verification_at_ten_thousand_nesting_levels_does_not_recurse() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("<script class=\"{marker}\">alert(1)</script>");
+    let open = "<n>".repeat(10_000);
+    let close = "</n>".repeat(10_000);
+    let cases = [
+        (
+            "application/xml",
+            format!(
+                "<root><svg xmlns=\"http://www.w3.org/2000/svg\" class=\"{marker}\" onload=\"alert(1)\"/>{open}{close}</root>"
+            ),
+            format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"{marker}\" onload=\"alert(1)\"/>"
+            ),
+        ),
+        (
+            "application/xhtml+xml",
+            format!(
+                "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{payload}{open}{close}</body></html>"
+            ),
+            payload.clone(),
+        ),
+        (
+            "image/svg+xml",
+            format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{payload}{open}{close}</svg>"),
+            payload,
+        ),
+    ];
+
+    for (content_type, body, expected_payload) in cases {
+        assert_eq!(
+            classify_dom_evidence_for_response(&expected_payload, &body, content_type),
+            Some(DomEvidenceKind::Marker),
+            "{content_type} should verify before the deeply nested tail"
+        );
+    }
+}
+
+#[test]
+fn xml_script_body_from_payload_is_verified_as_executable() {
+    let payload = "<script>alert(1)</script>";
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{payload}</svg>");
+    let xml_doc = roxmltree::Document::parse(&svg).expect("well-formed fixture");
+    let script_node = xml_doc
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "script")
+        .expect("script element");
+    assert!(xml_node_is_active(script_node));
+    assert_eq!(xml_node_text(script_node), "alert(1)");
+    assert!(xml_node_has_payload_structural_sink(
+        script_node,
+        payload,
+        payload
+    ));
+    assert_eq!(
+        classify_dom_evidence_for_response(payload, &svg, "image/svg+xml"),
+        Some(DomEvidenceKind::HtmlStructural)
+    );
+
+    let xhtml =
+        format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{payload}</body></html>");
+    assert_eq!(
+        classify_dom_evidence_for_response(payload, &xhtml, "application/xhtml+xml"),
+        Some(DomEvidenceKind::HtmlStructural)
+    );
+
+    let data_block = payload.replace("<script>", "<script type=\"application/json\">");
+    let svg_data_block = format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{data_block}</svg>");
+    assert_eq!(
+        classify_dom_evidence_for_response(&data_block, &svg_data_block, "image/svg+xml"),
+        None,
+        "script data blocks are not executable XML evidence"
+    );
+}
+
+/// Issue #1118: the public entry point used by the scan worker
+/// (`classify_dom_evidence`) must return `None` for a truncated-handler
+/// reflection — no fallback evidence path (HTML-structural, JS-context, inline
+/// breakout) should rescue it into a false [V].
+#[test]
+fn test_classify_dom_evidence_none_when_handler_truncated() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("'\"><svg/class={} onload=alert()//", marker);
+    let body = format!("<html><body><svg class=\"{}\"></svg></body></html>", marker);
+    assert_eq!(classify_dom_evidence(&payload, &body), None);
+}
+
+/// Issue #1118 coverage matrix for `has_marker_evidence`.
+///
+/// The bug slipped past the original suite because the fixtures sprinkled the
+/// marker into a hand-written body (`<img class="MARKER">`) instead of faithfully
+/// modelling what the server did to the *whole* payload. This table pins the
+/// verdict for each payload family against an explicit server transformation —
+/// full reflection, handler stripped/blanked/neutralised, marker as text only,
+/// multiple classes, multiple elements, ASCII case-fold, and entity-encoded
+/// sinks — so a regression in either direction (false [V] or lost recall) fails
+/// a named row.
+#[test]
+fn test_has_marker_evidence_matrix() {
+    let cm = crate::scanning::markers::class_marker();
+    let im = crate::scanning::markers::id_marker();
+    let up = cm.to_uppercase();
+
+    // (name, payload, reflected body, expected evidence)
+    let cases: Vec<(&str, String, String, bool)> = vec![
+        // ── handler templates: sink lives on the marker element ──
+        (
+            "svg_onload_full",
+            format!("<svg onload=alert() class={cm}>"),
+            format!("<svg onload=alert() class=\"{cm}\"></svg>"),
+            true,
+        ),
+        (
+            "svg_onload_handler_stripped",
+            format!("<svg onload=alert() class={cm}>"),
+            format!("<svg class=\"{cm}\"></svg>"),
+            false,
+        ),
+        (
+            "svg_onload_handler_blanked",
+            format!("<svg onload=alert() class={cm}>"),
+            format!("<svg onload=\"\" class=\"{cm}\"></svg>"),
+            false,
+        ),
+        (
+            "svg_onload_handler_neutralised",
+            format!("<svg onload=alert() class={cm}>"),
+            format!("<svg onload=\"void(0)\" class=\"{cm}\"></svg>"),
+            false,
+        ),
+        (
+            "breakout_class_first_full",
+            format!("'\"><svg/class={cm} onload=alert()//"),
+            format!("<svg class=\"{cm}\" onload=\"alert()//\"></svg>"),
+            true,
+        ),
+        (
+            "breakout_class_first_truncated",
+            format!("'\"><svg/class={cm} onload=alert()//"),
+            format!("<svg class=\"{cm}\"></svg>"),
+            false,
+        ),
+        (
+            "img_onerror_full",
+            format!("<img src=x onerror=alert(1) class={cm}>"),
+            format!("<img src=x onerror=alert(1) class=\"{cm}\">"),
+            true,
+        ),
+        (
+            "img_onerror_stripped",
+            format!("<img src=x onerror=alert(1) class={cm}>"),
+            format!("<img src=x class=\"{cm}\">"),
+            false,
+        ),
+        // ── script-body template: sink lives in the <script> body ──
+        (
+            "script_body_full",
+            format!("<script class={cm}>alert(1)</script>"),
+            format!("<script class=\"{cm}\">alert(1)</script>"),
+            true,
+        ),
+        (
+            "script_body_emptied",
+            format!("<script class={cm}>alert(1)</script>"),
+            format!("<script class=\"{cm}\"></script>"),
+            false,
+        ),
+        // ── marker placement / parsing edge cases ──
+        (
+            "marker_among_multiple_classes",
+            format!("<svg onload=alert() class={cm}>"),
+            format!("<svg onload=alert() class=\"a {cm} b\"></svg>"),
+            true,
+        ),
+        (
+            "marker_as_text_only_no_element",
+            format!("<svg onload=alert() class={cm}>"),
+            format!("<p>blocked input: class={cm} onlo...</p>"),
+            false,
+        ),
+        (
+            "multiple_markers_one_carries_handler",
+            format!("<svg onload=alert() class={cm}>"),
+            format!("<svg class=\"{cm}\"></svg><svg onload=alert() class=\"{cm}\"></svg>"),
+            true,
+        ),
+        // ── structural markers: presence is the exploit, no sink to verify ──
+        (
+            "structural_base_id",
+            format!("<base href=//evil/ id={im}>"),
+            format!("<base href=\"//evil/\" id=\"{im}\">"),
+            true,
+        ),
+        (
+            "structural_clobber_form",
+            format!(
+                "<form id={im} class={cm}><input name=action value=\"javascript:alert(1)\"></form>"
+            ),
+            format!(
+                "<form id=\"{im}\" class=\"{cm}\"><input name=action value=\"javascript:alert(1)\"></form>"
+            ),
+            true,
+        ),
+        // ── legacy `dalfox` marker ──
+        (
+            "legacy_dalfox_full",
+            "<img class=dalfox src=x onerror=alert(1)>".to_string(),
+            "<img class=\"dalfox\" src=x onerror=alert(1)>".to_string(),
+            true,
+        ),
+        (
+            "legacy_dalfox_stripped",
+            "<img class=dalfox src=x onerror=alert(1)>".to_string(),
+            "<img class=\"dalfox\">".to_string(),
+            false,
+        ),
+        // ── server uppercases every reflected byte (ASCII case-fold) ──
+        (
+            "casefold_handler_survives",
+            format!("<img src=x onerror=alert(1) class={cm}>"),
+            format!("<IMG SRC=X ONERROR=ALERT(1) CLASS=\"{up}\">"),
+            true,
+        ),
+        (
+            "casefold_handler_stripped",
+            format!("<img src=x onerror=alert(1) class={cm}>"),
+            format!("<IMG CLASS=\"{up}\">"),
+            false,
+        ),
+        // ── WAF-bypass: entity-encoded sink decodes to a live handler ──
+        (
+            "entity_encoded_sink_survives",
+            format!("<svg onload=alert&#40;1&#41; class={cm}>"),
+            format!("<svg onload=\"alert(1)\" class=\"{cm}\"></svg>"),
+            true,
+        ),
+        // numeric hex entity form in the sink value (tests shared decoder recovery)
+        (
+            "entity_encoded_sink_numeric_hex",
+            format!("<svg onload=alert&#x28;1&#x29; class={cm}>"),
+            format!("<svg onload=\"alert(1)\" class=\"{cm}\"></svg>"),
+            true,
+        ),
+        // server emitted uppercase named entity in handler value; DOM decoder + value_carries must recover
+        (
+            "entity_encoded_sink_upper_named_in_value",
+            format!("<img src=x onerror=alert(1) class={cm}>"),
+            format!("<img src=x onerror=\"ALERT&#40;1&#41;\" class=\"{cm}\">"),
+            true,
+        ),
+    ];
+
+    for (name, payload, body, expected) in cases {
+        assert_eq!(
+            has_marker_evidence(&payload, &body),
+            expected,
+            "case `{name}`: payload={payload:?} body={body:?}"
+        );
+    }
+}
+
+/// Exercise the shared fixtures reflect() helper + both decoders (reflection
+/// classify + DOM classify_dom_evidence / has_html_structural) on a
+/// structural payload whose handler value uses entity encoding (WAF bypass
+/// style). The DOM decoder must turn the payload's &#40; into ( so the
+/// "sink value verbatim in payload or its decode" check passes against the
+/// parsed attr. Cross-checks decoder unification + fixture usage.
+#[test]
+fn test_fixtures_reflect_entity_structural_roundtrip_with_decoders() {
+    use crate::scanning::dom_evidence_fixtures::{Transform, reflect};
+    // Structural tag payload with entity-encoded parens inside the handler
+    // (common WAF-bypass shape). Full reflect: server echoes the syntax raw.
+    let payload = "<svg onload=alert&#40;1&#41;>".to_string();
+    let body = reflect(&payload, Transform::Full, "<div>reflected: {PAYLOAD}</div>");
+    // has_html_structural will parse the body (creating <svg> with onload="alert(1)"),
+    // then require that "alert(1)" appears in payload or (more relevant here)
+    // in decode_html_entities(payload). The shared decoder must succeed.
+    assert!(
+        crate::scanning::check_dom_verification::has_dom_evidence(&payload, &body),
+        "structural with entity-encoded sink value in payload must yield DOM evidence via decoder"
+    );
+    let kind = crate::scanning::check_reflection::classify_reflection(&body, &payload);
+    assert!(kind.is_some(), "must still classify as a reflection");
+}
+
+#[test]
+fn test_has_executable_url_attribute_evidence_detects_iframe_src_protocol() {
+    let payload = "javascript:alert(1)";
+    let body = "<html><body><iframe src=\"javascript:alert(1)\"></iframe></body></html>";
+    assert!(has_dom_evidence(payload, body));
+}
+
+/// The server-side template often appends bytes around the reflected
+/// payload (a trailing comment, a serialized `&next=…`, an HTML entity).
+/// Browsers parse the entire attribute value as one URL, so when the value
+/// still *starts* with an executable scheme and the payload bytes appear
+/// verbatim inside it, the navigation still fires. The previous strict
+/// equality check rejected these, costing real findings.
+#[test]
+fn test_has_executable_url_attribute_evidence_with_trailing_bytes() {
+    let payload = "javascript:alert(1)";
+    let body = "<html><body><a href=\"javascript:alert(1)//&next=/home\">go</a></body></html>";
+    assert!(
+        has_dom_evidence(payload, body),
+        "trailing bytes after the reflected javascript: URL must still verify"
+    );
+}
+
+#[test]
+fn test_has_executable_url_attribute_evidence_not_a_substring_match() {
+    // Page already had its own javascript: URL; our payload appears nowhere
+    // inside the attribute value. Must NOT count as evidence.
+    let payload = "javascript:alert(1)";
+    let body = "<html><body><a href=\"javascript:console.log('hi')\">x</a></body></html>";
+    assert!(
+        !has_dom_evidence(payload, body),
+        "an unrelated javascript: URL must not verify our payload"
+    );
+}
+
+#[test]
+fn test_has_dom_evidence_skips_parse_for_irrelevant_payload() {
+    // Payload has neither Dalfox markers nor an executable URL protocol,
+    // so has_dom_evidence should short-circuit to false without parsing.
+    let payload = "plain alphanumeric";
+    let body = "<html><body>irrelevant</body></html>";
+    assert!(!has_dom_evidence(payload, body));
+}
+
+#[test]
+fn test_has_dom_evidence_combines_marker_and_protocol_checks() {
+    // Marker-bearing payload passes via the marker branch even when the
+    // payload is not an executable URL protocol.
+    let class_marker = crate::scanning::markers::class_marker();
+    let payload = format!("<img class=\"{}\">", class_marker);
+    let body = format!("<html><body><img class=\"{}\"></body></html>", class_marker);
+    assert!(has_dom_evidence(&payload, &body));
+}
+
+#[test]
+fn test_has_dom_evidence_via_js_context_breakout() {
+    // Mirrors brutelogic c3 / c4: payload introduces a real alert call
+    // inside a JS string-context reflection. No marker, no executable URL,
+    // but the JS-context AST verifier should accept it.
+    let payload = "\"-alert(1)-\"";
+    let body = format!(
+        "<html><body><script>var c2 = \"{}\";</script></body></html>",
+        payload
+    );
+    assert!(has_dom_evidence(payload, &body));
+}
+
+#[test]
+fn test_has_dom_evidence_rejects_inert_js_string_payload() {
+    // A payload that just becomes plain string text inside a JS literal
+    // has no exploit potential — must not be treated as evidence.
+    let payload = "\"hello\"";
+    let body = format!(
+        "<html><body><script>var x = \"{}\";</script></body></html>",
+        payload
+    );
+    assert!(!has_dom_evidence(payload, &body));
+}
+
+#[test]
+fn test_has_dom_evidence_html_struct_svg_onload() {
+    // No Dalfox marker in the payload but the parsed DOM contains a real
+    // svg element with onload="alert(1)" introduced by the injection.
+    let payload = "<svg/onload=alert(1)>";
+    let body = format!("<html><body>hello {}</body></html>", payload);
+    assert!(has_dom_evidence(payload, &body));
+}
+
+#[test]
+fn test_has_dom_evidence_html_struct_img_onerror() {
+    let payload = "<img src=x onerror=prompt(1)>";
+    let body = format!("<html><body>{}</body></html>", payload);
+    assert!(has_dom_evidence(payload, &body));
+}
+
+#[test]
+fn test_has_dom_evidence_html_struct_script_body() {
+    let payload = "<script>alert(1)</script>";
+    let body = format!("<html><body>{}</body></html>", payload);
+    assert!(has_dom_evidence(payload, &body));
+}
+
+#[test]
+fn test_has_dom_evidence_html_struct_ignores_pre_existing_handler() {
+    // The page already had <body onload="alert(1)">. The payload doesn't
+    // contain that attribute string, so the structural check must NOT
+    // claim evidence.
+    let payload = "harmless";
+    let body = "<html><body onload=\"alert(1)\">harmless</body></html>";
+    assert!(!has_dom_evidence(payload, body));
+}
+
+#[test]
+fn test_has_dom_evidence_html_struct_requires_sink_call() {
+    // Payload reflects as a real element with an event handler, but the
+    // handler value doesn't reference any sink — not actionable XSS.
+    let payload = "<div onmouseover=foo()>";
+    let body = format!("<html><body>{}</body></html>", payload);
+    assert!(!has_dom_evidence(payload, &body));
+}
+
+#[test]
+fn test_has_dom_evidence_html_struct_ignores_text_only_reflection() {
+    // Server entity-encoded `<` so the payload renders as text, not as
+    // a parsed element. scraper produces no svg element — no evidence.
+    let payload = "<svg/onload=alert(1)>";
+    let body = "<html><body>hello &lt;svg/onload=alert(1)&gt;</body></html>";
+    assert!(!has_dom_evidence(payload, body));
+}
+
+#[test]
+fn test_classify_dom_evidence_returns_marker() {
+    let class_marker = crate::scanning::markers::class_marker();
+    let payload = format!("<img class=\"{}\">", class_marker);
+    let body = format!("<html><body><img class=\"{}\"></body></html>", class_marker);
+    assert_eq!(
+        classify_dom_evidence(&payload, &body),
+        Some(DomEvidenceKind::Marker)
+    );
+}
+
+#[test]
+fn test_classify_dom_evidence_returns_html_structural() {
+    let payload = "<svg/onload=alert(1)>";
+    let body = format!("<html><body>{}</body></html>", payload);
+    assert_eq!(
+        classify_dom_evidence(payload, &body),
+        Some(DomEvidenceKind::HtmlStructural)
+    );
+}
+
+#[test]
+fn test_classify_dom_evidence_returns_js_context() {
+    let payload = "\"-alert(1)-\"";
+    let body = format!(
+        "<html><body><script>var c2 = \"{}\";</script></body></html>",
+        payload
+    );
+    assert_eq!(
+        classify_dom_evidence(payload, &body),
+        Some(DomEvidenceKind::JsContext)
+    );
+}
+
+#[test]
+fn test_classify_dom_evidence_returns_inline_handler_breakout() {
+    // xss-game L4 shape: server emits `<img onload="startTimer('USER')">`,
+    // the browser decodes the `&#39;` HTML entity at attribute-parse
+    // time, so the handler becomes `startTimer('';-alert(1)-'')` and
+    // the alert fires.
+    let payload = "'-alert(1)-'";
+    let body = "<img onload=\"startTimer('&#39;-alert(1)-&#39;');\">".to_string();
+    assert_eq!(
+        classify_dom_evidence(payload, &body),
+        Some(DomEvidenceKind::InlineHandlerBreakout)
+    );
+}
+
+#[test]
+fn test_inline_handler_breakout_ignores_short_payload_substring_match() {
+    // A short payload like `'` or `");` will accidentally match the
+    // bytes of any page-defined `onclick="alert('hi')"` — the strict
+    // `contains(payload)` check alone isn't enough. The length floor
+    // (MIN_INLINE_HANDLER_BREAKOUT_PAYLOAD_LEN) keeps short payloads
+    // from auto-upgrading R to V.
+    let payload = "');";
+    let body = "<button onclick=\"alert('hi');\">Click</button>".to_string();
+    assert_eq!(classify_dom_evidence(payload, &body), None);
+}
+
+#[test]
+fn test_inline_handler_breakout_ignores_unrelated_alert_in_handler() {
+    // Page-defined `onclick="alert('hi')"` shares the `alert(`
+    // substring with the payload list. Without the
+    // `attr_value.contains(payload)` strictness check we'd false-V
+    // every reflection. Confirm the strict check holds.
+    let payload = "'-alert(1)-'";
+    let body = "<button onclick=\"alert('hi')\">Click</button>".to_string();
+    assert_eq!(classify_dom_evidence(payload, &body), None);
+}
+
+#[test]
+fn test_inline_handler_breakout_ignores_payload_inside_js_string() {
+    // The server JS-escapes and HTML-escapes the input into a single-quoted
+    // argument: after attribute decoding the handler is
+    // `startTimer('</script><svg onload=alert(1) class=x>')` — the payload
+    // (and its `alert(`) is inert string content. Previously reported [V].
+    let payload = "</script><svg onload=alert(1) class=dlx0000>";
+    let body = "<img src=x onload=\"startTimer('&lt;/script&gt;&lt;svg onload=alert(1) class=dlx0000&gt;')\">";
+    assert_eq!(classify_dom_evidence(payload, body), None);
+
+    // A `"` payload inside the template's `'…'` string never closes it.
+    let payload = "\"-alert(1)-\"";
+    let body = "<img src=x onload=\"startTimer('&quot;-alert(1)-&quot;')\">";
+    assert_eq!(classify_dom_evidence(payload, body), None);
+}
+
+#[test]
+fn test_inline_handler_breakout_does_not_double_decode_entities() {
+    // `&amp;#39;` reaches the JS engine as the literal text `&#39;`, so the
+    // quote never closes the string.
+    let payload = "'-alert(1)-'";
+    let body = "<img onload=\"startTimer('&amp;#39;-alert(1)-&amp;#39;')\">";
+    assert_eq!(classify_dom_evidence(payload, body), None);
+}
+
+#[test]
+fn test_inline_handler_breakout_parses_handler_as_function_body() {
+    // Handler bodies may `return`; that must not read as a parse error.
+    let payload = "'-alert(1)-'";
+    let body = "<a href=# onclick=\"return go('&#39;-alert(1)-&#39;')\">x</a>";
+    assert_eq!(
+        classify_dom_evidence(payload, body),
+        Some(DomEvidenceKind::InlineHandlerBreakout)
+    );
+}
+
+#[test]
+fn test_classify_dom_evidence_returns_executable_url() {
+    let payload = "javascript:alert(1)";
+    let body = format!("<html><body><a href=\"{}\">x</a></body></html>", payload);
+    assert_eq!(
+        classify_dom_evidence(payload, &body),
+        Some(DomEvidenceKind::ExecutableUrl)
+    );
+}
+
+#[test]
+fn test_classify_dom_evidence_realworld_marker_in_comment_and_body() {
+    // xssmaze /realworld/level1 reflects the query twice: once with angles
+    // stripped inside an HTML comment, and once raw inside `<h2>`. With
+    // the standard marker-bearing payload, the marker should be found in
+    // the parsed DOM. Pinning this regression: dalfox previously reported
+    // only R against this shape (3045 R-only on deep-scan).
+    let class_marker = crate::scanning::markers::class_marker();
+    let payload = format!("<svg/onload=alert(1) class={}>", class_marker);
+    let body = format!(
+        "<!-- search: svg/onload=alert(1) class={} --><h2>Results for: {}</h2>",
+        class_marker, payload
+    );
+    assert!(
+        has_dom_evidence(&payload, &body),
+        "marker carried on a <svg> inside <h2> must be detected as DOM evidence; \
+         current behavior on /realworld/level1 was 'R only'"
+    );
+}
+
+#[test]
+fn test_classify_dom_evidence_comment_breakout() {
+    // xssmaze /realworld/level1 shape: payload reflects raw inside a
+    // following <h2>, and via a comment-breakout sequence
+    // (--><payload><!--) the comment is closed mid-page. After parsing,
+    // the introduced <svg onload=…> element should fire structural
+    // evidence. Pinning this here flagged the gap where dalfox surfaced
+    // only R despite the payload trivially producing a sink element.
+    let payload = "--><svg/onload=alert(1)><!--";
+    let body = format!(
+        "<!-- search: {} --><h2>Results for: {}</h2>",
+        payload, payload
+    );
+    assert_eq!(
+        classify_dom_evidence(payload, &body),
+        Some(DomEvidenceKind::HtmlStructural),
+        "comment-breakout payload that introduces <svg onload=alert(1)> \
+         must classify as structural HTML evidence"
+    );
+}
+
+#[test]
+fn test_classify_dom_evidence_returns_none_for_inert() {
+    let payload = "harmless";
+    let body = "<html><body>harmless</body></html>";
+    assert_eq!(classify_dom_evidence(payload, body), None);
+}
+
+#[test]
+fn test_has_dom_evidence_html_struct_skipped_for_json_body() {
+    // Browsers don't render application/json as HTML, so even though
+    // scraper happily parses `{"echo":"<script>alert(1)</script>"}` and
+    // finds a script element, this is not exploitable in real conditions.
+    let payload = "<script>alert(1)</script>";
+    let body = "{\"echo\":\"<script>alert(1)</script>\"}";
+    assert!(
+        !has_dom_evidence(payload, body),
+        "JSON-shaped body should not yield structural HTML evidence"
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_accepts_executable_url_attribute_protocol() {
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/url-attribute");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, "javascript:alert(1)", &args).await;
+
+    assert!(
+        found,
+        "javascript: payloads reflected into iframe src should verify"
+    );
+    assert!(
+        body.unwrap_or_default()
+            .contains("iframe src=\"javascript:alert(1)\"")
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_accepts_decoded_payload_variant_with_marker() {
+    let payload = crate::encoding::url_encode(&format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    ));
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/decoded");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(
+        found,
+        "decoded payload variants with DOM markers should verify"
+    );
+    assert!(
+        body.unwrap_or_default()
+            .contains(crate::scanning::markers::class_marker())
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_rejects_javascript_url_in_img_src() {
+    // `<img src="javascript:alert(1)">` is structurally not exploitable —
+    // browsers refuse the scheme on img@src. Verification must not fire.
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/url-attribute-img");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, _body) = dom_verify(&target, &param, "javascript:alert(1)", &args).await;
+    assert!(
+        !found,
+        "javascript: scheme reflected into img@src must not be a verified finding"
+    );
+}
+
+#[tokio::test]
+async fn test_check_dom_verification_skips_body_on_redirect_response() {
+    // A 307 whose body echoes the payload — body has marker, looks like
+    // text/html, would satisfy DOM evidence if naively parsed. Browsers
+    // never render a 3xx body, so verification must short-circuit on the
+    // redirect status without consulting the body.
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/redirect-body");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (found, body) = dom_verify(&target, &param, &payload, &args).await;
+    assert!(
+        !found,
+        "DOM evidence in a 3xx response body must not be treated as verified"
+    );
+    assert!(body.is_none(), "no body should be returned for redirects");
+}
+
+/// Issue #1156: a 3xx redirect outcome must report `reflected == false` and the
+/// 3xx status (not blocking), so a redirect-every-payload endpoint neither
+/// accrues the inert-echo budget nor the blocked streak (it just runs the set).
+#[tokio::test]
+async fn test_dom_outcome_redirect_is_not_reflected_and_threads_3xx_status() {
+    let payload = format!(
+        "<img src=x onerror=alert(1) class={}>",
+        crate::scanning::markers::class_marker()
+    );
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/dom/redirect-body");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+
+    let outcome = check_dom_verification_with_evidence(&client, &target, &param, &payload, &args)
+        .await
+        .outcome;
+    assert!(!outcome.verified, "a 3xx body must not verify");
+    assert!(
+        !outcome.reflected,
+        "a redirect must not be flagged reflected (body is never rendered)"
+    );
+    assert_eq!(outcome.status, 307, "the 3xx status must be threaded out");
+    assert!(outcome.response_text.is_none());
+}
+
+#[test]
+fn test_is_executable_url_attribute_pin_whitelist() {
+    // Pin the (element, attribute) pairs that browsers actually dereference
+    // as code. xssmaze /mediacontext exercises src reflections on every media
+    // element; verification must NOT promote those to V, while the genuine
+    // navigation/frame-load/submit pairs must keep doing so. Any change to
+    // the whitelist surfaces here instead of silently flipping behavior.
+
+    // Should be exec URL contexts (V allowed):
+    for (tag, attr) in [
+        ("a", "href"),
+        ("area", "href"),
+        ("base", "href"),
+        ("link", "href"),
+        ("iframe", "src"),
+        ("embed", "src"),
+        ("frame", "src"),
+        ("iframe", "srcdoc"),
+        ("object", "data"),
+        ("form", "action"),
+        ("input", "formaction"),
+        ("button", "formaction"),
+        ("a", "xlink:href"),
+        ("use", "xlink:href"),
+        // Case insensitivity guarantee
+        ("A", "HREF"),
+        ("IFRAME", "Src"),
+    ] {
+        assert!(
+            is_executable_url_attribute(tag, attr),
+            "{tag}@{attr} must be a verified-V exec URL context"
+        );
+    }
+
+    // Resource-fetch / inert pairs (V forbidden — only R should fire):
+    for (tag, attr) in [
+        ("img", "src"),
+        ("audio", "src"),
+        ("video", "src"),
+        ("source", "src"),
+        ("script", "src"),
+        ("track", "src"),
+        // Other innocuous combinations
+        ("img", "alt"),
+        ("a", "target"),
+        ("div", "data-href"),
+        ("link", "rel"),
+        ("meta", "content"),
+        ("iframe", "name"),
+    ] {
+        assert!(
+            !is_executable_url_attribute(tag, attr),
+            "{tag}@{attr} must NOT be treated as exec URL context"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Payload × transform matrices (issue #1124)
+//
+// The marker-evidence matrix lives with the #1118/#1123 handler-survival fix.
+// These tables extend the same pattern to the *other* DOM-evidence kinds —
+// executable-URL attribute, HTML-structural, and inline-handler breakout — so
+// each kind is exercised against bodies produced by an explicit, reviewable
+// server transform (`reflect(payload, Transform, sink)`) rather than ad-hoc
+// hand-written HTML. Every row documents "what the server did", and the
+// expected verdict is checked against that transform.
+// ---------------------------------------------------------------------------
+use crate::scanning::dom_evidence_fixtures::{Transform, reflect};
+
+#[test]
+fn test_executable_url_evidence_matrix() {
+    // Payload is a bare `javascript:` URL; the sink template decides the
+    // reflection context (navigational vs resource-fetch attribute).
+    let payload = "javascript:alert(1)";
+    let nav = r#"<html><body><a href="{PAYLOAD}">go</a></body></html>"#;
+    let img = r#"<html><body><img src="{PAYLOAD}"></body></html>"#;
+
+    // (label, transform, sink, expected_kind) — pin the exact evidence path so
+    // a regression that confirms via the wrong kind is caught, not just masked.
+    let hit = Some(DomEvidenceKind::ExecutableUrl);
+    let cases: &[(&str, Transform, &str, Option<DomEvidenceKind>)] = &[
+        ("full reflect into a@href", Transform::Full, nav, hit),
+        // HTML-entity encoding does NOT defang a scheme with no markup
+        // metacharacters — the href still navigates. URL/percent encoding is
+        // the real defence here.
+        (
+            "entity-encoded into a@href",
+            Transform::EntityEncoded,
+            nav,
+            hit,
+        ),
+        // Percent-encoding breaks the `:` so it is no longer a URL scheme.
+        (
+            "percent-encoded into a@href",
+            Transform::PercentEncoded,
+            nav,
+            None,
+        ),
+        // Schemes are matched case-insensitively, mirroring the browser.
+        ("case-folded into a@href", Transform::CaseFolded, nav, hit),
+        // Truncated before `(` — the full payload no longer appears in the value.
+        (
+            "truncated at '(' into a@href",
+            Transform::TruncatedAt("("),
+            nav,
+            None,
+        ),
+        // Same scheme, reflected into a resource-fetch attribute the browser
+        // never executes as code: the "sink" is not actually a sink.
+        ("full reflect into img@src", Transform::Full, img, None),
+    ];
+
+    for (label, transform, sink, expected) in cases {
+        let body = reflect(payload, *transform, sink);
+        assert_eq!(
+            classify_dom_evidence(payload, &body),
+            *expected,
+            "executable-URL matrix row `{label}` mismatched on body: {body}"
+        );
+    }
+}
+
+#[test]
+fn test_html_structural_evidence_matrix() {
+    // Payload introduces a real element carrying an event-handler sink.
+    let payload = "<svg onload=alert(1)>";
+    let text_sink = "<html><body>results: {PAYLOAD}</body></html>";
+
+    let hit = Some(DomEvidenceKind::HtmlStructural);
+    let cases: &[(&str, Transform, Option<DomEvidenceKind>)] = &[
+        ("full reflect", Transform::Full, hit),
+        // Element survives but the handler that carried the sink is gone.
+        ("handler stripped", Transform::HandlerStripped, None),
+        // Handler attribute present but emptied — no sink call.
+        ("handler blanked", Transform::HandlerBlanked, None),
+        // Angle brackets escaped → inert text, scraper builds no <svg> element.
+        ("entity encoded", Transform::EntityEncoded, None),
+        // Percent escapes are not decoded by the HTML parser → inert text.
+        ("percent encoded", Transform::PercentEncoded, None),
+        // `ALERT` is a distinct (undefined) identifier; JS is case-sensitive.
+        ("case folded", Transform::CaseFolded, None),
+        // Truncated before the handler — element with no usable handler.
+        (
+            "truncated before handler",
+            Transform::TruncatedAt("onload"),
+            None,
+        ),
+    ];
+
+    for (label, transform, expected) in cases {
+        let body = reflect(payload, *transform, text_sink);
+        assert_eq!(
+            classify_dom_evidence(payload, &body),
+            *expected,
+            "html-structural matrix row `{label}` mismatched on body: {body}"
+        );
+    }
+}
+
+#[test]
+fn test_inline_handler_breakout_evidence_matrix() {
+    // xss-game L4 shape: the server's own template wraps the reflected payload
+    // inside an existing `on*` handler's JS string argument.
+    let payload = "'-alert(1)-'";
+    let handler_sink = r#"<img onload="startTimer('{PAYLOAD}')">"#;
+    // A non-handler reflection context (server emits no `on*` attribute).
+    let text_sink = "<div>startTimer('{PAYLOAD}')</div>";
+
+    let hit = Some(DomEvidenceKind::InlineHandlerBreakout);
+    let cases: &[(&str, Transform, &str, Option<DomEvidenceKind>)] = &[
+        // Raw reflection: the single quotes break the JS string immediately.
+        (
+            "full reflect into on-handler",
+            Transform::Full,
+            handler_sink,
+            hit,
+        ),
+        // Server entity-encodes the quote, but the browser decodes `&#39;` at
+        // attribute-parse time, so the breakout still fires (the L4 lesson).
+        (
+            "entity-encoded quote in on-handler",
+            Transform::EntityEncoded,
+            handler_sink,
+            hit,
+        ),
+        // Percent escapes stay literal in an HTML attribute → no breakout.
+        (
+            "percent-encoded quote in on-handler",
+            Transform::PercentEncoded,
+            handler_sink,
+            None,
+        ),
+        // `ALERT` is not the real sink under case-sensitive JS.
+        (
+            "case-folded in on-handler",
+            Transform::CaseFolded,
+            handler_sink,
+            None,
+        ),
+        // No `on*` attribute at all → nothing to break out of.
+        (
+            "reflected outside any handler",
+            Transform::Full,
+            text_sink,
+            None,
+        ),
+    ];
+
+    for (label, transform, sink, expected) in cases {
+        let body = reflect(payload, *transform, sink);
+        assert_eq!(
+            classify_dom_evidence(payload, &body),
+            *expected,
+            "inline-handler matrix row `{label}` mismatched on body: {body}"
+        );
+    }
+}
+
+#[test]
+fn html_structural_evidence_matches_entity_encoded_payload() {
+    // WAF-bypass payloads entity-encode the sink chars (`alert&#40;1&#41;`), but
+    // scraper decodes the parsed attribute back to `alert(1)`. The containment
+    // check must compare against the entity-decoded payload too, otherwise a
+    // genuine breakout is downgraded from Verified to Reflected.
+    let payload = "<svg onload=alert&#40;1&#41; class=dalfox>";
+    let doc = scraper::Html::parse_document(r#"<svg onload="alert(1)" class="dalfox"></svg>"#);
+    assert!(
+        has_html_structural_evidence_in_doc(payload, &doc),
+        "entity-encoded payload should still match the decoded attribute value"
+    );
+}
+
+// ── Issue #1183: on* handlers never fire on <input type="hidden"> ──────────
+//
+// A hidden input has no rendered box: it cannot be hovered, focused, or
+// clicked, and it loads no resource, so any injected `on*` handler is inert.
+// DOM verification must not upgrade such reflections to [V]; they remain [R].
+
+/// The exact reported false positive: an attribute-injection payload lands a
+/// marker class + `onmouseover` onto a pre-existing `<input type="hidden">`.
+/// This slips past the #1118 gate (the bare payload forms no element), so it
+/// reached the presence-only marker branch and verified. It must now be inert.
+#[test]
+fn test_1183_marker_handler_on_hidden_input_not_evidence() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("\" onmouseover=alert(1) class={} x=\"", marker);
+    let body = format!(
+        "<html><body><input type=\"hidden\" id=\"url\" value=\"{}\"></body></html>",
+        payload
+    );
+    assert!(
+        !has_marker_evidence(&payload, &body),
+        "onmouseover on a hidden input never fires; must not be marker evidence"
+    );
+    assert_eq!(
+        classify_dom_evidence(&payload, &body),
+        None,
+        "the reported FP must classify as no DOM evidence (downgrades V -> R)"
+    );
+}
+
+/// `type` is matched case-insensitively, so `type=HIDDEN` is still suppressed.
+#[test]
+fn test_1183_marker_handler_on_uppercase_hidden_input_not_evidence() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("\" onmouseover=alert(1) class={} x=\"", marker);
+    let body = format!(
+        "<html><body><input TYPE=\"HIDDEN\" value=\"{}\"></body></html>",
+        payload
+    );
+    assert_eq!(classify_dom_evidence(&payload, &body), None);
+}
+
+/// A server that case-folds the *entire* reflected value — marker, handler
+/// name, and sink — into upper case must still be recognised as a hidden-input
+/// handler and suppressed. Both the marker match (`element_class_has`) and the
+/// sink match (`value_carries_js_sink`) are ASCII case-fold, so a reflection
+/// like `CLASS=DLX… ONMOUSEOVER=ALERT(1)` is still inert.
+#[test]
+fn test_1183_marker_handler_on_case_folded_hidden_input_not_evidence() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("\" onmouseover=alert(1) class={} x=\"", marker);
+    let reflected = format!(
+        "\" ONMOUSEOVER=ALERT(1) CLASS={} X=\"",
+        marker.to_uppercase()
+    );
+    let body = format!(
+        "<html><body><input TYPE=\"HIDDEN\" VALUE=\"{}\"></body></html>",
+        reflected
+    );
+    assert_eq!(
+        classify_dom_evidence(&payload, &body),
+        None,
+        "a fully case-folded reflection on a hidden input must still suppress [V]"
+    );
+}
+
+/// FN guard: the genuine tag-breakout alternative on the same parameter lands
+/// the marker on a NEW rendered `<svg>` (self-executing). A hidden input next
+/// to it must not suppress the real finding.
+#[test]
+fn test_1183_marker_kept_for_tag_breakout_beside_hidden_input() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("\"><svg/onload=alert(1) class={}>", marker);
+    let body = format!(
+        "<html><body><input type=\"hidden\" value=\"\">\
+         <svg onload=\"alert(1)\" class=\"{}\"></svg>\"></body></html>",
+        marker
+    );
+    assert!(
+        has_marker_evidence(&payload, &body),
+        "marker on a rendered svg must stay evidence even with a hidden input present"
+    );
+}
+
+/// FN guard: an `on*` handler injected onto a VISIBLE input (`type=text`) does
+/// fire on hover/focus, so it must stay verified.
+#[test]
+fn test_1183_marker_kept_for_visible_input_handler() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("\" onmouseover=alert(1) class={} x=\"", marker);
+    let body = format!(
+        "<html><body><input type=\"text\" value=\"{}\"></body></html>",
+        payload
+    );
+    assert!(
+        has_marker_evidence(&payload, &body),
+        "onmouseover on a visible text input fires; must stay marker evidence"
+    );
+}
+
+/// FN guard: a bare hidden input carrying only the marker (no `on*` handler) is
+/// a structural marker (its only conceivable exploit is DOM clobbering). It has
+/// no firing handler to suppress, so presence-only evidence is preserved — same
+/// treatment as <base>/<form> structural markers.
+#[test]
+fn test_1183_marker_kept_for_structural_hidden_input_without_handler() {
+    let id = crate::scanning::markers::id_marker();
+    let payload = format!("<input type=hidden id={} name=evil_var>", id);
+    let body = format!(
+        "<html><body><input type=\"hidden\" id=\"{}\" name=\"evil_var\"></body></html>",
+        id
+    );
+    assert!(
+        has_marker_evidence(&payload, &body),
+        "a handler-less hidden-input marker is structural and must stay evidence"
+    );
+}
+
+/// FN guard: when the marker rides on BOTH a hidden input and a visible
+/// element, "every marker element is a hidden input" is false, so the finding
+/// is kept (the visible element can execute).
+#[test]
+fn test_1183_marker_kept_when_on_both_hidden_and_visible() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("<svg onload=alert(1) class={}>", marker);
+    let body = format!(
+        "<html><body><div class=\"{}\">x</div>\
+         <input type=\"hidden\" onmouseover=alert(1) class=\"{}\"></body></html>",
+        marker, marker
+    );
+    assert!(
+        has_marker_evidence(&payload, &body),
+        "a marker also present on a rendered element must stay evidence"
+    );
+}
+
+/// Path B (HtmlStructural): a no-marker payload that forms a hidden input with
+/// an `on*` handler must not be HtmlStructural evidence.
+#[test]
+fn test_1183_html_structural_handler_on_hidden_input_not_evidence() {
+    let payload = "<input type=hidden onmouseover=alert(1)>";
+    let body = format!("<html><body>{}</body></html>", payload);
+    assert_eq!(
+        classify_dom_evidence(payload, &body),
+        None,
+        "onmouseover on a hidden input is inert; HtmlStructural must not fire"
+    );
+}
+
+/// Path B FN guard: the same handler on a visible input stays HtmlStructural.
+#[test]
+fn test_1183_html_structural_handler_on_visible_input_is_evidence() {
+    let payload = "<input type=text onmouseover=alert(1)>";
+    let body = format!("<html><body>{}</body></html>", payload);
+    assert_eq!(
+        classify_dom_evidence(payload, &body),
+        Some(DomEvidenceKind::HtmlStructural),
+        "onmouseover on a visible input fires; must stay HtmlStructural evidence"
+    );
+}
+
+/// Path C (InlineHandlerBreakout): breaking into a server handler that sits on
+/// a hidden input is inert. The visible-element counterpart is covered by
+/// `test_classify_dom_evidence_returns_inline_handler_breakout`.
+#[test]
+fn test_1183_inline_breakout_on_hidden_input_not_evidence() {
+    let payload = "'-alert(1)-'";
+    let body = "<input type=hidden onfocus=\"startTimer('&#39;-alert(1)-&#39;');\">".to_string();
+    assert_eq!(
+        classify_dom_evidence(payload, &body),
+        None,
+        "an inline breakout on a hidden input never fires"
+    );
+}
+
+// ── Bare attribute-injection payloads whose handler is swallowed ───────────
+//
+// An attribute-injection payload forms no element of its own, so the #1118
+// gate (which parses the payload) finds nothing to inspect. When the payload
+// lands inside a *quoted* attribute value the server already wrote, the
+// injected `on*=` is absorbed into that value while a later `id=`/`class=`
+// still tokenizes into a real attribute — the marker rides a live element
+// that executes nothing. Observed against xssmaze `/inlinestyle/level2`,
+// `/multicontext/level2`, `/multireflect/level2`, `/partial-encode/level1`,
+// `/data-attribute/level2`, `/tagattrmix/level6`.
+
+/// The reported shape: the payload's `onmouseover` is swallowed by the
+/// pre-existing double-quoted `style` value; only `id=` escapes as a real
+/// attribute, so the `<p>` carries the marker but no handler.
+#[test]
+fn test_bare_attr_handler_swallowed_by_quoted_value_not_evidence() {
+    let marker = crate::scanning::markers::id_marker();
+    let payload = format!("'/onmouseover=\"alert(1)\"/id=\"{}\"/x='", marker);
+    let body = format!(
+        "<html><body><p style=\"background-image: url('{}')\">text</p></body></html>",
+        payload
+    );
+    assert!(
+        !has_marker_evidence(&payload, &body),
+        "the payload's handler was absorbed into the style value; the marker alone is not evidence"
+    );
+    assert_eq!(
+        classify_dom_evidence(&payload, &body),
+        None,
+        "the reported FP must classify as no DOM evidence (downgrades V -> R)"
+    );
+}
+
+/// The `<a href="…">` variant of the same shape (xssmaze
+/// `/multicontext/level2`): `href` eats the handler, `id=` survives.
+#[test]
+fn test_bare_attr_handler_swallowed_by_href_value_not_evidence() {
+    let marker = crate::scanning::markers::id_marker();
+    let payload = format!("x/onmouseover=\"alert(1)\"/id=\"{}\"/", marker);
+    let body = format!(
+        "<html><body><a href=\"{}\">Click</a></body></html>",
+        payload
+    );
+    assert_eq!(classify_dom_evidence(&payload, &body), None);
+}
+
+/// FN guard: the same family of payload with a handler that *does* survive
+/// alongside the marker stays DOM-verified.
+#[test]
+fn test_bare_attr_handler_surviving_is_still_evidence() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("\" onmouseover=alert(1) class={} x=\"", marker);
+    let body = format!(
+        "<html><body><input type=\"text\" value=\"{}\" class=\"form-control\"></body></html>",
+        payload
+    );
+    assert!(
+        has_marker_evidence(&payload, &body),
+        "handler and marker both survive on the input; this is genuine DOM evidence"
+    );
+}
+
+/// FN guard: a bare attribute payload carrying no handler sink at all (a
+/// structural `id=`-only marker) keeps presence-only evidence.
+#[test]
+fn test_bare_attr_without_handler_keeps_presence_only_evidence() {
+    let marker = crate::scanning::markers::id_marker();
+    let payload = format!("\" id={} x=\"", marker);
+    let body = format!(
+        "<html><body><div title=\"{}\">x</div></body></html>",
+        payload
+    );
+    assert!(
+        has_marker_evidence(&payload, &body),
+        "a marker with no handler sink is a structural marker and keeps presence-only evidence"
+    );
+}
+
+/// FN guard: a tag-forming payload is untouched by the new branch — it keeps
+/// going through the #1118 element parse, which already requires co-survival.
+#[test]
+fn test_tag_forming_payload_unaffected_by_bare_attr_gate() {
+    let marker = crate::scanning::markers::class_marker();
+    let payload = format!("\"><svg onload=alert(1) class={}>", marker);
+    let body = format!(
+        "<html><body><svg onload=\"alert(1)\" class=\"{}\"></svg></body></html>",
+        marker
+    );
+    assert!(has_marker_evidence(&payload, &body));
+}
+
+/// Unit guard for the textual handler detector: `on` inside a longer word is
+/// not an event-handler attribute.
+#[test]
+fn test_payload_has_handler_sink_text_ignores_embedded_on() {
+    assert!(!payload_has_handler_sink_text("button=alert(1)"));
+    assert!(!payload_has_handler_sink_text("\" id=dlx x=\""));
+    assert!(payload_has_handler_sink_text(
+        "\" onmouseover=alert(1) x=\""
+    ));
+    assert!(payload_has_handler_sink_text("'/onfocus=\"alert(1)\"/x='"));
+}
+
+#[test]
+fn deeply_nested_payload_does_not_stall_the_sink_check() {
+    // This gate parses once per payload, so one pathological entry in a
+    // `--custom-payload` file or a fetched `--remote-payloads` list stalls the
+    // whole scan: html5ever's tree building is O(depth^2). Measured on this
+    // shape in debug — 15.2 s unbounded vs 11 ms through the nesting guard.
+    //
+    // A wall-clock assertion is the only way to pin the call site: both parsers
+    // return the same answer for realistic payloads, which is precisely why the
+    // swap is safe. The bound is set far from both figures (≈270x the bounded
+    // time, ≈5x under the unbounded one) so it can only fail if the guard is
+    // gone, not because the machine is busy.
+    let depth = 20_000;
+    let payload = format!(
+        "{}<svg onload=alert(1) class={}>{}",
+        "<div>".repeat(depth),
+        crate::scanning::markers::class_marker(),
+        "</div>".repeat(depth)
+    );
+    let start = std::time::Instant::now();
+    let _ = payload_marker_element_carries_sink(&payload);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs() < 3,
+        "nesting guard is not applied to the payload parse: took {elapsed:?}"
+    );
+}
+
+#[test]
+fn test_payload_has_handler_sink_text_is_linear_in_handler_count() {
+    // Each `on*=` used to re-check the whole remaining suffix.
+    let many = format!("\"{} onclick=alert(1) x=\"", " onx=a".repeat(40_000));
+    let start = std::time::Instant::now();
+    assert!(payload_has_handler_sink_text(&many));
+    assert!(!payload_has_handler_sink_text(&" onx=a".repeat(40_000)));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        start.elapsed()
+    );
+    // A sink in a later handler is still found through the first suffix.
+    assert!(payload_has_handler_sink_text(
+        "\" onmouseover=x onfocus=alert(1) \""
+    ));
+}

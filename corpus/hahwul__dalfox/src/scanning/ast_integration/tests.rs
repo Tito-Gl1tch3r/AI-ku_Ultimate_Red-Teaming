@@ -1,0 +1,1789 @@
+use super::*;
+
+#[test]
+fn inactive_script_bodies_do_not_produce_dom_findings() {
+    for attrs in [
+        "type='application/json'",
+        "type='application/ld+json'",
+        "type='text/template'",
+        "type='importmap'",
+        "type='speculationrules'",
+        "type='text/javascript; charset=utf-8'",
+        "language='vbscript'",
+        "src='/app.js'",
+        "src=''",
+    ] {
+        let html = format!("<script {attrs}>document.write(location.hash);</script>");
+        let results = run_initial_ast_dom_analysis(
+            &html,
+            "https://example.com/",
+            "GET",
+            PageSecurityPosture::default(),
+        );
+        assert!(results.is_empty(), "{attrs}: {results:?}");
+    }
+}
+
+#[test]
+fn executable_script_types_reach_the_result_pipeline() {
+    for attrs in [
+        "",
+        "type=''",
+        "type='module'",
+        "type='text/javascript'",
+        "type='APPLICATION/JAVASCRIPT'",
+        "type='text/javascript1.5'",
+        "language='JavaScript'",
+        "type='' language='vbscript'",
+    ] {
+        let html = format!(
+            "<script {attrs}>document.write?.(new URLSearchParams(location.search)['get']('query'));</script>"
+        );
+        let results = run_initial_ast_dom_analysis(
+            &html,
+            "https://example.com/",
+            "GET",
+            PageSecurityPosture::default(),
+        );
+        assert_eq!(results.len(), 1, "{attrs}: {results:?}");
+        assert_eq!(results[0].param, "query", "{attrs}: {:?}", results[0]);
+        assert!(results[0].data.contains("query="));
+    }
+}
+
+#[test]
+fn initial_ast_uses_the_response_parser_and_suppresses_inert_types() {
+    let html = r#"<!doctype html><html><body><script>document.body.innerHTML=location.hash</script></body></html>"#;
+    let posture = PageSecurityPosture::default();
+    for content_type in [
+        "application/json",
+        "text/json; charset=utf-8",
+        "text/plain",
+        "text/plain; charset=utf-8",
+        "text/csv",
+        "application/javascript",
+    ] {
+        let results = run_initial_ast_dom_analysis_for_response(
+            html,
+            content_type,
+            "https://example.com/",
+            "GET",
+            posture,
+        );
+        assert!(results.is_empty(), "{content_type}: {results:?}");
+    }
+
+    for content_type in ["text/html", ""] {
+        let results = run_initial_ast_dom_analysis_for_response(
+            html,
+            content_type,
+            "https://example.com/",
+            "GET",
+            posture,
+        );
+        assert!(
+            !results.is_empty(),
+            "{content_type}: expected HTML AST findings"
+        );
+    }
+
+    let xhtml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><script>document.body.innerHTML=location.hash</script></body></html>"#;
+    let results = run_initial_ast_dom_analysis_for_response(
+        xhtml,
+        "application/xhtml+xml; charset=utf-8",
+        "https://example.com/",
+        "GET",
+        posture,
+    );
+    assert!(
+        !results.is_empty(),
+        "valid XHTML script must reach XML AST analysis"
+    );
+
+    let generic_xml = r#"<root><script>document.body.innerHTML=location.hash</script></root>"#;
+    let results = run_initial_ast_dom_analysis_for_response(
+        generic_xml,
+        "application/xml",
+        "https://example.com/",
+        "GET",
+        posture,
+    );
+    assert!(
+        results.is_empty(),
+        "unnamespaced XML is not an active markup document"
+    );
+}
+
+#[test]
+fn xml_ast_extraction_preserves_xml_names_and_active_namespaces() {
+    let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"><body onload="run(location.hash)"><script id="app">document.body.innerHTML=location.hash</script><SCRIPT id="uppercase">document.write(location.hash)</SCRIPT><script type="application/json">document.write(location.hash)</script></body></html>"#;
+    let (blocks, ids) = extract_js_and_script_ids_from_xml(xml);
+    assert!(ids.contains("app"));
+    assert!(!ids.contains("uppercase"));
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks.iter().any(|block| block.contains("innerHTML")));
+    assert!(
+        blocks
+            .iter()
+            .any(|block| block.contains("run(location.hash)"))
+    );
+    assert!(!blocks.iter().any(|block| block.contains("document.write")));
+}
+
+#[test]
+fn xml_ast_analysis_recovers_active_scripts_before_ten_thousand_deep_tail() {
+    let deep_open = "<n>".repeat(10_000);
+    let deep_close = "</n>".repeat(10_000);
+    let code = "document.body.innerHTML=location.hash;";
+    let xhtml_ns = "http://www.w3.org/1999/xhtml";
+    let svg_ns = "http://www.w3.org/2000/svg";
+    let fixtures = [
+        (
+            "application/xml",
+            format!(
+                "<root><script xmlns=\"{xhtml_ns}\">{code}</script>{deep_open}{deep_close}</root>"
+            ),
+        ),
+        (
+            "application/xhtml+xml",
+            format!(
+                "<html xmlns=\"{xhtml_ns}\"><body><script>{code}</script>{deep_open}{deep_close}</body></html>"
+            ),
+        ),
+        (
+            "image/svg+xml",
+            format!("<svg xmlns=\"{svg_ns}\"><script>{code}</script>{deep_open}{deep_close}</svg>"),
+        ),
+    ];
+
+    for (content_type, body) in fixtures {
+        let results = run_initial_ast_dom_analysis_for_response(
+            &body,
+            content_type,
+            "https://example.com/",
+            "GET",
+            PageSecurityPosture::default(),
+        );
+        assert!(
+            !results.is_empty(),
+            "{content_type} should recover the executable script before deeply nested markup"
+        );
+    }
+}
+
+#[test]
+fn external_script_discovery_skips_data_blocks() {
+    let html = r#"
+        <script type="application/json" src="/data.json"></script>
+        <script type="importmap" src="/imports.json"></script>
+        <script type="module" src="/app.mjs"></script>
+        <script src="/app.js"></script>
+    "#;
+    let urls =
+        extract_same_origin_script_srcs(html, &url::Url::parse("https://example.com/").unwrap());
+    assert_eq!(
+        urls.iter().map(|u| u.path()).collect::<Vec<_>>(),
+        ["/app.mjs", "/app.js"]
+    );
+}
+
+#[test]
+fn test_extract_javascript_from_html() {
+    let html = r#"
+<html>
+<head>
+<script>
+    var x = 1;
+</script>
+</head>
+<body>
+<script>
+    let y = location.search;
+    document.getElementById('foo').innerHTML = y;
+</script>
+</body>
+</html>
+"#;
+    let js_code = extract_javascript_from_html(html);
+    assert_eq!(js_code.len(), 2);
+    assert!(js_code[1].contains("location.search"));
+}
+
+/// The single-parse `extract_js_and_script_ids` must return byte-identical
+/// results to calling the two separate extractors — that equivalence is the
+/// entire safety argument for sharing one `Html::parse_document` pass.
+#[test]
+fn test_extract_js_and_script_ids_matches_separate_extractors() {
+    let html = r#"
+<html>
+<head>
+<script id="cfg" type="application/json">{"a":1}</script>
+<script id="app">
+    var y = location.hash;
+    document.getElementById('foo').innerHTML = y;
+</script>
+</head>
+<body onload="doStuff(location.search)">
+<a href="javascript:alert(1)">x</a>
+<script>console.log('no id here');</script>
+</body>
+</html>
+"#;
+    let (js_blocks, ids) = extract_js_and_script_ids(html);
+    assert_eq!(js_blocks, extract_javascript_from_html(html));
+    assert_eq!(ids, extract_script_element_ids(html));
+    // Sanity: both signals were actually populated.
+    assert!(ids.contains("app") && ids.contains("cfg"));
+    assert!(js_blocks.iter().any(|b| b.contains("location.hash")));
+    assert!(js_blocks.iter().any(|b| b.contains("doStuff")));
+    assert!(js_blocks.iter().any(|b| b.contains("alert(1)")));
+}
+
+#[test]
+fn test_analyze_javascript_for_dom_xss() {
+    let js = r#"
+let param = location.search;
+document.getElementById('x').innerHTML = param;
+"#;
+    let findings = analyze_javascript_for_dom_xss(js);
+    assert!(!findings.is_empty());
+    let (_vuln, payload, description) = &findings[0];
+    assert!(description.contains("DOM-based XSS"));
+    assert!(description.contains("innerHTML"));
+    assert!(payload.contains("alert"));
+}
+
+#[test]
+fn test_generate_dom_xss_poc_for_urlsearchparams_source() {
+    let (payload, description) = generate_dom_xss_poc("URLSearchParams.get(query)", "innerHTML");
+    assert_eq!(
+        payload,
+        "query=<img src=x onerror=alert(1) class=dalfox>"
+            .replace("dalfox", crate::scanning::markers::class_marker())
+    );
+    assert!(description.contains("URLSearchParams.get(query)"));
+}
+
+#[test]
+fn test_generate_dom_xss_poc_for_nested_urlsearchparams_source() {
+    let (payload, description) =
+        generate_dom_xss_poc("URLSearchParams.get(blob).get(query)", "innerHTML");
+    assert_eq!(
+        payload,
+        "query=<img src=x onerror=alert(1) class=dalfox>"
+            .replace("dalfox", crate::scanning::markers::class_marker())
+    );
+    assert!(description.contains("URLSearchParams.get(blob).get(query)"));
+}
+
+#[test]
+fn test_generate_dom_xss_poc_hash_to_src_sink_uses_data_uri() {
+    // xss-game L6 shape: `script.src = location.hash.substr(1)`. The
+    // HTML payload `<img onerror>` doesn't execute as a script src —
+    // we need an executable URL scheme. `data:text/javascript,…` is
+    // accepted by the browser; `javascript:` schemes don't execute in
+    // `<script src>` on modern browsers.
+    let (payload, _) = generate_dom_xss_poc("location.hash", "src");
+    assert!(
+        payload.starts_with("#data:text/javascript,alert(1)"),
+        "expected hash-fragment data: URL payload, got {:?}",
+        payload
+    );
+}
+
+#[test]
+fn test_generate_dom_xss_poc_hash_to_eval_sink_uses_bare_js() {
+    // `eval(location.hash.substr(1))` accepts JS source directly — no
+    // need to wrap with an HTML tag or URL scheme. Same for `Function`,
+    // `setTimeout(stringArg)`, etc.
+    let (payload, _) = generate_dom_xss_poc("location.hash", "eval");
+    assert!(
+        payload.starts_with("#alert(1)"),
+        "expected hash-fragment bare-JS payload, got {:?}",
+        payload
+    );
+}
+
+#[test]
+fn test_generate_dom_xss_poc_search_to_href_sink_uses_data_uri() {
+    let (payload, _) = generate_dom_xss_poc("location.search", "href");
+    assert!(
+        payload.starts_with("xss=data:text/javascript,alert(1)"),
+        "expected search query data: URL payload, got {:?}",
+        payload
+    );
+}
+
+#[test]
+fn test_generate_dom_xss_poc_default_innerhtml_still_html_tag() {
+    // Regression: keep the existing HTML payload for innerHTML-style
+    // sinks (jQuery `.html()`, `document.write`, `outerHTML`, …) so we
+    // don't regress all the cases tests #generate_dom_xss_poc_*_source
+    // pinned. The new sink-aware branches only fire for URL / JS-eval
+    // sinks.
+    let (payload, _) = generate_dom_xss_poc("location.hash", "innerHTML");
+    assert!(
+        payload.contains("<img src=x onerror=alert(1)"),
+        "expected HTML payload for innerHTML sink, got {:?}",
+        payload
+    );
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_for_hash_source() {
+    let url = build_dom_xss_poc_url(
+        "https://example.com/dom/level2/",
+        "location.hash",
+        "#<img src=x onerror=alert(1) class=dalfox>",
+    );
+    assert!(url.contains("/dom/level2/#"));
+    assert!(url.contains("img%20src=x"));
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_for_search_source() {
+    let url = build_dom_xss_poc_url(
+        "https://example.com/dom/level8/",
+        "location.search",
+        "xss=<img src=x onerror=alert(1) class=dalfox>",
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    assert_eq!(parsed.path(), "/dom/level8/");
+    assert_eq!(
+        parsed.query(),
+        Some("xss=%3Cimg%20src=x%20onerror=alert(1)%20class=dalfox%3E")
+    );
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_for_urlsearchparams_source() {
+    let url = build_dom_xss_poc_url(
+        "https://example.com/dom/level32/",
+        "URLSearchParams.get(query)",
+        "query=<img src=x onerror=alert(1) class=dalfox>",
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    assert_eq!(parsed.path(), "/dom/level32/");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs,
+        vec![(
+            "query".to_string(),
+            "<img src=x onerror=alert(1) class=dalfox>".to_string()
+        )]
+    );
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_for_nested_urlsearchparams_source() {
+    let url = build_dom_xss_poc_url(
+        "https://example.com/reparse/level2/?blob=query=a",
+        "URLSearchParams.get(blob).get(query)",
+        "query=<img src=x onerror=alert(1) class=dalfox>",
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    assert_eq!(parsed.path(), "/reparse/level2/");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs,
+        vec![(
+            "blob".to_string(),
+            "query=<img src=x onerror=alert(1) class=dalfox>".to_string()
+        )]
+    );
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_for_nested_urlsearchparams_html_source() {
+    let url = build_dom_xss_poc_url(
+        "https://example.com/reparse/level4/?blob=html=a",
+        "URLSearchParams.get(blob).get(html)",
+        "html=<img src=x onerror=alert(1) class=dalfox>",
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    assert_eq!(parsed.path(), "/reparse/level4/");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs,
+        vec![(
+            "blob".to_string(),
+            "html=<img src=x onerror=alert(1) class=dalfox>".to_string()
+        )]
+    );
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_for_double_nested_urlsearchparams_source() {
+    let url = build_dom_xss_poc_url(
+        "https://example.com/reparse/level5/?blob=outer=query=a",
+        "URLSearchParams.get(blob).get(outer).get(query)",
+        "query=<img src=x onerror=alert(1) class=dalfox>",
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    assert_eq!(parsed.path(), "/reparse/level5/");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs,
+        vec![(
+            "blob".to_string(),
+            "outer=query=<img src=x onerror=alert(1) class=dalfox>".to_string()
+        )]
+    );
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_for_pathname_source() {
+    let url = build_dom_xss_poc_url(
+        "https://example.com/dom/level28/",
+        "location.pathname",
+        "<img src=x onerror=alert(1) class=dalfox>",
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    assert_eq!(
+        parsed.path(),
+        "/dom/level28/%3Cimg%20src=x%20onerror=alert(1)%20class=dalfox%3E"
+    );
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_falls_back_for_non_url_sources() {
+    let base = "https://example.com/dom/level13/";
+    let url = build_dom_xss_poc_url(base, "window.name", "<img src=x onerror=alert(1)>");
+    assert_eq!(url, base);
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_uses_seed_bootstrap_for_window_name() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let url = build_dom_xss_poc_url(
+        "https://example.com/browser-state/level1/?seed=a",
+        "window.name",
+        payload,
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    assert_eq!(parsed.path(), "/browser-state/level1/");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs, vec![("seed".to_string(), payload.to_string())]);
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_uses_seed_bootstrap_for_window_opener() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let url = build_dom_xss_poc_url(
+        "https://example.com/opener/level1/?seed=a",
+        "window.opener",
+        payload,
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs, vec![("seed".to_string(), payload.to_string())]);
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_uses_seed_bootstrap_for_storage_source() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let url = build_dom_xss_poc_url(
+        "https://example.com/browser-state/level2/?seed=a",
+        "localStorage.getItem",
+        payload,
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs, vec![("seed".to_string(), payload.to_string())]);
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_uses_seed_bootstrap_for_event_data() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let url = build_dom_xss_poc_url(
+        "https://example.com/browser-state/level4/?seed=a",
+        "event.data",
+        payload,
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs, vec![("seed".to_string(), payload.to_string())]);
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_uses_seed_bootstrap_for_channel_message_source() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let url = build_dom_xss_poc_url(
+        "https://example.com/channel/level1/?seed=a",
+        "BroadcastChannel.message",
+        payload,
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs, vec![("seed".to_string(), payload.to_string())]);
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_uses_seed_bootstrap_for_document_referrer() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let url = build_dom_xss_poc_url(
+        "https://example.com/browser-state/level5/?seed=a",
+        "document.referrer",
+        payload,
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs, vec![("seed".to_string(), payload.to_string())]);
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_uses_seed_bootstrap_for_history_state() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let url = build_dom_xss_poc_url(
+        "https://example.com/history-state/level1/?seed=a",
+        "history.state",
+        payload,
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs, vec![("seed".to_string(), payload.to_string())]);
+}
+
+#[test]
+fn test_build_dom_xss_poc_url_uses_seed_bootstrap_for_storage_event() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let url = build_dom_xss_poc_url(
+        "https://example.com/storage-event/level1/?seed=a",
+        "event.newValue",
+        payload,
+    );
+    let parsed = url::Url::parse(&url).expect("valid poc url");
+    let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs, vec![("seed".to_string(), payload.to_string())]);
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_window_name() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/dom/level13/",
+        "window.name",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("window.name should produce a manual hint");
+    assert!(hint.contains("window.open('about:blank')"));
+    assert!(hint.contains("w.name = \"<img src=x onerror=alert(1)>\""));
+    assert!(hint.contains("https://example.com/dom/level13/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_window_opener() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/opener/level1/",
+        "window.opener",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("window.opener should produce a manual hint");
+    assert!(hint.contains("same-origin page"));
+    assert!(hint.contains("window.name = \"<img src=x onerror=alert(1)>\""));
+    assert!(hint.contains("window.__xssmazePreview = { html: \"<img src=x onerror=alert(1)>\" }"));
+    assert!(hint.contains("https://example.com/opener/level1/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_document_referrer() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/dom/level14/",
+        "document.referrer",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("document.referrer should produce a manual hint");
+    assert!(hint.contains("attacker-controlled page"));
+    assert!(hint.contains("https://example.com/dom/level14/"));
+    assert!(hint.contains("<img src=x onerror=alert(1)>"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_document_cookie() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/dom/level12/",
+        "document.cookie",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("document.cookie should produce a manual hint");
+    assert!(hint.contains("same-origin cookie"));
+    assert!(hint.contains("cookie-safe variant may be needed"));
+    assert!(hint.contains("https://example.com/dom/level12/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_history_state() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/history-state/level1/",
+        "history.state",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("history.state should produce a manual hint");
+    assert!(hint.contains("history.replaceState"));
+    assert!(hint.contains("reload"));
+    assert!(hint.contains("https://example.com/history-state/level1/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_event_data() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/dom/level23/",
+        "event.data",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("event.data should produce a manual hint");
+    assert!(hint.contains("window.open(\"https://example.com/dom/level23/\")"));
+    assert!(hint.contains("postMessage(\"<img src=x onerror=alert(1)>\", '*'"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_broadcast_channel_message() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/channel/level1/",
+        "BroadcastChannel.message",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("BroadcastChannel message sources should produce a manual hint");
+    assert!(hint.contains("BroadcastChannel"));
+    assert!(hint.contains("postMessage(\"<img src=x onerror=alert(1)>\""));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_service_worker_message() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/advanced/level3/",
+        "ServiceWorker.message",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("ServiceWorker message sources should produce a manual hint");
+    assert!(hint.contains("navigator.serviceWorker.controller?.postMessage"));
+    assert!(hint.contains("https://example.com/advanced/level3/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_websocket_message() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/websocket/level6/",
+        "WebSocket.message",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("WebSocket message sources should produce a manual hint");
+    assert!(hint.contains("onmessage"));
+    assert!(hint.contains("https://example.com/websocket/level6/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_event_source_message() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/eventsource/level1/",
+        "EventSource.message",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("EventSource message sources should produce a manual hint");
+    assert!(hint.contains("EventSource"));
+    assert!(hint.contains("MessageEvent"));
+    assert!(hint.contains("https://example.com/eventsource/level1/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_storage_event_source() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/dom/storage-event/",
+        "event.newValue",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("storage event sources should produce a manual hint");
+    assert!(hint.contains("same-origin tab"));
+    assert!(hint.contains("localStorage.setItem('dalfox'"));
+    assert!(hint.contains("https://example.com/dom/storage-event/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_storage_source() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/dom/storage/",
+        "localStorage.getItem(xssmaze:browser-state:level2)",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("localStorage should produce a manual hint");
+    assert!(hint.contains("localStorage.setItem(\"xssmaze:browser-state:level2\""));
+    assert!(hint.contains("https://example.com/dom/storage/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_for_session_storage_source() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/dom/storage/",
+        "sessionStorage.getItem(xssmaze:browser-state:level3)",
+        "<img src=x onerror=alert(1)>",
+    )
+    .expect("sessionStorage should produce a manual hint");
+    assert!(hint.contains("sessionStorage.setItem(\"xssmaze:browser-state:level3\""));
+    assert!(hint.contains("https://example.com/dom/storage/"));
+}
+
+#[test]
+fn test_build_dom_xss_manual_poc_hint_none_for_url_sources() {
+    let hint = build_dom_xss_manual_poc_hint(
+        "https://example.com/dom/level2/",
+        "location.hash",
+        "#<img src=x onerror=alert(1)>",
+    );
+    assert!(hint.is_none());
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_for_window_name() {
+    let js = r#"
+        const url = new URL(location.href);
+        const seed = url.searchParams.get('seed');
+        if (seed) {
+          window.name = seed;
+        } else {
+          document.getElementById('output').innerHTML = window.name;
+        }
+    "#;
+
+    assert!(has_self_bootstrap_verification(js, "window.name"));
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_for_window_opener_name_bootstrap() {
+    let js = r#"
+        const url = new URL(location.href);
+        const seed = url.searchParams.get('seed');
+        if (seed && !window.opener) {
+          window.name = seed;
+          window.open(location.pathname, 'xssmaze:opener:level1');
+        } else if (window.opener) {
+          document.getElementById('output').innerHTML = window.opener.name || '';
+        }
+    "#;
+
+    assert!(has_self_bootstrap_verification(js, "window.opener"));
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_for_window_opener_object_bootstrap() {
+    let js = r#"
+        const url = new URL(location.href);
+        const seed = url.searchParams.get('seed');
+        if (seed && !window.opener) {
+          window.__xssmazePreview = { html: seed };
+          window.open(location.pathname, 'xssmaze:opener:level2');
+        } else if (window.opener) {
+          const bootstrap = window.opener.__xssmazePreview || {};
+          document.getElementById('preview').setAttribute('srcdoc', bootstrap.html || '');
+        }
+    "#;
+
+    assert!(has_self_bootstrap_verification(js, "window.opener"));
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_for_local_storage_keyed_source() {
+    let js = r#"
+        const url = new URL(location.href);
+        const seed = url.searchParams.get('seed');
+        if (seed) {
+          localStorage.setItem('xssmaze:browser-state:level2', seed);
+        } else {
+          const stored = localStorage.getItem('xssmaze:browser-state:level2') || '';
+          document.getElementById('output').insertAdjacentHTML('beforeend', stored);
+        }
+    "#;
+
+    assert!(has_self_bootstrap_verification(
+        js,
+        "localStorage.getItem(xssmaze:browser-state:level2)"
+    ));
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_for_event_source_dispatch() {
+    let js = r#"
+        const url = new URL(location.href);
+        const seed = url.searchParams.get('seed');
+        const source = new EventSource('/map/text');
+        source.onmessage = function(event) {
+          document.getElementById('output').innerHTML = event.data;
+        };
+
+        if (seed) {
+          source.dispatchEvent(new MessageEvent('message', { data: seed }));
+        }
+    "#;
+
+    assert!(has_self_bootstrap_verification(js, "EventSource.message"));
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_for_service_worker_dispatch() {
+    let js = r#"
+        const url = new URL(location.href);
+        const seed = url.searchParams.get('seed');
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.addEventListener('message', function(event) {
+            document.getElementById('output').innerHTML = event.data;
+          });
+          if (seed) {
+            navigator.serviceWorker.dispatchEvent(
+              new MessageEvent('message', { data: seed })
+            );
+          }
+        }
+    "#;
+
+    assert!(has_self_bootstrap_verification(js, "ServiceWorker.message"));
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_for_history_state_object_bootstrap() {
+    let js = r#"
+        const url = new URL(location.href);
+        const seed = url.searchParams.get('seed');
+        if (seed) {
+          history.replaceState({ html: seed }, '', location.pathname);
+        }
+
+        const state = history.state || {};
+        document.getElementById('preview').setAttribute('srcdoc', state.html || '');
+    "#;
+
+    assert!(has_self_bootstrap_verification(js, "history.state"));
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_for_document_referrer_child_relay() {
+    let js = r#"
+        const url = new URL(location.href);
+        const seed = url.searchParams.get('seed');
+        const child = url.searchParams.get('child');
+        if (child === '1') {
+          document.write(document.referrer);
+        } else if (seed) {
+          const relayUrl = new URL(location.href);
+          relayUrl.searchParams.delete('seed');
+          relayUrl.searchParams.set('child', '1');
+          document.getElementById('relay').src =
+            relayUrl.pathname + '?' + relayUrl.searchParams.toString();
+        }
+    "#;
+
+    assert!(has_self_bootstrap_verification(js, "document.referrer"));
+}
+
+#[test]
+fn test_has_self_bootstrap_verification_ignores_manual_only_sources() {
+    let js = r#"
+        if (location.search.includes('seed')) {
+          document.getElementById('relay').src = '/child';
+        }
+        document.write(document.referrer);
+    "#;
+
+    assert!(!has_self_bootstrap_verification(js, "document.referrer"));
+}
+
+#[test]
+fn test_extract_script_element_ids_collects_only_script_ids() {
+    let html = r#"
+<html>
+<body>
+<div id='output'></div>
+<script id='scriptTag'></script>
+<script id='another'></script>
+<script>
+  document.getElementById('scriptTag').innerText = location.hash.slice(1);
+</script>
+</body>
+</html>
+"#;
+    let ids = extract_script_element_ids(html);
+    assert!(ids.contains("scriptTag"));
+    assert!(ids.contains("another"));
+    // The <div id='output'> id must NOT be in the set — only script tags.
+    assert!(!ids.contains("output"));
+}
+
+#[test]
+fn test_extract_script_element_ids_ignores_blank_ids() {
+    let html = r#"<script id='   '></script><script></script><script id='ok'></script>"#;
+    let ids = extract_script_element_ids(html);
+    assert_eq!(ids.len(), 1);
+    assert!(ids.contains("ok"));
+}
+
+// ===== End-to-end pipeline coverage for issues #1021 / #1022 / #1024 =====
+// Each test feeds the actual xssmaze page HTML through the same path the
+// scanner uses (extract JS from HTML -> AST analyze -> POC generation).
+
+#[test]
+fn e2e_jquery_level1_constructor_finding_and_hash_poc() {
+    // xssmaze /jquery/level1/
+    let html = r#"<html><head><script src='https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js'></script></head>
+    <body>
+    <div id='content'></div>
+    <script>
+      var target = decodeURIComponent(location.hash.slice(1));
+      if (target) { $(target).appendTo('#content'); }
+    </script>
+    </body></html>"#;
+    let results = run_initial_ast_dom_analysis(
+        html,
+        "http://t/jquery/level1/",
+        "GET",
+        PageSecurityPosture::default(),
+    );
+    assert!(
+        results.iter().any(|r| r.evidence.contains("jQuery$")),
+        "jQuery $() constructor must surface a finding; got {:?}",
+        results
+            .iter()
+            .map(|r| r.evidence.clone())
+            .collect::<Vec<_>>()
+    );
+    // location.hash source -> HTML payload carried in the fragment (the PoC
+    // URL is stored in the `data` field).
+    assert!(
+        results
+            .iter()
+            .any(|r| r.data.contains('#') && r.payload.contains("onerror=alert(1)")),
+        "expected a hash-fragment HTML PoC; got {:?}",
+        results
+            .iter()
+            .map(|r| (r.data.clone(), r.payload.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn e2e_codeexec_level1_dynamic_import_finding_and_data_uri_poc() {
+    // xssmaze /codeexec/level1/
+    let html = r#"<html><body>
+    <div id='status'>loading plugin...</div>
+    <script>
+      var name = new URLSearchParams(location.search).get('query') || '';
+      if (name) {
+        import(name).then(function () {}).catch(function () {});
+      }
+    </script>
+    </body></html>"#;
+    let results = run_initial_ast_dom_analysis(
+        html,
+        "http://t/codeexec/level1/?query=a",
+        "GET",
+        PageSecurityPosture::default(),
+    );
+    assert!(
+        results.iter().any(|r| r.evidence.contains("Sink: import")),
+        "dynamic import() must surface a finding; got {:?}",
+        results
+            .iter()
+            .map(|r| r.evidence.clone())
+            .collect::<Vec<_>>()
+    );
+    // import takes a module specifier -> executable data: URL payload on `query`.
+    assert!(
+        results
+            .iter()
+            .any(|r| r.payload.contains("query=data:text/javascript,alert(1)")),
+        "expected a data: URL module PoC on query; got {:?}",
+        results
+            .iter()
+            .map(|r| r.payload.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn e2e_apidom_level1_fetch_innerhtml_finding() {
+    // xssmaze /apidom/level1/
+    let html = r#"<html><body>
+    <div id='out'>loading...</div>
+    <script>
+      var q = new URLSearchParams(location.search).get('q') || '';
+      fetch('/apidom/level1/api?q=' + encodeURIComponent(q))
+        .then(function (r) { return r.text(); })
+        .then(function (t) { document.getElementById('out').innerHTML = t; });
+    </script>
+    </body></html>"#;
+    let results = run_initial_ast_dom_analysis(
+        html,
+        "http://t/apidom/level1/?q=a",
+        "GET",
+        PageSecurityPosture::default(),
+    );
+    assert!(
+        results
+            .iter()
+            .any(|r| r.evidence.contains("Source: Response.text")
+                && r.evidence.contains("Sink: innerHTML")),
+        "fetch text response -> innerHTML must surface; got {:?}",
+        results
+            .iter()
+            .map(|r| r.evidence.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn e2e_apidom_level3_xhr_innerhtml_finding() {
+    // xssmaze /apidom/level3/
+    let html = r#"<html><body>
+    <div id='out'>loading...</div>
+    <script>
+      var q = new URLSearchParams(location.search).get('q') || '';
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/apidom/level3/api?q=' + encodeURIComponent(q));
+      xhr.onload = function () { document.getElementById('out').innerHTML = xhr.responseText; };
+      xhr.send();
+    </script>
+    </body></html>"#;
+    let results = run_initial_ast_dom_analysis(
+        html,
+        "http://t/apidom/level3/?q=a",
+        "GET",
+        PageSecurityPosture::default(),
+    );
+    assert!(
+        results.iter().any(
+            |r| r.evidence.contains("Source: XMLHttpRequest.responseText")
+                && r.evidence.contains("Sink: innerHTML")
+        ),
+        "xhr.responseText -> innerHTML must surface; got {:?}",
+        results
+            .iter()
+            .map(|r| r.evidence.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+// --- extract_same_origin_script_srcs tests ---
+
+#[test]
+fn test_extract_same_origin_script_srcs_absolute() {
+    let base = url::Url::parse("https://example.com/page").unwrap();
+    let html = r#"<html><body>
+        <script src="https://example.com/app.js"></script>
+    </body></html>"#;
+    let srcs = extract_same_origin_script_srcs(html, &base);
+    assert_eq!(srcs.len(), 1);
+    assert_eq!(srcs[0].as_str(), "https://example.com/app.js");
+}
+
+#[test]
+fn test_extract_same_origin_script_srcs_relative() {
+    let base = url::Url::parse("https://example.com/page").unwrap();
+    let html = r#"<html><body>
+        <script src="/bundle.js"></script>
+    </body></html>"#;
+    let srcs = extract_same_origin_script_srcs(html, &base);
+    assert_eq!(srcs.len(), 1);
+    assert_eq!(srcs[0].as_str(), "https://example.com/bundle.js");
+}
+
+#[test]
+fn test_extract_same_origin_script_srcs_drops_cross_origin() {
+    let base = url::Url::parse("https://example.com/page").unwrap();
+    let html = r#"<html><body>
+        <script src="/local.js"></script>
+        <script src="https://cdn.example.com/remote.js"></script>
+        <script src="http://example.com/wrongscheme.js"></script>
+    </body></html>"#;
+    let srcs = extract_same_origin_script_srcs(html, &base);
+    assert_eq!(srcs.len(), 1);
+    assert_eq!(srcs[0].as_str(), "https://example.com/local.js");
+}
+
+#[test]
+fn test_extract_same_origin_script_srcs_dedups() {
+    let base = url::Url::parse("https://example.com/page").unwrap();
+    let html = r#"<html><body>
+        <script src="/app.js"></script>
+        <script src="/app.js"></script>
+    </body></html>"#;
+    let srcs = extract_same_origin_script_srcs(html, &base);
+    assert_eq!(srcs.len(), 1);
+}
+
+#[test]
+fn test_extract_same_origin_script_srcs_ignores_inline_and_empty_src() {
+    let base = url::Url::parse("https://example.com/page").unwrap();
+    let html = r#"<html><body>
+        <script>var x = 1;</script>
+        <script src=""></script>
+        <script src="/real.js"></script>
+    </body></html>"#;
+    let srcs = extract_same_origin_script_srcs(html, &base);
+    assert_eq!(srcs.len(), 1);
+    assert_eq!(srcs[0].as_str(), "https://example.com/real.js");
+}
+
+#[test]
+fn test_extract_same_origin_script_srcs_preserves_order() {
+    let base = url::Url::parse("https://example.com/page").unwrap();
+    let html = r#"<html><body>
+        <script src="/first.js"></script>
+        <script src="https://other.com/skip.js"></script>
+        <script src="/second.js"></script>
+    </body></html>"#;
+    let srcs = extract_same_origin_script_srcs(html, &base);
+    assert_eq!(srcs.len(), 2);
+    assert!(srcs[0].as_str().ends_with("/first.js"));
+    assert!(srcs[1].as_str().ends_with("/second.js"));
+}
+
+#[test]
+fn test_extract_same_origin_script_srcs_skips_unparseable_src() {
+    // "http://" has an empty host — url::Url::join returns Err and the entry
+    // must be silently skipped (the `Err(_) => continue` branch at line 104).
+    let base = url::Url::parse("https://example.com/page").unwrap();
+    let html = r#"<html><body>
+        <script src="http://"></script>
+        <script src="/valid.js"></script>
+    </body></html>"#;
+    let srcs = extract_same_origin_script_srcs(html, &base);
+    assert_eq!(srcs.len(), 1);
+    assert_eq!(srcs[0].as_str(), "https://example.com/valid.js");
+}
+
+#[test]
+fn test_extract_same_origin_script_srcs_relative_no_slash() {
+    // "classic.js" (no leading slash) resolves relative to the base path directory,
+    // not the root — so https://example.com/app/page -> https://example.com/app/classic.js
+    let base = url::Url::parse("https://example.com/app/page").unwrap();
+    let html = r#"<html><body>
+        <script src="classic.js"></script>
+    </body></html>"#;
+    let srcs = extract_same_origin_script_srcs(html, &base);
+    assert_eq!(srcs.len(), 1);
+    assert_eq!(srcs[0].as_str(), "https://example.com/app/classic.js");
+}
+
+#[test]
+fn test_build_ast_dom_xss_result_self_bootstrap_verified_upgrades_to_high() {
+    use crate::scanning::result::FindingType;
+    let r = super::build_ast_dom_xss_result(super::AstDomFinding {
+        target_url: "https://example.com/",
+        target_method: "GET",
+        vuln: &test_vuln("location.hash", "innerHTML", false),
+        payload: "#<img src=x onerror=alert(1)>".to_string(),
+        evidence: "example.com:1:1 - sink (Source: location.hash, Sink: innerHTML)".to_string(),
+        message: "DOM-XSS via hash".to_string(),
+        self_bootstrap_verified: true,
+        posture: PageSecurityPosture::default(),
+    });
+    assert_eq!(r.result_type, FindingType::Verified);
+    assert_eq!(r.severity, "High");
+    assert!(
+        r.message_str.contains("[static self-bootstrap confirmed]"),
+        "message must carry verification note; got: {}",
+        r.message_str
+    );
+}
+
+#[test]
+fn test_build_ast_dom_xss_result_not_verified_stays_medium_ast() {
+    use crate::scanning::result::FindingType;
+    let r = super::build_ast_dom_xss_result(super::AstDomFinding {
+        target_url: "https://example.com/",
+        target_method: "GET",
+        vuln: &test_vuln("location.hash", "innerHTML", false),
+        payload: "#<img src=x onerror=alert(1)>".to_string(),
+        evidence: "evidence".to_string(),
+        message: "DOM-XSS via hash".to_string(),
+        self_bootstrap_verified: false,
+        posture: PageSecurityPosture::default(),
+    });
+    assert_eq!(r.result_type, FindingType::AstDetected);
+    assert_eq!(r.severity, "Medium");
+    assert!(
+        !r.message_str.contains("[static self-bootstrap confirmed]"),
+        "unverified result must not carry verification note"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Source → reported parameter label (issue #1238)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_dom_source_param_label_reports_query_key() {
+    assert_eq!(
+        super::dom_source_param_label("URLSearchParams.get(q)"),
+        "q",
+        "query-backed sources must report the key that carries the payload"
+    );
+}
+
+#[test]
+fn test_dom_source_param_label_reports_outermost_key_for_nested_chain() {
+    // `build_dom_xss_poc_url` nests the inner key inside the outer query
+    // parameter, so the outer one is the name on the wire.
+    assert_eq!(
+        super::dom_source_param_label("URLSearchParams.get(outer).get(inner)"),
+        "outer"
+    );
+}
+
+#[test]
+fn test_dom_source_param_label_falls_back_to_browser_surface() {
+    for source in ["location.hash", "window.name", "document.referrer"] {
+        assert_eq!(
+            super::dom_source_param_label(source),
+            source,
+            "non-query sources report the surface the operator must control"
+        );
+    }
+}
+
+#[test]
+fn test_build_ast_dom_xss_result_reports_source_param_not_dash() {
+    let r = super::build_ast_dom_xss_result(super::AstDomFinding {
+        target_url: "https://example.com/",
+        target_method: "GET",
+        vuln: &test_vuln("URLSearchParams.get(name)", "innerHTML", false),
+        payload: "name=<img src=x onerror=alert(1)>".to_string(),
+        evidence: "evidence".to_string(),
+        message: "DOM-XSS via name".to_string(),
+        self_bootstrap_verified: false,
+        posture: PageSecurityPosture::default(),
+    });
+    assert_eq!(r.param, "name", "AST findings must name the affected input");
+    assert!(
+        r.poc_url_complete,
+        "AST findings build their own POC URL and must be flagged as complete"
+    );
+}
+
+#[test]
+fn test_run_initial_ast_dom_analysis_drops_internal_light_check_wording() {
+    let html = r#"<html><body><script>
+        var q = new URLSearchParams(location.search).get('q');
+        document.getElementById('out').innerHTML = q;
+    </script></body></html>"#;
+    let results = super::run_initial_ast_dom_analysis(
+        html,
+        "https://example.com/",
+        "GET",
+        PageSecurityPosture::default(),
+    );
+    assert!(!results.is_empty(), "expected a DOM-XSS finding");
+    for r in &results {
+        assert!(
+            r.message_str.contains("(needs runtime confirmation)"),
+            "AST findings must keep the confirmation caveat: {}",
+            r.message_str
+        );
+        assert!(
+            !r.message_str.contains("light check: no parameter"),
+            "internal wording must not reach users: {}",
+            r.message_str
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Confidence grading (issue #1238 tier model, Phase 1)
+// ─────────────────────────────────────────────────────────────────────────
+
+use crate::scanning::result::Confidence;
+
+/// The baseline shape dalfox can claim: a link-deliverable source flowing into
+/// a sink the page's CSP would let execute.
+#[test]
+fn test_grade_ast_finding_url_source_grades_high() {
+    let (grade, reason) = super::grade_ast_finding(
+        "URLSearchParams.get(q)",
+        "innerHTML",
+        false,
+        false,
+        PageSecurityPosture::default(),
+    );
+    assert_eq!(grade, Confidence::High);
+    assert!(reason.contains("URL-carried source"), "got: {}", reason);
+    assert!(
+        reason.contains("inline script permitted"),
+        "got: {}",
+        reason
+    );
+}
+
+/// Sources that need a driver page are real findings, but dalfox cannot claim
+/// them from a URL alone.
+#[test]
+fn test_grade_ast_finding_setup_required_source_grades_low() {
+    for source in [
+        "window.name",
+        "document.referrer",
+        "event.data",
+        "localStorage.getItem(x)",
+    ] {
+        let (grade, reason) = super::grade_ast_finding(
+            source,
+            "innerHTML",
+            false,
+            false,
+            PageSecurityPosture::default(),
+        );
+        assert_eq!(grade, Confidence::Low, "source {} should grade low", source);
+        assert!(
+            reason.contains("attacker-controlled page"),
+            "reason must name the blocker; got: {}",
+            reason
+        );
+    }
+}
+
+/// A conditional flow is reported but must not be downgraded: the dominant
+/// shape is `if (q) { el.innerHTML = q }`, an attacker-satisfiable presence
+/// check that mitigates nothing. Grading on it made nearly every real finding
+/// `Low`.
+#[test]
+fn test_grade_ast_finding_guarded_flow_is_noted_not_downgraded() {
+    let (grade, reason) = super::grade_ast_finding(
+        "location.hash",
+        "innerHTML",
+        true,
+        false,
+        PageSecurityPosture::default(),
+    );
+    assert_eq!(grade, Confidence::High);
+    assert!(reason.contains("conditional branch"), "got: {}", reason);
+}
+
+/// An enforcing CSP without `unsafe-inline` stops the injected handler, so the
+/// flow is no longer something dalfox can assert.
+#[test]
+fn test_grade_ast_finding_csp_blocking_inline_grades_low() {
+    let posture = PageSecurityPosture {
+        trusted_types_enforced: false,
+        inline_script_allowed: false,
+    };
+    let (grade, reason) =
+        super::grade_ast_finding("location.hash", "innerHTML", false, false, posture);
+    assert_eq!(grade, Confidence::Low);
+    assert!(reason.contains("CSP"), "got: {}", reason);
+}
+
+/// …but a sink that runs script directly does not depend on inline-handler
+/// permission, so the same CSP leaves it high.
+#[test]
+fn test_grade_ast_finding_script_executing_sink_survives_inline_block() {
+    let posture = PageSecurityPosture {
+        trusted_types_enforced: false,
+        inline_script_allowed: false,
+    };
+    for sink in ["eval", "document.write", "Function"] {
+        let (grade, reason) =
+            super::grade_ast_finding("location.hash", sink, false, false, posture);
+        assert_eq!(grade, Confidence::High, "sink {} should stay high", sink);
+        assert!(
+            reason.contains("executes script directly"),
+            "got: {}",
+            reason
+        );
+    }
+}
+
+#[test]
+fn test_grade_ast_finding_trusted_types_enforced_grades_low() {
+    let posture = PageSecurityPosture {
+        trusted_types_enforced: true,
+        inline_script_allowed: true,
+    };
+    let (grade, reason) =
+        super::grade_ast_finding("location.hash", "innerHTML", false, false, posture);
+    assert_eq!(grade, Confidence::Low);
+    assert!(reason.contains("Trusted Types"), "got: {}", reason);
+}
+
+// ── PageSecurityPosture derivation ──────────────────────────────────────
+
+#[test]
+fn test_posture_no_csp_allows_inline() {
+    let p = PageSecurityPosture::from_csp(None);
+    assert!(p.inline_script_allowed);
+    assert!(!p.trusted_types_enforced);
+}
+
+#[test]
+fn test_posture_report_only_csp_enforces_nothing() {
+    // A report-only policy must not lower confidence — it emits reports and
+    // blocks nothing.
+    let mut csp = crate::payload::xss_csp_bypass::analyze_csp("script-src 'self'");
+    csp.report_only = true;
+    let p = PageSecurityPosture::from_csp(Some(&csp));
+    assert!(
+        p.inline_script_allowed,
+        "report-only CSP must be treated as permissive"
+    );
+}
+
+#[test]
+fn test_posture_enforcing_csp_without_unsafe_inline_blocks() {
+    let csp = crate::payload::xss_csp_bypass::analyze_csp("script-src 'self'");
+    let p = PageSecurityPosture::from_csp(Some(&csp));
+    assert!(!p.inline_script_allowed);
+}
+
+#[test]
+fn test_posture_unsafe_inline_is_ignored_when_nonce_pinned() {
+    // Per CSP: a nonce in `script-src` makes `'unsafe-inline'` inert, and a
+    // nonce never helps an attribute the attacker injected.
+    let csp = crate::payload::xss_csp_bypass::analyze_csp(
+        "script-src 'unsafe-inline' 'nonce-abc123' 'self'",
+    );
+    let p = PageSecurityPosture::from_csp(Some(&csp));
+    assert!(
+        !p.inline_script_allowed,
+        "nonce-pinned policy must not count as inline-permitting"
+    );
+}
+
+#[test]
+fn test_posture_plain_unsafe_inline_allows() {
+    let csp = crate::payload::xss_csp_bypass::analyze_csp("script-src 'unsafe-inline' 'self'");
+    let p = PageSecurityPosture::from_csp(Some(&csp));
+    assert!(p.inline_script_allowed);
+}
+
+/// The legacy self-bootstrap upgrade flips the tier to `V` on a static pattern
+/// match. The grade is computed independently, so the two can disagree — here a
+/// CSP that blocks the injected handler keeps the grade `Low` while the tier
+/// still reads `V`. Reporting that disagreement is the point during the
+/// migration; normalizing it would hide what dalfox can actually claim.
+#[test]
+fn test_build_ast_dom_xss_result_grade_can_disagree_with_legacy_tier() {
+    use crate::scanning::result::{FindingMethod, FindingType};
+    let r = super::build_ast_dom_xss_result(super::AstDomFinding {
+        target_url: "https://example.com/",
+        target_method: "GET",
+        vuln: &test_vuln("window.name", "innerHTML", false),
+        payload: "<img src=x onerror=alert(1)>".to_string(),
+        evidence: "evidence".to_string(),
+        message: "DOM-XSS via window.name".to_string(),
+        self_bootstrap_verified: true,
+        posture: PageSecurityPosture {
+            trusted_types_enforced: false,
+            inline_script_allowed: false,
+        },
+    });
+    assert_eq!(
+        r.result_type,
+        FindingType::Verified,
+        "legacy tier preserved"
+    );
+    assert_eq!(
+        r.confidence,
+        Some(Confidence::Low),
+        "grade must not be overwritten by the tier upgrade"
+    );
+    assert_eq!(
+        r.detection_method,
+        FindingMethod::Ast,
+        "method stays ast even though the tier reads V"
+    );
+}
+
+/// Minimal `DomXssVulnerability` for the result-building tests: only source /
+/// sink / `guarded` are read there.
+fn test_vuln(
+    source: &str,
+    sink: &str,
+    guarded: bool,
+) -> crate::scanning::ast_dom_analysis::DomXssVulnerability {
+    crate::scanning::ast_dom_analysis::DomXssVulnerability {
+        line: 1,
+        column: 1,
+        source: source.to_string(),
+        sink: sink.to_string(),
+        guarded,
+    }
+}
+
+/// A page that seeds a non-URL source from a query parameter is reachable by
+/// handing someone a link, so the "needs a driver page" blocker does not apply.
+/// This is the xssmaze `?seed=` shape, and the signal is the same one the legacy
+/// tier promotion uses — here it informs reachability, not the tier.
+#[test]
+fn test_grade_ast_finding_bootstrapped_source_grades_high() {
+    let (grade, reason) = super::grade_ast_finding(
+        "window.opener",
+        "innerHTML",
+        false,
+        true,
+        PageSecurityPosture::default(),
+    );
+    assert_eq!(grade, Confidence::High);
+    assert!(
+        reason.contains("seeded from a query parameter"),
+        "got: {}",
+        reason
+    );
+}
+
+// ── PageSecurityPosture::from_response — CLI/server parity ──────────────
+
+fn headers_with(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    for (k, v) in pairs {
+        h.insert(
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            reqwest::header::HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    h
+}
+
+/// The CLI reads a `<meta http-equiv>` policy during preflight, so the server /
+/// MCP surfaces must too — otherwise the same page grades differently depending
+/// on which interface ran the scan, and Phase 2 turns that into a tier split.
+#[test]
+fn test_posture_from_response_reads_meta_csp_when_no_header() {
+    let body = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy" content="script-src 'self'">
+        </head><body></body></html>"#;
+    let p = PageSecurityPosture::from_response(&headers_with(&[]), body);
+    assert!(
+        !p.inline_script_allowed,
+        "a meta-declared policy must restrict inline script"
+    );
+}
+
+#[test]
+fn test_posture_from_response_meta_report_only_enforces_nothing() {
+    let body = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy-Report-Only" content="script-src 'self'">
+        </head><body></body></html>"#;
+    let p = PageSecurityPosture::from_response(&headers_with(&[]), body);
+    assert!(p.inline_script_allowed);
+}
+
+/// A header and a meta policy are both enforced, so the restrictive header is
+/// not relaxed by a permissive meta; the enforcing header wins over
+/// report-only — the same precedence preflight applies.
+#[test]
+fn test_posture_from_response_header_precedence() {
+    let permissive_meta =
+        r#"<meta http-equiv="Content-Security-Policy" content="script-src 'unsafe-inline'">"#;
+    let p = PageSecurityPosture::from_response(
+        &headers_with(&[("content-security-policy", "script-src 'self'")]),
+        permissive_meta,
+    );
+    assert!(!p.inline_script_allowed, "header must win over meta");
+
+    let p = PageSecurityPosture::from_response(
+        &headers_with(&[
+            ("content-security-policy", "script-src 'self'"),
+            (
+                "content-security-policy-report-only",
+                "script-src 'unsafe-inline'",
+            ),
+        ]),
+        "",
+    );
+    assert!(
+        !p.inline_script_allowed,
+        "enforcing header must win over report-only"
+    );
+}
+
+/// A report-only header enforces nothing, so it must not shadow an enforcing
+/// `<meta>` policy in the same response. The report-only header used to win
+/// simply for being a header, and the enforcing meta was never read.
+#[test]
+fn test_posture_from_response_enforcing_meta_beats_report_only_header() {
+    let body = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy"
+              content="script-src 'self'; require-trusted-types-for 'script'">
+        </head><body></body></html>"#;
+    let p = PageSecurityPosture::from_response(
+        &headers_with(&[(
+            "content-security-policy-report-only",
+            "script-src 'unsafe-inline'",
+        )]),
+        body,
+    );
+    assert!(
+        !p.inline_script_allowed,
+        "the enforcing meta policy restricts inline script"
+    );
+    assert!(p.trusted_types_enforced, "the enforcing meta requires TT");
+}
+
+/// Browsers enforce every `Content-Security-Policy` header, so a restriction
+/// sent in a second header line applies. Only the first line used to be read,
+/// grading a Trusted-Types-hardened, nonce-only page `high`.
+#[test]
+fn test_posture_from_response_reads_every_enforcing_header() {
+    let mut h = headers_with(&[("content-security-policy", "object-src 'none'")]);
+    h.append(
+        reqwest::header::CONTENT_SECURITY_POLICY,
+        reqwest::header::HeaderValue::from_static(
+            "script-src 'nonce-abc'; require-trusted-types-for 'script'",
+        ),
+    );
+    let p = PageSecurityPosture::from_response(&h, "");
+    assert!(
+        !p.inline_script_allowed,
+        "second header's script-src applies"
+    );
+    assert!(
+        p.trusted_types_enforced,
+        "second header's TT requirement applies"
+    );
+}
+
+/// An enforcing header does not hide an enforcing `<meta>` policy: both apply.
+#[test]
+fn test_posture_from_response_combines_header_and_meta() {
+    let body = r#"<meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">"#;
+    let p = PageSecurityPosture::from_response(
+        &headers_with(&[("content-security-policy", "script-src 'unsafe-inline'")]),
+        body,
+    );
+    assert!(
+        p.inline_script_allowed,
+        "neither policy restricts inline script"
+    );
+    assert!(p.trusted_types_enforced, "the meta policy requires TT");
+}
+
+#[test]
+fn test_posture_from_response_report_only_header_is_permissive() {
+    let p = PageSecurityPosture::from_response(
+        &headers_with(&[("content-security-policy-report-only", "script-src 'self'")]),
+        "",
+    );
+    assert!(p.inline_script_allowed);
+}
+
+#[test]
+fn test_posture_from_response_no_csp_anywhere() {
+    let p = PageSecurityPosture::from_response(&headers_with(&[]), "<html></html>");
+    assert!(p.inline_script_allowed);
+    assert!(!p.trusted_types_enforced);
+}
+
+/// `location.origin` / `location.host` / `document.domain` are taint sources,
+/// but they are fixed by the origin the victim is already on — a link cannot
+/// change them, so they must not reach a vulnerability claim on reachability
+/// grounds. They match the `location` prefix, hence the explicit carve-out.
+#[test]
+fn test_grade_ast_finding_origin_fixed_sources_grade_low() {
+    for source in [
+        "location.origin",
+        "location.host",
+        "location.hostname",
+        "location.protocol",
+        "document.domain",
+    ] {
+        let (grade, reason) = super::grade_ast_finding(
+            source,
+            "innerHTML",
+            false,
+            false,
+            PageSecurityPosture::default(),
+        );
+        assert_eq!(grade, Confidence::Low, "source {} should grade low", source);
+        assert!(
+            reason.contains("attacker-controlled page"),
+            "got: {}",
+            reason
+        );
+    }
+}
+
+#[test]
+fn reflected_markup_prescan_finds_marker_slots_only() {
+    let m = crate::scanning::markers::open_marker();
+    let html = format!(
+        r#"<html><head><style>body {{ --theme: {m}; --plain: red; }}</style></head><body>
+        <div id="target" data-content="{m}" data-other="x"></div>
+        <noscript id="ns">{m}</noscript>
+        <div data-noid="{m}"></div>
+        <div id="clean" data-content="hello">plain</div>
+        <span id="styled" style="--inline: {m}"></span>
+        <script>1</script></body></html>"#
+    );
+    let (_, _, markup) = extract_js_script_ids_and_reflected_markup(&html);
+    assert_eq!(
+        markup
+            .attrs
+            .get("target")
+            .map(|a| a.contains("data-content")),
+        Some(true)
+    );
+    assert!(!markup.attrs["target"].contains("data-other"));
+    assert!(!markup.attrs.contains_key("clean"));
+    assert!(markup.text.contains("ns"));
+    assert!(!markup.text.contains("clean"));
+    assert!(markup.css_custom_properties.contains("--theme"));
+    assert!(markup.css_custom_properties.contains("--inline"));
+    assert!(!markup.css_custom_properties.contains("--plain"));
+
+    // A response without this scan's marker proves nothing.
+    let (_, _, empty) = extract_js_script_ids_and_reflected_markup(
+        r#"<div id="t" data-content="dlxdeadbeef">x</div>"#,
+    );
+    assert!(empty.is_empty());
+}
+
+/// End to end through the per-param entry point's analysis: a page that reads
+/// back a reflected `data-*` attribute yields a markup-sourced finding graded
+/// as reachable, and the same page without the marker yields nothing.
+#[test]
+fn reflected_markup_flow_is_found_and_graded_reachable() {
+    let m = crate::scanning::markers::open_marker();
+    let page = |value: &str| {
+        format!(
+            r#"<div id="target" data-content="{value}"></div><script>
+            document.getElementById('target').innerHTML = document.getElementById('target').dataset.content;
+            </script>"#
+        )
+    };
+    let run = |html: &str| {
+        let (js, ids, markup) = extract_js_script_ids_and_reflected_markup(html);
+        let (ids, markup) = (Arc::new(ids), Arc::new(markup));
+        js.iter()
+            .flat_map(|code| {
+                analyze_javascript_for_dom_xss_with_html_context(code, &ids, &markup, false)
+            })
+            .map(|(v, _, _)| v)
+            .collect::<Vec<_>>()
+    };
+    let found = run(&page(m));
+    let v = found
+        .first()
+        .expect("reflected data-* read reaches innerHTML");
+    assert_eq!(v.source, "markup:#target[data-content]");
+    let (grade, reason) = grade_ast_finding(
+        &v.source,
+        &v.sink,
+        false,
+        false,
+        PageSecurityPosture::default(),
+    );
+    assert_eq!(grade, crate::scanning::result::Confidence::High, "{reason}");
+    assert!(run(&page("static")).is_empty());
+}
+
+/// Form ids are collected on every page (no marker needed), and a
+/// `form.action` finding gets a `javascript:` payload, the only scheme a form
+/// submission navigates to and runs.
+#[test]
+fn form_ids_prescan_and_form_action_payload() {
+    let (_, _, markup) = extract_js_script_ids_and_reflected_markup(
+        r#"<form id="f"></form><form></form><div id="d"></div><script>1</script>"#,
+    );
+    assert!(markup.form_ids.contains("f"));
+    assert!(!markup.form_ids.contains("d"));
+    assert!(markup.is_empty(), "form ids are not reflected slots");
+
+    let (payload, _) = generate_dom_xss_poc("URLSearchParams.get(query)", "form.action");
+    assert!(
+        payload.starts_with("query=javascript:alert(1)"),
+        "{payload}"
+    );
+}

@@ -1,0 +1,71 @@
+//! This crate supports the creation of a fully-featured Ockam Node
+//! (see [`NodeManager`](https://github.com/build-trust/ockam/blob/2fc6d7714a4e54f8734c172ad6480fedc6e3629c/implementations/rust/ockam/ockam_api/src/nodes/service.rs#L87) in [`src/nodes/service.rs`](https://github.com/build-trust/ockam/blob/2fc6d7714a4e54f8734c172ad6480fedc6e3629c/implementations/rust/ockam/ockam_api/src/nodes/service.rs)).
+//!
+//! # Configuration
+//!
+//! A `NodeManager` maintains its database and log files on disk in
+//! the `OCKAM_HOME` directory (`~/.ockam`) by default:
+//! ```shell
+//! root
+//! ├─ database.sqlite
+//! ├─ nodes
+//! │  ├─ node1
+//! │  │  ├─ stderr.log
+//! │  │  ├─ stdout.log
+//! │  ├─ node2
+//! │  └─ ...
+//! ```
+
+#[macro_use]
+extern crate tracing;
+
+
+
+pub mod address;
+pub mod authenticator;
+pub mod cli_state;
+pub mod config;
+pub mod echoer;
+pub mod enroll;
+pub mod error;
+pub mod hop;
+pub mod kafka;
+pub mod minicbor_url;
+pub mod nodes;
+pub mod okta;
+pub mod orchestrator;
+pub mod port_range;
+pub mod session;
+pub mod uppercase;
+mod version;
+
+pub mod authority_node;
+pub mod influxdb;
+
+pub mod logs;
+mod schema;
+
+pub mod common_api;
+pub mod control_api;
+mod date;
+mod http;
+mod multiaddr_resolver;
+mod rendezvous_healthcheck;
+pub mod test_utils;
+mod ui;
+mod util;
+
+pub use cli_state::CliState;
+pub use date::UtcDateTime;
+pub use error::*;
+pub use multiaddr_resolver::*;
+pub use nodes::service::default_address::*;
+pub use rendezvous_healthcheck::*;
+pub use session::connection_status::ConnectionStatus;
+pub use ui::*;
+pub use util::*;
+pub use version::*;
+
+pub mod multiaddr {
+    pub use ockam_multiaddr::MultiAddr;
+}

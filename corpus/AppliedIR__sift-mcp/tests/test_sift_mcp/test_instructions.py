@@ -1,0 +1,122 @@
+"""Tests for MCP server instruction strings."""
+
+from sift_common.instructions import (
+    FORENSIC_MCP,
+    FORENSIC_RAG,
+    GATEWAY,
+    OPENCTI,
+    OPENSEARCH,
+    SIFT_MCP,
+    WINDOWS_TRIAGE,
+    WINTOOLS_MCP,
+)
+
+
+class TestInstructionConstants:
+    """Verify all instruction constants exist and contain key phrases."""
+
+    def test_forensic_mcp_has_rule_zero(self):
+        assert isinstance(FORENSIC_MCP, str)
+        assert len(FORENSIC_MCP) > 100
+        assert "RULE ZERO" in FORENSIC_MCP
+        assert "approval mechanism" in FORENSIC_MCP
+
+    def test_sift_mcp_has_evidence_sovereign(self):
+        assert isinstance(SIFT_MCP, str)
+        assert len(SIFT_MCP) > 100
+        assert "EVIDENCE IS SOVEREIGN" in SIFT_MCP
+
+    def test_wintools_mcp_has_evidence_sovereign(self):
+        assert isinstance(WINTOOLS_MCP, str)
+        assert len(WINTOOLS_MCP) > 100
+        assert "EVIDENCE IS SOVEREIGN" in WINTOOLS_MCP
+        assert "Zimmerman" in WINTOOLS_MCP
+
+    def test_gateway_references_backends(self):
+        assert isinstance(GATEWAY, str)
+        assert len(GATEWAY) > 50
+        assert "forensic-mcp" in GATEWAY
+        assert "sift-mcp" in GATEWAY
+        assert "skip_enrichment" in GATEWAY
+
+    def test_windows_triage_explains_unknown(self):
+        assert isinstance(WINDOWS_TRIAGE, str)
+        assert len(WINDOWS_TRIAGE) > 50
+        assert "UNKNOWN" in WINDOWS_TRIAGE
+
+    def test_forensic_rag_describes_search(self):
+        assert isinstance(FORENSIC_RAG, str)
+        assert len(FORENSIC_RAG) > 50
+        assert "knowledge" in FORENSIC_RAG.lower()
+
+    def test_opencti_describes_cti(self):
+        assert isinstance(OPENCTI, str)
+        assert len(OPENCTI) > 50
+        assert "intelligence" in OPENCTI.lower()
+
+
+class TestServerInstructionsWired:
+    """Verify server constructors receive instructions."""
+
+    def test_forensic_mcp_server_has_instructions(self):
+        from forensic_mcp.server import create_server
+
+        server = create_server()
+        # FastMCP stores instructions on the underlying _mcp_server
+        instructions = getattr(server, "instructions", None) or getattr(
+            getattr(server, "_mcp_server", None), "instructions", None
+        )
+        assert instructions is not None
+        assert "RULE ZERO" in instructions
+
+    def test_sift_mcp_server_has_instructions(self):
+        from sift_mcp.server import create_server
+
+        server = create_server()
+        instructions = getattr(server, "instructions", None) or getattr(
+            getattr(server, "_mcp_server", None), "instructions", None
+        )
+        assert instructions is not None
+        assert "EVIDENCE IS SOVEREIGN" in instructions
+
+
+def test_opensearch_aggregation_guidance_names_both_field_forms():
+    """A text guard over the guidance's clauses; it checks nothing about meaning.
+    The old line told the AI to add .keyword to CSV fields, which returns 0
+    buckets, silently, on keyword-only (delim-, json-, zeek-) indices."""
+    assert "use .keyword suffix" not in OPENSEARCH
+    for clause in (
+        "include_fields=true) can show them",  # a sample, not proof
+        "doesn't show .keyword sub-fields",
+        "how a file was ingested",  # the ingest path decides, not the tool
+        "idx_ingest_delimited",
+        "delim-",
+        "json-",
+        "use the bare name",
+        "<field>.keyword",
+        "another artifact's word",  # name collisions
+        "each artifact with its own form via index=",
+        "0 buckets does not prove there are no values",
+    ):
+        assert clause in OPENSEARCH, clause
+    assert "fails loudly" not in OPENSEARCH
+    assert "include_fields=true) shows them" not in OPENSEARCH
+
+
+def test_opensearch_instructions_group_hosts_by_host_id():
+    assert "idx_aggregate on event.code/user.name/host.id" in OPENSEARCH
+    assert "host.name for overview" not in OPENSEARCH
+    for clause in (
+        "filter and group by host.id",
+        "host.name is the raw name a record carried",
+        "Index names carry no host",
+        "idx_host_inventory",
+        "writes nothing until the examiner confirms its hosts, or chooses Start now",
+    ):
+        assert clause in OPENSEARCH, clause
+
+
+def test_forensic_mcp_startup_aggregates_hosts_by_host_id():
+    assert "idx_aggregate on host.id/event.code/user.name" in FORENSIC_MCP
+    assert "idx_aggregate on host.name" not in FORENSIC_MCP
+    assert "idx_host_inventory" in FORENSIC_MCP

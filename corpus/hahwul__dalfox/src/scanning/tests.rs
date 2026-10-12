@@ -1,0 +1,5776 @@
+use super::*;
+use crate::parameter_analysis::{InjectionContext, Location, Param};
+use crate::target_parser::parse_target;
+
+mod request_efficiency;
+
+/// ScanArgs preset for run_scanning integration tests below. Keeps
+/// `skip_xss_scanning` toggleable per-test so the empty/short-circuit
+/// tests can still opt out of real HTTP traffic while the
+/// `realworld_level1_shape_v_upgrade` test exercises the full pipeline.
+fn integration_scan_args(skip_xss: bool) -> crate::cmd::scan::ScanArgs {
+    crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        skip_mining: true,
+        skip_mining_dict: true,
+        skip_mining_dom: true,
+        skip_discovery: true,
+        skip_reflection_header: true,
+        skip_reflection_cookie: true,
+        skip_reflection_path: true,
+        timeout: 5,
+        no_color: true,
+        silence: true,
+        workers: 4,
+        max_concurrent_targets: 4,
+        max_targets_per_host: 8,
+        encoders: vec!["url".to_string()],
+        skip_xss_scanning: skip_xss,
+        sxss_retries: 1,
+        skip_ast_analysis: true,
+        waf_bypass: "off".to_string(),
+        skip_waf_probe: true,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    }
+}
+
+fn make_result(ft: FindingType) -> crate::scanning::result::Result {
+    crate::scanning::result::Result::builder(ft).build()
+}
+
+#[test]
+fn test_inject_type_label_for_sxss() {
+    // Pins the public JSON contract — downstream tooling parses
+    // `inject_type` to distinguish stored from reflected findings.
+    // Changes to these strings break consumers; bump intentionally.
+    assert_eq!(super::inject_type_label_for(false), "inHTML");
+    assert_eq!(super::inject_type_label_for(true), "sxss-inHTML");
+}
+
+#[test]
+fn test_is_template_shaped_payload_detects_double_braces() {
+    assert!(super::is_template_shaped_payload(
+        "{{constructor.constructor('alert(1)')()}} <span class=x>"
+    ));
+    assert!(super::is_template_shaped_payload(
+        "{{this.constructor.constructor('alert(1)')()}}"
+    ));
+}
+
+#[test]
+fn test_is_template_shaped_payload_ignores_single_brace_or_html() {
+    assert!(!super::is_template_shaped_payload("<svg/onload=alert(1)>"));
+    assert!(!super::is_template_shaped_payload("{not-a-template}"));
+    assert!(!super::is_template_shaped_payload("{{ unclosed"));
+    assert!(!super::is_template_shaped_payload("unopened }}"));
+}
+
+#[test]
+fn test_inject_type_for_payload_with_sink_prefers_framework_label_over_csti() {
+    // Framework innerHTML sinks have a more specific exploitation
+    // story than a generic `{{…}}` payload — once the sink is known,
+    // the label should reflect it even when the payload itself is
+    // template-shaped. Helps users prioritise the higher-signal hit.
+    let s = super::inject_type_for_payload_with_sink(
+        false,
+        "{{constructor.constructor('alert(1)')()}}",
+        Some("v-html"),
+    );
+    assert_eq!(s, "inHTML-VHtml");
+}
+
+#[test]
+fn test_inject_type_for_payload_with_sink_maps_known_directives() {
+    assert_eq!(
+        super::inject_type_for_payload_with_sink(false, "<svg/onload=alert(1)>", Some("v-html")),
+        "inHTML-VHtml"
+    );
+    assert_eq!(
+        super::inject_type_for_payload_with_sink(false, "<svg/onload=alert(1)>", Some("data-bind")),
+        "inHTML-DataBind"
+    );
+    assert_eq!(
+        super::inject_type_for_payload_with_sink(
+            false,
+            "<svg/onload=alert(1)>",
+            Some("ng-bind-html")
+        ),
+        "inHTML-NgBindHtml"
+    );
+    assert_eq!(
+        super::inject_type_for_payload_with_sink(true, "<svg/onload=alert(1)>", Some("v-html")),
+        "sxss-inHTML-VHtml"
+    );
+    // Unknown directive falls back to the generic `-FrameworkSink`
+    // suffix so a future detector entry surfaces clearly even before
+    // we wire its short label here.
+    assert_eq!(
+        super::inject_type_for_payload_with_sink(
+            false,
+            "<svg/onload=alert(1)>",
+            Some("unknown-future-directive")
+        ),
+        "inHTML-FrameworkSink"
+    );
+}
+
+#[test]
+fn test_inject_type_for_payload_adds_csti_suffix() {
+    // Template-shaped payloads get the `-CSTI` suffix so downstream
+    // reporters distinguish client-side template injection findings
+    // from generic HTML reflections.
+    assert_eq!(
+        super::inject_type_for_payload(false, "{{constructor.constructor('alert(1)')()}}"),
+        "inHTML-CSTI"
+    );
+    assert_eq!(
+        super::inject_type_for_payload(true, "{{constructor.constructor('alert(1)')()}}"),
+        "sxss-inHTML-CSTI"
+    );
+    // Non-template payloads keep the legacy label so existing
+    // consumers don't have to relearn the format.
+    assert_eq!(
+        super::inject_type_for_payload(false, "<svg/onload=alert(1)>"),
+        "inHTML"
+    );
+    assert_eq!(
+        super::inject_type_for_payload(true, "<svg/onload=alert(1)>"),
+        "sxss-inHTML"
+    );
+}
+
+#[test]
+fn test_count_matching_results_all() {
+    let results = vec![
+        make_result(FindingType::Verified),
+        make_result(FindingType::Reflected),
+        make_result(FindingType::AstDetected),
+    ];
+    assert_eq!(count_matching_results(&results, "ALL", None), 3);
+}
+
+#[test]
+fn test_count_matching_results_filtered() {
+    let results = vec![
+        make_result(FindingType::Verified),
+        make_result(FindingType::Reflected),
+        make_result(FindingType::Reflected),
+        make_result(FindingType::AstDetected),
+    ];
+    assert_eq!(count_matching_results(&results, "V", None), 1);
+    assert_eq!(count_matching_results(&results, "R", None), 2);
+    assert_eq!(count_matching_results(&results, "A", None), 1);
+}
+
+#[test]
+fn test_limit_count_filter_narrows_to_only_poc() {
+    let filter = |limit: &str, only: &[&str]| {
+        crate::cmd::scan::ScanArgs {
+            limit_result_type: limit.to_string(),
+            only_poc: only.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+        .limit_count_filter()
+    };
+    let results = vec![
+        make_result(FindingType::Verified),
+        make_result(FindingType::Reflected),
+    ];
+    let counted = |f: String| count_matching_results(&results, &f, None);
+    assert_eq!(counted(filter("all", &[])), 2);
+    assert_eq!(counted(filter("all", &["v"])), 1);
+    assert_eq!(counted(filter("all", &["v", "r"])), 2);
+    assert_eq!(counted(filter("r", &["v", "r"])), 1);
+    assert_eq!(
+        counted(filter("r", &["v"])),
+        0,
+        "the two exclude each other"
+    );
+}
+
+#[test]
+fn test_count_matching_results_empty() {
+    let results: Vec<crate::scanning::result::Result> = vec![];
+    assert_eq!(count_matching_results(&results, "ALL", None), 0);
+    assert_eq!(count_matching_results(&results, "V", None), 0);
+}
+
+fn make_typed_param_result(
+    ft: FindingType,
+    param: &str,
+    inject: &str,
+) -> crate::scanning::result::Result {
+    make_typed_param_result_for(ft, param, inject, "https://example.com/?x=1")
+}
+
+fn make_typed_param_result_for(
+    ft: FindingType,
+    param: &str,
+    inject: &str,
+    data: &str,
+) -> crate::scanning::result::Result {
+    crate::scanning::result::Result::builder(ft)
+        .inject_type(inject)
+        .method("GET")
+        .data(data)
+        .param(param)
+        .payload("PAY")
+        .cwe("CWE-79")
+        .severity("Info")
+        .message_id(606)
+        .build()
+}
+
+#[test]
+fn test_collapse_drops_r_when_v_exists_for_same_param_and_inject_type() {
+    let results = vec![
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+        make_typed_param_result(FindingType::Verified, "q", "inHTML"),
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+    ];
+    let after = collapse_redundant_reflected(
+        results,
+        "https://example.com/?x=1",
+        "https://example.com/?x=1",
+    );
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].result_type, FindingType::Verified);
+}
+
+#[test]
+fn test_collapse_keeps_r_when_no_v_for_that_param() {
+    let results = vec![
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+    ];
+    let after = collapse_redundant_reflected(
+        results,
+        "https://example.com/?x=1",
+        "https://example.com/?x=1",
+    );
+    assert_eq!(after.len(), 2, "no V to cover, keep R findings");
+}
+
+/// A `q` in the query string and a `q` in the request body are different
+/// injection points (see `found_param_key`), so proving the body one
+/// exploitable must not delete the query one's evidence.
+#[test]
+fn test_collapse_keeps_r_when_the_v_is_at_a_different_wire_location() {
+    let mut verified_body = make_typed_param_result(FindingType::Verified, "q", "inHTML");
+    verified_body.location = "Body".to_string();
+    let mut reflected_query = make_typed_param_result(FindingType::Reflected, "q", "inHTML");
+    reflected_query.location = "Query".to_string();
+
+    let after = collapse_redundant_reflected(
+        vec![verified_body, reflected_query],
+        "https://example.com/?x=1",
+        "https://example.com/?x=1",
+    );
+    assert_eq!(
+        after.len(),
+        2,
+        "the query-string reflection is a separate injection point from the \
+         verified body parameter and must survive the collapse"
+    );
+
+    // Same location: the R really is the weaker evidence for the same finding.
+    let mut verified = make_typed_param_result(FindingType::Verified, "q", "inHTML");
+    verified.location = "Query".to_string();
+    let mut reflected = make_typed_param_result(FindingType::Reflected, "q", "inHTML");
+    reflected.location = "Query".to_string();
+    let after = collapse_redundant_reflected(
+        vec![verified, reflected],
+        "https://example.com/?x=1",
+        "https://example.com/?x=1",
+    );
+    assert_eq!(after.len(), 1);
+}
+
+/// The same field name posted to two different form actions is two injection
+/// points: a finding at one must not mark the other as already found.
+#[test]
+fn found_param_key_separates_same_name_at_different_form_actions() {
+    let at = |action: Option<&str>| Param {
+        form_action_url: action.map(str::to_string),
+        ..Param::new("q".to_string(), String::new(), Location::Body)
+    };
+    assert_ne!(
+        found_param_key(&at(Some("https://x/a"))),
+        found_param_key(&at(Some("https://x/b")))
+    );
+    assert_ne!(
+        found_param_key(&at(None)),
+        found_param_key(&at(Some("https://x/a")))
+    );
+    assert_eq!(
+        found_param_key(&at(Some("https://x/a"))),
+        found_param_key(&at(Some("https://x/a")))
+    );
+}
+
+#[test]
+fn test_collapse_keeps_r_for_different_param_or_inject_type() {
+    let results = vec![
+        make_typed_param_result(FindingType::Verified, "q", "inHTML"),
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML-HPP"),
+        make_typed_param_result(FindingType::Reflected, "other", "inHTML"),
+    ];
+    let after = collapse_redundant_reflected(
+        results,
+        "https://example.com/?x=1",
+        "https://example.com/?x=1",
+    );
+    assert_eq!(
+        after.len(),
+        3,
+        "different inject_type or param must be kept"
+    );
+}
+
+#[tokio::test]
+async fn test_collapse_target_results_no_underflow_when_filter_excludes_r() {
+    // Regression: with `--limit-result-type V`, `findings_count` only ever
+    // counted the V findings, but the old collapse subtracted the *raw* drop in
+    // length (the dropped R duplicates). On `usize` that wrapped to ~usize::MAX
+    // and poisoned `limit_reached()` for the rest of a multi-target run.
+    let results = std::sync::Arc::new(tokio::sync::Mutex::new(vec![
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+        make_typed_param_result(FindingType::Verified, "q", "inHTML"),
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+    ]));
+    // Under filter "V" only the single V finding was ever counted.
+    let findings_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let target = parse_target("https://example.com/?x=1").unwrap();
+
+    collapse_target_results(&results, &findings_count, "V", None, &target).await;
+
+    // Two R duplicates dropped, but none matched "V" — counter must be untouched.
+    assert_eq!(
+        findings_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "collapse must not decrement findings_count for non-matching (R) drops"
+    );
+    assert_eq!(results.lock().await.len(), 1, "collapse keeps only the V");
+}
+
+#[tokio::test]
+async fn test_collapse_target_results_decrements_matching_r_under_all_filter() {
+    // Counterpart: under "ALL" (or "R") the dropped R duplicates *were* counted,
+    // so the counter must decrement by exactly the matching drop.
+    let results = std::sync::Arc::new(tokio::sync::Mutex::new(vec![
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+        make_typed_param_result(FindingType::Verified, "q", "inHTML"),
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+    ]));
+    let findings_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(3));
+    let target = parse_target("https://example.com/?x=1").unwrap();
+
+    collapse_target_results(&results, &findings_count, "ALL", None, &target).await;
+
+    // 3 -> 1 finding: decrement by 2.
+    assert_eq!(
+        findings_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "collapse must decrement by the matching drop under ALL"
+    );
+}
+
+#[test]
+fn test_collapse_does_not_drop_r_from_other_targets() {
+    // V on target A must not drop R on target B even when (param, inject)
+    // shape matches — this was the regression that caused mass false-clean
+    // in batch scans of e.g. xssmaze.
+    let results = vec![
+        make_typed_param_result_for(
+            FindingType::Verified,
+            "q",
+            "inHTML",
+            "http://a.example/?q=1",
+        ),
+        make_typed_param_result_for(
+            FindingType::Reflected,
+            "q",
+            "inHTML",
+            "http://b.example/?q=1",
+        ),
+    ];
+    // Run collapse for target A — must keep B's R.
+    let after =
+        collapse_redundant_reflected(results, "http://a.example/?q=1", "http://a.example/?q=1");
+    assert_eq!(after.len(), 2);
+    assert!(
+        after
+            .iter()
+            .any(|r| r.data.starts_with("http://b.example")
+                && r.result_type == FindingType::Reflected)
+    );
+}
+
+#[test]
+fn test_collapse_drops_r_within_path_injection_target() {
+    // Same path-injection target — different payload encoded into the
+    // last segment. R must collapse against V.
+    let target = "http://a.example/path/level1/seed";
+    let results = vec![
+        make_typed_param_result_for(
+            FindingType::Verified,
+            "p",
+            "inHTML",
+            "http://a.example/path/level1/%3Cimg%3E",
+        ),
+        make_typed_param_result_for(
+            FindingType::Reflected,
+            "p",
+            "inHTML",
+            "http://a.example/path/level1/%3Csvg%3E",
+        ),
+    ];
+    let after = collapse_redundant_reflected(results, target, target);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].result_type, FindingType::Verified);
+}
+
+#[test]
+fn test_collapse_preserves_ast_findings() {
+    let results = vec![
+        make_typed_param_result(FindingType::Verified, "q", "inHTML"),
+        make_typed_param_result(FindingType::AstDetected, "q", "inHTML"),
+        make_typed_param_result(FindingType::Reflected, "q", "inHTML"),
+    ];
+    let after = collapse_redundant_reflected(
+        results,
+        "https://example.com/?x=1",
+        "https://example.com/?x=1",
+    );
+    assert_eq!(after.len(), 2);
+    assert!(
+        after
+            .iter()
+            .any(|r| r.result_type == FindingType::AstDetected)
+    );
+}
+
+#[test]
+fn test_http_scannable_param_count_excludes_fragment() {
+    // Fragment params are client-side only and generate_param_jobs skips them,
+    // so async front-ends must not count them in params_total (it would make
+    // estimated_completion_pct stall below 100%).
+    let mut target = parse_target("https://example.com/?q=x").expect("parse target");
+    mock_add_reflection_param(&mut target, "q", Location::Query);
+    mock_add_reflection_param(&mut target, "body", Location::Body);
+    mock_add_reflection_param(&mut target, "hash", Location::Fragment);
+
+    assert!(super::param_is_http_scannable(&target.reflection_params[0]));
+    assert!(!super::param_is_http_scannable(
+        &target.reflection_params[2]
+    ));
+    assert_eq!(
+        super::http_scannable_param_count(&target),
+        2,
+        "fragment param must be excluded from the HTTP-scannable count"
+    );
+}
+
+// Mock function for XSS scanning tests (similar to parameter analysis mocks)
+fn mock_add_reflection_param(target: &mut Target, name: &str, location: Location) {
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new(name.to_string(), "mock_value".to_string(), location)
+    });
+}
+
+fn default_scan_args() -> crate::cmd::scan::ScanArgs {
+    crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        targets: vec!["https://example.com".to_string()],
+        silence: true,
+        workers: 10,
+        max_concurrent_targets: 10,
+        encoders: vec!["url".to_string(), "html".to_string(), "base64".to_string()],
+        skip_xss_scanning: true,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_get_dom_payloads_javascript_context_returns_breakout_payloads() {
+    let param = Param {
+        injection_context: Some(InjectionContext::Javascript(None)),
+        ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+    };
+    let args = default_scan_args();
+    let payloads = get_dom_payloads(&param, &args).expect("dom payload generation");
+    assert!(
+        !payloads.is_empty(),
+        "JS context should now produce script breakout payloads"
+    );
+    assert!(
+        payloads.iter().any(|p| p.contains("</script>")),
+        "should contain script breakout"
+    );
+}
+
+#[test]
+fn test_get_dom_payloads_javascript_context_carries_string_breakouts() {
+    use crate::parameter_analysis::DelimiterType;
+    let args = default_scan_args();
+    for (delim, wants) in [
+        (
+            DelimiterType::SingleQuote,
+            &[
+                "'-alert(1)-'",
+                "'+alert(1)+'",
+                "'*alert(1)*'",
+                "');alert(1)//",
+                "':alert(1),'",
+            ][..],
+        ),
+        (
+            DelimiterType::DoubleQuote,
+            &[
+                "\"-alert(1)-\"",
+                "\"+alert(1)+\"",
+                "\"*alert(1)*\"",
+                "\");alert(1)//",
+                "\":alert(1),\"",
+            ][..],
+        ),
+        (DelimiterType::Backtick, &["${alert(1)}"][..]),
+    ] {
+        let param = Param {
+            injection_context: Some(InjectionContext::Javascript(Some(delim))),
+            ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+        };
+        let payloads = get_dom_payloads(&param, &args).expect("dom payload generation");
+        for want in wants {
+            assert!(
+                payloads.iter().any(|p| p == want),
+                "JS context must carry the `{want}` string breakout"
+            );
+        }
+        // The expression breakouts come before the `</script>` tag breakouts,
+        // and the whole catalog stays far below the per-param safety cap.
+        let first_tag = payloads.iter().position(|p| p.contains("</script>"));
+        let last_expr = payloads.iter().rposition(|p| wants.contains(&p.as_str()));
+        assert!(last_expr < first_tag, "expression breakouts must lead");
+        assert!(payloads.len() < crate::cmd::scan::DEFAULT_PAYLOAD_SAFETY_CAP / 2);
+    }
+}
+
+#[test]
+fn test_get_dom_payloads_javascript_string_breakouts_are_raw_and_bounded_ahead_of_tags() {
+    use crate::parameter_analysis::DelimiterType;
+    let args = default_scan_args();
+    let expression = get_js_expression_breakout_payloads(Some(&DelimiterType::DoubleQuote));
+    let dom = |escaped: Option<Vec<char>>| {
+        let param = Param {
+            injection_context: Some(InjectionContext::Javascript(Some(
+                DelimiterType::DoubleQuote,
+            ))),
+            escaped_specials: escaped,
+            ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+        };
+        get_dom_payloads(&param, &args).expect("dom payload generation")
+    };
+
+    // Raw only: each string breakout is sent once, never through the encoders.
+    let payloads = dom(None);
+    for e in &expression {
+        assert_eq!(payloads.iter().filter(|p| *p == e).count(), 1, "`{e}`");
+    }
+    let tags =
+        crate::encoding::apply_encoders_to_payloads(&get_js_breakout_payloads(), &args.encoders);
+    assert_eq!(
+        payloads.len(),
+        get_jsonp_callback_payloads().len() + expression.len() + tags.len(),
+        "only the tag breakouts go through the encoders"
+    );
+
+    // A `</script>`-exploitable string must reach the tag breakouts after at
+    // most one form per joiner (the JSONP verifiers lead the whole list).
+    let jsonp = get_jsonp_callback_payloads().len();
+    let first_tag = payloads
+        .iter()
+        .position(|p| p.contains("</script>"))
+        .expect("tag breakouts present");
+    assert!(first_tag <= jsonp + 5, "tag breakouts start at {first_tag}");
+
+    // A JS-escaped delimiter quote defeats every raw-quote breakout.
+    let payloads = dom(Some(vec!['"']));
+    assert!(payloads[jsonp].contains("</script>"));
+}
+
+#[test]
+fn test_get_dom_payloads_html_context_includes_encoded_variants() {
+    let param = Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+    };
+    let args = default_scan_args();
+    let payloads = get_dom_payloads(&param, &args).expect("dom payload generation");
+    assert!(!payloads.is_empty());
+    assert!(payloads.iter().any(|p| p.contains("alert(1)")));
+    assert!(payloads.iter().any(|p| p.contains("%3C")));
+    assert!(payloads.iter().any(|p| p.contains("&#x")));
+}
+
+#[test]
+fn test_get_dom_payloads_only_custom_honors_known_contexts() {
+    use crate::parameter_analysis::InjectionContext;
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "dalfox-only-custom-{}-{unique}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, "<custom-only-payload>\n").expect("write custom payload fixture");
+
+    let mut args = default_scan_args();
+    args.only_custom_payload = true;
+    args.custom_payload = Some(path.to_string_lossy().into_owned());
+    args.encoders = vec!["none".to_string()];
+
+    for context in [
+        InjectionContext::Html(None),
+        InjectionContext::Attribute(None),
+        InjectionContext::Javascript(None),
+    ] {
+        let param = Param {
+            injection_context: Some(context),
+            ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+        };
+        let payloads = get_dom_payloads(&param, &args).expect("DOM payload generation");
+        assert_eq!(payloads, vec!["<custom-only-payload>".to_string()]);
+    }
+
+    std::fs::remove_file(path).expect("remove custom payload fixture");
+}
+
+#[test]
+fn test_get_dom_payloads_unknown_context_falls_back_without_custom_restriction() {
+    let param = Param::new("q".to_string(), "seed".to_string(), Location::Query);
+    let mut args = default_scan_args();
+    args.only_custom_payload = false;
+    args.custom_payload = None;
+    args.encoders = vec!["none".to_string()];
+
+    let payloads = get_dom_payloads(&param, &args).expect("dom fallback payload generation");
+    assert!(
+        !payloads.is_empty(),
+        "fallback should include default HTML/attribute payloads"
+    );
+    assert!(payloads.iter().any(|p| p.contains("onerror=alert(1)")));
+}
+
+#[test]
+fn test_interleave_payload_families_round_robins_and_preserves_order() {
+    let out = interleave_payload_families(vec![
+        vec!["a1".to_string(), "a2".to_string(), "a3".to_string()],
+        vec!["b1".to_string()],
+        vec!["c1".to_string(), "c2".to_string()],
+    ]);
+    // Round-robin across families; shorter families simply drop out of later
+    // rounds, and within-family order is preserved.
+    assert_eq!(out, vec!["a1", "b1", "c1", "a2", "c2", "a3"]);
+    // The union is preserved exactly (no dedup at this layer).
+    assert_eq!(out.len(), 6);
+}
+
+/// Issue #1156 recall guarantee (machine-checked): the unknown-context DOM
+/// catalog must place a representative of EVERY DOM-evidence family within the
+/// early-exit budget window, so the inert-echo early exit can never cut a whole
+/// family — in particular the `javascript:`/`data:` protocol payloads that are
+/// the only verifier for URL-attribute sinks (these were appended last before
+/// the interleave and sat thousands of payloads past the budget).
+#[test]
+fn test_get_dom_payloads_unknown_context_samples_every_evidence_family_in_budget_window() {
+    let param = Param::new("q".to_string(), "seed".to_string(), Location::Query);
+    let mut args = default_scan_args();
+    // `none` keeps the base interleaved order (no encoder expansion) so the
+    // assertion is about catalog ordering, independent of encoder fan-out.
+    args.encoders = vec!["none".to_string()];
+    args.custom_payload = None;
+    args.only_custom_payload = false;
+
+    let payloads = get_dom_payloads(&param, &args).expect("dom payloads");
+
+    use std::collections::HashSet;
+    let html: HashSet<String> = crate::payload::get_dynamic_xss_html_payloads()
+        .into_iter()
+        .collect();
+    let attr: HashSet<String> = crate::payload::get_dynamic_xss_attribute_payloads()
+        .into_iter()
+        .collect();
+    let mxss: HashSet<String> = crate::payload::get_mxss_payloads().into_iter().collect();
+    let clobber: HashSet<String> = crate::payload::get_dom_clobbering_payloads()
+        .into_iter()
+        .collect();
+    let protocol: HashSet<String> = crate::payload::get_protocol_injection_payloads()
+        .into_iter()
+        .collect();
+
+    // A window far below INERT_ECHO_BUDGET (256): with five interleaved families
+    // each appears within the first few rounds.
+    let window = 60.min(payloads.len());
+    let head = &payloads[..window];
+    for (name, fam) in [
+        ("html-tag", &html),
+        ("attribute/event-handler", &attr),
+        ("mXSS", &mxss),
+        ("dom-clobbering", &clobber),
+        ("protocol/url", &protocol),
+    ] {
+        assert!(
+            head.iter().any(|p| fam.contains(p)),
+            "evidence family '{name}' must appear within the first {window} DOM payloads \
+             (interleaved) so the early exit cannot cut it; budget is {INERT_ECHO_BUDGET}"
+        );
+    }
+}
+
+#[test]
+fn test_get_fallback_reflection_payloads_include_encoder_outputs() {
+    let args = default_scan_args();
+    let payloads = get_fallback_reflection_payloads(&args).expect("reflection fallback payloads");
+
+    // Should include HTML payloads (not raw JS like alert(1))
+    assert!(payloads.iter().any(|p| p.contains("onerror=")));
+    assert!(payloads.iter().any(|p| p.contains("<IMG")));
+    // Should have encoded variants
+    assert!(
+        payloads.len() > 100,
+        "should have many payloads with encoder variants"
+    );
+}
+
+/// The reflection catalog (unknown context) must interleave its families like
+/// the DOM catalog does, so the reflection phase's transformed-inert-echo
+/// budget samples every family in an early prefix. Before the interleave the
+/// protocol family was concatenated last and sat thousands of payloads past the
+/// budget — on a uniformly-escaping URL-attribute echo the budget could retire
+/// before a single `javascript:` protocol payload was tried.
+#[test]
+fn test_get_fallback_reflection_payloads_samples_every_family_in_budget_window() {
+    let mut args = default_scan_args();
+    // `none` keeps the base interleaved order (no encoder fan-out), so the
+    // assertion is about catalog ordering only.
+    args.encoders = vec!["none".to_string()];
+    args.custom_payload = None;
+    args.only_custom_payload = false;
+
+    let payloads = get_fallback_reflection_payloads(&args).expect("reflection fallback payloads");
+
+    use std::collections::HashSet;
+    let html: HashSet<String> = crate::payload::get_dynamic_xss_html_payloads()
+        .into_iter()
+        .collect();
+    let attr: HashSet<String> = crate::payload::get_dynamic_xss_attribute_payloads()
+        .into_iter()
+        .collect();
+    let mxss: HashSet<String> = crate::payload::get_mxss_payloads().into_iter().collect();
+    let protocol: HashSet<String> = crate::payload::get_protocol_injection_payloads()
+        .into_iter()
+        .collect();
+
+    // Far below the reflection phase's transformed-echo budget: with four
+    // interleaved families each appears within the first few rounds.
+    let window = 40.min(payloads.len());
+    let head = &payloads[..window];
+    for (name, fam) in [
+        ("html-tag", &html),
+        ("attribute/event-handler", &attr),
+        ("mXSS", &mxss),
+        ("protocol/url", &protocol),
+    ] {
+        assert!(
+            head.iter().any(|p| fam.contains(p)),
+            "reflection family '{name}' must appear within the first {window} payloads"
+        );
+    }
+}
+
+/// The interleave is a pure reordering: same union, same within-family order,
+/// no member added or dropped (the encoder pass dedups downstream, so this
+/// asserts the pre-encoder base is a permutation of the four families).
+#[test]
+fn test_get_fallback_reflection_payloads_union_and_within_family_order_preserved() {
+    let mut args = default_scan_args();
+    args.encoders = vec!["none".to_string()];
+    args.custom_payload = None;
+    args.only_custom_payload = false;
+
+    let payloads = get_fallback_reflection_payloads(&args).expect("reflection fallback payloads");
+
+    let html = crate::payload::get_dynamic_xss_html_payloads();
+    let attr = crate::payload::get_dynamic_xss_attribute_payloads();
+    let mxss = crate::payload::get_mxss_payloads();
+    let protocol = crate::payload::get_protocol_injection_payloads();
+
+    // Union: every family member is present, and the total is exactly the sum
+    // (families are disjoint; if a future family shared a member this would flag
+    // it so the assertion is revisited rather than silently masked).
+    use std::collections::HashSet;
+    let actual: HashSet<&String> = payloads.iter().collect();
+    for fam in [&html, &attr, &mxss, &protocol] {
+        for p in fam {
+            assert!(
+                actual.contains(p),
+                "family member {p:?} must survive interleave"
+            );
+        }
+    }
+    assert_eq!(
+        payloads.len(),
+        html.len() + attr.len() + mxss.len() + protocol.len(),
+        "interleave must be a permutation of the four families' union"
+    );
+
+    // Within-family order: the subsequence of `payloads` restricted to each
+    // family equals that family's own order.
+    for (name, fam) in [
+        ("html", &html),
+        ("attr", &attr),
+        ("mxss", &mxss),
+        ("protocol", &protocol),
+    ] {
+        let fam_set: HashSet<&String> = fam.iter().collect();
+        let subseq: Vec<&String> = payloads.iter().filter(|p| fam_set.contains(*p)).collect();
+        let expected: Vec<&String> = fam.iter().collect();
+        assert_eq!(
+            subseq, expected,
+            "within-family order for '{name}' must be preserved by the interleave"
+        );
+    }
+}
+
+#[test]
+fn test_format_req_per_sec_renders_fixed_width_field() {
+    // Pins the field shape consumed by the `{req_per_sec}` template key in
+    // both the per-target and overall progress bars. The 7-char right-aligned
+    // numeric field + ` req/s` suffix keeps the bar's trailing columns from
+    // jittering as rate magnitude changes; widen with care.
+    let s = format_req_per_sec(120, 2.0);
+    assert_eq!(s, "   60.0 req/s");
+
+    // Sub-unit rate still occupies the same column width.
+    let slow = format_req_per_sec(1, 10.0);
+    assert_eq!(slow, "    0.1 req/s");
+
+    // Large rate doesn't truncate — width is a minimum, not a max.
+    let fast = format_req_per_sec(123_456, 1.0);
+    assert_eq!(fast, "123456.0 req/s");
+}
+
+#[test]
+fn test_format_req_per_sec_zero_elapsed_yields_zero_rate() {
+    // The tracker is queried on the bar's first tick before any wall time
+    // has accumulated; dividing by zero there would render `inf req/s`.
+    // Contract: clamp to `0.0 req/s` until elapsed is positive.
+    assert_eq!(format_req_per_sec(42, 0.0), "    0.0 req/s");
+    assert_eq!(format_req_per_sec(0, 0.0), "    0.0 req/s");
+    // Defensive: negative elapsed (shouldn't happen but guards the branch).
+    assert_eq!(format_req_per_sec(42, -1.0), "    0.0 req/s");
+}
+
+#[test]
+fn test_format_req_per_sec_zero_delta_is_zero_rate() {
+    // Idle bar (no HTTP traffic yet) still renders cleanly.
+    assert_eq!(format_req_per_sec(0, 5.0), "    0.0 req/s");
+}
+
+#[test]
+fn test_prune_blocked_raw_angles_drops_lt_and_gt_when_blocked() {
+    let payloads = vec![
+        "<svg onload=alert(1)>".to_string(),
+        "\" onfocus=alert(1) \"".to_string(),
+        "%3Csvg%20onload%3Dalert(1)%3E".to_string(),
+        "&lt;svg&gt;".to_string(),
+        "\"><img src=x onerror=alert(1)>".to_string(),
+    ];
+    let pruned = prune_blocked_raw_angles(payloads, &['<', '>']);
+    assert_eq!(pruned.len(), 3, "raw < / > payloads must be dropped");
+    assert!(pruned.iter().all(|p| !p.contains('<') && !p.contains('>')));
+}
+
+#[test]
+fn test_prune_blocked_raw_angles_no_op_without_block() {
+    let payloads = vec![
+        "<svg onload=alert(1)>".to_string(),
+        "\" onfocus=alert(1) \"".to_string(),
+    ];
+    let original = payloads.clone();
+    // Empty invalid set — must be a pass-through.
+    let pruned = prune_blocked_raw_angles(payloads, &[]);
+    assert_eq!(pruned, original);
+}
+
+#[test]
+fn test_prune_blocked_raw_angles_partial_block_keeps_other_angle() {
+    // Only `>` is blocked: payloads carrying `>` get dropped, but a raw `<`
+    // alone is still allowed through. Captures servers that strip one angle
+    // but not the other (uncommon, but the helper should respect that).
+    let payloads = vec!["<a>".to_string(), "<a".to_string(), "a>".to_string()];
+    let pruned = prune_blocked_raw_angles(payloads, &['>']);
+    assert_eq!(pruned, vec!["<a".to_string()]);
+}
+
+#[test]
+fn test_payload_is_angle_free_detects_encoded_forms() {
+    assert!(payload_is_angle_free("\" onfocus=alert(1) \""));
+    assert!(payload_is_angle_free("javascript:alert(1)"));
+    assert!(!payload_is_angle_free("<svg>"));
+    assert!(!payload_is_angle_free("%3Csvg%3E"));
+    assert!(!payload_is_angle_free("%3csvg%3e"));
+    assert!(!payload_is_angle_free("&lt;svg&gt;"));
+    assert!(!payload_is_angle_free("&#60;svg&#62;"));
+    assert!(!payload_is_angle_free("&#x3c;svg&#x3e;"));
+    assert!(!payload_is_angle_free("%253Csvg%253E"));
+}
+
+#[test]
+fn test_hoist_angle_free_payloads_orders_clean_first() {
+    let payloads = vec![
+        "%3Csvg%20onload%3Dalert(1)%3E".to_string(), // encoded angles
+        "\" onfocus=alert(1) \"".to_string(),        // angle-free
+        "&lt;img&gt;".to_string(),                   // encoded angles
+        "javascript:alert(1)".to_string(),           // angle-free
+    ];
+    let hoisted = hoist_angle_free_payloads(payloads, &['<']);
+    assert_eq!(hoisted[0], "\" onfocus=alert(1) \"");
+    assert_eq!(hoisted[1], "javascript:alert(1)");
+    // The encoded-angle ones come after, in original relative order.
+    assert!(hoisted[2].contains("%3C"));
+    assert!(hoisted[3].contains("&lt;"));
+}
+
+#[test]
+fn test_hoist_angle_free_payloads_no_op_without_block() {
+    let payloads = vec!["<svg>".to_string(), "\" onfocus=alert(1) \"".to_string()];
+    let original = payloads.clone();
+    let hoisted = hoist_angle_free_payloads(payloads, &['"']);
+    assert_eq!(hoisted, original, "non-angle invalids must not reorder");
+}
+
+#[test]
+fn test_prune_keeps_positional_pad_bypass_despite_blocked_angles() {
+    // A leading-window ("positional") pad payload carries a raw `<` on purpose —
+    // the block may only touch a leading window, so the tag passes once padded
+    // past it. The raw-angle prune must exempt it while still dropping ordinary
+    // raw-angle payloads.
+    let pad = format!("{}<svg onload=alert(1) class=x>", "0".repeat(24));
+    let payloads = vec![
+        pad.clone(),
+        "<svg onload=alert(1)>".to_string(), // ordinary raw-angle: dropped
+        "\" onfocus=alert(1) \"".to_string(), // angle-free: kept
+    ];
+    let pruned = prune_blocked_raw_angles(payloads, &['<', '>']);
+    assert!(
+        pruned.contains(&pad),
+        "positional-pad payload must survive the prune"
+    );
+    assert!(
+        !pruned.iter().any(|p| p == "<svg onload=alert(1)>"),
+        "ordinary raw-angle payloads must still be dropped"
+    );
+}
+
+#[test]
+fn test_hoist_puts_positional_pad_bypass_first() {
+    // When angles are reported blocked, positional-pad payloads must lead so the
+    // DOM phase's inert-echo early exit cannot retire before they are tried.
+    let pad = format!("{}<svg onload=alert(1) class=x>", "0".repeat(24));
+    let payloads = vec![
+        "\" onfocus=alert(1) \"".to_string(), // angle-free
+        pad.clone(),                          // positional pad (raw <)
+        "%3Csvg%3E".to_string(),              // encoded angle
+    ];
+    let hoisted = hoist_angle_free_payloads(payloads, &['<']);
+    assert_eq!(
+        hoisted[0], pad,
+        "positional-pad payload must be hoisted to the very front"
+    );
+    assert_eq!(hoisted[1], "\" onfocus=alert(1) \"");
+    assert!(hoisted[2].contains("%3C"));
+}
+
+// ── expand_waf_payloads: orthogonal mutation/encoder expansion ───────
+
+#[test]
+fn test_expand_waf_payloads_keeps_axes_orthogonal_no_cross_product() {
+    use crate::waf::bypass::{BypassStrategy, MutationType};
+    let base = vec!["<script>alert(1)</script>".to_string()];
+    let strategy = BypassStrategy {
+        extra_encoders: vec!["url".to_string()],
+        mutations: vec![MutationType::CaseAlternation],
+        extra_delay_hint_ms: 0,
+    };
+    let out = expand_waf_payloads(&base, &strategy, None);
+
+    // The raw mutation is present, un-encoded.
+    let mutated = crate::waf::bypass::apply_mutations(&base, &[MutationType::CaseAlternation], 1)
+        .into_iter()
+        .find(|p| p != &base[0])
+        .expect("case-alternation should produce a variant");
+    assert!(out.contains(&mutated), "raw mutation must be present");
+
+    // The url-encoded *original* is present.
+    let enc = crate::encoding::url_encode(&base[0]);
+    assert!(out.contains(&enc), "encoded original must be present");
+
+    // But the cross product encode(mutate(p)) must NOT be generated.
+    let cross = crate::encoding::url_encode(&mutated);
+    assert!(
+        !out.contains(&cross),
+        "encode(mutation) cross product must not be emitted"
+    );
+}
+
+#[test]
+fn test_expand_waf_payloads_ordering_originals_then_mutations_then_encoders() {
+    use crate::waf::bypass::{BypassStrategy, MutationType};
+    let base = vec!["<svg onload=alert(1)>".to_string()];
+    let strategy = BypassStrategy {
+        extra_encoders: vec!["url".to_string()],
+        mutations: vec![MutationType::SlashSeparator],
+        extra_delay_hint_ms: 0,
+    };
+    let out = expand_waf_payloads(&base, &strategy, None);
+
+    assert_eq!(out[0], base[0], "original must come first");
+    let slash = "<svg/onload=alert(1)>".to_string();
+    let enc = crate::encoding::url_encode(&base[0]);
+    let i_slash = out
+        .iter()
+        .position(|p| p == &slash)
+        .expect("raw mutation present");
+    let i_enc = out
+        .iter()
+        .position(|p| p == &enc)
+        .expect("encoder variant present");
+    assert!(
+        i_slash < i_enc,
+        "raw mutation must precede encoder variants (got slash@{i_slash}, enc@{i_enc})"
+    );
+}
+
+#[test]
+fn test_expand_waf_payloads_records_mutation_telemetry() {
+    use crate::waf::bypass::{BypassStrategy, MutationStats, MutationType};
+    let base = vec!["<svg onload=alert(1)>".to_string()];
+    let strategy = BypassStrategy {
+        extra_encoders: vec![],
+        mutations: vec![MutationType::SlashSeparator],
+        extra_delay_hint_ms: 0,
+    };
+    let stats = MutationStats::default();
+    let _ = expand_waf_payloads(&base, &strategy, Some(&stats));
+    let snap = stats.snapshot();
+    assert_eq!(
+        snap.variants.get(&MutationType::SlashSeparator).copied(),
+        Some(1),
+        "the applied mutation must be recorded once"
+    );
+}
+
+#[test]
+fn test_expand_waf_payloads_reduces_request_count_vs_cross_product() {
+    use crate::waf::bypass::{BypassStrategy, MutationType};
+    // Demonstrates the request-volume win: the orthogonal expansion is
+    // strictly smaller than the old multiply-everything cross product.
+    let base = vec![
+        "<script>alert(1)</script>".to_string(),
+        "<svg onload=alert(1)>".to_string(),
+    ];
+    let strategy = BypassStrategy {
+        extra_encoders: vec!["url".to_string(), "2url".to_string(), "unicode".to_string()],
+        mutations: vec![
+            MutationType::HtmlCommentSplit,
+            MutationType::CaseAlternation,
+            MutationType::BacktickParens,
+        ],
+        extra_delay_hint_ms: 0,
+    };
+    let new = expand_waf_payloads(&base, &strategy, None);
+
+    // Old behavior: mutate first, then encode the *whole* set.
+    let mutated = crate::waf::bypass::apply_mutations(
+        &base,
+        &strategy.mutations,
+        MAX_WAF_MUTATION_VARIANTS_PER_PAYLOAD,
+    );
+    let old = crate::encoding::apply_encoders_to_payloads(&mutated, &strategy.extra_encoders);
+
+    assert!(
+        new.len() < old.len(),
+        "orthogonal expansion ({}) must send fewer payloads than the cross product ({})",
+        new.len(),
+        old.len()
+    );
+}
+
+#[test]
+fn test_expand_waf_payloads_empty_strategy_dedups_originals() {
+    use crate::waf::bypass::BypassStrategy;
+    let base = vec!["<x>".to_string(), "<x>".to_string(), "<y>".to_string()];
+    let strategy = BypassStrategy::default();
+    let out = expand_waf_payloads(&base, &strategy, None);
+    assert_eq!(out, vec!["<x>".to_string(), "<y>".to_string()]);
+}
+
+#[test]
+fn test_get_fallback_reflection_payloads_none_encoder_keeps_raw_only() {
+    let mut args = default_scan_args();
+    args.encoders = vec!["none".to_string()];
+    let payloads = get_fallback_reflection_payloads(&args).expect("reflection fallback payloads");
+
+    // Should include HTML payloads
+    assert!(payloads.iter().any(|p| p.contains("onerror=")));
+    // With "none" encoder, should NOT have URL-encoded variants of HTML payloads
+    let raw_count = payloads
+        .iter()
+        .filter(|p| p.contains("<IMG") || p.contains("<sVg"))
+        .count();
+    assert!(raw_count > 0, "should contain raw HTML payloads");
+}
+
+#[test]
+fn test_build_request_text_query_contains_headers_and_cookies() {
+    let mut target = parse_target("https://example.com/search?a=1").unwrap();
+    target.method = "GET".to_string();
+    target.headers = vec![("X-Test".to_string(), "1".to_string())];
+    target.cookies = vec![("sid".to_string(), "abc".to_string())];
+
+    let param = Param::new("q".to_string(), "".to_string(), Location::Query);
+
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert!(request.contains("GET /search?a=1&q=PAYLOAD HTTP/1.1"));
+    assert!(request.contains("Host: example.com"));
+    assert!(request.contains("X-Test: 1"));
+    assert!(request.contains("Cookie: sid=abc"));
+}
+
+#[test]
+fn test_build_request_text_path_segment_injection() {
+    let mut target = parse_target("https://example.com/a/b/c").unwrap();
+    target.method = "GET".to_string();
+
+    let param = Param::new(
+        "path_segment_1".to_string(),
+        "b".to_string(),
+        Location::Path,
+    );
+
+    let request = build_request_text(&target, &param, "hello world");
+    assert!(request.contains("GET /a/hello%20world/c HTTP/1.1"));
+}
+
+#[test]
+fn test_build_request_text_json_body_empty_value_reserializes() {
+    // Regression (ORCH-2): an empty `param.value` used to make the JsonBody
+    // fallback call `str::replace("", payload)`, splicing the payload between
+    // every byte of the (invalid-JSON) body and producing a garbled PoC. It
+    // should re-serialize to `{name: payload}` instead, matching what the
+    // scanner actually sends for invalid-JSON bodies.
+    let mut target = parse_target("https://example.com/api").unwrap();
+    target.method = "POST".to_string();
+    target.data = Some("not-json-at-all".to_string());
+
+    let param = Param::new("q".to_string(), String::new(), Location::JsonBody);
+
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert!(
+        request.contains(r#"{"q":"PAYLOAD"}"#),
+        "expected re-serialized JSON body, got:\n{request}"
+    );
+    // The old empty-pattern splice produced "PAYLOADn…" (payload interleaved
+    // with the original body bytes); ensure that no longer happens.
+    assert!(
+        !request.contains("PAYLOADn"),
+        "payload should not be spliced into the original body:\n{request}"
+    );
+}
+
+// ── Issue #1156: DOM-phase early-exit decision logic ──────────────────────
+// These pin the pure helpers so the threshold semantics are tested without a
+// live server; the end-to-end wiring + request reduction is covered by the
+// `run_scanning` integration tests further down.
+
+#[test]
+fn test_is_blocking_dom_status_is_5xx_only() {
+    // Only 5xx server errors are "blocking" for the early exit.
+    for s in [500u16, 502, 503, 504, 599] {
+        assert!(is_blocking_dom_status(s), "status {s} should be blocking");
+    }
+    // 4xx WAF blocks are intentionally EXCLUDED — a payload variant can bypass
+    // a WAF filter, so they must not drive the early exit (recall preservation).
+    // Normal responses and the request-error sentinel are likewise not blocking.
+    for s in [0u16, 200, 204, 301, 302, 400, 401, 403, 404, 406, 418, 429] {
+        assert!(
+            !is_blocking_dom_status(s),
+            "status {s} should not be blocking"
+        );
+    }
+}
+
+#[test]
+fn test_next_blocked_streak_resets_on_non_block() {
+    // Consecutive silent 5xx accumulate…
+    assert_eq!(next_blocked_streak(0, 503, false), 1);
+    assert_eq!(next_blocked_streak(63, 503, false), 64);
+    // …but ANY non-5xx response resets the streak to 0 — this is what makes the
+    // streak *consecutive*, so 64 non-consecutive blocks never early-exit.
+    assert_eq!(next_blocked_streak(63, 200, false), 0);
+    assert_eq!(next_blocked_streak(63, 403, false), 0); // 4xx WAF block does not count
+    assert_eq!(next_blocked_streak(63, 0, false), 0); // request error does not count
+}
+
+/// A 5xx that echoes the payload is a rendered error page, not a dead server.
+///
+/// Regression guard: framework development error pages (Kemal, Werkzeug, Rails,
+/// Symfony) reflect the request path / query string / an exception message built
+/// from user input, and they are a 500 by construction — GHSA-2x8p-5jvx-v7jw is
+/// exactly this shape. Counting them toward the streak ended the DOM phase after
+/// `BLOCKED_STREAK_LIMIT` payloads, so the parameter could only ever be reported
+/// `[R]` even though `--deep-scan` verifies it as `[V]`. Fan-out on these
+/// endpoints is bounded by `INERT_ECHO_BUDGET` instead, which is the budget
+/// meant for "reflects everything, verifies nothing".
+#[test]
+fn test_next_blocked_streak_spares_reflecting_error_pages() {
+    // A reflecting 5xx never accumulates, no matter how long the run.
+    assert_eq!(next_blocked_streak(0, 500, true), 0);
+    assert_eq!(next_blocked_streak(63, 500, true), 0);
+    assert_eq!(next_blocked_streak(63, 503, true), 0);
+    // …and it clears a streak built by preceding silent errors, exactly like any
+    // other response that proves the endpoint is still rendering.
+    assert_eq!(
+        next_blocked_streak(next_blocked_streak(0, 500, false), 500, true),
+        0
+    );
+    // The early exit therefore never fires on this endpoint via the streak.
+    assert!(!dom_phase_should_early_exit(
+        false,
+        0,
+        next_blocked_streak(63, 500, true),
+        0
+    ));
+}
+
+#[test]
+fn test_next_inert_echo_count_is_cumulative() {
+    // A reflected response increments…
+    assert_eq!(next_inert_echo_count(10, true), 11);
+    // …and a NON-reflecting response does NOT reset (cumulative, unlike the
+    // blocked streak). An endpoint that reflects most-but-not-all payloads must
+    // still converge on the budget.
+    assert_eq!(next_inert_echo_count(10, false), 10);
+    assert_eq!(next_inert_echo_count(0, false), 0);
+}
+
+#[test]
+fn test_dom_phase_early_exit_disabled_under_deep_scan() {
+    // Even way past both budgets, --deep-scan never early-exits (exhaustive).
+    assert!(!dom_phase_should_early_exit(
+        true,
+        INERT_ECHO_BUDGET * 10,
+        BLOCKED_STREAK_LIMIT * 10,
+        REDIRECT_STREAK_LIMIT * 10
+    ));
+}
+
+#[test]
+fn test_dom_phase_early_exit_inert_echo_threshold() {
+    // One below the budget keeps scanning; reaching it stops.
+    assert!(!dom_phase_should_early_exit(
+        false,
+        INERT_ECHO_BUDGET - 1,
+        0,
+        0
+    ));
+    assert!(dom_phase_should_early_exit(false, INERT_ECHO_BUDGET, 0, 0));
+    assert!(dom_phase_should_early_exit(
+        false,
+        INERT_ECHO_BUDGET + 1,
+        0,
+        0
+    ));
+}
+
+#[test]
+fn test_dom_phase_early_exit_blocked_streak_threshold() {
+    assert!(!dom_phase_should_early_exit(
+        false,
+        0,
+        BLOCKED_STREAK_LIMIT - 1,
+        0
+    ));
+    assert!(dom_phase_should_early_exit(
+        false,
+        0,
+        BLOCKED_STREAK_LIMIT,
+        0
+    ));
+}
+
+#[test]
+fn test_dom_phase_no_early_exit_without_signal() {
+    // No inert echoes and no block streak → run the full (capped) set.
+    assert!(!dom_phase_should_early_exit(false, 0, 0, 0));
+    assert!(!dom_phase_should_early_exit(false, 10, 5, 0));
+    // Redirect streak alone triggers the exit at its own threshold.
+    assert!(!dom_phase_should_early_exit(
+        false,
+        0,
+        0,
+        REDIRECT_STREAK_LIMIT - 1
+    ));
+    assert!(dom_phase_should_early_exit(
+        false,
+        0,
+        0,
+        REDIRECT_STREAK_LIMIT
+    ));
+}
+
+#[tokio::test]
+async fn test_xss_scanning_get_query() {
+    let mut target = parse_target("https://example.com").unwrap();
+    mock_add_reflection_param(&mut target, "q", Location::Query);
+
+    let args = crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        targets: vec!["https://example.com".to_string()],
+        workers: 10,
+        max_concurrent_targets: 10,
+        skip_xss_scanning: true,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    };
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+
+    // Mock scanning - in real scenario this would attempt HTTP requests
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results, Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    // Verify that reflection params are present
+    assert!(!target.reflection_params.is_empty());
+    assert_eq!(target.reflection_params[0].location, Location::Query);
+}
+
+#[tokio::test]
+async fn test_xss_scanning_post_body() {
+    let mut target = parse_target("https://example.com").unwrap();
+    mock_add_reflection_param(&mut target, "data", Location::Body);
+
+    let args = crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        targets: vec!["https://example.com".to_string()],
+        data: Some("key1=value1&key2=value2".to_string()),
+        method: "POST".to_string(),
+        workers: 10,
+        max_concurrent_targets: 10,
+        skip_xss_scanning: true,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    };
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+
+    // Mock scanning - in real scenario this would attempt HTTP requests
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results, Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    // Verify that reflection params are present
+    assert!(!target.reflection_params.is_empty());
+    assert_eq!(target.reflection_params[0].location, Location::Body);
+}
+
+#[tokio::test]
+async fn test_run_scanning_with_reflection_params() {
+    let mut target = parse_target("https://example.com").unwrap();
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new(
+            "test_param".to_string(),
+            "test_value".to_string(),
+            Location::Query,
+        )
+    });
+
+    let args = crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        targets: vec!["https://example.com".to_string()],
+        workers: 10,
+        max_concurrent_targets: 10,
+        skip_xss_scanning: true,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    };
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+
+    // This will attempt real HTTP requests, but in test environment it may fail
+    // For unit testing, we can just ensure no panic occurs
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results, Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+}
+
+/// End-to-end test for the static V upgrade broadened in #960. Runs
+/// `run_scanning` against a mock that mimics the xssmaze `/realworld/level1`
+/// shape — reflects the query twice, once with angles stripped inside an
+/// HTML comment, once raw inside `<h2>`. Before the fix the static V
+/// upgrade only checked `has_js_context_evidence`, so this shape produced
+/// R findings only (3045 R-only on deep-scan). After the fix the
+/// reflection-phase response itself carries `<svg/onload=alert(1)>` and
+/// `classify_dom_evidence` returns `HtmlStructural`, so a Verified
+/// finding must appear.
+#[tokio::test]
+async fn test_run_scanning_realworld_level1_shape_promotes_to_verified() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    async fn realworld_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+        // Mirror xssmaze /realworld/level1: strip < and > inside the comment,
+        // reflect raw inside <h2>. Filters::strip_angles equivalent.
+        let q = params.get("query").cloned().unwrap_or_default();
+        let safe: String = q.chars().filter(|c| *c != '<' && *c != '>').collect();
+        Html(format!(
+            "<!-- search: {} --><h2>Results for: {}</h2>",
+            safe, q
+        ))
+    }
+
+    let app = Router::new().route("/", get(realworld_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?query=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    // Skip discovery entirely (it would re-probe and may classify <> as
+    // invalid given the comment-side stripping). The test exercises the
+    // V-upgrade path with a pre-populated reflection param.
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("query".to_string(), "a".to_string(), Location::Query)
+    });
+
+    let args = Arc::new(integration_scan_args(false));
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        args,
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    let verified: Vec<_> = guard
+        .iter()
+        .filter(|r| matches!(r.result_type, FindingType::Verified) && r.param == "query")
+        .collect();
+    assert!(
+        !verified.is_empty(),
+        "the realworld/level1 shape must produce at least one Verified finding on `query`; \
+         got {} total results: {:?}",
+        guard.len(),
+        guard
+            .iter()
+            .map(|r| (&r.result_type, &r.param))
+            .collect::<Vec<_>>()
+    );
+    // The evidence label should reflect the actual DOM evidence kind that
+    // fired, not the hard-coded "JS-context AST" string the prior code
+    // emitted unconditionally. The comment-breakout shape produces
+    // `HtmlStructural` → label "HTML element with sink"; other shapes
+    // may surface marker / executable-URL / JS-context.
+    let labels: Vec<_> = verified.iter().map(|r| r.evidence.as_str()).collect();
+    assert!(
+        labels.iter().any(|m| m.contains("HTML element with sink")
+            || m.contains("DOM marker")
+            || m.contains("javascript: URL in attribute")
+            || m.contains("JS-context AST")),
+        "V finding must carry a DomEvidenceKind label from classify_dom_evidence; got {:?}",
+        labels
+    );
+}
+
+/// A reflection inside a server `on*` handler's single-quoted JS argument.
+/// `/inert` JS-escapes then HTML-escapes the input, so nothing can close the
+/// string: no payload may verify (the inline-handler check used to accept a
+/// `</script><svg onload=alert(1)>` payload sitting inside the string).
+/// `/vuln` only HTML-escapes; the browser decodes `&#x27;` at attribute-parse
+/// time (xss-game L4), so a string breakout must verify — which needs the JS
+/// DOM catalog to carry `'-alert(1)-'`-style payloads, not only `</script>`
+/// tag breakouts that are inert in a handler.
+#[tokio::test]
+async fn test_run_scanning_inline_handler_string_reflection_verifies_only_real_breakout() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    fn html_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#x27;")
+    }
+    async fn inert(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let q = p.get("q").cloned().unwrap_or_default();
+        let js = q.replace('\\', "\\\\").replace('\'', "\\'");
+        Html(format!(
+            "<img src=x onload=\"startTimer('{}')\">",
+            html_escape(&js)
+        ))
+    }
+    async fn vuln(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let q = p.get("q").cloned().unwrap_or_default();
+        Html(format!(
+            "<img src=x onload=\"startTimer('{}')\">",
+            html_escape(&q)
+        ))
+    }
+
+    // Vulnerable twins behind a filter that strips `-` (only the `+`/`*`/closer
+    // joiners survive), one with the reflection in an object-key position.
+    async fn nodash(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let q = p.get("q").cloned().unwrap_or_default().replace('-', "");
+        Html(format!(
+            "<img src=x onload=\"startTimer('{}')\">",
+            html_escape(&q)
+        ))
+    }
+    async fn objkey(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+        let q = p.get("q").cloned().unwrap_or_default().replace('-', "");
+        Html(format!(
+            "<button onclick=\"go({{'{}':1}})\">x</button>",
+            html_escape(&q)
+        ))
+    }
+
+    let app = Router::new()
+        .route("/inert", get(inert))
+        .route("/vuln", get(vuln))
+        .route("/nodash", get(nodash))
+        .route("/objkey", get(objkey));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    for (path, expect_verified) in [
+        ("inert", false),
+        ("vuln", true),
+        ("nodash", true),
+        ("objkey", true),
+    ] {
+        let mut target = parse_target(&format!("http://{addr}/{path}?q=a")).expect("parse_target");
+        target.reflection_params.push(Param {
+            injection_context: Some(InjectionContext::Javascript(Some(
+                crate::parameter_analysis::DelimiterType::SingleQuote,
+            ))),
+            // What discovery records for both routes: the HTML-escaped
+            // characters come back encoded, so the reflection phase's adaptive
+            // payloads drop every quote-bearing breakout and only the DOM phase
+            // can verify.
+            invalid_specials: Some(vec!['\'', '"', '<', '>', '&']),
+            valid_specials: Some(vec!['(', ')', '-', '+', ';', '/', '=', '`']),
+            ..Param::new("q".to_string(), "a".to_string(), Location::Query)
+        });
+        let results = Arc::new(Mutex::new(Vec::new()));
+        run_scanning(
+            &target,
+            Arc::new(integration_scan_args(false)),
+            ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        let guard = results.lock().await;
+        let verified: Vec<_> = guard
+            .iter()
+            .filter(|r| matches!(r.result_type, FindingType::Verified))
+            .map(|r| r.payload.clone())
+            .collect();
+        if expect_verified {
+            assert!(
+                verified
+                    .iter()
+                    .any(|p| p.starts_with('\'') && !p.contains("</script>")),
+                "/{path}: a string breakout must verify; got {verified:?}"
+            );
+        } else {
+            assert!(
+                verified.is_empty(),
+                "/{path}: inert reflection verified: {verified:?}"
+            );
+        }
+    }
+}
+
+/// Issue #1156 — a self-/canonical-link-style echo that reflects every payload
+/// but in a permanently inert context (reflected inside an HTML comment with the
+/// `-->` terminator neutralised, so no payload can break out to form an element)
+/// must trigger the DOM-phase inert-echo early exit. An HTML comment is
+/// deliberately *not* one of the reflection phase's safe-tag contexts, so that
+/// phase still records a real R and short-circuits, leaving the DOM phase — where
+/// the raw payload reflects but is permanently inert — to exercise the early
+/// exit. The unknown-context (`injection_context: None`) DOM payload set is
+/// thousands of payloads; the early exit has to cap the request fan-out well
+/// below that without producing a false Verified finding.
+#[tokio::test]
+async fn test_run_scanning_dom_phase_early_exits_on_inert_echo() {
+    use axum::{
+        Router,
+        extract::{Query, State},
+        response::Html,
+        routing::get,
+    };
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, sleep};
+
+    async fn inert_handler(
+        State(counter): State<Arc<AtomicUsize>>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Html<String> {
+        counter.fetch_add(1, Ordering::Relaxed);
+        let q = params.get("query").cloned().unwrap_or_default();
+        // Reflect inside an HTML comment with the comment terminator neutralised
+        // so no payload can break out. An HTML comment is *not* one of the
+        // reflection phase's safe-tag contexts (textarea/noscript/xmp/plaintext/
+        // title), so the reflection phase still classifies it as a real R and
+        // short-circuits after one request — leaving the DOM phase, where the
+        // raw payload reflects (classify_reflection = Some) but is permanently
+        // inert (comment content forms no element), to exercise the early exit.
+        let sanitized = q.replace("-->", "__");
+        Html(format!(
+            "<html><body><!-- echo: {} --></body></html>",
+            sanitized
+        ))
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/", get(inert_handler))
+        .with_state(counter.clone());
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?query=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.reflection_params.clear();
+    // `Param::new` leaves `injection_context` unset: unknown context → the full
+    // HTML+attribute+… DOM payload catalog (thousands of payloads once
+    // encoder-expanded).
+    target
+        .reflection_params
+        .push(Param::new("query", "a", Location::Query));
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(integration_scan_args(false)),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let sent = counter.load(Ordering::Relaxed);
+    // A full diverse pass (~INERT_ECHO_BUDGET reflections + probe + the
+    // short-circuited reflection phase) runs before the exit — proving the cut
+    // is signal-driven, not a premature bail.
+    assert!(
+        sent >= 200,
+        "early exit must still take a diverse sample first; only sent {sent}"
+    );
+    // Without the early exit this echo would run the entire unknown-context DOM
+    // set (~6k requests with the url encoder). The inert-echo budget caps it at
+    // roughly one diverse pass.
+    assert!(
+        sent < 600,
+        "inert-echo early exit must curb the DOM fan-out; sent {sent} requests"
+    );
+
+    let guard = results.lock().await;
+    let verified = guard
+        .iter()
+        .filter(|r| matches!(r.result_type, FindingType::Verified))
+        .count();
+    let reflected = guard
+        .iter()
+        .filter(|r| matches!(r.result_type, FindingType::Reflected) && r.param == "query")
+        .count();
+    assert_eq!(
+        verified, 0,
+        "a permanently inert HTML-comment echo must not yield a false Verified finding"
+    );
+    assert!(
+        reflected >= 1,
+        "the payload is echoed, so the reflection phase must still record an R finding"
+    );
+}
+
+/// Issue #1156 — recall guard: the early exit must never suppress a real
+/// finding. An echo that reflects the payload into live HTML must still surface
+/// a Verified finding (the early exit only fires on *non*-verifying responses).
+#[tokio::test]
+async fn test_run_scanning_dom_phase_preserves_recall_on_executable_echo() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    async fn exec_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+        let q = params.get("query").cloned().unwrap_or_default();
+        // Reflected raw into live body markup — payloads form real elements.
+        Html(format!("<html><body><div>{}</div></body></html>", q))
+    }
+
+    let app = Router::new().route("/", get(exec_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?query=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.reflection_params.clear();
+    target.reflection_params.push(Param::new(
+        "query".to_string(),
+        "a".to_string(),
+        Location::Query,
+    ));
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(integration_scan_args(false)),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    let verified = guard
+        .iter()
+        .filter(|r| matches!(r.result_type, FindingType::Verified) && r.param == "query")
+        .count();
+    assert!(
+        verified >= 1,
+        "an executable echo must still produce a Verified finding; got {:?}",
+        guard
+            .iter()
+            .map(|r| (&r.result_type, &r.param))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Issue #1156 — the inert-echo signal must be CUMULATIVE, not consecutive: an
+/// endpoint that reflects most-but-not-all payloads (here ~3 of every 4) must
+/// still accumulate to the budget and early-exit. A regression making the count
+/// reset on a non-reflecting response would never reach the budget on this
+/// handler and would run the entire DOM set — so a bounded request count proves
+/// the cumulative wiring end-to-end.
+#[tokio::test]
+async fn test_run_scanning_dom_phase_inert_echo_count_is_cumulative() {
+    use axum::{
+        Router,
+        extract::{Query, State},
+        response::Html,
+        routing::get,
+    };
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, sleep};
+
+    async fn partial_handler(
+        State(counter): State<Arc<AtomicUsize>>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Html<String> {
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        let q = params.get("query").cloned().unwrap_or_default();
+        // Every 4th request returns a clean page with NO reflection; the other
+        // ~75% reflect the payload inertly (inside a comment). The probe and the
+        // first reflection payload (n = 0,1,2) always reflect so the scan
+        // proceeds into the DOM phase.
+        if n >= 3 && n % 4 == 3 {
+            return Html("<html><body>clean</body></html>".to_string());
+        }
+        let sanitized = q.replace("-->", "__");
+        Html(format!(
+            "<html><body><!-- echo: {} --></body></html>",
+            sanitized
+        ))
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/", get(partial_handler))
+        .with_state(counter.clone());
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?query=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.reflection_params.clear();
+    target.reflection_params.push(Param::new(
+        "query".to_string(),
+        "a".to_string(),
+        Location::Query,
+    ));
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(integration_scan_args(false)),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let sent = counter.load(Ordering::Relaxed);
+    // Cumulative: 256 inert echoes reached after ~256/0.75 ≈ 341 reflecting
+    // requests, so the phase early-exits well under the full ~6k set. A
+    // consecutive (reset-on-miss) counter would never reach 256 here and would
+    // run the entire set.
+    assert!(
+        sent < 1500,
+        "inert_echo_count must be cumulative across non-reflecting gaps; sent {sent} requests"
+    );
+}
+
+/// HTML-escape every structural character — the uniformly-escaping shape the
+/// reflection-phase transformed-inert-echo budget targets. Shared by the budget
+/// tests below.
+fn escape_structural_for_test(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// axum handler: reflect the `query` param HTML-escaped into a `<div>` (inert
+/// literal text — no payload can form markup) and count every request. Shared
+/// by the reflection-phase budget tests.
+async fn counting_escaping_handler(
+    axum::extract::State(counter): axum::extract::State<Arc<std::sync::atomic::AtomicUsize>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Html<String> {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let q = params.get("query").cloned().unwrap_or_default();
+    axum::response::Html(format!(
+        "<html><body><div>{}</div></body></html>",
+        escape_structural_for_test(&q)
+    ))
+}
+
+/// Spawn [`counting_escaping_handler`] on an ephemeral port; returns the address
+/// and the per-request counter.
+async fn spawn_counting_escaping_server()
+-> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route("/", axum::routing::get(counting_escaping_handler))
+        .with_state(counter.clone());
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    (addr, counter)
+}
+
+/// Phase 2A — the reflection phase's transformed-inert-echo budget. A server
+/// that uniformly HTML-escapes its output mints no `R` (an escaped echo is
+/// demoted to `None`), so the `reflection_found_locally` short-circuit never
+/// fires and, before this budget, the phase ran its entire catalog. The budget
+/// must cap that fan-out once enough transformed-inert echoes have been seen,
+/// without producing any finding.
+#[tokio::test]
+async fn test_run_scanning_reflection_phase_early_exits_on_escaped_echo() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (addr, counter) = spawn_counting_escaping_server().await;
+
+    let url = format!("http://{}/?query=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.reflection_params.clear();
+    // Unknown context → the full (thousands-strong) reflection catalog.
+    target
+        .reflection_params
+        .push(Param::new("query", "a", Location::Query));
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(integration_scan_args(false)),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let sent = counter.load(Ordering::Relaxed);
+    // Signal-driven, not a premature bail: at least one diverse budget window of
+    // transformed-inert echoes is sampled before the cut (the reflection budget
+    // plus the DOM budget each take ~256).
+    assert!(
+        sent >= 200,
+        "the early exit must still take a diverse sample first; only sent {sent}"
+    );
+    // Without the reflection-phase budget this endpoint runs its whole catalog
+    // (thousands of requests). Both the reflection and DOM budgets cap it to a
+    // couple of diverse passes.
+    assert!(
+        sent < 1500,
+        "the transformed-inert-echo budget must curb the reflection fan-out; sent {sent}"
+    );
+
+    // The real exploitability property: a uniformly-escaping endpoint can never
+    // execute a payload, so there must be no Verified finding. (An `R` on a bare
+    // event-handler string reflected as body *text* is a pre-existing reflection
+    // classification quirk, orthogonal to this budget and to exploitability, so
+    // it is not constrained here.)
+    let guard = results.lock().await;
+    let verified = guard
+        .iter()
+        .filter(|r| matches!(r.result_type, FindingType::Verified))
+        .count();
+    assert_eq!(
+        verified,
+        0,
+        "a uniformly-escaping endpoint is not exploitable and must yield no Verified finding; got {:?}",
+        guard
+            .iter()
+            .map(|r| (&r.result_type, &r.param))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Phase 2A recall guard — `--deep-scan` disables the transformed-inert-echo
+/// budget (as it disables every other fan-out trim), so the exhaustive mode
+/// still runs the whole catalog against the same escaping endpoint. A bounded
+/// `--max-payloads-per-param` keeps the test fast while leaving the two runs
+/// clearly distinguishable: deep scan must send materially more than the
+/// budgeted run.
+#[tokio::test]
+async fn test_run_scanning_reflection_phase_budget_disabled_under_deep_scan() {
+    use std::sync::atomic::Ordering;
+
+    async fn run(deep_scan: bool, cap: usize) -> usize {
+        let (addr, counter) = spawn_counting_escaping_server().await;
+
+        let url = format!("http://{}/?query=a", addr);
+        let mut target = parse_target(&url).expect("parse_target");
+        target.reflection_params.clear();
+        target
+            .reflection_params
+            .push(Param::new("query", "a", Location::Query));
+
+        let mut args = integration_scan_args(false);
+        args.deep_scan = deep_scan;
+        // Bound the catalog so the deep-scan run stays fast but still far exceeds
+        // the ~256 budget window.
+        args.max_payloads_per_param = cap;
+
+        let results = Arc::new(Mutex::new(Vec::new()));
+        run_scanning(
+            &target,
+            Arc::new(args),
+            ScanRunHandles::new(
+                results.clone(),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ),
+        )
+        .await;
+        counter.load(Ordering::Relaxed)
+    }
+
+    let budgeted = run(false, 700).await;
+    let deep = run(true, 700).await;
+
+    // Deep scan opts out of the cut, so it sends materially more requests than
+    // the budgeted run against the identical endpoint.
+    assert!(
+        deep > budgeted + 200,
+        "deep scan must run past the budget: budgeted={budgeted}, deep={deep}"
+    );
+}
+
+#[tokio::test]
+async fn test_run_scanning_increments_params_done_counter() {
+    // Each per-parameter worker must bump the live `params_done` counter once
+    // on completion — including the non-reflective early-return path — so the
+    // REST server and MCP can report `params_tested` climbing during a scan
+    // instead of pinning it at 0 until the very end. The target reflects
+    // nothing, so every worker takes the "no reflection, skip payloads" path;
+    // the counter must still reach the param count.
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+    async fn ok_handler() -> Html<String> {
+        Html("<html><body>no reflection here</body></html>".to_string())
+    }
+    let app = Router::new().route("/", get(ok_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?a=1&b=2&c=3", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.reflection_params.clear();
+    for name in ["a", "b", "c"] {
+        target.reflection_params.push(Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            ..Param::new(name.to_string(), "1".to_string(), Location::Query)
+        });
+    }
+
+    let params_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    run_scanning(
+        &target,
+        Arc::new(integration_scan_args(false)),
+        ScanRunHandles::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_params_done(params_done.clone()),
+    )
+    .await;
+
+    assert_eq!(
+        params_done.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "every parameter worker must increment params_done exactly once"
+    );
+}
+
+#[tokio::test]
+async fn test_run_scanning_cancelled_workers_are_not_counted_as_tested() {
+    // Every parameter worker is spawned up front and the ones queued behind the
+    // semaphore return early once the scan is cancelled. They must not bump
+    // `params_done`, or a cancelled scan reports params_tested == params_total
+    // (100%) after a handful of requests.
+    use axum::{Router, extract::State, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+    async fn cancel_handler(
+        State(flag): State<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Html<String> {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        Html("<html><body>no reflection here</body></html>".to_string())
+    }
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = Router::new()
+        .route("/", get(cancel_handler))
+        .with_state(cancel.clone());
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?a=1&b=2&c=3", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.workers = 1;
+    target.reflection_params.clear();
+    for name in ["a", "b", "c"] {
+        target.reflection_params.push(Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            ..Param::new(name.to_string(), "1".to_string(), Location::Query)
+        });
+    }
+
+    let params_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    run_scanning(
+        &target,
+        Arc::new(integration_scan_args(false)),
+        ScanRunHandles::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_cancel(cancel)
+        .with_params_done(params_done.clone()),
+    )
+    .await;
+
+    assert_eq!(
+        params_done.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "workers that bailed on cancellation must not count as tested"
+    );
+}
+
+/// Serve `body` for every GET and count the hits.
+async fn spawn_counting_page(body: String) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    use axum::{Router, extract::State, response::Html, routing::get};
+    use std::net::Ipv4Addr;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/",
+            get(
+                |State((hits, body)): State<(Arc<AtomicUsize>, String)>| async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Html(body)
+                },
+            ),
+        )
+        .with_state((hits.clone(), body));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    (addr, hits)
+}
+
+fn ast_sink_page(script_line: &str, n: usize) -> String {
+    let mut s = String::from("<html><body><div id=\"out\"></div><script>\n");
+    for _ in 0..n {
+        s.push_str(script_line);
+        s.push('\n');
+    }
+    s.push_str("</script></body></html>");
+    s
+}
+
+#[tokio::test]
+async fn test_run_ast_dom_analysis_bounds_light_verify_requests_and_evidence() {
+    // A page chooses how many sinks it carries; each used to cost one uncounted,
+    // uncancellable GET plus a retained 64 KiB body. N sinks sharing a payload
+    // are one request, and only the first findings keep a response copy.
+    let n = 200;
+    let page = ast_sink_page(
+        "document.getElementById('out').innerHTML = location.hash;",
+        n,
+    );
+    let (addr, hits) = spawn_counting_page(page.clone()).await;
+    let target = parse_target(&format!("http://{addr}/?q=1")).expect("parse_target");
+    let param = Param::new("q".to_string(), "1".to_string(), Location::Query);
+    let client = target.build_client_or_default();
+    let mut seen = HashSet::new();
+
+    let results =
+        run_ast_dom_analysis(&client, &target, &param, &page, "m", false, &mut seen, None).await;
+
+    assert!(
+        results.len() >= n,
+        "every sink is still reported ({} findings)",
+        results.len()
+    );
+    let verify_gets = hits.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        verify_gets <= 4,
+        "one light-verify GET per distinct payload, not per sink: {verify_gets}"
+    );
+    let with_body = results.iter().filter(|r| r.response.is_some()).count();
+    assert!(
+        with_body <= 64,
+        "response copies are capped, got {with_body}"
+    );
+}
+
+#[tokio::test]
+async fn test_run_ast_dom_analysis_skips_light_verify_once_cancelled() {
+    let page = ast_sink_page(
+        "document.getElementById('out').innerHTML = location.hash;",
+        5,
+    );
+    let (addr, hits) = spawn_counting_page(page.clone()).await;
+    let target = parse_target(&format!("http://{addr}/?q=1")).expect("parse_target");
+    let param = Param::new("q".to_string(), "1".to_string(), Location::Query);
+    let client = target.build_client_or_default();
+    let mut seen = HashSet::new();
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+
+    let results = run_ast_dom_analysis(
+        &client,
+        &target,
+        &param,
+        &page,
+        "m",
+        false,
+        &mut seen,
+        Some(&cancel),
+    )
+    .await;
+
+    assert!(!results.is_empty(), "static findings are still reported");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a cancelled scan must not fire verification requests"
+    );
+}
+
+#[tokio::test]
+async fn test_run_ast_dom_analysis_poc_url_uses_param_pre_encoding() {
+    // The reflection / DOM phases build the PoC from the as-sent payload; the
+    // AST path used the raw one, so `data` disagreed with `request` for a
+    // pre-encoded param and the PoC did not reproduce.
+    let page = ast_sink_page("document.getElementById('out').innerHTML = window.name;", 1);
+    let (addr, _hits) = spawn_counting_page(page.clone()).await;
+    let target = parse_target(&format!("http://{addr}/?q=c2FmZQ==")).expect("parse_target");
+    let mut param = Param::new("q".to_string(), "c2FmZQ==".to_string(), Location::Query);
+    param.pre_encoding = Some("base64".to_string());
+    let client = target.build_client_or_default();
+    let mut seen = HashSet::new();
+
+    let results =
+        run_ast_dom_analysis(&client, &target, &param, &page, "m", false, &mut seen, None).await;
+
+    let r = results
+        .iter()
+        .find(|r| !r.poc_url_complete)
+        .expect("a non-URL-surface source finding");
+    let wire = r.wire_payload.as_deref().expect("wire payload recorded");
+    assert_ne!(wire, r.payload);
+    assert_eq!(
+        wire,
+        crate::encoding::pre_encoding::apply_param_encoding(&r.payload, &param)
+    );
+    assert!(
+        r.data.contains(&urlencoding::encode(wire).into_owned()) || r.data.contains(wire),
+        "PoC URL carries the as-sent payload: {}",
+        r.data
+    );
+}
+
+#[tokio::test]
+async fn test_run_scanning_empty_params() {
+    let target = parse_target("https://example.com").unwrap();
+
+    let args = crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        targets: vec!["https://example.com".to_string()],
+        workers: 10,
+        max_concurrent_targets: 10,
+        skip_xss_scanning: true,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    };
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results, Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+}
+
+// ── fetch_and_analyze_external_js unit tests ─────────────────────────────────
+
+/// Minimal axum server for external-JS unit tests. Serves:
+///   GET /app.js  → `js_body`
+///   GET /big.js  → body just over MAX_EXTERNAL_JS_BYTES (512 KiB)
+async fn start_ext_js_server(js_body: &'static str) -> std::net::SocketAddr {
+    use axum::{Router, http::header, routing::get};
+
+    let app_js =
+        move || async move { ([(header::CONTENT_TYPE, "application/javascript")], js_body) };
+    let big_js = || async {
+        // "// x\n" × 110_000 ≈ 550 KiB > 512 KiB cap
+        let body = "// x\n".repeat(110_000);
+        ([(header::CONTENT_TYPE, "application/javascript")], body)
+    };
+    let app = Router::new()
+        .route("/app.js", get(app_js))
+        .route("/big.js", get(big_js));
+
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind ext-js test server");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    addr
+}
+
+fn ext_js_scan_args(analyze: bool) -> crate::cmd::scan::ScanArgs {
+    crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        input_type: "url".to_string(),
+        format: "json".to_string(),
+        skip_mining: true,
+        skip_mining_dict: true,
+        skip_mining_dom: true,
+        skip_discovery: true,
+        skip_reflection_header: true,
+        skip_reflection_cookie: true,
+        skip_reflection_path: true,
+        timeout: 5,
+        no_color: true,
+        silence: true,
+        workers: 2,
+        max_concurrent_targets: 2,
+        max_targets_per_host: 10,
+        encoders: vec![],
+        skip_xss_scanning: true,
+        sxss_retries: 1,
+        analyze_external_js: analyze,
+        waf_bypass: "off".to_string(),
+        skip_waf_probe: true,
+        retry_delay: 0,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    }
+}
+
+/// flag=false → always returns empty regardless of page content.
+#[tokio::test]
+async fn test_fetch_ext_js_flag_off_returns_empty() {
+    let addr = start_ext_js_server(
+        r#"document.getElementById("r").innerHTML = location.hash.substring(1);"#,
+    )
+    .await;
+    let target = parse_target(&format!("http://{addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    let html = format!(r#"<html><body><script src="http://{addr}/app.js"></script></body></html>"#);
+    let args = ext_js_scan_args(false);
+    let findings = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+    assert!(
+        findings.is_empty(),
+        "flag off must return empty; got {findings:?}"
+    );
+}
+
+/// flag=true + script has `location.hash → innerHTML` → finding returned and
+/// evidence cites the script URL.
+#[tokio::test]
+async fn test_fetch_ext_js_detects_dom_xss_in_script() {
+    let addr = start_ext_js_server(
+        r#"document.getElementById("r").innerHTML = location.hash.substring(1);"#,
+    )
+    .await;
+    let target = parse_target(&format!("http://{addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    let html = format!(r#"<html><body><script src="http://{addr}/app.js"></script></body></html>"#);
+    let args = ext_js_scan_args(true);
+    let findings = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+    assert!(
+        !findings.is_empty(),
+        "expected DOM-XSS finding from external script"
+    );
+    let cites_script = findings.iter().any(|f| f.evidence.contains("/app.js"));
+    assert!(
+        cites_script,
+        "evidence must cite the script URL; got {findings:#?}"
+    );
+}
+
+/// Body larger than MAX_EXTERNAL_JS_BYTES → skipped gracefully, no panic.
+#[tokio::test]
+async fn test_fetch_ext_js_skips_oversized_body() {
+    let addr = start_ext_js_server("").await;
+    let target = parse_target(&format!("http://{addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    let html = format!(r#"<html><body><script src="http://{addr}/big.js"></script></body></html>"#);
+    let args = ext_js_scan_args(true);
+    // big.js has no sink; primary assertion is no panic on oversized body.
+    let _ = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+}
+
+/// exclude_url matching the script URL → script skipped, empty result.
+#[tokio::test]
+async fn test_fetch_ext_js_exclude_url_skips_script() {
+    let addr = start_ext_js_server(
+        r#"document.getElementById("r").innerHTML = location.hash.substring(1);"#,
+    )
+    .await;
+    let target = parse_target(&format!("http://{addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    let html = format!(r#"<html><body><script src="http://{addr}/app.js"></script></body></html>"#);
+    let mut args = ext_js_scan_args(true);
+    args.exclude_url = vec!["app\\.js".to_string()];
+    let findings = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+    assert!(
+        findings.is_empty(),
+        "excluded script must not produce findings; got {findings:?}"
+    );
+}
+
+/// Script URL returns a non-2xx status (404) → skipped gracefully, no findings.
+#[tokio::test]
+async fn test_fetch_ext_js_non_2xx_response_is_skipped() {
+    let addr = start_ext_js_server("").await;
+    let target = parse_target(&format!("http://{addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    // /nonexistent.js has no route → axum returns 404
+    let html = format!(
+        r#"<html><body><script src="http://{addr}/nonexistent.js"></script></body></html>"#
+    );
+    let args = ext_js_scan_args(true);
+    let findings = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+    assert!(
+        findings.is_empty(),
+        "non-2xx response must be skipped; got {findings:?}"
+    );
+}
+
+/// Script URL connection is refused (port closed) → error silently skipped, no panic.
+#[tokio::test]
+async fn test_fetch_ext_js_network_error_is_skipped() {
+    // Bind, capture address, then drop so the port is closed before the test connects.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let closed_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let target = parse_target(&format!("http://{closed_addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    let html =
+        format!(r#"<html><body><script src="http://{closed_addr}/app.js"></script></body></html>"#);
+    let args = ext_js_scan_args(true);
+    let findings = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+    assert!(
+        findings.is_empty(),
+        "network error must be skipped gracefully; got {findings:?}"
+    );
+}
+
+/// include_url set to a pattern that does NOT match the script URL → script skipped, empty result.
+#[tokio::test]
+async fn test_fetch_ext_js_include_url_skips_non_matching_script() {
+    let addr = start_ext_js_server(
+        r#"document.getElementById("r").innerHTML = location.hash.substring(1);"#,
+    )
+    .await;
+    let target = parse_target(&format!("http://{addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    let html = format!(r#"<html><body><script src="http://{addr}/app.js"></script></body></html>"#);
+    let mut args = ext_js_scan_args(true);
+    // Pattern that does NOT match /app.js → the include-filter `continue` branch fires.
+    args.include_url = vec!["only_this_pattern_matches".to_string()];
+    let findings = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+    assert!(
+        findings.is_empty(),
+        "script not matching include_url must be skipped; got {findings:?}"
+    );
+}
+
+/// resp.text() failure (connection dropped mid-body) → skipped gracefully, no findings.
+#[tokio::test]
+async fn test_fetch_ext_js_body_read_error_is_skipped() {
+    use tokio::io::AsyncWriteExt;
+
+    // Raw TCP server: advertises Content-Length: 1000 but closes after a few bytes,
+    // so reqwest's resp.text() gets a truncated-body error.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 1000\r\n\r\npartial",
+                )
+                .await
+                .ok();
+            // Dropping `stream` closes the connection before 1000 bytes are sent.
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let target = parse_target(&format!("http://{addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    let html = format!(r#"<html><body><script src="http://{addr}/app.js"></script></body></html>"#);
+    let args = ext_js_scan_args(true);
+    let findings = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+    assert!(
+        findings.is_empty(),
+        "body read error must be skipped gracefully; got {findings:?}"
+    );
+}
+
+/// The script_element_ids set must be sourced from the host HTML, not the JS body.
+/// When the host page has `<script id="eval-me">` and the external JS writes
+/// `document.getElementById('eval-me').innerText = location.hash.substring(1)`,
+/// the analyzer must recognise it as a JS-eval sink. With the old (buggy) code the JS
+/// body was passed to `extract_script_element_ids`, producing an empty set and silently
+/// missing the finding.
+#[tokio::test]
+async fn test_fetch_ext_js_uses_html_for_script_element_ids() {
+    let addr = start_ext_js_server(
+        r#"document.getElementById('eval-me').innerText = location.hash.substring(1);"#,
+    )
+    .await;
+    let target = parse_target(&format!("http://{addr}/")).unwrap();
+    let client = target.build_client_or_default();
+    // Host HTML declares <script id="eval-me"> — the ID that makes the sink recognisable.
+    let html = format!(
+        r#"<html><body><script id="eval-me"></script><script src="http://{addr}/app.js"></script></body></html>"#
+    );
+    let args = ext_js_scan_args(true);
+    let findings = fetch_and_analyze_external_js(&client, &target, &html, &args).await;
+    assert!(
+        !findings.is_empty(),
+        "expected DOM-XSS finding when host HTML supplies the script element ID; got none"
+    );
+}
+
+/// accumulate_findings with an empty batch must be a no-op (counter unchanged, vec unchanged).
+#[tokio::test]
+async fn test_accumulate_findings_empty_batch_is_noop() {
+    let results: tokio::sync::Mutex<Vec<crate::scanning::result::Result>> =
+        tokio::sync::Mutex::new(Vec::new());
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    accumulate_findings(&results, &counter, vec![], "ALL", None).await;
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "counter must not change for empty batch"
+    );
+    assert!(
+        results.lock().await.is_empty(),
+        "results vec must remain empty for empty batch"
+    );
+}
+
+/// accumulate_findings must bump the limit counter by the number of findings
+/// matching --limit-result-type (like flush_results), not the whole batch —
+/// otherwise non-matching preflight findings trip --limit early.
+#[tokio::test]
+async fn test_accumulate_findings_counts_only_matching_result_type() {
+    let results: tokio::sync::Mutex<Vec<crate::scanning::result::Result>> =
+        tokio::sync::Mutex::new(Vec::new());
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let batch = vec![
+        make_result(FindingType::Verified),
+        make_result(FindingType::Reflected),
+        make_result(FindingType::Reflected),
+    ];
+    accumulate_findings(&results, &counter, batch, "V", None).await;
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the single V finding should count toward --limit-result-type V"
+    );
+    assert_eq!(
+        results.lock().await.len(),
+        3,
+        "all findings are still stored regardless of the limit filter"
+    );
+}
+
+/// An AST finding (`message_id == 0`) counts toward `--limit` only when no
+/// counted finding already shares its `ast_dedup_key`.
+#[test]
+fn count_new_matching_results_folds_ast_duplicates() {
+    let ast = |evidence: &str| {
+        let mut r = make_result(FindingType::AstDetected);
+        r.message_id = 0;
+        r.evidence = evidence.to_string();
+        r
+    };
+    let mut reflected = make_result(FindingType::Reflected);
+    reflected.message_id = 1;
+    let existing = vec![reflected, ast("sink-a")];
+    let batch = vec![ast("sink-a"), ast("sink-b"), ast("sink-b")];
+    assert_eq!(
+        count_new_matching_results(&existing, &batch, "ALL", None),
+        1
+    );
+}
+
+// ---- build_request_text: the displayed PoC HTTP request ------------------
+
+use crate::target_parser::Target;
+
+/// Minimal `Param` for request-text tests (all the discovery-derived metadata
+/// fields left at their `None` defaults).
+fn req_param(name: &str, value: &str, location: Location) -> Param {
+    Param::new(name.to_string(), value.to_string(), location)
+}
+
+fn target_for(url: &str) -> Target {
+    Target::for_url(url::Url::parse(url).expect("valid url"))
+}
+
+#[test]
+fn build_request_text_query_replaces_existing_param() {
+    let target = target_for("https://example.com/path?a=1&b=2");
+    let param = req_param("a", "1", Location::Query);
+    let req = super::build_request_text(&target, &param, "PAYLOAD");
+    // Request line is the GET method against the path with the injected query.
+    assert!(req.starts_with("GET /path?"), "req:\n{req}");
+    assert!(req.contains("a=PAYLOAD"), "req:\n{req}");
+    assert!(req.contains("b=2"), "req:\n{req}");
+    assert!(
+        req.contains(" HTTP/1.1\r\nHost: example.com"),
+        "req:\n{req}"
+    );
+    // A bodyless GET ends with the blank-line terminator, no Content-Length.
+    assert!(!req.contains("Content-Length:"), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_query_appends_missing_param() {
+    let target = target_for("https://example.com/path?x=1");
+    let param = req_param("q", "", Location::Query);
+    let req = super::build_request_text(&target, &param, "INJ");
+    assert!(req.contains("x=1"), "req:\n{req}");
+    assert!(req.contains("q=INJ"), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_path_segment_injection() {
+    let target = target_for("https://example.com/a/b/c");
+    // path_segment_1 targets the middle segment "b".
+    let param = req_param("path_segment_1", "b", Location::Path);
+    let req = super::build_request_text(&target, &param, "INJ");
+    assert!(req.starts_with("GET /a/INJ/c "), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_path_segment_out_of_range_is_unchanged() {
+    let target = target_for("https://example.com/a/b");
+    // Index 9 is past the end: the path is left intact.
+    let param = req_param("path_segment_9", "", Location::Path);
+    let req = super::build_request_text(&target, &param, "INJ");
+    assert!(req.starts_with("GET /a/b "), "req:\n{req}");
+    assert!(!req.contains("INJ"), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_body_replaces_in_existing_form_data() {
+    let target = Target {
+        method: "POST".to_string(),
+        data: Some("user=alice&pass=secret".to_string()),
+        ..target_for("https://example.com/login")
+    };
+    let param = req_param("pass", "secret", Location::Body);
+    let req = super::build_request_text(&target, &param, "PAY");
+    // Body-capable methods are preserved; form content type is set.
+    assert!(req.starts_with("POST /login "), "req:\n{req}");
+    assert!(
+        req.contains("Content-Type: application/x-www-form-urlencoded"),
+        "req:\n{req}"
+    );
+    assert!(req.contains("user=alice"), "req:\n{req}");
+    assert!(req.contains("pass=PAY"), "req:\n{req}");
+    assert!(req.contains("Content-Length: "), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_body_preserves_query_method() {
+    // RFC 10008 QUERY: body injection must not force POST.
+    let target = Target {
+        method: "QUERY".to_string(),
+        data: Some("filter=foo&q=seed".to_string()),
+        ..target_for("https://example.com/search")
+    };
+    let param = req_param("q", "seed", Location::Body);
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(req.starts_with("QUERY /search "), "req:\n{req}");
+    assert!(req.contains("filter=foo"), "req:\n{req}");
+    assert!(req.contains("q=PAY"), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_body_synthesizes_when_no_data() {
+    let target = target_for("https://example.com/login");
+    let param = req_param("q", "", Location::Body);
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(req.starts_with("POST /login "), "req:\n{req}");
+    assert!(req.contains("q=PAY"), "req:\n{req}");
+    assert!(
+        req.contains("Content-Type: application/x-www-form-urlencoded"),
+        "req:\n{req}"
+    );
+}
+
+#[test]
+fn build_request_text_jsonbody_injects_into_object() {
+    let target = Target {
+        method: "POST".to_string(),
+        data: Some(r#"{"name":"bob"}"#.to_string()),
+        ..target_for("https://example.com/api")
+    };
+    let param = req_param("name", "bob", Location::JsonBody);
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(
+        req.contains("Content-Type: application/json"),
+        "req:\n{req}"
+    );
+    assert!(req.contains(r#""name":"PAY""#), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_graphqlbody_uses_field_value_as_json_body() {
+    // GraphQL bodies rebuild the whole document from the param pipeline via
+    // `apply_param_encoding`; with no pipeline set that is the raw payload,
+    // shipped as `application/json`.
+    let target = target_for("https://example.com/graphql");
+    let param = req_param("variables.n", "", Location::GraphqlBody);
+    let req = super::build_request_text(&target, &param, "<svg onload=alert(1)>");
+    assert!(
+        req.contains("Content-Type: application/json"),
+        "req:\n{req}"
+    );
+    assert!(
+        req.contains("\r\n\r\n<svg onload=alert(1)>"),
+        "graphql body should be the rebuilt document, req:\n{req}"
+    );
+}
+
+#[test]
+fn build_request_text_xmlbody_uses_field_value_and_xml_content_type() {
+    // XML bodies are likewise the pipeline-rebuilt document; the content type
+    // comes from `xml_request_content_type` (default `application/xml`).
+    let target = target_for("https://example.com/soap");
+    let param = req_param("q", "", Location::XmlBody);
+    let req = super::build_request_text(&target, &param, "<svg onload=alert(1)>");
+    assert!(req.contains("Content-Type: application/xml"), "req:\n{req}");
+    assert!(
+        req.contains("\r\n\r\n<svg onload=alert(1)>"),
+        "xml body should be the rebuilt document, req:\n{req}"
+    );
+}
+
+#[test]
+fn build_request_text_jsonbody_synthesizes_when_no_data() {
+    let target = target_for("https://example.com/api");
+    let param = req_param("q", "", Location::JsonBody);
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(
+        req.contains("Content-Type: application/json"),
+        "req:\n{req}"
+    );
+    assert!(req.contains(r#""q":"PAY""#), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_jsonbody_empty_value_reserializes_invalid_json() {
+    // Invalid-JSON body + empty param.value: must re-serialize as {name: payload}
+    // rather than splicing the payload between every byte of the body.
+    let target = Target {
+        method: "POST".to_string(),
+        data: Some("not-json-at-all".to_string()),
+        ..target_for("https://example.com/api")
+    };
+    let param = req_param("x", "", Location::JsonBody);
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(req.contains(r#"{"x":"PAY"}"#), "req:\n{req}");
+    assert!(!req.contains("not-json"), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_multipart_injects_field_with_boundary() {
+    // Regression: the multipart PoC used to clone `target.data` verbatim (the
+    // payload-free, urlencoded original) under a boundary-less
+    // `multipart/form-data` type — a request that reproduced nothing. It must
+    // now render a real multipart body: the payload in the named field, framed
+    // by a boundary that the Content-Type header declares.
+    let target = Target {
+        method: "POST".to_string(),
+        data: Some("q=seed&other=keep".to_string()),
+        ..target_for("https://example.com/upload")
+    };
+    let param = req_param("q", "seed", Location::MultipartBody);
+    let req = super::build_request_text(&target, &param, "<svg onload=alert(1)>");
+    // Content-Type carries a boundary...
+    let boundary = req
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("Content-Type: multipart/form-data; boundary=")
+                .map(str::to_string)
+        })
+        .expect("multipart Content-Type with a boundary");
+    assert!(
+        !boundary.is_empty(),
+        "boundary must be non-empty, req:\n{req}"
+    );
+    // ...and the body is framed by exactly that boundary, with the payload in
+    // the `q` field and the untouched neighbour preserved.
+    assert!(
+        req.contains(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\n<svg onload=alert(1)>\r\n")),
+        "payload must land in the q field, req:\n{req}"
+    );
+    assert!(
+        req.contains("name=\"other\"\r\n\r\nkeep\r\n"),
+        "req:\n{req}"
+    );
+    assert!(
+        req.contains(&format!("--{boundary}--\r\n")),
+        "closing boundary, req:\n{req}"
+    );
+    // The original urlencoded form must not leak through as the body.
+    assert!(!req.contains("q=seed&other=keep"), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_does_not_duplicate_content_type_header() {
+    // When the target already carries a Content-Type the synthesizer must not
+    // append a second one.
+    let target = Target {
+        method: "POST".to_string(),
+        data: Some(r#"{"a":"1"}"#.to_string()),
+        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        ..target_for("https://example.com/api")
+    };
+    let param = req_param("a", "1", Location::JsonBody);
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert_eq!(
+        req.matches("Content-Type:").count(),
+        1,
+        "exactly one Content-Type expected, req:\n{req}"
+    );
+}
+
+#[test]
+fn build_request_text_includes_headers_and_cookies() {
+    let target = Target {
+        headers: vec![("X-Custom".to_string(), "yes".to_string())],
+        cookies: vec![
+            ("sid".to_string(), "abc".to_string()),
+            ("t".to_string(), "1".to_string()),
+        ],
+        ..target_for("https://example.com/path?a=1")
+    };
+    let param = req_param("a", "1", Location::Query);
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(req.contains("\r\nX-Custom: yes"), "req:\n{req}");
+    // Cookies are joined with "; " on a single Cookie header.
+    assert!(req.contains("\r\nCookie: sid=abc; t=1"), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_body_renders_pre_encoded_value() {
+    // A param that requires pre-encoding is sent encoded on the wire (the scan
+    // applies `apply_param_encoding` before injecting), and the server decodes
+    // it back to the raw payload. The PoC must show the encoded value it would
+    // replay — otherwise a pasted request carries un-encoded bytes the sink
+    // never reflects. base64("PAY") == "UEFZ".
+    let mut param = req_param("q", "seed", Location::Body);
+    param.pre_encoding = Some("base64".to_string());
+    let target = Target {
+        method: "POST".to_string(),
+        data: Some("q=seed".to_string()),
+        ..target_for("https://example.com/e")
+    };
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(
+        req.contains("q=UEFZ"),
+        "expected base64 field value, req:\n{req}"
+    );
+    assert!(
+        !req.contains("q=PAY"),
+        "raw payload must not appear, req:\n{req}"
+    );
+}
+
+#[test]
+fn build_request_text_query_renders_the_as_sent_url() {
+    // The request POC must show the URL `build_url_inject_request` sends: the
+    // pre-encoded value (base64("PAY") == "UEFZ"), not the raw payload the
+    // server would never decode back into the sink.
+    let mut param = req_param("q", "seed", Location::Query);
+    param.pre_encoding = Some("base64".to_string());
+    let target = target_for("https://example.com/s?q=seed&x=1");
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(req.starts_with("GET /s?q=UEFZ&x=1 "), "req:\n{req}");
+
+    // A nested-field param (`qs.move_url`, base64-of-JSON inside `qs`) is sent
+    // under its wire name with the whole pipeline applied, not as a new
+    // `qs.move_url=<raw>` pair.
+    let pipeline = crate::encoding::pipeline::EncodingPipeline::new(vec![
+        crate::encoding::pipeline::EncodingStep::JsonField {
+            pointer: "/u".to_string(),
+            template: serde_json::json!({"u": "x"}),
+        },
+        crate::encoding::pipeline::EncodingStep::Base64,
+    ]);
+    let nested = Param {
+        wire_name: Some("qs".to_string()),
+        pre_encoding_pipeline: Some(pipeline.clone()),
+        ..req_param("qs.u", "x", Location::Query)
+    };
+    let target = target_for("https://example.com/s?qs=eyJ1IjoieCJ9");
+    let req = super::build_request_text(&target, &nested, "PAY");
+    let sent = crate::scanning::url_inject::build_injected_url(
+        &target.url,
+        &nested,
+        &pipeline.apply("PAY").unwrap(),
+    );
+    let sent = url::Url::parse(&sent).unwrap();
+    assert!(
+        req.starts_with(&format!("GET /s?{} ", sent.query().unwrap())),
+        "req:\n{req}"
+    );
+    assert!(!req.contains("qs.u="), "display name leaked, req:\n{req}");
+}
+
+#[test]
+fn build_request_text_path_renders_pre_encoded_value() {
+    // `2url` pre-encoding: the segment carries exactly two encoding layers
+    // (one from the pre-encoding, one from the segment's `%` escape), matching
+    // what the path detection probe measured.
+    let mut param = req_param("path_segment_1", "b", Location::Path);
+    param.pre_encoding = Some("2url".to_string());
+    let target = target_for("https://example.com/a/b/c");
+    let req = super::build_request_text(&target, &param, "<x>");
+    let sent = crate::scanning::url_inject::build_injected_url(
+        &target.url,
+        &param,
+        &crate::encoding::pre_encoding::apply_param_encoding("<x>", &param),
+    );
+    let sent = url::Url::parse(&sent).unwrap();
+    assert!(
+        req.starts_with(&format!("GET {} ", sent.path())),
+        "req:\n{req}"
+    );
+    assert!(req.contains("/a/%253Cx%253E/c "), "req:\n{req}");
+}
+
+#[test]
+fn build_request_text_header_and_cookie_render_pre_encoded_value() {
+    // A header / cookie param behind a size-limited WAF window is sent with
+    // the `wafpad` prefix; without it the pasted request is the one the WAF
+    // blocked.
+    let pad = crate::encoding::pre_encoding::waf_window_pad();
+    let mut header = req_param("X-Q", "", Location::Header);
+    header.pre_encoding = Some("wafpad".to_string());
+    let target = target_for("https://example.com/");
+    let req = super::build_request_text(&target, &header, "<x>");
+    assert!(req.contains(&format!("\r\nX-Q: {pad}<x>")), "req:\n{req}");
+
+    let mut cookie = req_param("sid", "abc", Location::Header);
+    cookie.pre_encoding = Some("wafpad".to_string());
+    let target = Target {
+        cookies: vec![("sid".to_string(), "abc".to_string())],
+        ..target_for("https://example.com/")
+    };
+    let req = super::build_request_text(&target, &cookie, "<x>");
+    assert!(
+        req.contains(&format!("\r\nCookie: sid={pad}<x>")),
+        "req:\n{req}"
+    );
+}
+
+#[test]
+fn build_request_text_multipart_renders_pre_encoded_value() {
+    // Same contract for a multipart field: the boundary-framed part carries the
+    // pre-encoded value, mirroring `build_multipart_request`.
+    let mut param = req_param("q", "seed", Location::MultipartBody);
+    param.pre_encoding = Some("base64".to_string());
+    let target = Target {
+        method: "POST".to_string(),
+        data: Some("q=seed".to_string()),
+        ..target_for("https://example.com/e")
+    };
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(
+        req.contains("name=\"q\"\r\n\r\nUEFZ\r\n"),
+        "expected base64 in the multipart field, req:\n{req}"
+    );
+    assert!(
+        !req.contains("\r\nPAY\r\n"),
+        "raw payload must not appear, req:\n{req}"
+    );
+}
+
+#[test]
+fn build_request_text_multipart_synthesizes_field_when_absent() {
+    // `target.data` for a multipart injection is `key=value` pairs (see
+    // `multipart_form`), never a raw multipart blob. When the injected field
+    // isn't among them, it is appended as a new multipart part carrying the
+    // payload — the request must still be a well-framed multipart body.
+    let target = Target {
+        method: "POST".to_string(),
+        data: Some("unrelated=1".to_string()),
+        ..target_for("https://example.com/upload")
+    };
+    let param = req_param("file", "", Location::MultipartBody);
+    let req = super::build_request_text(&target, &param, "PAY");
+    assert!(req.starts_with("POST /upload "), "req:\n{req}");
+    assert!(
+        req.contains("Content-Type: multipart/form-data; boundary="),
+        "req:\n{req}"
+    );
+    assert!(
+        req.contains("name=\"file\"\r\n\r\nPAY\r\n"),
+        "injected field must be present, req:\n{req}"
+    );
+    assert!(
+        req.contains("name=\"unrelated\"\r\n\r\n1\r\n"),
+        "existing fields preserved, req:\n{req}"
+    );
+}
+
+// ---- ast_source_uses_browser_url_surface --------------------------------
+
+#[test]
+fn ast_source_browser_url_surface_detects_each_source() {
+    for src in [
+        "var x = location.hash;",
+        "location.search.slice(1)",
+        "new URLSearchParams.get('q')",
+        "el.href = location.href",
+        "p = location.pathname",
+        "d = document.URL",
+        "window.opener.postMessage(1)",
+        "if (event.newValue) {}",
+        "log(event.oldValue)",
+    ] {
+        assert!(
+            super::ast_source_uses_browser_url_surface(src),
+            "should flag attacker-controllable URL surface: {src:?}"
+        );
+    }
+}
+
+#[test]
+fn ast_source_browser_url_surface_ignores_safe_sources() {
+    for src in [
+        "var x = config.value;",
+        "el.textContent = data;",
+        "const n = items.length;",
+        "",
+    ] {
+        assert!(
+            !super::ast_source_uses_browser_url_surface(src),
+            "should not flag non-URL source: {src:?}"
+        );
+    }
+}
+
+// ---- compute_waf_strategy -----------------------------------------------
+
+#[test]
+fn compute_waf_strategy_off_returns_none() {
+    let target = target_for("https://example.com/");
+    // integration_scan_args defaults waf_bypass to "off".
+    let args = integration_scan_args(true);
+    assert_eq!(args.waf_bypass, "off");
+    assert!(super::compute_waf_strategy(&target, &args).is_none());
+}
+
+#[test]
+fn compute_waf_strategy_no_waf_info_returns_none() {
+    let target = target_for("https://example.com/");
+    let mut args = integration_scan_args(true);
+    args.waf_bypass = "auto".to_string();
+    // No WAF was fingerprinted, so there's nothing to bypass.
+    assert!(super::compute_waf_strategy(&target, &args).is_none());
+}
+
+#[test]
+fn compute_waf_strategy_empty_waf_info_returns_none() {
+    let target = Target {
+        waf_info: Some(crate::waf::WafDetectionResult::default()),
+        ..target_for("https://example.com/")
+    };
+    let mut args = integration_scan_args(true);
+    args.waf_bypass = "auto".to_string();
+    assert!(super::compute_waf_strategy(&target, &args).is_none());
+}
+
+#[test]
+fn compute_waf_strategy_detected_waf_returns_strategy() {
+    let waf = crate::waf::WafDetectionResult {
+        detected: vec![crate::waf::WafFingerprint {
+            waf_type: crate::waf::WafType::Cloudflare,
+            confidence: 0.9,
+            evidence: "cf-ray header".to_string(),
+        }],
+    };
+    let target = Target {
+        waf_info: Some(waf),
+        ..target_for("https://example.com/")
+    };
+    let mut args = integration_scan_args(true);
+    args.waf_bypass = "auto".to_string();
+    assert!(super::compute_waf_strategy(&target, &args).is_some());
+}
+
+// ---- generate_param_jobs: per-parameter work-unit assembly --------------
+
+fn target_with_params(params: Vec<Param>) -> Target {
+    Target {
+        reflection_params: params,
+        ..target_for("https://example.com/path?a=1")
+    }
+}
+
+#[test]
+fn generate_param_jobs_skips_fragment_params() {
+    // URL fragments never reach the server, so they must not produce a job.
+    let target = target_with_params(vec![
+        req_param("frag", "", Location::Fragment),
+        req_param("a", "1", Location::Query),
+    ]);
+    let args = integration_scan_args(true);
+    let (jobs, _total) = super::generate_param_jobs(&target, &args, None, &[]);
+    assert_eq!(jobs.len(), 1, "only the query param should yield a job");
+    assert_eq!(jobs[0].0.name, "a");
+}
+
+// The CLI's overall bar is created empty and sized by `run_scanning` from
+// `generate_param_jobs` (replacing a synchronous per-group payload precount).
+// Cancelled up front so no request is sent: sizing happens before dispatch.
+#[tokio::test]
+async fn run_scanning_sizes_overall_bar_from_param_jobs() {
+    let mut target = parse_target("http://127.0.0.1:9/?a=1").unwrap();
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("a".to_string(), "1".to_string(), Location::Query)
+    });
+    let args = crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        silence: true,
+        max_payloads_per_param: 5,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    };
+    let (_, expected) = generate_param_jobs(
+        &target,
+        &args,
+        compute_waf_strategy(&target, &args).as_ref(),
+        &build_shared_payloads(&target),
+    );
+    assert!(expected > 0);
+    let mp = Arc::new(MultiProgress::with_draw_target(
+        indicatif::ProgressDrawTarget::hidden(),
+    ));
+    let overall = Arc::new(mp.add(indicatif::ProgressBar::new(0)));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_progress(Some(mp), Some(overall.clone()))
+        .with_cancel(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+    )
+    .await;
+    assert_eq!(overall.length(), Some(expected));
+}
+
+#[test]
+fn generate_param_jobs_total_tasks_matches_payload_counts() {
+    // `total_tasks` must equal the sum of reflection + DOM payloads across all
+    // jobs — that count drives the progress bar length and ETA.
+    let target = target_with_params(vec![req_param("a", "1", Location::Query)]);
+    let args = integration_scan_args(true);
+    let (jobs, total) = super::generate_param_jobs(&target, &args, None, &[]);
+    let summed: u64 = jobs
+        .iter()
+        .map(|(_, refl, dom)| (refl.len() + dom.len()) as u64)
+        .sum();
+    assert_eq!(total, summed);
+    // A plain reflected query param yields a non-empty payload set.
+    assert!(total > 0, "expected payloads for a reflected param");
+}
+
+#[test]
+fn xml_namespace_payloads_are_scoped_small_and_keep_verifiers_ahead_of_caps() {
+    let mut param = req_param("q", "seed", Location::Query);
+    param.injection_context = Some(InjectionContext::Html(None));
+    param.xml_namespace_candidate = Some("image/svg+xml; charset=utf-8".to_string());
+    param.valid_specials = Some(vec!['<', '>', '"', '\'']);
+    let target = target_with_params(vec![param]);
+    let mut args = integration_scan_args(true);
+    args.max_payloads_per_param = 1;
+    let shared = vec!["<shared-csp-payload>".to_string()];
+    let (jobs, _) = super::generate_param_jobs(&target, &args, None, &shared);
+    let (_, reflection, dom) = &jobs[0];
+    let marker = crate::scanning::markers::class_marker();
+
+    assert_eq!(reflection.len(), 1);
+    assert!(
+        reflection[0].starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""),
+        "image/svg+xml should try the SVG namespace verifier before the cap"
+    );
+    assert!(reflection[0].contains(&format!("class=\"{marker}\"")));
+    assert!(reflection[0].contains("onload=\"alert(1)\""));
+    assert!(
+        dom.is_empty(),
+        "the reflection response verifies XML payloads directly"
+    );
+    assert!(
+        !reflection
+            .iter()
+            .chain(dom)
+            .any(|payload| payload == "<shared-csp-payload>"),
+        "inert XML candidates should not regain the full shared catalog"
+    );
+
+    let mut html_param = req_param("q", "seed", Location::Query);
+    html_param.injection_context = Some(InjectionContext::Html(None));
+    let html_target = target_with_params(vec![html_param]);
+    let (html_jobs, _) = super::generate_param_jobs(&html_target, &args, None, &[]);
+    assert_ne!(
+        html_jobs[0].1,
+        crate::scanning::payload_families::get_xml_namespace_payloads("image/svg+xml"),
+        "XML namespace payloads must not replace or bloat the normal HTML family"
+    );
+}
+
+#[test]
+fn generate_param_jobs_respects_max_payloads_per_param() {
+    let target = target_with_params(vec![req_param("a", "1", Location::Query)]);
+    let mut args = integration_scan_args(true);
+    args.max_payloads_per_param = 2;
+    let (jobs, _total) = super::generate_param_jobs(&target, &args, None, &[]);
+    for (_, refl, dom) in &jobs {
+        assert!(refl.len() <= 2, "reflection set over cap: {}", refl.len());
+        assert!(dom.len() <= 2, "dom set over cap: {}", dom.len());
+    }
+}
+
+#[test]
+fn generate_param_jobs_appends_shared_payloads() {
+    // Shared payloads (CSP-bypass + tech-specific) are appended to every job's
+    // reflection and DOM sets.
+    let target = target_with_params(vec![req_param("a", "1", Location::Query)]);
+    let args = integration_scan_args(true);
+    let shared = vec!["<shared-marker>".to_string()];
+    let (jobs, _total) = super::generate_param_jobs(&target, &args, None, &shared);
+    let (_, refl, dom) = &jobs[0];
+    assert!(
+        refl.iter().any(|p| p == "<shared-marker>"),
+        "refl missing shared"
+    );
+    assert!(
+        dom.iter().any(|p| p == "<shared-marker>"),
+        "dom missing shared"
+    );
+}
+
+#[test]
+fn generate_param_jobs_only_custom_excludes_generated_and_shared_payloads() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "dalfox-only-custom-jobs-{}-{unique}.txt",
+        std::process::id()
+    ));
+    let custom = "<custom-only-payload>";
+    std::fs::write(&path, format!("{custom}\n")).expect("write custom payload fixture");
+
+    let mut param = req_param("a", "1", Location::Query);
+    param.injection_context = Some(InjectionContext::Html(None));
+    // Active probing records a profile even when no special characters were
+    // blocked. Job assembly must not turn that metadata into built-in payloads
+    // when the caller explicitly selected custom-only testing.
+    param.invalid_specials = Some(vec![]);
+    param.valid_specials = Some(vec!['<', '>', '"']);
+    let target = target_with_params(vec![param]);
+    let mut args = integration_scan_args(true);
+    args.only_custom_payload = true;
+    args.custom_payload = Some(path.to_string_lossy().into_owned());
+    args.encoders = vec!["none".to_string()];
+
+    let shared = vec!["<shared-builtin-payload>".to_string()];
+    let (jobs, _) = super::generate_param_jobs(&target, &args, None, &shared);
+    std::fs::remove_file(path).expect("remove custom payload fixture");
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].1, vec![custom.to_string()]);
+    assert_eq!(jobs[0].2, vec![custom.to_string()]);
+}
+
+#[test]
+fn generate_param_jobs_waf_expansion_never_drops_originals() {
+    // With a bypass strategy the reflection set is expanded with mutations /
+    // encoder variants, but the originals are always kept (at the front), so
+    // the expanded count is at least the un-expanded count.
+    let target = target_with_params(vec![req_param("a", "1", Location::Query)]);
+    let args = integration_scan_args(true);
+    let (plain_jobs, _) = super::generate_param_jobs(&target, &args, None, &[]);
+    let strategy = crate::waf::bypass::merge_strategies(&[&crate::waf::WafType::Cloudflare]);
+    let (waf_jobs, _) = super::generate_param_jobs(&target, &args, Some(&strategy), &[]);
+    assert!(
+        waf_jobs[0].1.len() >= plain_jobs[0].1.len(),
+        "WAF expansion must not shrink the reflection set ({} < {})",
+        waf_jobs[0].1.len(),
+        plain_jobs[0].1.len()
+    );
+}
+
+#[test]
+fn test_effective_payload_cap_resolution() {
+    let safety = crate::cmd::scan::DEFAULT_PAYLOAD_SAFETY_CAP;
+    // Default (0) without deep-scan -> built-in safety cap (issue #1153).
+    assert_eq!(effective_payload_cap(0, false), safety);
+    // Default (0) with deep-scan -> unlimited.
+    assert_eq!(effective_payload_cap(0, true), 0);
+    // Explicit cap always wins, even under deep-scan.
+    assert_eq!(effective_payload_cap(50, false), 50);
+    assert_eq!(effective_payload_cap(50, true), 50);
+    // An explicit cap larger than the safety default is honored verbatim.
+    assert_eq!(effective_payload_cap(safety + 5000, false), safety + 5000);
+}
+
+#[test]
+fn test_generate_param_jobs_applies_builtin_safety_cap() {
+    // The built-in safety cap must behave exactly like an explicit
+    // --max-payloads-per-param of the same size, must bound the *base* payload
+    // sets, and must be lifted by --deep-scan. (In real scans a few shared
+    // CSP/tech payloads are appended after the cap and can push the final set
+    // slightly past it; here we pass no shared payloads — `&[]` below — so the
+    // base set is the final set and the cap is a strict bound.) Asserting the
+    // default-vs-explicit *equivalence* exercises the cap regardless of how
+    // large the base payload set happens to be. Issue #1153.
+    let target = target_with_params(vec![req_param("a", "1", Location::Query)]);
+    let safety = crate::cmd::scan::DEFAULT_PAYLOAD_SAFETY_CAP;
+
+    // Default (0, no --deep-scan) -> built-in safety cap.
+    let mut args = integration_scan_args(true);
+    args.max_payloads_per_param = 0;
+    args.deep_scan = false;
+    let (default_jobs, _) = super::generate_param_jobs(&target, &args, None, &[]);
+    for (_, refl, dom) in &default_jobs {
+        assert!(
+            refl.len() <= safety && dom.len() <= safety,
+            "default scan must cap reflection ({}) and DOM ({}) sets to {safety}",
+            refl.len(),
+            dom.len(),
+        );
+    }
+
+    // Default (0) must be equivalent to an explicit cap of the safety value.
+    let mut explicit = integration_scan_args(true);
+    explicit.max_payloads_per_param = safety;
+    explicit.deep_scan = false;
+    let (explicit_jobs, _) = super::generate_param_jobs(&target, &explicit, None, &[]);
+    assert_eq!(default_jobs.len(), explicit_jobs.len());
+    for (d, e) in default_jobs.iter().zip(&explicit_jobs) {
+        assert_eq!(
+            (d.1.len(), d.2.len()),
+            (e.1.len(), e.2.len()),
+            "default (built-in cap) must match explicit --max-payloads-per-param {safety}"
+        );
+    }
+
+    // --deep-scan lifts the bound (never shrinks below the capped run).
+    args.deep_scan = true;
+    let (deep_jobs, _) = super::generate_param_jobs(&target, &args, None, &[]);
+    assert!(
+        deep_jobs[0].1.len() >= default_jobs[0].1.len()
+            && deep_jobs[0].2.len() >= default_jobs[0].2.len(),
+        "--deep-scan must not shrink the payload sets below the capped run"
+    );
+}
+
+#[test]
+fn generate_param_jobs_default_cap_preserves_waf_variants() {
+    // Regression for the #1155 review: the safety cap must bound the BASE
+    // catalog, NOT the WAF-expanded set. `expand_waf_payloads` keeps originals
+    // at the front and appends every mutation/encoder variant at the tail, so
+    // capping after expansion truncated 100% of the bypass variants whenever the
+    // base exceeded the cap (attribute context ~9k base vs the 3000 default),
+    // silently defeating WAF bypass on exactly the params it was selected for.
+    let mut param = req_param("a", "1", Location::Query);
+    param.injection_context = Some(InjectionContext::Attribute(None));
+    let target = target_with_params(vec![param]);
+    let mut args = integration_scan_args(true);
+    args.max_payloads_per_param = 0; // built-in safety cap (3000)
+    args.deep_scan = false;
+    let safety = crate::cmd::scan::DEFAULT_PAYLOAD_SAFETY_CAP;
+
+    // The capped base set (no WAF), used as the "originals" reference.
+    let (base_jobs, _) = super::generate_param_jobs(&target, &args, None, &[]);
+    let base_set: std::collections::HashSet<&String> = base_jobs[0].1.iter().collect();
+    assert!(
+        base_jobs[0].1.len() <= safety,
+        "no-WAF base reflection set must be bounded to the cap"
+    );
+
+    // Same param + same cap, now with a bypass strategy active.
+    let strategy = crate::waf::bypass::merge_strategies(&[&crate::waf::WafType::Cloudflare]);
+    let (waf_jobs, _) = super::generate_param_jobs(&target, &args, Some(&strategy), &[]);
+    let refl = &waf_jobs[0].1;
+    let waf_variants = refl.iter().filter(|p| !base_set.contains(*p)).count();
+    let base_portion = refl.iter().filter(|p| base_set.contains(*p)).count();
+    assert!(
+        waf_variants > 0,
+        "default cap must NOT evict all WAF-bypass variants (got {waf_variants} variants, \
+         {base_portion} base of {} total)",
+        refl.len()
+    );
+    assert!(
+        base_portion <= safety,
+        "base portion ({base_portion}) must stay bounded to the cap ({safety}); \
+         expansion is added on top"
+    );
+}
+
+#[test]
+fn generate_param_jobs_shared_payloads_appended_after_cap() {
+    // Covers the shared-after-cap path: shared CSP/tech payloads are appended
+    // AFTER the base cap (never trimmed), and angle-bearing shared are pruned
+    // when the server strips `<`/`>`.
+    let mut param = req_param("a", "1", Location::Query);
+    param.injection_context = Some(InjectionContext::Attribute(None));
+    param.invalid_specials = Some(vec!['<', '>']);
+    let target = target_with_params(vec![param]);
+    let mut args = integration_scan_args(true);
+    args.max_payloads_per_param = 5; // tiny explicit cap -> base truncated hard
+    args.deep_scan = false;
+
+    let shared = vec![
+        "zz-angle-free-shared".to_string(),
+        "<svg/onload=alert(1)>".to_string(), // angle-bearing -> pruned
+    ];
+    let (jobs, _) = super::generate_param_jobs(&target, &args, None, &shared);
+    let refl = &jobs[0].1;
+    assert!(
+        refl.iter().any(|p| p == "zz-angle-free-shared"),
+        "angle-free shared payload must survive the base cap (appended after)"
+    );
+    assert!(
+        !refl.iter().any(|p| p == "<svg/onload=alert(1)>"),
+        "angle-bearing shared payload must be pruned when <>` are stripped"
+    );
+    // Same on the DOM set.
+    let dom = &jobs[0].2;
+    assert!(dom.iter().any(|p| p == "zz-angle-free-shared"));
+    assert!(!dom.iter().any(|p| p == "<svg/onload=alert(1)>"));
+}
+
+/// `extract_meta_csp` must prefer an enforcing `Content-Security-Policy` meta
+/// over a report-only one even when the report-only tag appears first —
+/// otherwise downstream marks the policy report-only (zeroing Trusted Types
+/// enforcement) and the real enforcing policy is dropped.
+#[test]
+fn test_extract_meta_csp_prefers_enforcing_over_report_only() {
+    let html = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy-Report-Only" content="default-src 'none'">
+        <meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">
+    </head><body></body></html>"#;
+    let (name, content) = extract_meta_csp(html).expect("a meta CSP is present");
+    assert_eq!(name, "Content-Security-Policy");
+    assert!(content.contains("require-trusted-types-for"));
+}
+
+/// Every enforcing meta policy applies, so all of them are returned as one
+/// policy list, not just the first.
+#[test]
+fn test_extract_meta_csp_returns_every_enforcing_policy() {
+    let html = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy" content="object-src 'none'">
+        <meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">
+    </head><body></body></html>"#;
+    let (name, content) = extract_meta_csp(html).expect("a meta CSP is present");
+    assert_eq!(name, "Content-Security-Policy");
+    assert_eq!(
+        content,
+        "object-src 'none', require-trusted-types-for 'script'"
+    );
+}
+
+/// With only a report-only meta present, it is still returned (nothing else to
+/// fall back to).
+#[test]
+fn test_extract_meta_csp_returns_report_only_when_no_enforcing() {
+    let html = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy-Report-Only" content="default-src 'self'">
+    </head><body></body></html>"#;
+    let (name, content) = extract_meta_csp(html).expect("a report-only meta is present");
+    assert_eq!(name, "Content-Security-Policy-Report-Only");
+    assert!(content.contains("default-src 'self'"));
+}
+
+/// End-to-end coverage for the `--hpp` phase, which had none: `run_hpp_phase`
+/// and the `check_reflection_with_hpp_url` it drives were both fully untested,
+/// so an `inHTML-HPP` finding was never produced by any test.
+///
+/// The mock target models the shape HPP exists to defeat: the sanitizer runs on
+/// the *first* occurrence of `q`, while the reflection uses the *last* one. A
+/// single-parameter request (what the reflection phase sends) is therefore
+/// always sanitized and finds nothing — only the duplicated-parameter URL gets
+/// the payload through. That makes the assertion specific to the HPP phase
+/// rather than something the reflection phase could have produced.
+#[tokio::test]
+async fn test_run_scanning_hpp_phase_reports_duplicated_param_bypass() {
+    use axum::{Router, extract::RawQuery, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    async fn hpp_handler(RawQuery(raw): RawQuery) -> Html<String> {
+        let raw = raw.unwrap_or_default();
+        let values: Vec<String> = raw
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("q="))
+            .map(|v| urlencoding::decode(v).unwrap_or_default().into_owned())
+            .collect();
+        if values.is_empty() {
+            return Html("<div>no q</div>".to_string());
+        }
+        // Sanitizer inspects the first occurrence...
+        let first = &values[0];
+        if first.contains('<') || first.contains('>') {
+            return Html("<div>blocked</div>".to_string());
+        }
+        // ...but the page renders the last one, raw.
+        Html(format!("<div>{}</div>", values[values.len() - 1]))
+    }
+
+    let app = Router::new().route("/", get(hpp_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?q=safe", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("q".to_string(), "safe".to_string(), Location::Query)
+    });
+
+    let mut args = integration_scan_args(false);
+    args.hpp = true;
+    let args = Arc::new(args);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        args,
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    let hpp: Vec<_> = guard
+        .iter()
+        .filter(|r| r.inject_type == "inHTML-HPP")
+        .collect();
+    assert!(
+        !hpp.is_empty(),
+        "the first-occurrence-sanitized / last-occurrence-rendered shape must \
+         yield an inHTML-HPP finding; got: {:?}",
+        guard
+            .iter()
+            .map(|r| (&r.result_type, r.inject_type.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let finding = hpp[0];
+    // Pin the reporting contract for the HPP finding: these fields are what
+    // distinguishes it from a plain reflection in JSON/SARIF output.
+    assert_eq!(finding.param, "q");
+    assert_eq!(finding.message_id, 606);
+    assert_eq!(finding.severity, "Info");
+    assert_eq!(finding.location, "Query");
+    assert!(
+        finding.data.contains("q=") && finding.data.matches("q=").count() >= 2,
+        "the reported URL must be the duplicated-parameter one, got: {}",
+        finding.data
+    );
+    assert!(
+        finding.evidence.contains("HPP bypass") && finding.evidence.contains("position="),
+        "evidence must name the HPP position, got: {}",
+        finding.evidence
+    );
+    // Only one HPP finding per param — the phase breaks out after the first hit.
+    assert_eq!(
+        hpp.len(),
+        1,
+        "run_hpp_phase must report at most one finding per param"
+    );
+}
+
+/// A query param discovered in a `<form action=…>` lives at the action URL. The
+/// reflection and DOM phases inject there (`effective_query_base`); the HPP
+/// phase polluted `target.url` — the page hosting the form — instead, so the
+/// duplicated parameter never reached the sink and the bypass went unreported.
+#[tokio::test]
+async fn test_run_scanning_hpp_phase_targets_the_form_action_url() {
+    use axum::{Router, extract::RawQuery, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    // Sanitizes the first `q`, renders the last one raw.
+    async fn sink(RawQuery(raw): RawQuery) -> Html<String> {
+        let raw = raw.unwrap_or_default();
+        let values: Vec<String> = raw
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("q="))
+            .map(|v| urlencoding::decode(v).unwrap_or_default().into_owned())
+            .collect();
+        match values.as_slice() {
+            [] => Html("<div>no q</div>".to_string()),
+            [first, ..] if first.contains('<') || first.contains('>') => {
+                Html("<div>blocked</div>".to_string())
+            }
+            [.., last] => Html(format!("<div>{last}</div>")),
+        }
+    }
+
+    let app = Router::new()
+        .route(
+            "/page",
+            get(|| async { Html(r#"<form action="/sink" method="get"><input name="q"></form>"#) }),
+        )
+        .route("/sink", get(sink));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).expect("parse_target");
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        form_action_url: Some(format!("http://{addr}/sink")),
+        form_origin_url: Some(format!("http://{addr}/page")),
+        ..Param::new("q".to_string(), "safe".to_string(), Location::Query)
+    });
+
+    let mut args = integration_scan_args(false);
+    args.hpp = true;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    let hpp: Vec<_> = guard
+        .iter()
+        .filter(|r| r.inject_type == "inHTML-HPP")
+        .collect();
+    assert_eq!(
+        hpp.len(),
+        1,
+        "the HPP bypass at the form action must be reported; got: {:?}",
+        guard
+            .iter()
+            .map(|r| (&r.result_type, r.inject_type.as_str(), r.data.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        hpp[0].data.starts_with(&format!("http://{addr}/sink?")),
+        "the reported (and PoC) URL must be the form action, got: {}",
+        hpp[0].data
+    );
+}
+
+/// A pre-encoded param (base64 here) is sent encoded by every phase except, it
+/// used to be, HPP: the duplicated value went out raw, the server base64-decoded
+/// it to garbage, and the bypass was never seen. The reported URL must carry the
+/// encoded value too, or the PoC reproduces nothing.
+#[tokio::test]
+async fn test_run_scanning_hpp_phase_applies_param_pre_encoding() {
+    use axum::{Router, extract::RawQuery, response::Html, routing::get};
+    use base64::Engine as _;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    // Base64-decodes every `q`; escapes the first, renders the last raw.
+    async fn sink(RawQuery(raw): RawQuery) -> Html<String> {
+        let raw = raw.unwrap_or_default();
+        let values: Vec<String> = raw
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("q="))
+            .map(|v| {
+                let v = urlencoding::decode(v).unwrap_or_default().into_owned();
+                base64::engine::general_purpose::STANDARD
+                    .decode(v)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_default()
+            })
+            .collect();
+        match values.as_slice() {
+            [first, .., last] => Html(format!(
+                "<div>{}</div><div>{last}</div>",
+                first.replace('<', "&lt;")
+            )),
+            [only] => Html(format!("<div>{}</div>", only.replace('<', "&lt;"))),
+            [] => Html("<div>no q</div>".to_string()),
+        }
+    }
+
+    let app = Router::new().route("/", get(sink));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/?q=c2FmZQ==")).expect("parse_target");
+    let mut param = Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("q".to_string(), "c2FmZQ==".to_string(), Location::Query)
+    };
+    param.pre_encoding = Some("base64".to_string());
+    target.reflection_params.push(param);
+
+    let mut args = integration_scan_args(false);
+    args.hpp = true;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    let hpp: Vec<_> = guard
+        .iter()
+        .filter(|r| r.inject_type == "inHTML-HPP")
+        .collect();
+    assert_eq!(
+        hpp.len(),
+        1,
+        "the HPP bypass on a base64 param must be reported; got: {:?}",
+        guard
+            .iter()
+            .map(|r| (&r.result_type, r.inject_type.as_str(), r.data.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let finding = hpp[0];
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&finding.payload);
+    assert!(
+        finding.data.contains(&*urlencoding::encode(&encoded)),
+        "the reported URL must carry the base64 value that was sent, got: {}",
+        finding.data
+    );
+    assert_eq!(finding.wire_payload.as_deref(), Some(encoded.as_str()));
+}
+
+/// The HPP phase is opt-in. Without `--hpp` the same target must produce no
+/// HPP finding, so the flag gate in `run_hpp_phase` (and the payload-cloning
+/// gate in `scan_param` that mirrors it) stays honest.
+#[tokio::test]
+async fn test_run_scanning_without_hpp_flag_reports_no_hpp_finding() {
+    use axum::{Router, extract::RawQuery, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::time::{Duration, sleep};
+
+    async fn echo_last_q(RawQuery(raw): RawQuery) -> Html<String> {
+        let raw = raw.unwrap_or_default();
+        let last = raw
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("q="))
+            .next_back()
+            .unwrap_or("");
+        Html(format!(
+            "<div>{}</div>",
+            urlencoding::decode(last).unwrap_or_default()
+        ))
+    }
+
+    let app = Router::new().route("/", get(echo_last_q));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?q=safe", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("q".to_string(), "safe".to_string(), Location::Query)
+    });
+
+    let args = Arc::new(integration_scan_args(false));
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        args,
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    assert!(
+        guard.iter().all(|r| r.inject_type != "inHTML-HPP"),
+        "HPP findings must require --hpp"
+    );
+}
+
+// --- evidence-body bounding -------------------------------------------------
+
+#[test]
+fn bound_evidence_body_leaves_normal_bodies_untouched() {
+    let body = "<html><body>PAYLOAD</body></html>".to_string();
+    assert_eq!(
+        crate::scanning::result::bound_evidence_body(body.clone(), "PAYLOAD"),
+        body
+    );
+}
+
+#[test]
+fn bound_evidence_body_keeps_the_window_around_the_payload() {
+    // A reflection far past the cap must survive: `extract_context` searches
+    // the retained body for the payload to render the `L1:` line, so a blind
+    // prefix cut would silently blank that evidence.
+    use crate::scanning::result::{MAX_EVIDENCE_BODY_BYTES, bound_evidence_body};
+    let payload = "<svg onload=alert(1)>";
+    let body = format!(
+        "{}{}{}",
+        "A".repeat(4 * 1024 * 1024),
+        payload,
+        "B".repeat(1024)
+    );
+    let bounded = bound_evidence_body(body, payload);
+    assert!(
+        bounded.len() < MAX_EVIDENCE_BODY_BYTES + 64,
+        "bounded body is {} bytes",
+        bounded.len()
+    );
+    assert!(
+        bounded.contains(payload),
+        "the payload must survive the cut"
+    );
+    assert!(bounded.starts_with('…'), "an elided prefix must be marked");
+}
+
+#[test]
+fn bound_evidence_body_cuts_on_char_boundaries() {
+    use crate::scanning::result::bound_evidence_body;
+    // Multi-byte characters straddling both cut points must not panic and must
+    // leave valid UTF-8 (the return type guarantees it; the point is no panic).
+    let body = format!("{}PAY{}", "한".repeat(1_000_000), "글".repeat(1_000_000));
+    let bounded = bound_evidence_body(body, "PAY");
+    assert!(bounded.contains("PAY"));
+}
+
+#[test]
+fn bound_evidence_body_falls_back_to_a_prefix_when_the_payload_is_absent() {
+    use crate::scanning::result::{MAX_EVIDENCE_BODY_BYTES, bound_evidence_body};
+    let body = "Z".repeat(4 * 1024 * 1024);
+    let bounded = bound_evidence_body(body, "not-present");
+    assert!(bounded.len() < MAX_EVIDENCE_BODY_BYTES + 64);
+    assert!(bounded.ends_with('…'), "an elided suffix must be marked");
+}
+
+// --- URL-attribute back-walk budget ----------------------------------------
+
+#[test]
+fn url_attr_reflection_in_a_normal_href_is_still_recognised() {
+    // The budget must not change the answer for ordinary markup: this is the
+    // suppression the back-walk exists to enable.
+    let html = r#"<html><body><a href="/path/MARKER1">x</a></body></html>"#;
+    assert!(
+        crate::scanning::check_reflection::marker_reflects_in_url_attr_only(html, "MARKER1"),
+        "a marker echoed only inside href must still read as URL-attr-only"
+    );
+    let text = r#"<html><body><div>MARKER1</div></body></html>"#;
+    assert!(
+        !crate::scanning::check_reflection::marker_reflects_in_url_attr_only(text, "MARKER1"),
+        "a marker in body text is not URL-attr-only"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// estimate_param_requests — the shared preflight/dry-run request estimator
+//
+// `run_scanning` fans a parameter out into a reflection payload set AND a DOM
+// payload set, truncates each to the effective cap, and sends one request per
+// payload in both. The REST `/preflight` endpoint and the MCP `preflight_dalfox`
+// tool used to count only the reflection half, so they quoted roughly half the
+// real volume — on the one number those surfaces exist to produce. All three
+// estimates now call this, so it is worth pinning each branch directly rather
+// than only through a live-target preflight (which never reaches the
+// no-context and JS-context arms).
+// ---------------------------------------------------------------------------
+
+fn param_with_context(ctx: Option<InjectionContext>) -> Param {
+    Param {
+        injection_context: ctx,
+        ..Param::new("q".to_string(), "seed".to_string(), Location::Query)
+    }
+}
+
+#[test]
+fn test_estimate_param_requests_counts_both_scan_phases() {
+    let args = default_scan_args();
+    let uncapped = |n: usize| n;
+
+    // HTML / Attribute / AttributeUrl / Css and the unknown-context fallback all
+    // run both phases, so each must be billed strictly more than its reflection
+    // half alone — that difference is exactly what the old estimate dropped.
+    for ctx in [
+        None,
+        Some(InjectionContext::Html(None)),
+        Some(InjectionContext::Attribute(None)),
+        Some(InjectionContext::AttributeUrl(None)),
+        Some(InjectionContext::Css(None)),
+    ] {
+        let p = param_with_context(ctx.clone());
+        let refl_only = match &p.injection_context {
+            Some(c) => crate::scanning::xss_common::get_dynamic_payloads(c, &args)
+                .expect("reflection payloads")
+                .len(),
+            None => {
+                crate::payload::get_dynamic_xss_html_payloads().len()
+                    + crate::payload::XSS_JAVASCRIPT_PAYLOADS.len()
+            }
+        };
+        let total = estimate_param_requests(&p, &args, 1, &uncapped);
+        assert!(
+            total > refl_only,
+            "context {ctx:?} runs a DOM phase too, so the estimate must exceed \
+             the reflection-only count ({refl_only}), got {total}"
+        );
+    }
+
+    // A JS-context param runs the script-breakout DOM set too (plus the JSONP
+    // verifiers), so it is billed for both halves.
+    let js = param_with_context(Some(InjectionContext::Javascript(None)));
+    let js_refl = crate::scanning::xss_common::get_dynamic_payloads(
+        js.injection_context.as_ref().expect("js context"),
+        &args,
+    )
+    .expect("reflection payloads")
+    .len();
+    let js_dom = get_dom_payloads(&js, &args).expect("dom payloads").len();
+    assert!(js_dom > 0, "a JS-context param has a DOM payload set");
+    assert_eq!(
+        estimate_param_requests(&js, &args, 1, &uncapped),
+        js_refl + js_dom
+    );
+}
+
+#[test]
+fn test_estimate_param_requests_caps_each_phase_separately() {
+    let args = default_scan_args();
+    // `run_scanning` truncates the reflection set and the DOM set to `cap`
+    // *each*, so a two-phase parameter costs up to `2 * cap` — not `cap`.
+    // Clamping the combined figure at `cap` is what halved the quote.
+    let cap = 5usize;
+    let apply_cap = move |n: usize| n.min(cap);
+    let html = param_with_context(Some(InjectionContext::Html(None)));
+    assert_eq!(
+        estimate_param_requests(&html, &args, 1, &apply_cap),
+        2 * cap,
+        "both phases generate well over {cap} payloads, so each is capped at \
+         {cap} and the parameter costs {}",
+        2 * cap
+    );
+
+    // A JS-context param runs both phases too, each capped.
+    let js = param_with_context(Some(InjectionContext::Javascript(None)));
+    assert_eq!(estimate_param_requests(&js, &args, 1, &apply_cap), 2 * cap);
+
+    // `cap == 0` is the --deep-scan spelling of "unlimited" and must not zero
+    // the estimate.
+    let unlimited = |n: usize| n;
+    assert!(estimate_param_requests(&html, &args, 1, &unlimited) > 2 * cap);
+}
+
+#[test]
+fn test_dom_payloads_with_probe_data_honor_encoders_none() {
+    // A param with probe data takes the adaptive DOM arm, which always appended
+    // url / entity / adaptive-encoded variants and ignored `-e none`.
+    let mut p = param_with_context(Some(InjectionContext::Attribute(Some(
+        crate::parameter_analysis::DelimiterType::DoubleQuote,
+    ))));
+    p.invalid_specials = Some(vec!['<', '>', '"', '\'']);
+    p.valid_specials = Some(vec![]);
+    let mut args = default_scan_args();
+    args.encoders = vec!["none".to_string()];
+    let none = get_dom_payloads_for_context(&p, &args).expect("dom payloads");
+    assert!(!none.is_empty());
+    assert!(
+        none.iter()
+            .all(|x| !x.contains("%25") && !x.contains("&#x")),
+        "`-e none` must send raw payloads only"
+    );
+    args.encoders = vec!["url".to_string(), "html".to_string()];
+    let encoded = get_dom_payloads_for_context(&p, &args).expect("dom payloads");
+    assert!(encoded.len() > none.len());
+}
+
+// ---------------------------------------------------------------------------
+// Scan-core defect regressions (A1)
+// ---------------------------------------------------------------------------
+
+/// Bind an axum app on an ephemeral loopback port and return its base address.
+async fn spawn_regression_app(app: axum::Router) -> std::net::SocketAddr {
+    use std::net::Ipv4Addr;
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    addr
+}
+
+/// `FoundParams` used to be keyed by parameter *name* alone, so the first wire
+/// slot to produce a finding suppressed every sibling slot with the same name:
+/// the reflection/DOM phases short-circuited and the dispatch loop skipped the
+/// sibling's worker outright.
+///
+/// Here `q` names two genuinely independent injection points on one request —
+/// `?q=` in the query string and `q` in the urlencoded POST body — and the mock
+/// reflects **both** raw. Both are exploitable, so both must be reported;
+/// before the fix whichever worker won the race silenced the other and the scan
+/// reported exactly one finding (a false negative on a real vulnerability).
+#[tokio::test]
+async fn test_run_scanning_reports_same_name_query_and_body_params_separately() {
+    use axum::{Router, extract::Query, response::Html, routing::post};
+    use std::collections::HashMap;
+
+    async fn handler(Query(q): Query<HashMap<String, String>>, body: String) -> Html<String> {
+        let from_query = q.get("q").cloned().unwrap_or_default();
+        let from_body = url::form_urlencoded::parse(body.as_bytes())
+            .find(|(k, _)| k == "q")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        Html(format!(
+            "<html><body><div id=q>{}</div><div id=b>{}</div></body></html>",
+            from_query, from_body
+        ))
+    }
+
+    let addr = spawn_regression_app(Router::new().route("/", post(handler))).await;
+
+    let url = format!("http://{}/?q=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.method = "POST".to_string();
+    target.data = Some("q=b".to_string());
+    target.workers = 4;
+    target.reflection_params = vec![
+        Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            ..Param::new("q".to_string(), "a".to_string(), Location::Query)
+        },
+        Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            ..Param::new("q".to_string(), "b".to_string(), Location::Body)
+        },
+    ];
+
+    let args = Arc::new(integration_scan_args(false));
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        args,
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let guard = results.lock().await;
+    let locations: Vec<&str> = guard
+        .iter()
+        .filter(|r| r.param == "q")
+        .map(|r| r.location.as_str())
+        .collect();
+    assert!(
+        locations.contains(&"Query"),
+        "the vulnerable query-string `q` must be reported; got {:?}",
+        locations
+    );
+    assert!(
+        locations.contains(&"Body"),
+        "the vulnerable body `q` is a different injection point and must be \
+         reported too; got {:?}",
+        locations
+    );
+}
+
+/// Cancellation used to be honoured only inside the reflection and DOM payload
+/// loops. Every parameter's worker is spawned up front, so on a cancelled scan
+/// the workers still queued behind the concurrency semaphore each went on to
+/// fire the Stage-0 probe and then the whole `--hpp` phase — thousands of
+/// requests at a target the operator had already asked us to stop hitting.
+///
+/// The mock flips the cancel flag once it has served a handful of requests and
+/// counts everything it receives afterwards. `--hpp` is on and duplicate-
+/// parameter requests are answered without a reflection, so the HPP phase runs
+/// its full `payloads x positions` fan-out when it is not stopped.
+#[tokio::test]
+async fn test_run_scanning_cancel_stops_probe_and_hpp_requests() {
+    use axum::{Router, extract::RawQuery, extract::State, response::Html, routing::get};
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Clone)]
+    struct AppState {
+        requests: Arc<AtomicUsize>,
+        cancel: Arc<AtomicBool>,
+    }
+
+    /// Requests served before the scan is cancelled.
+    const CANCEL_AFTER: usize = 6;
+
+    async fn handler(State(st): State<AppState>, RawQuery(q): RawQuery) -> Html<String> {
+        let n = st.requests.fetch_add(1, Ordering::SeqCst) + 1;
+        if n >= CANCEL_AFTER {
+            st.cancel.store(true, Ordering::SeqCst);
+        }
+        let raw = q.unwrap_or_default();
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(raw.as_bytes())
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        // HPP probes send the same name twice. Answer those without echoing
+        // anything so the HPP phase never short-circuits on a first hit and
+        // instead spends its full per-parameter budget.
+        let mut names: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        let deduped = {
+            let mut d = names.clone();
+            d.dedup();
+            d.len()
+        };
+        if deduped != names.len() {
+            return Html("<html><body>no</body></html>".to_string());
+        }
+        let echoed: String = pairs.iter().map(|(_, v)| v.as_str()).collect();
+        Html(format!("<html><body><div>{}</div></body></html>", echoed))
+    }
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let state = AppState {
+        requests: requests.clone(),
+        cancel: cancel.clone(),
+    };
+    let addr = spawn_regression_app(
+        Router::new()
+            .route("/", get(handler))
+            .with_state(state.clone()),
+    )
+    .await;
+
+    // 40 parameters, 2 workers: 38 of them are queued behind the semaphore when
+    // the cancel flag flips, which is exactly the population the fix protects.
+    const PARAMS: usize = 40;
+    let query: String = (0..PARAMS)
+        .map(|i| format!("p{}=a", i))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = format!("http://{}/?{}", addr, query);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.workers = 2;
+    target.reflection_params = (0..PARAMS)
+        .map(|i| Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            ..Param::new(format!("p{}", i), "a".to_string(), Location::Query)
+        })
+        .collect();
+
+    let mut raw_args = integration_scan_args(false);
+    raw_args.hpp = true;
+    // One reflection payload per param keeps the *pre*-cancel traffic tiny; the
+    // HPP subset is taken from this same list, so the post-cancel fan-out this
+    // test measures stays attributable to the probe + HPP phases.
+    raw_args.max_payloads_per_param = 1;
+    let args = Arc::new(raw_args);
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        args,
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))).with_cancel(cancel),
+    )
+    .await;
+
+    let total = requests.load(Ordering::SeqCst);
+    // Before the fix each of the ~38 queued workers still ran a probe and the
+    // full HPP fan-out after cancellation, which lands in the hundreds. The
+    // small allowance covers the two workers that were already mid-flight.
+    assert!(
+        total < 60,
+        "a cancelled scan must stop issuing requests; the queued workers sent \
+         {} requests in total (cancel fired at request {})",
+        total,
+        CANCEL_AFTER
+    );
+}
+
+/// The `--sxss` branch of `fetch_injection_response` used to return
+/// candidate bodies without applying any of the response gates the normal
+/// reflection branch applies. An `application/json` echo is inert — a browser
+/// renders it as data, never as markup — so the plain path suppresses it, while
+/// `--sxss` reported it as a stored-XSS reflection.
+///
+/// The HTML half of the test is the control: it proves the mock is otherwise
+/// detectable, so an empty result on the JSON half means "gated", not
+/// "nothing reached the scanner".
+#[tokio::test]
+async fn test_sxss_applies_the_same_response_gates_as_the_normal_path() {
+    use axum::http::header;
+    use axum::{Router, extract::Query, response::IntoResponse, routing::get};
+    use std::collections::HashMap;
+
+    async fn json_echo(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+        let v = q.get("q").cloned().unwrap_or_default();
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            format!("{{\"q\":\"{}\"}}", v),
+        )
+    }
+    async fn html_echo(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+        let v = q.get("q").cloned().unwrap_or_default();
+        (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            format!("<html><body><div>{}</div></body></html>", v),
+        )
+    }
+
+    let addr = spawn_regression_app(
+        Router::new()
+            .route("/json", get(json_echo))
+            .route("/html", get(html_echo)),
+    )
+    .await;
+
+    async fn scan_path(addr: std::net::SocketAddr, path: &str) -> usize {
+        let url = format!("http://{}{}?q=a", addr, path);
+        let mut target = parse_target(&url).expect("parse_target");
+        target.workers = 2;
+        target.reflection_params = vec![Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            ..Param::new("q".to_string(), "a".to_string(), Location::Query)
+        }];
+
+        let mut raw_args = integration_scan_args(false);
+        raw_args.sxss = true;
+        raw_args.max_payloads_per_param = 8;
+        let results = Arc::new(Mutex::new(Vec::new()));
+        run_scanning(
+            &target,
+            Arc::new(raw_args),
+            ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        results.lock().await.len()
+    }
+
+    assert!(
+        scan_path(addr, "/html").await > 0,
+        "control: an HTML echo must still be reported under --sxss"
+    );
+    assert_eq!(
+        scan_path(addr, "/json").await,
+        0,
+        "an application/json echo is inert markup-wise; --sxss must apply the \
+         same inert-content-type gate the plain reflection path applies"
+    );
+}
+
+/// `PhaseFlow::Abort` (a global `--limit` reached mid-phase) used to `return`
+/// out of the per-parameter worker *before* `flush_results`, silently
+/// discarding every finding that worker had already confirmed and batched.
+///
+/// Under a `--limit` the phase loops now flush before every limit check
+/// (`limit_reached_in_phase`), so the abort can no longer be holding a batched
+/// finding. `victim` below reflects entity-escaped: it records an `R` on its
+/// first reflection payload, that `R` alone trips `--limit 1`, and the worker
+/// aborts mid-catalog. The finding that tripped the limit must be in the
+/// results — `--limit` is a stop condition, not an instruction to destroy
+/// evidence.
+#[tokio::test]
+async fn test_run_scanning_limit_abort_keeps_already_confirmed_findings() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let handler = move |Query(q): Query<HashMap<String, String>>| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        let v = q.get("victim").cloned().unwrap_or_default();
+        async move {
+            let escaped = v
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;");
+            Html(format!("<html><body><div>{escaped}</div></body></html>"))
+        }
+    };
+    let addr = spawn_regression_app(Router::new().route("/", get(handler))).await;
+
+    let url = format!("http://{}/?victim=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.workers = 2;
+    target.reflection_params = vec![Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("victim".to_string(), "a".to_string(), Location::Query)
+    }];
+
+    let mut raw_args = integration_scan_args(false);
+    raw_args.limit = Some(1);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let report = run_scanning(
+        &target,
+        Arc::new(raw_args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    // The stop happened inside the parameter's phase loop, never in the
+    // dispatch loop; `--state-file` must still see the target as cut short,
+    // or it records `completed` and skips the untested catalog forever.
+    assert!(
+        report.limit_stopped,
+        "a phase-level --limit stop must be reported"
+    );
+
+    let guard = results.lock().await;
+    let params: Vec<(String, String)> = guard
+        .iter()
+        .map(|r| (r.param.clone(), r.result_type.short().to_string()))
+        .collect();
+    assert_eq!(
+        params,
+        vec![("victim".to_string(), "R".to_string())],
+        "the finding that tripped --limit must survive the abort"
+    );
+    // Sanity: the limit actually stopped the worker mid-catalog.
+    assert!(
+        requests.load(Ordering::SeqCst) < 60,
+        "--limit 1 did not stop the scan ({} requests)",
+        requests.load(Ordering::SeqCst)
+    );
+}
+
+/// The other half of the `--sxss` gate parity: the Path-injection drops.
+///
+/// A path segment echoed back by an error page is only a finding when it lands
+/// somewhere a browser parses as markup. Pure URL echo — a canonical `<link>`,
+/// `<a href>` breadcrumbs — is noise, and the plain reflection path drops it via
+/// `should_suppress_path_reflection_with_body`. The `--sxss` branch never ran
+/// that check, so stored runs reported every 404 that prints the requested URI.
+#[tokio::test]
+async fn test_sxss_path_injection_drops_url_echo_only_reflections() {
+    use axum::extract::Path as AxumPath;
+    use axum::http::{StatusCode, header};
+    use axum::{Router, response::IntoResponse, routing::get};
+
+    /// 404 that echoes the requested path *only* inside a canonical link.
+    async fn url_echo(AxumPath(rest): AxumPath<String>) -> impl IntoResponse {
+        (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            format!(
+                "<html><head><link rel=\"canonical\" href=\"/{}\"></head><body>Not found</body></html>",
+                rest
+            ),
+        )
+    }
+
+    /// 404 that renders the requested path into the document body — genuine
+    /// error-page XSS, and it must survive the gate.
+    async fn body_echo(AxumPath(rest): AxumPath<String>) -> impl IntoResponse {
+        (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            format!("<html><body><table><td>{}</td></table></body></html>", rest),
+        )
+    }
+
+    /// An empty body carries no evidence at all.
+    async fn empty() -> impl IntoResponse {
+        (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            String::new(),
+        )
+    }
+
+    let addr = spawn_regression_app(
+        Router::new()
+            .route("/url-echo/{*rest}", get(url_echo))
+            .route("/body-echo/{*rest}", get(body_echo))
+            .route("/empty/{*rest}", get(empty)),
+    )
+    .await;
+
+    async fn scan_path(addr: std::net::SocketAddr, prefix: &str) -> usize {
+        let url = format!("http://{}/{}/seg", addr, prefix);
+        let mut target = parse_target(&url).expect("parse_target");
+        target.workers = 2;
+        // `Location::Path` params are addressed by segment index (see
+        // `url_inject`); index 1 is the `seg` component.
+        target.reflection_params = vec![Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            ..Param::new(
+                "path_segment_1".to_string(),
+                "seg".to_string(),
+                Location::Path,
+            )
+        }];
+
+        let mut raw_args = integration_scan_args(false);
+        raw_args.sxss = true;
+        raw_args.max_payloads_per_param = 8;
+        let results = Arc::new(Mutex::new(Vec::new()));
+        run_scanning(
+            &target,
+            Arc::new(raw_args),
+            ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        results.lock().await.len()
+    }
+
+    assert!(
+        scan_path(addr, "body-echo").await > 0,
+        "control: a 404 that renders the path segment into the document body is \
+         real error-page XSS and must still be reported under --sxss"
+    );
+    assert_eq!(
+        scan_path(addr, "url-echo").await,
+        0,
+        "a path segment echoed only inside a canonical <link> is URL noise; \
+         --sxss must apply the same body-level Path gate the plain path applies"
+    );
+    assert_eq!(
+        scan_path(addr, "empty").await,
+        0,
+        "an empty response body carries no evidence"
+    );
+}
+
+#[test]
+fn test_build_request_text_host_carries_a_non_default_port() {
+    // `Host` is host *and* port. Dropping it replayed every PoC against a
+    // non-default port to :80/:443 — a different service, or nothing at all.
+    let target = parse_target("http://127.0.0.1:3031/x?q=1").unwrap();
+    let param = Param::new("q".to_string(), "1".to_string(), Location::Query);
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert!(
+        request.contains("Host: 127.0.0.1:3031"),
+        "port missing from Host, got:\n{request}"
+    );
+}
+
+#[test]
+fn test_build_request_text_omits_the_schemes_default_port() {
+    // The flip side: :443 on https is implicit and must not be spelled out.
+    let target = parse_target("https://example.com/x?q=1").unwrap();
+    let param = Param::new("q".to_string(), "1".to_string(), Location::Query);
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert!(request.contains("Host: example.com\r\n"));
+    assert!(!request.contains("example.com:443"));
+}
+
+#[test]
+fn test_build_request_text_injects_a_header_param() {
+    // A `Location::Header` param is injected into the request, not the URL.
+    // Emitting only the target's original headers left the payload nowhere in
+    // the PoC, so it reproduced nothing.
+    let mut target = parse_target("http://127.0.0.1:3031/h").unwrap();
+    target.method = "GET".to_string();
+    target.headers = vec![("X-Keep".to_string(), "1".to_string())];
+
+    let param = Param::new("Referer".to_string(), String::new(), Location::Header);
+    let request = build_request_text(&target, &param, "<svg onload=alert(1)>");
+    assert!(
+        request.contains("Referer: <svg onload=alert(1)>"),
+        "injected header missing, got:\n{request}"
+    );
+    assert!(request.contains("X-Keep: 1"), "original header dropped");
+}
+
+#[test]
+fn test_build_request_text_header_param_overrides_a_same_named_original() {
+    // The wire path applies the injected header via `apply_header_overrides`,
+    // which replaces. Emitting both would show a request that was never sent.
+    let mut target = parse_target("http://127.0.0.1:3031/h").unwrap();
+    target.headers = vec![("Referer".to_string(), "https://original/".to_string())];
+
+    let param = Param::new("Referer".to_string(), String::new(), Location::Header);
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert!(request.contains("Referer: PAYLOAD"));
+    assert!(
+        !request.contains("https://original/"),
+        "the overridden original was emitted too, got:\n{request}"
+    );
+}
+
+#[test]
+fn test_build_request_text_cookie_param_goes_into_the_cookie_header() {
+    // Per-cookie discovery files cookies as `Location::Header` named after the
+    // cookie. `build_header_request` routes those into `Cookie` — injected
+    // first, the target's other cookies preserved after it. Emitting
+    // `sid: <payload>` instead would be a header the application never reads.
+    let mut target = parse_target("http://127.0.0.1:3031/c").unwrap();
+    target.cookies = vec![
+        ("sid".to_string(), "abc".to_string()),
+        ("theme".to_string(), "dark".to_string()),
+    ];
+
+    let param = Param::new("sid".to_string(), "abc".to_string(), Location::Header);
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert!(
+        request.contains("Cookie: sid=PAYLOAD"),
+        "cookie param not injected into Cookie, got:\n{request}"
+    );
+    assert!(
+        request.contains("theme=dark"),
+        "neighbouring cookies dropped — they often carry the session the sink needs, got:\n{request}"
+    );
+    assert!(
+        !request.contains("\r\nsid: PAYLOAD"),
+        "cookie emitted as a header of its own name, got:\n{request}"
+    );
+}
+
+#[test]
+fn test_build_request_text_cookie_param_replaces_a_captured_cookie_header() {
+    // A cookie param is sent through `build_request_with_cookie`, whose
+    // composed value *replaces* any Cookie captured into `target.headers`.
+    // Emitting the captured one too showed two Cookie lines that never went out
+    // together, and put them in the opposite order to the wire.
+    let mut target = parse_target("http://127.0.0.1:3031/c").unwrap();
+    target.headers = vec![("Cookie".to_string(), "sid=abc".to_string())];
+    target.cookies = vec![("sid".to_string(), "abc".to_string())];
+
+    let param = Param::new("sid".to_string(), "abc".to_string(), Location::Header);
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert_eq!(
+        request.matches("Cookie: ").count(),
+        1,
+        "exactly one Cookie line, got:\n{request}"
+    );
+    assert!(request.contains("Cookie: sid=PAYLOAD"), "got:\n{request}");
+}
+
+#[test]
+fn test_build_request_text_does_not_emit_a_second_cookie_line() {
+    // `apply_headers_ua_cookies` auto-attaches `target.cookies` only when the
+    // target has no Cookie header of its own. The PoC must mirror that instead
+    // of printing both.
+    let mut target = parse_target("http://127.0.0.1:3031/q").unwrap();
+    target.headers = vec![("Cookie".to_string(), "sid=abc".to_string())];
+    target.cookies = vec![("sid".to_string(), "abc".to_string())];
+
+    let param = Param::new("q".to_string(), String::new(), Location::Query);
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert_eq!(
+        request.matches("Cookie: ").count(),
+        1,
+        "the captured Cookie header was duplicated by the auto-attach, got:\n{request}"
+    );
+}
+
+#[test]
+fn test_build_request_text_body_param_shows_the_injectors_content_type() {
+    // `build_body_request_base` drops a captured Content-Type so the injector's
+    // is the only one on the wire. Showing the captured one instead described a
+    // request that frames the body in a format it is not written in.
+    let mut target = parse_target("http://127.0.0.1:3031/p").unwrap();
+    target.method = "POST".to_string();
+    target.headers = vec![(
+        "Content-Type".to_string(),
+        "multipart/form-data; boundary=----OLD".to_string(),
+    )];
+    target.data = Some("q=1".to_string());
+
+    let param = Param::new("q".to_string(), "1".to_string(), Location::Body);
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert!(
+        request.contains("Content-Type: application/x-www-form-urlencoded"),
+        "got:\n{request}"
+    );
+    assert!(
+        !request.contains("boundary=----OLD"),
+        "the dropped captured Content-Type was emitted, got:\n{request}"
+    );
+    assert_eq!(request.matches("Content-Type: ").count(), 1);
+}
+
+#[test]
+fn test_build_request_text_query_param_keeps_the_captured_content_type() {
+    // Query/Path injectors re-send the original body verbatim through
+    // `build_request`, which preserves the captured Content-Type.
+    let mut target = parse_target("http://127.0.0.1:3031/p").unwrap();
+    target.method = "POST".to_string();
+    target.headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+    target.data = Some("{\"a\":1}".to_string());
+
+    let param = Param::new("q".to_string(), String::new(), Location::Query);
+    let request = build_request_text(&target, &param, "PAYLOAD");
+    assert!(
+        request.contains("Content-Type: application/json"),
+        "got:\n{request}"
+    );
+}
+
+/// A safe/sanitizing single-parameter endpoint (entity-encodes `<`/`>`, so it
+/// reflects the marker but never verifies) exercises the full reflection + DOM
+/// catalog. With within-parameter concurrency the payloads are fanned out, so
+/// the mock must observe more than one request in flight at once — bounded by
+/// `--workers`. Before within-param concurrency this endpoint issued its entire
+/// catalog one request at a time (observed concurrency == 1), which was the
+/// single-parameter wall-time bottleneck.
+#[tokio::test]
+async fn test_within_param_concurrency_fans_out_requests() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, sleep};
+
+    let cur = Arc::new(AtomicUsize::new(0));
+    let observed_max = Arc::new(AtomicUsize::new(0));
+    let cur_h = cur.clone();
+    let max_h = observed_max.clone();
+    let handler = move |Query(params): Query<HashMap<String, String>>| {
+        let cur = cur_h.clone();
+        let max = max_h.clone();
+        async move {
+            let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+            max.fetch_max(now, Ordering::SeqCst);
+            // Hold the request open briefly so genuinely-concurrent requests
+            // overlap in the counter (a purely serial loop never would).
+            sleep(Duration::from_millis(20)).await;
+            cur.fetch_sub(1, Ordering::SeqCst);
+            // Entity-encode angles: the marker still reflects (probe passes) but
+            // no payload ever verifies, so the whole catalog is exercised.
+            let q = params.get("q").cloned().unwrap_or_default();
+            let esc = q.replace('<', "&lt;").replace('>', "&gt;");
+            Html(format!("<html><body><div>{}</div></body></html>", esc))
+        }
+    };
+    let app = Router::new().route("/", get(handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?q=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.workers = 8;
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("q".to_string(), "a".to_string(), Location::Query)
+    });
+
+    let mut args = integration_scan_args(false);
+    // Keep the run quick but comfortably larger than the concurrency window so
+    // several chunks are issued.
+    args.max_payloads_per_param = 60;
+    let args = Arc::new(args);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        args,
+        ScanRunHandles::new(results, Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let observed = observed_max.load(Ordering::SeqCst);
+    assert!(
+        observed > 1,
+        "within-parameter concurrency should keep more than one request in \
+         flight on a single parameter; observed max concurrency = {observed}"
+    );
+    assert!(
+        observed <= target.workers,
+        "observed concurrency {observed} must never exceed --workers {}",
+        target.workers
+    );
+}
+
+/// `--waf-evasion` opts out of within-parameter concurrency: its stealth cadence
+/// requires a single request at a time. The same sanitizing endpoint must be
+/// scanned strictly serially (observed max concurrency == 1). This also guards
+/// the `--sxss` / `--delay` serial modes, which share the `request_concurrency`
+/// gate.
+/// The scan worker's Stage-0 probe asks the same question, with the same
+/// markers, that `parameter_analysis::active_probe_param` asked one stage
+/// earlier. When that probe already saw the echo (`Param::marker_echoed`) the
+/// request is skipped — one request per parameter — and the scan is otherwise
+/// identical: the same findings, and the AST pass the probe response used to
+/// seed now runs on the reflection phase's first renderable body.
+#[tokio::test]
+async fn test_marker_echoed_param_skips_the_stage_0_probe_request() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, sleep};
+
+    async fn scan_counting_requests(marker_echoed: bool) -> (usize, usize) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_h = hits.clone();
+        let handler = move |Query(params): Query<HashMap<String, String>>| {
+            let hits = hits_h.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let q = params.get("q").cloned().unwrap_or_default();
+                Html(format!("<html><body><div>{}</div></body></html>", q))
+            }
+        };
+        let app = Router::new().route("/", get(handler));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test listener");
+        let addr: SocketAddr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let url = format!("http://{}/?q=a", addr);
+        let mut target = parse_target(&url).expect("parse_target");
+        target.reflection_params.push(Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            marker_echoed,
+            ..Param::new("q".to_string(), "a".to_string(), Location::Query)
+        });
+
+        let args = Arc::new(integration_scan_args(false));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        run_scanning(
+            &target,
+            args,
+            ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        let findings = results.lock().await.len();
+        (hits.load(Ordering::SeqCst), findings)
+    }
+
+    let (with_probe, findings_with_probe) = scan_counting_requests(false).await;
+    let (reusing_echo, findings_reusing_echo) = scan_counting_requests(true).await;
+
+    assert_eq!(
+        reusing_echo + 1,
+        with_probe,
+        "reusing the active probe's echo must cost exactly one request less \
+         (probe: {with_probe}, reuse: {reusing_echo})"
+    );
+    assert!(
+        findings_reusing_echo >= 1 && findings_reusing_echo == findings_with_probe,
+        "skipping the probe must not change the findings \
+         (probe: {findings_with_probe}, reuse: {findings_reusing_echo})"
+    );
+}
+
+/// `--deep-scan` keeps the probe: exhaustive mode must not depend on an earlier
+/// stage's verdict.
+#[tokio::test]
+async fn test_deep_scan_keeps_the_stage_0_probe_for_an_echoed_param() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, sleep};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_h = hits.clone();
+    let handler = move |Query(params): Query<HashMap<String, String>>| {
+        let hits = hits_h.clone();
+        async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let q = params.get("q").cloned().unwrap_or_default();
+            // Echo the markers back so the probe records a reflection, but keep
+            // the body free of anything that verifies.
+            Html(format!("<html><body><div>{}</div></body></html>", q))
+        }
+    };
+    let app = Router::new().route("/", get(handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?q=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        marker_echoed: true,
+        ..Param::new("q".to_string(), "a".to_string(), Location::Query)
+    });
+
+    let mut args = integration_scan_args(false);
+    args.deep_scan = true;
+    args.max_payloads_per_param = 2;
+    let args = Arc::new(args);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        args,
+        ScanRunHandles::new(results, Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let sent = hits.load(Ordering::SeqCst);
+    assert!(
+        sent > 2,
+        "--deep-scan must still send its own Stage-0 probe (requests: {sent})"
+    );
+}
+
+#[tokio::test]
+async fn test_waf_evasion_keeps_requests_serial() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, sleep};
+
+    let cur = Arc::new(AtomicUsize::new(0));
+    let observed_max = Arc::new(AtomicUsize::new(0));
+    let cur_h = cur.clone();
+    let max_h = observed_max.clone();
+    let handler = move |Query(params): Query<HashMap<String, String>>| {
+        let cur = cur_h.clone();
+        let max = max_h.clone();
+        async move {
+            let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+            max.fetch_max(now, Ordering::SeqCst);
+            sleep(Duration::from_millis(5)).await;
+            cur.fetch_sub(1, Ordering::SeqCst);
+            let q = params.get("q").cloned().unwrap_or_default();
+            let esc = q.replace('<', "&lt;").replace('>', "&gt;");
+            Html(format!("<html><body><div>{}</div></body></html>", esc))
+        }
+    };
+    let app = Router::new().route("/", get(handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let url = format!("http://{}/?q=a", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.workers = 8;
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("q".to_string(), "a".to_string(), Location::Query)
+    });
+
+    let mut args = integration_scan_args(false);
+    args.max_payloads_per_param = 40;
+    args.waf_evasion = true;
+    let args = Arc::new(args);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        args,
+        ScanRunHandles::new(results, Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    assert_eq!(
+        observed_max.load(Ordering::SeqCst),
+        1,
+        "--waf-evasion must keep requests strictly serial (no within-param fan-out)"
+    );
+}
+
+#[test]
+fn test_next_redirect_streak_consecutive_and_resets() {
+    // A 3xx increments the streak…
+    assert_eq!(next_redirect_streak(0, 302), 1);
+    assert_eq!(next_redirect_streak(5, 301), 6);
+    assert_eq!(next_redirect_streak(31, 307), 32);
+    // …every non-3xx (2xx render, 4xx block, 5xx error, 0 transport error)
+    // resets it, so a conditionally-redirecting endpoint is never abandoned on
+    // the first 200 that dodges the redirect rule.
+    assert_eq!(next_redirect_streak(31, 200), 0);
+    assert_eq!(next_redirect_streak(31, 404), 0);
+    assert_eq!(next_redirect_streak(31, 500), 0);
+    assert_eq!(next_redirect_streak(31, 0), 0);
+    // Boundary of the redirect class.
+    assert_eq!(next_redirect_streak(0, 299), 0);
+    assert_eq!(next_redirect_streak(0, 300), 1);
+    assert_eq!(next_redirect_streak(0, 399), 1);
+    assert_eq!(next_redirect_streak(0, 400), 0);
+}
+
+#[test]
+fn test_is_redirect_dom_status_classifies_3xx_only() {
+    assert!(is_redirect_dom_status(300));
+    assert!(is_redirect_dom_status(302));
+    assert!(is_redirect_dom_status(399));
+    assert!(!is_redirect_dom_status(200));
+    assert!(!is_redirect_dom_status(404));
+    assert!(!is_redirect_dom_status(500));
+}
+
+#[test]
+fn test_dom_phase_early_exit_redirect_streak_disabled_under_deep_scan() {
+    // --deep-scan opts out of the redirect early-exit too (exhaustive).
+    assert!(!dom_phase_should_early_exit(
+        true,
+        0,
+        0,
+        REDIRECT_STREAK_LIMIT * 10
+    ));
+}
+
+/// A path segment the app URL-decodes a second time behind a `<>` filter is
+/// classified `2url` by active probing; the scan must then reach it. The
+/// multi-URL pre-encoding used to be applied in full *and* escaped again by
+/// the path-segment encoder, so every payload arrived one layer short of
+/// decoded and the param read clean.
+#[tokio::test]
+async fn path_param_classified_2url_is_scanned_with_matching_layers() {
+    use axum::{Router, extract::Path, response::Html, routing::get};
+    use std::net::Ipv4Addr;
+    async fn double_decode(Path(seg): Path<String>) -> Html<String> {
+        let filtered: String = seg.chars().filter(|c| *c != '<' && *c != '>').collect();
+        let decoded = urlencoding::decode(&filtered)
+            .map(|c| c.into_owned())
+            .unwrap_or(filtered);
+        Html(format!("<html><body><div>{decoded}</div></body></html>"))
+    }
+    let app = Router::new().route("/a/{seg}", get(double_decode));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+
+    let mut target = parse_target(&format!("http://{addr}/a/b")).expect("parse_target");
+    let mut param = crate::parameter_analysis::active_probe_param(
+        &target,
+        Param::new(
+            "path_segment_1".to_string(),
+            "b".to_string(),
+            Location::Path,
+        ),
+        Arc::new(tokio::sync::Semaphore::new(4)),
+    )
+    .await;
+    assert_eq!(param.pre_encoding.as_deref(), Some("2url"));
+    param.injection_context = Some(InjectionContext::Html(None));
+    target.reflection_params.push(param);
+
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(integration_scan_args(false)),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    let guard = results.lock().await;
+    assert!(
+        guard.iter().any(|r| r.param == "path_segment_1"),
+        "a 2url path param must produce a finding; got {} results",
+        guard.len()
+    );
+}
+
+/// A CSP `<meta>` outside `<head>` is ignored by browsers, so it must not be
+/// merged into the analysed policy.
+#[test]
+fn test_extract_meta_csp_ignores_meta_outside_head() {
+    let html = r#"<html><head><title>x</title></head><body>
+        <meta http-equiv="Content-Security-Policy" content="script-src 'none'">
+    </body></html>"#;
+    assert_eq!(extract_meta_csp(html), None);
+    let html = r#"<html><head>
+        <meta http-equiv="Content-Security-Policy" content="object-src 'none'">
+    </head><body>
+        <meta http-equiv="Content-Security-Policy" content="script-src 'none'">
+    </body></html>"#;
+    assert_eq!(
+        extract_meta_csp(html).map(|(_, c)| c).as_deref(),
+        Some("object-src 'none'")
+    );
+}
+
+/// End-to-end for `--sxss` per-parameter marker attribution. Two body fields
+/// (`c`, `name`) are injected at a stored sink. Which fields the sink keeps is
+/// varied; a field is credited with a Verified finding only when the retrieval
+/// page shows an element *this field* produced. Because every field is sent the
+/// same payload catalog, a shared marker would let one field's stored element
+/// satisfy another's verification — the cross-attribution this guards against.
+#[tokio::test]
+async fn sxss_credits_only_the_fields_that_actually_store() {
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use tokio::time::{Duration, sleep};
+
+    async fn run_case(store_fields: &'static [&'static str]) -> Vec<(String, String)> {
+        let store: Arc<StdMutex<Vec<String>>> = Arc::default();
+        let write = store.clone();
+        let read = store.clone();
+        let app = Router::new()
+            .route(
+                "/save",
+                axum::routing::post(move |body: String| {
+                    let store = write.clone();
+                    async move {
+                        for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                            if store_fields.contains(&k.as_ref()) {
+                                store.lock().unwrap().push(v.into_owned());
+                            }
+                        }
+                        Html("saved")
+                    }
+                }),
+            )
+            .route(
+                "/view",
+                get(move || {
+                    let store = read.clone();
+                    async move {
+                        Html(format!(
+                            "<html><body>{}</body></html>",
+                            store.lock().unwrap().join("<hr>")
+                        ))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+        target.workers = 1;
+        for name in ["c", "name"] {
+            target.reflection_params.push(Param {
+                injection_context: Some(InjectionContext::Html(None)),
+                form_action_url: Some(format!("http://{addr}/save")),
+                form_origin_url: Some(format!("http://{addr}/page")),
+                ..Param::new(name.to_string(), "x".to_string(), Location::Body)
+            });
+        }
+        let mut args = integration_scan_args(false);
+        args.sxss = true;
+        args.sxss_url = Some(format!("http://{addr}/view"));
+        args.max_payloads_per_param = 40;
+        let results = Arc::new(Mutex::new(Vec::new()));
+        run_scanning(
+            &target,
+            Arc::new(args),
+            ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+        )
+        .await;
+        server.abort();
+        let out: Vec<(String, String)> = results
+            .lock()
+            .await
+            .iter()
+            .filter(|r| r.result_type == FindingType::Verified)
+            .map(|r| (r.param.clone(), r.payload.clone()))
+            .collect();
+        out
+    }
+
+    // Only `c` stores: `name` must not be credited with `c`'s stored element.
+    let only_c = run_case(&["c"]).await;
+    assert!(
+        only_c.iter().all(|(p, _)| p == "c"),
+        "a field the sink never stores must not be credited: {only_c:?}"
+    );
+    assert!(
+        only_c.iter().any(|(p, _)| p == "c"),
+        "the storing field must be verified: {only_c:?}"
+    );
+
+    // Both store: each is credited (the baseline delta sees each field's own
+    // injection raise the payload's occurrence on the retrieval page).
+    let both = run_case(&["c", "name"]).await;
+    for field in ["c", "name"] {
+        assert!(
+            both.iter().any(|(p, _)| p == field),
+            "both storing fields must be verified, missing {field}: {both:?}"
+        );
+    }
+}
+
+/// The `--sxss` credit gate fails *open* when no baseline is in scope, and the
+/// baseline is a task-local that does not cross `tokio::spawn`. Drive a real
+/// `--sxss` scan through `run_scanning` and assert every attack-payload gate
+/// call during the reflection/DOM phases saw a baseline. A future spawn inside
+/// those phases (or dropping the scope) would record fail-open hits here.
+#[tokio::test]
+async fn sxss_credit_gate_always_sees_a_baseline_during_the_phases() {
+    use crate::scanning::check_reflection::{SXSS_GATE_FAIL_OPEN, SXSS_GATE_GUARD_SENTINEL};
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use tokio::time::{Duration, sleep};
+
+    let store: Arc<StdMutex<Vec<String>>> = Arc::default();
+    let write = store.clone();
+    let read = store.clone();
+    // Every page carries the sentinel so only this test's gate calls are
+    // recorded (see `record_sxss_gate_fail_open`).
+    let app = Router::new()
+        .route(
+            "/save",
+            axum::routing::post(move |body: String| {
+                let store = write.clone();
+                async move {
+                    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                        if k == "c" {
+                            store.lock().unwrap().push(v.into_owned());
+                        }
+                    }
+                    Html(format!("<p>{SXSS_GATE_GUARD_SENTINEL}</p>saved"))
+                }
+            }),
+        )
+        .route(
+            "/view",
+            get(move || {
+                let store = read.clone();
+                async move {
+                    Html(format!(
+                        "<html><body><p>{SXSS_GATE_GUARD_SENTINEL}</p>{}</body></html>",
+                        store.lock().unwrap().join("<hr>")
+                    ))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+    target.workers = 1;
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        form_action_url: Some(format!("http://{addr}/save")),
+        form_origin_url: Some(format!("http://{addr}/page")),
+        ..Param::new("c".to_string(), "x".to_string(), Location::Body)
+    });
+    let mut args = integration_scan_args(false);
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/view"));
+    args.max_payloads_per_param = 20;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    // Control: the phases actually ran and reached the gate with a stored hit.
+    assert!(
+        results
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.param == "c" && r.result_type == FindingType::Verified),
+        "control: the stored field must be verified"
+    );
+    let hits = SXSS_GATE_FAIL_OPEN.lock().unwrap().clone();
+    assert!(
+        hits.is_empty(),
+        "credit gate ran without a baseline in scope for {} attack payload(s), e.g. {:?}",
+        hits.len(),
+        hits.first()
+    );
+}
+
+/// Request-budget guard for the `--sxss` store-probe. Two form fields (`c`,
+/// `name`); only `c` stores. `name` never stores, but the storing field's
+/// stale marker on the retrieval page lets it pass the (deliberately un-gated)
+/// Stage-0 probe. Without the baseline-gated store-probe it would then run the
+/// whole payload catalog — every payload correctly refused, but each refusal
+/// paying the full sxss retrieval retry loop, which measured in the tens of
+/// thousands of requests. The store-probe must stop `name` before the catalog.
+#[tokio::test]
+async fn sxss_store_probe_bounds_a_non_storing_siblings_request_budget() {
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
+    use tokio::time::{Duration, sleep};
+
+    let store: Arc<StdMutex<Vec<String>>> = Arc::default();
+    // Counts POSTs that inject a payload into the *non-storing* `name` field
+    // (its value is something other than the seed). This isolates the sibling's
+    // own scan cost from the storing field's, independent of when the storing
+    // field verifies and stops. The store-probe should let `name` issue only
+    // its one marker probe; without it, `name` runs the whole payload catalog.
+    let name_injections = Arc::new(AtomicUsize::new(0));
+    let write = store.clone();
+    let read = store.clone();
+    let name_inj = name_injections.clone();
+    let app = Router::new()
+        .route(
+            "/save",
+            axum::routing::post(move |body: String| {
+                let store = write.clone();
+                let name_inj = name_inj.clone();
+                async move {
+                    // Only `c` is stored; `name` is accepted and dropped.
+                    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                        if k == "name" && v != "x" {
+                            name_inj.fetch_add(1, AtOrd::Relaxed);
+                        }
+                        if k == "c" {
+                            store.lock().unwrap().push(v.into_owned());
+                        }
+                    }
+                    Html("saved")
+                }
+            }),
+        )
+        .route(
+            "/view",
+            get(move || {
+                let store = read.clone();
+                async move {
+                    Html(format!(
+                        "<html><body>{}</body></html>",
+                        store.lock().unwrap().join("<hr>")
+                    ))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+    target.workers = 1;
+    for name in ["c", "name"] {
+        target.reflection_params.push(Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            form_action_url: Some(format!("http://{addr}/save")),
+            form_origin_url: Some(format!("http://{addr}/page")),
+            ..Param::new(name.to_string(), "x".to_string(), Location::Body)
+        });
+    }
+    let mut args = integration_scan_args(false);
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/view"));
+    // A full catalog: if `name` were to run it, the hit count would be orders
+    // of magnitude over the budget below.
+    args.max_payloads_per_param = 120;
+    args.sxss_retries = 1;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    assert!(
+        results
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.param == "c" && r.result_type == FindingType::Verified),
+        "control: the storing field must still be Verified"
+    );
+    let name_posts = name_injections.load(AtOrd::Relaxed);
+    // `name` never stores, so its store-probe injection does not raise the
+    // marker count above the baseline and its catalog is skipped: only the one
+    // store-probe POST reaches the sink. Without the store-probe `name` runs the
+    // full catalog (here 120 payloads plus the DOM set) — an order of magnitude
+    // more injections.
+    assert!(
+        name_posts < 10,
+        "the non-storing sibling must be stopped by the store-probe, \
+         but it injected into `name` {name_posts} times (a catalog run is 100+)"
+    );
+}
+
+/// Regression (a): a sink that stores only short values keeps the long
+/// bracketed marker out, so the field passes Stage 0 only on the short numeric
+/// fallback marker. The store-probe must try that fallback too, or the field is
+/// wrongly judged non-storing and its catalog skipped.
+#[tokio::test]
+async fn sxss_store_probe_uses_the_numeric_marker_fallback_for_length_capped_sinks() {
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
+    use tokio::time::{Duration, sleep};
+
+    let store: Arc<StdMutex<Vec<String>>> = Arc::default();
+    // POSTs that inject a non-seed value into `c` — i.e. the field's catalog is
+    // running rather than being skipped after the probe.
+    let c_injections = Arc::new(AtomicUsize::new(0));
+    let write = store.clone();
+    let read = store.clone();
+    let c_inj = c_injections.clone();
+    let app = Router::new()
+        .route(
+            "/save",
+            axum::routing::post(move |body: String| {
+                let store = write.clone();
+                let c_inj = c_inj.clone();
+                async move {
+                    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                        if k == "c" {
+                            if v != "x" {
+                                c_inj.fetch_add(1, AtOrd::Relaxed);
+                            }
+                            // Length-capped sink: the ~36-char bracketed marker
+                            // and the long payloads never fit; the 8-char
+                            // numeric fallback marker does.
+                            if v.len() <= 10 {
+                                store.lock().unwrap().push(v.into_owned());
+                            }
+                        }
+                    }
+                    Html("saved")
+                }
+            }),
+        )
+        .route(
+            "/view",
+            get(move || {
+                let store = read.clone();
+                async move {
+                    Html(format!(
+                        "<html><body>{}</body></html>",
+                        store.lock().unwrap().join("<hr>")
+                    ))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+    target.workers = 1;
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        form_action_url: Some(format!("http://{addr}/save")),
+        form_origin_url: Some(format!("http://{addr}/page")),
+        ..Param::new("c".to_string(), "x".to_string(), Location::Body)
+    });
+    let mut args = integration_scan_args(false);
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/view"));
+    args.max_payloads_per_param = 40;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    // The field stores short values, so the numeric fallback credits it and its
+    // catalog runs. Without the fallback the probe sees only the too-long
+    // bracketed marker, judges it non-storing, and skips (a handful of probe
+    // injections at most).
+    let injections = c_injections.load(AtOrd::Relaxed);
+    assert!(
+        injections > 20,
+        "the length-capped field must be scanned via the numeric-marker fallback, \
+         but only {injections} payloads reached `c` (a skipped catalog is a few)"
+    );
+}
+
+/// Regression (b): a write-behind sink (the value is stored but visible on the
+/// retrieval page only after a short delay) must still be found. The store-probe
+/// window must be wide enough to observe the delayed store, and — because the
+/// store is not synchronous — the per-payload retrieval retries must be kept so
+/// a delayed payload is not missed.
+#[tokio::test]
+async fn sxss_finds_a_write_behind_store() {
+    use axum::{Router, response::Html, routing::get};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
+    use tokio::time::{Duration, sleep};
+
+    // Each stored item becomes visible on /view only ~350 ms after it was
+    // written — a write-behind sink.
+    let store: Arc<StdMutex<Vec<(Instant, String)>>> = Arc::default();
+    let write = store.clone();
+    let read = store.clone();
+    let app = Router::new()
+        .route(
+            "/save",
+            axum::routing::post(move |body: String| {
+                let store = write.clone();
+                async move {
+                    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                        if k == "c" && v != "x" {
+                            store.lock().unwrap().push((Instant::now(), v.into_owned()));
+                        }
+                    }
+                    Html("saved")
+                }
+            }),
+        )
+        .route(
+            "/view",
+            get(move || {
+                let store = read.clone();
+                async move {
+                    let now = Instant::now();
+                    let visible: String = store
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(t, _)| now.duration_since(*t) >= Duration::from_millis(350))
+                        .map(|(_, v)| v.clone())
+                        .collect::<Vec<_>>()
+                        .join("<hr>");
+                    Html(format!("<html><body>{visible}</body></html>"))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/page")).unwrap();
+    target.workers = 1;
+    target.reflection_params.push(Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        form_action_url: Some(format!("http://{addr}/save")),
+        form_origin_url: Some(format!("http://{addr}/page")),
+        ..Param::new("c".to_string(), "x".to_string(), Location::Body)
+    });
+    let mut args = integration_scan_args(false);
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{addr}/view"));
+    // Default retry ramp (backoff 500 ms) covers the 350 ms write-behind delay.
+    args.sxss_retries = 3;
+    args.max_payloads_per_param = 40;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+    server.abort();
+
+    assert!(
+        results
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.param == "c" && r.result_type == FindingType::Verified),
+        "a write-behind store must still be verified: the store-probe window must \
+         observe the delayed store and the per-payload retries must be kept"
+    );
+}
+
+/// `--deep-scan` keeps one finding per reflecting payload, batched per
+/// parameter until the parameter finishes. A `--limit` (the server/MCP findings
+/// ceiling) only counted flushed findings, so every concurrent parameter ran
+/// its whole catalog past the limit — thousands of findings, each with 64 KiB
+/// of evidence, from one echo-everything target.
+#[tokio::test]
+async fn test_deep_scan_limit_bounds_findings_across_concurrent_params() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+
+    const LIMIT: usize = 20;
+    const WORKERS: usize = 4;
+    let handler = |Query(q): Query<HashMap<String, String>>| async move {
+        let mut body = String::from("<html><body>");
+        for v in q.values() {
+            body.push_str(v);
+        }
+        body.push_str("</body></html>");
+        Html(body)
+    };
+    let addr = spawn_regression_app(Router::new().route("/", get(handler))).await;
+
+    let names = ["a", "b", "c", "d"];
+    let url = format!("http://{}/?a=1&b=1&c=1&d=1", addr);
+    let mut target = parse_target(&url).expect("parse_target");
+    target.workers = WORKERS;
+    target.reflection_params = names
+        .iter()
+        .map(|n| Param {
+            injection_context: Some(InjectionContext::Html(None)),
+            marker_echoed: true,
+            ..Param::new(n.to_string(), "1".to_string(), Location::Query)
+        })
+        .collect();
+
+    let mut args = integration_scan_args(false);
+    args.deep_scan = true;
+    args.workers = WORKERS;
+    args.limit = Some(LIMIT);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    run_scanning(
+        &target,
+        Arc::new(args),
+        ScanRunHandles::new(results.clone(), Arc::new(AtomicUsize::new(0))),
+    )
+    .await;
+
+    let n = results.lock().await.len();
+    // Unlimited, this target yields thousands; the post-scan collapse may
+    // fold a few, so only require that the scan produced findings at all.
+    assert!(n > 0, "sanity: the echo target must produce findings");
+    // Overshoot is what was already in flight when the limit hit — a chunk
+    // per parameter. Unbounded, this target yields thousands; keep the
+    // ceiling loose so a slow runner cannot flake it.
+    assert!(
+        n <= LIMIT * 5,
+        "deep_scan ran past --limit {LIMIT}: {n} findings"
+    );
+}
+
+/// The findings tally behind `--limit`'s early stop, the deep-scan cap, the
+/// ticker and REST/MCP `findings_so_far` counts only findings
+/// `--min-confidence` keeps: `--limit 1 --min-confidence high` must not stop
+/// on an `R` it will then drop. Ungraded `I` findings still count.
+#[test]
+fn count_matching_results_skips_findings_min_confidence_drops() {
+    use crate::scanning::result::Confidence;
+    let graded = |t: FindingType, c: Option<Confidence>| {
+        let mut r = crate::scanning::result::Result::builder(t).build();
+        r.confidence = c;
+        r
+    };
+    let results = vec![
+        graded(FindingType::Reflected, Some(Confidence::Low)),
+        graded(FindingType::Verified, Some(Confidence::Low)),
+        graded(FindingType::Verified, Some(Confidence::High)),
+        graded(FindingType::Informational, None),
+    ];
+    assert_eq!(count_matching_results(&results, "ALL", None), 4);
+    assert_eq!(count_matching_results(&results, "ALL", Some("low")), 4);
+    assert_eq!(count_matching_results(&results, "ALL", Some("high")), 2);
+    assert_eq!(count_matching_results(&results, "V", Some("high")), 1);
+    assert_eq!(count_matching_results(&results, "R", Some("high")), 0);
+}
+
+/// Collapsing a dropped `R` under `--min-confidence high` must not decrement
+/// a tally that never counted it (the counter is unsigned).
+#[tokio::test]
+async fn collapse_under_min_confidence_does_not_underflow_the_tally() {
+    use crate::scanning::result::Confidence;
+    let mut v = make_typed_param_result(FindingType::Verified, "q", "inHTML");
+    v.confidence = Some(Confidence::High);
+    let mut r = make_typed_param_result(FindingType::Reflected, "q", "inHTML");
+    r.confidence = Some(Confidence::Low);
+    let batch = vec![v, r];
+    let counted = count_matching_results(&batch, "ALL", Some("high"));
+    assert_eq!(counted, 1);
+    let results = std::sync::Arc::new(tokio::sync::Mutex::new(batch));
+    let findings_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(counted));
+    let target = parse_target("https://example.com/?x=1").unwrap();
+    collapse_target_results(&results, &findings_count, "ALL", Some("high"), &target).await;
+    assert_eq!(results.lock().await.len(), 1, "the redundant R collapses");
+    assert_eq!(findings_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// Every parameter's Stage-0 probe re-runs the AST pass over the same page, so
+/// one page-level sink is recorded once per parameter — and the report folds
+/// those into a single finding (`dedupe_ast_results`). The tally `--limit`
+/// stops on must count the sink once too: it counted it per parameter, so
+/// `--limit 2` on a page with one sink and three parameters stopped the scan
+/// (target `incomplete`, `--state-file` retry) with one finding reported.
+#[tokio::test]
+async fn test_run_scanning_tally_counts_a_page_sink_once_across_params() {
+    use axum::{Router, response::Html, routing::get};
+
+    let page = "<html><body><div id=o></div><script>\
+                document.getElementById('o').innerHTML = location.hash.slice(1);\
+                </script></body></html>";
+    let addr =
+        spawn_regression_app(Router::new().route("/", get(move || async move { Html(page) })))
+            .await;
+
+    let mut target = parse_target(&format!("http://{addr}/?a=1&b=2&c=3")).expect("parse_target");
+    target.reflection_params = ["a", "b", "c"]
+        .iter()
+        .map(|n| Param::new(n.to_string(), "1".to_string(), Location::Query))
+        .collect();
+
+    let mut raw_args = integration_scan_args(false);
+    raw_args.skip_ast_analysis = false;
+    raw_args.limit = Some(2);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let findings_count = Arc::new(AtomicUsize::new(0));
+    let report = run_scanning(
+        &target,
+        Arc::new(raw_args),
+        ScanRunHandles::new(results.clone(), findings_count.clone()),
+    )
+    .await;
+
+    let reported = crate::cmd::scan::dedupe_ast_results(results.lock().await.clone()).len();
+    assert_eq!(reported, 1, "fixture: one page-level sink");
+    assert_eq!(
+        findings_count.load(Ordering::Relaxed),
+        reported,
+        "the tally must count what the report keeps"
+    );
+    assert!(
+        !report.limit_stopped,
+        "one distinct finding cannot reach --limit 2"
+    );
+}
+
+/// `--limit` caps what the report displays, and `--only-poc` decides what it
+/// displays — so a finding `--only-poc` hides must not count toward the stop.
+/// `--only-poc v --limit 1` used to stop on the first `R`, then report nothing
+/// and exit 0 with the catalog untested.
+#[tokio::test]
+async fn test_run_scanning_limit_ignores_findings_only_poc_hides() {
+    use axum::{Router, extract::Query, response::Html, routing::get};
+    use std::collections::HashMap;
+
+    let handler = |Query(q): Query<HashMap<String, String>>| async move {
+        let v = q.get("victim").cloned().unwrap_or_default();
+        let escaped = v
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        Html(format!("<html><body><div>{escaped}</div></body></html>"))
+    };
+    let addr = spawn_regression_app(Router::new().route("/", get(handler))).await;
+
+    let mut target = parse_target(&format!("http://{addr}/?victim=a")).expect("parse_target");
+    target.reflection_params = vec![Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        ..Param::new("victim".to_string(), "a".to_string(), Location::Query)
+    }];
+
+    let mut raw_args = integration_scan_args(false);
+    raw_args.limit = Some(1);
+    raw_args.only_poc = vec!["v".to_string()];
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let findings_count = Arc::new(AtomicUsize::new(0));
+    let report = run_scanning(
+        &target,
+        Arc::new(raw_args),
+        ScanRunHandles::new(results.clone(), findings_count.clone()),
+    )
+    .await;
+
+    assert!(
+        results
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.result_type == FindingType::Reflected),
+        "fixture: the escaped echo records an R"
+    );
+    assert_eq!(findings_count.load(Ordering::Relaxed), 0);
+    assert!(
+        !report.limit_stopped,
+        "an R that --only-poc v hides must not stop the scan"
+    );
+}

@@ -1,0 +1,207 @@
+package pivot
+
+import (
+	"fmt"
+
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/chainreactors/malice-network/client/command/generic"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+func Commands(con *core.Console) []*cobra.Command {
+	remCmd := &cobra.Command{
+		Use:   consts.CommandRemDial + " [pipeline] [args]",
+		Short: "Run rem on the implant",
+		Long:  "Start or control a REM agent through the active implant using a pipeline and REM arguments.",
+		Example: `~~~
+rem_dial rem-main start --port 1080
+~~~`,
+		Args: cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return RemDialCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleRemDial,
+		},
+	}
+
+	common.BindArgCompletions(remCmd, nil, common.RemPipelineCompleter(con))
+
+	forwardCmd := &cobra.Command{
+		Use:   consts.CommandPortForward + " [pipeline]",
+		Short: "Forward local port to remote target",
+		Long:  `Forward local port to remote target through the implant`,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return ForwardCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleRemDial,
+		},
+		Example: `Forward local port to remote target:
+~~~
+portfwd rem_default --port 8080 --target 192.168.1.1:80
+~~~`,
+	}
+	common.BindArgCompletions(forwardCmd, nil, common.RemPipelineCompleter(con))
+	common.BindFlag(forwardCmd, func(f *pflag.FlagSet) {
+		f.StringP("port", "p", "", "Local port to listen on")
+		f.StringP("target", "t", "", "Remote target address (host:port)")
+	})
+
+	reverseCmd := &cobra.Command{
+		Use:   consts.CommandReverse + " [pipeline]",
+		Short: "Reverse port forward from remote to local",
+		Long:  `Create a reverse port forward from remote target to local through the implant`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return ReverseCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleRemDial,
+		},
+		Example: `Create reverse port forward:
+~~~
+reverse rem_default --port 12345
+~~~`,
+	}
+	common.BindArgCompletions(reverseCmd, nil, common.RemPipelineCompleter(con))
+	common.BindFlag(reverseCmd, common.ProxyFlagSet)
+
+	proxyCmd := &cobra.Command{
+		Use:   consts.CommandProxy + " [pipeline]",
+		Short: "Create a proxy through the implant",
+		Long:  `Create a proxy server through the implant with optional authentication`,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return ProxyCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleRemDial,
+		},
+		Example: `Create a proxy server:
+~~~
+proxy rem_default --port 8080
+~~~`,
+	}
+	common.BindArgCompletions(proxyCmd, nil, common.RemPipelineCompleter(con))
+	common.BindFlag(proxyCmd, common.ProxyFlagSet)
+
+	rportforwardCmd := &cobra.Command{
+		Use:   consts.CommandReversePortForward + " [pipeline]",
+		Short: "Remote port forward through the implant",
+		Long:  `Create a remote port forward through the implant to connect back to a local port`,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return ReversePortForwardCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleRemDial,
+		},
+		Example: `Create remote port forward:
+~~~
+rportfwd rem_default --port 8080 --remote 192.168.1.1:80
+~~~`,
+	}
+
+	common.BindArgCompletions(rportforwardCmd, nil, common.RemPipelineCompleter(con))
+	common.BindFlag(rportforwardCmd, func(f *pflag.FlagSet) {
+		f.StringP("port", "p", "", "Local port to listen on")
+		f.StringP("remote", "r", "", "implant's address to connect to (host:port)")
+	})
+
+	rportforwardLocalCmd := &cobra.Command{
+		Use:   consts.CommandReversePortForwardLocal + " [pipeline] [agent]",
+		Short: "Remote port forward through the implant to client",
+		Long:  "Ask a REM agent to connect an implant-side address back to a port exposed by this client.",
+		Example: `~~~
+rportfwd_local rem-main uDM0BgG6 --port 8080 --remote 127.0.0.1:80
+~~~`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return RPortForwardLocalCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleRemDial,
+		},
+	}
+
+	common.BindArgCompletions(rportforwardLocalCmd, nil,
+		common.RemPipelineCompleter(con),
+		common.RemAgentCompleter(con),
+	)
+	common.BindFlag(rportforwardLocalCmd, func(f *pflag.FlagSet) {
+		f.StringP("port", "p", "", "Local port to listen on")
+		f.StringP("remote", "r", "", "implant's internal address to connect to (host:port)")
+	})
+	rportforwardLocalCmd.MarkFlagRequired("remote")
+
+	portforwardLocalCmd := &cobra.Command{
+		Use:   consts.CommandPortForwardLocal + " [pipeline] [agent]",
+		Short: "Forward local port to remote target",
+		Long:  "Forward a client-side port through the selected REM agent to a local target address.",
+		Example: `~~~
+portfwd_local rem-main uDM0BgG6 --port 8080 --local 127.0.0.1:80
+~~~`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return PortForwardLocalCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleRemDial,
+		},
+	}
+	common.BindArgCompletions(portforwardLocalCmd, nil,
+		common.RemPipelineCompleter(con),
+		common.RemAgentCompleter(con))
+	common.BindFlag(portforwardLocalCmd, func(f *pflag.FlagSet) {
+		f.StringP("port", "p", "", "Local port to listen on")
+		f.StringP("local", "l", "", "Local address to connect to (host:port)")
+	})
+	return []*cobra.Command{
+		remCmd,
+		forwardCmd,
+		reverseCmd,
+		proxyCmd,
+		rportforwardCmd,
+		portforwardLocalCmd,
+		rportforwardLocalCmd,
+	}
+}
+
+func Register(con *core.Console) {
+	// Register all command functions
+	con.RegisterImplantFunc(
+		consts.ModuleRemDial,
+		RemDial,
+		"",
+		nil,
+		func(content *clientpb.TaskContext) (interface{}, error) {
+			resp, err := output.ParseResponse(content)
+			if err != nil {
+				return nil, err
+			}
+			return fmt.Sprintf("rem agent id: %s", resp), nil
+		},
+		nil,
+	)
+	con.AddCommandFuncHelper(
+		consts.ModuleRemDial,
+		consts.ModuleRemDial,
+		consts.ModuleRemDial+`(active(),"pipeline1",{"-p","1080"})`,
+		[]string{
+			"session: special session",
+			"pipeline: pipeline name",
+			"args: command args",
+		},
+		[]string{"task"},
+	)
+
+	con.RegisterServerFunc("rem_link", GetRemLink, nil)
+
+	con.RegisterServerFunc("pivots", generic.ListPivot, nil)
+}

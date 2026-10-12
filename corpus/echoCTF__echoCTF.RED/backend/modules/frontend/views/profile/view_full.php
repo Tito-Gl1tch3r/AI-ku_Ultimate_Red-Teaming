@@ -1,0 +1,159 @@
+<?php
+
+use yii\helpers\Html;
+use yii\helpers\Url;
+use yii\widgets\DetailView;
+use kartik\tabs\TabsX;
+
+/* @var $this yii\web\View */
+/* @var $model app\modules\frontend\models\Profile */
+
+$this->title = "View Profile for " . Html::encode($model->owner->username) . " profile: " . $model->id;
+$this->params['breadcrumbs'][] = ['label' => Yii::t('app', 'Profiles'), 'url' => ['index']];
+$this->params['breadcrumbs'][] = $this->title;
+$this->params['jumpto'] = \app\widgets\JumpToWidget::widget([
+    'name' => 'player_jump',
+    'placeholder' => '🔍 Jump to player...',
+    'sourceUrl' => ['/frontend/player/ajax-search'],
+    'redirectUrl' => ['/frontend/profile/view-full'],
+    'idField' => 'pid',
+]);
+\yii\web\YiiAsset::register($this);
+?>
+<section class="container">
+  <div class="profile-view-full">
+    <!-- Begin .page-heading -->
+    <p></p>
+    <?= $this->render('_heading', ['model' => $model]); ?>
+    <div class="row">
+      <div class="col-md-4">
+        <div class="panel">
+          <div class="panel-heading">
+            <?= $this->render('_quick_actions', ['model' => $model]); ?>
+          </div>
+        </div>
+        <?= $this->render('_player_details', ['model' => $model]); ?>
+        <?= $this->render('_player_memcache_details', ['model' => $model]); ?>
+        <?= $this->render('_player_counters_details', ['model' => $model]); ?>
+        <?= $this->render('_player_date_details', ['model' => $model]); ?>
+        <?= $this->render('_player_meta_details', ['model' => $model]); ?>
+        <?= $this->render('_player_relations', ['model' => $model]); ?>
+        <?= $this->render('_player_badges', ['model' => $model]); ?>
+      </div>
+      <div class="col-md-8">
+        <div class="tab-block">
+          <?php
+          echo TabsX::widget([
+            'position' => TabsX::POS_ABOVE,
+            'align' => TabsX::ALIGN_LEFT,
+            'encodeLabels' => false,
+            'pluginOptions' => [
+              'enableCache' => false,
+              'cacheTimeout' => 10000
+            ],
+            'items' => [
+              [
+                'label' => '<i class="fas fa-file-contract" data-toggle="tooltip" data-placement="top" title="Activity Stream"></i>',
+                'content' => $this->render('_details_tab', ['model' => $model,'abuserModel'=>$abuserModel]),
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'options' => ['id' => 'details-tab'],
+                'active' => true,
+              ],
+              [
+                'label' => '<i class="fas fa-file-contract" data-toggle="tooltip" data-placement="top" title="Activity Stream"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['stream-lag', 'id' => $model->id])],
+                'options' => ['id' => 'stream-tab'],
+              ],
+              [
+                'label' => '<i class="fas fa-calendar" data-toggle="tooltip" data-placement="top" title="Monthly Scores"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['score-monthly', 'id' => $model->id])],
+                'options' => ['id' => 'score-monthly-tab'],
+                'visible' => count($model->owner->monthlyScores) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-spinner" data-placement="top" title="Target Progress"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['target-progress', 'id' => $model->id])],
+                'options' => ['id' => 'target-progress-tab'],
+                'visible' => count($model->owner->progressTargets) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-skull-crossbones" data-toggle="tooltip" data-placement="top" title="Headshots"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['headshots', 'id' => $model->id])],
+                'options' => ['id' => 'headshots-tab'],
+                'visible' => count($model->owner->headshots) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-book-dead" data-toggle="tooltip" data-placement="top" title="Submitted Writeups"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['writeups', 'id' => $model->id])],
+                'options' => ['id' => 'writeups-tab'],
+                'visible' => count($model->owner->writeups) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-notes-medical" data-toggle="tooltip" data-placement="top" title="Activated Writeups"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['activated-writeups', 'id' => $model->id])],
+                'options' => ['id' => 'activated-writeups-tab'],
+                'visible' => count($model->owner->playerTargetHelps) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-comment-medical" data-toggle="tooltip" data-placement="top" title="Rated Writeups"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['writeup-rating', 'id' => $model->id])],
+                'options' => ['id' => 'writeup-rating-tab'],
+                'visible' => count($model->owner->writeupRatings) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-tasks" data-toggle="tooltip" data-placement="top" title="Challenge Solves"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['solves', 'id' => $model->id])],
+                'options' => ['id' => 'solves-tab'],
+                'visible' => count($model->owner->challengeSolvers) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-shield" data-toggle="tooltip" data-placement="top" title="VPN History"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['vpn-history', 'id' => $model->id])],
+                'options' => ['id' => 'vpn-history-tab'],
+                'visible' => count($model->owner->vpnHistory) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-sync" data-toggle="tooltip" data-placement="top" title="Spin History"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['spin-history', 'id' => $model->id])],
+                'options' => ['id' => 'spin-history-tab'],
+                'visible' => count($model->owner->spinHistory) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-exclamation-triangle" data-toggle="tooltip" data-placement="top" title="Notifications"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['notifications', 'id' => $model->id])],
+                'options' => ['id' => 'notifications-tab'],
+                'visible' => count($model->owner->notifications) > 0
+              ],
+              [
+                'label' => '<i class="fa fa-shield-virus" data-toggle="tooltip" data-placement="top" title="VPN History Duplicates"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['vpn-history-duplicates', 'id' => $model->id])],
+                'options' => ['id' => 'vpn-history-duplicates-tab'],
+                'visible' => count($model->owner->vpnHistory) > 0
+              ],
+              [
+                'label' => '<i class="fas fa-bullhorn" data-toggle="tooltip" data-placement="top" title="Abuses"></i>',
+                'headerOptions' => ['style' => 'font-weight:bold'],
+                'linkOptions' => ['data-url' => Url::to(['abusers', 'id' => $model->id])],
+                'options' => ['id' => 'abusers-tab'],
+                'visible' => count($model->owner->abusers) > 0
+              ],
+            ],
+          ]);
+          ?>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

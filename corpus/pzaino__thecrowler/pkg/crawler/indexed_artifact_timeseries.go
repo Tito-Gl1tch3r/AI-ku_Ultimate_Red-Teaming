@@ -1,0 +1,197 @@
+// Copyright 2026 Paolo Fabio Zaino
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+
+package crawler
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	cmn "github.com/pzaino/thecrowler/pkg/common"
+	cfg "github.com/pzaino/thecrowler/pkg/config"
+	cdb "github.com/pzaino/thecrowler/pkg/database"
+	tse "github.com/pzaino/thecrowler/pkg/timeseries"
+)
+
+type crawlerIndexedArtifactScopeResolver struct{ tx *sql.Tx }
+
+func (r crawlerIndexedArtifactScopeResolver) ResolveIndexedArtifactScopes(input tse.IndexedArtifactInput) ([]cdb.TimeSeriesScope, error) {
+	if r.tx == nil {
+		return nil, fmt.Errorf("indexed-artifact scope transaction is nil")
+	}
+	rows, err := r.tx.Query(`
+		SELECT DISTINCT ssi.source_id,
+		       sisi.source_information_seed_id, sisi.information_seed_id, em.entity_id
+		FROM SourceSearchIndex ssi
+		LEFT JOIN SourceInformationSeedIndex sisi
+		  ON sisi.source_id = ssi.source_id AND sisi.deleted_at IS NULL
+		LEFT JOIN EntityMemberships em
+		  ON em.object_type = $2 AND em.object_id = $3
+		WHERE ssi.index_id = $1`, input.IndexID, input.ObjectType, input.ObjectID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve indexed-artifact source links: %w", err)
+	}
+	defer rows.Close()
+	scopes := []cdb.TimeSeriesScope{}
+	for rows.Next() {
+		var sourceID uint64
+		var sourceSeedID, seedID, entityID sql.NullInt64
+		if err = rows.Scan(&sourceID, &sourceSeedID, &seedID, &entityID); err != nil {
+			return nil, err
+		}
+		indexID := input.IndexID
+		scope := cdb.TimeSeriesScope{IndexID: &indexID, SourceID: &sourceID}
+		if sourceSeedID.Valid {
+			value := uint64(sourceSeedID.Int64)
+			scope.SourceInformationSeedID = &value
+		}
+		if seedID.Valid {
+			value := uint64(seedID.Int64)
+			scope.InformationSeedID = &value
+		}
+		if entityID.Valid {
+			value := uint64(entityID.Int64)
+			scope.EntityID = &value
+		}
+		scopes = append(scopes, scope)
+	}
+	return scopes, rows.Err()
+}
+
+func newCrawlerIndexedArtifactEmitter(tx *sql.Tx, currCfg *cfg.Config) *tse.Emitter {
+	if currCfg == nil {
+		return nil
+	}
+	return &tse.Emitter{
+		Repository:     cdb.TransactionTimeSeriesRepository{Tx: tx, DBMS: cdb.DBPostgresStr},
+		ArtifactScopes: crawlerIndexedArtifactScopeResolver{tx: tx},
+		Cardinality:    crawlerTimeSeriesCardinalityGuard{tx: tx},
+		Config:         &currCfg.TimeSeries,
+		Logger:         crawlerTimeSeriesLogger{},
+	}
+}
+
+func emitIndexedArtifactsStandalone(
+	db cdb.Handler,
+	currCfg *cfg.Config,
+	inputs []tse.IndexedArtifactInput,
+) (retErr error) {
+	if db == nil ||
+		currCfg == nil ||
+		!currCfg.TimeSeries.Enabled ||
+		len(inputs) == 0 {
+		return nil
+	}
+
+	logger := crawlerTimeSeriesLogger{}
+	txCtx, cancelTx := cdb.TransactionContext(context.Background(), currCfg)
+	defer cancelTx()
+	tx, err := db.BeginTx(txCtx, nil)
+	if err != nil {
+		return cdb.NormalizeTransactionError(txCtx, fmt.Errorf("starting indexed-artifact time-series transaction: %w", err))
+	}
+	logger.Debugf("standalone emission started artifacts=%d", len(inputs))
+
+	committed := false
+	defer func() {
+		if !committed {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil &&
+				!errors.Is(rollbackErr, sql.ErrTxDone) {
+				cmn.DebugMsg(
+					cmn.DbgLvlError,
+					"rolling back indexed-artifact time-series transaction: %v",
+					rollbackErr,
+				)
+			}
+		}
+		retErr = cdb.NormalizeTransactionError(txCtx, retErr)
+	}()
+
+	emitter := newCrawlerIndexedArtifactEmitter(tx, currCfg)
+	snapshot, err := emitter.LoadEnabledMetricSnapshot()
+	if err != nil {
+		return err
+	}
+
+	for _, input := range inputs {
+		if err := emitter.EmitIndexedArtifact(snapshot, input); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf(
+			"committing indexed-artifact time-series transaction: %w",
+			err,
+		)
+	}
+
+	committed = true
+	logger.Debugf("standalone emission committed artifacts=%d", len(inputs))
+	return nil
+}
+
+func decodeArtifactDetails(raw []byte) map[string]interface{} {
+	if len(raw) == 0 {
+		return nil
+	}
+	var details map[string]interface{}
+	if err := json.Unmarshal(raw, &details); err != nil {
+		return nil
+	}
+	return details
+}
+
+func emitPersistedArtifact(tx *sql.Tx, currCfg *cfg.Config, snapshot *tse.EnabledMetricSnapshot, input tse.IndexedArtifactInput) error {
+	if tx == nil || currCfg == nil || !currCfg.TimeSeries.Enabled {
+		return nil
+	}
+	if input.ObjectType != "" && input.ObjectID != 0 {
+		attributes, err := loadObjectAttributeSiblings(tx, input.ObjectID, input.ObjectType, "")
+		if err != nil {
+			return err
+		}
+		input.NormalizedAttributes = attributes
+		input.AttributePaths = configuredAttributePaths(currCfg, input.ObjectType)
+	}
+	return newCrawlerIndexedArtifactEmitter(tx, currCfg).EmitIndexedArtifact(snapshot, input)
+}
+
+func configuredAttributePaths(currCfg *cfg.Config, objectType string) map[string]string {
+	paths := map[string]string{}
+	if currCfg == nil {
+		return paths
+	}
+	for _, definition := range attributeDefinitionsForObject(currCfg, objectType) {
+		paths[definition.Key] = definition.Path
+	}
+	return paths
+}
+
+func attributeDefinitionsForObject(currCfg *cfg.Config, objectType string) []cfg.AttributeDefinition {
+	if currCfg == nil {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(objectType)) {
+	case "webobject":
+		return currCfg.AttributesIndexing.WebObject
+	case "httpinfo":
+		return currCfg.AttributesIndexing.HTTPInfo
+	case "netinfo":
+		return currCfg.AttributesIndexing.NetInfo
+	default:
+		return nil
+	}
+}
+
+func utcNowPointer() *time.Time {
+	value := time.Now().UTC()
+	return &value
+}

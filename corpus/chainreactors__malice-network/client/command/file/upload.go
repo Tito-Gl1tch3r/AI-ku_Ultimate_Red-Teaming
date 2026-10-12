@@ -1,0 +1,70 @@
+package file
+
+import (
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	"github.com/chainreactors/malice-network/client/core"
+	"os"
+	"path/filepath"
+	"strconv"
+
+	"github.com/chainreactors/IoM-go/proto/services/clientrpc"
+	"github.com/spf13/cobra"
+)
+
+func UploadCmd(cmd *cobra.Command, con *core.Console) error {
+	path := cmd.Flags().Arg(0)
+	target := cmd.Flags().Arg(1)
+	priv, _ := cmd.Flags().GetString("priv")
+	hidden, _ := cmd.Flags().GetBool("hidden")
+
+	task, err := Upload(con.Rpc, con.GetInteractive(), path, target, priv, hidden)
+	if err != nil {
+		return err
+	}
+
+	con.GetInteractive().Console(task, string(*con.App.Shell().Line()))
+	return nil
+}
+
+func Upload(rpc clientrpc.MaliceRPCClient, session *client.Session, path string, target string, priv string, hidden bool) (*clientpb.Task, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	value, err := strconv.ParseUint(priv, 8, 32)
+	if err != nil {
+		return nil, err
+	}
+	task, err := rpc.Upload(session.Context(), &implantpb.UploadRequest{
+		Name:   filepath.Base(path),
+		Target: target,
+		Priv:   uint32(value),
+		Data:   data,
+		Hidden: hidden,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return task, err
+}
+
+func UploadRaw(rpc clientrpc.MaliceRPCClient, session *client.Session, data string, target string, priv string, hidden bool) (*clientpb.Task, error) {
+	path := "fake_path"
+	value, err := strconv.ParseUint(priv, 8, 32)
+	if err != nil {
+		return nil, err
+	}
+	task, err := rpc.Upload(session.Context(), &implantpb.UploadRequest{
+		Name:   filepath.Base(path),
+		Target: target,
+		Priv:   uint32(value),
+		Data:   []byte(data),
+		Hidden: hidden,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return task, err
+}

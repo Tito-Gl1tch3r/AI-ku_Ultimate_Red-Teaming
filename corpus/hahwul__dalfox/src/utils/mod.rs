@@ -1,0 +1,277 @@
+/*!
+Utility helpers for Dalfox.
+
+This module re-exports commonly used helpers so other modules can simply
+`use crate::utils::*;` or import the specific functions directly.
+*/
+
+pub mod banner;
+pub mod fs;
+pub mod html;
+pub mod http;
+pub mod log;
+pub mod rate_limit;
+pub mod scan_id;
+pub mod shimmer;
+pub mod term;
+pub(crate) mod xml;
+
+/// Largest permit count `tokio::sync::Semaphore::new` accepts; it asserts
+/// above this. Taken from tokio's own public constant rather than hand-copying
+/// its `usize::MAX >> 3` definition, which is a private detail tokio is free to
+/// change — a stale local copy would make this clamp itself the panic.
+pub(crate) const MAX_SEMAPHORE_PERMITS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
+/// Clamp a configured concurrency into the range `Semaphore::new` accepts.
+///
+/// Concurrency knobs (`--workers`, `--max-concurrent-targets`) reach a
+/// semaphore from four surfaces: the CLI, a config file, the REST
+/// `ScanOptions`, and MCP. Only the CLI path runs `validate_numeric_args`, and
+/// even there `max_concurrent_targets` is checked for zero but has no upper
+/// bound — so an absurd value used to reach `Semaphore::new` and panic the
+/// scanner on user input.
+///
+/// Both ends matter, and the lower one is the more damaging: `Semaphore::new(0)`
+/// is not a slow scan, it is a permanent deadlock — every worker blocks on
+/// `acquire()` forever and the scan hangs with no output. A helper whose whole
+/// point is holding regardless of which validator ran must therefore floor at 1
+/// as well as cap. Anything near the ceiling is already "effectively
+/// unlimited", so no realistic scan changes.
+pub(crate) fn semaphore_permits(requested: usize) -> usize {
+    requested.clamp(1, MAX_SEMAPHORE_PERMITS)
+}
+
+// Re-export banner helpers at `crate::utils::*`
+pub use banner::print_banner_once;
+// Re-export scan_id helpers at `crate::utils::*`
+pub(crate) use scan_id::{make_scan_id, make_unique_scan_id, short_scan_id};
+// Re-export http helpers at `crate::utils::*`
+pub(crate) use http::{
+    apply_header_overrides, build_body_request_base, build_preflight_request, build_request,
+    build_request_with_cookie, compose_cookie_header_excluding, content_type_is_never_markup,
+    content_type_primary, is_htmlish_content_type, is_javascript_content_type, is_xml_content_type,
+    is_xss_scannable_content_type, response_has_markup_document, send_with_retry,
+};
+
+// Re-export remote payload/wordlist getters at `crate::utils::*`
+pub use crate::payload::get_remote_payloads;
+
+/// Stable per-finding identity fingerprint for SARIF `partialFingerprints`
+/// and any other dedup consumer that compares results across scan runs.
+///
+/// Built from the *vulnerability* identity, not the *payload variant*: two
+/// payloads that surface the same logical issue (e.g. an `R` and a `V` for
+/// the same parameter and injection context) hash to the same fingerprint.
+/// Re-running the scan against an unchanged target yields the same value
+/// — that's the property SARIF consumers rely on to dedupe re-scans.
+///
+/// Inputs are joined into a single string before hashing so a future
+/// reordering of fields can't silently change the output for existing
+/// findings.
+///
+/// Returns a 16-char lowercase hex string (truncated SHA-256). 64 bits
+/// is plenty of collision resistance for finding identity within a run,
+/// and it keeps SARIF output compact.
+pub(crate) fn stable_finding_fingerprint(
+    target_url: &str,
+    param: &str,
+    inject_type: &str,
+    cwe: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!(
+        "v1|{}|{}|{}|{}",
+        target_identity_key_owned(target_url),
+        param,
+        inject_type,
+        cwe
+    ));
+    let digest = hasher.finalize();
+    let hex_full = hex::encode(digest);
+    hex_full[..16].to_string()
+}
+
+/// Owned version of the identity key used by `finding_belongs_to_target`,
+/// suitable for hashing. Mirrors that helper's logic: strip query if
+/// present, else key by parent path. Lives next to the matching helper
+/// so the two stay in sync.
+fn target_identity_key_owned(url: &str) -> String {
+    let no_query = url.split('?').next().unwrap_or(url);
+    if url.contains('?') {
+        return no_query.to_string();
+    }
+    match no_query.rfind('/') {
+        Some(i) => no_query[..=i].to_string(),
+        None => no_query.to_string(),
+    }
+}
+
+/// Drop a leading `http://` / `https://`, leaving anything else untouched.
+fn strip_url_scheme(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+}
+
+/// Decide whether a finding URL was produced by scanning a given target URL.
+///
+/// Used both by `collapse_redundant_reflected` (dedup) and the
+/// `target_summary` attribution in CLI output, so the two stay in sync.
+/// A naive `starts_with(target_url)` fails because payload variants can
+/// shape the finding URL in three different ways:
+///
+///   - **Query/cookie/header/body injection**: payload mutates the query
+///     string only — finding URL has the same path as the target, possibly
+///     a different query.
+///   - **Path injection**: payload replaces a path segment — finding URL
+///     has the same parent path as the target but a different last segment.
+///   - **No-mutation injection** (header/cookie/body without query in the
+///     target): finding URL is byte-identical to the target.
+///
+/// We try each strategy in order. Trade-off: two targets that share the
+/// same path-without-query (e.g. `/search?q=a` vs `/search?id=b`) or the
+/// same parent path for path injection (e.g. `/api/v1/foo` vs
+/// `/api/v1/bar`) will both match a single finding. This mirrors the
+/// pre-existing prefix-match behavior; single-target scans are unaffected.
+pub(crate) fn finding_belongs_to_target(target_url: &str, finding_url: &str) -> bool {
+    // Compare without the scheme. A scan is allowed to follow exactly one
+    // scheme change — the same-host `http` -> `https` form-action upgrade that
+    // `utils::http::same_origin_or_tls_upgrade` permits — and the finding is
+    // then recorded at the upgraded action URL. Attribution has to follow that
+    // hop too: comparing with the scheme attached, an `http://host/page` target
+    // whose form posts to `https://host/login` matches none of the three
+    // strategies below, so it counts zero findings and is summarised as `clean`
+    // while the same run lists the XSS in `results`.
+    //
+    // The cost is that a scan listing both `http://host/x` and `https://host/x`
+    // as separate targets attributes one finding to both, which is the same
+    // over-attribution the trade-off note above already accepts — and the
+    // failure it replaces (a target reporting `clean` while it produced
+    // findings) is the far worse of the two.
+    let target_url = strip_url_scheme(target_url);
+    let finding_url = strip_url_scheme(finding_url);
+    if target_url == finding_url {
+        return true;
+    }
+    let t_path = target_url.split('?').next().unwrap_or(target_url);
+    let f_path = finding_url.split('?').next().unwrap_or(finding_url);
+    if t_path == f_path {
+        return true;
+    }
+    // Path-injection fallback: only when the target has no query string,
+    // since query targets keep their path stable.
+    if !target_url.contains('?')
+        && let Some(i) = t_path.rfind('/')
+    {
+        let parent = &t_path[..=i];
+        if f_path.starts_with(parent) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Counts, for many targets, how many of a fixed set of finding URLs
+/// [`finding_belongs_to_target`] attributes to each — without the O(targets ×
+/// findings) predicate scan.
+///
+/// After the scheme strip, the predicate reduces to a test on the finding's
+/// path-without-query (`f_path`) alone:
+///
+///   - target **with** a query: `f_path == t_path` (an exact `t == f` match
+///     implies equal paths, so it adds nothing);
+///   - target **without** a query, containing a `/`: `f_path` starts with the
+///     target's parent (`t[..=last '/']`) — which also covers `f_path == t`,
+///     since `t` itself starts with its parent;
+///   - target **without** a query or any `/`: `f_path == t`.
+///
+/// So the findings' `f_path`s are sorted once and each target becomes an
+/// equal-range or prefix-range count by binary search: in sorted order every
+/// string with a given prefix is contiguous and sits at or after the prefix.
+/// `finding_attribution_index_matches_predicate` keeps this pinned to the
+/// predicate.
+pub(crate) struct FindingAttributionIndex<'a> {
+    sorted_paths: Vec<&'a str>,
+}
+
+impl<'a> FindingAttributionIndex<'a> {
+    pub(crate) fn new(finding_urls: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut sorted_paths: Vec<&'a str> = finding_urls
+            .into_iter()
+            .map(|f| {
+                let f = strip_url_scheme(f);
+                f.split('?').next().unwrap_or(f)
+            })
+            .collect();
+        sorted_paths.sort_unstable();
+        Self { sorted_paths }
+    }
+
+    /// Number of indexed findings `finding_belongs_to_target(target_url, _)`
+    /// accepts.
+    pub(crate) fn count_for(&self, target_url: &str) -> usize {
+        let t = strip_url_scheme(target_url);
+        let paths = &self.sorted_paths;
+        let lo_of = |key: &str| paths.partition_point(|p| *p < key);
+        if !t.contains('?')
+            && let Some(i) = t.rfind('/')
+        {
+            let parent = &t[..=i];
+            let lo = lo_of(parent);
+            let hi = paths.partition_point(|p| *p < parent || p.starts_with(parent));
+            return hi - lo;
+        }
+        let key = t.split('?').next().unwrap_or(t);
+        paths.partition_point(|p| *p <= key) - lo_of(key)
+    }
+}
+
+/// Fetch both remote lists, **not** short-circuiting on the first failure, and
+/// report every failure together.
+///
+/// The `?`-chained version stopped at the first error, which mattered once an
+/// all-failed fetch started returning `Err` instead of caching an empty list: a
+/// payload-provider outage silently skipped the wordlist fetch too, so a scan
+/// that asked for both lost the one that was actually reachable.
+async fn fetch_both(
+    payload_providers: &[String],
+    wordlist_providers: &[String],
+    opts: crate::payload::RemoteFetchOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut errors: Vec<String> = Vec::new();
+    if !payload_providers.is_empty()
+        && let Err(e) =
+            crate::payload::init_remote_payloads_with(payload_providers, opts.clone()).await
+    {
+        errors.push(format!("payloads: {e}"));
+    }
+    if !wordlist_providers.is_empty()
+        && let Err(e) = crate::payload::init_remote_wordlists_with(wordlist_providers, opts).await
+    {
+        errors.push(format!("wordlists: {e}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; ").into())
+    }
+}
+
+/// Initialize remote resources with explicit options (timeout/proxy).
+/// Use this in contexts (like server jobs) where you want to honor user/network options.
+pub async fn init_remote_resources_with_options(
+    payload_providers: &[String],
+    wordlist_providers: &[String],
+    timeout_secs: Option<u64>,
+    proxy: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let opts = crate::payload::RemoteFetchOptions {
+        timeout_secs,
+        proxy,
+    };
+    fetch_both(payload_providers, wordlist_providers, opts).await
+}
+
+#[cfg(test)]
+mod tests;

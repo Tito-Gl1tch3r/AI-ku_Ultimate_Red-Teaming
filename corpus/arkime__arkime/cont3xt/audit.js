@@ -1,0 +1,199 @@
+/******************************************************************************/
+/* audit.js  -- Cont3xt history
+ *
+ * Copyright Yahoo Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+'use strict';
+
+const ArkimeConfig = require('../common/arkimeConfig');
+const ArkimeUtil = require('../common/arkimeUtil');
+
+class Audit {
+  // the only fields an audit can be sorted on
+  static SORT_FIELDS = ['issuedAt', 'indicator', 'iType'];
+  static MAX_ITEMS_PER_PAGE = 10000;
+  static MAX_PAGE = 1000000;
+
+  constructor (data) {
+    Object.assign(this, data);
+  }
+
+  /**
+   * Initialization sets up periodic cleaning of expired audit history logs
+   * @param {number} options.expireHistoryDays How long to keep history
+   */
+  static initialize (options) {
+    if (ArkimeConfig.debug > 1) {
+      console.log('Audit.initialize', options);
+    }
+    let { expireHistoryDays } = options;
+    if (typeof expireHistoryDays === 'string') {
+      expireHistoryDays = parseFloat(expireHistoryDays);
+    }
+    if (isNaN(expireHistoryDays)) {
+      console.log(`ERROR - expireHistoryDays (${expireHistoryDays}) is not a number. History will NOT be cleaned!`);
+      return;
+    }
+
+    const hourMs = 3600000;
+    const expireHistoryMsBack = Math.ceil(expireHistoryDays * 24 * hourMs);
+
+    const deleteExpiredAudits = () => {
+      Db.deleteExpiredAudits(Date.now() - expireHistoryMsBack).then((numDeleted) => {
+        if (ArkimeConfig.debug) {
+          console.log(`Successful deletion of ${numDeleted} expired history logs`);
+        }
+      }).catch((err) => {
+        console.log('ERROR - Failed to delete expired history logs.', err);
+      });
+    };
+
+    // fire off one initial cleaning, then begin hourly interval
+    deleteExpiredAudits();
+    setInterval(deleteExpiredAudits, hourMs);
+  }
+
+  /**
+   * A Cont3xt Audit Object
+   * @param {string} _id
+   * @param {string} userId
+   * @param {number} issuedAt
+   * @param {number} took
+   * @param {number} resultCount
+   * @param {string} iType
+   * @param {string} indicator
+   * @param {string[]} tags
+   * @param {string | undefined} viewId
+   */
+
+  /**
+   * Creates a new history audit log
+   * @name /audit
+   * @param {Audit} audit - The history entry to create
+   * @returns {Promise} - The promise that either resolves or rejects in error
+   */
+  static async create (audit) {
+    return new Promise((resolve, reject) => {
+      const msg = Audit.verifyAudit(audit);
+
+      if (msg) {
+        return reject(msg);
+      }
+
+      Db.putAudit(null, audit).then((results) => {
+        if (!results) {
+          reject('ES Error');
+        } else {
+          resolve(results);
+        }
+      }).catch((err) => reject('ES Error: ' + err));
+    });
+  }
+
+  // Verify the given audit entry, returns error msg on failure, null otherwise
+  static verifyAudit (audit) {
+    if (typeof (audit.userId) !== 'string') { return 'must have field userId of type string'; }
+    if (typeof (audit.issuedAt) !== 'number') { return 'must have field issuedAt of type number (milliseconds)'; }
+    if (typeof (audit.took) !== 'number') { return 'must have field took of type number (milliseconds)'; }
+    if (typeof (audit.resultCount) !== 'number') { return 'must have field resultCount of type number'; }
+    if (typeof (audit.iType) !== 'string') { return 'must have field iType of type string'; }
+    if (typeof (audit.indicator) !== 'string') { return 'must have field indicator of type string'; }
+    if (!Array.isArray(audit.tags)) { return 'must have field tags of type Array'; }
+    if (typeof (audit.viewId) !== 'string' && audit.viewId !== undefined) { return 'field viewId must be of type string or undefined'; }
+
+    return null;
+  }
+
+  /**
+   * GET - /api/audits
+   *
+   * Returns list of audit logs that the requesting user is allowed to view.
+   * @name /audits
+   * @param {string} searchTerm - an optional query parameter to filter on indicator, iType, and tags
+   * @param {string} startMs - an optional query parameter to specify the start of results (milliseconds since Unix EPOCH)
+   * @param {string} stopMs - an optional query parameter to specify the end of results (milliseconds since Unix EPOCH)
+   * @param {string} seeAll - an optional query parameter to request viewing all history (only works for admin users)
+   * @param {string} sortBy - an optional query parameter to specify the field to sort by
+   * @param {string} sortOrder - an optional query parameter to specify the order to sort by
+   * @param {string} itemsPerPage - an optional query parameter to specify the number of results to return
+   * @param {string} page - an optional query parameter to specify the page number (1-indexed)
+   * @returns {Audit[]} audits - A sorted array of audit logs that the logged-in user can view
+   * @returns {boolean} success - True if the request was successful, false otherwise
+   */
+  static async apiGet (req, res, next) {
+    const roles = await req.user.getRoles();
+
+    // normalize the values that reach an ES size, a sql LIMIT/OFFSET, a sort
+    // field name, a bound sql param or an array index - the Db implementations
+    // don't all validate. Repeated params arrive as arrays.
+    const query = { ...req.query };
+    for (const key of ['startMs', 'stopMs']) {
+      const n = ArkimeUtil.isString(query[key]) ? Number(query[key]) : NaN;
+      query[key] = Number.isFinite(n) ? n : undefined;
+    }
+    query.sortBy = Audit.SORT_FIELDS.includes(query.sortBy) ? query.sortBy : 'issuedAt';
+    query.sortOrder = query.sortOrder === 'asc' ? 'asc' : 'desc';
+    if (!ArkimeUtil.isString(query.searchTerm)) { query.searchTerm = undefined; }
+    query.page = Math.min(Math.abs(parseInt(query.page, 10)) || 1, Audit.MAX_PAGE);
+    // must land in [1, MAX] - a negative LIMIT means no limit in sqlite, and
+    // ES rejects a from+size past max_result_window
+    query.itemsPerPage = query.itemsPerPage === '-1'
+      ? Audit.MAX_ITEMS_PER_PAGE
+      : Math.min(Math.abs(parseInt(query.itemsPerPage, 10)) || 100, Audit.MAX_ITEMS_PER_PAGE);
+
+    try {
+      const { audits, total } = await Db.getMatchingAudits(req.user.userId, [...roles], query);
+      res.send({ success: true, audits, total });
+    } catch (err) {
+      console.log('ERROR - getting audits', err);
+      res.send({ success: false, text: 'Database error' });
+    }
+  }
+
+  /**
+   * DELETE - /api/audit/:id
+   *
+   * Delete a log from history. Users can delete their own logs. Admins can delete any log.
+   * @name /audit/:id
+   * @returns {boolean} success - Whether the delete history log operation was successful.
+   * @returns {string} text - The success/error message to (optionally) display.
+   */
+  static async apiDelete (req, res, next) {
+    try {
+      const audit = await Db.getAudit(req.params.id);
+      const roles = [...await req.user.getRoles()];
+
+      if (!audit) {
+        return res.send({ success: false, text: 'History log not found' });
+      }
+
+      // permissions ---------------------------
+      if (!req.user.getPermission('removeEnabled')) {
+        return res.send({ success: false, text: 'Can not delete a history log when user has data removal disabled.' });
+      }
+
+      if (req.user.userId !== audit.userId && !roles?.includes('cont3xtAdmin')) {
+        return res.send({ success: false, text: 'User does not have permission to delete this log.' });
+      }
+      // ----------------------------------------
+
+      const results = await Db.implementation.deleteAudit(req.params.id);
+
+      if (!results) {
+        return res.send({ success: false, text: 'Database error' });
+      }
+
+      res.send({ success: true, text: 'Success' });
+    } catch (err) {
+      console.log('ERROR - deleting audit', err);
+      res.send({ success: false, text: 'Database error' });
+    }
+  }
+}
+
+module.exports = Audit;
+
+// Must be at bottom to avoid circular dependency
+const Db = require('./db.js');

@@ -1,0 +1,109 @@
+import { resolve, dirname } from 'node:path';
+import { execSyncVarlock, VarlockExecError } from 'varlock/exec-sync-varlock';
+import { initVarlockEnv } from 'varlock/env';
+// namespace import: `patchProcessStreams` is missing from older varlock versions, and a missing
+// named import would fail at link time rather than degrade to console-only redaction
+import * as varlockPatchConsole from 'varlock/patch-console';
+import type { SerializedEnvGraph } from 'varlock';
+
+const VARLOCK_SUBPATHS = [
+  'varlock/env',
+  'varlock/patch-console',
+  'varlock/patch-response',
+  'varlock/patch-server-response',
+  'varlock/auto-load',
+  'varlock/exec-sync-varlock',
+];
+
+// Pre-resolve subpaths using Node.js (which supports package.json "exports"),
+// so we can hand absolute file paths to Metro's resolver (which does not).
+const resolvedVarlockPaths: Record<string, string> = {};
+for (const subpath of VARLOCK_SUBPATHS) {
+  try {
+    resolvedVarlockPaths[subpath] = require.resolve(subpath);
+  } catch { /* varlock not installed — resolver will be a no-op */ }
+}
+
+/**
+ * Wraps the Metro config to initialize varlock in the main Metro process.
+ *
+ * - Adds a custom resolver so Metro can resolve `varlock/env` and other
+ *   subpath exports (Metro doesn't support package.json `"exports"` by default).
+ * - Ensures the varlock package directory is in Metro's `watchFolders` so
+ *   resolved files are accessible (needed when using linked/local deps).
+ * - Initializes the ENV proxy in the main process so sensitive values are
+ *   available at runtime in Expo Router server routes (`+api` files).
+ *
+ * @example
+ * // metro.config.js
+ * const { getDefaultConfig } = require('expo/metro-config');
+ * const { withVarlockMetroConfig } = require('@varlock/expo-integration/metro-config');
+ *
+ * const config = getDefaultConfig(__dirname);
+ * module.exports = withVarlockMetroConfig(config);
+ */
+export function withVarlockMetroConfig<T extends Record<string, any>>(config: T): T {
+  const c = config as Record<string, any>;
+  c.resolver ??= {};
+
+  // Install custom resolver for varlock subpath exports
+  const existingResolveRequest = c.resolver.resolveRequest;
+  c.resolver.resolveRequest = (
+    context: any,
+    moduleName: string,
+    platform: string | null,
+  ) => {
+    const absolutePath = resolvedVarlockPaths[moduleName];
+    if (absolutePath) {
+      return { type: 'sourceFile', filePath: absolutePath };
+    }
+    if (existingResolveRequest) {
+      return existingResolveRequest(context, moduleName, platform);
+    }
+    return context.resolveRequest(context, moduleName, platform);
+  };
+
+  // Ensure the varlock package dir is in watchFolders so Metro can access
+  // resolved files (required when varlock is linked via symlink/local deps).
+  const envPath = resolvedVarlockPaths['varlock/env'];
+  if (envPath) {
+    const varlockPkgDir = resolve(dirname(envPath), '..', '..');
+    const watchFolders: Array<string> = c.watchFolders ?? [];
+    if (!watchFolders.some((f: string) => varlockPkgDir.startsWith(f) || f.startsWith(varlockPkgDir))) {
+      watchFolders.push(varlockPkgDir);
+    }
+    c.watchFolders = watchFolders;
+  }
+
+  if (process.env.__VARLOCK_ENV) return config;
+
+  try {
+    const { stdout } = execSyncVarlock('load --format json-full', {
+      fullResult: true,
+      integrationTelemetry: {
+        name: __VARLOCK_INTEGRATION_NAME__,
+        version: __VARLOCK_INTEGRATION_VERSION__,
+      },
+    });
+    process.env.__VARLOCK_ENV = stdout;
+
+    const parsed = JSON.parse(stdout) as SerializedEnvGraph;
+    // No encryption needed here — Expo's Metro process is both build and runtime.
+    (globalThis as any).__varlockLoadedEnv = parsed;
+
+    initVarlockEnv();
+    varlockPatchConsole.patchGlobalConsole();
+    varlockPatchConsole.patchProcessStreams?.();
+  } catch (err) {
+    if (err instanceof VarlockExecError && err.stderr) {
+      process.stderr.write(err.stderr);
+    }
+    throw new Error(
+      '@varlock/expo-integration: Failed to initialize varlock in Metro config.\n'
+      + 'Your .env.schema may have syntax errors or failing validation.\n'
+      + `Details: ${(err as Error).message}`,
+    );
+  }
+
+  return config;
+}

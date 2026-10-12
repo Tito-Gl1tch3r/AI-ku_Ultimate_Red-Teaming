@@ -1,0 +1,2572 @@
+// Copyright 2023 Paolo Fabio Zaino
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"reflect"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/qri-io/jsonschema"
+
+	cmn "github.com/pzaino/thecrowler/pkg/common"
+)
+
+const (
+	testURL            = "https://example.com"
+	testRegion         = "us-west-1"
+	errExpected        = "expected %v, got %v"
+	errExpectedFalse   = "Expected false, got true"
+	errExpectedTrue    = "Expected true, got false"
+	errExpectedTimeout = "Expected Timeout to be %d, got %v"
+)
+
+type MockFileReader struct {
+	// Mock data or behavior can be customized per test
+	Data map[string][]byte
+}
+
+func (m MockFileReader) ReadFile(filename string) ([]byte, error) {
+	data, exists := m.Data[filename]
+	if !exists {
+		return nil, fmt.Errorf("file not found")
+	}
+	return data, nil
+}
+
+// Test LoadConfig
+func TestLoadConfig(t *testing.T) {
+	// Set the environment variables
+	os.Setenv("DB_USER", "testuser")
+	os.Setenv("DB_PASSWORD", "testpassword")
+
+	// Call the function
+	config, err := LoadConfig("./test-config.yml")
+
+	// Check for errors
+	if err != nil {
+		t.Errorf("LoadConfig returned an error: %v", err)
+	}
+
+	// Check if the returned structure matches the expected output
+	if IsEmpty(config) {
+		t.Errorf("No config was loaded")
+	}
+
+	// Check if the database credentials are correct
+	// aka verify that the environment variables are read correctly
+	if config.Database.User != "testuser" {
+		t.Errorf("Expected testuser, got %v", config.Database.User)
+	}
+
+	// Check if the database credentials are correct
+	// aka verify that the environment variables are read correctly
+	if config.Database.Password != "testpassword" {
+		t.Errorf("Expected testpassword, got %v", config.Database.Password)
+	}
+	if config.API.MaxRequestBodySize != 0 {
+		t.Errorf("Expected fixture API body enforcement to be unlimited, got %d bytes", config.API.MaxRequestBodySize)
+	}
+}
+
+// Test LoadConfigInvalidFile
+func TestLoadConfigInvalidFile(t *testing.T) {
+	_, err := LoadConfig("./invalid_test_config.yaml")
+	if err == nil {
+		t.Errorf("Expected error, got none")
+	}
+}
+
+func TestAgentFeatureFlagDefaults(t *testing.T) {
+	cfg := NewConfig()
+	if cfg == nil {
+		t.Fatal("expected NewConfig to return non-nil config")
+	}
+	if cfg.Agent.IdentityEnforcement {
+		t.Fatal("expected agent.identity_enforcement default to false")
+	}
+	if cfg.Agent.ContractEnforcement {
+		t.Fatal("expected agent.contract_enforcement default to false")
+	}
+	if cfg.Agent.MemoryRuntime {
+		t.Fatal("expected agent.memory_runtime default to false")
+	}
+}
+
+// Test IsEmpty
+func TestConfigIsEmpty(t *testing.T) {
+	// Create a non-empty config
+	nonEmptyConfig := Config{
+		Crawler: Crawler{
+			// Set some fields in Crawler struct
+		},
+		Database: Database{
+			// Set some fields in Database struct
+		},
+		API: API{
+			// Set some fields in API struct
+		},
+		Selenium: []Selenium{
+			{
+				// Set some fields in Selenium struct
+				Type: "chrome",
+				Path: "",
+				Port: 4444,
+			},
+		},
+		ImageStorageAPI: FileStorageAPI{
+			// Set some fields in FileStorageAPI struct
+		},
+		FileStorageAPI: FileStorageAPI{
+			// Set some fields in FileStorageAPI struct
+		},
+		HTTPHeaders: HTTPConfig{
+			// Set some fields in HTTPConfig struct
+		},
+		NetworkInfo: NetworkInfo{
+			DNS:       DNSConfig{},
+			WHOIS:     WHOISConfig{},
+			NetLookup: NetLookupConfig{},
+			// Set some fields in other NetworkInfo structs
+		},
+		OS:         "linux",
+		DebugLevel: 1,
+	}
+
+	// Call the IsEmpty function with the non-empty config
+	isEmpty := IsEmpty(nonEmptyConfig)
+
+	// Check if the IsEmpty function returns false for a non-empty config
+	if isEmpty {
+		t.Errorf("%s", errExpectedFalse)
+	}
+
+	// Create an empty config
+	emptyConfig := Config{}
+
+	// Call the IsEmpty function with the empty config
+	isEmpty = IsEmpty(emptyConfig)
+
+	// Check if the IsEmpty function returns true for an empty config
+	if !isEmpty {
+		t.Errorf("%s", errExpectedTrue)
+	}
+}
+
+// Test recursiveInclude
+func TestRecursiveInclude(t *testing.T) {
+	// Example setup for a test
+	baseDir := "/path/to/base"
+	yamlContent := `include: "config.yaml"`
+	mockData := map[string][]byte{
+		"/path/to/base/config.yaml": []byte("content: value"),
+	}
+	mockReader := MockFileReader{Data: mockData}
+
+	// Call the function with the mock
+	result, err := recursiveInclude(yamlContent, baseDir, mockReader)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Assert the result
+	expected := `content: value`
+	if result != expected {
+		t.Errorf("expected %q, got %q", expected, result)
+	}
+}
+
+// Test ReadFile
+func TestReadFile(t *testing.T) {
+	// Create a temporary file
+	tempFile, err := os.CreateTemp("", "test-file")
+	if err != nil {
+		t.Fatalf("Failed to create temporary file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+
+	// Write some data to the temporary file
+	data := []byte("test data")
+	if _, err := tempFile.Write(data); err != nil {
+		t.Fatalf("Failed to write data to temporary file: %v", err)
+	}
+
+	// Close the temporary file
+	if err := tempFile.Close(); err != nil {
+		t.Fatalf("Failed to close temporary file: %v", err)
+	}
+
+	// Create an instance of OsFileReader
+	reader := OsFileReader{}
+
+	// Call the ReadFile function with the temporary file
+	result, err := reader.ReadFile(tempFile.Name())
+	if err != nil {
+		t.Fatalf("ReadFile returned an error: %v", err)
+	}
+
+	// Check if the returned data matches the expected data
+	if !bytes.Equal(result, data) {
+		t.Errorf("Expected %v, got %v", data, result)
+	}
+}
+
+// Test validateRemote
+func TestValidateRemote(t *testing.T) {
+	config := &Config{
+		// Set the necessary fields for testing
+	}
+
+	err := config.validateRemote()
+
+	// Check for errors
+	if err != nil {
+		t.Errorf("validateRemote returned an error: %v", err)
+	}
+
+	// Add additional assertions if needed
+}
+
+// Test validateRemoteHost
+func TestValidateRemoteHost(t *testing.T) {
+	// Create a config instance with empty Remote.Host
+	config := &Config{
+		Remote: Remote{
+			Host: "",
+		},
+	}
+
+	// Call the validateRemoteHost function
+	config.validateRemoteHost()
+
+	// Check if the Remote.Host is set to LoalhostStr
+	if config.Remote.Host != cmn.LoalhostStr {
+		t.Errorf("Expected Remote.Host to be 'localhost', got %v", config.Remote.Host)
+	}
+
+	// Create a config instance with non-empty Remote.Host
+	config = &Config{
+		Remote: Remote{
+			Host: testURL,
+		},
+	}
+
+	// Call the validateRemoteHost function
+	config.validateRemoteHost()
+
+	// Check if the Remote.Host is trimmed and unchanged
+	if config.Remote.Host != testURL {
+		t.Errorf("Expected Remote.Host to be 'example.com', got %v", config.Remote.Host)
+	}
+}
+
+// Test validateRemotePath
+func TestValidateRemotePath(t *testing.T) {
+	// Create a config instance with empty Remote.Path
+	config := &Config{
+		Remote: Remote{
+			Path: "",
+		},
+	}
+
+	// Call the validateRemotePath function
+	config.validateRemotePath()
+
+	// Check if the Remote.Path is set to "/"
+	if config.Remote.Path != "/" {
+		t.Errorf("Expected Remote.Path to be '/', got %v", config.Remote.Path)
+	}
+
+	// Create a config instance with non-empty Remote.Path
+	config = &Config{
+		Remote: Remote{
+			Path: "/api",
+		},
+	}
+
+	// Call the validateRemotePath function
+	config.validateRemotePath()
+
+	// Check if the Remote.Path is trimmed and unchanged
+	if config.Remote.Path != "/api" {
+		t.Errorf("Expected Remote.Path to be '/api', got %v", config.Remote.Path)
+	}
+}
+
+// Test validateRemotePort
+func TestValidateRemotePort(t *testing.T) {
+	// Create a config instance with a valid port
+	config := &Config{
+		Remote: Remote{
+			Port: "8080",
+		},
+	}
+
+	// Call the validateRemotePort function
+	config.validateRemotePort()
+
+	// Check if the Remote.Port remains unchanged
+	if config.Remote.Port != "8080" {
+		t.Errorf("Expected Remote.Port to be 8080, got %v", config.Remote.Port)
+	}
+
+	// Create a config instance with an invalid port
+	config = &Config{
+		Remote: Remote{
+			Port: "99999",
+		},
+	}
+
+	// Call the validateRemotePort function
+	config.validateRemotePort()
+
+	// Check if the Remote.Port is set to the default port (8081)
+	if config.Remote.Port != "8086" {
+		t.Errorf("Expected Remote.Port to be 8086, got %v", config.Remote.Port)
+	}
+
+	// Create a config instance with a negative port
+	config = &Config{
+		Remote: Remote{
+			Port: "-123",
+		},
+	}
+
+	// Call the validateRemotePort function
+	config.validateRemotePort()
+
+	// Check if the Remote.Port is set to the default port (8081)
+	if config.Remote.Port != "8086" {
+		t.Errorf("Expected Remote.Port to be 8081, got %v", config.Remote.Port)
+	}
+}
+
+// Test validateRemoteRegion
+func TestValidateRemoteRegion(t *testing.T) {
+	// Create a config instance with empty Remote.Region
+	config := &Config{
+		Remote: Remote{
+			Region: "",
+		},
+	}
+
+	// Call the validateRemoteRegion function
+	config.validateRemoteRegion()
+
+	// Check if the Remote.Region is set to an empty string
+	if config.Remote.Region != "" {
+		t.Errorf("Expected Remote.Region to be an empty string, got %v", config.Remote.Region)
+	}
+
+	// Create a config instance with non-empty Remote.Region
+	config = &Config{
+		Remote: Remote{
+			Region: testRegion,
+		},
+	}
+
+	// Call the validateRemoteRegion function
+	config.validateRemoteRegion()
+
+	// Check if the Remote.Region is trimmed and unchanged
+	if config.Remote.Region != testRegion {
+		t.Errorf("Expected Remote.Region to be 'us-west-1', got %v", config.Remote.Region)
+	}
+}
+
+// Test validateRemoteToken
+func TestValidateRemoteToken(t *testing.T) {
+	// Create a config instance with an empty Remote.Token
+	config := &Config{
+		Remote: Remote{
+			Token: "",
+		},
+	}
+
+	// Call the validateRemoteToken function
+	config.validateRemoteToken()
+
+	// Check if the Remote.Token remains unchanged
+	if config.Remote.Token != "" {
+		t.Errorf("Expected Remote.Token to be an empty string, got %v", config.Remote.Token)
+	}
+
+	// Create a config instance with a non-empty Remote.Token
+	config = &Config{
+		Remote: Remote{
+			Token: "  mytoken  ",
+		},
+	}
+
+	// Call the validateRemoteToken function
+	config.validateRemoteToken()
+
+	// Check if the Remote.Token is trimmed and unchanged
+	if config.Remote.Token != "mytoken" {
+		t.Errorf("Expected Remote.Token to be 'mytoken', got %v", config.Remote.Token)
+	}
+}
+
+// Test validateRemoteSecret
+func TestValidateRemoteSecret(t *testing.T) {
+	// Create a config instance with an empty Remote.Secret
+	config := &Config{
+		Remote: Remote{
+			Secret: "",
+		},
+	}
+
+	// Call the validateRemoteSecret function
+	config.validateRemoteSecret()
+
+	// Check if the Remote.Secret remains unchanged
+	if config.Remote.Secret != "" {
+		t.Errorf("Expected Remote.Secret to be an empty string, got %v", config.Remote.Secret)
+	}
+
+	// Create a config instance with a non-empty Remote.Secret
+	config = &Config{
+		Remote: Remote{
+			Secret: "  mysecret  ",
+		},
+	}
+
+	// Call the validateRemoteSecret function
+	config.validateRemoteSecret()
+
+	// Check if the Remote.Secret is trimmed and unchanged
+	if config.Remote.Secret != "mysecret" {
+		t.Errorf("Expected Remote.Secret to be 'mysecret', got %v", config.Remote.Secret)
+	}
+}
+
+// Test validateRemoteTimeout
+func TestValidateRemoteTimeout(t *testing.T) {
+	// Create a config instance with a valid timeout
+	config := &Config{
+		Remote: Remote{
+			Timeout: 10,
+		},
+	}
+
+	// Call the validateRemoteTimeout function
+	config.validateRemoteTimeout()
+
+	// Check if the Remote.Timeout remains unchanged
+	if config.Remote.Timeout != 10 {
+		t.Errorf("Expected Remote.Timeout to be 10, got %v", config.Remote.Timeout)
+	}
+
+	// Create a config instance with an invalid timeout
+	config = &Config{
+		Remote: Remote{
+			Timeout: -5,
+		},
+	}
+
+	// Call the validateRemoteTimeout function
+	config.validateRemoteTimeout()
+
+	// Check if the Remote.Timeout is set to the default timeout (15)
+	if config.Remote.Timeout != 15 {
+		t.Errorf("Expected Remote.Timeout to be 15, got %v", config.Remote.Timeout)
+	}
+}
+
+// Test validateRemoteType
+func TestValidateRemoteType(t *testing.T) {
+	// Create a config instance with an empty Remote.Type
+	config := &Config{
+		Remote: Remote{
+			Type: "",
+		},
+	}
+
+	// Call the validateRemoteType function
+	config.validateRemoteType()
+
+	// Check if the Remote.Type is set to cmn.LocalStr
+	if config.Remote.Type != cmn.LocalStr {
+		t.Errorf("Expected Remote.Type to be 'local', got %v", config.Remote.Type)
+	}
+
+	// Create a config instance with a non-empty Remote.Type
+	config = &Config{
+		Remote: Remote{
+			Type: "  remote  ",
+		},
+	}
+
+	// Call the validateRemoteType function
+	config.validateRemoteType()
+
+	// Check if the Remote.Type is trimmed and unchanged
+	if config.Remote.Type != "remote" {
+		t.Errorf("Expected Remote.Type to be 'remote', got %v", config.Remote.Type)
+	}
+}
+
+// Test validateRemoteSSLMode
+func TestValidateRemoteSSLMode(t *testing.T) {
+	// Create a config instance with an empty Remote.SSLMode
+	config := &Config{
+		Remote: Remote{
+			SSLMode: "",
+		},
+	}
+
+	// Call the validateRemoteSSLMode function
+	config.validateRemoteSSLMode()
+
+	// Check if the Remote.SSLMode is set to cmn.DisableStr
+	if config.Remote.SSLMode != cmn.DisableStr {
+		t.Errorf("Expected Remote.SSLMode to be 'disable', got %v", config.Remote.SSLMode)
+	}
+
+	// Create a config instance with a non-empty Remote.SSLMode
+	config = &Config{
+		Remote: Remote{
+			SSLMode: "  require  ",
+		},
+	}
+
+	// Call the validateRemoteSSLMode function
+	config.validateRemoteSSLMode()
+
+	// Check if the Remote.SSLMode is trimmed and set to lowercase
+	if config.Remote.SSLMode != "require" {
+		t.Errorf("Expected Remote.SSLMode to be 'require', got %v", config.Remote.SSLMode)
+	}
+}
+
+// Test validateCrawler
+func TestValidateCrawler(t *testing.T) {
+	// Create a config instance with default values
+	config := &Config{
+		Crawler: Crawler{
+			Workers:     0,
+			Interval:    "",
+			Timeout:     0,
+			Maintenance: 0,
+		},
+	}
+
+	// Call the validateCrawler function
+	config.validateCrawler()
+
+	// Check if the Workers field is set to 1
+	if config.Crawler.Workers != 1 {
+		t.Errorf("Expected Workers to be %d, got %v", 1, config.Crawler.Workers)
+	}
+
+	// Check if the Interval field is set to "2"
+	if config.Crawler.Interval != "2" {
+		t.Errorf("Expected Interval to be '%d', got %v", 2, config.Crawler.Interval)
+	}
+
+	// Check if the Timeout field is set to 10
+	if config.Crawler.Timeout != 10 {
+		t.Errorf(errExpectedTimeout, 10, config.Crawler.Timeout)
+	}
+
+	// Check if the Maintenance field is set to 60
+	if config.Crawler.Maintenance != 60 {
+		t.Errorf("Expected Maintenance to be 60, got %v", config.Crawler.Maintenance)
+	}
+}
+
+func TestIndexingConcurrencyConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want int
+	}{
+		{name: "omitted", yaml: "crawler:\n  workers: 1\n", want: 1},
+		{name: "unlimited", yaml: "crawler:\n  indexing_concurrency: 0\n", want: 0},
+		{name: "positive", yaml: "crawler:\n  indexing_concurrency: 4\n", want: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := ParseConfig([]byte(tt.yaml))
+			if err != nil {
+				t.Fatalf("ParseConfig() error = %v", err)
+			}
+			if got := cfg.Crawler.IndexingConcurrency; got != tt.want {
+				t.Fatalf("IndexingConcurrency = %d, want %d", got, tt.want)
+			}
+		})
+	}
+
+	cfg := NewConfig()
+	if got := cfg.Crawler.IndexingConcurrency; got != 1 {
+		t.Fatalf("NewConfig IndexingConcurrency = %d, want 1", got)
+	}
+}
+
+func TestIndexingConcurrencySchema(t *testing.T) {
+	schemaData, err := os.ReadFile("../../schemas/crowler-config-schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schemaDocument struct {
+		Properties map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaData, &schemaDocument); err != nil {
+		t.Fatal(err)
+	}
+	indexingSchema := schemaDocument.Properties["crawler"].Properties["indexing_concurrency"]
+	if len(indexingSchema) == 0 {
+		t.Fatal("indexing_concurrency schema not found")
+	}
+	schema := &jsonschema.Schema{}
+	if err := schema.UnmarshalJSON(indexingSchema); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		value      int
+		wantIssues bool
+	}{
+		{name: "zero", value: 0},
+		{name: "positive", value: 2},
+		{name: "negative", value: -1, wantIssues: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			document := []byte(fmt.Sprintf(`%d`, test.value))
+			issues, err := schema.ValidateBytes(context.Background(), document)
+			if err != nil {
+				t.Fatalf("schema validation error: %v", err)
+			}
+			if gotIssues := len(issues) != 0; gotIssues != test.wantIssues {
+				t.Fatalf("schema returned issues = %v, want issues = %v: %v", gotIssues, test.wantIssues, issues)
+			}
+		})
+	}
+}
+
+// Test validateDatabase
+func TestValidateDatabase(t *testing.T) {
+	// Create a config instance with empty values
+	config := &Config{
+		Database: Database{},
+	}
+
+	// Call the validateDatabase function
+	config.validateDatabase()
+
+	// Check if the Database.Type is set to "postgres"
+	if config.Database.Type != "postgres" {
+		t.Errorf("Expected Database.Type to be 'postgres', got %v", config.Database.Type)
+	}
+
+	// Check if the Database.Host is set to cmn.LoalhostStr
+	if config.Database.Host != cmn.LoalhostStr {
+		t.Errorf("Expected Database.Host to be 'localhost', got %v", config.Database.Host)
+	}
+
+	// Check if the Database.Port is set to 5432
+	if config.Database.Port != 5432 {
+		t.Errorf("Expected Database.Port to be 5432, got %v", config.Database.Port)
+	}
+
+	// Check if the Database.User is set to "crowler"
+	if config.Database.User != "crowler" {
+		t.Errorf("Expected Database.User to be 'crowler', got %v", config.Database.User)
+	}
+
+	// Check if the Database.DBName is set to "SitesIndex"
+	if config.Database.DBName != "SitesIndex" {
+		t.Errorf("Expected Database.DBName to be 'SitesIndex', got %v", config.Database.DBName)
+	}
+
+	// Check if the Database.RetryTime is set to 5
+	if config.Database.RetryTime != 5 {
+		t.Errorf("Expected Database.RetryTime to be 5, got %v", config.Database.RetryTime)
+	}
+
+	// Check if the Database.PingTime is set to 5
+	if config.Database.PingTime != 5 {
+		t.Errorf("Expected Database.PingTime to be 5, got %v", config.Database.PingTime)
+	}
+}
+
+// Test validateAPI
+func TestValidateAPI(t *testing.T) {
+	// Create a config instance with empty API fields
+	config := &Config{
+		API: API{},
+	}
+
+	// Call the validateAPI function
+	config.validateAPI()
+
+	// Check if the API.Host is set to "0.0.0.0"
+	if config.API.Host != "0.0.0.0" {
+		t.Errorf("Expected API.Host to be '0.0.0.0', got %v", config.API.Host)
+	}
+
+	// Check if the API.Port is set to the default port (8080)
+	if config.API.Port != 8080 {
+		t.Errorf("Expected API.Port to be 8080, got %v", config.API.Port)
+	}
+
+	// Check if the API.Timeout is set to the default timeout (30)
+	if config.API.Timeout != 60 {
+		t.Errorf("Expected API.Timeout to be 30, got %v", config.API.Timeout)
+	}
+
+	// Check if the API.RateLimit is set to the default rate limit ("10,10")
+	if config.API.RateLimit != "10,10" {
+		t.Errorf("Expected API.RateLimit to be '10,10', got %v", config.API.RateLimit)
+	}
+
+	// Check if the API.ReadHeaderTimeout is set to the default timeout (15)
+	if config.API.ReadHeaderTimeout != 15 {
+		t.Errorf("Expected API.ReadHeaderTimeout to be 15, got %v", config.API.ReadHeaderTimeout)
+	}
+
+	// Check if the API.ReadTimeout is set to the default timeout (15)
+	if config.API.ReadTimeout != 15 {
+		t.Errorf("Expected API.ReadTimeout to be 15, got %v", config.API.ReadTimeout)
+	}
+
+	// Check if the API.WriteTimeout is set to the default timeout (30)
+	if config.API.WriteTimeout != 30 {
+		t.Errorf("Expected API.WriteTimeout to be 30, got %v", config.API.WriteTimeout)
+	}
+
+	// Create a config instance with non-empty API fields
+	config = &Config{
+		API: API{
+			Host:              testURL,
+			Port:              8888,
+			Timeout:           60,
+			RateLimit:         "20,20",
+			ReadHeaderTimeout: 30,
+			ReadTimeout:       30,
+			WriteTimeout:      60,
+		},
+	}
+
+	// Call the validateAPI function
+	config.validateAPI()
+
+	// Check if the API.Host remains unchanged
+	if config.API.Host != testURL {
+		t.Errorf("Expected API.Host to be 'example.com', got %v", config.API.Host)
+	}
+
+	// Check if the API.Port remains unchanged
+	if config.API.Port != 8888 {
+		t.Errorf("Expected API.Port to be 8888, got %v", config.API.Port)
+	}
+
+	// Check if the API.Timeout remains unchanged
+	if config.API.Timeout != 60 {
+		t.Errorf("Expected API.Timeout to be 60, got %v", config.API.Timeout)
+	}
+
+	// Check if the API.RateLimit remains unchanged
+	if config.API.RateLimit != "20,20" {
+		t.Errorf("Expected API.RateLimit to be '20,20', got %v", config.API.RateLimit)
+	}
+
+	// Check if the API.ReadHeaderTimeout remains unchanged
+	if config.API.ReadHeaderTimeout != 30 {
+		t.Errorf("Expected API.ReadHeaderTimeout to be 30, got %v", config.API.ReadHeaderTimeout)
+	}
+
+	// Check if the API.ReadTimeout remains unchanged
+	if config.API.ReadTimeout != 30 {
+		t.Errorf("Expected API.ReadTimeout to be 30, got %v", config.API.ReadTimeout)
+	}
+
+	// Check if the API.WriteTimeout remains unchanged
+	if config.API.WriteTimeout != 60 {
+		t.Errorf("Expected API.WriteTimeout to be 60, got %v", config.API.WriteTimeout)
+	}
+}
+
+func TestAPIMaxRequestBodySize(t *testing.T) {
+	tests := []struct {
+		name      string
+		yaml      string
+		want      int64
+		unlimited bool
+		wantErr   bool
+	}{
+		{name: "omitted", yaml: "api:\n  host: localhost\n", want: 0, unlimited: true},
+		{name: "explicit zero", yaml: "api:\n  max_request_body_size: 0\n", want: 0, unlimited: true},
+		{name: "positive bytes", yaml: "api:\n  max_request_body_size: 1048577\n", want: 1048577},
+		{name: "negative", yaml: "api:\n  max_request_body_size: -1\n", want: -1, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := ParseConfig([]byte(tt.yaml))
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "api.max_request_body_size") {
+					t.Fatalf("ParseConfig() error = %v, want api.max_request_body_size validation error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseConfig() error = %v", err)
+			}
+			if cfg.API.MaxRequestBodySize != tt.want {
+				t.Errorf("MaxRequestBodySize = %d, want %d", cfg.API.MaxRequestBodySize, tt.want)
+			}
+			if gotUnlimited := cfg.API.MaxRequestBodySize == 0; gotUnlimited != tt.unlimited {
+				t.Errorf("unlimited = %t, want %t", gotUnlimited, tt.unlimited)
+			}
+		})
+	}
+}
+
+// Test validateVDI
+func TestValidateVDI(t *testing.T) {
+	// Create a config instance with some Selenium configurations
+	config := &Config{
+		Selenium: []Selenium{
+			{
+				Type:        "chrome",
+				ServiceType: "chromedriver",
+				Path:        "/path/to/chrome",
+				DriverPath:  "/path/to/chromedriver",
+				Host:        cmn.LoalhostStr,
+				Port:        4444,
+				ProxyURL:    "http://proxy.example.com",
+			},
+			{
+				Type:        "firefox",
+				ServiceType: "geckodriver",
+				Path:        "/path/to/firefox",
+				DriverPath:  "/path/to/geckodriver",
+				Host:        cmn.LoalhostStr,
+				Port:        4444,
+				ProxyURL:    "http://proxy.example.com",
+			},
+		},
+	}
+
+	// Call the validateVDI function
+	config.validateVDI()
+
+	// Add assertions to check if the validations are successful
+	for _, selenium := range config.Selenium {
+		// Add assertions for each validation function
+		// Example assertion for validateVDIType
+		if selenium.Type != "chrome" && selenium.Type != "firefox" {
+			t.Errorf("Invalid Selenium type: %s", selenium.Type)
+		}
+
+		// Add assertions for other validation functions
+		// validateVDIServiceType, validateVDIPath, etc.
+	}
+}
+
+// Test validateVDIType
+func TestValidateVDIType(t *testing.T) {
+	// Create a config instance
+	config := &Config{}
+
+	// Create a Selenium instance with an empty Type
+	selenium := &Selenium{
+		Type: "",
+	}
+
+	// Call the validateVDIType function
+	config.validateVDIType(selenium)
+
+	// Check if the Type is set to "chrome"
+	if selenium.Type != "chrome" {
+		t.Errorf("Expected Type to be 'chrome', got %v", selenium.Type)
+	}
+
+	// Create a Selenium instance with a non-empty Type
+	selenium = &Selenium{
+		Type: "firefox",
+	}
+
+	// Call the validateVDIType function
+	config.validateVDIType(selenium)
+
+	// Check if the Type is trimmed and unchanged
+	if selenium.Type != "firefox" {
+		t.Errorf("Expected Type to be 'firefox', got %v", selenium.Type)
+	}
+}
+
+// Test validateVDIServiceType
+func TestValidateVDIServiceType(t *testing.T) {
+	// Create a config instance with a Selenium struct
+	config := &Config{
+		Selenium: []Selenium{
+			{
+				ServiceType: "",
+			},
+			{
+				ServiceType: "  grid  ",
+			},
+		},
+	}
+
+	// Call the validateVDIServiceType function for each Selenium struct
+	for i := range config.Selenium {
+		config.validateVDIServiceType(&config.Selenium[i])
+	}
+
+	// Check if the ServiceType is set to "standalone" for the first Selenium struct
+	if config.Selenium[0].ServiceType != "standalone" {
+		t.Errorf("Expected ServiceType to be 'standalone', got %v", config.Selenium[0].ServiceType)
+	}
+
+	// Check if the ServiceType is trimmed and unchanged for the second Selenium struct
+	if config.Selenium[1].ServiceType != "grid" {
+		t.Errorf("Expected ServiceType to be 'grid', got %v", config.Selenium[1].ServiceType)
+	}
+}
+
+// Test validateVDIHost
+func TestValidateVDIHost(t *testing.T) {
+	// Create a config instance with an empty Selenium.Host
+	config := &Config{
+		Selenium: []Selenium{
+			{
+				Host: "",
+			},
+		},
+	}
+
+	// Call the validateVDIHost function
+	config.validateVDIHost(&config.Selenium[0])
+
+	// Check if the Selenium.Host is set to cmn.LoalhostStr
+	if config.Selenium[0].Host != cmn.LoalhostStr {
+		t.Errorf("Expected Selenium.Host to be 'localhost', got %v", config.Selenium[0].Host)
+	}
+
+	// Create a config instance with non-empty Selenium.Host
+	config = &Config{
+		Selenium: []Selenium{
+			{
+				Host: testURL,
+			},
+		},
+	}
+
+	// Call the validateVDIHost function
+	config.validateVDIHost(&config.Selenium[0])
+
+	// Check if the Selenium.Host is trimmed and unchanged
+	if config.Selenium[0].Host != testURL {
+		t.Errorf("Expected Selenium.Host to be 'example.com', got %v", config.Selenium[0].Host)
+	}
+}
+
+// Test validateVDIPort
+func TestValidateVDIPort(t *testing.T) {
+	// Create a config instance with a Selenium struct
+	config := &Config{
+		Selenium: []Selenium{
+			{
+				Port: 0,
+			},
+			{
+				Port: 65536,
+			},
+			{
+				Port: 8080,
+			},
+		},
+	}
+
+	// Call the validateVDIPort function for each Selenium struct
+	for i := range config.Selenium {
+		config.validateVDIPort(&config.Selenium[i])
+	}
+
+	// Check if the Selenium ports are validated correctly
+	expectedPorts := []int{4444, 4444, 8080}
+	for i, selenium := range config.Selenium {
+		if selenium.Port != expectedPorts[i] {
+			t.Errorf("Expected Selenium port to be %d, got %d", expectedPorts[i], selenium.Port)
+		}
+	}
+}
+
+// Test validateRulesets
+func TestValidateRulesets(t *testing.T) {
+	// Create a config instance
+	config := &Config{
+		RulesetsSchemaPath: "",
+		Rulesets: []RulesetConfig{
+			{
+				Type: "",
+				Path: []string{},
+			},
+			{
+				Type: "remote",
+				Path: []string{"", "path1", "path2"},
+			},
+		},
+	}
+
+	// Call the validateRulesets function
+	config.validateRulesets()
+
+	// Check if the RulesetsSchemaPath is set to the default value
+	if config.RulesetsSchemaPath != "./schemas/crowler-ruleset-schema.json" {
+		t.Errorf("Expected RulesetsSchemaPath to be './schemas/crowler-ruleset-schema.json', got %v", config.RulesetsSchemaPath)
+	}
+
+	// Check if the first Ruleset Type is set to the default value
+	if config.Rulesets[0].Type != cmn.LocalStr {
+		t.Errorf("Expected first Ruleset Type to be 'local', got %v", config.Rulesets[0].Type)
+	}
+
+	// Check if the first Ruleset Path is set to the default values
+	expectedPath := []string{JSONRulesDefaultPath, YAMLRulesDefaultPath1, YAMLRulesDefaultPath2}
+	if !reflect.DeepEqual(config.Rulesets[0].Path, expectedPath) {
+		t.Errorf("Expected first Ruleset Path to be %v, got %v", expectedPath, config.Rulesets[0].Path)
+	}
+
+	// Check if the second Ruleset Type remains unchanged
+	if config.Rulesets[1].Type != "remote" {
+		t.Errorf("Expected second Ruleset Type to be 'remote', got %v", config.Rulesets[1].Type)
+	}
+
+	// Check if the second Ruleset Path is trimmed and unchanged
+	expectedPath = []string{JSONRulesDefaultPath, "path1", "path2"}
+	if !reflect.DeepEqual(config.Rulesets[1].Path, expectedPath) {
+		t.Errorf("Expected second Ruleset Path to be %v, got %v", expectedPath, config.Rulesets[1].Path)
+	}
+}
+
+// Test validateImageStorageAPI
+func TestValidateImageStorageAPI(t *testing.T) {
+	// Create a config instance with empty ImageStorageAPI fields
+	config := &Config{
+		ImageStorageAPI: FileStorageAPI{},
+	}
+
+	// Call the validateImageStorageAPI function
+	config.validateImageStorageAPI()
+
+	// Check if the ImageStorageAPI fields are set to their default values
+	if config.ImageStorageAPI.Type != cmn.LocalStr {
+		t.Errorf("Expected ImageStorageAPI.Type to be 'local', got %v", config.ImageStorageAPI.Type)
+	}
+	if config.ImageStorageAPI.Host != "" {
+		t.Errorf("Expected ImageStorageAPI.Host to be an empty string, got %v", config.ImageStorageAPI.Host)
+	}
+	if config.ImageStorageAPI.Path != DataDefaultPath {
+		t.Errorf("Expected ImageStorageAPI.Path to be '%v', got %v", DataDefaultPath, config.ImageStorageAPI.Path)
+	}
+	if config.ImageStorageAPI.Port != 0 {
+		t.Errorf("Expected ImageStorageAPI.Port to be 0, got %v", config.ImageStorageAPI.Port)
+	}
+	if config.ImageStorageAPI.Region != cmn.NowhereStr {
+		t.Errorf("Expected ImageStorageAPI.Region to be 'nowhere', got %v", config.ImageStorageAPI.Region)
+	}
+	if config.ImageStorageAPI.Token != "" {
+		t.Errorf("Expected ImageStorageAPI.Token to be an empty string, got %v", config.ImageStorageAPI.Token)
+	}
+	if config.ImageStorageAPI.Secret != "" {
+		t.Errorf("Expected ImageStorageAPI.Secret to be an empty string, got %v", config.ImageStorageAPI.Secret)
+	}
+	if config.ImageStorageAPI.Timeout != 15 {
+		t.Errorf("Expected ImageStorageAPI.Timeout to be 15, got %v", config.ImageStorageAPI.Timeout)
+	}
+
+	// Add additional assertions if needed
+}
+
+// Test validateFileStorageAPI
+func TestValidateFileStorageAPI(t *testing.T) {
+	// Create a config instance with empty FileStorageAPI fields
+	config := &Config{
+		FileStorageAPI: FileStorageAPI{},
+	}
+
+	// Call the validateFileStorageAPI function
+	config.validateFileStorageAPI()
+
+	// Check if the FileStorageAPI fields are set to their default values
+	if config.FileStorageAPI.Type != cmn.LocalStr {
+		t.Errorf("Expected FileStorageAPI.Type to be 'local', got %v", config.FileStorageAPI.Type)
+	}
+	if config.FileStorageAPI.Host != "" {
+		t.Errorf("Expected FileStorageAPI.Host to be an empty string, got %v", config.FileStorageAPI.Host)
+	}
+	if config.FileStorageAPI.Path != DataDefaultPath {
+		t.Errorf("Expected FileStorageAPI.Path to be '%v', got %v", DataDefaultPath, config.FileStorageAPI.Path)
+	}
+	if config.FileStorageAPI.Port != 0 {
+		t.Errorf("Expected FileStorageAPI.Port to be 0, got %v", config.FileStorageAPI.Port)
+	}
+	if config.FileStorageAPI.Region != cmn.NowhereStr {
+		t.Errorf("Expected FileStorageAPI.Region to be 'nowhere', got %v", config.FileStorageAPI.Region)
+	}
+	if config.FileStorageAPI.Token != "" {
+		t.Errorf("Expected FileStorageAPI.Token to be an empty string, got %v", config.FileStorageAPI.Token)
+	}
+	if config.FileStorageAPI.Secret != "" {
+		t.Errorf("Expected FileStorageAPI.Secret to be an empty string, got %v", config.FileStorageAPI.Secret)
+	}
+	if config.FileStorageAPI.Timeout != 15 {
+		t.Errorf("Expected FileStorageAPI.Timeout to be 15, got %v", config.FileStorageAPI.Timeout)
+	}
+
+	// Create a config instance with non-empty FileStorageAPI fields
+	config = &Config{
+		FileStorageAPI: FileStorageAPI{
+			Type:    "s3",
+			Host:    testURL,
+			Path:    "/data",
+			Port:    9000,
+			Region:  "us-west-2",
+			Token:   "mytoken",
+			Secret:  "mysecret",
+			Timeout: 30,
+		},
+	}
+
+	// Call the validateFileStorageAPI function
+	config.validateFileStorageAPI()
+
+	// Check if the FileStorageAPI fields remain unchanged
+	if config.FileStorageAPI.Type != "s3" {
+		t.Errorf("Expected FileStorageAPI.Type to be 's3', got %v", config.FileStorageAPI.Type)
+	}
+	if config.FileStorageAPI.Host != testURL {
+		t.Errorf("Expected FileStorageAPI.Host to be 'example.com', got %v", config.FileStorageAPI.Host)
+	}
+	if config.FileStorageAPI.Path != "/data" {
+		t.Errorf("Expected FileStorageAPI.Path to be '/data', got %v", config.FileStorageAPI.Path)
+	}
+	if config.FileStorageAPI.Port != 9000 {
+		t.Errorf("Expected FileStorageAPI.Port to be 9000, got %v", config.FileStorageAPI.Port)
+	}
+	if config.FileStorageAPI.Region != "us-west-2" {
+		t.Errorf("Expected FileStorageAPI.Region to be 'us-west-2', got %v", config.FileStorageAPI.Region)
+	}
+	if config.FileStorageAPI.Token != "mytoken" {
+		t.Errorf("Expected FileStorageAPI.Token to be 'mytoken', got %v", config.FileStorageAPI.Token)
+	}
+	if config.FileStorageAPI.Secret != "mysecret" {
+		t.Errorf("Expected FileStorageAPI.Secret to be 'mysecret', got %v", config.FileStorageAPI.Secret)
+	}
+	if config.FileStorageAPI.Timeout != 30 {
+		t.Errorf("Expected FileStorageAPI.Timeout to be 30, got %v", config.FileStorageAPI.Timeout)
+	}
+}
+
+// Test validateHTTPHeaders
+func TestValidateHTTPHeaders(t *testing.T) {
+	// Create a config instance with a valid timeout
+	config := &Config{
+		HTTPHeaders: HTTPConfig{
+			Timeout: 30,
+		},
+	}
+
+	// Call the validateHTTPHeaders function
+	config.validateHTTPHeaders()
+
+	// Check if the HTTPHeaders.Timeout remains unchanged
+	if config.HTTPHeaders.Timeout != 30 {
+		t.Errorf("Expected HTTPHeaders.Timeout to be 30, got %v", config.HTTPHeaders.Timeout)
+	}
+
+	// Create a config instance with an invalid timeout
+	config = &Config{
+		HTTPHeaders: HTTPConfig{
+			Timeout: -10,
+		},
+	}
+
+	// Call the validateHTTPHeaders function
+	config.validateHTTPHeaders()
+
+	// Check if the HTTPHeaders.Timeout is set to the default timeout (60)
+	if config.HTTPHeaders.Timeout != 60 {
+		t.Errorf("Expected HTTPHeaders.Timeout to be 60, got %v", config.HTTPHeaders.Timeout)
+	}
+}
+
+// Test validateOS
+func TestValidateOS(t *testing.T) {
+	// Create a config instance with an empty OS
+	config := &Config{
+		OS: "",
+	}
+
+	// Call the validateOS function
+	config.validateOS()
+
+	// Check if the OS is set to the default value (runtime.GOOS)
+	if config.OS != runtime.GOOS {
+		t.Errorf("Expected OS to be %v, got %v", runtime.GOOS, config.OS)
+	}
+
+	// Create a config instance with a non-empty OS
+	config = &Config{
+		OS: "   linux   ",
+	}
+
+	// Call the validateOS function
+	config.validateOS()
+
+	// Check if the OS is trimmed and unchanged
+	if config.OS != "linux" {
+		t.Errorf("Expected OS to be 'linux', got %v", config.OS)
+	}
+}
+
+// Test validateDebugLevel
+func TestValidateDebugLevel(t *testing.T) {
+	// Create a config instance with a negative DebugLevel
+	config := &Config{
+		DebugLevel: -1,
+	}
+
+	// Call the validateDebugLevel function
+	config.validateDebugLevel()
+
+	// Check if the DebugLevel is set to 0
+	if config.DebugLevel != 0 {
+		t.Errorf("Expected DebugLevel to be 0, got %v", config.DebugLevel)
+	}
+
+	// Create a config instance with a positive DebugLevel
+	config = &Config{
+		DebugLevel: 2,
+	}
+
+	// Call the validateDebugLevel function
+	config.validateDebugLevel()
+
+	// Check if the DebugLevel remains unchanged
+	if config.DebugLevel != 2 {
+		t.Errorf("Expected DebugLevel to be 2, got %v", config.DebugLevel)
+	}
+
+	// Create a config instance with a zero DebugLevel
+	config = &Config{
+		DebugLevel: 0,
+	}
+
+	// Call the validateDebugLevel function
+	config.validateDebugLevel()
+
+	// Check if the DebugLevel remains unchanged
+	if config.DebugLevel != 0 {
+		t.Errorf("Expected DebugLevel to be 0, got %v", config.DebugLevel)
+	}
+}
+
+// Test String
+func TestConfigString(t *testing.T) {
+	// Create a config instance with sample values
+	config := &Config{
+		Remote: Remote{
+			Host:   testURL,
+			Path:   "/api",
+			Port:   "8080",
+			Region: testRegion,
+			Token:  "mytoken",
+		},
+		Database: Database{
+			User:     "testuser",
+			Password: "testpassword",
+		},
+		Crawler: Crawler{
+			// Set some fields in Crawler struct
+		},
+		API: API{
+			// Set some fields in API struct
+		},
+		Selenium: []Selenium{
+			{
+				// Set some fields in Selenium struct
+				Type: "chrome",
+				Path: "",
+				Port: 4444,
+			},
+		},
+		RulesetsSchemaPath: "path/to/schema",
+		Rulesets:           []RulesetConfig{},
+		ImageStorageAPI:    FileStorageAPI{
+			// Set some fields in FileStorageAPI struct
+		},
+		FileStorageAPI: FileStorageAPI{
+			// Set some fields in FileStorageAPI struct
+		},
+		HTTPHeaders: HTTPConfig{
+			// Set some fields in HTTPConfig struct
+		},
+		NetworkInfo: NetworkInfo{
+			DNS:       DNSConfig{},
+			WHOIS:     WHOISConfig{},
+			NetLookup: NetLookupConfig{},
+			// Set some fields in other NetworkInfo structs
+		},
+		OS:         "linux",
+		DebugLevel: 1,
+	}
+
+	// Define the expected string representation of the config
+	expected := "Config{Remote: {https://example.com /api 8080 us-west-1 mytoken  0  }, Database: {  0 testuser testpassword  0 0   0 0 0}, Crawler: {0 0 0 []  false false <nil>     0 0 false false 0 0 0 0 0 0  0  0 0 0  false  false     false false false false false false false false false false false false false false false false [] false 0 false false { 0 0     0 0 0}}, API: {  0 0 0 false false false false     false 0 0 0 0 false [] {false []} {false 0 []} false {false [] 0 0 0} {false     0 {false} {false   }}}, Selenium: [{    chrome  4444  false false     {0 0     0 0 0}}], RulesetsSchemaPath: path/to/schema, Rulesets: [], ImageStorageAPI: {  0    0  }, FileStorageAPI: {  0    0  }, HTTPHeaders: {false 0 false {false false false false false false false false false false false false false false false false} []}, NetworkInfo: {{false 0 } {false 0 } {false 0 } {false 0 { 0} false false false false false false  false false [] [] []    0 0 0   false 0  false  false 0 [] []} {false    0 } {  }}, OS: linux, DebugLevel: 1}"
+
+	// Call the String method on the config
+	result := config.String()
+
+	// Check if the result matches the expected string representation
+	if result != expected {
+		t.Errorf("Expected %q, got %q", expected, result)
+	}
+}
+
+// Test validate
+func TestDNSConfigValidate(t *testing.T) {
+	// Create a DNSConfig instance with Enabled set to true
+	config := &DNSConfig{
+		Enabled:   true,
+		Timeout:   0,
+		RateLimit: "",
+	}
+
+	// Call the validate function
+	config.validate()
+
+	// Check if the Timeout is set to the default value (10)
+	if config.Timeout != 10 {
+		t.Errorf(errExpectedTimeout, 10, config.Timeout)
+	}
+
+	// Check if the RateLimit is set to the default value ("1")
+	if config.RateLimit != "1" {
+		t.Errorf("Expected RateLimit to be \"%d\", got %v", 1, config.RateLimit)
+	}
+
+	// Create a DNSConfig instance with Enabled set to false
+	config = &DNSConfig{
+		Enabled:   false,
+		Timeout:   5,
+		RateLimit: "2",
+	}
+
+	// Call the validate function
+	config.validate()
+
+	// Check if the Timeout remains unchanged
+	if config.Timeout != 5 {
+		t.Errorf(errExpectedTimeout, 5, config.Timeout)
+	}
+
+	// Check if the RateLimit remains unchanged
+	if config.RateLimit != "2" {
+		t.Errorf("Expected RateLimit to be \"%d\", got %v", 2, config.RateLimit)
+	}
+}
+
+// Test validate
+func TestValidateWHOISConfig(t *testing.T) {
+	// Create a WHOISConfig instance with enabled set to true
+	config := &WHOISConfig{
+		Enabled:   true,
+		Timeout:   0,
+		RateLimit: "",
+	}
+
+	// Call the validate function
+	config.validate()
+
+	// Check if the Timeout is set to the default value (10)
+	if config.Timeout != 10 {
+		t.Errorf("Expected Timeout to be %d, got %v", 10, config.Timeout)
+	}
+
+	// Check if the RateLimit is set to the default value ("1")
+	if config.RateLimit != "1" {
+		t.Errorf("Expected RateLimit to be '1', got %v", config.RateLimit)
+	}
+
+	// Create a WHOISConfig instance with enabled set to false
+	config = &WHOISConfig{
+		Enabled:   false,
+		Timeout:   5,
+		RateLimit: "2",
+	}
+
+	// Call the validate function
+	config.validate()
+
+	// Check if the Timeout remains unchanged
+	if config.Timeout != 5 {
+		t.Errorf("Expected Timeout to be 5, got %v", config.Timeout)
+	}
+
+	// Check if the RateLimit remains unchanged
+	if config.RateLimit != "2" {
+		t.Errorf("Expected RateLimit to be '2', got %v", config.RateLimit)
+	}
+}
+
+// Test validate
+func TestNetLookupConfigValidate(t *testing.T) {
+	// Create a NetLookupConfig instance with Enabled set to true
+	config := &NetLookupConfig{
+		Enabled:   true,
+		Timeout:   0,
+		RateLimit: "",
+	}
+
+	// Call the validate method
+	config.validate()
+
+	// Check if the Timeout is set to the default value (10)
+	if config.Timeout != 10 {
+		t.Errorf("Expected Timeout to be 10, got %v", config.Timeout)
+	}
+
+	// Check if the RateLimit is set to the default value ("1")
+	if config.RateLimit != "1" {
+		t.Errorf("Expected RateLimit to be \"1\", got %v", config.RateLimit)
+	}
+
+	// Create a NetLookupConfig instance with Enabled set to false
+	config = &NetLookupConfig{
+		Enabled:   false,
+		Timeout:   5,
+		RateLimit: "2",
+	}
+
+	// Call the validate method
+	config.validate()
+
+	// Check if the Timeout remains unchanged
+	if config.Timeout != 5 {
+		t.Errorf("Expected Timeout to be 5, got %v", config.Timeout)
+	}
+
+	// Check if the RateLimit remains unchanged
+	if config.RateLimit != "2" {
+		t.Errorf("Expected RateLimit to be \"2\", got %v", config.RateLimit)
+	}
+}
+
+// Test validate
+func TestServiceScoutConfigValidate(t *testing.T) {
+	// Create a ServiceScoutConfig instance with enabled set to true
+	config := &ServiceScoutConfig{
+		Enabled: true,
+	}
+
+	// Call the validate function
+	config.validate()
+
+	// Add assertions to check if the validation logic is working correctly
+	// For example, you can check if the timeout validation is performed correctly
+	// by asserting the expected behavior based on the configuration values.
+
+	// Example assertion:
+	if config.Timeout <= 0 {
+		t.Errorf("Expected Timeout to be greater than 0, got %v", config.Timeout)
+	}
+}
+
+// Test validateTimeout
+func TestValidateTimeout(t *testing.T) {
+	// Create a ServiceScoutConfig instance with a timeout less than 1
+	config := &ServiceScoutConfig{
+		Timeout: 0,
+	}
+
+	// Call the validateTimeout function
+	config.validateTimeout()
+
+	// Check if the Timeout is set to the default timeout (SSDefaultTimeout)
+	if config.Timeout != SSDefaultTimeout {
+		t.Errorf("Expected Timeout to be %v, got %v", SSDefaultTimeout, config.Timeout)
+	}
+
+	// Create a ServiceScoutConfig instance with a timeout greater than 1
+	config = &ServiceScoutConfig{
+		Timeout: 10,
+	}
+
+	// Call the validateTimeout function
+	config.validateTimeout()
+
+	// Check if the Timeout remains unchanged
+	if config.Timeout != 10 {
+		t.Errorf("Expected Timeout to be 10, got %v", config.Timeout)
+	}
+}
+
+// Test validateHostTimeout
+func TestValidateHostTimeout(t *testing.T) {
+	// Create a ServiceScoutConfig instance with a non-empty HostTimeout
+	config := &ServiceScoutConfig{
+		HostTimeout: "  10s  ",
+		Timeout:     30,
+	}
+
+	// Call the validateHostTimeout function
+	config.validateHostTimeout()
+
+	// Check if the HostTimeout is trimmed and unchanged
+	if config.HostTimeout != "10s" {
+		t.Errorf("Expected HostTimeout to be '10s', got %v", config.HostTimeout)
+	}
+
+	// Create a ServiceScoutConfig instance with an empty HostTimeout
+	config = &ServiceScoutConfig{
+		HostTimeout: "",
+		Timeout:     30,
+	}
+
+	// Call the validateHostTimeout function
+	config.validateHostTimeout()
+
+	// Calculate the expected HostTimeout value
+	expectedTimeout := fmt.Sprint((config.Timeout - (config.Timeout / 4)))
+
+	// Check if the HostTimeout is set to the expected value
+	if config.HostTimeout != expectedTimeout {
+		t.Errorf("Expected HostTimeout to be %v, got %v", expectedTimeout, config.HostTimeout)
+	}
+}
+
+// Test validateScanDelay
+func TestValidateScanDelay(t *testing.T) {
+	// Create a ServiceScoutConfig instance with an empty ScanDelay
+	config := &ServiceScoutConfig{
+		ScanDelay: "",
+	}
+
+	// Call the validateScanDelay function
+	config.validateScanDelay()
+
+	// Check if the ScanDelay is set to an empty string
+	if config.ScanDelay != "" {
+		t.Errorf("Expected ScanDelay to be an empty string, got %v", config.ScanDelay)
+	}
+
+	// Create a ServiceScoutConfig instance with a non-empty ScanDelay
+	config = &ServiceScoutConfig{
+		ScanDelay: "  10s  ",
+	}
+
+	// Call the validateScanDelay function
+	config.validateScanDelay()
+
+	// Check if the ScanDelay is trimmed and unchanged
+	if config.ScanDelay != "10s" {
+		t.Errorf("Expected ScanDelay to be '10s', got %v", config.ScanDelay)
+	}
+}
+
+// Test validateMaxPortNumber
+func TestValidateMaxPortNumber(t *testing.T) {
+	// Create a config instance with MaxPortNumber less than 1
+	config := &ServiceScoutConfig{
+		MaxPortNumber: 0,
+	}
+
+	// Call the validateMaxPortNumber function
+	config.validateMaxPortNumber()
+
+	// Check if the MaxPortNumber is set to the default value (9000)
+	if config.MaxPortNumber != 9000 {
+		t.Errorf("Expected MaxPortNumber to be 9000, got %v", config.MaxPortNumber)
+	}
+
+	// Create a config instance with MaxPortNumber greater than 65535
+	config = &ServiceScoutConfig{
+		MaxPortNumber: 70000,
+	}
+
+	// Call the validateMaxPortNumber function
+	config.validateMaxPortNumber()
+
+	// Check if the MaxPortNumber is set to the maximum value (65535)
+	if config.MaxPortNumber != 65535 {
+		t.Errorf("Expected MaxPortNumber to be 65535, got %v", config.MaxPortNumber)
+	}
+
+	// Create a config instance with MaxPortNumber within the valid range
+	config = &ServiceScoutConfig{
+		MaxPortNumber: 5000,
+	}
+
+	// Call the validateMaxPortNumber function
+	config.validateMaxPortNumber()
+
+	// Check if the MaxPortNumber remains unchanged
+	if config.MaxPortNumber != 5000 {
+		t.Errorf("Expected MaxPortNumber to be 5000, got %v", config.MaxPortNumber)
+	}
+}
+
+// Test validateTimingTemplate
+func TestValidateTimingTemplate(t *testing.T) {
+	// Create a ServiceScoutConfig instance with an empty TimingTemplate
+	config := &ServiceScoutConfig{
+		TimingTemplate: "",
+	}
+
+	// Call the validateTimingTemplate function
+	config.validateTimingTemplate()
+
+	// Check if the TimingTemplate is set to the default value
+	expected := fmt.Sprint(SSDefaultTimeProfile)
+	if config.TimingTemplate != expected {
+		t.Errorf("Expected TimingTemplate to be %q, got %q", expected, config.TimingTemplate)
+	}
+
+	// Create a ServiceScoutConfig instance with a non-empty TimingTemplate
+	config = &ServiceScoutConfig{
+		TimingTemplate: "  template  ",
+	}
+
+	// Call the validateTimingTemplate function
+	config.validateTimingTemplate()
+
+	// Check if the TimingTemplate is trimmed and unchanged
+	expected = "template"
+	if config.TimingTemplate != expected {
+		t.Errorf("Expected TimingTemplate to be %q, got %q", expected, config.TimingTemplate)
+	}
+}
+
+// Test validate
+func TestValidateGeoLookupConfig(t *testing.T) {
+	// Create a GeoLookupConfig instance with Enabled set to true
+	config := &GeoLookupConfig{
+		Enabled: true,
+		Type:    "  ",
+		DBPath:  "  ",
+	}
+
+	// Call the validate function
+	config.validate()
+
+	// Check if the Type is set to the default value "maxmind"
+	if config.Type != "maxmind" {
+		t.Errorf("Expected Type to be 'maxmind', got %v", config.Type)
+	}
+
+	// Check if the DBPath is set to the default value "./data/GeoLite2-City.mmdb"
+	if config.DBPath != "./data/GeoLite2-City.mmdb" {
+		t.Errorf("Expected DBPath to be './data/GeoLite2-City.mmdb', got %v", config.DBPath)
+	}
+
+	// Create a GeoLookupConfig instance with Enabled set to false
+	config = &GeoLookupConfig{
+		Enabled: false,
+		Type:    "geolite",
+		DBPath:  "/path/to/database",
+	}
+
+	// Call the validate function
+	config.validate()
+
+	// Check if the Type remains unchanged
+	if config.Type != "geolite" {
+		t.Errorf("Expected Type to be 'geolite', got %v", config.Type)
+	}
+
+	// Check if the DBPath remains unchanged
+	if config.DBPath != "/path/to/database" {
+		t.Errorf("Expected DBPath to be '/path/to/database', got %v", config.DBPath)
+	}
+}
+
+// Test IsEmpty
+func TestServiceScoutConfigIsEmpty(t *testing.T) {
+	// Create a non-empty ServiceScoutConfig
+	nonEmptyConfig := &ServiceScoutConfig{
+		Enabled:          true,
+		Timeout:          10,
+		OSFingerprinting: true,
+		ServiceDetection: true,
+	}
+
+	// Call the IsEmpty function with the non-empty config
+	isEmpty := nonEmptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns false for a non-empty config
+	if isEmpty {
+		t.Errorf("%s", errExpectedFalse)
+	}
+
+	// Create an empty ServiceScoutConfig
+	emptyConfig := &ServiceScoutConfig{}
+
+	// Call the IsEmpty function with the empty config
+	isEmpty = emptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns true for an empty config
+	if !isEmpty {
+		t.Errorf("%s", errExpectedTrue)
+	}
+}
+
+// Test IsEmpty
+func TestExecutionPlanItemIsEmpty(t *testing.T) {
+	// Create an empty ExecutionPlanItem
+	emptyItem := &ExecutionPlanItem{}
+
+	// Call the IsEmpty function on the empty item
+	isEmpty := emptyItem.IsEmpty()
+
+	// Check if the IsEmpty function returns true for an empty item
+	if !isEmpty {
+		t.Errorf("%s", errExpectedTrue)
+	}
+
+	// Create a non-empty ExecutionPlanItem
+	nonEmptyItem := &ExecutionPlanItem{
+		Rulesets:   []string{"ruleset1", "ruleset2"},
+		RuleGroups: []string{"group1", "group2"},
+		Rules:      []string{"rule1", "rule2"},
+	}
+
+	// Call the IsEmpty function on the non-empty item
+	isEmpty = nonEmptyItem.IsEmpty()
+
+	// Check if the IsEmpty function returns false for a non-empty item
+	if isEmpty {
+		t.Errorf("%s", errExpectedFalse)
+	}
+}
+
+// Test IsEmpty
+func TestSourceConfigIsEmpty(t *testing.T) {
+	// Create a nil SourceConfig
+	var sc *SourceConfig
+
+	// Call the IsEmpty function with the nil SourceConfig
+	isEmpty := sc.IsEmpty()
+
+	// Check if the IsEmpty function returns true for a nil SourceConfig
+	if !isEmpty {
+		t.Errorf("%s", errExpectedTrue)
+	}
+
+	// Create a non-nil SourceConfig with a nil ExecutionPlan
+	sc = &SourceConfig{
+		ExecutionPlan: nil,
+	}
+
+	// Call the IsEmpty function with the non-nil SourceConfig
+	isEmpty = sc.IsEmpty()
+
+	// Check if the IsEmpty function returns true for a non-nil SourceConfig with a nil ExecutionPlan
+	if !isEmpty {
+		t.Errorf("%s", errExpectedTrue)
+	}
+}
+
+type MockFetcher struct {
+	Body string
+	Err  error
+}
+
+func (m *MockFetcher) FetchRemoteFile(url string, timeout int, sslMode string) (string, error) {
+	if m.Err != nil {
+		return "", m.Err
+	}
+	return m.Body, nil
+}
+
+func TestLoadRemoteConfig(t *testing.T) {
+	cases := []struct {
+		name      string
+		cfg       Config
+		mockBody  string
+		mockErr   error
+		expectErr bool
+		validate  func(t *testing.T, cfg Config, err error)
+	}{
+		{
+			name: "empty remote config",
+			cfg: Config{
+				Remote: Remote{}, // Explicitly empty to trigger the expected error
+			},
+			mockBody:  "",
+			mockErr:   nil,
+			expectErr: true,
+			validate: func(t *testing.T, cfg Config, err error) {
+				if err == nil {
+					t.Errorf("expected an error, got none")
+				}
+			},
+		},
+		{
+			name: "valid remote config fetch",
+			cfg: Config{
+				Remote: Remote{
+					Host:    testURL,
+					Path:    "config.yaml",
+					Timeout: 10,
+					SSLMode: cmn.DisableStr,
+				},
+			},
+			mockBody:  "remote_content: valid",
+			mockErr:   nil,
+			expectErr: false,
+			validate: func(t *testing.T, cfg Config, err error) {
+				if err != nil {
+					t.Errorf("did not expect an error, got %v", err)
+				}
+			},
+		},
+		{
+			name: "network error",
+			cfg: Config{
+				Remote: Remote{
+					Host:    testURL,
+					Path:    "config.yaml",
+					Timeout: 10,
+					SSLMode: cmn.DisableStr,
+				},
+			},
+			mockBody:  "",
+			mockErr:   fmt.Errorf("network failure"),
+			expectErr: true,
+			validate: func(t *testing.T, cfg Config, err error) {
+				if err == nil {
+					t.Errorf("expected an error, got none")
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &MockFetcher{Body: tc.mockBody, Err: tc.mockErr}
+			resultCfg, err := LoadRemoteConfig(tc.cfg, fetcher)
+
+			if (err != nil) != tc.expectErr {
+				t.Errorf("expected error: %v, got: %v", tc.expectErr, err != nil)
+			}
+
+			tc.validate(t, resultCfg, err)
+		})
+	}
+}
+
+// Test IsEmpty
+func TestDNSConfigIsEmpty(t *testing.T) {
+	// Create a non-empty config
+	nonEmptyConfig := DNSConfig{
+		Enabled: true,
+	}
+
+	// Call the IsEmpty function with the non-empty config
+	isEmpty := nonEmptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns false for a non-empty config
+	if isEmpty {
+		t.Errorf("Expected IsEmpty to return false for a non-empty DNSConfig")
+	}
+
+	// Create an empty config
+	emptyConfig := DNSConfig{}
+
+	// Call the IsEmpty function with the empty config
+	isEmpty = emptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns true for an empty config
+	if !isEmpty {
+		t.Errorf("Expected IsEmpty to return true for an empty DNSConfig")
+	}
+}
+
+func TestWHOISConfigIsEmpty(t *testing.T) {
+	// Create a non-empty config
+	nonEmptyConfig := WHOISConfig{
+		Enabled: true,
+	}
+
+	// Call the IsEmpty function with the non-empty config
+	isEmpty := nonEmptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns false for a non-empty config
+	if isEmpty {
+		t.Errorf("Expected IsEmpty to return false for a non-empty WHOISConfig")
+	}
+
+	// Create an empty config
+	emptyConfig := WHOISConfig{}
+
+	// Call the IsEmpty function with the empty config
+	isEmpty = emptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns true for an empty config
+	if !isEmpty {
+		t.Errorf("Expected IsEmpty to return true for an empty WHOISConfig")
+	}
+}
+func TestNetLookupConfigIsEmpty(t *testing.T) {
+	// Create a non-empty config
+	nonEmptyConfig := NetLookupConfig{
+		Enabled: true,
+	}
+
+	// Call the IsEmpty function with the non-empty config
+	isEmpty := nonEmptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns false for a non-empty config
+	if isEmpty {
+		t.Errorf("Expected IsEmpty to return false for a non-empty NetLookupConfig")
+	}
+
+	// Create an empty config
+	emptyConfig := NetLookupConfig{}
+
+	// Call the IsEmpty function with the empty config
+	isEmpty = emptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns true for an empty config
+	if !isEmpty {
+		t.Errorf("Expected IsEmpty to return true for an empty NetLookupConfig")
+	}
+}
+
+func TestGeoLookupConfigIsEmpty(t *testing.T) {
+	// Create a non-empty config
+	nonEmptyConfig := GeoLookupConfig{
+		Enabled: true,
+	}
+
+	// Call the IsEmpty function with the non-empty config
+	isEmpty := nonEmptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns false for a non-empty config
+	if isEmpty {
+		t.Errorf("Expected IsEmpty to return false for a non-empty GeoLookupConfig")
+	}
+
+	// Create an empty config
+	emptyConfig := GeoLookupConfig{}
+
+	// Call the IsEmpty function with the empty config
+	isEmpty = emptyConfig.IsEmpty()
+
+	// Check if the IsEmpty function returns true for an empty config
+	if !isEmpty {
+		t.Errorf("Expected IsEmpty to return true for an empty GeoLookupConfig")
+	}
+}
+
+func TestInformationSeedDefaultsAndValidation(t *testing.T) {
+	cfg := NewConfig()
+	if cfg == nil {
+		t.Fatal("expected NewConfig to return non-nil config")
+	}
+	if cfg.InformationSeed.Enabled {
+		t.Fatal("expected information_seed.enabled default to false")
+	}
+	if cfg.InformationSeed.QueryTimer != informationSeedDefaultQueryTimer {
+		t.Errorf(errExpected, informationSeedDefaultQueryTimer, cfg.InformationSeed.QueryTimer)
+	}
+	if cfg.InformationSeed.PluginLimits.MaxOutputSizeBytes != informationSeedDefaultPluginOutputSize {
+		t.Errorf(errExpected, informationSeedDefaultPluginOutputSize, cfg.InformationSeed.PluginLimits.MaxOutputSizeBytes)
+	}
+
+	cfg.InformationSeed = InformationSeedConfig{
+		Enabled:              true,
+		QueryTimer:           -1,
+		MaxConcurrentSeeds:   1000,
+		MaxQueriesPerSeed:    2,
+		MaxCandidatesPerSeed: 0,
+		RetryInterval:        999999,
+		ProcessingTimeout:    " 1 hour ",
+		ProviderAllowList:    []string{" Example ", "example", " plugin "},
+		Providers: map[string]InformationSeedProviderConfig{
+			" Example ": {
+				Host:        " https://api.example.com ",
+				Endpoint:    " /v1/search ",
+				APIKeyLabel: " X-API-Key ",
+				Timeout:     999,
+				MaxRequests: 999,
+				Parameters:  map[string]string{" api_key ": " ${INFORMATION_SEED_API_KEY} ", "": "ignored"},
+				Headers:     map[string]string{" Authorization ": " Bearer ${INFORMATION_SEED_TOKEN} ", " ": "ignored"},
+				PageSize:    999,
+				MaxPages:    999,
+			},
+			"blocked": {
+				Timeout:     10,
+				MaxRequests: 1,
+			},
+		},
+		PluginLimits: InformationSeedPluginLimitsConfig{
+			Timeout:            0,
+			MaxOutputSizeBytes: 99999999,
+		},
+	}
+
+	cfg.validateInformationSeed()
+
+	if cfg.InformationSeed.QueryTimer != informationSeedDefaultQueryTimer {
+		t.Errorf(errExpected, informationSeedDefaultQueryTimer, cfg.InformationSeed.QueryTimer)
+	}
+	if cfg.InformationSeed.MaxConcurrentSeeds != informationSeedMaxConcurrentSeeds {
+		t.Errorf(errExpected, informationSeedMaxConcurrentSeeds, cfg.InformationSeed.MaxConcurrentSeeds)
+	}
+	if cfg.InformationSeed.MaxQueriesPerSeed != 2 {
+		t.Errorf(errExpected, 2, cfg.InformationSeed.MaxQueriesPerSeed)
+	}
+	if cfg.InformationSeed.MaxCandidatesPerSeed != informationSeedDefaultMaxCandidatesPerSeed {
+		t.Errorf(errExpected, informationSeedDefaultMaxCandidatesPerSeed, cfg.InformationSeed.MaxCandidatesPerSeed)
+	}
+	if cfg.InformationSeed.RetryInterval != informationSeedMaxRetryInterval {
+		t.Errorf(errExpected, informationSeedMaxRetryInterval, cfg.InformationSeed.RetryInterval)
+	}
+	if cfg.InformationSeed.ProcessingTimeout != "1 hour" {
+		t.Errorf(errExpected, "1 hour", cfg.InformationSeed.ProcessingTimeout)
+	}
+	if !reflect.DeepEqual(cfg.InformationSeed.ProviderAllowList, []string{"example", "plugin"}) {
+		t.Errorf(errExpected, []string{"example", "plugin"}, cfg.InformationSeed.ProviderAllowList)
+	}
+	if _, exists := cfg.InformationSeed.Providers["blocked"]; exists {
+		t.Fatal("expected provider outside allow-list to be removed")
+	}
+	provider, exists := cfg.InformationSeed.Providers["example"]
+	if !exists {
+		t.Fatal("expected normalized example provider to remain")
+	}
+	if provider.Provider != "example" {
+		t.Errorf(errExpected, "example", provider.Provider)
+	}
+	if provider.Timeout != informationSeedMaxPluginTimeout {
+		t.Errorf(errExpected, informationSeedMaxPluginTimeout, provider.Timeout)
+	}
+	if provider.MaxRequests != cfg.InformationSeed.MaxQueriesPerSeed {
+		t.Errorf(errExpected, cfg.InformationSeed.MaxQueriesPerSeed, provider.MaxRequests)
+	}
+	if provider.PageSize != informationSeedMaxProviderPageSize {
+		t.Errorf(errExpected, informationSeedMaxProviderPageSize, provider.PageSize)
+	}
+	if provider.MaxPages != provider.MaxRequests {
+		t.Errorf(errExpected, provider.MaxRequests, provider.MaxPages)
+	}
+	if !reflect.DeepEqual(provider.Parameters, map[string]string{"api_key": "${INFORMATION_SEED_API_KEY}"}) {
+		t.Errorf(errExpected, map[string]string{"api_key": "${INFORMATION_SEED_API_KEY}"}, provider.Parameters)
+	}
+	if !reflect.DeepEqual(provider.Headers, map[string]string{"Authorization": "Bearer ${INFORMATION_SEED_TOKEN}"}) {
+		t.Errorf(errExpected, map[string]string{"Authorization": "Bearer ${INFORMATION_SEED_TOKEN}"}, provider.Headers)
+	}
+	if cfg.InformationSeed.PluginLimits.Timeout != informationSeedDefaultPluginTimeout {
+		t.Errorf(errExpected, informationSeedDefaultPluginTimeout, cfg.InformationSeed.PluginLimits.Timeout)
+	}
+	if cfg.InformationSeed.PluginLimits.MaxOutputSizeBytes != informationSeedMaxPluginOutputSize {
+		t.Errorf(errExpected, informationSeedMaxPluginOutputSize, cfg.InformationSeed.PluginLimits.MaxOutputSizeBytes)
+	}
+
+	cfg.InformationSeed.ProviderAllowList = nil
+	cfg.InformationSeed.Providers = map[string]InformationSeedProviderConfig{
+		"example": {Timeout: 10, MaxRequests: 1},
+	}
+	cfg.validateInformationSeed()
+	if len(cfg.InformationSeed.Providers) != 0 {
+		t.Fatalf("expected empty information_seed.provider_allow_list to remove configured providers, got %v", cfg.InformationSeed.Providers)
+	}
+}
+
+func TestInformationSeedProviderMapCopyIsolation(t *testing.T) {
+	original := NewConfig()
+	original.InformationSeed.ProviderAllowList = []string{"example"}
+	original.InformationSeed.Providers = map[string]InformationSeedProviderConfig{
+		"example": {
+			Parameters: map[string]string{"api_key": "${INFORMATION_SEED_API_KEY}"},
+			Headers:    map[string]string{"Authorization": "Bearer ${INFORMATION_SEED_TOKEN}"},
+			Browser: InformationSeedBrowserConfig{
+				VDIAllowList:           []string{"primary"},
+				InitialActions:         []string{"init"},
+				ConsentActions:         []string{"consent"},
+				QueryActions:           []string{"query"},
+				PaginationActions:      []string{"next"},
+				ScrapingRules:          []string{"extract"},
+				AllowedNavigationHosts: []string{"example.com"},
+			},
+		},
+	}
+
+	clone := DeepCopyConfig(original)
+	clone.InformationSeed.Providers["example"].Parameters["api_key"] = "changed"
+	clone.InformationSeed.Providers["example"].Headers["Authorization"] = "changed"
+	cloneProvider := clone.InformationSeed.Providers["example"]
+	cloneProvider.Browser.VDIAllowList[0] = "changed"
+	cloneProvider.Browser.InitialActions[0] = "changed"
+	cloneProvider.Browser.ConsentActions[0] = "changed"
+	cloneProvider.Browser.QueryActions[0] = "changed"
+	cloneProvider.Browser.PaginationActions[0] = "changed"
+	cloneProvider.Browser.ScrapingRules[0] = "changed"
+	cloneProvider.Browser.AllowedNavigationHosts[0] = "changed"
+
+	if got := original.InformationSeed.Providers["example"].Parameters["api_key"]; got != "${INFORMATION_SEED_API_KEY}" {
+		t.Fatalf("parameters map was aliased, got %q", got)
+	}
+	if got := original.InformationSeed.Providers["example"].Headers["Authorization"]; got != "Bearer ${INFORMATION_SEED_TOKEN}" {
+		t.Fatalf("headers map was aliased, got %q", got)
+	}
+	originalBrowser := original.InformationSeed.Providers["example"].Browser
+	if originalBrowser.VDIAllowList[0] != "primary" || originalBrowser.InitialActions[0] != "init" || originalBrowser.ConsentActions[0] != "consent" || originalBrowser.QueryActions[0] != "query" || originalBrowser.PaginationActions[0] != "next" || originalBrowser.ScrapingRules[0] != "extract" || originalBrowser.AllowedNavigationHosts[0] != "example.com" {
+		t.Fatalf("browser config slices were aliased: %#v", originalBrowser)
+	}
+
+	// Remove the browser-only fixture before checking legacy HTTP validation isolation.
+	provider := original.InformationSeed.Providers["example"]
+	provider.Browser = InformationSeedBrowserConfig{}
+	original.InformationSeed.Providers["example"] = provider
+	sourceParams := original.InformationSeed.Providers["example"].Parameters
+	sourceHeaders := original.InformationSeed.Providers["example"].Headers
+	original.validateInformationSeed()
+	sourceParams["api_key"] = "changed after validation"
+	sourceHeaders["Authorization"] = "changed after validation"
+	if got := original.InformationSeed.Providers["example"].Parameters["api_key"]; got != "${INFORMATION_SEED_API_KEY}" {
+		t.Fatalf("validated parameters map should be isolated from input map, got %q", got)
+	}
+	if got := original.InformationSeed.Providers["example"].Headers["Authorization"]; got != "Bearer ${INFORMATION_SEED_TOKEN}" {
+		t.Fatalf("validated headers map should be isolated from input map, got %q", got)
+	}
+}
+
+func TestTimeSeriesDefaultsAndBackwardCompatibility(t *testing.T) {
+	cfg, err := ParseConfig([]byte("crawler:\n  workers: 1\n"))
+	if err != nil {
+		t.Fatalf("configuration without timeseries must remain valid: %v", err)
+	}
+	if cfg.TimeSeries.Enabled {
+		t.Fatal("timeseries must be disabled by default")
+	}
+	if cfg.TimeSeries.Defaults.FailurePolicy != TimeSeriesFailureLogSkip {
+		t.Fatalf("expected safe failure policy %q, got %q", TimeSeriesFailureLogSkip, cfg.TimeSeries.Defaults.FailurePolicy)
+	}
+	if cfg.TimeSeries.Cardinality.MaxSeriesPerMetric < 1 || cfg.TimeSeries.Privacy.MaxValueLength < 1 {
+		t.Fatal("expected explicit bounded cardinality and privacy defaults")
+	}
+}
+
+func TestTimeSeriesYAMLAndJSONDeserializeEquivalently(t *testing.T) {
+	yamlConfig := []byte(`timeseries:
+  enabled: true
+  metrics:
+    - key: response_time
+      enabled: true
+      source_kind: object_attribute
+      object_type: httpinfo
+      selector:
+        attribute_key: response_time_ms
+      value_type: duration
+      aggregates: [count, average, p95]
+      time_basis: source_timestamp
+      timestamp_selector:
+        path: captured_at
+      dimensions:
+        - key: status
+          selector:
+            path: status_code
+`)
+	jsonConfig := []byte(`{"timeseries":{"enabled":true,"metrics":[{"key":"response_time","enabled":true,"source_kind":"object_attribute","object_type":"httpinfo","selector":{"attribute_key":"response_time_ms"},"value_type":"duration","aggregates":["count","average","p95"],"time_basis":"source_timestamp","timestamp_selector":{"path":"captured_at"},"dimensions":[{"key":"status","selector":{"path":"status_code"}}]}]}}`)
+	yamlParsed, err := ParseConfig(yamlConfig)
+	if err != nil {
+		t.Fatalf("parse YAML: %v", err)
+	}
+	jsonParsed, err := ParseConfig(jsonConfig)
+	if err != nil {
+		t.Fatalf("parse JSON: %v", err)
+	}
+	if !reflect.DeepEqual(yamlParsed.TimeSeries, jsonParsed.TimeSeries) {
+		t.Fatalf("YAML and JSON differ:\nYAML: %#v\nJSON: %#v", yamlParsed.TimeSeries, jsonParsed.TimeSeries)
+	}
+}
+
+func TestTimeSeriesFailIndexingPolicyAccepted(t *testing.T) {
+	data := []byte("timeseries:\n  metrics:\n    - {key: sample, source_kind: keyword, failure_policy: fail_indexing}\n")
+	if _, err := ParseConfig(data); err != nil {
+		t.Fatalf("fail_indexing should be available to production emitters: %v", err)
+	}
+}
+
+func TestTimeSeriesValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		metric  string
+		wantErr string
+	}{
+		{"duplicate keys", `- {key: same, source_kind: keyword}
+    - {key: same, source_kind: keyword}`, "duplicate key"},
+		{"empty key", `- {key: "", source_kind: keyword}`, "key: must not be empty"},
+		{"source enum", `- {key: sample, source_kind: invalid}`, "source_kind: invalid value"},
+		{"metatag selector", `- {key: sample, source_kind: metatag}`, "selector.metatag_name"},
+		{"attribute selector", `- {key: sample, source_kind: object_attribute, object_type: webobject}`, "selector.attribute_key"},
+		{"object type required", `- {key: sample, source_kind: object_attribute, selector: {attribute_key: score}}`, "object_type: invalid value"},
+		{"object type inapplicable", `- {key: sample, source_kind: keyword, object_type: webobject}`, "object_type: only applies"},
+		{"timestamp selector", `- {key: sample, source_kind: keyword, time_basis: event_at}`, "timestamp_selector"},
+		{"aggregate compatibility", `- {key: sample, source_kind: keyword, value_type: string, aggregates: [sum]}`, "requires integer, decimal, or duration"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte("timeseries:\n  metrics:\n    " + tc.metric + "\n")
+			_, err := ParseConfig(data)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestTimeSeriesInvalidEnums(t *testing.T) {
+	tests := map[string]string{
+		"value_type":      "invalid",
+		"bucket_interval": "invalid",
+		"time_basis":      "invalid",
+		"dedupe_scope":    "invalid",
+		"failure_policy":  "invalid",
+	}
+	for field, value := range tests {
+		t.Run(field, func(t *testing.T) {
+			data := []byte(fmt.Sprintf("timeseries:\n  metrics:\n    - key: sample\n      source_kind: keyword\n      %s: %s\n", field, value))
+			_, err := ParseConfig(data)
+			if err == nil || !strings.Contains(err.Error(), "timeseries.metrics[0]."+field) {
+				t.Fatalf("expected field-specific enum error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestTimeSeriesPrivacyAndCardinalityValidation(t *testing.T) {
+	data := []byte(`timeseries:
+  cardinality:
+    max_series_per_metric: 10000001
+    overflow: invalid
+  privacy:
+    hash_only: true
+    store_value_text: true
+    max_value_length: 1048577
+    redact_patterns: ["["]
+`)
+	_, err := ParseConfig(data)
+	if err == nil {
+		t.Fatal("expected invalid privacy/cardinality configuration to fail")
+	}
+	for _, want := range []string{"max_series_per_metric", "overflow", "max_value_length", "hash_only", "redact_patterns[0]"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected error to contain %q: %v", want, err)
+		}
+	}
+}
+
+func TestInformationSeedWebDriverProviderConfigYAMLAndJSON(t *testing.T) {
+	yamlConfig := []byte(`
+information_seed:
+  enabled: true
+  max_queries_per_seed: 3
+  max_candidates_per_seed: 20
+  provider_allow_list: [browser]
+  providers:
+    browser:
+      provider: browser_search
+      transport: webdriver
+      host: https://search.example.invalid
+      page_size: 30
+      max_pages: 99
+      max_requests: 99
+      browser:
+        vdi_allow_list: [Primary, primary, Secondary]
+        navigation_timeout: 999
+        page_readiness_timeout: 999
+        hbs_enabled: true
+        selenium_fallback: true
+        initial_actions: [init, " init "]
+        consent_actions: [consent]
+        query_actions: [query]
+        pagination_actions: [next]
+        scraping_rules: [extract, " extract "]
+        allowed_navigation_hosts: [Example.COM, "*.Example.COM"]
+        max_pages: 99
+        max_requests: 99
+        max_candidates: 99
+        screenshot_on_error: true
+`)
+	jsonConfig := []byte(`{
+  "information_seed": {
+    "enabled": true,
+    "max_queries_per_seed": 3,
+    "max_candidates_per_seed": 20,
+    "provider_allow_list": ["browser"],
+    "providers": {
+      "browser": {
+        "provider": "browser_search",
+        "transport": "webdriver",
+        "host": "https://search.example.invalid",
+        "page_size": 30,
+        "max_pages": 99,
+        "max_requests": 99,
+        "browser": {
+          "vdi_allow_list": ["Primary", "primary", "Secondary"],
+          "navigation_timeout": 999,
+          "page_readiness_timeout": 999,
+          "hbs_enabled": true,
+          "selenium_fallback": true,
+          "initial_actions": ["init", " init "],
+          "consent_actions": ["consent"],
+          "query_actions": ["query"],
+          "pagination_actions": ["next"],
+          "scraping_rules": ["extract", " extract "],
+          "allowed_navigation_hosts": ["Example.COM", "*.Example.COM"],
+          "max_pages": 99,
+          "max_requests": 99,
+          "max_candidates": 99,
+          "screenshot_on_error": true
+        }
+      }
+    }
+  }
+}`)
+
+	yamlParsed, err := ParseConfig(yamlConfig)
+	if err != nil {
+		t.Fatalf("parse yaml webdriver config: %v", err)
+	}
+	jsonParsed, err := ParseConfig(jsonConfig)
+	if err != nil {
+		t.Fatalf("parse json webdriver config: %v", err)
+	}
+
+	yamlProvider := yamlParsed.InformationSeed.Providers["browser"]
+	jsonProvider := jsonParsed.InformationSeed.Providers["browser"]
+	if !reflect.DeepEqual(yamlProvider, jsonProvider) {
+		t.Fatalf("YAML and JSON provider configs differ:\nYAML: %#v\nJSON: %#v", yamlProvider, jsonProvider)
+	}
+	if yamlProvider.Transport != "webdriver" {
+		t.Fatalf("expected webdriver transport, got %q", yamlProvider.Transport)
+	}
+	if yamlProvider.MaxRequests != 3 || yamlProvider.MaxPages != 3 {
+		t.Fatalf("expected provider caps clamped to global query cap, got requests=%d pages=%d", yamlProvider.MaxRequests, yamlProvider.MaxPages)
+	}
+	browser := yamlProvider.Browser
+	if browser.NavigationTimeout != informationSeedMaxBrowserNavigationTimeout || browser.PageReadinessTimeout != informationSeedMaxBrowserReadinessTimeout {
+		t.Fatalf("expected timeout caps, got %#v", browser)
+	}
+	if browser.MaxRequests != 3 || browser.MaxPages != 3 || browser.MaxCandidates != 20 {
+		t.Fatalf("expected browser caps clamped to global caps, got %#v", browser)
+	}
+	if !reflect.DeepEqual(browser.VDIAllowList, []string{"primary", "secondary"}) {
+		t.Fatalf("unexpected VDI allow list normalization: %#v", browser.VDIAllowList)
+	}
+	if !reflect.DeepEqual(browser.ScrapingRules, []string{"extract"}) || !reflect.DeepEqual(browser.AllowedNavigationHosts, []string{"example.com", "*.example.com"}) {
+		t.Fatalf("unexpected rule/host normalization: rules=%#v hosts=%#v", browser.ScrapingRules, browser.AllowedNavigationHosts)
+	}
+}
+
+func TestInformationSeedProviderTransportValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string
+	}{
+		{
+			name: "unknown transport",
+			config: `
+information_seed:
+  provider_allow_list: [bad]
+  providers:
+    bad:
+      transport: browser
+`,
+			wantErr: "unknown transport",
+		},
+		{
+			name: "webdriver requires scraping rules",
+			config: `
+information_seed:
+  provider_allow_list: [bad]
+  providers:
+    bad:
+      transport: webdriver
+`,
+			wantErr: "requires at least one scraping rule",
+		},
+		{
+			name: "unsafe navigation host",
+			config: `
+information_seed:
+  provider_allow_list: [bad]
+  providers:
+    bad:
+      transport: webdriver
+      browser:
+        scraping_rules: [extract]
+        allowed_navigation_hosts: ["*"]
+`,
+			wantErr: "unsafe allowed navigation host pattern",
+		},
+		{
+			name: "privileged override",
+			config: `
+information_seed:
+  provider_allow_list: [bad]
+  providers:
+    bad:
+      transport: webdriver
+      parameters:
+        set_vdi_gpu_patch: true
+      browser:
+        scraping_rules: [extract]
+`,
+			wantErr: "privileged browser override",
+		},
+		{
+			name: "typed privileged override",
+			config: `
+information_seed:
+  provider_allow_list: [bad]
+  providers:
+    bad:
+      transport: webdriver
+      browser:
+        scraping_rules: [extract]
+        browser_type: 1
+`,
+			wantErr: "privileged browser overrides",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(tc.config))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestInformationSeedHTTPTransportDefaultAndWebDriverOptIn(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`
+information_seed:
+  provider_allow_list: [legacy]
+  providers:
+    legacy:
+      provider: http_json
+`))
+	if err != nil {
+		t.Fatalf("parse legacy provider: %v", err)
+	}
+	provider := cfg.InformationSeed.Providers["legacy"]
+	if provider.Transport != "http" {
+		t.Fatalf("expected default http transport, got %q", provider.Transport)
+	}
+
+	_, err = ParseConfig([]byte(`
+information_seed:
+  provider_allow_list: [implicit]
+  providers:
+    implicit:
+      browser:
+        scraping_rules: [extract]
+`))
+	if err == nil || !strings.Contains(err.Error(), "requires explicit transport") {
+		t.Fatalf("expected browser config without webdriver opt-in to fail, got %v", err)
+	}
+}
+
+// TestTransactionTimeoutValidation covers the database.transaction_timeout
+// clamping rules enforced by validateDatabase.
+func TestTransactionTimeoutValidation(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input int
+		want  int
+	}{
+		{name: "zero falls back to default", input: 0, want: DefaultTransactionTimeoutSeconds},
+		{name: "below minimum falls back to default", input: 10, want: DefaultTransactionTimeoutSeconds},
+		{name: "minimum is kept", input: 30, want: 30},
+		{name: "valid value is kept", input: 600, want: 600},
+		{name: "above maximum is clamped", input: 100000, want: 86400},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := &Config{Database: Database{TransactionTimeout: test.input}}
+			c.validateDatabase()
+			if c.Database.TransactionTimeout != test.want {
+				t.Fatalf("TransactionTimeout = %d, want %d", c.Database.TransactionTimeout, test.want)
+			}
+		})
+	}
+}
+
+// TestTransactionTimeoutSchema keeps the JSON schema in sync with the Go
+// validation rules for database.transaction_timeout.
+func TestTransactionTimeoutSchema(t *testing.T) {
+	schemaData, err := os.ReadFile("../../schemas/crowler-config-schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schemaDocument struct {
+		Properties map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaData, &schemaDocument); err != nil {
+		t.Fatal(err)
+	}
+	timeoutSchema := schemaDocument.Properties["database"].Properties["transaction_timeout"]
+	if len(timeoutSchema) == 0 {
+		t.Fatal("transaction_timeout schema not found")
+	}
+	schema := &jsonschema.Schema{}
+	if err := schema.UnmarshalJSON(timeoutSchema); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		value      int
+		wantIssues bool
+	}{
+		{name: "minimum", value: 30},
+		{name: "default", value: 300},
+		{name: "maximum", value: 86400},
+		{name: "below minimum", value: 29, wantIssues: true},
+		{name: "above maximum", value: 86401, wantIssues: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			document := []byte(fmt.Sprintf(`%d`, test.value))
+			issues, err := schema.ValidateBytes(context.Background(), document)
+			if err != nil {
+				t.Fatalf("schema validation error: %v", err)
+			}
+			if gotIssues := len(issues) != 0; gotIssues != test.wantIssues {
+				t.Fatalf("schema returned issues = %v, want issues = %v: %v", gotIssues, test.wantIssues, issues)
+			}
+		})
+	}
+}

@@ -1,0 +1,80 @@
+package pivot
+
+import (
+	"fmt"
+	"net/url"
+	"strings"
+
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	"github.com/chainreactors/IoM-go/proto/services/clientrpc"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/spf13/cobra"
+)
+
+func RemDialCmd(cmd *cobra.Command, con *core.Console) error {
+	pid := cmd.Flags().Arg(0)
+	args := cmd.Flags().Args()[1:]
+	task, err := RemDial(con.Rpc, con.GetInteractive(), pid, args)
+	con.GetInteractive().Console(task, string(*con.App.Shell().Line()))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func GetRemLink(con *core.Console, pipe string) (string, error) {
+	// direct link mode: contains "://" means it's already a link address
+	if strings.Contains(pipe, "://") {
+		return pipe, nil
+	}
+	remPipe, err := common.FindCachedPipeline(con, pipe, func(pipeline *clientpb.Pipeline) bool {
+		return pipeline.GetRem() != nil && pipeline.GetRem().GetLink() != ""
+	})
+	if err != nil {
+		if _, cachedErr := common.FindCachedPipeline(con, pipe, func(candidate *clientpb.Pipeline) bool {
+			return candidate.GetRem() != nil
+		}); cachedErr == nil {
+			return "", fmt.Errorf("REM pipeline %q has no link address (not started?)", pipe)
+		}
+		return "", err
+	}
+	link := remPipe.GetRem().Link
+	if link == "" {
+		return "", fmt.Errorf("REM pipeline %q has no link address (not started?)", pipe)
+	}
+	return link, nil
+}
+
+func FormatRemCmdLine(con *core.Console, pipe, mod string, remote, local *url.URL) ([]string, error) {
+	remLink, err := GetRemLink(con, pipe)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"-c", remLink}
+	args = append(args, "-m", mod)
+	if remote != nil {
+		args = append(args, "-r", remote.String())
+	}
+	if local != nil {
+		args = append(args, "-l", local.String())
+	}
+	return args, nil
+}
+
+func RemDial(rpc clientrpc.MaliceRPCClient, session *client.Session, pid string, args []string) (*clientpb.Task, error) {
+	task, err := rpc.RemDial(session.Context(), &implantpb.Request{
+		Name: consts.ModuleRemDial,
+		Args: args,
+		Params: map[string]string{
+			"pipeline_id": pid,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return task, err
+}

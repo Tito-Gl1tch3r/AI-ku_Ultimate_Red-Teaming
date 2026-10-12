@@ -1,0 +1,190 @@
+package taskschd
+
+import (
+	"github.com/carapace-sh/carapace"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+func Commands(con *core.Console) []*cobra.Command {
+	taskschdCmd := &cobra.Command{
+		Use:   consts.CommandTaskSchd,
+		Short: "Manage scheduled tasks",
+		Long:  "Perform operations related to scheduled tasks, including listing, creating, starting, stopping, and deleting tasks.",
+		Annotations: map[string]string{
+			"depend": consts.ModuleTaskSchdList,
+			"ttp":    "T1053.005",
+		},
+	}
+
+	taskSchdListCmd := &cobra.Command{
+		Use:   consts.SubCommandName(consts.ModuleTaskSchdList),
+		Short: "List all scheduled tasks",
+		Long:  "Retrieve a list of all scheduled tasks on the system.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return TaskSchdListCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleTaskSchdList,
+			"ttp":    "T1053.005",
+		},
+		Example: `List all scheduled tasks:
+  ~~~
+  taskschd list
+  ~~~`,
+	}
+
+	taskSchdCreateCmd := &cobra.Command{
+		Use:   consts.SubCommandName(consts.ModuleTaskSchdCreate),
+		Short: "Create a new scheduled task",
+		Long:  "Create a new scheduled task with the specified name, executable path, trigger type, and start boundary.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return TaskSchdCreateCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleTaskSchdCreate,
+			"ttp":    "T1053.005",
+		},
+		Example: `Create a scheduled task:
+  ~~~
+  taskschd create --name ExampleTask --path /path/to/executable --trigger_type AtLogon --start_boundary "2023-10-10T09:00:00"
+  ~~~`,
+	}
+	common.BindFlag(taskSchdCreateCmd, func(f *pflag.FlagSet) {
+		f.String("name", "", "Name of the scheduled task (required)")
+		f.String("path", "", "Path to the executable for the scheduled task (required)")
+		f.String("trigger_type", "", "Trigger type for the task (e.g. Daily,Weekly,monthly)")
+		f.String("start_boundary", "", "Start boundary for the scheduled task (e.g., 2023-10-10T09:00:00)")
+		f.String("task_folder", "\\", "Task Folder for the scheduled task")
+	})
+
+	common.BindFlagCompletions(taskSchdCreateCmd, func(comp carapace.ActionMap) {
+		comp["trigger_type"] = common.TaskTriggerTypeCompleter()
+	})
+	_ = taskSchdCreateCmd.MarkFlagRequired("name")
+	_ = taskSchdCreateCmd.MarkFlagRequired("path")
+
+	taskSchdStartCmd := &cobra.Command{
+		Use:   consts.SubCommandName(consts.ModuleTaskSchdStart) + " [name]",
+		Short: "Start a scheduled task",
+		Long:  "Start a scheduled task by specifying its name.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return TaskSchdStartCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleTaskSchdStart,
+			"ttp":    "T1053.005",
+		},
+		Example: `Start a scheduled task:
+  ~~~
+  taskschd start ExampleTask
+  ~~~`,
+	}
+	common.BindFlag(taskSchdStartCmd, func(f *pflag.FlagSet) {
+		f.String("task_folder", "\\", "Task Folder for the scheduled task")
+	})
+
+	taskSchdStopCmd := &cobra.Command{
+		Use:   consts.SubCommandName(consts.ModuleTaskSchdStop) + " [name]",
+		Short: "Stop a running scheduled task",
+		Long:  "Stop a scheduled task by specifying its name.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return TaskSchdStopCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleTaskSchdStop,
+			"ttp":    "T1053.005",
+		},
+		Example: `Stop a scheduled task:
+  ~~~
+  taskschd stop ExampleTask
+  ~~~`,
+	}
+	common.BindFlag(taskSchdStopCmd, func(f *pflag.FlagSet) {
+		f.String("task_folder", "\\", "Task Folder for the scheduled task")
+	})
+
+	taskSchdDeleteCmd := &cobra.Command{
+		Use:   consts.SubCommandName(consts.ModuleTaskSchdDelete) + " [name]",
+		Short: "Delete a scheduled task",
+		Long:  "Delete a scheduled task by specifying its name.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return TaskSchdDeleteCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleTaskSchdDelete,
+			"ttp":    "T1053.005",
+		},
+		Example: `Delete a scheduled task:
+  ~~~
+  taskschd delete ExampleTask
+  ~~~`,
+	}
+	common.BindFlag(taskSchdDeleteCmd, func(f *pflag.FlagSet) {
+		f.String("task_folder", "\\", "Task Folder for the scheduled task")
+	})
+
+	taskSchdQueryCmd := &cobra.Command{
+		Use:   consts.SubCommandName(consts.ModuleTaskSchdQuery) + " [name]",
+		Short: "Query the configuration of a scheduled task",
+		Long:  "Retrieve the current configuration, status, and timing information of a specified scheduled task by name.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return TaskSchdQueryCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleTaskSchdQuery,
+			"ttp":    "T1053.005",
+		},
+		Example: `Query the configuration of a scheduled task:
+  ~~~
+  taskschd query ExampleTask
+  ~~~`,
+	}
+	common.BindFlag(taskSchdQueryCmd, func(f *pflag.FlagSet) {
+		f.String("task_folder", "\\", "Task Folder for the scheduled task")
+	})
+
+	taskSchdRunCmd := &cobra.Command{
+		Use:   consts.SubCommandName(consts.ModuleTaskSchdRun) + " [name]",
+		Short: "Run a scheduled task immediately",
+		Long:  "Execute a scheduled task immediately by specifying its name.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return TaskSchdRunCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleTaskSchdRun,
+			"ttp":    "T1053.005",
+		},
+		Example: `Run a scheduled task immediately:
+  ~~~
+  taskschd run ExampleTask
+  ~~~`,
+	}
+	common.BindFlag(taskSchdRunCmd, func(f *pflag.FlagSet) {
+		f.String("task_folder", "\\", "Task Folder for the scheduled task")
+	})
+	taskschdCmd.AddCommand(taskSchdListCmd, taskSchdCreateCmd, taskSchdStartCmd, taskSchdStopCmd, taskSchdDeleteCmd, taskSchdQueryCmd, taskSchdRunCmd)
+
+	// Enable wizard for taskschd commands that need configuration
+	common.EnableWizardForCommands(taskSchdCreateCmd)
+
+	return []*cobra.Command{taskschdCmd}
+}
+
+func Register(con *core.Console) {
+	RegisterTaskSchdListFunc(con)
+	RegisterTaskSchdCreateFunc(con)
+	RegisterTaskSchdStartFunc(con)
+	RegisterTaskSchdStopFunc(con)
+	RegisterTaskSchdDeleteFunc(con)
+	RegisterTaskSchdQueryFunc(con)
+	RegisterTaskSchdRunFunc(con)
+}

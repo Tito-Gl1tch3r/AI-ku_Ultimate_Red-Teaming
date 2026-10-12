@@ -1,0 +1,144 @@
+package com.six2dez.burp.aiagent.config
+
+import com.fasterxml.jackson.databind.json.JsonMapper
+import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import com.six2dez.burp.aiagent.mcp.external.ExternalMcpServerConfig
+import java.security.SecureRandom
+import java.util.Base64
+
+data class McpSettings(
+    val enabled: Boolean,
+    val host: String,
+    val port: Int,
+    val externalEnabled: Boolean,
+    val stdioEnabled: Boolean,
+    val token: String,
+    val allowedOrigins: List<String>,
+    val tlsEnabled: Boolean,
+    val tlsAutoGenerate: Boolean,
+    val tlsKeystorePath: String,
+    val tlsKeystorePassword: String,
+    val scanTaskTtlMinutes: Int,
+    val collaboratorClientTtlMinutes: Int,
+    val maxConcurrentRequests: Int,
+    val maxBodyBytes: Int,
+    val proxyHistoryMaxItemsPerRequest: Int = Defaults.MCP_PROXY_HISTORY_MAX_ITEMS_PER_REQUEST,
+    val proxyHistoryNewestFirst: Boolean = Defaults.MCP_PROXY_HISTORY_NEWEST_FIRST,
+    val allowUnpreprocessedProxyHistory: Boolean = Defaults.MCP_ALLOW_UNPREPROCESSED_PROXY_HISTORY,
+    val toolToggles: Map<String, Boolean>,
+    val enabledUnsafeTools: Set<String>,
+    val unsafeEnabled: Boolean,
+    // 07-03 D-03: restrict every scope-aware MCP tool to in-scope hosts when true.
+    // Default false so existing serialised preferences (no `mcp.scope.only` key) load unchanged.
+    val scopeOnly: Boolean = false,
+    // PHASE 16: external MCP server list. JSON-serialized blob stored encrypted via SecretCipher.
+    // Default empty list; schema v5 migration adds the Preferences key.
+    val externalMcpServers: List<ExternalMcpServerConfig> = emptyList(),
+) {
+    companion object {
+        private val mapper =
+            JsonMapper
+                .builder()
+                .build()
+                .registerKotlinModule()
+
+        fun generateToken(): String {
+            val bytes = ByteArray(32)
+            SecureRandom().nextBytes(bytes)
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+        }
+
+        /**
+         * True when [token] is too short to resist offline guessing (WR-01, 25-REVIEW).
+         *
+         * The bind-conflict takeover proof is `HMAC-SHA256(key = token, message = ...)` over a
+         * message every byte of which a squatting local process already knows — the host, the port
+         * and a 10-second window index. A captured proof is therefore an offline verifier for the
+         * token itself: one HMAC per guess, no interaction with the victim, no rate limit and no
+         * lockout. Against [generateToken]'s 32 random bytes that is infeasible; against a typed
+         * `burpmcp2026` it is seconds.
+         *
+         * Length is a proxy for entropy, and a deliberately crude one — it is the only property that
+         * can be judged without second-guessing the operator's password manager. The check is
+         * ADVISORY: callers surface a notice and carry on. Nothing here blocks a save, refuses to
+         * start the server, or rewrites the operator's credential.
+         *
+         * Pure, AWT-free and dependency-free, so the UI is not the only place it can be exercised.
+         */
+        fun isTokenWeak(token: String): Boolean = token.trim().length < Defaults.MCP_MIN_TOKEN_LENGTH
+
+        fun generatePassword(): String {
+            val bytes = ByteArray(24)
+            SecureRandom().nextBytes(bytes)
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+        }
+
+        fun parseToolToggles(raw: String?): Map<String, Boolean> {
+            if (raw.isNullOrBlank()) return emptyMap()
+            return try {
+                mapper
+                    .readValue(raw, Map::class.java)
+                    .mapNotNull { (k, v) ->
+                        val key = k?.toString()?.trim().orEmpty()
+                        val value =
+                            when (v) {
+                                is Boolean -> v
+                                is String -> v.equals("true", ignoreCase = true)
+                                else -> null
+                            }
+                        if (key.isNotBlank() && value != null) key to value else null
+                    }.toMap()
+            } catch (_: Exception) {
+                emptyMap()
+            }
+        }
+
+        fun serializeToolToggles(toggles: Map<String, Boolean>): String =
+            try {
+                mapper.writeValueAsString(toggles)
+            } catch (_: Exception) {
+                "{}"
+            }
+
+        fun parseAllowedOrigins(raw: String?): List<String> {
+            if (raw.isNullOrBlank()) return emptyList()
+            return raw
+                .split('\n', ',', ';')
+                .asSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .toList()
+        }
+
+        fun serializeAllowedOrigins(origins: List<String>): String {
+            if (origins.isEmpty()) return ""
+            return origins
+                .asSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .joinToString("\n")
+        }
+
+        fun parseUnsafeToolSet(raw: String?): Set<String> {
+            if (raw.isNullOrBlank()) return emptySet()
+            return raw
+                .split(',', '\n', ';')
+                .asSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .toSet()
+        }
+
+        fun serializeUnsafeToolSet(ids: Set<String>): String {
+            if (ids.isEmpty()) return ""
+            return ids
+                .asSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .sorted()
+                .joinToString(",")
+        }
+    }
+}

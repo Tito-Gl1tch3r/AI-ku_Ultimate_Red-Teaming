@@ -1,0 +1,546 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	cmn "github.com/pzaino/thecrowler/pkg/common"
+	cfg "github.com/pzaino/thecrowler/pkg/config"
+	cdb "github.com/pzaino/thecrowler/pkg/database"
+	infoseeddiag "github.com/pzaino/thecrowler/pkg/infoseed"
+	mailconfig "github.com/pzaino/thecrowler/pkg/mail/config"
+	plg "github.com/pzaino/thecrowler/pkg/plugin"
+	"github.com/pzaino/thecrowler/pkg/vdi"
+)
+
+const sourceConfigRedactionMarker = mailconfig.RedactedValue
+
+var errAPIRequestBodyTooLarge = errors.New("API request body exceeds configured maximum size")
+
+// readAPIRequestBody reads an inbound API-owned request body while enforcing
+// the configured application limit. A zero limit deliberately preserves the
+// historical unlimited behavior.
+func readAPIRequestBody(r *http.Request) ([]byte, error) {
+	limit := config.API.MaxRequestBodySize
+	if limit <= 0 {
+		return io.ReadAll(r.Body)
+	}
+	if r.ContentLength > limit {
+		return nil, errAPIRequestBodyTooLarge
+	}
+
+	readLimit := limit
+	if limit < math.MaxInt64 {
+		readLimit++
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, readLimit))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, errAPIRequestBodyTooLarge
+	}
+	return body, nil
+}
+
+func apiRequestBodyErrorStatus(err error) int {
+	if errors.Is(err, errAPIRequestBodyTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
+// marshalRedactedSourceConfig serializes a source configuration after replacing
+// secret values and secret-store references in its email envelope. Email
+// extensions are recursive because provider-specific settings can nest
+// authentication material.
+func marshalRedactedSourceConfig(sourceConfig cfg.SourceConfig) ([]byte, error) {
+	encoded, err := json.Marshal(sourceConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	var document map[string]any
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		return nil, err
+	}
+	if email, ok := document["email"]; ok {
+		document["email"] = mailconfig.RedactValue(email)
+	}
+	return json.Marshal(document)
+}
+
+func handleRequestWithDB(w http.ResponseWriter, r *http.Request, successCode int, action func(string, int, *cdb.Handler) (interface{}, error)) {
+	if !acquireDBAdmission(w, false) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid query", apiRequestBodyErrorStatus(err), successCode)
+		return
+	}
+
+	results, err := action(query, getQTypeFromName(r.Method), &dbHandler)
+	handleErrorAndRespond(w, err, results, "Error performing action: %v", http.StatusInternalServerError, successCode)
+
+}
+
+// handleErrorAndRespond encapsulates common error handling and JSON response logic.
+func handleErrorAndRespond(w http.ResponseWriter, err error, results interface{}, errMsg string, errCode int, successCode int) {
+	var response interface{}
+
+	if successCode == 0 {
+		successCode = http.StatusOK
+	} else if successCode == 204 {
+		successCode = http.StatusOK
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		// Log the error and prepare an error response
+		redactedErr := mailconfig.RedactString(infoseeddiag.RedactDiagnosticString(err.Error()))
+		cmn.DebugMsg(cmn.DbgLvlDebug3, errMsg, redactedErr)
+		response = cmn.StdAPIError{
+			ErrCode: errCode,
+			Err:     redactedErr,
+			Message: errMsg,
+		}
+		w.WriteHeader(errCode) // Send the error code
+	} else {
+		// Prepare a success response
+		if resp, ok := results.(ConsoleResponse); ok {
+			if resp.Message == "" {
+				resp.Message = "Success"
+			}
+			response = resp
+		} else {
+			response = results
+		}
+		w.WriteHeader(successCode) // Send the success code
+	}
+
+	// Encode the response as JSON (always include a body)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		// Log the error and send a fallback error response
+		cmn.DebugMsg(cmn.DbgLvlDebug3, "Error encoding JSON response: %v", err)
+		cmn.DebugMsg(cmn.DbgLvlDebug4, "Original Results: %s", mailconfig.RedactString(fmt.Sprintf("%+v", results)))
+
+		fallbackResponse := cmn.StdAPIError{
+			ErrCode: http.StatusInternalServerError,
+			Err:     "Internal Server Error",
+			Message: "An error occurred while processing your request.",
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(fallbackResponse)
+	}
+}
+
+// extractQueryOrBody extracts the query parameter for GET requests or the body for POST requests.
+func extractQueryOrBody(r *http.Request) (string, error) {
+	if r.Method == http.MethodPost {
+		bodyBytes, err := readAPIRequestBody(r)
+		if err != nil {
+			return "", err
+		}
+		//defer r.Body.Close() // nolint:errcheck - we will close it in the caller after processing
+
+		// Replace body so it can be read again later
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		return string(bodyBytes), nil
+	}
+
+	// Handle GET requests
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		return "", fmt.Errorf("query parameter 'q' is required")
+	}
+
+	// Decode in case 'q' itself contains encoded data
+	if decodedQuery, err := url.QueryUnescape(query); err == nil {
+		query = decodedQuery
+	}
+
+	params := []string{}
+
+	// Validate and append 'offset'
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		offset, err := strconv.Atoi(offsetStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid offset value: must be an integer")
+		}
+		if offset < 0 {
+			return "", fmt.Errorf("invalid offset value: must be non-negative")
+		}
+		params = append(params, "offset:"+url.QueryEscape(offsetStr))
+	}
+
+	// Validate and append 'limit'
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		limit, err := strconv.Atoi(limitStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid limit value: must be an integer")
+		}
+		if limit < 0 {
+			return "", fmt.Errorf("invalid limit value: must be non-negative")
+		}
+		params = append(params, "limit:"+url.QueryEscape(limitStr))
+	}
+
+	// Append optional 'details'
+	if details := r.URL.Query().Get("details"); details != "" {
+		params = append(params, "details:"+url.QueryEscape(details))
+	}
+
+	// Combine query and validated params
+	if len(params) > 0 {
+		query = fmt.Sprintf("%s&%s", query, strings.Join(params, "&"))
+	}
+
+	return query, nil
+}
+
+func queryValuesToPluginJSON(values url.Values) map[string]interface{} {
+	data := make(map[string]interface{}, len(values))
+	for key, vals := range values {
+		if len(vals) == 0 {
+			data[key] = ""
+			continue
+		}
+		if len(vals) == 1 {
+			data[key] = vals[0]
+			continue
+		}
+		copied := make([]string, len(vals))
+		copy(copied, vals)
+		data[key] = copied
+	}
+	return data
+}
+
+func apiPluginHTTPContext(r *http.Request) map[string]interface{} {
+	return map[string]interface{}{
+		"method": r.Method,
+		"path":   r.URL.Path,
+		"query":  r.URL.RawQuery,
+		"header": r.Header,
+	}
+}
+
+func attachHTTPContextToPluginData(data interface{}, httpCtx map[string]interface{}) interface{} {
+	if object, ok := data.(map[string]interface{}); ok {
+		object["http"] = httpCtx
+		return object
+	}
+	return data
+}
+
+func extractAPIPluginData(r *http.Request) (interface{}, map[string]interface{}, error) {
+	httpCtx := apiPluginHTTPContext(r)
+	if r.Method == http.MethodGet {
+		data := queryValuesToPluginJSON(r.URL.Query())
+		data["http"] = httpCtx
+		return data, httpCtx, nil
+	}
+
+	bodyBytes, err := readAPIRequestBody(r)
+	if err != nil {
+		return nil, httpCtx, err
+	}
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	trimmed := strings.TrimSpace(string(bodyBytes))
+	if trimmed == "" {
+		data := map[string]interface{}{"http": httpCtx}
+		return data, httpCtx, nil
+	}
+
+	var parsed interface{}
+	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+		cmn.DebugMsg(cmn.DbgLvlDebug3, "Input is not valid JSON, treating as raw string")
+		parsed = PrepareInput(trimmed)
+	}
+
+	return attachHTTPContextToPluginData(parsed, httpCtx), httpCtx, nil
+}
+
+func getQTypeFromName(name string) int {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "post" {
+		return postQuery
+	}
+	return getQuery
+}
+
+// PrepareInput prepares the input string by removing all \" and trimming external quotes and spaces.
+func PrepareInput(input string) string {
+	// Remove all \" from the input
+	input = strings.ReplaceAll(input, "\\\"", "\"")
+	// trim external quotes (if any)
+	input = strings.Trim(input, "\"")
+	// trim spaces
+	input = strings.TrimSpace(input)
+	return input
+}
+
+func makeAPIPluginHandler(plugin plg.JSPlugin) http.HandlerFunc {
+	allowed := map[string]bool{}
+	if plugin.API != nil {
+		for _, m := range plugin.API.Methods {
+			allowed[strings.ToUpper(m)] = true
+		}
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !allowed[r.Method] {
+			w.Header().Set("Allow", strings.Join(plugin.API.Methods, ", "))
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		cmn.DebugMsg(
+			cmn.DbgLvlDebug2,
+			"API PLUGIN HIT: %s %s (%s)",
+			r.Method,
+			r.URL.Path,
+			plugin.Name,
+		)
+
+		// Streaming (SSE) mode
+		if r.Header.Get("Accept") == "text/event-stream" {
+			handleStreamingAPIPlugin(w, r, plugin)
+			return
+		}
+
+		// Normal request-response mode
+		handleNormalAPIPlugin(w, r, plugin)
+	}
+}
+
+func handleNormalAPIPlugin(w http.ResponseWriter, r *http.Request, plugin plg.JSPlugin) {
+	handleNormalAPIPluginWithExecutor(w, r, plugin, plugin.ExecuteContext)
+}
+
+// handleNormalAPIPluginWithExecutor keeps body admission ahead of execution and
+// gives regression tests an observable boundary around plugin invocation.
+func handleNormalAPIPluginWithExecutor(
+	w http.ResponseWriter,
+	r *http.Request,
+	plugin plg.JSPlugin,
+	execute func(context.Context, *vdi.WebDriver, *cdb.Handler, int, map[string]interface{}) (map[string]interface{}, error),
+) {
+	jsonData, httpCtx, err := extractAPIPluginData(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(
+			w,
+			err,
+			nil,
+			"Invalid request",
+			apiRequestBodyErrorStatus(err),
+			0,
+		)
+		return
+	}
+
+	ctx := map[string]interface{}{
+		"http":     httpCtx,
+		"jsonData": jsonData,
+	}
+
+	result, err := execute(
+		r.Context(),
+		nil,
+		&dbHandler,
+		config.API.Plugins.Timeout,
+		ctx,
+	)
+
+	if err != nil {
+		handleErrorAndRespond(
+			w,
+			err,
+			nil,
+			"Plugin execution failed",
+			http.StatusInternalServerError,
+			0,
+		)
+		return
+	}
+
+	handleErrorAndRespond(
+		w,
+		nil,
+		result,
+		"",
+		0,
+		http.StatusOK,
+	)
+}
+
+func setWriteDeadline(w http.ResponseWriter, d time.Duration) {
+	if wd, ok := w.(interface {
+		SetWriteDeadline(time.Time) error
+	}); ok {
+		_ = wd.SetWriteDeadline(time.Now().Add(d))
+	}
+}
+
+func handleStreamingAPIPlugin(w http.ResponseWriter, r *http.Request, plugin plg.JSPlugin) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	jsonData, httpCtx, err := extractAPIPluginData(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid request", apiRequestBodyErrorStatus(err), 0)
+		return
+	}
+
+	_, err = io.Copy(io.Discard, r.Body)
+	if (err != nil) && (err != io.EOF) {
+		cmn.DebugMsg(cmn.DbgLvlError, "Error reading request body: %v", err)
+	}
+	err = r.Body.Close()
+	if err != nil {
+		cmn.DebugMsg(cmn.DbgLvlError, "Error closing request body: %v", err)
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // nginx
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.WriteHeader(http.StatusOK)
+
+	setWriteDeadline(w, 5*time.Second)
+	_, err = fmt.Fprintf(w, "event: status\ndata: started\n\n")
+	if err != nil {
+		cmn.DebugMsg(cmn.DbgLvlError, "Error writing to SSE: %v", err)
+	}
+	flusher.Flush()
+
+	progressCh := make(chan map[string]interface{}, 16)
+	resultCh := make(chan interface{}, 1)
+	errCh := make(chan error, 1)
+
+	pluginDone := make(chan struct{})
+
+	go func() {
+		defer close(pluginDone)
+
+		ctx := map[string]interface{}{
+			"http":     httpCtx,
+			"jsonData": jsonData,
+			"progress": func(msg map[string]interface{}) {
+				select {
+				case progressCh <- msg:
+				default:
+				}
+			},
+		}
+
+		result, err := plugin.ExecuteContext(
+			r.Context(),
+			nil,
+			&dbHandler,
+			config.API.Plugins.Timeout,
+			ctx,
+		)
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		resultCh <- result
+	}()
+
+	keepAlive := time.NewTicker(10 * time.Second)
+	defer keepAlive.Stop()
+	exitReason := "completed"
+
+loop:
+	for {
+		select {
+		case msg := <-progressCh:
+			b, _ := json.Marshal(msg)
+			setWriteDeadline(w, 5*time.Second)
+			_, err = fmt.Fprintf(w, "event: progress\ndata: %s\n\n", b)
+			if err != nil {
+				cmn.DebugMsg(cmn.DbgLvlError, "Error writing to SSE: %v", err)
+			}
+			flusher.Flush()
+
+		case result := <-resultCh:
+			b, _ := json.Marshal(result)
+			setWriteDeadline(w, 5*time.Second)
+			_, err = fmt.Fprintf(w, "event: result\ndata: %s\n\n", b)
+			if err != nil {
+				cmn.DebugMsg(cmn.DbgLvlError, "Error writing to SSE: %v", err)
+			}
+			flusher.Flush()
+
+			setWriteDeadline(w, 5*time.Second)
+			_, err = fmt.Fprintf(w, "event: done\ndata: completed\n\n")
+			if err != nil {
+				cmn.DebugMsg(cmn.DbgLvlError, "Error writing to SSE: %v", err)
+			}
+			flusher.Flush()
+			break loop
+
+		case err := <-errCh:
+			setWriteDeadline(w, 5*time.Second)
+			_, err = fmt.Fprintf(w, "event: error\ndata: %q\n\n", err.Error())
+			if err != nil {
+				cmn.DebugMsg(cmn.DbgLvlError, "Error writing to SSE: %v", err)
+			}
+			flusher.Flush()
+			exitReason = "error"
+			break loop
+
+		case <-keepAlive.C:
+			setWriteDeadline(w, 5*time.Second)
+			_, err = fmt.Fprint(w, ": ping\n\n")
+			if err != nil {
+				cmn.DebugMsg(cmn.DbgLvlError, "Error writing to SSE: %v", err)
+			}
+			flusher.Flush()
+
+		case <-r.Context().Done():
+			cmn.DebugMsg(
+				cmn.DbgLvlDebug2,
+				"SSE client disconnected: %s (%s): %v",
+				r.RemoteAddr,
+				plugin.Name,
+				r.Context().Err(),
+			)
+			exitReason = "client_disconnect"
+			break loop
+		}
+	}
+
+	<-pluginDone // 2. wait until plugin is 100% done
+
+	cmn.DebugMsg(
+		cmn.DbgLvlDebug2,
+		"SSE handler exit (%s): %s",
+		exitReason,
+		plugin.Name,
+	)
+}

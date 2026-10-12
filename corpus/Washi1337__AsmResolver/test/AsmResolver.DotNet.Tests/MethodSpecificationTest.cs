@@ -1,0 +1,117 @@
+using System;
+using System.Linq;
+using AsmResolver.DotNet.Signatures;
+using AsmResolver.DotNet.TestCases.Generics;
+using AsmResolver.PE.DotNet.Cil;
+using Xunit;
+
+namespace AsmResolver.DotNet.Tests
+{
+    public class MethodSpecificationTest
+    {
+        [Fact]
+        public void ReadMethod()
+        {
+            var module = ModuleDefinition.FromFile(typeof(GenericsTestClass).Assembly.Location, TestReaderParameters);
+            var method = (MethodDefinition) module.LookupMember(typeof(GenericsTestClass)
+                .GetMethod(nameof(GenericsTestClass.MethodInstantiationFromGenericType))!.MetadataToken);
+
+            var call = method.CilMethodBody!.Instructions.First(i => i.OpCode.Code == CilCode.Call);
+
+            var specification = Assert.IsType<MethodSpecification>(call.Operand, exactMatch: false);
+            Assert.Equal("GenericMethodInGenericType", specification.Method!.Name);
+        }
+
+        [Fact]
+        public void ReadFullName()
+        {
+            var module = ModuleDefinition.FromFile(typeof(GenericsTestClass).Assembly.Location, TestReaderParameters);
+            var method = (MethodDefinition) module.LookupMember(typeof(GenericsTestClass)
+                .GetMethod(nameof(GenericsTestClass.MethodInstantiationFromGenericType))!.MetadataToken);
+
+            var call = method.CilMethodBody!.Instructions.First(i => i.OpCode.Code == CilCode.Call);
+
+            var specification = Assert.IsType<MethodSpecification>(call.Operand, exactMatch: false);
+            Assert.Equal(
+                "System.Void AsmResolver.DotNet.TestCases.Generics.GenericType`3<System.Byte, System.UInt16, System.UInt32>::GenericMethodInGenericType<System.SByte, System.Int16, System.Int32>()",
+                specification.FullName
+            );
+            Assert.Equal(
+                "System.Void AsmResolver.DotNet.TestCases.Generics.GenericType`3<System.Byte, System.UInt16, System.UInt32>::GenericMethodInGenericType<?, ?, ?>()",
+                specification.Method!.FullName
+            );
+        }
+
+        [Fact]
+        public void ReadSignature()
+        {
+            var module = ModuleDefinition.FromFile(typeof(GenericsTestClass).Assembly.Location, TestReaderParameters);
+            var method = (MethodDefinition) module.LookupMember(typeof(GenericsTestClass)
+                .GetMethod(nameof(GenericsTestClass.MethodInstantiationFromGenericType))!.MetadataToken);
+
+            var call = method.CilMethodBody!.Instructions.First(i => i.OpCode.Code == CilCode.Call);
+
+            var specification = Assert.IsType<MethodSpecification>(call.Operand, exactMatch: false);
+            Assert.Equal(
+                new GenericInstanceMethodSignature([
+                    module.CorLibTypeFactory.SByte,
+                    module.CorLibTypeFactory.Int16,
+                    module.CorLibTypeFactory.Int32
+                ]),
+                specification.Signature,
+                SignatureComparer.Default!
+            );
+        }
+
+        [Fact]
+        public void InstantiateGenericMethod()
+        {
+            var module = ModuleDefinition.FromFile(typeof(GenericsTestClass).Assembly.Location, TestReaderParameters);
+            var method = (MethodDefinition) module.LookupMember(typeof(NonGenericType)
+                .GetMethod(nameof(NonGenericType.GenericMethodInNonGenericType))!.MetadataToken);
+
+            var specification = method.MakeGenericInstanceMethod([
+                module.CorLibTypeFactory.SByte,
+                module.CorLibTypeFactory.Int16,
+                module.CorLibTypeFactory.Int32
+            ]);
+
+            Assert.Equal(
+                new GenericInstanceMethodSignature([
+                    module.CorLibTypeFactory.SByte,
+                    module.CorLibTypeFactory.Int16,
+                    module.CorLibTypeFactory.Int32
+                ]),
+                specification.Signature,
+                SignatureComparer.Default!
+            );
+        }
+
+        [Fact]
+        public void InstantiateGenericMethodWithWrongNumberOfArgumentsShouldThrow()
+        {
+            var module = ModuleDefinition.FromFile(typeof(GenericsTestClass).Assembly.Location, TestReaderParameters);
+            var method = (MethodDefinition) module.LookupMember(typeof(NonGenericType)
+                .GetMethod(nameof(NonGenericType.GenericMethodInNonGenericType))!.MetadataToken);
+
+            Assert.Throws<ArgumentException>(() => method.MakeGenericInstanceMethod([
+                module.CorLibTypeFactory.SByte,
+                module.CorLibTypeFactory.Int16
+            ]));
+        }
+
+        [Fact]
+        public void InstantiateNonGenericMethodShouldThrow()
+        {
+            var module = ModuleDefinition.FromFile(typeof(GenericsTestClass).Assembly.Location, TestReaderParameters);
+            var method = (MethodDefinition) module.LookupMember(typeof(NonGenericType)
+                .GetMethod(nameof(NonGenericType.NonGenericMethodInNonGenericType))!.MetadataToken);
+
+            Assert.Throws<ArgumentException>(() => method.MakeGenericInstanceMethod([
+                module.CorLibTypeFactory.SByte,
+                module.CorLibTypeFactory.Int16,
+                module.CorLibTypeFactory.Int32
+            ]));
+        }
+    }
+}

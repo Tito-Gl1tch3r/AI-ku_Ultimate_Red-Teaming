@@ -1,0 +1,477 @@
+"""Utility functions for PE analysis output and formatting."""
+import atexit
+import collections
+import concurrent.futures
+import datetime
+import itertools
+import math
+import os
+import re
+import sys
+import threading
+
+from typing import Dict, Any, Optional, List
+
+from arkana.config import pefile, logger
+
+
+def _safe_env_int(key: str, default: int, min_val: int | None = None, max_val: int | None = None) -> int:
+    """Read an environment variable as int with fallback to *default*.
+
+    Resolution order:
+      1. Environment variable (key)
+      2. User config file (~/.arkana/config.json) — if the env var name is
+         registered in user_config._ENV_VAR_MAP
+      3. Hardcoded default
+
+    Returns *default* when the variable is missing or its value cannot be
+    converted to ``int`` (e.g. empty string, float notation, non-numeric
+    text).  A warning is logged for invalid values so operators can notice
+    misconfigurations.
+
+    When *min_val* or *max_val* are provided, the parsed value is clamped
+    to the given range.
+    """
+    val = os.environ.get(key)
+    if val is None:
+        # Check user config file as middle layer
+        val = _config_lookup_by_env(key)
+    if val is None:
+        result = default
+    else:
+        try:
+            result = int(val)
+        except (ValueError, TypeError):
+            logger.warning("Invalid value for %s=%r, using default %d", key, val, default)
+            result = default
+    if min_val is not None and result < min_val:
+        result = min_val
+    if max_val is not None and result > max_val:
+        result = max_val
+    return result
+
+
+# Reverse map: env var name -> config key.  Built lazily to avoid import
+# cycles (user_config imports nothing from utils).
+_env_to_config_key: dict | None = None
+
+
+def _config_lookup_by_env(env_key: str) -> str | None:
+    """Look up a user config value by its environment variable name."""
+    global _env_to_config_key
+    if _env_to_config_key is None:
+        try:
+            from arkana.user_config import _ENV_VAR_MAP, load_user_config  # noqa: F811
+            _env_to_config_key = {}
+            for cfg_key, env_vars in _ENV_VAR_MAP.items():
+                for ev in env_vars:
+                    _env_to_config_key[ev] = cfg_key
+        except ImportError:
+            _env_to_config_key = {}
+            return None
+
+    cfg_key = _env_to_config_key.get(env_key)
+    if cfg_key is None:
+        return None
+    try:
+        from arkana.user_config import load_user_config
+        config = load_user_config()
+        val = config.get(cfg_key)
+        return str(val) if val is not None else None
+    except Exception:
+        return None
+
+# Module-level shared executor for regex timeout protection.
+# Using a small pool avoids per-call thread creation/teardown overhead.
+# Pool is recreated when stuck threads exhaust it (see safe_regex_search).
+_REGEX_MAX_WORKERS = 4  # M2-v11: named constant replaces private attr access
+_regex_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_REGEX_MAX_WORKERS)
+_regex_executor_lock = threading.Lock()
+_regex_pool_recreations = 0  # M6-v8: Track pool recreations for monitoring
+_regex_consecutive_timeouts = 0  # M2-v11: replaces private _threads access for pool health
+atexit.register(lambda: _regex_executor.shutdown(wait=False))
+
+# --- Safe slicing ---
+
+def _safe_slice(value, n):
+    """Safely slice a value to at most *n* items.
+
+    Handles lists, tuples, dicts, strings, sets, frozensets, and other
+    iterables.  Returns the original value unchanged if it cannot be sliced.
+    """
+    if isinstance(value, (list, tuple)):
+        return value[:n]
+    if isinstance(value, dict):
+        keys = list(value.keys())[:n]
+        return {k: value[k] for k in keys}
+    if isinstance(value, str):
+        return value[:n]
+    if isinstance(value, (set, frozenset)):
+        return type(value)(list(value)[:n])
+    # For other iterables (generators, etc.), use islice to avoid OOM
+    try:
+        return list(itertools.islice(value, n))
+    except TypeError:
+        return value
+
+
+# --- ReDoS Protection ---
+_MAX_REGEX_PATTERN_LENGTH = 1000
+# Detects nested quantifiers that can cause catastrophic backtracking.
+# Matches patterns like (X+)+, (X*)+, (X+)*, (X{n,m})+ etc.
+_NESTED_QUANTIFIER_RE = re.compile(
+    r'\((?:\?[:=!])?[^)]*[+*}\?][^)]*\)\s*[+*{]'
+)
+# Detects alternation inside quantified groups, e.g. (a|ab)+, (foo|foobar)*
+# Conservative: not all such patterns cause catastrophic backtracking (only those
+# with overlapping alternatives), but detecting overlap statically is infeasible.
+# The 5-second timeout in safe_regex_search() provides the real safety net.
+_ALTERNATION_QUANTIFIER_RE = re.compile(
+    r'\([^)]*\|[^)]*\)[*+?]|\([^)]*\|[^)]*\)\{'
+)
+
+
+def validate_regex_pattern(pattern: str) -> None:
+    """Validate a regex pattern for safety before compilation.
+
+    Raises ValueError if the pattern is too long, contains constructs
+    that are known to cause catastrophic backtracking (ReDoS), or is
+    not a valid regular expression.
+    """
+    if len(pattern) > _MAX_REGEX_PATTERN_LENGTH:
+        raise ValueError(
+            f"Regex pattern is too long ({len(pattern)} chars). "
+            f"Maximum allowed length is {_MAX_REGEX_PATTERN_LENGTH} characters."
+        )
+    if _NESTED_QUANTIFIER_RE.search(pattern):
+        raise ValueError(
+            f"Regex pattern contains nested quantifiers which can cause "
+            f"catastrophic backtracking (ReDoS). Please simplify the pattern: "
+            f"'{pattern[:80]}{'...' if len(pattern) > 80 else ''}'"
+        )
+    if _ALTERNATION_QUANTIFIER_RE.search(pattern):
+        raise ValueError(
+            f"Regex pattern contains alternation inside a quantified group which can cause "
+            f"catastrophic backtracking (ReDoS). Please simplify the pattern: "
+            f"'{pattern[:80]}{'...' if len(pattern) > 80 else ''}'"
+        )
+    # Verify the pattern actually compiles
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        raise ValueError(f"Invalid regex pattern: {e}") from e
+
+
+# --- Regex Execution Timeout ---
+_REGEX_TIMEOUT_SECONDS = 5
+
+
+def safe_regex_search(compiled_re: re.Pattern, text: str,
+                      timeout: float = _REGEX_TIMEOUT_SECONDS) -> Optional[re.Match]:
+    """Execute a regex search with timeout protection against ReDoS.
+
+    Even with ``validate_regex_pattern()`` catching common nested-quantifier
+    patterns, some ReDoS constructs (e.g. alternation-based backtracking)
+    slip through.  This function provides a hard timeout as a safety net.
+
+    Args:
+        compiled_re: A pre-compiled ``re.Pattern`` object.
+        text: The string to search.
+        timeout: Maximum seconds to allow the search to run (default 5).
+
+    Returns:
+        The ``re.Match`` object if found, or ``None``.
+
+    Raises:
+        ValueError: If the search exceeds the timeout.
+    """
+    global _regex_executor, _regex_consecutive_timeouts
+    with _regex_executor_lock:
+        executor = _regex_executor
+    future = executor.submit(compiled_re.search, text)
+    try:
+        result = future.result(timeout=timeout)
+        # M-9: Protect counter reset under lock for thread safety
+        with _regex_executor_lock:
+            _regex_consecutive_timeouts = 0
+        return result
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        pattern_preview = str(compiled_re.pattern)[:80]
+        # M-9: Protect counter increment and pool recreation under lock
+        with _regex_executor_lock:
+            _regex_consecutive_timeouts += 1
+            current_timeouts = _regex_consecutive_timeouts
+        logger.warning(
+            "Regex timed out after %ss — pattern: %s (consecutive timeouts: %d/%d)",
+            timeout, pattern_preview, current_timeouts, _REGEX_MAX_WORKERS,
+        )
+        # Recreate pool after _REGEX_MAX_WORKERS consecutive timeouts (all workers likely stuck)
+        if current_timeouts >= 2:
+            with _regex_executor_lock:
+                # Double-check under lock
+                if _regex_consecutive_timeouts >= 2:
+                    global _regex_pool_recreations
+                    _regex_pool_recreations += 1
+                    logger.warning(
+                        "Regex pool exhausted — recreating executor (recreation #%d)",
+                        _regex_pool_recreations,
+                    )
+                    if _regex_pool_recreations > 5:
+                        logger.error(
+                            "Regex pool recreated %d times — chronic stuck thread issue. "
+                            "Consider reviewing regex patterns for ReDoS.",
+                            _regex_pool_recreations,
+                        )
+                    old = _regex_executor
+                    _regex_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_REGEX_MAX_WORKERS)
+                    old.shutdown(wait=False)
+                    _regex_consecutive_timeouts = 0
+                    logger.warning(
+                        "Regex pool recreated (%d times). Note: %d worker threads may still be "
+                        "running from timed-out operations (inherent Python limitation).",
+                        _regex_pool_recreations,
+                        threading.active_count(),
+                    )
+        raise ValueError(
+            f"Regex execution timed out after {timeout}s. "
+            "The pattern may cause catastrophic backtracking. "
+            "Please simplify the regex."
+        )
+
+
+def shannon_entropy(data: bytes) -> float:
+    """Compute the Shannon entropy of a byte sequence.
+
+    Returns a value between 0.0 (uniform) and 8.0 (maximum randomness).
+    Returns 0.0 for empty input.
+    """
+    length = len(data)
+    if length == 0:
+        return 0.0
+    # collections.Counter uses optimised C internals for counting, which is
+    # significantly faster than a manual loop for large byte sequences.
+    entropy = 0.0
+    for count in collections.Counter(data).values():
+        p = count / length
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def safe_print(text_to_print, verbose_prefix=""):
+    try:
+        print(f"{verbose_prefix}{text_to_print}")
+    except UnicodeEncodeError:
+        try:
+            output_encoding = (sys.stdout.encoding if sys.stdout and sys.stdout.encoding else 'utf-8')
+            encoded_text = str(text_to_print).encode(output_encoding, errors='backslashreplace').decode(output_encoding, errors='ignore')
+            print(f"{verbose_prefix}{encoded_text} (some characters replaced/escaped)")
+        except Exception:
+            print(f"{verbose_prefix}<Unencodable string: contains characters not supported by output encoding>")
+
+
+def format_timestamp(timestamp_val: int) -> str:
+    if not isinstance(timestamp_val, int) or timestamp_val < 0: return f"{timestamp_val} (Invalid timestamp value)"
+    if timestamp_val == 0: return "0 (No timestamp or invalid)"
+    current_year = datetime.datetime.now(datetime.timezone.utc).year
+    try:
+        dt_obj = datetime.datetime.fromtimestamp(timestamp_val, datetime.timezone.utc)
+        formatted_date = dt_obj.strftime('%Y-%m-%d %H:%M:%S UTC')
+        if dt_obj.year > current_year + 20 or dt_obj.year < 1980:
+            return f"{formatted_date} ({timestamp_val}) (Timestamp unusual)"
+        return formatted_date
+    except (ValueError, OSError, OverflowError):
+        return f"{timestamp_val} (Invalid or out-of-range timestamp value)"
+
+
+def get_file_characteristics(flags: int) -> List[str]:
+    characteristics = []
+    for flag_name, flag_val in pefile.IMAGE_CHARACTERISTICS.items():
+        if isinstance(flag_val, int) and (flags & flag_val): characteristics.append(flag_name)
+    return characteristics if characteristics else ["NONE"]
+
+
+def get_dll_characteristics(flags: int) -> List[str]:
+    characteristics = []
+    for flag_name, flag_val in pefile.DLL_CHARACTERISTICS.items():
+        if isinstance(flag_val, int) and (flags & flag_val): characteristics.append(flag_name)
+    return characteristics if characteristics else ["NONE"]
+
+
+def get_section_characteristics(flags: int) -> List[str]:
+    characteristics = []
+    for flag_name, flag_val in pefile.SECTION_CHARACTERISTICS.items():
+        if isinstance(flag_val, int) and (flags & flag_val): characteristics.append(flag_name)
+    return characteristics if characteristics else ["NONE"]
+
+
+# Reverse-lookup table for relocation types — built once instead of
+# reconstructing the dict on every call to get_relocation_type_str.
+_RELOCATION_TYPE_REVERSE: Optional[Dict[int, str]] = None
+
+
+def get_relocation_type_str(reloc_type: int) -> str:
+    global _RELOCATION_TYPE_REVERSE
+    if _RELOCATION_TYPE_REVERSE is None:
+        _RELOCATION_TYPE_REVERSE = {val: name for name, val in pefile.RELOCATION_TYPE.items()}
+    return _RELOCATION_TYPE_REVERSE.get(reloc_type, f"UNKNOWN_TYPE_{reloc_type}")
+
+
+def get_symbol_type_str(sym_type: int) -> str:
+    types = {
+        0x0: "NULL", 0x1: "VOID", 0x2: "CHAR", 0x3: "SHORT",
+        0x4: "INT", 0x5: "LONG", 0x6: "FLOAT", 0x7: "DOUBLE",
+        0x8: "STRUCT", 0x9: "UNION", 0xA: "ENUM",
+        0xB: "MOE (Member of Enum)", 0xC: "BYTE", 0xD: "WORD",
+        0xE: "UINT", 0xF: "DWORD",
+    }
+    base_type = sym_type & 0x000F
+    derived_type = (sym_type & 0x00F0) >> 4
+    type_str = types.get(base_type, f"UNKNOWN_BASE({hex(base_type)})")
+    if derived_type == pefile.IMAGE_SYM_DTYPE_POINTER:
+        type_str = f"POINTER_TO_{type_str}"
+    elif derived_type == pefile.IMAGE_SYM_DTYPE_FUNCTION:
+        type_str = f"FUNCTION_RETURNING_{type_str}"
+    elif derived_type == pefile.IMAGE_SYM_DTYPE_ARRAY:
+        type_str = f"ARRAY_OF_{type_str}"
+    if sym_type == 0x20:
+        return "FUNCTION"
+    return type_str
+
+
+_STORAGE_CLASS_MAP: Optional[Dict[int, str]] = None  # L1-v11: lazy-init cache
+
+
+def get_symbol_storage_class_str(storage_class: int) -> str:
+    global _STORAGE_CLASS_MAP
+    if _STORAGE_CLASS_MAP is None:
+        classes = {
+            0: "NULL", 1: "AUTOMATIC", 2: "EXTERNAL", 3: "STATIC",
+            4: "REGISTER", 5: "EXTERNAL_DEF", 6: "LABEL",
+            7: "UNDEFINED_LABEL", 8: "MEMBER_OF_STRUCT", 9: "ARGUMENT",
+            10: "STRUCT_TAG", 11: "MEMBER_OF_UNION", 12: "UNION_TAG",
+            13: "TYPE_DEFINITION", 14: "UNDEFINED_STATIC", 15: "ENUM_TAG",
+            16: "MEMBER_OF_ENUM", 17: "REGISTER_PARAM", 18: "BIT_FIELD",
+            100: "BLOCK", 101: "FUNCTION", 102: "END_OF_STRUCT",
+            103: "FILE", 104: "SECTION", 105: "WEAK_EXTERNAL",
+            107: "CLR_TOKEN",
+        }
+        if hasattr(pefile, 'SYMBOL_STORAGE_CLASSES'):
+            pefile_classes = {v: k.replace("IMAGE_SYM_CLASS_", "") for k, v in pefile.SYMBOL_STORAGE_CLASSES.items()}
+            classes.update(pefile_classes)
+        _STORAGE_CLASS_MAP = classes
+    return _STORAGE_CLASS_MAP.get(storage_class, f"UNKNOWN_CLASS({storage_class})")
+
+
+def _dump_aux_symbol_to_dict(parent_symbol_struct, aux_symbol_struct, aux_idx: int) -> Dict[str, Any]:
+    aux_dict: Dict[str, Any] = {"aux_record_index": aux_idx + 1}
+    parent_storage_class = parent_symbol_struct.StorageClass
+
+    sym_class_file = getattr(pefile, 'IMAGE_SYM_CLASS_FILE', 103)
+    sym_class_section = getattr(pefile, 'IMAGE_SYM_CLASS_SECTION', 104)
+    sym_class_static = getattr(pefile, 'IMAGE_SYM_CLASS_STATIC', 3)
+    sym_class_function = getattr(pefile, 'IMAGE_SYM_CLASS_FUNCTION', 101)
+    sym_class_weak_external = getattr(pefile, 'IMAGE_SYM_CLASS_WEAK_EXTERNAL', 105)
+    sym_dtype_function = getattr(pefile, 'IMAGE_SYM_DTYPE_FUNCTION', 2)
+
+    if parent_storage_class == sym_class_file:
+        name_bytes = getattr(aux_symbol_struct, 'Name', b'')
+        if not name_bytes and hasattr(aux_symbol_struct, 'strings'):
+            name_bytes = aux_symbol_struct.strings
+        name_str = "N/A"
+        if isinstance(name_bytes, bytes):
+            try:
+                name_str = name_bytes.decode('utf-8', 'ignore').rstrip('\x00')
+            except Exception:
+                name_str = name_bytes.hex()
+        elif isinstance(name_bytes, str):
+            name_str = name_bytes.rstrip('\x00')
+        aux_dict["filename"] = name_str
+        return aux_dict
+
+    if (parent_storage_class == sym_class_section
+            or (parent_storage_class == sym_class_static
+                and parent_symbol_struct.SectionNumber > 0)):
+        aux_dict["type"] = "Section Definition Aux Record"
+        if hasattr(aux_symbol_struct, 'Length'):
+            aux_dict["length"] = aux_symbol_struct.Length
+        if hasattr(aux_symbol_struct, 'NumberOfRelocations'):
+            aux_dict["number_of_relocations"] = aux_symbol_struct.NumberOfRelocations
+        if hasattr(aux_symbol_struct, 'NumberOfLinenumbers'):
+            aux_dict["number_of_linenumbers"] = aux_symbol_struct.NumberOfLinenumbers
+        if hasattr(aux_symbol_struct, 'CheckSum'):
+            aux_dict["checksum"] = hex(aux_symbol_struct.CheckSum)
+        if hasattr(aux_symbol_struct, 'Number'):
+            aux_dict["number_comdat"] = aux_symbol_struct.Number
+        if hasattr(aux_symbol_struct, 'Selection'):
+            sel_map = {
+                0: "NODUPLICATES", 1: "ANY", 2: "SAME_SIZE",
+                3: "EXACT_MATCH", 4: "ASSOCIATIVE", 5: "LARGEST",
+            }
+            sel_str = sel_map.get(
+                aux_symbol_struct.Selection,
+                f"UNKNOWN ({aux_symbol_struct.Selection})",
+            )
+            aux_dict["selection_comdat"] = sel_str
+        return aux_dict
+
+    is_func_rel = (
+        (parent_symbol_struct.Type >> 4) == sym_dtype_function
+        or parent_symbol_struct.Type == 0x20
+    )
+    if is_func_rel or parent_storage_class == sym_class_function:
+        aux_dict["type"] = "Function-related Aux Record"
+        if hasattr(aux_symbol_struct, 'TagIndex'):
+            aux_dict["tag_index"] = aux_symbol_struct.TagIndex
+        if hasattr(aux_symbol_struct, 'TotalSize'):
+            aux_dict["total_size"] = aux_symbol_struct.TotalSize
+        if hasattr(aux_symbol_struct, 'PointerToLinenumber'):
+            aux_dict["pointer_to_linenumber"] = hex(aux_symbol_struct.PointerToLinenumber)
+        if hasattr(aux_symbol_struct, 'PointerToNextFunction'):
+            aux_dict["pointer_to_next_function"] = aux_symbol_struct.PointerToNextFunction
+        if hasattr(aux_symbol_struct, 'Linenumber'):
+            aux_dict["linenumber_lf"] = aux_symbol_struct.Linenumber
+        return aux_dict
+
+    if parent_storage_class == sym_class_weak_external:
+        aux_dict["type"] = "Weak External Aux Record"
+        if hasattr(aux_symbol_struct, 'TagIndex'):
+            aux_dict["tag_index"] = aux_symbol_struct.TagIndex
+        if hasattr(aux_symbol_struct, 'Characteristics'):
+            char_val = aux_symbol_struct.Characteristics
+            char_map = {
+                1: "IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY",
+                2: "IMAGE_WEAK_EXTERN_SEARCH_LIBRARY",
+                3: "IMAGE_WEAK_EXTERN_SEARCH_ALIAS",
+            }
+            char_str = char_map.get(char_val, f"UNKNOWN ({hex(char_val)})")
+            aux_dict["characteristics"] = char_str
+        return aux_dict
+
+    aux_dict["type"] = "Raw Auxiliary Data"
+    raw_bytes = b''
+    if isinstance(aux_symbol_struct, bytes):
+        raw_bytes = aux_symbol_struct
+    elif hasattr(aux_symbol_struct, '__pack__'):
+        try:
+            raw_bytes = aux_symbol_struct.__pack__()
+        except Exception:
+            pass
+    if raw_bytes:
+        suffix = "..." if len(raw_bytes) > 18 else ""
+        aux_dict["hex_data"] = raw_bytes[:18].hex() + suffix
+    else:
+        raw_attrs = {}
+        for attr_name in dir(aux_symbol_struct):
+            if attr_name.startswith('_') or callable(getattr(aux_symbol_struct, attr_name)):
+                continue
+            attr_val = getattr(aux_symbol_struct, attr_name)
+            if isinstance(attr_val, int):
+                is_addr = any(kw in attr_name for kw in ('Pointer', 'Address', 'Offset'))
+                raw_attrs[attr_name] = hex(attr_val) if is_addr else attr_val
+            elif isinstance(attr_val, bytes):
+                raw_attrs[attr_name] = attr_val.hex()
+            else:
+                raw_attrs[attr_name] = str(attr_val)
+        aux_dict["attributes"] = raw_attrs
+    return aux_dict

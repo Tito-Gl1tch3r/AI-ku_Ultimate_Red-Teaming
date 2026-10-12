@@ -1,0 +1,2248 @@
+// Copyright 2023 Paolo Fabio Zaino
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package main (API) implements the API server for the Crowler search engine.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	auth "github.com/pzaino/thecrowler/pkg/auth"
+	cmn "github.com/pzaino/thecrowler/pkg/common"
+	cfg "github.com/pzaino/thecrowler/pkg/config"
+	cdb "github.com/pzaino/thecrowler/pkg/database"
+	plg "github.com/pzaino/thecrowler/pkg/plugin"
+	ws "github.com/pzaino/thecrowler/pkg/ws"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/push"
+	"golang.org/x/time/rate"
+)
+
+const (
+	errTooManyRequests = "Too Many Requests"
+	errRateLimitExceed = "Rate limit exceeded"
+)
+
+// Create a rate limiter for your application. Adjust the parameters as needed.
+var (
+	limiter     *rate.Limiter
+	configMutex sync.Mutex
+	configFile  *string
+	dbAdmission *dbAdmissionGate // Gate for database operations
+	dbHandler   cdb.Handler
+
+	sysReadyMtx sync.RWMutex // Mutex to protect the SysReady variable
+	sysReady    int          // System readiness status variable 0 = not ready, 1 = starting up, 2 = ready
+
+	// Counters for monitoring (atomic)
+	totalRequests atomic.Int64
+	totalErrors   atomic.Int64
+	totalSuccess  atomic.Int64
+
+	apiPlugins         *plg.JSPluginRegister
+	allowedAPIPlugins  map[string]bool
+	allowedAPINetworks []*net.IPNet
+	apiWSHub           *ws.Hub
+)
+
+func setSysReady(newStatus int) {
+	if newStatus < 0 || newStatus > 2 {
+		return
+	}
+	sysReadyMtx.Lock()
+	defer sysReadyMtx.Unlock()
+	sysReady = newStatus
+}
+
+func getSysReady() int {
+	sysReadyMtx.RLock()
+	defer sysReadyMtx.RUnlock()
+	return sysReady
+}
+
+func initAll(configFile *string, config *cfg.Config, lmt **rate.Limiter) error {
+	// Reading the configuration file
+	var err error
+	currentSysReady := getSysReady()
+	setSysReady(1) // Indicate system is starting up or being restarted
+
+	*config, err = cfg.LoadConfig(*configFile)
+	if err != nil {
+		cmn.DebugMsg(cmn.DbgLvlFatal, "Error reading config file: %v", err)
+	}
+	if cfg.IsEmpty(*config) {
+		cmn.DebugMsg(cmn.DbgLvlFatal, "Config file is empty")
+	}
+
+	// Set the OS variable
+	config.OS = runtime.GOOS
+
+	// Set the rate limiter
+	var rl, bl int
+	if strings.TrimSpace(config.API.RateLimit) == "" {
+		config.API.RateLimit = "10,10"
+	}
+	if !strings.Contains(config.API.RateLimit, ",") {
+		config.API.RateLimit = config.API.RateLimit + ",10"
+	}
+	rlStr := strings.Split(config.API.RateLimit, ",")[0]
+	if rlStr == "" {
+		rlStr = "10"
+	}
+	rl, err = strconv.Atoi(rlStr)
+	if err != nil {
+		rl = 10
+	}
+	blStr := strings.Split(config.API.RateLimit, ",")[1]
+	if blStr == "" {
+		blStr = "10"
+	}
+	bl, err = strconv.Atoi(blStr)
+	if err != nil {
+		bl = 10
+	}
+	*lmt = rate.NewLimiter(rate.Limit(rl), bl)
+
+	// Configure database admission. Heartbeats are the existing switch for
+	// dynamic fleet budgeting; no separate API setting is needed.
+	configureAPIQuota(*config)
+
+	if dbAdmission == nil {
+		effectiveMaxOpen := cdb.ResolveEffectiveMaxOpenConnections(*config)
+
+		targetLimit := effectiveMaxOpen - cdb.FleetDBReservedConnections
+		if config.Events.HeartbeatEnabled {
+			targetLimit = 1
+		}
+
+		if targetLimit <= 0 {
+			targetLimit = 1
+		}
+
+		dbAdmission = newDBAdmissionGate(targetLimit)
+	}
+
+	// Initialize the database
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Initializing database connection...")
+	connected := false
+	dbHandler, err = cdb.NewHandler(*config)
+	if err != nil {
+		cmn.DebugMsg(cmn.DbgLvlError, "Error allocating database resources: %v", err)
+	} else {
+		for !connected {
+			err = dbHandler.Connect(*config)
+			if err != nil {
+				cmn.DebugMsg(cmn.DbgLvlError, "Error opening database connection: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			connected = true
+		}
+		if err = applyAPIQuotaAfterConnect(*config); err != nil {
+			return fmt.Errorf("apply API database quota: %w", err)
+		}
+		if err = cdb.CheckStartupCompatibility(context.Background(), dbHandler); err != nil {
+			cmn.DebugMsg(cmn.DbgLvlError, "%v", err)
+		}
+		cmn.DebugMsg(cmn.DbgLvlInfo, "Database connection established")
+	}
+
+	// Reload plugins
+	apiPlugins = plg.NewJSPluginRegister().
+		LoadPluginsFromConfig(config, "api_plugin")
+	cmn.DebugMsg(
+		cmn.DbgLvlInfo,
+		"API PLUGINS: loaded %d plugins",
+		len(apiPlugins.Registry),
+	)
+
+	// Initialize allowed API CIDRs
+	initAllowedAPICIDRs()
+
+	setSysReady(currentSysReady) // Restore previous system ready state
+	return nil
+}
+
+func initAllowedAPICIDRs() error {
+	for _, cidr := range config.API.AllowedIPs {
+		_, netw, err := net.ParseCIDR(strings.TrimSpace(cidr))
+		if err != nil {
+			cmn.DebugMsg(cmn.DbgLvlError, "invalid CIDR in API config: '%s' skipping.", cidr)
+			continue
+		}
+		allowedAPINetworks = append(allowedAPINetworks, netw)
+	}
+
+	cmn.DebugMsg(
+		cmn.DbgLvlInfo,
+		"API CIDR filter enabled (%d networks)",
+		len(allowedAPINetworks),
+	)
+
+	return nil
+}
+
+func main() {
+	setSysReady(1) // Indicate system is starting
+
+	// Parse the command line arguments
+	configFile = flag.String("config", "./config.yaml", "Path to the configuration file")
+	flag.Parse()
+
+	// Initialize the logger
+	cmn.InitLogger("TheCROWlerAPI")
+	cmn.DebugMsg(cmn.DbgLvlInfo, "The CROWler API is starting...")
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Node   ID: %s", cmn.GetEngineID())
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Node name: %s", cmn.GetMicroServiceName())
+	nCPU := runtime.NumCPU()
+	nUsableCPU := runtime.GOMAXPROCS(0)
+	cmn.DebugMsg(cmn.DbgLvlInfo, "CPU cores available: %d, usable by this process: %d", nCPU, nUsableCPU)
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	heapUsed := m.HeapAlloc
+	heapReserved := m.HeapSys
+	heapIdle := m.HeapIdle
+	heapReleased := m.HeapReleased
+	heapInUse := m.HeapInuse
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Memory usage at startup: HeapUsed=%d bytes, HeapReserved=%d bytes, HeapIdle=%d bytes, HeapReleased=%d bytes, HeapInUse=%d bytes",
+		heapUsed, heapReserved, heapIdle, heapReleased, heapInUse,
+	)
+
+	// Setting up a channel to listen for termination signals
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Setting up termination signals listener...")
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+
+	// Define signal handling
+	go func() {
+		for {
+			sig := <-signals
+			switch sig {
+			case syscall.SIGINT:
+				// Handle SIGINT (Ctrl+C)
+				cmn.DebugMsg(cmn.DbgLvlInfo, "SIGINT received, shutting down...")
+				setSysReady(0)
+				updateMetrics()
+				time.Sleep(2 * time.Second) // Give some time for metrics to be pushed before exiting
+				os.Exit(0)
+
+			case syscall.SIGTERM:
+				// Handle SIGTERM
+				cmn.DebugMsg(cmn.DbgLvlInfo, "SIGTERM received, shutting down...")
+				setSysReady(0)
+				updateMetrics()
+				time.Sleep(2 * time.Second) // Give some time for metrics to be pushed before exiting
+				os.Exit(0)
+
+			case syscall.SIGQUIT:
+				// Handle SIGQUIT
+				cmn.DebugMsg(cmn.DbgLvlInfo, "SIGQUIT received, shutting down...")
+				setSysReady(0)
+				updateMetrics()
+				time.Sleep(2 * time.Second) // Give some time for metrics to be pushed before exiting
+				os.Exit(0)
+
+			case syscall.SIGHUP:
+				// Handle SIGHUP
+				cmn.DebugMsg(cmn.DbgLvlInfo, "SIGHUP received, will reload configuration as soon as all pending jobs are completed...")
+				updateMetrics()
+				configMutex.Lock()
+				err := initAll(configFile, &config, &limiter)
+				if err != nil {
+					configMutex.Unlock()
+					cmn.DebugMsg(cmn.DbgLvlFatal, "Error initializing the crawler: %v", err)
+				}
+				configMutex.Unlock()
+			}
+		}
+	}()
+
+	// Initialize the configuration
+	err := initAll(configFile, &config, &limiter)
+	if err != nil {
+		cmn.DebugMsg(cmn.DbgLvlFatal, "Error initializing the crawler: %v", err)
+		os.Exit(-1)
+	}
+
+	addr := ""
+	if config.API.UseGoogleCloudRun {
+		addr = cloudRunAddr(config)
+	} else {
+		addr = fmt.Sprintf("%s:%d", config.API.Host, config.API.Port)
+	}
+
+	srv := &http.Server{
+		Addr: addr,
+
+		// ReadHeaderTimeout is the amount of time allowed to read
+		// request headers. The connection's read deadline is reset
+		// after reading the headers and the Handler can decide what
+		// is considered too slow for the body. If ReadHeaderTimeout
+		// is zero, the value of ReadTimeout is used. If both are
+		// zero, there is no timeout.
+		ReadHeaderTimeout: time.Duration(config.API.ReadHeaderTimeout) * time.Second,
+
+		// ReadTimeout is the maximum duration for reading the entire
+		// request, including the body. A zero or negative value means
+		// there will be no timeout.
+		//
+		// Because ReadTimeout does not let Handlers make per-request
+		// decisions on each request body's acceptable deadline or
+		// upload rate, most users will prefer to use
+		// ReadHeaderTimeout. It is valid to use them both.
+		ReadTimeout: time.Duration(config.API.ReadTimeout) * time.Second,
+
+		// WriteTimeout is the maximum duration before timing out
+		// writes of the response. It is reset whenever a new
+		// request's header is read. Like ReadTimeout, it does not
+		// let Handlers make decisions on a per-request basis.
+		// A zero or negative value means there will be no timeout.
+		WriteTimeout: time.Duration(config.API.WriteTimeout) * time.Second,
+
+		// IdleTimeout is the maximum amount of time to wait for the
+		// next request when keep-alive are enabled. If IdleTimeout
+		// is zero, the value of ReadTimeout is used. If both are
+		// zero, there is no timeout.
+		IdleTimeout: time.Duration(config.API.IdleTimeout) * time.Second,
+	}
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// Set the handlers
+	initAPIv1()
+
+	// ---------------------------------------------------------
+	// Start Event Listener (Search API participates in heartbeats)
+	// ---------------------------------------------------------
+	notifyTimeout := 90 * time.Second
+	go cdb.ListenForEvents(&dbHandler, handleNotification, notifyTimeout)
+
+	// ---------------------------------------------------------
+	// Start Prometheus metrics updater
+	// ---------------------------------------------------------
+	if config.Prometheus.Enabled {
+		// Init immediate metrics update
+		updateMetrics()
+		// Start periodic metrics update
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				updateMetrics()
+			}
+		}()
+	}
+
+	cmn.DebugMsg(cmn.DbgLvlInfo, "System time: '%v'", time.Now())
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Local location: '%v'", time.Local.String())
+
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Starting server on %s:%d", config.API.Host, config.API.Port)
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Awaiting for requests...")
+	if strings.ToLower(strings.TrimSpace(config.API.SSLMode)) == cmn.EnableStr {
+		setSysReady(2) // Indicate system is ready
+		cmn.DebugMsg(cmn.DbgLvlFatal, "Server return: %v", srv.ListenAndServeTLS(config.API.CertFile, config.API.KeyFile))
+	} else {
+		setSysReady(2) // Indicate system is ready
+		cmn.DebugMsg(cmn.DbgLvlFatal, "Server return: %v", srv.ListenAndServe())
+	}
+	setSysReady(0) // Indicate system is NOT ready
+}
+
+func cloudRunAddr(cfg cfg.Config) string {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		if cfg.Events.Port > 0 {
+			port = strconv.Itoa(cfg.Events.Port)
+		} else {
+			port = "8080"
+		}
+	}
+
+	// Cloud Run requires listening on all interfaces.
+	return "0.0.0.0:" + port
+}
+
+// ---------------------------------------------------------
+// Event Listener for the Search API
+// ---------------------------------------------------------
+
+func handleNotification(payload string) {
+	var event cdb.Event
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		cmn.DebugMsg(cmn.DbgLvlError, "API: Failed to decode incoming event: %v", err)
+		return
+	}
+
+	eventType := strings.ToLower(strings.TrimSpace(event.Type))
+
+	switch eventType {
+	case "system_event":
+		cmn.DebugMsg(cmn.DbgLvlDebug3, "API: Received event of type '%s'", eventType)
+		processSystemEvent(event)
+	case "crowler_heartbeat":
+		cmn.DebugMsg(cmn.DbgLvlDebug3, "API: Received event of type '%s'", eventType)
+		processHeartbeatEvent(event)
+	case "crowler_heartbeat_report":
+		cmn.DebugMsg(cmn.DbgLvlDebug3, "API: Received event of type '%s'", eventType)
+		processHeartbeatReport(event)
+	default:
+		if apiWSHub != nil {
+			apiWSHub.Broadcast("event", event)
+		}
+		// Ignore all other events
+		cmn.DebugMsg(cmn.DbgLvlDebug5, "API: Ignoring event type '%s'", eventType)
+	}
+}
+
+// ---------------------------------------------------------
+// Heartbeat response logic for The CROWler Search API
+// ---------------------------------------------------------
+
+func processHeartbeatEvent(event cdb.Event) {
+	// SearchAPI has a single pipeline with info, so let's respond accordingly
+	pipelineResults := make([]any, 0)
+	pipelineResults = append(pipelineResults, map[string]any{
+		"pipeline_name":   "search_api_pipeline",
+		"pipeline_status": "ready",
+		"Total Requests":  totalRequests.Load(),
+		"Total Errors":    totalErrors.Load(),
+		"Total Success":   totalSuccess.Load(),
+	})
+	resp := cdb.Event{
+		Type:      "crowler_heartbeat_response",
+		Severity:  "crowler_system_info",
+		Timestamp: time.Now().Format(time.RFC3339),
+		ExpiresAt: time.Now().Add(1 * time.Minute).Format(time.RFC3339),
+		Details: map[string]any{
+			"parent_event_id": event.ID,
+			"type":            "heartbeat_response",
+			"status":          "ok",
+			"origin_name":     cmn.GetMicroServiceName(),
+			"origin_type":     "crowler-api",
+			"origin_time":     time.Now().Format(time.RFC3339),
+			"pipeline_status": pipelineResults,
+		},
+	}
+
+	_, err := cdb.CreateEventWithRetries(&dbHandler, resp)
+	if err != nil {
+		cmn.DebugMsg(cmn.DbgLvlError, "API: Failed to send heartbeat response: %v", err)
+		return
+	}
+
+	cmn.DebugMsg(cmn.DbgLvlDebug3, "API: Heartbeat response sent")
+}
+
+func processSystemEvent(event cdb.Event) {
+	action, _ := event.Details["action"].(string)
+	action = strings.ToLower(strings.TrimSpace(action))
+
+	switch action {
+	case "update_debug_level":
+		if lv, ok := event.Details["level"].(string); ok {
+			newLevel := strings.ToLower(strings.TrimSpace(lv))
+			go updateDebugLevel(newLevel)
+		}
+	default:
+		cmn.DebugMsg(cmn.DbgLvlDebug5, "API: Ignoring system_event action '%s'", action)
+	}
+}
+
+func updateDebugLevel(newLevel string) {
+	// Get configuration lock
+	configMutex.Lock()
+	defer configMutex.Unlock()
+
+	var dbgLvl cmn.DbgLevel
+	switch newLevel {
+	case "debug":
+		config.DebugLevel = 1
+		cmn.SetDebugLevelFromString("debug")
+	case "debug1":
+		config.DebugLevel = 1
+		cmn.SetDebugLevelFromString("debug1")
+	case "debug2":
+		config.DebugLevel = 2
+		cmn.SetDebugLevelFromString("debug2")
+	case "debug3":
+		config.DebugLevel = 3
+		cmn.SetDebugLevelFromString("debug3")
+	case "debug4":
+		config.DebugLevel = 4
+		cmn.SetDebugLevelFromString("debug4")
+	case "debug5":
+		config.DebugLevel = 5
+		cmn.SetDebugLevelFromString("debug5")
+	case "info":
+		config.DebugLevel = 0
+		cmn.SetDebugLevelFromString("info")
+	default:
+		cmn.DebugMsg(cmn.DbgLvlDebug5, "Ignoring event, invalid debug level specified: %s", newLevel)
+		return
+	}
+
+	// Update the debug level
+	dbgLvl = cmn.DbgLevel(config.DebugLevel)
+	cmn.SetDebugLevel(dbgLvl)
+	cmn.DebugMsg(cmn.DbgLvlInfo, "Debug level updated to: %d", cmn.GetDebugLevel())
+}
+
+// -------------------------------------------
+// Handle Prometheus Push-Gateway Metrics
+//--------------------------------------------
+
+var (
+	gaugeSearchTotalRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "crowler_search_total_requests",
+			Help: "Total number of search requests",
+		},
+		[]string{"engine"},
+	)
+
+	gaugeSearchTotalErrors = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "crowler_search_total_errors",
+			Help: "Total number of search errors",
+		},
+		[]string{"engine"},
+	)
+
+	gaugeSearchTotalSuccess = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "crowler_search_total_success",
+			Help: "Total number of successful searches",
+		},
+		[]string{"engine"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(
+		gaugeSearchTotalRequests,
+		gaugeSearchTotalErrors,
+		gaugeSearchTotalSuccess,
+	)
+	for _, collector := range apiDBMetrics.Collectors() {
+		prometheus.MustRegister(collector)
+	}
+}
+
+func updateMetrics() {
+	if !config.Prometheus.Enabled {
+		return
+	}
+
+	engine := cmn.GetMicroServiceName()
+	url := "http://" + config.Prometheus.Host + ":" + strconv.Itoa(config.Prometheus.Port)
+
+	labels := prometheus.Labels{
+		"engine": engine,
+	}
+
+	gaugeSearchTotalRequests.With(labels).Set(float64(totalRequests.Load()))
+	gaugeSearchTotalErrors.With(labels).Set(float64(totalErrors.Load()))
+	gaugeSearchTotalSuccess.With(labels).Set(float64(totalSuccess.Load()))
+	if stats, err := cdb.ConnectionStats(&dbHandler); err == nil {
+		apiDBMetrics.UpdatePool(stats)
+	}
+
+	p := push.New(url, "crowler_search_api").
+		Collector(gaugeSearchTotalRequests).
+		Collector(gaugeSearchTotalErrors).
+		Collector(gaugeSearchTotalSuccess)
+	for _, collector := range apiDBMetrics.Collectors() {
+		p = p.Collector(collector)
+	}
+
+	if err := p.Push(); err != nil {
+		cmn.DebugMsg(cmn.DbgLvlError, "SearchAPI: Could not push metrics: %v", err)
+	} else {
+		cmn.DebugMsg(cmn.DbgLvlDebug3, "SearchAPI: Metrics pushed for engine=%s", engine)
+	}
+}
+
+// -------------------------------------------
+// API v1 Handlers and Middlewares
+//--------------------------------------------
+
+// StdAPIBasicQuery is a standard query struct for API endpoints that require a simple URL-based query parameter. It can be embedded in more specific query structs for different endpoints.
+type StdAPIBasicQuery struct {
+	URL string `json:"url" yaml:"url" desc:"a URL that express the Source you want to use in the query, for example url=https://example.com or url=example.com. If the URL is not specified, the query will be executed on all sources."`
+}
+
+// StdAPIIDQuery is a standard query struct for API endpoints that require a simple ID-based query parameter. It can be embedded in more specific query structs for different endpoints.
+type StdAPIIDQuery struct {
+	ID string `json:"id" yaml:"id" desc:"an uint64 number that express the ID of the Entity you want to use in the query, for example id=12345."`
+}
+
+// StdAPINameQuery is a standard query struct for API endpoints that require a name parameter.
+type StdAPINameQuery struct {
+	Name string `json:"name" yaml:"name" desc:"name of the configuration entry to inspect."`
+}
+
+// initAPIv1 initializes the API v1 handlers
+func initAPIv1() {
+	tagsNone := []string{}
+	tagsHealth := []string{"Health"}
+	tagsDocs := []string{"Documentation"}
+
+	// Auth endpoints
+	http.Handle("POST /v1/auth/login", withPublicMiddlewares(authLoginHandler))
+	cmn.RegisterAPIRoute("/v1/auth/login", []string{"POST"}, "Local authentication login endpoint", tagsNone, false, false, 200, authLoginRequest{}, nil, authLoginResponse{})
+
+	// Health check
+	healthCheckWithMiddlewares := withPublicMiddlewares(healthCheckHandler)
+	readyCheckWithMiddlewares := withPublicMiddlewares(readyCheckHandler)
+
+	http.Handle("/v1/health", healthCheckWithMiddlewares)
+	cmn.RegisterAPIRoute("/v1/health", []string{"GET"}, "Health check endpoint", tagsHealth, false, false, 200, nil, nil, nil)
+	http.Handle("/v1/health/", healthCheckWithMiddlewares)
+
+	http.Handle("/v1/ready", readyCheckWithMiddlewares)
+	cmn.RegisterAPIRoute("/v1/ready", []string{"GET"}, "Readiness check endpoint", tagsHealth, false, false, 200, nil, nil, nil)
+	http.Handle("/v1/ready/", readyCheckWithMiddlewares)
+
+	if !config.API.DisableDefault {
+		// Aggregate-first time-series query handlers. Raw observations remain on
+		// their explicit, conservatively bounded endpoint.
+
+		// Time series endpoints
+		http.Handle("/v1/timeseries/capabilities", withPublicMiddlewares(timeSeriesCapabilitiesHandler))
+		cmn.RegisterAPIRoute("/v1/timeseries/capabilities", []string{"GET"}, "Describe supported time-series query capabilities and limits", tagsNone, false, false, 200, nil, nil, TimeSeriesCapabilitiesResponse{})
+
+		http.Handle("/v1/timeseries/metrics", withPublicMiddlewares(timeSeriesMetricsHandler))
+		cmn.RegisterAPIRoute("/v1/timeseries/metrics", []string{"GET"}, "List time-series metric definitions", tagsNone, false, false, 200, nil, TimeSeriesQuery{}, TimeSeriesMetricListResponse{})
+
+		http.Handle("/v1/timeseries", withPublicMiddlewares(timeSeriesAggregatesHandler))
+		cmn.RegisterAPIRoute("/v1/timeseries", []string{"GET"}, "Query aggregate time-series buckets", tagsNone, false, false, 200, nil, TimeSeriesQuery{}, TimeSeriesAggregateResponse{})
+
+		http.Handle("/v1/timeseries/observations", withPublicMiddlewares(timeSeriesObservationsHandler))
+		cmn.RegisterAPIRoute("/v1/timeseries/observations", []string{"GET"}, "Query bounded raw time-series observations", tagsNone, false, false, 200, nil, TimeSeriesQuery{}, TimeSeriesObservationListResponse{})
+
+		http.Handle("/v1/timeseries/drilldown", withPublicMiddlewares(timeSeriesDrilldownHandler))
+		cmn.RegisterAPIRoute("/v1/timeseries/drilldown", []string{"GET"}, "Drill down from an aggregate hash or complete scope to matching observations", tagsNone, false, false, 200, nil, TimeSeriesQuery{}, TimeSeriesDrilldownResponse{})
+
+		http.Handle("/v1/timeseries/dimensions", withPublicMiddlewares(timeSeriesDimensionsHandler))
+		cmn.RegisterAPIRoute("/v1/timeseries/dimensions", []string{"GET"}, "Compare aggregate buckets grouped by a bounded metric dimension", tagsNone, false, false, 200, nil, TimeSeriesQuery{}, TimeSeriesDimensionComparisonResponse{})
+
+		// Search query handlers
+
+		http.Handle("/v1/search/general", withPublicMiddlewares(searchHandler))
+		cmn.RegisterAPIRoute("/v1/search/general", []string{"GET"}, "General search endpoint", tagsNone, false, false, 200, nil, cmn.StdAPIQuery{}, SearchResult{})
+
+		http.Handle("/v1/search/netinfo", withPublicMiddlewares(netInfoHandler))
+		cmn.RegisterAPIRoute("/v1/search/netinfo", []string{"GET"}, "Network information search endpoint", tagsNone, false, false, 200, nil, cmn.StdAPIQuery{}, NetInfoResponse{})
+
+		http.Handle("/v1/search/httpinfo", withPublicMiddlewares(httpInfoHandler))
+		cmn.RegisterAPIRoute("/v1/search/httpinfo", []string{"GET"}, "HTTP information search endpoint", tagsNone, false, false, 200, nil, cmn.StdAPIQuery{}, HTTPInfoResponse{})
+
+		http.Handle("/v1/search/screenshot", withPublicMiddlewares(scrImgSrchHandler))
+		cmn.RegisterAPIRoute("/v1/search/screenshot", []string{"GET"}, "Screenshot search endpoint", tagsNone, false, false, 200, nil, cmn.StdAPIQuery{}, ScreenshotResponse{})
+
+		http.Handle("/v1/search/webobject", withPublicMiddlewares(webObjectHandler))
+		cmn.RegisterAPIRoute("/v1/search/webobject", []string{"GET"}, "Web object search endpoint", tagsNone, false, false, 200, nil, cmn.StdAPIQuery{}, WebObjectResponse{})
+
+		http.Handle("/v1/search/correlated_sites", withPublicMiddlewares(webCorrelatedSitesHandler))
+		cmn.RegisterAPIRoute("/v1/search/correlated_sites", []string{"GET"}, "Correlated sites search endpoint", tagsNone, false, false, 200, nil, cmn.StdAPIQuery{}, CorrelatedSitesResponse{})
+
+		http.Handle("/v1/search/collected_data", withPublicMiddlewares(webScrapedDataHandler))
+		cmn.RegisterAPIRoute("/v1/search/collected_data", []string{"GET"}, "Collected data search endpoint", tagsNone, false, false, 200, nil, cmn.StdAPIQuery{}, ScrapedDataResponse{})
+
+		registerSearchFunctionRoute("/v1/search/correlated_sources", searchCorrelatedSourcesByDomainHandler, "Typed PostgreSQL correlated-source search endpoint", correlatedSourcesSearchQuery{})
+
+		registerSearchFunctionRoute("/v1/search/pages", searchPagesFunctionHandler, "Typed PostgreSQL page search endpoint", pagesSearchQuery{})
+
+		registerSearchFunctionRoute("/v1/search/webobjects_by_source", searchWebObjectsBySourceIDHandler, "Web objects collected for a source ID", webObjectsBySourceIDQuery{})
+
+		registerSearchFunctionRoute("/v1/search/webobjects_by_source_uid", searchWebObjectsBySourceUIDHandler, "Web objects collected for a source UID", sourceUIDQuery{})
+
+		registerSearchFunctionRoute("/v1/search/source_status_by_uid", searchSourceStatusByUIDHandler, "Source status lookup by source UID", sourceUIDQuery{})
+
+		registerSearchFunctionRoute("/v1/search/source_uid_by_name", searchSourceUIDByNameHandler, "Source UID lookup by source name", sourceNameQuery{})
+
+		registerSearchFunctionRoute("/v1/search/source_uid_by_url", searchSourceUIDByURLHandler, "Source UID lookup by source URL", sourceURLQuery{})
+
+		registerSearchFunctionRoute("/v1/search/scraped_data", searchScrapedDataFunctionHandler, "Typed PostgreSQL scraped-data search endpoint", qSearchFunctionQuery{})
+
+		registerSearchFunctionRoute("/v1/search/scraped_data_field", searchScrapedDataFieldFunctionHandler, "Typed PostgreSQL scraped-data field search endpoint", fieldSearchFunctionQuery{})
+
+		registerSearchFunctionRoute("/v1/search/artifacts", searchArtifactsFunctionHandler, "Typed PostgreSQL artifact search endpoint", qSearchFunctionQuery{})
+
+		registerSearchFunctionRoute("/v1/search/artifacts_field", searchArtifactsFieldFunctionHandler, "Typed PostgreSQL artifact field search endpoint", fieldSearchFunctionQuery{})
+
+		registerSearchFunctionRoute("/v1/search/artifacts_fields", searchArtifactsFieldsFunctionHandler, "Typed PostgreSQL artifact multi-field search endpoint", filtersSearchFunctionQuery{})
+
+		registerSearchFunctionRoute("/v1/search/artifacts_attribute", searchArtifactsByAttributeFunctionHandler, "Typed PostgreSQL artifact attribute search endpoint", fieldSearchFunctionQuery{})
+
+		registerSearchFunctionRoute("/v1/search/objects_attribute", searchObjectsByAttributeFunctionHandler, "Typed PostgreSQL object attribute search endpoint", fieldSearchFunctionQuery{})
+
+		registerSearchFunctionRoute("/v1/search/objects_attributes", searchObjectsByAttributesFunctionHandler, "Typed PostgreSQL object multi-attribute search endpoint", filtersSearchFunctionQuery{})
+	}
+
+	if config.API.EnableConsole {
+		addSourceHandlerWithMiddlewares := withPublicMiddlewares(addSourceHandler)
+		removeSourceHandlerWithMiddlewares := withPublicMiddlewares(removeSourceHandler)
+		updateSourceHandlerWithMiddlewares := withPublicMiddlewares(updateSourceHandler)
+		vacuumSourceHandlerWithMiddlewares := withPublicMiddlewares(vacuumSourceHandler)
+		singleURLstatusHandlerWithMiddlewares := withPublicMiddlewares(singleURLstatusHandler)
+		allURLstatusHandlerWithMiddlewares := withPublicMiddlewares(allURLstatusHandler)
+		filteredURLstatusHandlerWithMiddlewares := withPublicMiddlewares(filteredURLstatusHandler)
+		informationSeedAddHandlerWithMiddlewares := withPublicMiddlewares(informationSeedAddHandler)
+		informationSeedStatusHandlerWithMiddlewares := withPublicMiddlewares(informationSeedStatusHandler)
+		informationSeedListHandlerWithMiddlewares := withPublicMiddlewares(informationSeedListHandler)
+		informationSeedSourcesHandlerWithMiddlewares := withPublicMiddlewares(informationSeedSourcesHandler)
+		informationSeedCandidatesHandlerWithMiddlewares := withPublicMiddlewares(informationSeedCandidateDecisionsHandler)
+		informationSeedRetryHandlerWithMiddlewares := withPublicMiddlewares(informationSeedRetryHandler)
+		informationSeedUpdateHandlerWithMiddlewares := withPublicMiddlewares(informationSeedUpdateHandler)
+		informationSeedRemoveHandlerWithMiddlewares := withPublicMiddlewares(informationSeedRemoveHandler)
+		informationSeedRerunHandlerWithMiddlewares := withPublicMiddlewares(informationSeedRerunHandler)
+		informationSeedDisableHandlerWithMiddlewares := withPublicMiddlewares(informationSeedDisableHandler)
+		informationSeedPathDisableHandlerWithMiddlewares := withPublicMiddlewares(informationSeedPathDisableHandler)
+		informationSeedEnableHandlerWithMiddlewares := withPublicMiddlewares(informationSeedEnableHandler)
+		informationSeedEventsHandlerWithMiddlewares := withPublicMiddlewares(informationSeedEventsHandler)
+		informationSeedConfigProvidersHandlerWithMiddlewares := withPublicMiddlewares(informationSeedConfigProvidersHandler)
+		informationSeedConfigProviderHandlerWithMiddlewares := withPublicMiddlewares(informationSeedConfigProviderHandler)
+		vdiConfigListHandlerWithMiddlewares := withPublicMiddlewares(vdiConfigListHandler)
+		vdiConfigHandlerWithMiddlewares := withPublicMiddlewares(vdiConfigHandler)
+
+		registerAuthConsoleRoutes(tagsNone)
+
+		// Source management endpoints
+
+		http.Handle("/v1/source/add", addSourceHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/source/add", []string{"GET", "POST"}, "Add source endpoint (console)", tagsNone, true, false, 201, addSourceRequest{}, StdAPIBasicQuery{}, nil)
+
+		http.Handle("/v1/source/remove", removeSourceHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/source/remove", []string{"GET"}, "Remove source endpoint (console)", tagsNone, true, false, 204, true, StdAPIBasicQuery{}, nil)
+
+		http.Handle("/v1/source/update", updateSourceHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/source/update", []string{"POST"}, "Update source endpoint (console)", tagsNone, true, false, 204, updateSourceRequest{}, nil, nil)
+
+		http.Handle("/v1/source/vacuum", vacuumSourceHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/source/vacuum", []string{"GET"}, "Vacuum source endpoint (console)", tagsNone, true, false, 204, nil, StdAPIBasicQuery{}, nil)
+
+		http.Handle("/v1/source/status", singleURLstatusHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/source/status", []string{"GET"}, "Single URL status endpoint (console)", tagsNone, true, false, 200, nil, cmn.StdAPIQuery{}, SourcesStatusResponse{})
+
+		http.Handle("/v1/source/statuses", allURLstatusHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/source/statuses", []string{"GET"}, "All URLs status endpoint (console)", tagsNone, true, false, 200, nil, nil, SourcesStatusResponse{})
+
+		http.Handle("/v1/source/statuses/filter", filteredURLstatusHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/source/statuses/filter", []string{"GET"}, "Filtered URLs status endpoint (console)", tagsNone, true, false, 200, nil, cmn.StdAPIQuery{}, SourcesStatusResponse{})
+
+		// Configuration inspection endpoints
+
+		http.Handle("/v1/config/information_seed/providers", informationSeedConfigProvidersHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/config/information_seed/providers", []string{"GET"}, "List configured information seed providers endpoint (console)", tagsNone, true, false, 200, nil, nil, InformationSeedConfigProvidersResponse{})
+
+		http.Handle("GET /v1/config/information_seed/providers/{name}", informationSeedConfigProviderHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/config/information_seed/providers/{name}", []string{"GET"}, "Get configured information seed provider endpoint (console)", tagsNone, true, false, 200, nil, StdAPINameQuery{}, InformationSeedConfigProviderResponse{})
+
+		http.Handle("/v1/config/vdis", vdiConfigListHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/config/vdis", []string{"GET"}, "List configured VDI names endpoint (console)", tagsNone, true, false, 200, nil, nil, VDIConfigListResponse{})
+
+		http.Handle("GET /v1/config/vdis/{name}", vdiConfigHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/config/vdis/{name}", []string{"GET"}, "Get configured VDI endpoint (console)", tagsNone, true, false, 200, nil, StdAPINameQuery{}, VDIConfigResponse{})
+
+		// Information seed endpoints
+
+		http.Handle("/v1/information_seed/add", informationSeedAddHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/add", []string{"POST"}, "Add information seed endpoint (console)", tagsNone, true, false, 201, informationSeedAddRequest{}, nil, InformationSeedResponse{})
+
+		http.Handle("/v1/information_seed/status", informationSeedStatusHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/status", []string{"GET"}, "Information seed status endpoint (console)", tagsNone, true, false, 200, nil, StdAPIIDQuery{}, InformationSeedResponse{})
+
+		http.Handle("/v1/information_seed/list", informationSeedListHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/list", []string{"GET"}, "List information seeds with filters, pagination, and discovered source counts (console)", tagsNone, true, false, 200, nil, StdAPIIDQuery{}, InformationSeedListResponse{})
+
+		http.Handle("/v1/information_seed/sources", informationSeedSourcesHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/sources", []string{"GET"}, "List sources linked to an information seed with discovery provenance (console)", tagsNone, true, false, 200, nil, StdAPIIDQuery{}, InformationSeedLinkedSourceListResponse{})
+
+		http.Handle("/v1/information_seed/candidates", informationSeedCandidatesHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/candidates", []string{"GET"}, "List information seed candidate decision evidence (console)", tagsNone, true, false, 200, nil, StdAPIIDQuery{}, InformationSeedCandidateListResponse{})
+
+		http.Handle("/v1/information_seed/retry", informationSeedRetryHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/retry", []string{"POST"}, "Retry information seed endpoint (console)", tagsNone, true, false, 200, informationSeedIDRequest{}, nil, InformationSeedResponse{})
+
+		http.Handle("/v1/information_seed/disable", informationSeedDisableHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/disable", []string{"POST"}, "Disable information seed endpoint (console)", tagsNone, true, false, 200, informationSeedIDRequest{}, nil, InformationSeedResponse{})
+
+		http.Handle("/v1/information_seed/update", informationSeedUpdateHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/update", []string{"POST"}, "Update information seed endpoint (console)", tagsNone, true, false, 200, informationSeedUpdateRequest{}, nil, InformationSeedResponse{})
+
+		http.Handle("/v1/information_seed/remove", informationSeedRemoveHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/remove", []string{"POST"}, "Remove information seed endpoint (console)", tagsNone, true, false, 200, informationSeedIDRequest{}, nil, ConsoleResponse{})
+
+		http.Handle("GET /v1/information_seed/{id}/rerun", informationSeedRerunHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/{id}/rerun", []string{"GET"}, "Rerun information seed endpoint (console)", tagsNone, true, false, 200, nil, informationSeedIDGetRequest{}, InformationSeedResponse{})
+
+		http.Handle("GET /v1/information_seed/{id}/disable", informationSeedPathDisableHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/{id}/disable", []string{"GET"}, "Disable information seed by path ID endpoint (console)", tagsNone, true, false, 200, nil, informationSeedIDGetRequest{}, InformationSeedResponse{})
+
+		http.Handle("GET /v1/information_seed/{id}/enable", informationSeedEnableHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/{id}/enable", []string{"GET"}, "Enable information seed endpoint (console)", tagsNone, true, false, 200, informationSeedEnableRequest{}, informationSeedIDGetRequest{}, InformationSeedResponse{})
+
+		http.Handle("GET /v1/information_seed/{id}/events", informationSeedEventsHandlerWithMiddlewares)
+		cmn.RegisterAPIRoute("/v1/information_seed/{id}/events", []string{"GET"}, "List information seed discovery events endpoint (console)", tagsNone, true, false, 200, nil, informationSeedIDGetRequest{}, InformationSeedEventListResponse{})
+
+		http.Handle("GET /v1/information_seed/{id}/diagnostics", withPublicMiddlewares(http.HandlerFunc(informationSeedDiagnosticsHandler)))
+		cmn.RegisterAPIRoute("/v1/information_seed/{id}/diagnostics", []string{"GET"}, "Get redacted information seed run diagnostics endpoint (console)", tagsNone, true, false, 200, nil, informationSeedIDGetRequest{}, InformationSeedDiagnosticsResponse{})
+
+		// Owner endpoints
+
+		http.Handle("/v1/owner/add", withPublicMiddlewares(addOwnerHandler))
+		cmn.RegisterAPIRoute("/v1/owner/add", []string{"POST"}, "Add owner endpoint (console)", tagsNone, true, false, 201, cdb.OwnerRequest{}, nil, nil)
+
+		http.Handle("/v1/owner/update", withPublicMiddlewares(updateOwnerHandler))
+		cmn.RegisterAPIRoute("/v1/owner/update", []string{"POST"}, "Update owner endpoint (console)", tagsNone, true, false, 204, cdb.OwnerRequest{}, nil, nil)
+
+		http.Handle("/v1/owner/remove", withPublicMiddlewares(removeOwnerHandler))
+		cmn.RegisterAPIRoute("/v1/owner/remove", []string{"POST"}, "Remove owner endpoint (console)", tagsNone, true, false, 204, map[string]int64{}, nil, nil)
+
+		// Category endpoints
+
+		http.Handle("/v1/category/add", withPublicMiddlewares(addCategoryHandler))
+		cmn.RegisterAPIRoute("/v1/category/add", []string{"POST"}, "Add category endpoint (console)", tagsNone, true, false, 201, cdb.CategoryRequest{}, nil, nil)
+
+		http.Handle("/v1/category/update", withPublicMiddlewares(updateCategoryHandler))
+		cmn.RegisterAPIRoute("/v1/category/update", []string{"POST"}, "Update category endpoint (console)", tagsNone, true, false, 204, cdb.CategoryRequest{}, nil, nil)
+
+		http.Handle("/v1/category/remove", withPublicMiddlewares(removeCategoryHandler))
+		cmn.RegisterAPIRoute("/v1/category/remove", []string{"POST"}, "Remove category endpoint (console)", tagsNone, true, false, 204, map[string]int64{}, nil, nil)
+	}
+
+	apiWSHub = ws.NewHub("api", ws.Config(config.API.WebSocket))
+	http.Handle("/v1/ws", withMiddlewares(http.HandlerFunc(apiWSHub.Handler)))
+	cmn.RegisterAPIRoute("/v1/ws", []string{"GET"}, "WebSocket live API updates endpoint", tagsNone, false, false, 101, nil, nil, nil)
+
+	// Register API plugin routes
+	registeredPlugins := []string{}
+	if config.API.Plugins.Enabled {
+		initAllowedAPIPlugins()
+		registerAPIPluginRoutes(http.DefaultServeMux, &registeredPlugins)
+	}
+
+	if config.API.EnableAPIDocs {
+		// OpenAPI spec endpoint
+		http.Handle("/v1/openapi.json", withPublicMiddlewares(openapiHandler))
+		cmn.RegisterAPIRoute("/v1/openapi.json", []string{"GET"}, "OpenAPI 3.0.3 specification (generated at runtime)", tagsDocs, false, false, 200, nil, nil, nil)
+
+		// Finally add the docs endpoint (after plugins, to ensure it's always registered and not overridden by plugins)
+		http.Handle("/v1/docs", withPublicMiddlewares(http.HandlerFunc(openapiHandler)))
+		cmn.RegisterAPIRoute("/v1/docs", []string{"GET"}, "API documentation endpoint", tagsDocs, false, false, 200, nil, nil, nil)
+	}
+}
+
+type authLoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type authLoginResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+func authLoginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req authLoginRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	tok, err := auth.Login(r.Context(), dbHandler, config.API.Auth, req.Username, req.Password)
+	if err != nil {
+		cmn.DebugMsg(cmn.DbgLvlInfo, "auth login failed for user=%q remote=%q", req.Username, r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	cmn.DebugMsg(cmn.DbgLvlInfo, "auth login succeeded for user=%q remote=%q", req.Username, r.RemoteAddr)
+	handleErrorAndRespond(w, nil, authLoginResponse{AccessToken: tok, TokenType: "Bearer", ExpiresIn: config.API.Auth.TokenTTL}, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func docsHandler(w http.ResponseWriter, _ *http.Request) {
+	handleErrorAndRespond(
+		w,
+		nil,
+		map[string]any{
+			"service":   "CROWler API",
+			"version":   "v1",
+			"endpoints": cmn.GetAPIRoutes(),
+		},
+		"",
+		http.StatusInternalServerError,
+		http.StatusOK,
+	)
+}
+
+func openapiHandler(w http.ResponseWriter, _ *http.Request) {
+	routes := cmn.GetAPIRoutes()
+
+	serverURL := ""
+	scheme := "http"
+	if strings.ToLower(strings.TrimSpace(config.API.SSLMode)) == cmn.EnableStr {
+		scheme = "https"
+	}
+
+	// If host is 0.0.0.0, leave serverURL blank (Swagger UI can still work).
+	const localhost = "http://localhost"
+	host := strings.TrimSpace(config.API.URL)
+	port := ""
+	if (config.API.Port != 80) && (config.API.Port != 443) && (config.API.Port != 0) {
+		port = fmt.Sprintf(":%d", config.API.Port)
+	}
+	if host == "" {
+		host = strings.TrimSpace(config.API.Host)
+		if (host != "") && (host != "0.0.0.0") && (host != "::") {
+			serverURL = fmt.Sprintf("%s://%s%s", scheme, host, port)
+		} else {
+			serverURL = localhost // Default to localhost if host is not set or is a wildcard
+			if port != "" {
+				serverURL += port
+			}
+		}
+	} else {
+		// If config.API.URL is set, use it as the base for serverURL. If it doesn't include a scheme, prepend it.
+		if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+			host = fmt.Sprintf("%s://%s", scheme, host)
+		}
+		serverURL = host
+	}
+	if serverURL == "" {
+		serverURL = localhost // Fallback to localhost if serverURL is still empty
+		if port != "" {
+			serverURL += port
+		}
+	}
+	// Check if the serverURL got the port attached twice (e.g., if config.API.URL already included the port)
+	if strings.Count(serverURL, ":") > 2 && strings.Contains(serverURL, port) {
+		serverURL = strings.Replace(serverURL, port, "", 1)
+	}
+
+	spec := cmn.BuildOpenAPISpec(routes, cmn.OpenAPIOptions{
+		Title:       "CROWler Search API",
+		Version:     "v1",
+		Description: "Dynamically generated OpenAPI spec from the running server route registry.",
+		ServerURL:   serverURL,
+		Contact: &cmn.OpenAPIContact{
+			Name:  "CROWler Team",
+			URL:   "https://github.com/pzaino/thecrowler",
+			Email: "",
+		},
+		Tags: []cmn.OpenAPITag{
+			{
+				Name:        "API",
+				Description: "Endpoints for API default API routes (search, time-series, etc.).",
+			},
+			{
+				Name:        "Console",
+				Description: "Endpoints for console features (source management, information seeds, etc.).",
+			},
+			{
+				Name:        "Documentation",
+				Description: "Endpoints for API documentation and OpenAPI spec.",
+			},
+			{
+				Name:        "Health",
+				Description: "Endpoints for health and readiness checks.",
+			},
+			{
+				Name:        "Plugins",
+				Description: "Endpoints for API plugins.",
+			},
+		},
+	})
+
+	handleErrorAndRespond(w, nil, spec, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func initAllowedAPIPlugins() {
+	allowedAPIPlugins = make(map[string]bool)
+
+	if !config.API.Plugins.Enabled {
+		return
+	}
+
+	for _, name := range config.API.Plugins.Allowed {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		allowedAPIPlugins[name] = true
+	}
+
+	cmn.DebugMsg(
+		cmn.DbgLvlInfo,
+		"API PLUGINS: allowlist loaded (%d plugins)",
+		len(allowedAPIPlugins),
+	)
+}
+
+func registerAPIPluginRoutes(mux *http.ServeMux, currentRegisteredPlugins *[]string) {
+	for _, name := range apiPlugins.Order {
+		plugin := apiPlugins.Registry[name]
+		api := plugin.API
+		if api == nil {
+			continue
+		}
+		if api.EndPoint == "" || len(api.Methods) == 0 {
+			continue
+		}
+
+		// Enforce allowlist
+		if len(allowedAPIPlugins) > 0 {
+			if !allowedAPIPlugins[plugin.Name] {
+				cmn.DebugMsg(
+					cmn.DbgLvlInfo,
+					"API PLUGIN SKIPPED (not allowed): %s",
+					plugin.Name,
+				)
+				continue
+			}
+		}
+
+		cmn.DebugMsg(cmn.DbgLvlDebug2, "API PLUGIN FOUND: name=%s type=%s endpoint=%v",
+			name,
+			plugin.PType,
+			func() string {
+				if plugin.API == nil {
+					return "<nil>"
+				}
+				return plugin.API.EndPoint
+			}())
+
+		if len(api.Methods) == 0 {
+			api.Methods = []string{"GET"}
+		}
+
+		// Check if the plugin is already registered
+		alreadyRegistered := false
+		for _, registered := range *currentRegisteredPlugins {
+			if registered == name {
+				alreadyRegistered = true
+				break
+			}
+		}
+		if alreadyRegistered {
+			continue
+		}
+		cmn.DebugMsg(cmn.DbgLvlDebug2, "Registering API plugin routes")
+		handler := withAPIPluginMiddlewares(
+			makeAPIPluginHandler(plugin),
+		)
+
+		mux.Handle(api.EndPoint, handler)
+		(*currentRegisteredPlugins) = append((*currentRegisteredPlugins), name)
+		cmn.RegisterAPIPluginRoute(
+			api.EndPoint,
+			api.Methods,
+			fmt.Sprintf("API plugin endpoint '%s': %s", plugin.Name, plugin.Description),
+			true,
+			200,
+			plugin.API.OpenAPIQueryJSON,
+			plugin.API.OpenAPIRequestJSON,
+			plugin.API.OpenAPIResponseJSON,
+		)
+	}
+}
+
+func withAPIPluginMiddlewares(h http.HandlerFunc) http.Handler {
+	return RecoverMiddleware(
+		CIDRFilterMiddleware(
+			CORSHeadersMiddleware(
+				SecurityHeadersMiddleware(
+					KeepAliveHeadersMiddleware(
+						RateLimitMiddleware(auth.Middleware(config.API.Auth, dbHandler)(h)),
+					),
+				),
+			),
+		),
+	)
+}
+
+// CIDRFilterMiddleware filters requests based on allowed CIDR ranges
+func CIDRFilterMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// If no CIDRs configured, allow all
+		if len(allowedAPINetworks) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		ipStr := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(ipStr); err == nil {
+			ipStr = host
+		}
+
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		for _, netw := range allowedAPINetworks {
+			if netw.Contains(ip) {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		cmn.DebugMsg(
+			cmn.DbgLvlDebug,
+			"API CIDR DENY: %s %s",
+			ipStr,
+			r.URL.Path,
+		)
+
+		http.Error(w, "Forbidden", http.StatusForbidden)
+	})
+}
+
+func withMiddlewares(h http.Handler) http.Handler {
+	return RecoverMiddleware(
+		CIDRFilterMiddleware(
+			SecurityHeadersMiddleware(
+				KeepAliveHeadersMiddleware(
+					RateLimitMiddleware(auth.Middleware(config.API.Auth, dbHandler)(h)),
+				),
+			),
+		),
+	)
+}
+
+func withPublicMiddlewares(h http.HandlerFunc) http.Handler {
+	return RecoverMiddleware(
+		CIDRFilterMiddleware(
+			CORSHeadersMiddleware(
+				SecurityHeadersMiddleware(
+					KeepAliveHeadersMiddleware(
+						RateLimitMiddleware(h),
+					),
+				),
+			),
+		),
+	)
+}
+
+// KeepAliveHeadersMiddleware adds keep-alive headers to responses
+func KeepAliveHeadersMiddleware(next http.Handler) http.Handler {
+	kaTimeout := config.Events.IdleTimeout
+	kaTimeoutStr := fmt.Sprintf("timeout=%d", kaTimeout)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 1 {
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("Keep-Alive", kaTimeoutStr)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// CORSHeadersMiddleware applies the API service CORS policy from configuration.
+func CORSHeadersMiddleware(next http.Handler) http.Handler {
+	cors := config.API.CORS
+	return cmn.CORSHeadersMiddleware(cmn.CORSOptions{
+		Enabled:        cors.Enabled,
+		AllowedOrigins: cors.AllowedOrigins,
+	})(next)
+}
+
+// RecoverMiddleware recovers from panics and returns a 500 error
+func RecoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				cmn.DebugMsg(cmn.DbgLvlError, "Recovered from panic: %v", rec)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// RateLimitMiddleware is a middleware for rate limiting
+func RateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			cmn.DebugMsg(cmn.DbgLvlDebug, errRateLimitExceed)
+			http.Error(w, errTooManyRequests, http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// SecurityHeadersMiddleware adds security-related headers to responses
+func SecurityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Add various security headers here
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		//w.Header().Set("Content-Security-Policy", "default-src 'self'")
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func healthCheckHandler(w http.ResponseWriter, _ *http.Request) {
+	// Create a JSON document with the health status
+	healthStatus := HealthCheck{
+		Status: "OK",
+	}
+
+	// Respond with the health status
+	handleErrorAndRespond(w, nil, healthStatus, "Error in health Check: ", http.StatusInternalServerError, http.StatusOK)
+}
+
+func readyCheckHandler(w http.ResponseWriter, _ *http.Request) {
+	sysReadyMtx.RLock()
+	defer sysReadyMtx.RUnlock()
+
+	msg := ""
+	switch sysReady {
+	case 1: // Starting up
+		msg = "STARTING UP"
+	case 2: // Ready
+		msg = "READY"
+	default:
+		msg = "NOT READY"
+	}
+
+	// Create a JSON document with the readiness status
+	readyStatus := ReadyCheck{
+		Status: msg,
+	}
+
+	// Respond with the readiness status
+	handleErrorAndRespond(w, nil, readyStatus, "Error in ready Check: ", http.StatusInternalServerError, http.StatusOK)
+}
+
+// searchHandler handles the traditional search requests
+func searchHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in search request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performSearch(r.Context(), query, &dbHandler)
+	results.SetHeaderFields(
+		"customsearch#search",
+		jsonResponse,
+		GetQueryTemplate("search", "v1", r.Method),
+		[]QueryRequest{
+			{
+				"search",
+				len(results.Items),
+				query,
+				len(results.Items),
+				results.Queries.Offset,
+				"utf8",
+				"utf8",
+				"off",
+				"0",
+			},
+		},
+	)
+	if err != nil {
+		totalErrors.Add(1)
+	} else {
+		totalSuccess.Add(1)
+	}
+
+	handleErrorAndRespond(w, err, results, "Error performing search: %v", http.StatusInternalServerError, successCode)
+}
+
+func webObjectHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in webobject search request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performWebObjectSearch(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if results.IsEmpty() {
+		var retCode int
+		if config.API.Return404 {
+			retCode = http.StatusNotFound
+			totalErrors.Add(1)
+		} else {
+			retCode = successCode
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing webobject search: %v", http.StatusNotFound, retCode)
+	} else {
+		results.SetHeaderFields(
+			"webobject#search",
+			jsonResponse,
+			GetQueryTemplate("webobject", "v1", r.Method),
+			[]QueryRequest{
+				{
+					"search",
+					len(results.Items),
+					query,
+					len(results.Items),
+					results.Queries.Offset,
+					"utf8",
+					"utf8",
+					"off",
+					"0",
+				},
+			},
+		)
+		if err != nil {
+			totalErrors.Add(1)
+		} else {
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing webobject search: %v", http.StatusInternalServerError, successCode)
+	}
+}
+
+func webCorrelatedSitesHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in correlatedsites search request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performCorrelatedSitesSearch(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if results.IsEmpty() {
+		var retCode int
+		if config.API.Return404 {
+			retCode = http.StatusNotFound
+			totalErrors.Add(1)
+		} else {
+			retCode = successCode
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing correlatedsites search: %v", http.StatusNotFound, retCode)
+	} else {
+		results.SetHeaderFields(
+			"correlatedsites#search",
+			jsonResponse,
+			GetQueryTemplate("correlatedsites", "v1", r.Method),
+			[]QueryRequest{
+				{
+					"search",
+					len(results.Items),
+					query,
+					len(results.Items),
+					results.Queries.Offset,
+					"utf8",
+					"utf8",
+					"off",
+					"0",
+				},
+			},
+		)
+		if err != nil {
+			totalErrors.Add(1)
+		} else {
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing correlatedsites search: %v", http.StatusInternalServerError, successCode)
+	}
+}
+
+// webScrapedDataHandler handles the search requests for scraped data
+func webScrapedDataHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in scraped_data search request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performScrapedDataSearch(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if results.IsEmpty() {
+		var retCode int
+		if config.API.Return404 {
+			retCode = http.StatusNotFound
+			totalErrors.Add(1)
+		} else {
+			retCode = successCode
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing scraped_data search: %v", http.StatusNotFound, retCode)
+	} else {
+		results.SetHeaderFields(
+			"scraped_data#search",
+			jsonResponse,
+			GetQueryTemplate("scraped_data", "v1", r.Method),
+			[]QueryRequest{
+				{
+					"search",
+					len(results.Items),
+					query,
+					len(results.Items),
+					results.Queries.Offset,
+					"utf8",
+					"utf8",
+					"off",
+					"0",
+				},
+			},
+		)
+		if err != nil {
+			totalErrors.Add(1)
+		} else {
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing correlatedsites search: %v", http.StatusInternalServerError, successCode)
+	}
+}
+
+// scrImgSrchHandler handles the search requests for screenshot images
+func scrImgSrchHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in screenshot search request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performScreenshotSearch(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if results == (ScreenshotResponse{}) {
+		var retCode int
+		if config.API.Return404 {
+			retCode = http.StatusNotFound
+			totalErrors.Add(1)
+		} else {
+			retCode = successCode
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing screenshot search: %v", http.StatusInternalServerError, retCode)
+	} else {
+		if err != nil {
+			totalErrors.Add(1)
+		} else {
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing screenshot search: %v", http.StatusInternalServerError, successCode)
+	}
+}
+
+// netInfoHandler handles the network information requests
+func netInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in netinfo search request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performNetInfoSearch(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if results.isEmpty() {
+		var retCode int
+		if config.API.Return404 {
+			retCode = http.StatusNotFound
+			totalErrors.Add(1)
+		} else {
+			retCode = successCode
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing netinfo search: %v", http.StatusNotFound, retCode)
+	} else {
+		results.SetHeaderFields(
+			"netinfo#search",
+			jsonResponse,
+			GetQueryTemplate("netinfo", "v1", r.Method),
+			[]QueryRequest{
+				{
+					"search",
+					len(results.Items),
+					query,
+					len(results.Items),
+					results.Queries.Offset,
+					"utf8",
+					"utf8",
+					"off",
+					"0",
+				},
+			},
+		)
+		if err != nil {
+			totalErrors.Add(1)
+		} else {
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing netinfo search: %v", http.StatusInternalServerError, successCode)
+	}
+}
+
+// httpInfoHandler handles the http information requests
+func httpInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in httpinfo search request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performHTTPInfoSearch(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if results.IsEmpty() {
+		var retCode int
+		if config.API.Return404 {
+			retCode = http.StatusNotFound
+			totalErrors.Add(1)
+		} else {
+			retCode = successCode
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing httpinfo search: %v", http.StatusNotFound, retCode)
+	} else {
+		results.SetHeaderFields(
+			"httpinfo#search",
+			jsonResponse,
+			GetQueryTemplate("httpinfo", "v1", r.Method),
+			[]QueryRequest{
+				{
+					"search",
+					len(results.Items),
+					query,
+					len(results.Items),
+					results.Queries.Offset,
+					"utf8",
+					"utf8",
+					"off",
+					"0",
+				},
+			},
+		)
+		if err != nil {
+			totalErrors.Add(1)
+		} else {
+			totalSuccess.Add(1)
+		}
+		handleErrorAndRespond(w, err, results, "Error performing httpinfo search: %v", http.StatusInternalServerError, successCode)
+	}
+}
+
+// addSourceHandler handles the addition of new sources
+func addSourceHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusCreated
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in addSource request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performAddSourceContext(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+	} else {
+		totalSuccess.Add(1)
+	}
+	errCode := http.StatusInternalServerError
+	if isSourceConfigValidationError(err) {
+		errCode = http.StatusBadRequest
+	}
+	handleErrorAndRespond(w, err, results, "Error performing addSource: %v", errCode, successCode)
+}
+
+// removeSourceHandler handles the removal of sources
+func removeSourceHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusNoContent
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in removeSource request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performRemoveSourceContext(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+	} else {
+		totalSuccess.Add(1)
+	}
+	handleErrorAndRespond(w, err, results, "Error performing removeSource: %v", http.StatusInternalServerError, successCode)
+}
+
+// updateSourceHandler handles the update of sources
+func updateSourceHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusNoContent
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in removeSource request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performUpdateSourceContext(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+	} else {
+		totalSuccess.Add(1)
+	}
+	errCode := http.StatusInternalServerError
+	if isSourceConfigValidationError(err) || isSourceRequestValidationError(err) {
+		errCode = http.StatusBadRequest
+	}
+	handleErrorAndRespond(w, err, results, "Error performing update Source: %v", errCode, successCode)
+}
+
+// vacuumSourceHandler handles the vacuum of sources
+func vacuumSourceHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusNoContent
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in removeSource request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performVacuumSourceContext(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+	} else {
+		totalSuccess.Add(1)
+	}
+	handleErrorAndRespond(w, err, results, "Error performing removeSource: %v", http.StatusInternalServerError, successCode)
+}
+
+// singleURLstatusHandler handles the status requests
+func singleURLstatusHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint: errcheck // we don't care about this error code
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in status request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performGetURLStatusContext(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+	} else {
+		totalSuccess.Add(1)
+	}
+	handleErrorAndRespond(w, err, results, "Error performing status: %v", http.StatusInternalServerError, successCode)
+}
+
+// filteredURLstatusHandler handles status requests for sources whose URL contains the q filter.
+func filteredURLstatusHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+	query, err := extractQueryOrBody(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Missing parameter 'q' in filtered statuses request", http.StatusBadRequest, successCode)
+		return
+	}
+
+	results, err := performGetFilteredURLStatusContext(r.Context(), query, getQTypeFromName(r.Method), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+	} else {
+		totalSuccess.Add(1)
+	}
+	handleErrorAndRespond(w, err, results, "Error performing filtered status: %v", http.StatusInternalServerError, successCode)
+}
+
+// allURLstatusHandler handles the status requests for all sources
+func allURLstatusHandler(w http.ResponseWriter, r *http.Request) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+
+	results, err := performGetAllURLStatusContext(r.Context(), getQTypeFromName(r.Method), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+	} else {
+		totalSuccess.Add(1)
+	}
+	handleErrorAndRespond(w, err, results, "Error performing status: %v", http.StatusInternalServerError, successCode)
+}
+
+func parseInformationSeedIDFromRequest(r *http.Request) (uint64, error) {
+	value := strings.TrimSpace(r.PathValue("id"))
+	if value == "" {
+		value = informationSeedIDFromPath(r.URL.Path)
+	}
+	if value == "" {
+		value = r.URL.Query().Get("information_seed_id")
+	}
+	if value == "" {
+		value = r.URL.Query().Get("id")
+	}
+	if value == "" {
+		value = r.URL.Query().Get("q")
+	}
+	if value == "" {
+		return 0, fmt.Errorf("information_seed_id is required")
+	}
+	id, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || id == 0 {
+		return 0, fmt.Errorf("invalid information_seed_id")
+	}
+	return id, nil
+}
+
+func informationSeedAddHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusCreated)
+		return
+	}
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	query, err := extractQueryOrBody(r)
+	defer r.Body.Close() // nolint:errcheck // best effort close after body extraction
+	if err != nil {
+		totalErrors.Add(1)
+		handleErrorAndRespond(w, err, nil, "Invalid information seed add request", apiRequestBodyErrorStatus(err), http.StatusCreated)
+		return
+	}
+
+	results, err := performAddInformationSeedContext(r.Context(), query, postQuery, &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+		handleErrorAndRespond(w, err, results, "Error adding information seed: %v", informationSeedAddErrorStatus(err), http.StatusCreated)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusCreated)
+}
+
+func informationSeedAddErrorStatus(err error) int {
+	if err == nil {
+		return http.StatusInternalServerError
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "invalid json") || strings.Contains(message, "config") || strings.Contains(message, "credential") || strings.Contains(message, "information_seed is required") || strings.Contains(message, "information seed text is required") {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+func informationSeedStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	id, err := parseInformationSeedIDFromRequest(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed status request", http.StatusBadRequest, http.StatusOK)
+		return
+	}
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+	results, err := performGetInformationSeedStatusContext(r.Context(), id, &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusInternalServerError
+		if strings.Contains(strings.ToLower(err.Error()), "no information seed found") {
+			status = http.StatusNotFound
+		}
+		handleErrorAndRespond(w, err, results, "Error getting information seed status: %v", status, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+// informationSeedListHandler handles information seed list requests.
+func informationSeedListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+
+	successCode := http.StatusOK
+
+	results, err := performListInformationSeedsContext(r.Context(), r.URL.Query(), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "limit") || strings.Contains(err.Error(), "offset") || strings.Contains(err.Error(), "boolean") || strings.Contains(err.Error(), "integer") {
+			status = http.StatusBadRequest
+		}
+		handleErrorAndRespond(w, err, results, "Error listing information seeds: %v", status, successCode)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, successCode)
+}
+
+func informationSeedSourcesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	id, err := parseInformationSeedIDFromRequest(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed sources request", http.StatusBadRequest, http.StatusOK)
+		return
+	}
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+	results, err := performListInformationSeedSourcesContext(r.Context(), id, r.URL.Query(), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no information seed found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "limit") || strings.Contains(err.Error(), "offset") {
+			status = http.StatusBadRequest
+		}
+		handleErrorAndRespond(w, err, results, "Error listing information seed sources: %v", status, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func informationSeedCandidateDecisionsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	id, err := parseInformationSeedIDFromRequest(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed candidate request", http.StatusBadRequest, http.StatusOK)
+		return
+	}
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+	results, err := performListInformationSeedCandidateDecisionsContext(r.Context(), id, r.URL.Query(), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no information seed found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "limit") || strings.Contains(err.Error(), "offset") {
+			status = http.StatusBadRequest
+		}
+		handleErrorAndRespond(w, err, results, "Error listing information seed candidate decisions: %v", status, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func informationSeedIDFromPath(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) >= 4 && parts[0] == "v1" && parts[1] == "information_seed" {
+		return strings.TrimSpace(parts[2])
+	}
+	return ""
+}
+
+func informationSeedRetryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	handleRequestWithDB(w, r, http.StatusOK, func(query string, _ int, db *cdb.Handler) (interface{}, error) {
+		return performRetryInformationSeedContext(r.Context(), query, db)
+	})
+}
+
+func informationSeedDisableHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	handleRequestWithDB(w, r, http.StatusOK, func(query string, _ int, db *cdb.Handler) (interface{}, error) {
+		return performDisableInformationSeedContext(r.Context(), query, db)
+	})
+}
+
+func informationSeedUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	handleRequestWithDB(w, r, http.StatusOK, func(query string, qType int, db *cdb.Handler) (interface{}, error) {
+		return performUpdateInformationSeedContext(r.Context(), query, qType, db)
+	})
+}
+
+func informationSeedRemoveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	handleRequestWithDB(w, r, http.StatusOK, func(query string, qType int, db *cdb.Handler) (interface{}, error) {
+		return performRemoveInformationSeedContext(r.Context(), query, qType, db)
+	})
+}
+
+func informationSeedRerunHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	id, err := parseInformationSeedIDFromRequest(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed rerun request", http.StatusBadRequest, http.StatusOK)
+		return
+	}
+	handleInformationSeedPathAction(w, r, func(_ string, db *cdb.Handler) (interface{}, error) {
+		return performRerunInformationSeedByIDContext(r.Context(), id, db)
+	})
+}
+
+func informationSeedPathDisableHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	id, err := parseInformationSeedIDFromRequest(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed disable request", http.StatusBadRequest, http.StatusOK)
+		return
+	}
+	handleInformationSeedPathAction(w, r, func(_ string, db *cdb.Handler) (interface{}, error) {
+		return performDisableInformationSeedByIDContext(r.Context(), id, db)
+	})
+}
+
+func informationSeedEnableHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	id, err := parseInformationSeedIDFromRequest(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed enable request", http.StatusBadRequest, http.StatusOK)
+		return
+	}
+	handleInformationSeedPathAction(w, r, func(query string, db *cdb.Handler) (interface{}, error) {
+		return performEnableInformationSeedByIDContext(r.Context(), id, query, db)
+	})
+}
+
+func informationSeedEventsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	id, err := parseInformationSeedIDFromRequest(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed events request", http.StatusBadRequest, http.StatusOK)
+		return
+	}
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+	results, err := performListInformationSeedEventsContext(r.Context(), id, r.URL.Query(), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no information seed found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "limit") || strings.Contains(err.Error(), "offset") {
+			status = http.StatusBadRequest
+		}
+		handleErrorAndRespond(w, err, results, "Error listing information seed events: %v", status, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func informationSeedDiagnosticsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	id, err := parseInformationSeedIDFromRequest(r)
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed diagnostics request", http.StatusBadRequest, http.StatusOK)
+		return
+	}
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+	results, err := performGetInformationSeedDiagnosticsContext(r.Context(), id, &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no information seed found") {
+			status = http.StatusNotFound
+		}
+		handleErrorAndRespond(w, err, results, "Error getting information seed diagnostics: %v", status, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func handleInformationSeedPathAction(w http.ResponseWriter, r *http.Request, action func(string, *cdb.Handler) (interface{}, error)) {
+	if !acquireDBAdmission(w, true) {
+		return
+	}
+	defer dbAdmission.Release()
+	bodyBytes, err := readAPIRequestBody(r)
+	defer r.Body.Close() // nolint:errcheck // best effort close after body extraction
+	if err != nil {
+		handleErrorAndRespond(w, err, nil, "Invalid information seed request", apiRequestBodyErrorStatus(err), http.StatusOK)
+		return
+	}
+	results, err := action(string(bodyBytes), &dbHandler)
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusInternalServerError
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "no information seed found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(message, "invalid json") || strings.Contains(message, "cannot be rerun") {
+			status = http.StatusBadRequest
+		}
+		handleErrorAndRespond(w, err, results, "Error updating information seed: %v", status, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func addOwnerHandler(w http.ResponseWriter, r *http.Request) {
+	handleRequestWithDB(w, r, http.StatusCreated, func(query string, qType int, db *cdb.Handler) (interface{}, error) {
+		return performAddOwnerContext(r.Context(), query, qType, db)
+	})
+}
+
+func updateOwnerHandler(w http.ResponseWriter, r *http.Request) {
+	handleRequestWithDB(w, r, http.StatusNoContent, func(query string, qType int, db *cdb.Handler) (interface{}, error) {
+		return performUpdateOwnerContext(r.Context(), query, qType, db)
+	})
+}
+
+func removeOwnerHandler(w http.ResponseWriter, r *http.Request) {
+	handleRequestWithDB(w, r, http.StatusNoContent, func(query string, qType int, db *cdb.Handler) (interface{}, error) {
+		return performRemoveOwnerContext(r.Context(), query, qType, db)
+	})
+}
+
+func addCategoryHandler(w http.ResponseWriter, r *http.Request) {
+	handleRequestWithDB(w, r, http.StatusCreated, func(query string, qType int, db *cdb.Handler) (interface{}, error) {
+		return performAddCategoryContext(r.Context(), query, qType, db)
+	})
+}
+
+func updateCategoryHandler(w http.ResponseWriter, r *http.Request) {
+	handleRequestWithDB(w, r, http.StatusNoContent, func(query string, qType int, db *cdb.Handler) (interface{}, error) {
+		return performUpdateCategoryContext(r.Context(), query, qType, db)
+	})
+}
+
+func removeCategoryHandler(w http.ResponseWriter, r *http.Request) {
+	handleRequestWithDB(w, r, http.StatusNoContent, func(query string, qType int, db *cdb.Handler) (interface{}, error) {
+		return performRemoveCategoryContext(r.Context(), query, qType, db)
+	})
+}
+
+func informationSeedConfigProvidersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, performListInformationSeedConfigProviders(), "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func informationSeedConfigProviderHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	name := configNameFromRequest(r)
+	results, err := performGetInformationSeedConfigProvider(name)
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusNotFound
+		if strings.Contains(strings.ToLower(err.Error()), "required") {
+			status = http.StatusBadRequest
+		}
+		handleErrorAndRespond(w, err, results, "Error getting information seed provider config: %v", status, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func vdiConfigListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, performListVDIConfig(), "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func vdiConfigHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		handleErrorAndRespond(w, fmt.Errorf("method not allowed"), nil, "Method not allowed", http.StatusMethodNotAllowed, http.StatusOK)
+		return
+	}
+	results, err := performGetVDIConfig(configNameFromRequest(r))
+	if err != nil {
+		totalErrors.Add(1)
+		status := http.StatusNotFound
+		if strings.Contains(strings.ToLower(err.Error()), "required") {
+			status = http.StatusBadRequest
+		}
+		handleErrorAndRespond(w, err, results, "Error getting VDI config: %v", status, http.StatusOK)
+		return
+	}
+	totalSuccess.Add(1)
+	handleErrorAndRespond(w, nil, results, "", http.StatusInternalServerError, http.StatusOK)
+}
+
+func configNameFromRequest(r *http.Request) string {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		name = strings.TrimSpace(r.URL.Query().Get("name"))
+	}
+	if name == "" {
+		name = strings.TrimSpace(r.URL.Query().Get("q"))
+	}
+	return name
+}

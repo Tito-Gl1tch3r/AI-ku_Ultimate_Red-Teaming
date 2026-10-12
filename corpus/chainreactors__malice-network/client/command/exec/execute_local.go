@@ -1,0 +1,152 @@
+package exec
+
+import (
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	"github.com/chainreactors/IoM-go/proto/services/clientrpc"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/utils/fileutils"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/kballard/go-shellquote"
+	"github.com/spf13/cobra"
+)
+
+// ExecuteLocalCmd - Execute local PE on sacrifice process
+func ExecuteLocalCmd(cmd *cobra.Command, con *core.Console) error {
+	args := cmd.Flags().Args()
+	process, _ := cmd.Flags().GetString("process")
+	quiet, _ := cmd.Flags().GetBool("quiet")
+	sac := common.ParseSacrificeFlags(cmd)
+	task, err := ExecLocal(con.Rpc, con.GetInteractive(), args, !quiet, process, sac)
+	if err != nil {
+		return err
+	}
+	return common.HandleTaskOutput(cmd, con, task)
+}
+
+func ExecLocal(rpc clientrpc.MaliceRPCClient, sess *client.Session,
+	args []string, output bool, process string, sac *implantpb.SacrificeProcess) (*clientpb.Task, error) {
+	args[0] = fileutils.FormatWindowPath(args[0])
+	if process == "" {
+		process = args[0]
+	}
+
+	binary := &implantpb.ExecuteBinary{
+		ProcessName: process,
+		Path:        args[0],
+		Args:        args[1:],
+		Output:      output,
+		Sacrifice:   sac,
+		Type:        consts.ModuleExecuteLocal,
+		Delay:       2000,
+	}
+
+	task, err := rpc.ExecuteLocal(sess.Context(), binary)
+	if err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func InlineLocalCmd(cmd *cobra.Command, con *core.Console) error {
+	args := cmd.Flags().Args()
+	process, _ := cmd.Flags().GetString("process")
+	output, _ := cmd.Flags().GetBool("output")
+	task, err := InlineLocal(con.Rpc, con.GetInteractive(), args, output, process)
+	if err != nil {
+		return err
+	}
+	return common.HandleTaskOutput(cmd, con, task)
+}
+
+func InlineLocal(rpc clientrpc.MaliceRPCClient, sess *client.Session,
+	args []string, output bool, process string) (*clientpb.Task, error) {
+	args[0] = fileutils.FormatWindowPath(args[0])
+
+	binary := &implantpb.ExecuteBinary{
+		Path:        args[0],
+		Args:        args[1:],
+		ProcessName: process,
+		Output:      output,
+		Type:        consts.ModuleInlineLocal,
+		Delay:       2000,
+	}
+
+	task, err := rpc.InlineLocal(sess.Context(), binary)
+	if err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func RegisterExecuteLocalFunc(con *core.Console) {
+	con.RegisterImplantFunc(
+		consts.ModuleExecuteLocal,
+		ExecLocal,
+		"bexecute",
+		func(rpc clientrpc.MaliceRPCClient, sess *client.Session, cmdline string) (*clientpb.Task, error) {
+			args, err := shellquote.Split(cmdline)
+			if err != nil {
+				return nil, err
+			}
+			return ExecLocal(rpc, sess, args, true, "", &implantpb.SacrificeProcess{
+				Hidden:   false,
+				BlockDll: false,
+				Etw:      false,
+				Ppid:     0,
+				Argue:    "",
+			})
+		},
+		output.ParseBinaryResponse,
+		nil,
+	)
+
+	con.AddCommandFuncHelper(
+		consts.ModuleExecuteLocal,
+		consts.ModuleExecuteLocal,
+		consts.ModuleExecuteLocal+`(active(),{"-i","127.0.0.1","-p","top2"},true,"gogo.exe",new_sacrifice(1234,false,true,true,"argue"))`,
+		[]string{
+			"session: special session",
+			"args: arguments",
+			"output",
+			"process",
+			"sacrifice: sacrifice process",
+		},
+		[]string{"task"})
+
+	con.AddCommandFuncHelper(
+		"bexecute",
+		"bexecute",
+		`bexecute(active(),"whoami")`,
+		[]string{
+			"session: special session",
+			"cmd: command to execute",
+		},
+		[]string{"task"})
+
+	// inlinelocal
+	con.RegisterImplantFunc(
+		consts.ModuleInlineLocal,
+		InlineLocal,
+		"",
+		nil,
+		output.ParseBinaryResponse,
+		nil,
+	)
+
+	con.AddCommandFuncHelper(
+		consts.ModuleInlineLocal,
+		consts.ModuleInlineLocal,
+		consts.ModuleInlineLocal+`(active(),{""},true,"whoami")`,
+		[]string{
+			"session: special session",
+			"args: arguments",
+			"output",
+			"process",
+		},
+		[]string{"task"},
+	)
+}

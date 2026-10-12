@@ -1,0 +1,740 @@
+/******************************************************************************/
+/* Base class for data sources
+ *
+ * Copyright 2012-2016 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+'use strict';
+
+const csv = require('csv');
+const axios = require('axios');
+const fs = require('fs');
+const iptrie = require('arkime-iptrie');
+const ArkimeUtil = require('../common/arkimeUtil');
+
+/**
+ * All sources need to have the WISESource as their top base class.
+ */
+
+class WISESource {
+  /**
+   * Should only be created by super(api, section, options) call
+   * @param {WISESourceAPI} api - the api when source created
+   * @param {string} section - the section name
+   * @param {object} options - All the options
+   * @param {boolean} [options.dontCache=false] - do not cache this source, the source handles itself
+   * @param {integer} [options.cacheTimeout=cacheAgeMin*60 or 60] - override the cacheAgeMin setting, -1 same as dontCache
+   * @param {boolean} [options.tagsSetting=false] - load the optional tags setting
+   * @param {boolean} [options.typeSetting=false] - load the required type setting
+   * @param {boolean} [options.formatSetting=false] - load the format setting with default the provided value if not false
+   * @param {boolean} [options.fullQuery=false] - for MD5/SHA, query will be query.value and query.contentType
+   */
+  constructor (api, section, options) {
+    this.api = api;
+    this.section = section;
+    this.view = '';
+    this.shortcuts = {};
+    if (options.dontCache) {
+      this.cacheTimeout = -1;
+    } else if (options.cacheTimeout !== undefined) {
+      this.cacheTimeout = options.cacheTimeout;
+    } else {
+      this.cacheTimeout = 60 * +this.api.getConfig(section, 'cacheAgeMin', '60'); // Default an hour
+    }
+    this.requestStat = 0;
+    this.cacheHitStat = 0;
+    this.cacheMissStat = 0;
+    this.cacheRefreshStat = 0;
+    this.requestDroppedStat = 0;
+    this.directHitStat = 0;
+    this.recentAverageMS = 0;
+    this.srcInProgress = {};
+    this.fullQuery = !!options.fullQuery;
+
+    if (options.typeSetting) {
+      this.typeSetting();
+    }
+
+    if (options.tagsSetting) {
+      this.tagsSetting();
+    }
+
+    if (options.formatSetting) {
+      this.formatSetting(options.formatSetting);
+    }
+
+    let items;
+    // Domain and Email wildcards to exclude from source
+    ['excludeDomains', 'excludeEmails', 'excludeURLs'].forEach((type) => {
+      items = api.getConfig(section, type);
+      this[type] = [];
+      if (!items) { return; }
+      items.split(';').map(item => item.trim()).forEach((item) => {
+        if (item === '') {
+          return;
+        }
+        this[type].push(RegExp.fromWildExp(item, 'ailop'));
+      });
+    });
+
+    // IP CIDRs to exclude from source
+    this.excludeIPs = new iptrie.IPTrie();
+    items = api.getConfig(section, 'excludeIPs', '');
+    items.split(';').map(item => item.trim()).forEach((item) => {
+      if (item === '') {
+        return;
+      }
+      if (!ArkimeUtil.addCidrToTrie(this.excludeIPs, item, true, { mapV4: false })) {
+        console.log(`${section} - ERROR - excludeIPs '${ArkimeUtil.sanitizeStr(item)}' is not a usable CIDR`);
+        process.exit(1);
+      }
+    });
+
+    items = api.getConfig(section, 'onlyIPs', undefined);
+    if (items) {
+      this.onlyIPs = new iptrie.IPTrie();
+      items.split(';').map(item => item.trim()).forEach((item) => {
+        if (item === '') {
+          return;
+        }
+        if (!ArkimeUtil.addCidrToTrie(this.onlyIPs, item, true, { mapV4: false })) {
+          console.log(`${section} - ERROR - onlyIPs '${ArkimeUtil.sanitizeStr(item)}' is not a usable CIDR`);
+          process.exit(1);
+        }
+      });
+    }
+
+    // fields defined for source
+    let fields = api.getConfig(section, 'fields');
+    if (fields !== undefined) {
+      fields = fields.split('\\n');
+      for (let i = 0; i < fields.length; i++) {
+        this.parseFieldDef(fields[i]);
+      }
+    }
+
+    // views defined for source
+    const view = api.getConfig(section, 'view');
+    if (view !== undefined) {
+      this.view = view.replace(/\\n/g, '\n');
+    }
+
+    if (this.view !== '') {
+      api.addView(section, this.view);
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Parse a field definition line and call the addField or addView as needed
+   * @param {string} line - the line to parse
+   */
+  parseFieldDef (line) {
+    if (line[0] === '#') {
+      line = line.substring(1);
+    }
+
+    if (line.lastIndexOf('field:', 0) === 0) {
+      const pos = this.api.addField(line);
+      const match = line.match(/shortcut:([^;]+)/);
+      if (match) {
+        this.shortcuts[match[1]] = { pos, mod: 0 };
+        const kind = line.match(/kind:([^;]+)/);
+        if (kind) {
+          if (kind[1] === 'lotermfield') {
+            this.shortcuts[match[1]].mod = 1;
+          } else if (kind[1] === 'uptermfield') {
+            this.shortcuts[match[1]].mod = 2;
+          }
+        }
+      }
+    } else if (line.lastIndexOf('view:', 0) === 0) {
+      this.view += line.substring(5) + '\n';
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Util function to parse CSV formatted data
+   * @param {string} body - the raw CSV data
+   * @param {function} setCb - the function to call for each row found
+   * @param {function} endCb - all done parsing
+   */
+  parseCSV (body, setCb, endCb) {
+    csv.parse(body, { skip_empty_lines: true, comment: '#', relax_column_count: true }, (err, data) => {
+      if (err) {
+        return endCb(err);
+      }
+
+      for (let i = 0; i < data.length; i++) {
+        const args = [];
+        for (const k in this.shortcuts) {
+          if (data[i][k] !== undefined && data[i][k] !== '') {
+            args.push(this.shortcuts[k].pos);
+
+            if (this.shortcuts[k].mod === 1) {
+              args.push(data[i][k].toLowerCase());
+            } else if (this.shortcuts[k].mod === 2) {
+              args.push(data[i][k].toUpperCase());
+            } else {
+              args.push(data[i][k]);
+            }
+          }
+        }
+
+        if (args.length === 0) {
+          setCb(data[i][this.column], WISESource.emptyResult);
+        } else {
+          setCb(data[i][this.column], WISESource.encodeResult.apply(null, args));
+        }
+      }
+      endCb(err);
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Util function to parse tagger formatted data
+   * @param {string} body - the raw tagger data
+   * @param {function} setCb - the function to call for each row found
+   * @param {function} endCb - all done parsing
+   */
+  parseTagger (body, setCb, endCb) {
+    const lines = body.toString().split(/\r?\n/);
+    this.view = '';
+    for (let l = 0, llen = lines.length; l < llen; l++) {
+      if (lines[l][0] === '#') {
+        this.parseFieldDef(lines[l]);
+        continue;
+      }
+
+      if (lines[l].match(/^\s*$/)) {
+        continue;
+      }
+
+      const args = [];
+      const parts = lines[l].split(';');
+      for (let p = 1; p < parts.length; p++) {
+        const kv = ArkimeUtil.splitRemain(parts[p], '=', 1);
+        if (kv.length !== 2) {
+          console.log('WARNING -', this.section, "- ignored extra piece '" + parts[p] + "' from line '" + lines[l] + "'");
+          continue;
+        }
+        if (this.shortcuts[kv[0]] !== undefined) {
+          args.push(this.shortcuts[kv[0]].pos);
+        } else if (WISESource.field2Pos.has(kv[0])) {
+          args.push(WISESource.field2Pos.get(kv[0]));
+        } else {
+          if (kv[0].length <= 2) {
+            console.log('WARNING -', this.section, "- '" + parts[p] + "' might be using an undefined shortcut");
+          }
+          args.push(this.api.addField('field:' + kv[0]));
+        }
+        args.push(kv[1]);
+      }
+      setCb(parts[0], WISESource.encodeResult.apply(null, args));
+    }
+    if (this.view !== '') {
+      this.api.addView(this.section, this.view);
+    }
+    endCb(null);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Util function to parse JSON formatted data
+   * @param {array} json - the parsed JSON array
+   * @param {function} setCb - the function to call for each row found
+   * @param {function} endCb - all done parsing
+   */
+  parseJSONArray (json, setCb, endCb) {
+    try {
+      // keyPath often defaults to 0 via keyColumn, treat any non-string as unset
+      if (this.keyPath === undefined || this.keyPath === 0 || this.keyPath === '') {
+        return endCb('No keyPath set');
+      }
+
+      const keyPath = this.keyPath.split('.');
+
+      for (let i = 0; i < json.length; i++) {
+        // Walk the key path
+        let key = json[i];
+        for (let j = 0; key && j < keyPath.length; j++) {
+          key = key[keyPath[j]];
+        }
+
+        if (key === undefined || key === null) {
+          continue;
+        }
+
+        const args = this.parseJSONElement(json[i]);
+
+        if (Array.isArray(key)) {
+          key.forEach((part) => {
+            setCb(part, WISESource.encodeResult.apply(null, args));
+          });
+        } else {
+          setCb(key, WISESource.encodeResult.apply(null, args));
+        }
+      }
+      endCb(null);
+    } catch (e) {
+      endCb(e);
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Util function to walk a JSON object using the configured shortcuts and
+   * build an args array suitable for {@link WISESource.encodeResult}.
+   *
+   * Each shortcut path may traverse intermediate arrays as well as a final
+   * array value: e.g. with shortcut `a.b.c`, the input
+   *   `{ a: [ { b: { c: "v1" } }, { b: { c: "v2" } } ] }`
+   * yields both `v1` and `v2`. With shortcut `d.e`, the input
+   *   `{ d: { e: ["v3", "v4"] } }`
+   * yields both `v3` and `v4`.
+   *
+   * @param {object} json - the JSON object (single element) to extract from
+   * @returns {Array} alternating pos/value entries for encodeResult
+   */
+  parseJSONElement (json) {
+    const args = [];
+    for (const k in this.shortcuts) {
+      const path = k.split('.');
+      const sv = this.shortcuts[k];
+      const values = [];
+      WISESource.#collectShortcutValues(json, path, 0, values);
+
+      for (let o = 0; o < values.length; o++) {
+        let val = values[o];
+        if (val === undefined || val === null || val === '') {
+          continue;
+        }
+        if (typeof val !== 'string') {
+          val = val.toString();
+        }
+        if (sv.mod === 1) {
+          val = val.toLowerCase();
+        } else if (sv.mod === 2) {
+          val = val.toUpperCase();
+        }
+        args.push(sv.pos);
+        args.push(val);
+      }
+    }
+    return args;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Recursively walk obj following path, expanding any arrays encountered
+   * along the way (including a final array value), and push leaf values
+   * into out.
+   * @private
+   */
+  static #collectShortcutValues (obj, path, idx, out) {
+    if (obj === undefined || obj === null) {
+      return;
+    }
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length; i++) {
+        WISESource.#collectShortcutValues(obj[i], path, idx, out);
+      }
+      return;
+    }
+    if (idx === path.length) {
+      out.push(obj);
+      return;
+    }
+    WISESource.#collectShortcutValues(obj[path[idx]], path, idx + 1, out);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Util function to parse JSON formatted data
+   * @param {string} body - the raw JSON data
+   * @param {function} setCb - the function to call for each row found
+   * @param {function} endCb - all done parsing
+   */
+  parseJSON (body, setCb, endCb) {
+    try {
+      let json = JSON.parse(body);
+
+      if (this.arrayPath !== undefined) {
+        const arrayPath = this.arrayPath.split('.');
+        for (let i = 0; i < arrayPath.length; i++) {
+          json = json[arrayPath[i]];
+          if (!json) {
+            return endCb(`Couldn't find ${arrayPath[i]} in results`);
+          }
+        }
+      }
+
+      // The rest of the code assumes an array
+      if (!Array.isArray(json)) {
+        json = [json];
+      }
+
+      return this.parseJSONArray(json, setCb, endCb);
+    } catch (e) {
+      endCb(e);
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Util function to parse JSONL formatted data
+   * @param {string} body - the raw JSONL data
+   * @param {function} setCb - the function to call for each row found
+   * @param {function} endCb - all done parsing
+   */
+  parseJSONL (body, setCb, endCb) {
+    const json = body.toString().split('\n').reduce((acc, line) => {
+      try {
+        if (line.trim() !== '') {
+          acc.push(JSON.parse(line));
+        }
+      } catch (e) {
+        console.log(this.section, `Skipping bad JSON line: ${line}`);
+      }
+      return acc;
+    }, []);
+    return this.parseJSONArray(json, setCb, endCb);
+  }
+
+  /** The encoded tags result if options.tagsSetting was set to true */
+  tagsResult;
+
+  // ----------------------------------------------------------------------------
+  tagsSetting () {
+    const tagsField = this.api.addField('field:tags');
+    const tags = this.api.getConfig(this.section, 'tags');
+    if (tags) {
+      const args = [];
+      tags.split(',').map(item => item.trim()).forEach((part) => {
+        args.push(tagsField, part);
+      });
+      this.tagsResult = WISESource.encodeResult.apply(null, args);
+    } else {
+      this.tagsResult = WISESource.emptyResult;
+    }
+  }
+
+  /** The format of the source if options.formatSetting was set to true. */
+  format;
+
+  /** {function} The parser function of the source if options.formatSetting was set to true. */
+  parse;
+
+  // ----------------------------------------------------------------------------
+  formatSetting (d) {
+    this.format = this.api.getConfig(this.section, 'format', d);
+    if (this.format === 'csv') {
+      this.parse = this.parseCSV;
+    } else if (this.format === 'tagger') {
+      this.parse = this.parseTagger;
+    } else if (this.format === 'json') {
+      this.parse = this.parseJSON;
+    } else if (this.format === 'jsonl') {
+      this.parse = this.parseJSONL;
+    } else {
+      throw new Error(`${this.section} - ERROR not loading unknown data format - ${this.format}`);
+    }
+  }
+
+  /** The wise item type of the source if options.typeSetting was set to true. */
+  type;
+
+  // ----------------------------------------------------------------------------
+  typeSetting () {
+    this.type = this.api.getConfig(this.section, 'type');
+    if (this.type === undefined) {
+      throw new Error(`${this.section} - ERROR not loading since missing required type setting`);
+    }
+    this.typeFunc = this.api.funcName(this.type);
+  }
+
+  // ----------------------------------------------------------------------------
+  /** A simple constant that should be used when needing to represent an empty result */
+  static emptyResult = Buffer.alloc(1);
+
+  // ----------------------------------------------------------------------------
+  static field2Pos = new Map();
+  static field2Info = new Map();
+  static pos2Field = new Map();
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Convert field ids and string values into the encoded form used in WISE.
+   *
+   * This method takes a variable number of arguments, each in a pair of field id and string value.
+   * @returns {buffer} - the encoded results
+   */
+  static encodeResult () {
+    const vals = [];
+    const lens = [];
+    let len = 0;
+
+    for (let a = 1; a < arguments.length; a += 2) {
+      let val = arguments[a];
+      if (typeof (val) === 'number') {
+        val = val.toString();
+      }
+
+      let l = Buffer.byteLength(val);
+      if (l > 250) {
+        val = val.substring(0, 240);
+        l = Buffer.byteLength(val);
+        // multibyte characters can still exceed the 1-byte length field, shrink until it fits
+        while (l > 250) {
+          val = val.substring(0, val.length - 10);
+          l = Buffer.byteLength(val);
+        }
+      }
+      vals.push(val);
+      lens.push(l);
+      len += 3 + l;
+    }
+
+    const buf = Buffer.allocUnsafe(len + 1);
+    let offset = 1;
+    let idx = 0;
+    for (let a = 1; a < arguments.length; a += 2) {
+      buf.writeUInt8(arguments[a - 1], offset);
+      const l = lens[idx];
+      const val = vals[idx];
+      buf.writeUInt8(l + 1, offset + 1);
+      buf.write(val, offset + 2);
+      buf.writeUInt8(0, offset + l + 2);
+      offset += 3 + l;
+      idx++;
+    }
+    buf[0] = arguments.length / 2;
+    return buf;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Combine an array of encoded results into one encoded result
+   *
+   * @param {object|array} results - Array of results
+   * @returns {Buffer} - A single combined result
+   */
+  static combineResults (results) {
+    // Don't really need to combine 1 result
+    if (results.length === 1) {
+      return results[0] ? results[0] : WISESource.emptyResult;
+    }
+
+    let num = 0;
+    let len = 0;
+    for (let a = 0; a < results.length; a++) {
+      if (!results[a]) {
+        continue;
+      }
+      num += results[a][0];
+      len += results[a].length - 1;
+    }
+
+    if (len === 0) { return WISESource.emptyResult; }
+
+    const buf = Buffer.allocUnsafe(len + 1);
+    let offset = 1;
+    for (let a = 0; a < results.length; a++) {
+      if (!results[a]) {
+        continue;
+      }
+
+      results[a].copy(buf, offset, 1);
+      offset += results[a].length - 1;
+    }
+    buf[0] = num;
+    return buf;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Convert an encoded combined results binary buffer into JSON string
+   *
+   * @param {Buffer} results - The combined results from encode
+   * @returns {string} - The JSON string
+   */
+  static result2JSON (results) {
+    const collection = [];
+    let offset = 1;
+    for (let i = 0; i < results[0]; i++) {
+      const pos = results[offset];
+      const len = results[offset + 1];
+      const value = results.toString('utf8', offset + 2, offset + 2 + len - 1);
+      offset += 2 + len;
+      collection.push({ field: WISESource.pos2Field.get(pos), len: len - 1, value });
+    }
+
+    return JSON.stringify(collection).replace(/},{/g, '},\n{');
+  }
+
+  // ----------------------------------------------------------------------------
+  // Sources download into shared directories like /tmp, where anyone can create
+  // the path before we do. Only ever use a plain file that we own with no extra
+  // links to it, so we can't be tricked into following a symlink or writing to
+  // (or loading) someone else's file.
+  static #statIsSafe (stat) {
+    const uid = process.getuid?.();
+    return stat.isFile() && stat.nlink === 1 && (uid === undefined || stat.uid === uid);
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Is the file a plain file that we own, so safe to use in a shared directory.
+   *
+   * @param {string} file - The file to check
+   * @returns {boolean}
+   */
+  static isSafeFile (file) {
+    try {
+      return WISESource.#statIsSafe(fs.lstatSync(file));
+    } catch (err) {
+      return false;
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  // Open file for writing without following symlinks, replacing anything in the
+  // way that isn't a plain file we own. Returns the fd or throws.
+  static #openSafe (file) {
+    /* eslint-disable no-bitwise */
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+    /* eslint-enable no-bitwise */
+
+    let fd;
+    try {
+      fd = fs.openSync(file, flags, 0o600);
+    } catch (err) {
+      // O_NOFOLLOW found a symlink, remove it and try once more
+      if (err.code !== 'ELOOP' && err.code !== 'EMLINK') { throw err; }
+      fs.unlinkSync(file);
+      fd = fs.openSync(file, flags, 0o600);
+    }
+
+    // The open created or truncated something, make sure it's really ours
+    if (!WISESource.#statIsSafe(fs.fstatSync(fd))) {
+      fs.closeSync(fd);
+      throw new Error(`${file} isn't a plain file owned by this user`);
+    }
+
+    return fd;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Download a url and save to a file, if we already have the file and less than a minute old use that file.
+   *
+   * @param {string} url - The URL to download
+   * @param {string} file - The file to save the results to
+   * @param {function} cb - (statusCode) The status code result from the download
+   */
+  static request (url, file, cb) {
+    const headers = {};
+    if (file) {
+      // lstat so a symlink left at file is never mistaken for our copy
+      let stat;
+      try { stat = fs.lstatSync(file); } catch (err) { }
+
+      if (stat && WISESource.#statIsSafe(stat)) {
+        // Don't download again if file is less than 1 minute old
+        if (Date.now() - stat.mtime.getTime() < 60000) {
+          return setImmediate(cb, 304);
+        }
+        headers['If-Modified-Since'] = stat.mtime.toUTCString();
+      }
+    }
+    axios({
+      method: 'GET',
+      url,
+      responseType: 'stream',
+      headers
+    }).then((response) => {
+      let fd;
+      try {
+        fd = WISESource.#openSafe(file);
+      } catch (err) {
+        console.log(`ERROR - not saving ${file} -`, err.message);
+        response.data.destroy();
+        return setTimeout(cb, 100, 403);
+      }
+
+      response.data.pipe(fs.createWriteStream(null, { fd })).on('close', () => {
+        setTimeout(cb, 100, 200);
+      });
+    }).catch((err) => {
+      if (err?.response?.status !== 304) {
+        console.log(err);
+      }
+      setTimeout(cb, 100, err?.response?.status ?? 404);
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * For sources that support it, get the number of items loaded into memory.
+   *
+   * @returns {integer} the number of items loaded into memory
+   */
+  itemCount () {
+    return 0;
+  }
+}
+/**
+ * Get the raw source data for editing.
+ * Source should implement this method if they want to support editing the data for a source.
+ *
+ * @method
+ * @name WISESource#getSourceRaw
+ * @param {function} cb - (err, data)
+ * @abstract
+ */
+/**
+ * Put the raw source data after editing.
+ * Source should implement this method if they want to support editing the data for a source.
+ *
+ * @method
+ * @name WISESource#putSourceRaw
+ * @param {string} data - The full data for the source from UI
+ * @param {function} cb - (err)
+ * @abstract
+ */
+/**
+ * Dump the sources data to caller.
+ * Source should implement this method if they want to support displaying the current state.
+ *
+ * @method
+ * @name WISESource#dump
+ * @param {object} res - The express res object
+ * @abstract
+ */
+
+/**
+ * Every source needs to implement this method. If a singleton it will just create the source object directly.
+ * If not it should loop through all keys that start with sourcekind:
+ * @method
+ * @name WISESource.initSource
+ * @param {WISESourceAPI} api - The api back into the WISE Service
+ * @abstract
+ * @example
+ * exports.initSource = function (api) {
+ *   api.addSourceConfigDef('sourcename', {
+ *     singleton: false,
+ *     name: 'sourcename',
+ *     description: 'This is the best source ever',
+ *     fields: [
+ *       { name: 'type', required: true, help: 'The wise query type this source supports' },
+ *       { name: 'tags', required: false, help: 'Comma separated list of tags to set for matches', regex: '^[-a-z0-9,]+' }
+ *     ]
+ *   });
+ *   new TheSource(api);
+ * }
+ */
+
+module.exports = WISESource;

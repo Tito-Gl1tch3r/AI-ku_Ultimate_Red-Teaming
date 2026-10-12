@@ -1,0 +1,147 @@
+package addon
+
+import (
+	"fmt"
+	"github.com/carapace-sh/carapace"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/chainreactors/tui"
+	"github.com/evertras/bubble-table/table"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"strings"
+)
+
+func Commands(con *core.Console) []*cobra.Command {
+	listaddonCmd := &cobra.Command{
+		Use:   consts.ModuleListAddon + " [addon]",
+		Short: "List all addons",
+		Long:  "List addons currently loaded in the active implant.",
+		Example: `~~~
+list_addon
+~~~`,
+		Run: func(cmd *cobra.Command, args []string) {
+			AddonListCmd(cmd, con)
+			return
+		},
+	}
+	loadaddonCmd := &cobra.Command{
+		Use:   consts.ModuleLoadAddon + " [file_path]",
+		Short: "Load an addon",
+		Long:  `Load an executable into the implant's memory for reuse`,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			LoadAddonCmd(cmd, con)
+			return
+		},
+		Example: `addon default name is filename, default module is selected based on the file extension
+~~~	
+load_addon gogo.exe
+~~~
+assigns an alias name gogo to the addon, and the specified module is execute_exe
+~~~
+load_addon gogo.exe -n gogo -m execute_exe
+~~~
+`,
+	}
+
+	common.BindFlag(loadaddonCmd, func(f *pflag.FlagSet) {
+		f.StringP("module", "m", "", "module type")
+		f.StringP("name", "n", "", "addon name")
+		//f.StringP("method", "t", "inline", "method type")
+	})
+
+	common.BindArgCompletions(loadaddonCmd, nil,
+		carapace.ActionFiles().Usage("path the addon file to load"))
+
+	common.BindFlagCompletions(loadaddonCmd, func(comp carapace.ActionMap) {
+		comp["module"] = carapace.ActionValues(consts.ExecuteModules...).Usage("executable module")
+		//comp["method"] = carapace.ActionValues("inline", "execute", "shellcode").Usage("method types")
+	})
+
+	execAddonCmd := &cobra.Command{
+		Use:   consts.ModuleExecuteAddon + " [addon_name] [arguments...]",
+		Short: "Execute the loaded addon",
+		Long:  "Execute an addon already loaded in the active implant and pass any remaining arguments to it.",
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			ExecuteAddonCmd(cmd, con)
+			return
+		},
+		Example: `Execute the addon without "-" arguments
+~~~
+execute_addon httpx 1.1.1.1
+~~~
+execute the addon file with "-" arguments, you need add "--" before the arguments
+~~~
+execute_addon gogo.exe -- -i 127.0.0.1 -p http
+~~~
+if you specify the addon name, you need to use the alias name
+~~~
+execute_addon gogo -- -i 127.0.0.1 -p http
+~~~
+`,
+	}
+	common.BindFlag(execAddonCmd, common.ExecuteFlagSet, common.SacrificeFlagSet)
+	common.BindArgCompletions(execAddonCmd, nil, common.SessionAddonCompleter(con))
+
+	return []*cobra.Command{listaddonCmd, loadaddonCmd, execAddonCmd}
+}
+
+func Register(con *core.Console) {
+	con.RegisterImplantFunc(consts.ModuleListAddon,
+		ListAddon,
+		"",
+		nil,
+		func(content *clientpb.TaskContext) (interface{}, error) {
+			exts := content.Spite.GetAddons()
+			if len(exts.Addons) == 0 {
+				return "", fmt.Errorf("no addon found")
+			}
+			var s strings.Builder
+			s.WriteString("\n")
+			for _, ext := range exts.Addons {
+				s.WriteString(fmt.Sprintf("%s\t%s\t%s\n", ext.Name, ext.Type, ext.Depend))
+			}
+			return s.String(), nil
+		},
+		func(content *clientpb.TaskContext) (string, error) {
+			exts := content.Spite.GetAddons()
+			if len(exts.Addons) == 0 {
+				return "", fmt.Errorf("no addon found")
+			}
+			var rowEntries []table.Row
+			var row table.Row
+			tableModel := tui.NewTable([]table.Column{
+				table.NewFlexColumn("Name", "Name", 1),
+				table.NewColumn("Type", "Type", 10),
+				table.NewFlexColumn("Depend", "Depend", 2),
+			},
+				true)
+			for _, ext := range exts.Addons {
+				row = table.NewRow(
+					table.RowData{
+						"Name":   ext.Name,
+						"Type":   ext.Type,
+						"Depend": ext.Depend,
+					})
+				//Row{ext.Name, ext.Type, ext.Depend}
+				rowEntries = append(rowEntries, row)
+			}
+			tableModel.SetMultiline()
+			tableModel.SetRows(rowEntries)
+			return tableModel.View(), nil
+		})
+	con.RegisterImplantFunc(consts.ModuleLoadAddon,
+		LoadAddon,
+		"",
+		nil,
+		func(content *clientpb.TaskContext) (interface{}, error) {
+			return "addon loaded", nil
+		}, nil)
+
+	con.RegisterImplantFunc(consts.ModuleExecuteAddon, ExecuteAddon, "", nil, output.ParseBinaryResponse, nil)
+}

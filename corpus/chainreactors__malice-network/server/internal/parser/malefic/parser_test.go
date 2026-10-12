@@ -1,0 +1,356 @@
+package malefic
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"io"
+	"testing"
+
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	"github.com/chainreactors/IoM-go/types"
+	"github.com/gookit/config/v2"
+)
+
+// rwcBuf wraps a bytes.Buffer to satisfy io.ReadWriteCloser.
+type rwcBuf struct {
+	*bytes.Buffer
+}
+
+func (r *rwcBuf) Close() error { return nil }
+
+// buildHeader constructs a 9-byte malefic header.
+func buildHeader(startDelim byte, sid uint32, bodyLen uint32) []byte {
+	header := make([]byte, HeaderLength)
+	header[MsgStart] = startDelim
+	binary.LittleEndian.PutUint32(header[MsgSessionStart:MsgSessionEnd], sid)
+	binary.LittleEndian.PutUint32(header[MsgSessionEnd:], bodyLen)
+	return header
+}
+
+// --- ReadHeader tests ---
+
+func TestMaleficParser_ReadHeader_ValidPacket(t *testing.T) {
+	config.Set(consts.ConfigMaxPacketLength, 10485760)
+	t.Cleanup(func() { config.Set(consts.ConfigMaxPacketLength, 0) })
+
+	p := NewMaleficParser()
+	sid := uint32(0xDEAD)
+	bodyLen := uint32(100)
+	header := buildHeader(DefaultStartDelimiter, sid, bodyLen)
+
+	buf := &rwcBuf{bytes.NewBuffer(header)}
+	gotSid, gotLen, err := p.ReadHeader(buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotSid != sid {
+		t.Fatalf("SID mismatch: got %d, want %d", gotSid, sid)
+	}
+	// readHeader returns length+1 (for end delimiter byte)
+	if gotLen != bodyLen+1 {
+		t.Fatalf("length mismatch: got %d, want %d", gotLen, bodyLen+1)
+	}
+}
+
+func TestMaleficParser_ReadHeader_InvalidStartDelimiter(t *testing.T) {
+	config.Set(consts.ConfigMaxPacketLength, 10485760)
+	t.Cleanup(func() { config.Set(consts.ConfigMaxPacketLength, 0) })
+
+	p := NewMaleficParser()
+	header := buildHeader(0xFF, 1, 10) // wrong start byte
+
+	buf := &rwcBuf{bytes.NewBuffer(header)}
+	_, _, err := p.ReadHeader(buf)
+	if !errors.Is(err, types.ErrInvalidStart) {
+		t.Fatalf("expected ErrInvalidStart, got %v", err)
+	}
+}
+
+func TestMaleficParser_ReadHeader_PacketTooLarge(t *testing.T) {
+	config.Set(consts.ConfigMaxPacketLength, 1024)
+	t.Cleanup(func() { config.Set(consts.ConfigMaxPacketLength, 0) })
+
+	p := NewMaleficParser()
+	// Set body length way beyond max + 16KB margin
+	hugeLen := uint32(1024 + consts.KB*16 + 100)
+	header := buildHeader(DefaultStartDelimiter, 1, hugeLen)
+
+	buf := &rwcBuf{bytes.NewBuffer(header)}
+	sid, length, err := p.ReadHeader(buf)
+	if err != nil {
+		t.Fatalf("expected packet beyond the chunking threshold to remain compatible: %v", err)
+	}
+	if sid != 1 {
+		t.Fatalf("ReadHeader SID = %d, want 1", sid)
+	}
+	if length != hugeLen+1 {
+		t.Fatalf("ReadHeader length = %d, want %d", length, hugeLen+1)
+	}
+}
+
+func TestMaleficParser_ReadHeader_CompatibilityMarginBoundary(t *testing.T) {
+	const maxPacketLength = uint32(1024)
+	p := NewMaleficParser()
+	p.MaxPacketLength = maxPacketLength
+	declaredLength := maxPacketLength + uint32(consts.KB)*16
+	header := buildHeader(DefaultStartDelimiter, 1, declaredLength)
+
+	_, length, err := p.ReadHeader(&rwcBuf{bytes.NewBuffer(header)})
+	if err != nil {
+		t.Fatalf("expected packet at the compatibility boundary to be accepted: %v", err)
+	}
+	if length != declaredLength+1 {
+		t.Fatalf("ReadHeader length = %d, want %d", length, declaredLength+1)
+	}
+}
+
+func TestMaxPacketLenUsesParserValue(t *testing.T) {
+	p := NewMaleficParser()
+	p.MaxPacketLength = 4096
+
+	got := p.maxPacketLen()
+	if got != 4096 {
+		t.Fatalf("maxPacketLen() = %d, want 4096", got)
+	}
+}
+
+func TestMaxPacketLenFallsBackToGlobal(t *testing.T) {
+	config.Set(consts.ConfigMaxPacketLength, 10485760)
+	t.Cleanup(func() { config.Set(consts.ConfigMaxPacketLength, 0) })
+
+	p := NewMaleficParser()
+
+	got := p.maxPacketLen()
+	if got != 10485760 {
+		t.Fatalf("maxPacketLen() = %d, want 10485760", got)
+	}
+}
+
+func TestMaleficParser_ReadHeader_TruncatedHeader(t *testing.T) {
+	p := NewMaleficParser()
+	// Only 5 bytes instead of 9
+	buf := &rwcBuf{bytes.NewBuffer([]byte{0xd1, 0x01, 0x00, 0x00, 0x00})}
+	_, _, err := p.ReadHeader(buf)
+	if err == nil {
+		t.Fatal("expected error for truncated header")
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Logf("got error (acceptable): %v", err)
+	}
+}
+
+func TestMaleficParser_ReadHeader_EmptyInput(t *testing.T) {
+	p := NewMaleficParser()
+	buf := &rwcBuf{bytes.NewBuffer([]byte{})}
+	_, _, err := p.ReadHeader(buf)
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+// --- Parse tests ---
+
+func TestMaleficParser_Parse_InvalidEndDelimiter(t *testing.T) {
+	p := NewMaleficParser()
+	// Payload with wrong end delimiter
+	payload := []byte{0x01, 0x02, 0xFF} // 0xFF instead of 0xd2
+	_, err := p.Parse(payload)
+	if !errors.Is(err, types.ErrInvalidEnd) {
+		t.Fatalf("expected ErrInvalidEnd, got %v", err)
+	}
+}
+
+func TestMaleficParser_Parse_EmptyPayload(t *testing.T) {
+	p := NewMaleficParser()
+	payload := []byte{DefaultEndDelimiter}
+	if _, err := p.Parse(payload); !errors.Is(err, ErrInvalidCompressedPayload) {
+		t.Fatalf("Parse error = %v, want ErrInvalidCompressedPayload", err)
+	}
+}
+
+func TestMaleficParser_Parse_RejectsDecodedPayloadAboveLimit(t *testing.T) {
+	p := NewMaleficParser()
+	var header [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(header[:], maxDecodedPayloadSize+1)
+	payload := append(append([]byte(nil), header[:n]...), DefaultEndDelimiter)
+
+	_, err := p.Parse(payload)
+	if !errors.Is(err, ErrDecodedPayloadTooLarge) {
+		t.Fatalf("Parse error = %v, want ErrDecodedPayloadTooLarge", err)
+	}
+}
+
+func TestMaleficParser_Parse_RejectsHeaderOnlyPayloadAtLimit(t *testing.T) {
+	p := NewMaleficParser()
+	var header [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(header[:], maxDecodedPayloadSize)
+	payload := append(append([]byte(nil), header[:n]...), DefaultEndDelimiter)
+
+	if _, err := p.Parse(payload); !errors.Is(err, ErrInvalidCompressedPayload) {
+		t.Fatalf("Parse error = %v, want ErrInvalidCompressedPayload", err)
+	}
+}
+
+func TestMaleficParser_Parse_ZeroLengthSlice(t *testing.T) {
+	p := NewMaleficParser()
+	if _, err := p.Parse(nil); err == nil {
+		t.Fatal("expected zero-length payload to be rejected")
+	}
+}
+
+func TestMaleficParser_Parse_RejectsMalformedSnappyPayload(t *testing.T) {
+	p := NewMaleficParser()
+	payload := []byte{0xff, 0xfe, 0xfd, DefaultEndDelimiter}
+	if _, err := p.Parse(payload); !errors.Is(err, ErrInvalidCompressedPayload) {
+		t.Fatalf("Parse error = %v, want ErrInvalidCompressedPayload", err)
+	}
+}
+
+func TestMaleficParser_MarshalParse_RoundTrip(t *testing.T) {
+	p := NewMaleficParser()
+
+	spite := &implantpb.Spite{
+		TaskId: 999,
+		Body:   &implantpb.Spite_Empty{},
+	}
+	spites := &implantpb.Spites{Spites: []*implantpb.Spite{spite}}
+	sid := uint32(42)
+
+	raw, err := p.Marshal(spites, sid)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	// Verify header structure
+	if raw[0] != DefaultStartDelimiter {
+		t.Fatalf("expected start delimiter 0x%x, got 0x%x", DefaultStartDelimiter, raw[0])
+	}
+	if raw[len(raw)-1] != DefaultEndDelimiter {
+		t.Fatalf("expected end delimiter 0x%x, got 0x%x", DefaultEndDelimiter, raw[len(raw)-1])
+	}
+
+	// Extract SID from header
+	gotSid := binary.LittleEndian.Uint32(raw[MsgSessionStart:MsgSessionEnd])
+	if gotSid != sid {
+		t.Fatalf("SID mismatch in marshalled data: got %d, want %d", gotSid, sid)
+	}
+
+	// Parse the payload (everything after 9-byte header)
+	payload := raw[HeaderLength:]
+	gotSpites, err := p.Parse(payload)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	if len(gotSpites.Spites) != 1 {
+		t.Fatalf("expected 1 spite, got %d", len(gotSpites.Spites))
+	}
+	if gotSpites.Spites[0].TaskId != 999 {
+		t.Fatalf("TaskId mismatch: got %d, want 999", gotSpites.Spites[0].TaskId)
+	}
+}
+
+// --- ParseSid tests ---
+
+func TestParseSid(t *testing.T) {
+	tests := []struct {
+		name string
+		sid  uint32
+	}{
+		{"zero", 0},
+		{"one", 1},
+		{"large", 0xDEADBEEF},
+		{"max uint32", 0xFFFFFFFF},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := make([]byte, 9)
+			data[0] = DefaultStartDelimiter
+			binary.LittleEndian.PutUint32(data[MsgSessionStart:MsgSessionEnd], tc.sid)
+
+			got := ParseSid(data)
+			if got != tc.sid {
+				t.Fatalf("ParseSid() = %d, want %d", got, tc.sid)
+			}
+		})
+	}
+}
+
+func TestParseSid_ShortData(t *testing.T) {
+	shortInputs := []struct {
+		name string
+		data []byte
+	}{
+		{"nil", nil},
+		{"empty", []byte{}},
+		{"1 byte", []byte{0xd1}},
+		{"4 bytes", []byte{0xd1, 0x01, 0x02, 0x03}},
+	}
+
+	for _, tc := range shortInputs {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ParseSid(tc.data); got != 0 {
+				t.Fatalf("ParseSid() = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// --- Marshal tests ---
+
+// TestMaleficParser_Marshal_NilSpites documents that proto.Marshal accepts nil
+// (treats it as an empty message). This means Marshal silently succeeds on nil
+// spites, which could be surprising to callers.
+func TestMaleficParser_Marshal_NilSpites(t *testing.T) {
+	p := NewMaleficParser()
+	raw, err := p.Marshal(nil, 1)
+	if err != nil {
+		// If this is reached, explicit nil checking was added (good).
+		t.Logf("Marshal correctly rejects nil spites: %v", err)
+		return
+	}
+	// proto.Marshal(nil) succeeds, producing an empty message.
+	t.Log("NOTE: Marshal accepts nil spites without error (proto.Marshal treats nil as empty message)")
+	if len(raw) < HeaderLength+1 {
+		t.Fatalf("packet too short: %d bytes", len(raw))
+	}
+}
+
+func TestMaleficParser_Marshal_EmptySpites(t *testing.T) {
+	p := NewMaleficParser()
+	spites := &implantpb.Spites{Spites: []*implantpb.Spite{}}
+	raw, err := p.Marshal(spites, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should still produce a valid framed packet
+	if len(raw) < HeaderLength+1 {
+		t.Fatalf("packet too short: %d bytes", len(raw))
+	}
+	if raw[0] != DefaultStartDelimiter || raw[len(raw)-1] != DefaultEndDelimiter {
+		t.Fatal("missing delimiters in marshalled packet")
+	}
+}
+
+func TestMaleficParser_Marshal_HeaderLength(t *testing.T) {
+	p := NewMaleficParser()
+	spites := &implantpb.Spites{Spites: []*implantpb.Spite{
+		{TaskId: 1, Body: &implantpb.Spite_Empty{}},
+	}}
+
+	raw, err := p.Marshal(spites, 100)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	// Verify the length field in the header matches actual payload size
+	lengthInHeader := binary.LittleEndian.Uint32(raw[MsgSessionEnd:HeaderLength])
+	actualPayload := len(raw) - HeaderLength - 1 // minus header and end delimiter
+	if int(lengthInHeader) != actualPayload {
+		t.Fatalf("length field mismatch: header says %d, actual payload is %d",
+			lengthInHeader, actualPayload)
+	}
+}

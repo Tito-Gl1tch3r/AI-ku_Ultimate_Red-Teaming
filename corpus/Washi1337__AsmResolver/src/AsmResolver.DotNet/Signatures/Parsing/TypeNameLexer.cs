@@ -1,0 +1,219 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using AsmResolver.Shims;
+
+namespace AsmResolver.DotNet.Signatures.Parsing
+{
+    internal struct TypeNameLexer
+    {
+        internal static readonly char[] ReservedChars = "*+.,&[]…".ToCharArray();
+        private static readonly char[] TrimCharacters = " ".ToCharArray();
+
+        private static readonly Dictionary<char, char> EscapeChars = new()
+        {
+            ['e'] = '\e',
+            ['b'] = '\b',
+            ['r'] = '\r',
+            ['n'] = '\n',
+            ['t'] = '\t',
+            ['*'] = '*',
+            ['+'] = '+',
+            ['.'] = '.',
+            [','] = ',',
+            ['&'] = '&',
+            ['['] = '[',
+            [']'] = ']',
+            ['…'] = '…',
+            ['\\'] = '\\',
+            [' '] = ' ',
+        };
+
+        private readonly TextReader _reader;
+        private readonly StringBuilder _buffer = new();
+        private TypeNameToken? _bufferedToken;
+
+        public TypeNameLexer(TextReader reader)
+        {
+            _reader = reader ?? throw new ArgumentNullException(nameof(reader));
+            HasConsumedTypeName = false;
+            _bufferedToken = default;
+        }
+
+        public bool HasConsumedTypeName
+        {
+            get;
+            set;
+        }
+
+        public TypeNameToken Peek()
+        {
+            _bufferedToken ??= ReadNextToken();
+            return _bufferedToken.GetValueOrDefault();
+        }
+
+        public TypeNameToken Next()
+        {
+            if (_bufferedToken.HasValue)
+            {
+                var next = _bufferedToken.Value;
+                _bufferedToken = null;
+                return next;
+            }
+
+            return ReadNextToken() ?? throw new EndOfStreamException();
+        }
+
+        private TypeNameToken? ReadNextToken()
+        {
+            SkipWhitespaces();
+            _buffer.Clear();
+
+            int c = _reader.Peek();
+            if (c == -1)
+                return null;
+
+            char currentChar = (char) c;
+            return currentChar switch
+            {
+                '*' => ReadSymbolToken(TypeNameTerminal.Star, "*"),
+                '+' => ReadSymbolToken(TypeNameTerminal.Plus, "+"),
+                '=' => ReadSymbolToken(TypeNameTerminal.Equals, "="),
+                '.' => ReadDotToken(),
+                ',' => ReadSymbolToken(TypeNameTerminal.Comma, ","),
+                '&' => ReadSymbolToken(TypeNameTerminal.Ampersand, "&"),
+                '[' => ReadSymbolToken(TypeNameTerminal.OpenBracket, "["),
+                ']' => ReadSymbolToken(TypeNameTerminal.CloseBracket, "]"),
+                '…' => ReadSymbolToken(TypeNameTerminal.Ellipsis, "…"),
+                _ => char.IsDigit(currentChar) ? ReadNumberOrIdentifierToken() : ReadIdentifierToken()
+            };
+        }
+
+        private TypeNameToken ReadDotToken()
+        {
+            // Consume first dot.
+            _reader.Read();
+
+            // See if there's a second one.
+            if (_reader.Peek() == '.')
+            {
+                _reader.Read();
+                return new TypeNameToken(TypeNameTerminal.DoubleDot, "..");
+            }
+
+            return new TypeNameToken(TypeNameTerminal.Dot, ".");
+        }
+
+        private TypeNameToken ReadNumberOrIdentifierToken()
+        {
+            bool escape = false;
+
+            TypeNameTerminal terminal = TypeNameTerminal.Number;
+            while (true)
+            {
+                int c = _reader.Peek();
+                if (c == -1)
+                {
+                    if (escape)
+                        throw new EndOfStreamException("Escape sequence ended unexpectedly.");
+                    break;
+                }
+
+                char currentChar = (char) c;
+
+                if (escape)
+                {
+                    if (!EscapeChars.TryGetValue(currentChar, out char mappedChar))
+                        throw new FormatException($"Invalid escape sequence '\\{currentChar}'.");
+                    currentChar = mappedChar;
+                    escape = false;
+                }
+                else
+                {
+                    if (currentChar == '\\')
+                    {
+                        escape = true;
+                    }
+                    else if (currentChar == '=' && HasConsumedTypeName)
+                    {
+                        break;
+                    }
+                    else if (ReservedChars.Contains(currentChar))
+                    {
+                        break;
+                    }
+                }
+
+                if (!char.IsDigit(currentChar))
+                    terminal = TypeNameTerminal.Identifier;
+
+                _reader.Read();
+
+                if (!escape)
+                    _buffer.Append(currentChar);
+            }
+
+            return new TypeNameToken(terminal, _buffer.ToString().Trim(TrimCharacters));
+        }
+
+        private TypeNameToken ReadIdentifierToken()
+        {
+            bool escape = false;
+            while (true)
+            {
+                int c = _reader.Peek();
+                if (c == -1)
+                {
+                    if (escape)
+                        throw new EndOfStreamException("Escape sequence ended unexpectedly.");
+                    break;
+                }
+
+                char currentChar = (char) c;
+
+                if (escape)
+                {
+                    if (!EscapeChars.TryGetValue(currentChar, out char mappedChar))
+                        throw new FormatException($"Invalid escape sequence '\\{currentChar}'.");
+                    currentChar = mappedChar;
+                    escape = false;
+                }
+                else
+                {
+                    if (currentChar == '\\')
+                        escape = true;
+                    else if (currentChar == '=' && HasConsumedTypeName)
+                        break;
+                    else if (ReservedChars.Contains(currentChar))
+                        break;
+                }
+
+                _reader.Read();
+
+                if (!escape)
+                    _buffer.Append(currentChar);
+            }
+
+            return new TypeNameToken(TypeNameTerminal.Identifier, _buffer.ToString().Trim(TrimCharacters));
+        }
+
+        private TypeNameToken ReadSymbolToken(TypeNameTerminal terminal, string tokenString)
+        {
+            _ = _reader.Read();
+            return new TypeNameToken(terminal, tokenString);
+        }
+
+        private void SkipWhitespaces()
+        {
+            while (true)
+            {
+                int c = _reader.Peek();
+                if (c == -1 || !char.IsWhiteSpace((char) c))
+                    break;
+                _reader.Read();
+            }
+        }
+
+    }
+}

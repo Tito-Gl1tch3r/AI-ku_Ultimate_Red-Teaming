@@ -1,0 +1,96 @@
+// Copyright 2023 Paolo Fabio Zaino
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package database is responsible for handling the database
+// setup, configuration and abstraction.
+package database
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+)
+
+// GetSourceID retrieves the source ID from the database based on the provided filter.
+func GetSourceID(filter SourceFilter, db *Handler) (uint64, error) {
+	return GetSourceIDContext(context.Background(), filter, db)
+}
+
+// GetSourceIDContext retrieves the source ID using ctx.
+func GetSourceIDContext(ctx context.Context, filter SourceFilter, db *Handler) (uint64, error) {
+	var sourceID int64 // Use int64 here since PostgreSQL BIGSERIAL maps to int64
+	var whereClauses []string
+	var args []interface{}
+	parID := 1
+
+	// Dynamically build the WHERE clause based on the input struct
+	if filter.URL != "" {
+		// Canonicalize the lookup key with the same function used when storing
+		// source URLs so URL-based lookups stay consistent with storage. Unlike
+		// common.NormalizeURL, this preserves host, path, query and fragment
+		// case, which source URLs (for example Instagram shortcodes) rely on.
+		whereClauses = append(whereClauses, "url = $"+fmt.Sprint(parID))
+		args = append(args, NormalizeSourceURL(filter.URL))
+		parID++
+	}
+	if filter.SourceID > 0 {
+		whereClauses = append(whereClauses, "source_id = $"+fmt.Sprint(parID))
+		args = append(args, filter.SourceID)
+	}
+
+	if len(whereClauses) == 0 {
+		return 0, fmt.Errorf("at least one filter (URL or SourceID) must be provided")
+	}
+
+	query := fmt.Sprintf(`
+        SELECT source_id
+        FROM Sources
+        WHERE %s
+        LIMIT 1
+    `, strings.Join(whereClauses, " AND "))
+
+	// Query the database
+	err := (*db).QueryRowContext(ctx, query, args...).Scan(&sourceID)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("no source found matching the provided filters")
+	} else if err != nil {
+		return 0, fmt.Errorf("error querying the source ID: %w", err)
+	}
+
+	// Ensure the value is non-negative
+	if sourceID < 0 {
+		return 0, fmt.Errorf("invalid source ID retrieved from database: %d", sourceID)
+	}
+
+	// Convert to uint64 (safe because of the check above)
+	return uint64(sourceID), nil //nolint:gosec // This is a read-only operation and the int64 is never negative
+}
+
+// IsURLKnown checks if a URL is already present in Sources or SearchIndex
+func IsURLKnown(url string, db *Handler) (bool, error) {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1 FROM SearchIndex WHERE page_url = $1
+		);
+	`
+
+	var exists bool
+	err := (*db).QueryRow(query, url).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check URL existence: %w", err)
+	}
+
+	return exists, nil
+}

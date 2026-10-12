@@ -1,0 +1,1130 @@
+//! Result-rendering stages: the `--dry-run` and `--only-discovery` early-exit
+//! reports, and the end-of-scan output path (dedupe → `--only-poc` filter →
+//! `--limit` → per-target summary → format-specific render → file/stdout).
+//! Lifted verbatim out of `run_scan`; shared handles arrive via [`ScanState`].
+
+use super::ScanOutcome;
+use super::ScanState;
+use super::TargetRef;
+use super::args::ScanArgs;
+use super::baseline::Baseline;
+use super::logging::log_warn;
+use super::poc::render_finding_block;
+use super::postprocess::dedupe_ast_results;
+use crate::scanning::result::{FindingType, Result};
+use crate::target_parser::Target;
+
+/// Every distinct input target was skipped (unreachable, content-type
+/// mismatch, per-host cap, ...): nothing was or would be scanned. Shared by the
+/// scan outcome and the `--dry-run` / `--only-discovery` previews so a dead host
+/// or typo'd URL cannot read as a clean pass in any mode.
+fn all_targets_skipped(
+    all_targets: &[TargetRef],
+    skipped: &std::collections::HashMap<String, &'static str>,
+) -> bool {
+    !all_targets.is_empty()
+        && !skipped.is_empty()
+        && all_targets.iter().all(|t| skipped.contains_key(&t.key))
+}
+
+/// Skipped targets with their error codes, sorted by target for stable output.
+fn skipped_entries(
+    all_targets: &[TargetRef],
+    skipped: &std::collections::HashMap<String, &'static str>,
+) -> Vec<serde_json::Value> {
+    let mut entries: Vec<(&str, &str, &str)> = all_targets
+        .iter()
+        .filter_map(|t| {
+            skipped
+                .get(&t.key)
+                .map(|code| (t.url.as_str(), t.method.as_str(), *code))
+        })
+        .collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .map(|(target, method, code)| {
+            serde_json::json!({ "target": target, "method": method, "error_code": code })
+        })
+        .collect()
+}
+
+/// Requests a scan of `target` is expected to send, as quoted by `--dry-run`.
+///
+/// Mirrors the scan-time effective cap (built-in safety cap unless
+/// --deep-scan / explicit --max-payloads-per-param). The shared estimator is
+/// the one REST `/preflight` and the MCP preflight tool use, so all three
+/// quote the same number for the same target. It counts both capped halves
+/// (reflection + DOM verification) but is still a LOWER BOUND: the shared
+/// CSP/tech payloads appended after the cap and the WAF-bypass
+/// mutation/encoder expansion are excluded.
+pub(crate) fn estimate_target_requests(args: &ScanArgs, target: &Target) -> usize {
+    // Encoder factor comes from the encoder pipeline so it can't drift from
+    // the expansion the scan actually performs.
+    let enc_factor = crate::encoding::encoder_expansion_factor(&args.encoders);
+    let cap = crate::scanning::effective_payload_cap(args.max_payloads_per_param, args.deep_scan);
+    let apply_cap = |n: usize| -> usize { if cap == 0 { n } else { n.min(cap) } };
+    target
+        .reflection_params
+        .iter()
+        // Fragment params are client-side only: no HTTP request is sent.
+        .filter(|p| crate::scanning::param_is_http_scannable(p))
+        .fold(0usize, |acc, p| {
+            acc.saturating_add(crate::scanning::estimate_param_requests(
+                p, args, enc_factor, &apply_cap,
+            ))
+        })
+}
+
+pub(crate) async fn render_dry_run(
+    args: &ScanArgs,
+    host_groups: &std::collections::BTreeMap<String, Vec<Target>>,
+    state: &ScanState,
+    all_targets: &[TargetRef],
+) -> ScanOutcome {
+    let skipped_targets = &state.skipped_targets;
+    let mut dry_run_targets = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for group in host_groups.values() {
+        for target in group {
+            let param_count = target.reflection_params.len();
+            let estimated_requests = estimate_target_requests(args, target);
+
+            let params: Vec<serde_json::Value> = target
+                .reflection_params
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "name": p.name,
+                        "location": format!("{:?}", p.location),
+                    })
+                })
+                .collect();
+
+            // Surface -p specs that still could not be seeded (path/fragment,
+            // unknown type). Agents use this to avoid treating "0 params" as a
+            // clean no-op when the operator asked for an unsynthesizable target.
+            if !args.param.is_empty() {
+                let unresolved = crate::parameter_analysis::unresolved_explicit_param_specs(
+                    &target.reflection_params,
+                    &args.param,
+                    target,
+                );
+                if !unresolved.is_empty() {
+                    warnings.push(format!(
+                        "EXPLICIT_PARAM_NOT_SEEDED target={} specs=[{}] (path/fragment and unknown types cannot be synthesized by name; use a name:location form such as q:query)",
+                        target.url,
+                        unresolved.join(", ")
+                    ));
+                } else if param_count == 0 {
+                    warnings.push(format!(
+                        "EXPLICIT_PARAM_EMPTY target={} param=[{}] produced zero scannable parameters",
+                        target.url,
+                        args.param.join(", ")
+                    ));
+                }
+            }
+
+            dry_run_targets.push(serde_json::json!({
+                "target": target.url.as_str(),
+                "method": target.method,
+                "params_discovered": param_count,
+                "estimated_requests": estimated_requests,
+                "params": params,
+            }));
+        }
+    }
+
+    let total_estimated: usize = dry_run_targets
+        .iter()
+        .filter_map(|t| t["estimated_requests"].as_u64())
+        .map(|n| n as usize)
+        .sum();
+    let total_params: usize = dry_run_targets
+        .iter()
+        .filter_map(|t| t["params_discovered"].as_u64())
+        .map(|n| n as usize)
+        .sum();
+    let skipped = skipped_targets.lock().await;
+    let total_input_targets =
+        dry_run_targets.len() + skipped.len() + state.dedup.collapsed + state.resumed_skipped;
+
+    let report = if args.format == "json" || args.format == "jsonl" {
+        let mut meta = serde_json::json!({
+            "dalfox_version": env!("CARGO_PKG_VERSION"),
+            "targets_input": total_input_targets,
+            "targets_scannable": dry_run_targets.len(),
+            "targets_skipped": skipped.len(),
+            "total_params_discovered": total_params,
+            "total_estimated_requests": total_estimated,
+            "dedup_mode": state.dedup.mode,
+            "targets_deduplicated": state.dedup.collapsed,
+        });
+        if state.unparsable_lines > 0 {
+            meta["targets_unparsable"] = serde_json::json!(state.unparsable_lines);
+        }
+        // The resume filter has already been applied to this plan, so the
+        // counts above describe what is *left* to scan, not the input list.
+        if let Some(sf) = &state.state_file {
+            meta["resumed"] = serde_json::json!({
+                "state_file": sf.path(),
+                "targets_skipped_completed": state.resumed_skipped,
+            });
+        }
+        if !skipped.is_empty() {
+            meta["skipped"] = serde_json::json!(skipped_entries(all_targets, &skipped));
+        }
+        if !warnings.is_empty() {
+            meta["warnings"] = serde_json::json!(warnings);
+        }
+        let output = serde_json::json!({
+            "dry_run": true,
+            "meta": meta,
+            "targets": dry_run_targets,
+        });
+        if args.format == "json" {
+            serde_json::to_string_pretty(&output).unwrap_or_default()
+        } else {
+            serde_json::to_string(&output).unwrap_or_default()
+        }
+    } else {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "Dry-run summary:");
+        let _ = writeln!(out, "  Targets (input):     {}", total_input_targets);
+        let _ = writeln!(out, "  Targets (scannable): {}", dry_run_targets.len());
+        let _ = writeln!(out, "  Targets (skipped):   {}", skipped.len());
+        for e in skipped_entries(all_targets, &skipped) {
+            let _ = writeln!(
+                out,
+                "    - {} {} ({})",
+                e["target"].as_str().unwrap_or("?"),
+                e["method"].as_str().unwrap_or("?"),
+                e["error_code"].as_str().unwrap_or("?")
+            );
+        }
+        if state.dedup.collapsed > 0 {
+            let _ = writeln!(
+                out,
+                "  Targets (deduped):   {} ({} mode)",
+                state.dedup.collapsed, state.dedup.mode
+            );
+        }
+        if state.unparsable_lines > 0 {
+            let _ = writeln!(
+                out,
+                "  Targets (unparsable): {} list line(s) skipped",
+                state.unparsable_lines
+            );
+        }
+        if state.resumed_skipped > 0 {
+            let _ = writeln!(
+                out,
+                "  Targets (resumed):   {} already completed",
+                state.resumed_skipped
+            );
+        }
+        let _ = writeln!(out, "  Params discovered:   {}", total_params);
+        let _ = writeln!(out, "  Estimated requests:  {}", total_estimated);
+        if !warnings.is_empty() {
+            let _ = writeln!(out, "  Warnings:");
+            for w in &warnings {
+                let _ = writeln!(out, "    - {}", w);
+            }
+        }
+        let _ = writeln!(out);
+        for t in &dry_run_targets {
+            let _ = writeln!(
+                out,
+                "  {} ({}):",
+                t["target"].as_str().unwrap_or("?"),
+                t["method"].as_str().unwrap_or("?")
+            );
+            if let Some(params) = t["params"].as_array() {
+                for p in params {
+                    let _ = writeln!(
+                        out,
+                        "    - {} ({})",
+                        p["name"].as_str().unwrap_or("?"),
+                        p["location"].as_str().unwrap_or("?")
+                    );
+                }
+            }
+            let _ = writeln!(out, "    estimated_requests: {}", t["estimated_requests"]);
+        }
+        // Trailing newline comes from the emitter, matching the JSON branches.
+        out.pop();
+        out
+    };
+
+    if write_output_or_stdout(args, &report) || all_targets_skipped(all_targets, &skipped) {
+        return ScanOutcome::Error;
+    }
+    ScanOutcome::Clean
+}
+
+pub(crate) async fn render_only_discovery(
+    args: &ScanArgs,
+    host_groups: &std::collections::BTreeMap<String, Vec<Target>>,
+    state: &ScanState,
+    all_targets: &[TargetRef],
+) -> ScanOutcome {
+    let skipped = state.skipped_targets.lock().await;
+    // Collect once so we can render both human-readable plain
+    // output and the `{meta, params}` envelope shape that matches
+    // every other JSON/JSONL output dalfox emits.
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for group in host_groups.values() {
+        for target in group {
+            for p in &target.reflection_params {
+                entries.push(serde_json::json!({
+                    "url": target.url.as_str(),
+                    "method": target.method,
+                    "param": p.name,
+                    "location": format!("{:?}", p.location),
+                }));
+            }
+        }
+    }
+    // Same disclosure rule as the scan and dry-run envelopes: the resume
+    // filter has already removed the completed targets, so a consumer must be
+    // able to tell this partial enumeration from a complete one.
+    let resumed = state.state_file.as_ref().map(|sf| {
+        serde_json::json!({
+            "state_file": sf.path(),
+            "targets_skipped_completed": state.resumed_skipped,
+        })
+    });
+    use std::fmt::Write as _;
+    let report = match args.format.as_str() {
+        "json" => {
+            let mut meta = serde_json::json!({
+                "dalfox_version": env!("CARGO_PKG_VERSION"),
+                "mode": "only_discovery",
+                "params_discovered": entries.len(),
+            });
+            if let Some(r) = &resumed {
+                meta["resumed"] = r.clone();
+            }
+            if !skipped.is_empty() {
+                meta["targets_skipped"] = serde_json::json!(skipped.len());
+                meta["skipped"] = serde_json::json!(skipped_entries(all_targets, &skipped));
+            }
+            let envelope = serde_json::json!({
+                "meta": meta,
+                "params": entries,
+            });
+            serde_json::to_string_pretty(&envelope).unwrap_or_default()
+        }
+        "jsonl" => {
+            // Meta line first (consistent with `-f jsonl` for scans),
+            // then one param per line.
+            let mut inner = serde_json::json!({
+                "dalfox_version": env!("CARGO_PKG_VERSION"),
+                "mode": "only_discovery",
+                "params_discovered": entries.len(),
+            });
+            if let Some(r) = &resumed {
+                inner["resumed"] = r.clone();
+            }
+            if !skipped.is_empty() {
+                inner["targets_skipped"] = serde_json::json!(skipped.len());
+                inner["skipped"] = serde_json::json!(skipped_entries(all_targets, &skipped));
+            }
+            let meta = serde_json::json!({ "meta": inner });
+            let mut out = serde_json::to_string(&meta).unwrap_or_default();
+            for e in &entries {
+                let _ = write!(out, "\n{}", serde_json::to_string(e).unwrap_or_default());
+            }
+            out
+        }
+        _ => {
+            let mut out = String::new();
+            for e in &entries {
+                let _ = writeln!(
+                    out,
+                    "[{}] {} ({})",
+                    e["url"].as_str().unwrap_or(""),
+                    e["param"].as_str().unwrap_or(""),
+                    e["location"].as_str().unwrap_or("")
+                );
+            }
+            out.pop();
+            out
+        }
+    };
+
+    if write_output_or_stdout(args, &report) || all_targets_skipped(all_targets, &skipped) {
+        return ScanOutcome::Error;
+    }
+    ScanOutcome::Clean
+}
+
+/// Build the `plain` summary line printed above the POC blocks.
+///
+/// The headline count stays verified-only — scripts grep `XSS found N XSS`,
+/// and `[V]` is the tier that means "dalfox saw the payload land". But a
+/// verified-only count printed directly above a list of `[A]` findings read as
+/// a contradiction: "XSS found 0 XSS" followed by three POCs (#1238). So the
+/// other tiers about to be printed are appended, and the two now agree.
+pub(super) fn plain_findings_summary(display_results: &[Result]) -> String {
+    let count_of = |tier: FindingType| {
+        display_results
+            .iter()
+            .filter(|r| r.result_type == tier)
+            .count()
+    };
+    let others: Vec<String> = [
+        (FindingType::AstDetected, "A"),
+        (FindingType::Reflected, "R"),
+        (FindingType::Informational, "I"),
+    ]
+    .into_iter()
+    .filter_map(|(tier, label)| match count_of(tier) {
+        0 => None,
+        n => Some(format!("{} {}", n, label)),
+    })
+    .collect();
+
+    let verified = count_of(FindingType::Verified);
+    if others.is_empty() {
+        format!("XSS found \x1b[33m{}\x1b[0m XSS", verified)
+    } else {
+        format!(
+            "XSS found \x1b[33m{}\x1b[0m XSS (+{})",
+            verified,
+            others.join(", ")
+        )
+    }
+}
+
+/// Apply `--baseline` to the deduped findings and return the `meta.baseline`
+/// block describing what it did.
+///
+/// Under `filter` (the default) known findings are dropped from `results`, so
+/// everything downstream — counts, `--limit`, the per-target summary, the exit
+/// code — describes only what is new. Under `annotate` nothing is dropped and
+/// each finding is tagged `new: true|false` instead.
+///
+/// A baseline that failed to load reaches here with `warning: Some(..)`: it
+/// changes nothing about the findings, but still reports itself in the envelope
+/// so a pipeline can tell "nothing new" apart from "the diff never ran".
+pub(super) fn apply_baseline(
+    results: &mut Vec<Result>,
+    baseline: Option<&Baseline>,
+) -> Option<serde_json::Value> {
+    let baseline = baseline?;
+    let mut block = serde_json::json!({
+        "path": baseline.path,
+        "mode": baseline.mode,
+    });
+
+    if !baseline.is_active() {
+        block["enabled"] = serde_json::json!(false);
+        block["warning"] = serde_json::json!(baseline.warning.as_deref().unwrap_or_default());
+        return Some(block);
+    }
+
+    // Compute membership once — `is_new` hashes the finding, and `annotate`
+    // would otherwise recompute it during the retain pass.
+    let is_new: Vec<bool> = results.iter().map(|r| baseline.is_new(r)).collect();
+    let new_count = is_new.iter().filter(|n| **n).count();
+    let known_count = is_new.len() - new_count;
+
+    if baseline.annotates() {
+        for (r, new) in results.iter_mut().zip(&is_new) {
+            r.new_since_baseline = Some(*new);
+        }
+    } else {
+        let mut keep = is_new.iter();
+        results.retain(|_| *keep.next().unwrap_or(&true));
+    }
+
+    block["enabled"] = serde_json::json!(true);
+    // Entries read from the report, not `keys.len()` — the deduplicated key
+    // count is smaller whenever the baseline holds several findings sharing one
+    // identity, and a pipeline comparing this against the baseline file's own
+    // `findings_count` would see a mismatch it could not explain.
+    block["baseline_findings"] = serde_json::json!(baseline.entries);
+    block["new"] = serde_json::json!(new_count);
+    block["known"] = serde_json::json!(known_count);
+    Some(block)
+}
+
+/// How many outbound requests this run made, and how many of them never got a
+/// response. Passed as one value rather than two adjacent `u64` parameters,
+/// which are trivially transposable at a call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RequestTally {
+    pub sent: u64,
+    pub failed: u64,
+}
+
+impl RequestTally {
+    /// Share of attempted requests that never produced a response, 0.0 when
+    /// nothing was sent.
+    fn failure_ratio(&self) -> f64 {
+        if self.sent == 0 {
+            return 0.0;
+        }
+        self.failed as f64 / self.sent as f64
+    }
+
+    /// Whether transport losses were heavy enough to call the run `incomplete`.
+    ///
+    /// The ratio alone is not enough: it is scale-free, and a scan of a single
+    /// parameter sends fewer than a dozen requests, so *one* transient reset
+    /// already clears 10% and flips a field that consumers read as a trust
+    /// signal. Requiring a floor on the absolute count too keeps the flag
+    /// meaningful on short runs while still catching a small run that lost
+    /// nearly everything (5 sent, 5 failed is 5 failures, not noise).
+    pub(crate) fn is_incomplete(&self) -> bool {
+        self.failed >= INCOMPLETE_MIN_FAILURES && self.failure_ratio() >= INCOMPLETE_FAILURE_RATIO
+    }
+}
+
+/// A run that lost at least this share of its requests is reported
+/// `incomplete`. A scan never gets a perfect network, so a handful of resets on
+/// a long run is noise and flipping the flag on a single failure would devalue
+/// it. Losing a tenth of everything attempted is not noise: at that rate the
+/// payloads that were never delivered outnumber most targets' whole payload
+/// catalogue, and "no findings" stops meaning "nothing to find". The raw
+/// `failed_requests` count is always reported regardless, so a consumer that
+/// wants a stricter bar has the number.
+const INCOMPLETE_FAILURE_RATIO: f64 = 0.10;
+
+/// Absolute floor that pairs with [`INCOMPLETE_FAILURE_RATIO`]; see
+/// [`RequestTally::is_incomplete`]. Two lost requests can be one flaky hop, so
+/// the flag needs a third before it claims the run was not really scanned.
+const INCOMPLETE_MIN_FAILURES: u64 = 3;
+
+/// The per-finding blocks of the plain report.
+///
+/// `streamed` is the set the `--stream-findings` printer recorded when it ran.
+/// The findings it emitted mid-scan are not rendered again — that produced the
+/// duplicate POC headers users reported — but everything it never saw (the
+/// initial AST pass, external JS, outdated libs, OOB callbacks, none of which
+/// go through `run_scanning`) is rendered here. Skipping every block whenever
+/// streaming was on counted those findings in the summary line and showed them
+/// nowhere.
+pub(crate) fn render_plain_finding_blocks(
+    args: &ScanArgs,
+    display_results: &[Result],
+    streamed: Option<&std::collections::HashSet<String>>,
+) -> String {
+    let mut output = String::new();
+    for result in display_results {
+        if streamed.is_some_and(|s| s.contains(&stream_key(result))) {
+            continue;
+        }
+        output.push_str(&render_finding_block(
+            result,
+            &args.poc_type,
+            args.include_request,
+            args.include_response,
+        ));
+    }
+    output
+}
+
+/// Identity the `--stream-findings` printer dedups on and records, so the
+/// end-of-scan renderer can tell which findings it already printed.
+///
+/// AST findings use the same fingerprint as [`super::postprocess::dedupe_ast_results`]
+/// (plus the type): one page-level sink is re-found by every parameter's AST
+/// pass with that parameter's name on it, and the final report folds those
+/// into a single finding. Keying them by `param` printed one block per
+/// parameter live and then the folded survivor a further time at the end. The
+/// type stays in the key so a stronger survivor (an `A` upgraded to `V`) is
+/// still shown at the end. The confidence grade deliberately does not: a
+/// `high` duplicate of a streamed `low` block folds into it live, and the final
+/// report (whose dedup prefers `high`) is the authoritative record.
+/// Whether the `--stream-findings` printer emits `result` now, recording it
+/// in `streamed` when it does.
+///
+/// Skipped when `--min-confidence` drops it — the same predicate the
+/// end-of-scan report applies, so the live output never shows a finding the
+/// summary and the exit code leave out — or when its [`stream_key`] was
+/// already printed (the same finding emitted along two code paths, e.g. a
+/// JS-context `V` upgrade and DOM verification). The set is shared with
+/// end-of-scan rendering, which prints whatever never came through here.
+pub(crate) fn admit_streamed(
+    result: &Result,
+    min_confidence: Option<&str>,
+    streamed: &mut std::collections::HashSet<String>,
+) -> bool {
+    !result.below_min_confidence(min_confidence) && streamed.insert(stream_key(result))
+}
+
+pub(crate) fn stream_key(result: &Result) -> String {
+    if let Some(ast_key) = super::postprocess::ast_dedup_key(result) {
+        return format!("{}|ast|{}", result.result_type.short(), ast_key);
+    }
+    format!(
+        "{}|{}|{}|{}",
+        result.result_type.short(),
+        result.data,
+        result.param,
+        result.payload,
+    )
+}
+
+pub(crate) async fn render_results(
+    args: &ScanArgs,
+    state: &ScanState,
+    all_targets: &[TargetRef],
+    scan_elapsed: std::time::Duration,
+    requests: RequestTally,
+    stream_findings_enabled: bool,
+    baseline: Option<&Baseline>,
+) -> (Vec<Result>, bool) {
+    let results = state.results.clone();
+    let skipped_targets = state.skipped_targets.clone();
+    let target_meta = state.target_meta.clone();
+    let target_mutation_stats = state.target_mutation_stats.clone();
+    // `--min-confidence` runs first — before AST dedup, so dedup picks the
+    // strongest *surviving* claim instead of picking a low-graded one that the
+    // filter then drops along with the high-graded duplicate it beat; and
+    // before `--baseline`, the per-target summary, and the returned vector, so
+    // a dropped finding cannot surface in counts or decide the exit code. The
+    // default (no flag) retains everything.
+    let (kept, confidence_dropped) = {
+        let all = results.lock().await;
+        let kept: Vec<Result> = all
+            .iter()
+            .filter(|r| !args.below_min_confidence(r))
+            .cloned()
+            .collect();
+        // Counted the way the report counts: AST copies of one sink fold into
+        // one finding, so a dropped key counts once, and not at all when a
+        // kept copy still reports it.
+        let mut ast_keys: std::collections::HashSet<String> = kept
+            .iter()
+            .filter_map(super::postprocess::ast_dedup_key)
+            .collect();
+        let dropped = all
+            .iter()
+            .filter(|r| args.below_min_confidence(r))
+            .filter(|r| super::postprocess::ast_dedup_key(r).is_none_or(|k| ast_keys.insert(k)))
+            .count();
+        (kept, dropped)
+    };
+    let mut final_results = dedupe_ast_results(kept);
+
+    // Apply --only-poc filter: keep only results whose type matches the specified filters
+    if !args.only_poc.is_empty() {
+        let allowed: Vec<String> = args
+            .only_poc
+            .iter()
+            .map(|s| s.trim().to_uppercase())
+            .collect();
+        final_results.retain(|r| allowed.iter().any(|a| a == r.result_type.short()));
+    }
+
+    // Apply the `--baseline` diff after `--only-poc` but before `--limit`.
+    //
+    // After `--only-poc`, so the reported `new` / `known` counts describe the
+    // same set as `findings_count` — running `--only-poc v --baseline` would
+    // otherwise report suppression of `R`s the operator already excluded.
+    // Before `--limit`, the per-target summary, and the returned vector, so
+    // under `filter` a known finding cannot consume a display slot, inflate a
+    // target's count, or decide the exit code: the whole point is that the run
+    // describes what is new.
+    let baseline_meta = apply_baseline(&mut final_results, baseline);
+
+    // Truncate the displayed findings to `--limit`. `--limit-result-type`
+    // makes the scan-time stop condition count ONLY findings of that type
+    // (see `count_matching_results` / `limit_reached`), so the display limit
+    // must use the same rule: truncate at the prefix ending with the `limit`-th
+    // matching finding, not the first `limit` findings of any type. Otherwise a
+    // run like `--limit 2 --limit-result-type v` — which keeps scanning until 2
+    // Verified findings accrue — could hide those very Verified findings behind
+    // Reflected ones recorded earlier. With the default `all`, every finding
+    // matches, so this collapses to the original first-`limit` slice.
+    let display_results_len = match args.limit {
+        None => final_results.len(),
+        Some(0) => 0,
+        Some(lim) if args.limit_result_type.eq_ignore_ascii_case("all") => {
+            std::cmp::min(final_results.len(), lim)
+        }
+        Some(lim) => {
+            // Truncate at the prefix ending with the `lim`-th finding whose
+            // type matches `--limit-result-type`. `lim >= 1` here (the `Some(0)`
+            // arm handled zero), and fewer than `lim` matches → keep everything
+            // (the limit was never reached, so nothing should be dropped).
+            let want = args.limit_result_type.to_uppercase();
+            final_results
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.result_type.short() == want)
+                .nth(lim - 1)
+                .map_or(final_results.len(), |(i, _)| i + 1)
+        }
+    };
+    let display_results = &final_results[..display_results_len];
+
+    // Build per-target summary for structured output.
+    //
+    // Attribution uses `finding_belongs_to_target`, the same helper that
+    // `collapse_redundant_reflected` uses for per-target dedup. The two
+    // MUST agree — if they disagree, a finding can be dropped by dedup but
+    // attributed to a different target than where it was actually produced.
+    //
+    // The heuristic's limitation — targets sharing a path-without-query or a
+    // parent directory both match one finding — applies only to findings
+    // without an `origin_target` (uncorrelated OOB callbacks, deserialized results).
+    let target_summary: Vec<serde_json::Value> = {
+        let skipped = skipped_targets.lock().await;
+        let meta = target_meta.lock().await;
+        let stats_map = target_mutation_stats.lock().await;
+        let session_lost = state.session_lost.lock().await;
+        let interrupted = state.interrupted_targets.lock().await;
+        let mut summary = Vec::with_capacity(all_targets.len());
+        // Counted over every finding, not the `--limit`-truncated display
+        // slice (a target whose finding fell past the cut is not `clean`), so
+        // under `--limit` the per-target counts can exceed `findings_count`.
+        // Stamped findings count for their origin; unstamped ones go through
+        // the indexed `finding_belongs_to_target` heuristic.
+        let (stamped, unstamped): (Vec<_>, Vec<_>) = final_results
+            .iter()
+            .partition(|r| r.origin_target.is_some());
+        let mut by_origin: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for r in stamped {
+            *by_origin
+                .entry(r.origin_target.as_deref().unwrap_or_default())
+                .or_default() += 1;
+        }
+        let attribution =
+            crate::utils::FindingAttributionIndex::new(unstamped.iter().map(|r| r.data.as_str()));
+        for TargetRef { key, url, method } in all_targets {
+            let finding_count =
+                by_origin.get(key.as_str()).copied().unwrap_or(0) + attribution.count_for(url);
+            // Session loss outranks `findings` and `clean`: a target whose
+            // session died was not fully tested, and reporting it as either
+            // would recreate exactly the ambiguity issue #1273 is about.
+            // It ranks below `skipped` only because a skipped target already
+            // carries the more specific reason it never ran.
+            let (status, error_code) = if let Some(code) = skipped.get(key) {
+                ("skipped", Some(*code))
+            } else if session_lost.contains_key(key) {
+                ("incomplete", Some(crate::cmd::error_codes::SESSION_LOST))
+            } else if finding_count > 0 {
+                ("findings", None)
+            } else if interrupted.contains(key) {
+                // Cut short by Ctrl-C / `--limit` / `--scan-timeout`, or never
+                // dispatched: "nothing found" is not "clean".
+                ("incomplete", None)
+            } else {
+                ("clean", None)
+            };
+            let mut entry = serde_json::json!({
+                "target": url,
+                "method": method,
+                "status": status,
+                "findings_count": finding_count,
+            });
+            if let Some(code) = error_code {
+                entry["error_code"] = serde_json::json!(code);
+            }
+            // Which signal fired, verbatim. Present for both the `incomplete`
+            // case above and a `skipped` target aborted by the scan loop.
+            if let Some(reason) = session_lost.get(key) {
+                entry["error_message"] = serde_json::json!(reason);
+            }
+            // Attach preflight metadata (WAF + applied bypass) when present.
+            // Omitted entirely for targets where no WAF was detected, to
+            // keep the common-case output lean.
+            if let Some(m) = meta.get(key) {
+                let mut waf_entry = m.clone();
+                // Fold per-target effectiveness telemetry into bypass{}.
+                // Only present when bypass actually ran (target had stats).
+                if let Some(stats) = stats_map.get(key) {
+                    let snap = stats.snapshot();
+                    let mut applied: Vec<serde_json::Value> = snap
+                        .variants
+                        .iter()
+                        .map(|(m, n)| {
+                            serde_json::json!({
+                                "type": m.to_string(),
+                                "variants_generated": n,
+                            })
+                        })
+                        .collect();
+                    // Stable order so re-runs diff cleanly in CI.
+                    applied.sort_by(|a, b| {
+                        a["type"]
+                            .as_str()
+                            .unwrap_or("")
+                            .cmp(b["type"].as_str().unwrap_or(""))
+                    });
+                    if let Some(bypass) = waf_entry.get_mut("bypass")
+                        && let Some(obj) = bypass.as_object_mut()
+                    {
+                        obj.insert(
+                            "mutations_applied".to_string(),
+                            serde_json::Value::Array(applied),
+                        );
+                        obj.insert(
+                            "requests_sent".to_string(),
+                            serde_json::json!(snap.bypass_requests),
+                        );
+                        obj.insert(
+                            "requests_blocked".to_string(),
+                            serde_json::json!(snap.bypass_blocks),
+                        );
+                    }
+                }
+                entry["waf"] = waf_entry;
+            }
+            summary.push(entry);
+        }
+        summary
+    };
+
+    // One field for "don't trust this run": a target's session died, or a
+    // significant share of this run's requests never reached the target. The
+    // session half is read straight off the summary we just built so the flag
+    // and the per-target statuses can't disagree; the transport half covers the
+    // case the summary cannot see — a target that resets or drops injection
+    // requests answers the reachability probe fine, so every per-target status
+    // stays `clean` while most payloads were never actually delivered.
+    let session_died = target_summary
+        .iter()
+        .any(|t| t["error_code"] == crate::cmd::error_codes::SESSION_LOST);
+    let lost_too_many_requests = requests.is_incomplete();
+    let stopped_early = !state.interrupted_targets.lock().await.is_empty();
+    let scan_incomplete = session_died || lost_too_many_requests || stopped_early;
+
+    // One envelope, built once and rendered by every format. Previously the
+    // `json` and `jsonl` arms each inlined their own copy of this object next
+    // to three `ScanMetadata` literals, so every new meta field had to be added
+    // in five places — and reached only the formats whose copy was remembered.
+    let scan_meta = crate::scanning::result::ScanMetadata {
+        dalfox_version: env!("CARGO_PKG_VERSION").to_string(),
+        // The targets as named (URLs, or the list/spec file path). A piped
+        // list names nothing on the command line; name its source, `-`, the
+        // way a list file is named by its path rather than its expanded URLs.
+        targets: if args.targets.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            args.targets.clone()
+        },
+        scan_duration_ms: scan_elapsed.as_millis() as u64,
+        total_requests: requests.sent,
+        failed_requests: requests.failed,
+        findings_count: display_results.len(),
+        // Moved, not cloned: on a mass-URL run this vector holds one JSON
+        // object per target, and nothing below needs a second copy.
+        target_summary,
+        dedup_mode: state.dedup.mode.to_string(),
+        targets_deduplicated: state.dedup.collapsed,
+        targets_unparsable: state.unparsable_lines,
+        baseline: baseline_meta,
+        resumed: state.state_file.as_ref().map(|sf| {
+            serde_json::json!({
+                "state_file": sf.path(),
+                "targets_skipped_completed": state.resumed_skipped,
+            })
+        }),
+        incomplete: scan_incomplete,
+        min_confidence: args.min_confidence.as_ref().map(|level| {
+            serde_json::json!({
+                "level": level,
+                "dropped": confidence_dropped,
+            })
+        }),
+    };
+
+    let output_content = if args.format == "json" {
+        let findings_json: Vec<serde_json::Value> = display_results
+            .iter()
+            .map(|r| r.to_json_value(args.include_request, args.include_response))
+            .collect();
+        let wrapper = serde_json::json!({
+            "meta": crate::scanning::result::Result::make_scan_meta_value(&scan_meta),
+            "findings": findings_json
+        });
+        serde_json::to_string_pretty(&wrapper).unwrap_or_else(|_| "{}".to_string())
+    } else if args.format == "jsonl" {
+        // JSONL: first line is meta, then one finding per line
+        let meta = serde_json::json!({
+            "meta": crate::scanning::result::Result::make_scan_meta_value(&scan_meta),
+        });
+        let mut out = serde_json::to_string(&meta).unwrap_or_default();
+        out.push('\n');
+        for r in display_results {
+            let v = r.to_json_value(args.include_request, args.include_response);
+            if let Ok(s) = serde_json::to_string(&v) {
+                out.push_str(&s);
+                out.push('\n');
+            }
+        }
+        out
+    } else if args.format == "markdown" {
+        crate::scanning::result::Result::results_to_markdown_with_meta(
+            display_results,
+            args.include_request,
+            args.include_response,
+            Some(&scan_meta),
+        )
+    } else if args.format == "sarif" {
+        crate::scanning::result::Result::results_to_sarif_with_meta(
+            display_results,
+            args.include_request,
+            args.include_response,
+            Some(&scan_meta),
+        )
+    } else if args.format == "toml" {
+        crate::scanning::result::Result::results_to_toml_with_meta(
+            display_results,
+            args.include_request,
+            args.include_response,
+            Some(&scan_meta),
+        )
+    } else if args.format == "plain" {
+        let mut output = String::new();
+
+        // Plain logger: XSS summary before POC lines
+        log_warn(args, &plain_findings_summary(display_results));
+
+        // A finding count printed after a session died is a half-truth — say
+        // so on the same screen, next to the number the operator will quote.
+        // The per-target detail already went to stderr as it happened.
+        let lost = scan_meta
+            .target_summary
+            .iter()
+            .filter(|t| t["error_code"] == crate::cmd::error_codes::SESSION_LOST)
+            .count();
+        if lost > 0 {
+            log_warn(
+                args,
+                &format!(
+                    "INCOMPLETE: \x1b[33m{}\x1b[0m target(s) had no usable session — those results are not a clean bill of health",
+                    lost
+                ),
+            );
+        }
+        // The transport half. A target that resets or drops injection requests
+        // answers the reachability probe fine, so every per-target status stays
+        // `clean` and the finding count reads as a verdict. Say what actually
+        // happened next to the number the operator will quote.
+        if lost_too_many_requests {
+            log_warn(
+                args,
+                &format!(
+                    "INCOMPLETE: \x1b[33m{}\x1b[0m of {} requests never reached the target ({:.0}%) — payloads that were not delivered were not tested, so this is not a clean bill of health",
+                    requests.failed,
+                    requests.sent,
+                    requests.failure_ratio() * 100.0
+                ),
+            );
+        }
+
+        let streamed = state.streamed_findings.lock().await;
+        output.push_str(&render_plain_finding_blocks(
+            args,
+            display_results,
+            stream_findings_enabled.then_some(&*streamed),
+        ));
+        output
+    } else {
+        let mut output = String::new();
+        for result in display_results {
+            // The parameter name is target-derived (page forms, parameter
+            // mining) and unfiltered — escape control bytes before it reaches
+            // the terminal or a report file.
+            output.push_str(&format!(
+                "Found XSS: {} - {}\n",
+                crate::utils::term::sanitize_display(&result.param),
+                crate::utils::term::sanitize_display(&result.payload)
+            ));
+        }
+        output
+    };
+
+    let output_write_failed = write_output_or_stdout(args, &output_content);
+
+    (final_results, output_write_failed)
+}
+
+/// Create-or-truncate `path` and write `content`, `0600` on Unix.
+///
+/// A report is at least as sensitive as the server's `--log-file` (already
+/// `0600`): under `--include-request` it embeds the raw request, which
+/// carries every `-H` header and the whole cookie jar — the session that made
+/// the target worth scanning. `std::fs::write` left it `0644`, readable by
+/// every local account on the host. The mode only applies at creation, so an
+/// existing file keeps whatever permissions the operator gave it, and the
+/// overwrite-on-rerun behaviour is unchanged.
+fn write_report_file(path: &str, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(content.as_bytes())
+}
+
+/// Write a rendered report to `--output`, or to stdout when no file was asked
+/// for. Returns whether the file write failed.
+///
+/// Shared by the end-of-scan renderer and by the `--dry-run` /
+/// `--only-discovery` previews. Those two return before `render_results`, which
+/// used to be the only place that read `args.output`, so `-o plan.json` was
+/// silently ignored and the command still exited 0 — a pipeline consuming that
+/// file read a stale one, or failed on a missing one, with no indication that
+/// dalfox had skipped the write.
+fn write_output_or_stdout(args: &ScanArgs, output_content: &str) -> bool {
+    let mut output_write_failed = false;
+    if let Some(output_path) = &args.output {
+        // Surface `..` traversal so the operator notices before a
+        // pipeline silently writes into a parent directory. We don't
+        // refuse — there are legitimate uses (`-o ../results.json` from
+        // a per-target subdir) — just emit a one-time stderr warning.
+        if output_path
+            .split(std::path::is_separator)
+            .any(|seg| seg == "..")
+        {
+            eprintln!(
+                "Warning: --output path '{}' contains parent-dir references — final path will be resolved by the OS",
+                output_path
+            );
+        }
+        // Always strip ANSI before writing to a file. `output_content` carries
+        // baked-in escapes from the plain builder (see `render_finding_block`),
+        // and the stdout branch below launders them through `cprintln!` — but
+        // this branch used to write the buffer raw, so `-f plain -o report.txt`
+        // produced a file starting `\e[31m[POC][V]...` even under `--no-color`
+        // and `NO_COLOR=1`, because the escapes never pass the global colour
+        // gate at all. A file is never a terminal, so there is no colour mode
+        // in which escapes belong here; strip unconditionally rather than
+        // mirroring the gate. Non-plain formats never contain escapes, so this
+        // is a no-op for them.
+        let mut file_content = crate::utils::term::strip_ansi(output_content);
+        // A report file ends with a newline. stdout gets one from `cprintln!`;
+        // the file branch has to add its own, and the JSON/JSONL renderers
+        // produce a buffer without a trailing one.
+        if !file_content.ends_with('\n') {
+            file_content.push('\n');
+        }
+        match write_report_file(output_path, &file_content) {
+            Ok(_) => {
+                if !args.silence {
+                    println!("Results written to {}", output_path);
+                }
+            }
+            Err(e) => {
+                // A failed `--output` write is a hard failure, not a log line:
+                // the operator asked for the results in a file and won't get
+                // them. Surface it even under `--silence` (it goes to stderr, so
+                // machine stdout stays clean) and propagate so the exit code
+                // becomes Error instead of a misleading success — otherwise a
+                // CI step like `dalfox -o out.json -S && use out.json` proceeds
+                // against a missing or stale file with zero indication.
+                eprintln!("Error writing to file {}: {}", output_path, e);
+                output_write_failed = true;
+            }
+        }
+    } else {
+        // output_content may carry baked-in ANSI escapes from the plain
+        // builder above — cprintln strips them when --no-color / NO_COLOR
+        // is in effect so the final POC/finding block stays plain.
+        crate::cprintln!("{}", output_content);
+    }
+    output_write_failed
+}
+
+/// Decide the process exit code from what the scan actually produced.
+///
+/// Every branch here exists because a real script read the wrong thing from a
+/// zero exit: `dalfox scan https://target && echo "no XSS found"` must not
+/// print that when the host was down, when the session died, or when the
+/// `--output` file could not be written. Only "we looked and found nothing"
+/// is Clean.
+pub(crate) async fn derive_outcome(
+    args: &ScanArgs,
+    all_targets: &[TargetRef],
+    state: &ScanState,
+    final_results: &[Result],
+    requests: RequestTally,
+    output_write_failed: bool,
+) -> ScanOutcome {
+    // A scan where every supplied target failed reachability checks
+    // (DNS lookup failure, connection refused, content-type mismatch,
+    // etc.) used to fall through to `ScanOutcome::Clean` here — same
+    // exit code 0 as "scanned and found nothing." That silently masked
+    // hard failures from scripts like
+    //   `dalfox scan https://target && echo "no XSS found"`,
+    // so the operator could read a downed server or typo'd host as a
+    // clean pass. Treat the all-skipped case as an error instead; if
+    // even one target produced any scan activity (even with zero
+    // findings) the outcome falls through to Clean as before.
+    let all_unreachable = all_targets_skipped(all_targets, &*state.skipped_targets.lock().await);
+    if all_unreachable {
+        return ScanOutcome::Error;
+    }
+
+    // An empty report after a dead session must not exit 0 — `dalfox scan ... &&
+    // echo "no XSS found"` is exactly the script this issue is about. Under
+    // `--on-session-loss continue` the operator has said the detection may be
+    // misfiring on their target and asked to keep going, so the exit code is
+    // left alone; the `incomplete` meta flag and the per-target SESSION_LOST
+    // entries still record what happened either way.
+    //
+    // Gated on there being no findings: a run that confirmed a `V` and *then*
+    // lost its session should exit 1 (vulnerabilities found), not 2 (hard
+    // error). CI that separates those two — a distinction the output guide
+    // documents — would otherwise read a successful detection as an
+    // infrastructure failure. `meta.incomplete` carries the incompleteness for
+    // both codes.
+    if final_results.is_empty()
+        && super::session::aborts_on_loss(args)
+        && !state.session_lost.lock().await.is_empty()
+    {
+        return ScanOutcome::Error;
+    }
+
+    // A target whose per-parameter worker panicked was recorded
+    // `INTERNAL_ERROR` in `skipped_targets` (scan_loop) — it was not fully
+    // tested. On a single-target run `all_unreachable` above already caught
+    // it, but with a healthy sibling that check is false, so an empty report
+    // would fall through to Clean (exit 0): the "a panic reads as a clean
+    // scan" class, unfixed for the *aggregate* code. Escalate here. Gated on
+    // no findings for the same reason as the session-loss block: a run that
+    // confirmed a `V` elsewhere should still exit 1, not 2 — `meta.incomplete`
+    // and the per-target INTERNAL_ERROR entry carry the partial-ness either way.
+    if final_results.is_empty() {
+        let skipped = state.skipped_targets.lock().await;
+        if skipped
+            .values()
+            .any(|code| *code == crate::cmd::error_codes::INTERNAL_ERROR)
+        {
+            return ScanOutcome::Error;
+        }
+    }
+
+    // A requested `--output` file that couldn't be written is a hard failure,
+    // same as an all-unreachable run: the operator asked for results on disk and
+    // didn't get them. Report it via the exit code so scripts don't read it as a
+    // clean/successful pass.
+    if output_write_failed {
+        return ScanOutcome::Error;
+    }
+
+    // The result envelope already marks severe transport loss as incomplete.
+    // Keep the CLI exit status consistent: with no finding, a run that failed
+    // to deliver enough requests did not establish a clean result.
+    if final_results.is_empty() && requests.is_incomplete() {
+        return ScanOutcome::Error;
+    }
+
+    if final_results.is_empty() {
+        ScanOutcome::Clean
+    } else {
+        ScanOutcome::Findings
+    }
+}

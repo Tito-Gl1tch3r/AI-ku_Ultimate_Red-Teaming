@@ -1,0 +1,352 @@
+package alias
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	clientrpc "github.com/chainreactors/IoM-go/proto/services/clientrpc"
+	"github.com/chainreactors/malice-network/client/assets"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/chainreactors/malice-network/client/command/help"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/utils/fileutils"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/chainreactors/mals"
+	"github.com/kballard/go-shellquote"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+const (
+	ManifestFileName = "alias.json"
+
+	windowsDefaultHostProc = `c:\\windows\\system32\\svchost.exe`
+	linuxDefaultHostProc   = "/bin/bash"
+	macosDefaultHostProc   = "/Applications/Safari.app/Contents/MacOS/SafariForWebKitDevelopment"
+)
+
+var (
+	// alias name -> manifest/command
+	loadedAliases = map[string]*loadedAlias{}
+
+	defaultHostProc = map[string]string{
+		"windows": windowsDefaultHostProc,
+		"linux":   linuxDefaultHostProc,
+		"darwin":  macosDefaultHostProc,
+	}
+)
+
+// Ties the manifest struct to the command struct
+type loadedAlias struct {
+	Manifest *AliasManifest
+	Command  *cobra.Command
+	Func     *mals.MalFunction
+}
+
+// AliasFile - An OS/Arch specific file
+type AliasFile struct {
+	OS   string `json:"os"`
+	Arch string `json:"arch"`
+	Path string `json:"path"`
+}
+
+// AliasManifest - The manifest for an alias, contains metadata
+type AliasManifest struct {
+	Name           string `json:"name"`
+	Version        string `json:"version"`
+	CommandName    string `json:"command_name"`
+	OriginalAuthor string `json:"original_author"`
+	RepoURL        string `json:"repo_url"`
+	Help           string `json:"help"`
+	LongHelp       string `json:"long_help"`
+
+	Entrypoint   string       `json:"entrypoint"`
+	AllowArgs    bool         `json:"allow_args"`
+	DefaultArgs  string       `json:"default_args"`
+	Files        []*AliasFile `json:"files"`
+	IsReflective bool         `json:"is_reflective"`
+	IsAssembly   bool         `json:"is_assembly"`
+
+	RootPath   string `json:"-"`
+	ArmoryName string `json:"-"`
+	ArmoryPK   string `json:"-"`
+}
+
+func (ec *AliasManifest) getDefaultProcess(targetOS string) (proc string, err error) {
+	proc, ok := defaultHostProc[targetOS]
+	if !ok {
+		err = fmt.Errorf("no default process for %s target, please specify one", targetOS)
+	}
+	return
+}
+
+func (a *AliasManifest) getFileForTarget(cmdName string, targetOS string, targetArch string) (string, error) {
+	filePath := ""
+	for _, extFile := range a.Files {
+		if targetOS == extFile.OS && targetArch == extFile.Arch {
+			filePath = path.Join(assets.GetAliasesDir(), a.CommandName, extFile.Path)
+			break
+		}
+	}
+	if filePath == "" {
+		err := fmt.Errorf("no alias file found for %s/%s", targetOS, targetArch)
+		return "", err
+	}
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		err = fmt.Errorf("alias file not found: %s", filePath)
+		return "", err
+	}
+	return filePath, nil
+}
+
+// AliasesLoadCmd - Locally load a alias into the Sliver shell.
+func AliasesLoadCmd(cmd *cobra.Command, con *core.Console) {
+	dirPath := cmd.Flags().Arg(0)
+	alias, err := LoadAlias(dirPath, con)
+	if err != nil {
+		con.Log.Errorf("Failed to load alias: %s\n", err)
+	} else {
+		con.Log.Infof("%s alias has been loaded\n", alias.Name)
+	}
+	err = RegisterAlias(alias, con.ImplantMenu(), con)
+	if err != nil {
+		con.Log.Errorf("%s\n", err.Error())
+		return
+	}
+}
+
+// LoadAlias - Load an alias into the Malice-Network shell from a given directory
+func LoadAlias(manifestPath string, con *core.Console) (*AliasManifest, error) {
+	// retrieve alias manifest
+	var err error
+	if !strings.HasPrefix(manifestPath, assets.GetAliasesDir()) {
+		manifestPath = path.Join(assets.GetAliasesDir(), manifestPath)
+	}
+	if !fileutils.Exist(manifestPath) {
+		return nil, fmt.Errorf("alias %s maybe not installed", manifestPath)
+	}
+	// parse it
+	if !strings.HasSuffix(manifestPath, ManifestFileName) {
+		manifestPath = path.Join(manifestPath, ManifestFileName)
+	}
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	aliasManifest, err := ParseAliasManifest(data)
+	if err != nil {
+		return nil, err
+	}
+	aliasManifest.RootPath = filepath.Dir(manifestPath)
+	// for each alias command, add a new app command
+	//implantMenu := con.App.Menu(consts.ImplantGroup)
+	// do not add if the command already exists
+	//if console.CmdExist(aliasManifest.CommandName, implantMenu.Command) {
+	//	return nil, fmt.Errorf("'%s' command already exists", aliasManifest.CommandName)
+	//}
+
+	return aliasManifest, nil
+}
+
+func RegisterAlias(aliasManifest *AliasManifest, cmd *cobra.Command, con *core.Console) error {
+	helpMsg := fmt.Sprintf("[%s] %s", aliasManifest.Name, aliasManifest.Help)
+	longHelpMsg := help.FormatHelpTmpl(aliasManifest.LongHelp)
+	longHelpMsg += "\n\n⚠️  If you're having issues passing arguments to the alias please read:\n"
+	longHelpMsg += "https://github.com/BishopFox/sliver/wiki/Aliases-&-Extensions#aliases-command-parsing"
+	addAliasCmd := &cobra.Command{
+		Use:   aliasManifest.CommandName,
+		Short: helpMsg,
+		Long:  longHelpMsg,
+		Run: func(cmd *cobra.Command, args []string) {
+			runAliasCommand(cmd, con)
+		},
+		Args:        cobra.ArbitraryArgs,
+		GroupID:     consts.ArmoryGroup,
+		Annotations: makeAliasPlatformFilters(aliasManifest),
+	}
+
+	if aliasManifest.IsReflective {
+		common.BindFlag(addAliasCmd, common.ExecuteFlagSet, common.SacrificeFlagSet, func(f *pflag.FlagSet) {
+			f.BoolP("inline", "i", false, "enable execute_dll")
+			f.StringP("entrypoint", "e", aliasManifest.Entrypoint, "entrypoint")
+		})
+	} else {
+		common.BindFlag(addAliasCmd, common.CLRFlagSet)
+	}
+
+	loadedAliases[aliasManifest.CommandName] = &loadedAlias{
+		Manifest: aliasManifest,
+		Command:  addAliasCmd,
+		Func: core.WrapImplantFunc(con, func(rpc clientrpc.MaliceRPCClient, sess *client.Session, args string,
+			param map[string]string,
+			sac *implantpb.SacrificeProcess) (*clientpb.Task, error) {
+			return ExecuteAlias(rpc, sess, aliasManifest.CommandName, args, param, sac)
+		}, output.ParseBinaryResponse),
+	}
+	profile, err := assets.GetProfile()
+	if err != nil {
+		return err
+	}
+	profile.AddAlias(aliasManifest.CommandName)
+	cmd.AddCommand(addAliasCmd)
+
+	return nil
+}
+
+// ParseAliasManifest - Parse an alias manifest
+func ParseAliasManifest(data []byte) (*AliasManifest, error) {
+	// parse it
+	alias := &AliasManifest{}
+	err := json.Unmarshal(data, alias)
+	if err != nil {
+		return nil, err
+	}
+	if alias.Name == "" {
+		return nil, fmt.Errorf("missing alias name in manifest")
+	}
+	if alias.CommandName == "" {
+		return nil, fmt.Errorf("missing command.name in alias manifest")
+	}
+	if alias.Help == "" {
+		return nil, fmt.Errorf("missing command.help in alias manifest")
+	}
+
+	for _, aliasFile := range alias.Files {
+		if aliasFile.OS == "" {
+			return nil, fmt.Errorf("missing command.files.os in alias manifest")
+		}
+		aliasFile.OS = strings.ToLower(aliasFile.OS)
+		if aliasFile.Arch == "" {
+			return nil, fmt.Errorf("missing command.files.arch in alias manifest")
+		}
+		aliasFile.Arch = strings.ToLower(aliasFile.Arch)
+		aliasFile.Path = fileutils.ResolvePath(aliasFile.Path)
+		if aliasFile.Path == "" || aliasFile.Path == "/" {
+			return nil, fmt.Errorf("missing command.files.path in alias manifest")
+		}
+	}
+
+	return alias, nil
+}
+
+func runAliasCommand(cmd *cobra.Command, con *core.Console) {
+	session := con.GetInteractive()
+	loadedAlias, ok := loadedAliases[cmd.Name()]
+	if !ok {
+		con.Log.Errorf("No alias found for `%s` command\n", cmd.Name())
+		return
+	}
+	aliasManifest := loadedAlias.Manifest
+	args := cmd.Flags().Args()
+	var extArgs string
+	if len(aliasManifest.DefaultArgs) != 0 && len(args) == 0 {
+		extArgs = aliasManifest.DefaultArgs
+	} else {
+		extArgs = strings.Join(args, " ")
+	}
+
+	extArgs = strings.TrimSpace(extArgs)
+	var err error
+	isInline, _ := cmd.Flags().GetBool("inline")
+	clrparams := common.ParseCLRFlags(cmd)
+	if isInline {
+		_, err = ExecuteAlias(con.Rpc, session, cmd.Name(), extArgs, clrparams, nil)
+	} else {
+		processName, _ := cmd.Flags().GetString("process")
+		if processName == "" {
+			processName, err = aliasManifest.getDefaultProcess(con.GetInteractive().Os.Name)
+			if err != nil {
+				con.Log.Errorf("%s\n", err)
+				return
+			}
+		}
+		sac := common.ParseSacrificeFlags(cmd)
+		task, err := ExecuteAlias(con.Rpc, session, cmd.Name(), extArgs, clrparams, sac)
+		if err != nil {
+			con.Log.Errorf("Execute error: %v\n", err)
+			return
+		}
+		session.Console(task, string(*con.App.Shell().Line()))
+	}
+
+}
+
+func ExecuteAlias(rpc clientrpc.MaliceRPCClient, sess *client.Session, aliasName string, args string, param map[string]string,
+	sac *implantpb.SacrificeProcess) (*clientpb.Task, error) {
+	loadedAlias, ok := loadedAliases[aliasName]
+	if !ok {
+		return nil, fmt.Errorf("No alias found for `%s` command\n", aliasName)
+	}
+	aliasManifest := loadedAlias.Manifest
+	binPath, err := aliasManifest.getFileForTarget(aliasName, sess.Os.Name, sess.Os.Arch)
+	if err != nil {
+		return nil, fmt.Errorf("Fail to find alias file: %w\n", err)
+	}
+
+	binData, err := os.ReadFile(binPath)
+	if err != nil {
+		return nil, err
+	}
+	var task *clientpb.Task
+	if aliasManifest.IsAssembly {
+		arg, err := shellquote.Split(args)
+		if err != nil {
+			return nil, err
+		}
+		binary := &implantpb.ExecuteBinary{
+			Name:   loadedAlias.Command.Name(),
+			Bin:    binData,
+			Type:   consts.ModuleExecuteAssembly,
+			Args:   arg,
+			Param:  param,
+			Output: true,
+			Delay:  2000,
+		}
+
+		task, err = rpc.ExecuteAssembly(sess.Context(), binary)
+	} else {
+		task, err = rpc.ExecuteDLL(sess.Context(), &implantpb.ExecuteBinary{
+			Name:       loadedAlias.Command.Name(),
+			Bin:        binData,
+			EntryPoint: aliasManifest.Entrypoint,
+			Type:       consts.ModuleExecuteDll,
+			Sacrifice:  sac,
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func makeAliasPlatformFilters(alias *AliasManifest) map[string]string {
+	all := make(map[string]string)
+
+	// Only add filters for architectures when there OS matters.
+	var arch []string
+	for _, file := range alias.Files {
+		all["os"] = file.OS
+		arch = append(arch, consts.FormatArch(file.Arch))
+	}
+	all["arch"] = strings.Join(arch, ",")
+
+	all["depend"] = aliasModule(alias)
+	return all
+}
+
+func aliasModule(manifest *AliasManifest) string {
+	if manifest.IsAssembly {
+		return consts.ModuleExecuteAssembly
+	} else if manifest.IsReflective {
+		return consts.ModuleExecuteDll
+	}
+	return ""
+}

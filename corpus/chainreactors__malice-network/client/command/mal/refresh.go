@@ -1,0 +1,49 @@
+package mal
+
+import (
+	"github.com/chainreactors/malice-network/client/assets"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/spf13/cobra"
+)
+
+func RefreshMalCmd(cmd *cobra.Command, con *core.Console) error {
+	if err := assets.RefreshProfile(); err != nil {
+		return err
+	}
+	manager, err := ensureMalManager(con)
+	if err != nil {
+		return err
+	}
+
+	implantCmd := con.ImplantMenu()
+
+	// 获取所有外部插件名称
+	externalPlugins := manager.GetAllExternalPlugins()
+	var pluginNames []string
+	for name := range externalPlugins {
+		pluginNames = append(pluginNames, name)
+	}
+
+	// 移除所有外部插件
+	for _, name := range pluginNames {
+		if plug, exists := manager.GetExternalPlugin(name); exists {
+			unregisterMalPlugin(con, implantCmd, plug)
+		}
+		err := manager.RemoveExternalMal(name)
+		if err != nil {
+			con.Log.Warnf("Failed to remove plugin %s: %s\n", name, err)
+		}
+	}
+
+	// 重新加载所有外部mal插件
+	for _, manifest := range manager.GetPluginManifests() {
+		err := LoadMalWithManifest(con, implantCmd, manifest)
+		if err != nil {
+			con.Log.Errorf("Failed to load mal %s: %s\n", manifest.Name, err)
+			continue
+		}
+	}
+
+	con.Log.Importantf("Successfully refreshed all mal plugins\n")
+	return nil
+}

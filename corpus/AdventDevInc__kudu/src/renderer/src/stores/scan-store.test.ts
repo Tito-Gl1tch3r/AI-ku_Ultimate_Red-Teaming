@@ -1,0 +1,249 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { useScanStore } from './scan-store'
+import { ScanStatus } from '@shared/enums'
+import type { ScanResult } from '@shared/types'
+
+// Mock localStorage
+const storage = new Map<string, string>()
+vi.stubGlobal('localStorage', {
+  getItem: (key: string) => storage.get(key) ?? null,
+  setItem: (key: string, val: string) => storage.set(key, val),
+  removeItem: (key: string) => storage.delete(key)
+})
+
+function makeResult(
+  category: string,
+  subcategory: string,
+  items: { id: string; size: number }[]
+): ScanResult {
+  return {
+    category,
+    subcategory,
+    items: items.map((i) => ({
+      ...i,
+      path: `C:\\temp\\${i.id}`,
+      category,
+      subcategory,
+      lastModified: Date.now(),
+      selected: true
+    })),
+    totalSize: items.reduce((s, i) => s + i.size, 0),
+    itemCount: items.length
+  }
+}
+
+describe('scan-store', () => {
+  beforeEach(() => {
+    storage.clear()
+    useScanStore.getState().reset()
+  })
+
+  it('tracks an opaque App Space token only while its results remain in the plan', () => {
+    const store = useScanStore.getState()
+    store.setResults([makeResult('app', 'Cursor', [{ id: 'cursor', size: 12 }])])
+    store.setAppSpaceHandoffToken('token')
+    store.addResults([makeResult('browser', 'Chrome', [{ id: 'chrome', size: 3 }])])
+    expect(useScanStore.getState().appSpaceHandoffToken).toBe('token')
+    store.setResults([])
+    expect(useScanStore.getState().appSpaceHandoffToken).toBeNull()
+    store.setAppSpaceHandoffToken('other')
+    store.reset()
+    expect(useScanStore.getState().appSpaceHandoffToken).toBeNull()
+  })
+  it('starts in idle state with empty results', () => {
+    const state = useScanStore.getState()
+    expect(state.status).toBe(ScanStatus.Idle)
+    expect(state.results).toEqual([])
+    expect(state.selectedItems.size).toBe(0)
+  })
+
+  it('keeps optional maintenance unselected on initial and incremental scans', () => {
+    const result = makeResult('app', 'Native maintenance', [{ id: 'native', size: 0 }])
+    result.items[0].selected = false
+    result.items[0].cleanupAction = 'uv-prune'
+    useScanStore.getState().setResults([result])
+    expect(useScanStore.getState().selectedItems.has('native')).toBe(false)
+    useScanStore.getState().addResults([result])
+    expect(useScanStore.getState().selectedItems.has('native')).toBe(false)
+    useScanStore.getState().toggleItem('native')
+    expect(useScanStore.getState().selectedItems.has('native')).toBe(true)
+  })
+
+  it('keeps privacy traces unselected on the next scan even after an opt-in', () => {
+    const scan = (id: string) => {
+      const result = makeResult('privacyTraces', 'Shell history', [{ id, size: 10 }])
+      result.items[0].selected = false
+      return result
+    }
+    useScanStore.getState().setResults([scan('first')])
+    useScanStore.getState().toggleSubcategory(useScanStore.getState().results[0])
+    expect(useScanStore.getState().selectedItems.has('first')).toBe(true)
+    useScanStore.getState().setResults([scan('second')])
+    expect(useScanStore.getState().selectedItems.has('second')).toBe(false)
+  })
+
+  it('setResults populates results and auto-selects items', () => {
+    const results = [
+      makeResult('system', 'temp', [
+        { id: 'a', size: 100 },
+        { id: 'b', size: 200 }
+      ])
+    ]
+    useScanStore.getState().setResults(results)
+    const state = useScanStore.getState()
+    expect(state.results).toHaveLength(1)
+    expect(state.selectedItems.has('a')).toBe(true)
+    expect(state.selectedItems.has('b')).toBe(true)
+  })
+
+  it('addResults appends without replacing', () => {
+    useScanStore.getState().setResults([makeResult('system', 'temp', [{ id: 'a', size: 100 }])])
+    useScanStore.getState().addResults([makeResult('system', 'logs', [{ id: 'b', size: 200 }])])
+    const state = useScanStore.getState()
+    expect(state.results).toHaveLength(2)
+    expect(state.selectedItems.has('a')).toBe(true)
+    expect(state.selectedItems.has('b')).toBe(true)
+  })
+
+  it('toggleItem deselects and reselects', () => {
+    useScanStore.getState().setResults([makeResult('system', 'temp', [{ id: 'a', size: 100 }])])
+    useScanStore.getState().toggleItem('a')
+    expect(useScanStore.getState().selectedItems.has('a')).toBe(false)
+    useScanStore.getState().toggleItem('a')
+    expect(useScanStore.getState().selectedItems.has('a')).toBe(true)
+  })
+
+  it('toggleSubcategory deselects all when all selected, selects all when some deselected', () => {
+    const result = makeResult('system', 'temp', [
+      { id: 'a', size: 100 },
+      { id: 'b', size: 200 }
+    ])
+    useScanStore.getState().setResults([result])
+    // All selected → toggle deselects all
+    useScanStore.getState().toggleSubcategory(result)
+    expect(useScanStore.getState().selectedItems.has('a')).toBe(false)
+    expect(useScanStore.getState().selectedItems.has('b')).toBe(false)
+    // None selected → toggle selects all
+    useScanStore.getState().toggleSubcategory(result)
+    expect(useScanStore.getState().selectedItems.has('a')).toBe(true)
+    expect(useScanStore.getState().selectedItems.has('b')).toBe(true)
+  })
+
+  it('selectAll / deselectAll works per category', () => {
+    useScanStore
+      .getState()
+      .setResults([
+        makeResult('system', 'temp', [{ id: 'a', size: 100 }]),
+        makeResult('browser', 'chrome', [{ id: 'b', size: 200 }])
+      ])
+    useScanStore.getState().deselectAll('system')
+    expect(useScanStore.getState().selectedItems.has('a')).toBe(false)
+    expect(useScanStore.getState().selectedItems.has('b')).toBe(true)
+    useScanStore.getState().selectAll('system')
+    expect(useScanStore.getState().selectedItems.has('a')).toBe(true)
+  })
+
+  it('toggleCategory toggles all items in a category', () => {
+    useScanStore
+      .getState()
+      .setResults([
+        makeResult('system', 'temp', [{ id: 'a', size: 100 }]),
+        makeResult('system', 'logs', [{ id: 'b', size: 200 }])
+      ])
+    // All selected → deselect all
+    useScanStore.getState().toggleCategory('system')
+    expect(useScanStore.getState().selectedItems.has('a')).toBe(false)
+    expect(useScanStore.getState().selectedItems.has('b')).toBe(false)
+    // None selected → select all
+    useScanStore.getState().toggleCategory('system')
+    expect(useScanStore.getState().selectedItems.has('a')).toBe(true)
+    expect(useScanStore.getState().selectedItems.has('b')).toBe(true)
+  })
+
+  it('getTotalSize sums all result sizes', () => {
+    useScanStore
+      .getState()
+      .setResults([
+        makeResult('system', 'temp', [{ id: 'a', size: 100 }]),
+        makeResult('system', 'logs', [{ id: 'b', size: 200 }])
+      ])
+    expect(useScanStore.getState().getTotalSize()).toBe(300)
+  })
+
+  it('getSelectedSize sums only selected item sizes', () => {
+    useScanStore.getState().setResults([
+      makeResult('system', 'temp', [
+        { id: 'a', size: 100 },
+        { id: 'b', size: 200 }
+      ])
+    ])
+    useScanStore.getState().toggleItem('a')
+    expect(useScanStore.getState().getSelectedSize()).toBe(200)
+  })
+
+  it('getSelectedIds returns array of selected IDs', () => {
+    useScanStore.getState().setResults([
+      makeResult('system', 'temp', [
+        { id: 'a', size: 100 },
+        { id: 'b', size: 200 }
+      ])
+    ])
+    const ids = useScanStore.getState().getSelectedIds()
+    expect(ids.sort()).toEqual(['a', 'b'])
+  })
+
+  it('excluded subcategories persist to localStorage', () => {
+    const result = makeResult('system', 'temp', [{ id: 'a', size: 100 }])
+    useScanStore.getState().setResults([result])
+    useScanStore.getState().toggleSubcategory(result)
+    expect(useScanStore.getState().excludedSubcategories.has('temp')).toBe(true)
+    const stored = JSON.parse(storage.get('kudu:excluded-subcategories')!)
+    expect(stored).toContain('temp')
+  })
+
+  it('reset clears state back to defaults', () => {
+    useScanStore.getState().setResults([makeResult('system', 'temp', [{ id: 'a', size: 100 }])])
+    useScanStore.getState().setStatus(ScanStatus.Complete)
+    useScanStore.getState().reset()
+    const state = useScanStore.getState()
+    expect(state.status).toBe(ScanStatus.Idle)
+    expect(state.results).toEqual([])
+    expect(state.selectedItems.size).toBe(0)
+  })
+})
+
+describe('search-scoped selection', () => {
+  beforeEach(() => {
+    storage.clear()
+    useScanStore.setState({ excludedSubcategories: new Set(['Temp files']) })
+    useScanStore.getState().reset()
+  })
+
+  it('changes only known matching IDs and preserves hidden selections and remembered exclusions', () => {
+    const store = useScanStore.getState()
+    store.setResults([
+      makeResult('system', 'Temp files', [
+        { id: 'match', size: 1 },
+        { id: 'hidden', size: 2 }
+      ]),
+      makeResult('app', 'Other cache', [{ id: 'elsewhere', size: 3 }])
+    ])
+    store.setItemsSelected(['match', 'expired'], true)
+    expect([...useScanStore.getState().selectedItems].sort()).toEqual(['elsewhere', 'match'])
+    store.setItemsSelected(['match'], false)
+    expect([...useScanStore.getState().selectedItems]).toEqual(['elsewhere'])
+    expect([...useScanStore.getState().excludedSubcategories]).toEqual(['Temp files'])
+    expect(storage.size).toBe(0)
+  })
+
+  it('does not persist a filtered deselection across scans', () => {
+    useScanStore.setState({ excludedSubcategories: new Set() })
+    const inventory = [makeResult('system', 'Temp files', [{ id: 'match', size: 1 }])]
+    const store = useScanStore.getState()
+    store.setResults(inventory)
+    store.setItemsSelected(['match'], false)
+    expect(useScanStore.getState().getSelectedIds()).toEqual([])
+    store.setResults(inventory)
+    expect(useScanStore.getState().getSelectedIds()).toEqual(['match'])
+  })
+})

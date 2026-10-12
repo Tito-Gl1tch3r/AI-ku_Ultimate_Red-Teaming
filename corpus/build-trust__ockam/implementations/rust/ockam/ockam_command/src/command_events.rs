@@ -1,0 +1,79 @@
+use ockam_api::cli_state::journeys::{JourneyEvent, APPLICATION_EVENT_COMMAND};
+use ockam_api::CliState;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::warn;
+
+/// This function creates a journey event describing the execution of a command
+pub async fn add_command_event(
+    cli_state: Arc<CliState>,
+    command: &str,
+    command_arguments: String,
+) -> miette::Result<()> {
+    let command_name = command.to_string();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        APPLICATION_EVENT_COMMAND,
+        sanitize_command_arguments(command_arguments),
+    );
+    if let Err(e) = cli_state
+        .add_journey_event(JourneyEvent::ok(command_name), attributes)
+        .await
+    {
+        warn!("cannot save a journey event: {}", e);
+    }
+
+    Ok(())
+}
+
+/// This function creates a journey event describing the error resulting from the execution of a command
+pub async fn add_command_error_event(
+    cli_state: Arc<CliState>,
+    command_name: &str,
+    message: &str,
+    command_arguments: String,
+) -> miette::Result<()> {
+    let message = message.to_string();
+    let command = command_name.to_string();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        APPLICATION_EVENT_COMMAND,
+        sanitize_command_arguments(command_arguments),
+    );
+    if let Err(e) = cli_state
+        .add_journey_error(&command, message, attributes)
+        .await
+    {
+        warn!("cannot save a journey event: {}", e);
+    }
+    Ok(())
+}
+
+/// The ockam project enroll command arguments contain the enrollment ticket which is sensitive
+/// information (because it could be potentially reused), so it should be removed from the user event.
+pub fn sanitize_command_arguments(command_args: String) -> String {
+    if command_args.starts_with("ockam project enroll") {
+        "ockam project enroll".to_string()
+    } else {
+        command_args
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_project_enroll() {
+        assert_eq!(
+            sanitize_command_arguments("ockam project enroll abcdxyz".to_string()),
+            "ockam project enroll".to_string()
+        );
+        assert_eq!(
+            sanitize_command_arguments("ockam node create n1".to_string()),
+            "ockam node create n1".to_string()
+        );
+    }
+}

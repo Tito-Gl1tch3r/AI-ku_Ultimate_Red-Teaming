@@ -1,0 +1,250 @@
+use crate::portal::addresses::{Addresses, PortalType};
+use crate::portal::tls_certificate::TlsCertificateProvider;
+use crate::portal::{InletSharedState, ReadHalfMaybeTls, WriteHalfMaybeTls};
+use crate::transport::set_socket_buffer_size;
+use crate::{portal::TcpPortalWorker, TcpInlet, TcpInletOptions, TcpRegistry};
+use log::warn;
+use ockam_core::compat::net::SocketAddr;
+use ockam_core::compat::sync::{Arc, RwLock as SyncRwLock};
+use ockam_core::env::get_env;
+use ockam_core::errcode::{Kind, Origin};
+use ockam_core::{async_trait, compat::boxed::Box, Result};
+use ockam_core::{Address, Processor, Route};
+use ockam_node::Context;
+use ockam_transport_core::{HostnamePort, TransportError};
+use rustls::pki_types::CertificateDer;
+use std::io::BufReader;
+use std::os::fd::AsRawFd;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::time::Instant;
+use tokio_rustls::{TlsAcceptor, TlsStream};
+use tracing::{debug, error, instrument, Level};
+
+/// A TCP Portal Inlet listen processor
+///
+/// TCP Portal Inlet listen processors are created by `TcpTransport`
+/// after a call is made to
+/// [`TcpTransport::create_inlet`](crate::TcpTransport::create_inlet).
+pub(crate) struct TcpInletListenProcessor {
+    registry: TcpRegistry,
+    inner: TcpListener,
+    inlet_shared_state: Arc<SyncRwLock<InletSharedState>>,
+    options: TcpInletOptions,
+}
+
+impl TcpInletListenProcessor {
+    pub fn new(
+        registry: TcpRegistry,
+        inner: TcpListener,
+        inlet_shared_state: Arc<SyncRwLock<InletSharedState>>,
+        options: TcpInletOptions,
+    ) -> Self {
+        Self {
+            registry,
+            inner,
+            inlet_shared_state,
+            options,
+        }
+    }
+
+    /// Start a new `TcpInletListenProcessor`
+    #[instrument(skip_all, name = "TcpInletListenProcessor::start", level = Level::TRACE)]
+    pub(crate) async fn start(
+        ctx: &Context,
+        registry: TcpRegistry,
+        outlet_listener_route: Route,
+        addr: SocketAddr,
+        options: TcpInletOptions,
+    ) -> Result<TcpInlet> {
+        let processor_address = Address::random_tagged("TcpInletListenProcessor");
+
+        debug!("Binding TcpPortalListenerWorker to {}", addr);
+        let inner = match TcpListener::bind(addr).await {
+            Ok(addr) => addr,
+            Err(err) => {
+                error!(%addr, %err, "could not bind to address");
+                return Err(TransportError::from(err))?;
+            }
+        };
+
+        if let Ok(Some(buffer_size)) = get_env::<usize>("OCKAM_TCP_PORTAL_SOCKET_LENGTH") {
+            set_socket_buffer_size(inner.as_raw_fd(), buffer_size)?;
+        }
+
+        let socket_addr = inner.local_addr().map_err(TransportError::from)?;
+        let inlet_shared_state =
+            InletSharedState::create(ctx, outlet_listener_route, options.is_paused)?;
+        let inlet_shared_state = Arc::new(SyncRwLock::new(inlet_shared_state));
+        let processor = Self::new(registry, inner, inlet_shared_state.clone(), options);
+
+        ctx.start_processor(processor_address.clone(), processor)?;
+
+        Ok(TcpInlet::new_regular(
+            socket_addr,
+            processor_address,
+            inlet_shared_state,
+        ))
+    }
+
+    /// Returns a TLS acceptor, in case of failure it retries until the timeout is hit.
+    /// The timeout is not a hard limit and may be surpassed.
+    async fn create_acceptor(
+        certificate_provider: &Arc<dyn TlsCertificateProvider>,
+        timeout: Duration,
+    ) -> Result<TlsAcceptor> {
+        let now = Instant::now();
+
+        loop {
+            if now.elapsed() > timeout {
+                return Err(ockam_core::Error::new(
+                    Origin::Transport,
+                    Kind::Timeout,
+                    "TLS certificated retrieval timed out",
+                ));
+            }
+
+            let certificate = match certificate_provider.get_certificate().await {
+                Ok(certificate) => certificate,
+                Err(error) => {
+                    if error.code().kind == Kind::Timeout {
+                        warn!("TLS certificate retrieval timed out. Retrying in 60 seconds.");
+                    } else {
+                        warn!("Cannot retrieve certificate: {error}. Retrying in 60 seconds.");
+                    }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                }
+            };
+
+            let chain = {
+                let mut reader = BufReader::new(certificate.full_chain_pem.as_slice());
+                let chain = rustls_pemfile::certs(&mut reader);
+                let chain: std::io::Result<Vec<CertificateDer<'static>>> = chain.collect();
+                chain.unwrap()
+            };
+
+            let private_key = {
+                let mut reader = BufReader::new(certificate.private_key_pem.as_slice());
+                let mut private_keys = rustls_pemfile::pkcs8_private_keys(&mut reader);
+
+                match private_keys.next() {
+                    Some(Ok(private_key)) => private_key.into(),
+
+                    Some(Err(error)) => {
+                        return Err(ockam_core::Error::new(
+                            Origin::Transport,
+                            Kind::Parse,
+                            error,
+                        ));
+                    }
+
+                    None => {
+                        return Err(ockam_core::Error::new(
+                            Origin::Transport,
+                            Kind::Parse,
+                            "No private key found in the provided certificate",
+                        ));
+                    }
+                }
+            };
+
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, private_key)
+                .map_err(|error| ockam_core::Error::new(Origin::Transport, Kind::Parse, error))?;
+
+            return Ok(TlsAcceptor::from(Arc::new(config)));
+        }
+    }
+}
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+#[async_trait]
+impl Processor for TcpInletListenProcessor {
+    type Context = Context;
+
+    #[instrument(skip_all, name = "TcpInletListenProcessor::initialize", level = Level::TRACE)]
+    async fn initialize(&mut self, ctx: &mut Self::Context) -> Result<()> {
+        self.registry
+            .add_inlet_listener_processor(ctx.primary_address());
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, name = "TcpInletListenProcessor::shutdown", level = Level::TRACE)]
+    async fn shutdown(&mut self, ctx: &mut Self::Context) -> Result<()> {
+        self.registry
+            .remove_inlet_listener_processor(ctx.primary_address());
+
+        Ok(())
+    }
+
+    #[instrument(skip_all, name = "TcpInletListenProcessor::process", level = Level::TRACE)]
+    async fn process(&mut self, ctx: &mut Self::Context) -> Result<bool> {
+        let (stream, socket_addr) = self.inner.accept().await.map_err(TransportError::from)?;
+
+        stream
+            .set_nodelay(!self.options.enable_nagle)
+            .map_err(TransportError::from)?;
+
+        let addresses = Addresses::generate(PortalType::Inlet {
+            listener_address: HostnamePort::from(
+                self.inner.local_addr().map_err(TransportError::from)?,
+            ),
+        });
+
+        let inlet_shared_state = self.inlet_shared_state.read().unwrap().clone();
+
+        if inlet_shared_state.is_paused() {
+            // Just drop the stream
+            return Ok(true);
+        }
+
+        TcpInletOptions::setup_flow_control(
+            ctx.flow_controls(),
+            &addresses,
+            inlet_shared_state.route().next()?,
+        );
+
+        let streams = if let Some(certificate_provider) = &self.options.tls_certificate_provider {
+            let (rx, tx) = tokio::io::split(TlsStream::from(
+                Self::create_acceptor(certificate_provider, DEFAULT_TIMEOUT)
+                    .await?
+                    .accept(stream)
+                    .await
+                    .map_err(|error| {
+                        ockam_core::Error::new(Origin::Transport, Kind::Protocol, error)
+                    })?,
+            ));
+            (
+                ReadHalfMaybeTls::ReadHalfWithTls(rx),
+                WriteHalfMaybeTls::WriteHalfWithTls(tx),
+            )
+        } else {
+            let (rx, tx) = stream.into_split();
+            (
+                ReadHalfMaybeTls::ReadHalfNoTls(rx),
+                WriteHalfMaybeTls::WriteHalfNoTls(tx),
+            )
+        };
+
+        TcpPortalWorker::start_new_inlet(
+            ctx,
+            self.registry.clone(),
+            streams,
+            HostnamePort::from(socket_addr),
+            inlet_shared_state.route().clone(),
+            inlet_shared_state.their_identifier(),
+            addresses,
+            self.options.incoming_access_control.clone(),
+            self.options.outgoing_access_control.clone(),
+            self.options.portal_payload_length,
+            self.options.skip_handshake,
+            self.options.enable_mptcp,
+        )?;
+
+        Ok(true)
+    }
+}

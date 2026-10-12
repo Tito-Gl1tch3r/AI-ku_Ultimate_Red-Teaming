@@ -1,0 +1,622 @@
+/******************************************************************************/
+/* cont3xt.js  -- The main cont3xt app
+ *
+ * Copyright Yahoo Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+'use strict';
+
+const express = require('express');
+const fs = require('fs');
+const app = express();
+const path = require('path');
+const os = require('os');
+const version = require('../common/version');
+const User = require('../common/user');
+const Auth = require('../common/auth');
+const ArkimeCache = require('../common/arkimeCache');
+const ArkimeUtil = require('../common/arkimeUtil');
+const ArkimeConfig = require('../common/arkimeConfig');
+const LinkGroup = require('./linkGroup');
+const Integration = require('./integration');
+const Audit = require('./audit');
+const Overview = require('./overview');
+const View = require('./view');
+const MCPServer = require('../common/mcpServer');
+const MCPCont3xtAPIs = require('./apiMcp');
+const Db = require('./db');
+const jsonParser = ArkimeUtil.jsonParser;
+const favicon = require('serve-favicon');
+const helmet = require('helmet');
+const uuid = require('uuid').v4;
+const dayMs = 60000 * 60 * 24;
+
+const internals = {};
+
+// Process args before routes
+processArgs(process.argv);
+
+// ----------------------------------------------------------------------------
+// Security
+// ----------------------------------------------------------------------------
+app.use(helmet.frameguard({ action: 'deny' })); // disallow iframing
+app.use(helmet.hidePoweredBy()); // hide powered by Express header
+app.use(helmet.xssFilter()); // disables browsers' buggy cross-site scripting filter
+app.use(helmet.noSniff()); // mitigates MIME type sniffing
+
+function setupHSTS () {
+  if (ArkimeConfig.getBool('hstsHeader', false)) {
+    app.use(helmet.hsts({
+      maxAge: 31536000,
+      includeSubDomains: true
+    }));
+  }
+}
+
+// calculate nonce
+app.use((req, res, next) => {
+  res.locals.nonce = Buffer.from(uuid()).toString('base64');
+  next();
+});
+
+// define csp headers - no-op in NODE_ENV=development, since csp will disable vite's HMR (hot module reloading)
+const cspHeader = (process.env.NODE_ENV === 'development')
+  ? (_req, _res, next) => { next(); }
+  : helmet.contentSecurityPolicy({
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"], // 'unsafe-inline' for vue inline styles
+      // need unsafe-eval for vue full build: https://vuejs.org/v2/guide/installation.html#CSP-environments
+      scriptSrc: ["'self'", "'unsafe-eval'", (req, res) => `'nonce-${res.locals.nonce}'`],
+      objectSrc: ["'none'"],
+      imgSrc: ["'self'", 'data:']
+    }
+  });
+
+// The url users open cont3xt at, arkimeWebURL, defaulting to this host
+function arkimeWebURL () {
+  return ArkimeConfig.webURL(
+    () => `${os.hostname()}${internals.webBasePath}`,
+    ArkimeConfig.get('keyFile') && ArkimeConfig.get('certFile')
+  );
+}
+
+function setCookie (req, res, next) {
+  const cookieOptions = {
+    path: internals.webBasePath,
+    sameSite: 'Strict',
+    overwrite: true
+  };
+
+  if (ArkimeConfig.get('keyFile') && ArkimeConfig.get('certFile')) {
+    cookieOptions.secure = true;
+  }
+
+  res.cookie( // send cookie for basic, non admin functions
+    'CONT3XT-COOKIE',
+    Auth.obj2auth({
+      date: Date.now(),
+      pid: process.pid,
+      userId: req.user.userId
+    }),
+    cookieOptions
+  );
+
+  return next();
+}
+
+function checkCookieToken (req, res, next) {
+  if (!req.headers['x-cont3xt-cookie']) {
+    return res.status(500).send({ success: false, text: 'Missing token' });
+  }
+
+  const cookie = req.headers['x-cont3xt-cookie'];
+  req.token = Auth.auth2obj(cookie);
+  const diff = Math.abs(Date.now() - req.token.date);
+  if (diff > 2400000 || req.token.userId !== req.user.userId) {
+    console.trace('bad token', req.token, diff, req.token.userId, req.user.userId);
+    return res.status(500).send({ success: false, text: 'Timeout - Please try reloading page and repeating the action' });
+  }
+
+  return next();
+}
+
+// ----------------------------------------------------------------------------
+// Logging
+// ----------------------------------------------------------------------------
+ArkimeUtil.logger(app);
+
+// ----------------------------------------------------------------------------
+// Load balancer test - no auth
+// ----------------------------------------------------------------------------
+app.use('/_ns_/nstest.html', function (req, res) {
+  res.end();
+});
+
+// ----------------------------------------------------------------------------
+// Middleware
+// ----------------------------------------------------------------------------
+app.use((req, res, next) => {
+  res.serverError = ArkimeUtil.serverError;
+  if (internals.webBasePath !== '/') {
+    req.url = req.url.replace(internals.webBasePath, '/');
+  }
+  return next();
+});
+
+// ----------------------------------------------------------------------------
+// Routes
+// ----------------------------------------------------------------------------
+// assets and fonts
+// using fallthrough: false because there is no 404 endpoint (client router
+// handles 404s) and sending index.html is confusing
+app.use('/mdi-font', express.static(
+  path.join(__dirname, '/../cont3xt/node_modules/@mdi/font'),
+  { maxAge: dayMs, fallthrough: false }
+), ArkimeUtil.missingResource);
+// PRODUCTION BUNDLE (created by vite) - includes bundled js, css, & assets!
+app.use('/assets', express.static(
+  path.join(__dirname, 'vueapp/dist/assets'),
+  { maxAge: dayMs, fallthrough: true }
+));
+// don't use 'assets' since that name is used for production bundle files from vite
+// NOTE: watching.gif and arkime logos are the only assets used in cont3xt currently, so maybe we should only host that?
+app.use(['/assets'], express.static(
+  path.join(__dirname, '../assets'),
+  { maxAge: dayMs, fallthrough: false }
+), ArkimeUtil.missingResource);
+app.use('/public', express.static(
+  path.join(__dirname, '/public'),
+  { maxAge: dayMs, fallthrough: false }
+), ArkimeUtil.missingResource);
+const integrationsStatic = express.static(
+  path.join(__dirname, '/integrations'),
+  { maxAge: dayMs, fallthrough: false }
+);
+app.use('/integrations', (req, res, next) => {
+  if (req.path.endsWith('.png') || req.path.endsWith('.jpg') || req.path.endsWith('.jpeg')) {
+    return integrationsStatic(req, res, (err) => {
+      ArkimeUtil.missingResource(err, req, res);
+    });
+  }
+  return ArkimeUtil.missingResource('Not png or jpg', req, res);
+});
+
+app.use(favicon(path.join(__dirname, '/favicon.ico')));
+
+if (ArkimeConfig.regressionTests) {
+  app.post('/regressionTests/shutdown', (req, res) => {
+    console.log('Shutting down');
+    process.exit(0);
+  });
+
+  app.post('/regressionTests/classify', [jsonParser], (req, res) => {
+    res.send(req.body.map(item => Integration.classify(item)));
+  });
+
+  app.post('/regressionTests/clearAll', async (req, res) => {
+    await Db.clearAll();
+    res.send({ success: true });
+  });
+}
+
+// mcp endpoint --------------------------------------------------------------
+// Mounted before Auth.app() on purpose: MCP does its own bearer auth so a
+// failure can answer 401 + WWW-Authenticate rather than redirecting, which MCP
+// clients don't follow. mcpEnabled is checked per request because the config
+// isn't loaded yet at require time.
+MCPCont3xtAPIs.initialize({
+  apis: { Integration, View, Overview, LinkGroup }
+});
+
+app.use('/mcp', MCPServer.router({
+  serviceName: 'arkime-cont3xt',
+  version: version.version,
+  serviceRole: 'cont3xtUser',
+  tools: MCPCont3xtAPIs.tools,
+  enabled: () => ArkimeConfig.getBool('mcpEnabled', false),
+  webUrl: arkimeWebURL
+}));
+
+// Set up auth, all APIs registered below will use passport
+Auth.app(app);
+
+// check for cont3xtUser
+app.use((req, res, next) => {
+  if (!req.user.hasRole('cont3xtUser')) {
+    req.user.logRoleFailure('cont3xtUser');
+    return res.send('Need cont3xtUser role assigned');
+  }
+  next();
+});
+
+// Demo mode - disable some APIs
+app.all([
+  '/api/user/password*',
+  '/api/user/totp/*'
+], (req, res, next) => {
+  if (!req.user.isDemoMode()) {
+    return next();
+  }
+  return res.serverError(403, 'Disabled in demo mode.');
+});
+
+app.get('/api/appversion', (req, res, next) => {
+  return res.send({ app: 'cont3xt', version: version.version });
+});
+
+app.get('/api/linkGroup', LinkGroup.apiGet);
+app.put('/api/linkGroup', [jsonParser, checkCookieToken], LinkGroup.apiCreate);
+app.put('/api/linkGroup/:id', [jsonParser, checkCookieToken, Auth.checkResourceAccess(Db.getLinkGroup, 'creator')], LinkGroup.apiUpdate);
+app.delete('/api/linkGroup/:id', [jsonParser, checkCookieToken, Auth.checkResourceAccess(Db.getLinkGroup, 'creator')], LinkGroup.apiDelete);
+
+app.get('/api/roles', [checkCookieToken], User.apiRoles);
+app.get('/api/user', User.apiGetUser);
+app.post('/api/users', [jsonParser, User.checkRole('usersAdmin'), setCookie], User.apiGetUsers);
+app.post('/api/users/csv', [jsonParser, User.checkRole('usersAdmin'), setCookie], User.apiGetUsersCSV);
+app.post('/api/users/min', [jsonParser, checkCookieToken, User.checkAssignableRole], User.apiGetUsersMin);
+app.post('/api/user', [jsonParser, checkCookieToken, User.checkRole('usersAdmin')], User.apiCreateUser);
+app.post('/api/user/password', [jsonParser, checkCookieToken, Auth.getSettingUserDb], User.apiUpdateUserPassword);
+
+// TOTP endpoints (only available to admin users)
+app.get('/api/user/totp/status', [ArkimeUtil.noCacheJson, Auth.getSettingUserDb, User.checkSettingUserAnyRole(['arkimeAdmin', 'cont3xtAdmin', 'wiseAdmin'])], User.apiGetTotpStatus);
+app.post('/api/user/totp/setup', [jsonParser, checkCookieToken, Auth.getSettingUserDb, ArkimeUtil.noCacheJson, User.checkSettingUserAnyRole(['arkimeAdmin', 'cont3xtAdmin', 'wiseAdmin'])], User.apiSetupTotp);
+app.post('/api/user/totp/confirm', [jsonParser, checkCookieToken, Auth.getSettingUserDb, ArkimeUtil.noCacheJson, User.checkSettingUserAnyRole(['arkimeAdmin', 'cont3xtAdmin', 'wiseAdmin'])], User.apiConfirmTotp);
+app.post('/api/user/totp/disable', [jsonParser, checkCookieToken, Auth.getSettingUserDb, ArkimeUtil.noCacheJson, User.checkSettingUserAnyRole(['arkimeAdmin', 'cont3xtAdmin', 'wiseAdmin'])], User.apiDisableTotp);
+
+app.delete('/api/user/:id', [jsonParser, checkCookieToken, User.checkRole('usersAdmin')], User.apiDeleteUser);
+app.post('/api/user/:id', [jsonParser, checkCookieToken, User.checkRole('usersAdmin')], User.apiUpdateUser);
+app.post('/api/user/:id/assignment', [jsonParser, checkCookieToken, User.checkAssignableRole], User.apiUpdateUserRole);
+
+app.get('/api/integration', Integration.apiList);
+app.post('/api/integration/search', [jsonParser], Integration.apiSearch);
+app.post('/api/integration/:itype/:integration/search', [jsonParser], Integration.apiSingleSearch);
+app.get('/api/settings', apiGetSettings);
+app.put('/api/settings', [jsonParser, checkCookieToken], apiPutSettings);
+app.get('/api/integration/settings', [setCookie], Integration.apiGetSettings);
+app.put('/api/integration/settings', [jsonParser, checkCookieToken], Integration.apiPutSettings);
+app.get('/api/integration/stats', [setCookie], Integration.apiStats);
+
+app.get('/api/views', [setCookie], View.apiGet);
+app.post('/api/view', [jsonParser, checkCookieToken], View.apiCreate);
+app.put('/api/view/:id', [jsonParser, checkCookieToken, Auth.checkResourceAccess(Db.getView, 'creator')], View.apiUpdate);
+app.delete('/api/view/:id', [jsonParser, checkCookieToken, Auth.checkResourceAccess(Db.getView, 'creator')], View.apiDelete);
+
+app.get('/api/audits', Audit.apiGet);
+app.delete('/api/audit/:id', [jsonParser, checkCookieToken], Audit.apiDelete);
+
+app.get('/api/overview', Overview.apiGet);
+app.put('/api/overview', [jsonParser, checkCookieToken], Overview.apiCreate);
+app.put('/api/overview/:id', [jsonParser, checkCookieToken, Auth.checkResourceAccess(Db.getOverview, 'creator')], Overview.apiUpdate);
+app.delete('/api/overview/:id', [jsonParser, checkCookieToken, Auth.checkResourceAccess(Db.getOverview, 'creator')], Overview.apiDelete);
+
+app.get('/api/health', (req, res) => { res.send({ success: true }); });
+
+// ----------------------------------------------------------------------------
+// Cont3xt Web APIs
+// ----------------------------------------------------------------------------
+
+/**
+ * GET - /api/settings
+ *
+ * Returns all the settings relevant for the cont3xt settings page
+ * @name /settings
+ * @returns {boolean} success - True if the request was successful, false otherwise
+ * @returns {object} settings - General cont3xt settings
+ * @returns {LinkGroup[]} linkGroups - An array of link groups that the logged in user can view/edit
+ * @returns {object} selectedOverviews - A mapping of the selected overview per iType, of shape {[iType]: overviewId}
+ */
+function apiGetSettings (req, res, next) {
+  const cont3xt = req.user.cont3xt ?? {};
+  res.send({
+    success: true,
+    settings: cont3xt.settings ?? {},
+    linkGroup: cont3xt.linkGroup ?? {},
+    selectedOverviews: cont3xt.selectedOverviews ?? {}
+  });
+}
+
+// verify linkGroup settings, on error returns { msg: <errorMsg> }, on success returns { linkGroup }
+// these are read back by LinkGroup.apiGet, so a wrong shape here breaks every
+// later link group fetch for this user
+function verifyLinkGroupSettings (linkGroup) {
+  if (!ArkimeUtil.isPlainObject(linkGroup)) {
+    return { msg: 'linkGroup must be an object' };
+  }
+
+  linkGroup = (({ order }) => ({ order }))(linkGroup); // only allow order
+
+  if (linkGroup.order !== undefined && !ArkimeUtil.isStringArray(linkGroup.order)) {
+    return { msg: 'linkGroup.order must be an array of strings' };
+  }
+
+  return { linkGroup };
+}
+
+// verify selectedOverviews, on error returns { msg: <errorMsg> }, on success returns { selectedOverviews }
+function verifySelectedOverviews (selectedOverviews) {
+  if (!ArkimeUtil.isPlainObject(selectedOverviews)) {
+    return { msg: 'selectedOverviews must be an object' };
+  }
+
+  selectedOverviews = (
+    ({ // only allow these properties in selectedOverviews
+      domain, ip, url, email, phone, hash, text
+    }) => ({ domain, ip, url, email, phone, hash, text })
+  )(selectedOverviews);
+
+  for (const selectedId of Object.values(selectedOverviews)) {
+    if (!ArkimeUtil.isString(selectedId)) {
+      return { msg: 'values in selectedOverviews must be string ids' };
+    }
+  }
+
+  return { selectedOverviews };
+}
+
+/**
+ * PUT - /api/settings
+ *
+ * Updates the general cont3xt settings
+ * @name /settings
+ * @param {object} settings - General cont3xt settings for the logged in user
+ * @returns {boolean} success - True if the request was successful, false otherwise
+ * @returns {string} text - The success/error message to (optionally) display to the user
+ */
+function apiPutSettings (req, res, next) {
+  let save = false;
+  User.getUser(req.user.userId, (err, user) => {
+    if (err || !user) {
+      return res.send({ success: false, text: 'Fetching user issue' });
+    }
+
+    if (user.cont3xt === undefined) { user.cont3xt = {}; }
+
+    if (req.body?.settings) {
+      if (!ArkimeUtil.isPlainObject(req.body.settings)) {
+        return res.send({ success: false, text: 'settings must be an object' });
+      }
+      user.cont3xt.settings = req.body.settings;
+      save = true;
+    }
+
+    if (req.body?.linkGroup) {
+      const { msg, linkGroup } = verifyLinkGroupSettings(req.body.linkGroup);
+      if (msg) { return res.send({ success: false, text: msg }); }
+
+      user.cont3xt.linkGroup = linkGroup;
+      save = true;
+    }
+
+    if (req.body?.selectedOverviews) {
+      const { msg, selectedOverviews } = verifySelectedOverviews(req.body.selectedOverviews);
+      if (msg) { return res.send({ success: false, text: msg }); }
+
+      user.cont3xt.selectedOverviews = selectedOverviews;
+      save = true;
+    }
+
+    if (!save) {
+      return res.send({ success: false, text: 'Nothing sent to change' });
+    }
+
+    user.save((err) => {
+      if (err) {
+        console.log('ERROR - saving cont3xt settings', err);
+        return res.send({ success: false, text: 'Save failed' });
+      }
+      res.send({ success: true, text: 'Saved' });
+    });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// VUE APP
+// ----------------------------------------------------------------------------
+
+// loads the manifest.json file from dist and inject it in the ejs template
+const parseManifest = () => {
+  if (process.env.NODE_ENV === 'development') return {};
+
+  const manifestPath = path.join(path.resolve(), 'vueapp/dist/.vite/manifest.json');
+  const manifestFile = fs.readFileSync(manifestPath, 'utf-8');
+
+  return JSON.parse(manifestFile);
+};
+const manifest = parseManifest();
+
+// vue index page
+app.use(cspHeader, setCookie, (req, res, next) => {
+  if (req.path.toLowerCase() === '/users' && !req.user.hasRole('usersAdmin')) {
+    return res.status(403).send('Permission denied');
+  }
+
+  const appContext = {
+    logoutUrl: Auth.logoutUrl(req),
+    logoutUrlMethod: Auth.logoutUrlMethod,
+    nonce: res.locals.nonce,
+    version: version.version,
+    path: internals.webBasePath,
+    disableUserPasswordUI: ArkimeConfig.getBool('disableUserPasswordUI', true),
+    demoMode: req.user.isDemoMode(),
+    environment: process.env.NODE_ENV,
+    manifest
+  };
+
+  res.render('index.html.ejs', appContext, (err, html) => {
+    if (err) {
+      console.log('ERROR - fetching vue index page:', err);
+      if (err.code === 404) {
+        res.status(404).end('Page not found');
+      } else {
+        res.status(500).end('Internal Server Error');
+      }
+      return;
+    }
+
+    res.send(html);
+  });
+});
+
+// Replace the default express error handler
+app.use(ArkimeUtil.expressErrorHandler);
+
+// ----------------------------------------------------------------------------
+// Command Line Parsing
+// ----------------------------------------------------------------------------
+function processArgs (argv) {
+  for (let i = 0, ilen = argv.length; i < ilen; i++) {
+    if (process.argv[i] === '-o') {
+      i++;
+      const equal = process.argv[i].indexOf('=');
+      if (equal === -1) {
+        console.log('Missing equal sign in', process.argv[i]);
+        process.exit(1);
+      }
+      const key = process.argv[i].slice(0, equal);
+      const value = process.argv[i].slice(equal + 1);
+      if (key.includes('.')) {
+        ArkimeConfig.setOverride(key, value);
+      } else {
+        ArkimeConfig.setOverride('cont3xt.' + key, value);
+      }
+    } else if (argv[i] === '--help') {
+      console.log('cont3xt.js [<options>]');
+      console.log('');
+      console.log('Options:');
+      console.log('  -c, --config <file|url>     Where to fetch the config file from');
+      console.log('  -o <section>.<key>=<value>  Override the config file');
+      console.log('  --debug                     Increase debug level, multiple are supported');
+      console.log('  --insecure                  Disable certificate verification for https calls');
+
+      process.exit(0);
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Config - temporary
+// ----------------------------------------------------------------------------
+
+User.prototype.getCont3xtKeys = function () {
+  const v = this.cont3xt?.keys;
+
+  if (!v) {
+    return undefined;
+  }
+
+  try {
+    return Auth.auth2obj(v, Auth.passwordSecret256, Auth.STORED_AUTH_MAX);
+  } catch (err) {
+    console.log('ERROR - decrypting cont3xt keys for', this.userId, err.message);
+    return undefined;
+  }
+};
+
+User.prototype.setCont3xtKeys = function (v) {
+  if (!this.cont3xt) {
+    this.cont3xt = {};
+  }
+  this.cont3xt.keys = Auth.obj2auth(v, Auth.passwordSecret256);
+  return new Promise((resolve, reject) => {
+    this.save((err) => {
+      if (err) { return reject(err); }
+      resolve();
+    });
+  });
+};
+
+// ----------------------------------------------------------------------------
+// Initialize stuff
+// ----------------------------------------------------------------------------
+async function setupAuth () {
+  const dbUrl = ArkimeConfig.get('dbUrl');
+  const es = ArkimeConfig.getArray('elasticsearch', 'http://localhost:9200');
+  const usersUrl = ArkimeConfig.get('usersUrl');
+  const usersEs = ArkimeConfig.getArray('usersElasticsearch') ?? es;
+
+  await Db.initialize({
+    insecure: ArkimeConfig.isInsecure([dbUrl, es]),
+    url: dbUrl,
+    node: es,
+    caTrustFile: ArkimeConfig.get('caTrustFile'),
+    apiKey: ArkimeConfig.get('elasticsearchAPIKey'),
+    basicAuth: ArkimeConfig.get('elasticsearchBasicAuth')
+  });
+
+  await Auth.initialize({
+    appAdminRole: 'cont3xtAdmin',
+    passwordSecretSection: 'cont3xt',
+    basePath: internals.webBasePath,
+    hostVar: 'cont3xtHost'
+  });
+
+  User.initialize({
+    insecure: ArkimeConfig.isInsecure([usersUrl, usersEs]),
+    requestTimeout: ArkimeConfig.get('elasticsearchTimeout', 300),
+    url: usersUrl,
+    node: usersEs,
+    caTrustFile: ArkimeConfig.get('caTrustFile'),
+    clientKey: ArkimeConfig.get('esClientKey'),
+    clientCert: ArkimeConfig.get('esClientCert'),
+    clientKeyPass: ArkimeConfig.get('esClientKeyPass'),
+    prefix: ArkimeConfig.get('usersPrefix'),
+    apiKey: ArkimeConfig.get('usersElasticsearchAPIKey'),
+    basicAuth: ArkimeConfig.get('usersElasticsearchBasicAuth', ArkimeConfig.get('elasticsearchBasicAuth'))
+  });
+
+  Audit.initialize({
+    expireHistoryDays: ArkimeConfig.get('expireHistoryDays', 180)
+  });
+
+  Overview.initialize();
+
+  const cache = ArkimeCache.createCache({
+    name: 'cont3xt',
+    type: ArkimeConfig.getFull('cache', 'type', 'memory'),
+    cacheSize: ArkimeConfig.getFull('cache', 'cacheSize', '100000'),
+    cacheTimeout: ArkimeConfig.getFull('cache', 'cacheTimeout'),
+    getConfig: (key, value) => ArkimeConfig.getFull('cache', key, value)
+  });
+
+  Integration.initialize({
+    cache
+  });
+}
+
+async function main () {
+  ArkimeConfig.registerValidated({
+    elasticsearch: { type: 'urls' },
+    usersElasticsearch: { type: 'urls' }
+  });
+
+  try {
+    await ArkimeConfig.initialize({
+      defaultConfigFile: `${version.config_prefix}/etc/cont3xt.ini`,
+      defaultSections: 'cont3xt'
+    });
+
+    internals.webBasePath = ArkimeConfig.get('webBasePath', '/');
+  } catch (err) {
+    console.log(err);
+    process.exit();
+  }
+  await setupAuth();
+  setupHSTS();
+
+  const cont3xtHost = ArkimeConfig.get('cont3xtHost');
+
+  ArkimeUtil.createHttpServer(app, cont3xtHost, ArkimeConfig.get('port', 3218));
+}
+
+// A rejected async express handler would otherwise exit the process
+process.on('unhandledRejection', (reason, p) => {
+  console.trace('Unhandled Rejection at: Promise', p, 'reason:', reason);
+});
+
+// Startup failures still need to exit
+main().catch((err) => {
+  console.log('ERROR - starting cont3xt', err);
+  process.exit(1);
+});

@@ -1,0 +1,570 @@
+import Foundation
+import AppKit
+import CryptoKit
+
+// MARK: - JSON Output Helpers
+
+func jsonOutput(_ dict: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: dict),
+          let str = String(data: data, encoding: .utf8) else {
+        fputs("{\"error\":\"Failed to serialize output\"}\n", stderr)
+        _exit(1)
+    }
+    print(str)
+}
+
+func jsonError(_ message: String) -> Never {
+    jsonOutput(["error": message])
+    // Flush stdout since _exit() won't do it for us
+    fflush(stdout)
+    // Use _exit to skip framework cleanup — LocalAuthentication teardown can
+    // hang in the kernel (UE state) if the Secure Enclave is unresponsive.
+    _exit(1)
+}
+
+func jsonSuccess(_ result: [String: Any]) -> Never {
+    jsonOutput(["ok": true].merging(result) { _, new in new })
+    fflush(stdout)
+    _exit(0)
+}
+
+func keychainErrorResponse(_ error: Error) -> [String: Any] {
+    if let keychainError = error as? KeychainError {
+        return [
+            "error": keychainError.localizedDescription,
+            "errorCode": keychainError.code,
+        ]
+    }
+    return ["error": error.localizedDescription]
+}
+
+// MARK: - CLI Parsing
+
+let args = CommandLine.arguments
+let command = args.count > 1 ? args[1] : "help"
+
+func getArg(_ flag: String) -> String? {
+    guard let idx = args.firstIndex(of: flag), idx + 1 < args.count else { return nil }
+    return args[idx + 1]
+}
+
+let defaultKeyId = "varlock-default"
+let noAuth = args.contains("--no-auth") // CI mode: skip biometric requirement
+
+switch command {
+
+// MARK: - generate-key
+
+case "generate-key":
+    let keyId = getArg("--key-id") ?? defaultKeyId
+
+    do {
+        let pubKeyData = try SecureEnclaveManager.generateKey(keyId: keyId, requireAuth: !noAuth)
+        jsonSuccess([
+            "keyId": keyId,
+            "publicKey": pubKeyData.base64EncodedString(),
+            "publicKeyBytes": pubKeyData.count,
+        ])
+    } catch {
+        jsonError(error.localizedDescription)
+    }
+
+// MARK: - delete-key
+
+case "delete-key":
+    let keyId = getArg("--key-id") ?? defaultKeyId
+    let deleted = SecureEnclaveManager.deleteKey(keyId: keyId)
+    jsonSuccess(["keyId": keyId, "deleted": deleted])
+
+// MARK: - list-keys
+
+case "list-keys":
+    let keys = SecureEnclaveManager.listKeys()
+    jsonSuccess(["keys": keys])
+
+// MARK: - key-exists
+
+case "key-exists":
+    let keyId = getArg("--key-id") ?? defaultKeyId
+    let exists = SecureEnclaveManager.keyExists(keyId: keyId)
+    jsonSuccess(["keyId": keyId, "exists": exists])
+
+// MARK: - encrypt
+
+case "encrypt":
+    let keyId = getArg("--key-id") ?? defaultKeyId
+
+    let dataB64: String
+    if args.contains("--data-stdin") {
+        // read one line of base64 from stdin so plaintext never appears in argv
+        // (matches the rust binary's encrypt --data-stdin interface)
+        guard let line = readLine(strippingNewline: true)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
+            jsonError("Failed to read data from stdin")
+        }
+        dataB64 = line
+    } else if let dataArg = getArg("--data") {
+        dataB64 = dataArg
+    } else {
+        jsonError("Missing --data argument (base64-encoded plaintext)")
+    }
+    guard let plaintext = Data(base64Encoded: dataB64) else {
+        jsonError("Invalid base64 data")
+    }
+
+    do {
+        let encrypted = try SecureEnclaveManager.encrypt(plaintext: plaintext, keyId: keyId)
+        jsonSuccess(["ciphertext": encrypted.base64EncodedString()])
+    } catch {
+        jsonError(error.localizedDescription)
+    }
+
+// MARK: - decrypt (one-shot, for testing)
+
+case "decrypt":
+    let keyId = getArg("--key-id") ?? defaultKeyId
+
+    guard let dataB64 = getArg("--data") else {
+        jsonError("Missing --data argument (base64-encoded ciphertext)")
+    }
+    guard let ciphertext = Data(base64Encoded: dataB64) else {
+        jsonError("Invalid base64 data")
+    }
+
+    do {
+        let decrypted = try SecureEnclaveManager.decrypt(payload: ciphertext, keyId: keyId, context: nil)
+        guard let plaintext = String(data: decrypted, encoding: .utf8) else {
+            jsonError("Decrypted data is not valid UTF-8")
+        }
+        jsonSuccess(["plaintext": plaintext])
+    } catch {
+        jsonError(error.localizedDescription)
+    }
+
+// MARK: - status
+
+case "status":
+    let seAvailable: Bool
+    #if targetEnvironment(simulator)
+    seAvailable = false
+    #else
+    seAvailable = true // If this binary runs on real hardware, SE is available
+    #endif
+
+    jsonSuccess([
+        "secureEnclaveAvailable": seAvailable,
+        "backend": "secure-enclave",
+        "hardwareBacked": seAvailable,
+        "biometricAvailable": seAvailable,
+        "platform": "darwin",
+        "arch": {
+            #if arch(arm64)
+            return "arm64"
+            #elseif arch(x86_64)
+            return "x86_64"
+            #else
+            return "unknown"
+            #endif
+        }(),
+        "keys": SecureEnclaveManager.listKeys(),
+    ])
+
+// MARK: - daemon
+
+case "daemon":
+    guard let socketPath = getArg("--socket-path") else {
+        jsonError("Missing --socket-path argument")
+    }
+
+    let sessionManager = SessionManager()
+    let server = IPCServer(socketPath: socketPath)
+
+    // State files are written only once we hold the startup lock (see below).
+    // Writing them before then would let a daemon that loses the lock race
+    // clobber the winner's PID file with its own, about-to-be-dead PID.
+    let pidPath = getArg("--pid-path")
+
+    // argv[0] is exactly the path the client resolved and spawned.
+    let daemonBinaryPath = CommandLine.arguments[0]
+
+    // Content hash of our own executable, reported from `ping`. Clients compare
+    // it against the binary they would spawn and replace us only when the code
+    // actually differs. Release builds are cached by source hash, so varlock
+    // versions that didn't touch the daemon ship byte-identical binaries and
+    // switching between them never restarts it (or costs a biometric prompt).
+    let daemonBinaryHash: String? = {
+        guard let data = FileManager.default.contents(atPath: daemonBinaryPath) else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }()
+
+    // daemon.info is only read by varlock releases that predate the hash check.
+    // They compare the path and mtime recorded here against their own binary
+    // and restart the daemon on a mismatch, or when the file is missing.
+    let infoPath: String? = pidPath.map {
+        (($0 as NSString).deletingLastPathComponent as NSString).appendingPathComponent("daemon.info")
+    }
+    // Same formula as Node's `mtimeMs`, so an unchanged binary compares equal
+    let daemonBinaryMtimeMs: Double? = {
+        var st = stat()
+        guard stat(daemonBinaryPath, &st) == 0 else { return nil }
+        return Double(st.st_mtimespec.tv_sec) * 1e3 + Double(st.st_mtimespec.tv_nsec) / 1e6
+    }()
+
+    /// Write a state file atomically (temp file + rename) so a concurrently
+    /// starting client never reads a half-written file.
+    func writeStateFile(_ path: String, contents: String) {
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let tmpPath = path + ".tmp.\(ProcessInfo.processInfo.processIdentifier)"
+        guard (try? contents.write(toFile: tmpPath, atomically: false, encoding: .utf8)) != nil else { return }
+        if rename(tmpPath, path) != 0 {
+            unlink(tmpPath)
+        }
+    }
+
+    /// Remove a state file only if it still holds the value we wrote, so a
+    /// daemon shutting down after another has taken over doesn't delete the
+    /// new daemon's files.
+    func removeStateFileIfOwned(_ path: String, expected: String) {
+        guard let current = try? String(contentsOfFile: path, encoding: .utf8),
+              current.trimmingCharacters(in: .whitespacesAndNewlines) == expected else { return }
+        try? FileManager.default.removeItem(atPath: path)
+    }
+
+    // Status bar menu (must be created before run loop starts)
+    // NSApplication is needed for status bar items to work
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory) // no Dock icon
+
+    var statusBarMenu: StatusBarMenu?
+
+    // Handle daemon shutdown
+    func shutdownDaemon() {
+        statusBarMenu?.remove()
+        server.stop()
+        if let pidPath = pidPath {
+            removeStateFileIfOwned(pidPath, expected: "\(ProcessInfo.processInfo.processIdentifier)")
+        }
+        // Use _exit to skip framework cleanup — LocalAuthentication teardown
+        // can hang in the kernel (UE state) if Secure Enclave is unresponsive.
+        _exit(0)
+    }
+
+    sessionManager.onDaemonTimeout = {
+        shutdownDaemon()
+    }
+
+    server.onConnectionActivity = {
+        sessionManager.noteIpcActivity()
+    }
+
+    // Handle IPC messages (sessionId is resolved from the peer's TTY or process tree)
+    server.messageHandler = { message, sessionId in
+        guard let action = message["action"] as? String else {
+            return ["error": "Missing action"]
+        }
+
+        switch action {
+        case "decrypt":
+            guard let payload = message["payload"] as? [String: Any],
+                  let ciphertextB64 = payload["ciphertext"] as? String,
+                  let ciphertext = Data(base64Encoded: ciphertextB64) else {
+                return ["error": "Missing or invalid ciphertext in payload"]
+            }
+
+            let keyId = (payload["keyId"] as? String) ?? defaultKeyId
+
+            do {
+                let context = try sessionManager.getAuthenticatedContext(sessionId: sessionId)
+                let decrypted = try SecureEnclaveManager.decrypt(
+                    payload: ciphertext,
+                    keyId: keyId,
+                    context: context
+                )
+                guard let plaintext = String(data: decrypted, encoding: .utf8) else {
+                    return ["error": "Decrypted data is not valid UTF-8"]
+                }
+                statusBarMenu?.refresh()
+                return ["result": plaintext]
+            } catch {
+                return ["error": error.localizedDescription]
+            }
+
+        case "ping":
+            return [
+                "result": [
+                    "pong": true,
+                    "sessionWarm": sessionManager.isSessionWarm(sessionId: sessionId),
+                    "sessionId": sessionId as Any,
+                    "pid": ProcessInfo.processInfo.processIdentifier,
+                    "binaryHash": daemonBinaryHash as Any,
+                ],
+            ]
+
+        case "encrypt":
+            guard let payload = message["payload"] as? [String: Any],
+                  let plaintextStr = payload["plaintext"] as? String else {
+                return ["error": "Missing plaintext in payload"]
+            }
+
+            let encKeyId = (payload["keyId"] as? String) ?? defaultKeyId
+            guard let plaintextData = plaintextStr.data(using: .utf8) else {
+                return ["error": "Plaintext is not valid UTF-8"]
+            }
+
+            do {
+                let encrypted = try SecureEnclaveManager.encrypt(plaintext: plaintextData, keyId: encKeyId)
+                return ["result": encrypted.base64EncodedString()]
+            } catch {
+                return ["error": error.localizedDescription]
+            }
+
+        case "prompt-secret":
+            let promptPayload = message["payload"] as? [String: Any]
+            let itemKey = promptPayload?["itemKey"] as? String
+            let promptMessage = promptPayload?["message"] as? String
+                ?? "Enter the secret value to encrypt:"
+
+            guard let value = SecureInputDialog.prompt(
+                title: "Varlock — Enter Secret",
+                message: promptMessage,
+                itemKey: itemKey
+            ) else {
+                return ["error": "cancelled"]
+            }
+
+            // Encrypt the entered value immediately
+            let promptKeyId = (promptPayload?["keyId"] as? String) ?? defaultKeyId
+            guard let valueData = value.data(using: .utf8) else {
+                return ["error": "Value is not valid UTF-8"]
+            }
+
+            do {
+                let encrypted = try SecureEnclaveManager.encrypt(plaintext: valueData, keyId: promptKeyId)
+                return ["result": [
+                    "ciphertext": encrypted.base64EncodedString(),
+                ]]
+            } catch {
+                return ["error": error.localizedDescription]
+            }
+
+        case "invalidate-session":
+            sessionManager.invalidateAllSessions()
+            statusBarMenu?.refresh()
+            return ["result": "all sessions invalidated"]
+
+        // MARK: Keychain actions
+
+        case "keychain-get":
+            guard let payload = message["payload"] as? [String: Any] else {
+                return ["error": "Missing payload"]
+            }
+
+            let service = payload["service"] as? String
+            let account = payload["account"] as? String
+            let keychainName = payload["keychain"] as? String
+            let field = payload["field"] as? String
+
+            guard service != nil || account != nil else {
+                return ["error": "At least one of service or account is required"]
+            }
+
+            // Metadata fields (account, label, etc.) don't need biometric gating
+            // since they're not secret values
+            if let field = field {
+                do {
+                    let value = try KeychainManager.getItemField(
+                        service: service,
+                        account: account,
+                        keychainName: keychainName,
+                        field: field
+                    )
+                    return ["result": value]
+                } catch {
+                    return keychainErrorResponse(error)
+                }
+            }
+
+            // Password reads require biometric gate
+            do {
+                _ = try sessionManager.getAuthenticatedContext(sessionId: sessionId)
+            } catch {
+                return ["error": error.localizedDescription]
+            }
+
+            do {
+                let value = try KeychainManager.getItem(
+                    service: service,
+                    account: account,
+                    keychainName: keychainName
+                )
+                statusBarMenu?.refresh()
+                return ["result": value]
+            } catch {
+                return keychainErrorResponse(error)
+            }
+
+        case "keychain-search":
+            let payload = message["payload"] as? [String: Any]
+            let query = payload?["query"] as? String
+            let keychainName = payload?["keychain"] as? String
+
+            let items = KeychainManager.searchItems(query: query, keychainName: keychainName)
+            let itemDicts = items.map { $0.toDictionary() }
+            return ["result": itemDicts]
+
+        case "keychain-pick":
+            let pickPayload = message["payload"] as? [String: Any]
+            let pickItemKey = pickPayload?["itemKey"] as? String
+            guard let selected = KeychainPickerDialog.pick(itemKey: pickItemKey) else {
+                return ["error": "cancelled"]
+            }
+            return ["result": selected]
+
+        case "keychain-fix-access":
+            guard let payload = message["payload"] as? [String: Any] else {
+                return ["error": "Missing payload"]
+            }
+            guard let service = payload["service"] as? String else {
+                return ["error": "Missing service"]
+            }
+            let account = payload["account"] as? String
+            let keychainName = payload["keychain"] as? String
+            let appPath = Bundle.main.executablePath ?? ProcessInfo.processInfo.arguments[0]
+
+            do {
+                let modified = try KeychainManager.addToACL(
+                    service: service,
+                    account: account,
+                    keychainName: keychainName,
+                    appPath: appPath
+                )
+                return ["result": ["modified": modified]]
+            } catch {
+                return keychainErrorResponse(error)
+            }
+
+        case "keychain-set":
+            guard let payload = message["payload"] as? [String: Any] else {
+                return ["error": "Missing payload"]
+            }
+            guard let service = payload["service"] as? String else {
+                return ["error": "Missing service"]
+            }
+            guard let value = payload["value"] as? String else {
+                return ["error": "Missing value"]
+            }
+            let account = payload["account"] as? String ?? ""
+            let update = payload["update"] as? Bool ?? false
+
+            do {
+                let updated = try KeychainManager.setGenericPassword(
+                    service: service,
+                    account: account,
+                    value: value,
+                    update: update
+                )
+                return ["result": ["updated": updated]]
+            } catch {
+                return keychainErrorResponse(error)
+            }
+
+        default:
+            return ["error": "Unknown action: \(action)"]
+        }
+    }
+
+    // Start server
+    do {
+        try server.start()
+
+        // We hold the startup lock and own the socket, so it's now safe to claim
+        // the shared state files. A daemon that lost the race never gets here,
+        // so it can't overwrite these with a PID that is about to disappear.
+        if let pidPath = pidPath {
+            writeStateFile(pidPath, contents: "\(ProcessInfo.processInfo.processIdentifier)")
+        }
+        if let infoPath = infoPath {
+            var info: [String: Any] = ["binaryPath": daemonBinaryPath]
+            if let daemonBinaryMtimeMs { info["binaryMtimeMs"] = daemonBinaryMtimeMs }
+            if let infoData = try? JSONSerialization.data(withJSONObject: info),
+               let infoJson = String(data: infoData, encoding: .utf8) {
+                writeStateFile(infoPath, contents: infoJson)
+            }
+        }
+
+        // Print ready message to stdout so the JS launcher knows we're ready
+        jsonOutput(["ready": true, "pid": ProcessInfo.processInfo.processIdentifier, "socketPath": socketPath])
+        fflush(stdout)
+
+        // Set up status bar menu
+        statusBarMenu = StatusBarMenu(
+            sessionManager: sessionManager,
+            onLock: {
+                sessionManager.invalidateAllSessions()
+                statusBarMenu?.refresh()
+            },
+            onQuit: {
+                shutdownDaemon()
+            }
+        )
+
+        // We need a run loop for NSWorkspace notifications (sleep/lock detection)
+        // and for the status bar menu to work
+        signal(SIGTERM, SIG_IGN)
+        signal(SIGINT, SIG_IGN)
+
+        let sigTermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        sigTermSource.setEventHandler { shutdownDaemon() }
+        sigTermSource.resume()
+
+        let sigIntSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sigIntSource.setEventHandler { shutdownDaemon() }
+        sigIntSource.resume()
+
+        app.run()
+    } catch IPCError.lockHeld {
+        // Another daemon won the race (parallel spawn, e.g. turbo tasks, or an
+        // app launching many MCP servers at once). Emit a marker the JS launcher
+        // can recognize and exit cleanly. We never wrote any shared state file,
+        // so there is nothing to undo: the winner owns them all.
+        jsonOutput(["alreadyRunning": true])
+        fflush(stdout)
+        _exit(0)
+    } catch {
+        jsonError("Failed to start daemon: \(error.localizedDescription)")
+    }
+
+// MARK: - help
+
+case "help", "--help", "-h":
+    let help = """
+    varlock-enclave - Secure Enclave encryption daemon for Varlock
+
+    COMMANDS:
+      generate-key [--key-id <id>]    Create a new Secure Enclave key
+      delete-key [--key-id <id>]      Delete a Secure Enclave key
+      list-keys                       List all Varlock Secure Enclave keys
+      key-exists [--key-id <id>]      Check if a key exists
+      encrypt --data <base64> [--key-id <id>]   Encrypt data (one-shot)
+      encrypt --data-stdin [--key-id <id>]      Encrypt data read from stdin
+      decrypt --data <base64> [--key-id <id>]   Decrypt data (one-shot, testing)
+      status                          Check Secure Enclave availability
+      daemon --socket-path <path> [--pid-path <path>]   Start IPC daemon
+
+    OPTIONS:
+      --key-id <id>       Key identifier (default: varlock-default)
+      --data <base64>     Base64-encoded data
+      --data-stdin        Read base64 data from stdin (one line)
+      --socket-path <path>  Unix socket path for daemon mode
+      --pid-path <path>   PID file path for daemon mode
+
+    All output is JSON. Errors return {"error": "message"}.
+    """
+    print(help)
+    fflush(stdout)
+    _exit(0)
+
+default:
+    jsonError("Unknown command: \(command). Run with --help for usage.")
+}

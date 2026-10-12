@@ -1,0 +1,2281 @@
+use super::*;
+use crate::target_parser::parse_target;
+use axum::{Router, extract::Query, response::Html, routing::get};
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
+use tokio::time::{Duration, sleep};
+
+mod bucket_attribution;
+mod collapse_recall;
+mod request_efficiency;
+
+#[test]
+fn cap_dom_params_boundary() {
+    let mk = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>();
+    // Exactly at the cap: kept whole, no truncation reported.
+    let (kept, capped) = cap_dom_params(mk(MAX_DOM_MINING_PARAMS));
+    assert_eq!(kept.len(), MAX_DOM_MINING_PARAMS);
+    assert_eq!(capped, None);
+    // One over the cap: truncated to the cap, original count reported so the
+    // caller can warn. Guards against a future `>`→`>=` or dropped-truncate
+    // regression re-opening the ~10^6-task fan-out.
+    let (kept, capped) = cap_dom_params(mk(MAX_DOM_MINING_PARAMS + 1));
+    assert_eq!(kept.len(), MAX_DOM_MINING_PARAMS);
+    assert_eq!(capped, Some(MAX_DOM_MINING_PARAMS + 1));
+    // Well under the cap: untouched.
+    let (kept, capped) = cap_dom_params(mk(3));
+    assert_eq!(kept.len(), 3);
+    assert_eq!(capped, None);
+}
+
+fn default_scan_args() -> ScanArgs {
+    ScanArgs {
+        insecure: Some(true),
+        input_type: "url".to_string(),
+        format: "json".to_string(),
+        targets: vec!["http://127.0.0.1:1".to_string()],
+        timeout: 1,
+        silence: true,
+        workers: 1,
+        max_concurrent_targets: 1,
+        max_targets_per_host: 1,
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_mining_sample_stats_collapses_after_sustained_reflection() {
+    let mut stats = MiningSampleStats::new();
+    assert!(!stats.should_collapse());
+
+    for _ in 0..15 {
+        stats.record_attempt();
+        stats.record_reflection();
+    }
+
+    assert!(stats.reflections >= 5);
+    assert!(stats.attempts >= 15);
+    assert!(stats.ewma_ratio >= COLLAPSE_EWMA_THRESHOLD);
+    assert!(stats.should_collapse());
+}
+
+#[test]
+fn test_mining_sample_stats_non_reflection_keeps_low_ewma() {
+    let mut stats = MiningSampleStats::new();
+    for _ in 0..20 {
+        stats.record_attempt();
+        stats.record_non_reflection();
+    }
+    assert_eq!(stats.reflections, 0);
+    assert!(!stats.should_collapse());
+}
+
+#[test]
+fn test_detect_injection_context_without_marker_is_html() {
+    let ctx = detect_injection_context("<html><body>plain</body></html>");
+    assert_eq!(ctx, InjectionContext::Html(None));
+}
+
+#[test]
+fn test_detect_injection_context_comment_delimiter() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<!-- {} -->", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(ctx, InjectionContext::Html(Some(DelimiterType::Comment)));
+}
+
+/// Past the cap, the kept DOM candidates are the first ones in document order,
+/// the same on every run (a hash-ordered set kept a random subset).
+#[test]
+fn dom_candidate_names_are_document_ordered_under_the_cap() {
+    let n = MAX_DOM_MINING_PARAMS + 500;
+    let html: String = (0..n)
+        .map(|i| format!("<input id=i{i} name=n{i}>"))
+        .collect();
+    let names = dom_candidate_names(&html);
+    assert_eq!(names.len(), 2 * n);
+    let (kept, capped) = cap_dom_params(names);
+    assert_eq!(capped, Some(2 * n));
+    let expected: Vec<String> = (0..MAX_DOM_MINING_PARAMS / 2)
+        .flat_map(|i| [format!("i{i}"), format!("n{i}")])
+        .collect();
+    assert_eq!(kept, expected);
+}
+
+#[test]
+fn test_detect_injection_context_marker_in_later_comment() {
+    let marker = crate::scanning::markers::open_marker();
+    let comment = InjectionContext::Html(Some(DelimiterType::Comment));
+    // Marker in the second comment, after an earlier one has closed.
+    let body = format!("<!-- a --><p>hi</p><!-- debug {} -->", marker);
+    assert_eq!(detect_injection_context(&body), comment);
+    // Marker in plain text between two comments is not a comment context.
+    let body = format!("<!-- a -->{}<!-- b -->", marker);
+    assert_eq!(
+        detect_injection_context(&body),
+        InjectionContext::Html(None)
+    );
+}
+
+#[test]
+fn test_detect_injection_context_script_single_quote() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>var x='{}';</script>", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::Javascript(Some(DelimiterType::SingleQuote))
+    );
+}
+
+#[test]
+fn test_detect_injection_context_script_backtick_template_literal() {
+    // Reflection inside a JS template literal (backtick-quoted string)
+    // must report Backtick so the payload generator emits `${…}` breakouts
+    // instead of the `'`/`"` escapes that don't apply.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>var content = `{}`;</script>", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::Javascript(Some(DelimiterType::Backtick))
+    );
+}
+
+#[test]
+fn test_detect_injection_context_script_backtick_wins_over_earlier_quote() {
+    // When both an earlier `'`/`"` and a backtick precede the marker, the
+    // closer (innermost) one is the actual surrounding delimiter.
+    // Regression: a naive max-position scan that only considered `'`/`"`
+    // would mislabel this as DoubleQuote.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>var s = \"x\"; var t = `{}`;</script>", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::Javascript(Some(DelimiterType::Backtick))
+    );
+}
+
+/// A quote inside a template literal is template text: the enclosing
+/// delimiter is the backtick, so `${…}` is the breakout that gets sent. The
+/// closest-quote guess picked SingleQuote and the finding stayed R.
+#[test]
+fn test_detect_injection_context_quote_inside_template_literal() {
+    let marker = crate::scanning::markers::open_marker();
+    let handler = format!("<button onclick=\"foo(`a '{}' b`)\">x</button>", marker);
+    assert_eq!(
+        detect_injection_context(&handler),
+        InjectionContext::Javascript(Some(DelimiterType::Backtick))
+    );
+    let script = format!("<script>var s = `a \"{}\" b`;</script>", marker);
+    assert_eq!(
+        detect_injection_context(&script),
+        InjectionContext::Javascript(Some(DelimiterType::Backtick))
+    );
+}
+
+#[test]
+fn test_detect_injection_context_script_unquoted_with_document_quotes() {
+    // When marker is in an unquoted JS expression, but the surrounding HTML
+    // has quotes in other tags, it should still be detected as unquoted Javascript(None).
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!(
+        "<div class=\"header\"><script>var count = {};</script><div class=\"footer\"></div>",
+        marker
+    );
+    let ctx = detect_injection_context(&body);
+    assert_eq!(ctx, InjectionContext::Javascript(None));
+}
+
+#[test]
+fn test_detect_js_breakout_bare_double_quote_string() {
+    // Reflection inside a plain double-quoted JS string: the closer is just the
+    // quote that returns to statement position.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>var x = \"{}\";</script>", marker);
+    assert_eq!(detect_js_breakout(&body).as_deref(), Some("\""));
+}
+
+#[test]
+fn test_detect_js_breakout_nested_call_array_object() {
+    // The motivating case from issue #1073: a reflection nested inside an open
+    // string, array, object and call. The exact closer derived from the *real*
+    // observed prefix must close all of them: `"` then `]` `}` `)`.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>foo({{ bar: [ \"{}\" ] }});</script>", marker);
+    assert_eq!(detect_js_breakout(&body).as_deref(), Some("\"]})"));
+}
+
+#[test]
+fn test_detect_js_breakout_uses_observed_prefix_not_fixed_shell() {
+    // A nesting shape the fixed depth-0–3 catalog does NOT enumerate
+    // (array-of-array-of-object inside a call) — only an observed-prefix
+    // computation reaches it, proving the wiring is prefix-derived.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>g([[{{k:\"{}\"}}]]);</script>", marker);
+    // open: ( [ [ { "  -> close: " } ] ] )
+    assert_eq!(detect_js_breakout(&body).as_deref(), Some("\"}]])"));
+}
+
+#[test]
+fn test_detect_js_breakout_template_literal() {
+    // Inside a backtick template literal the closer is the backtick.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>tag(`hi {}`);</script>", marker);
+    assert_eq!(detect_js_breakout(&body).as_deref(), Some("`)"));
+}
+
+#[test]
+fn test_detect_js_breakout_none_outside_script() {
+    // A reflection in HTML text (not inside <script>) has no JS breakout — the
+    // script-tag requirement scopes the carrier to inline-script contexts.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<div>{}</div>", marker);
+    assert_eq!(detect_js_breakout(&body), None);
+}
+
+#[test]
+fn test_detect_js_breakout_none_at_statement_position() {
+    // Marker already at statement position (raw JS, no open string/structure):
+    // empty closer -> None, so synthesis falls back to the raw-JS catalog.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>var x = 1; {}</script>", marker);
+    assert_eq!(detect_js_breakout(&body), None);
+}
+
+#[test]
+fn test_detect_js_breakout_none_after_closing_script() {
+    // Marker sits AFTER a closed <script> (between scripts). The </script>
+    // guard rejects it rather than computing a bogus closer from the prior
+    // script body.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>var a = 1;</script><div>{}</div>", marker);
+    assert_eq!(detect_js_breakout(&body), None);
+}
+
+#[test]
+fn test_detect_js_breakout_with_marker_custom() {
+    // The explicit-marker variant used by the numeric-only discovery probe.
+    let body = "<script>h([\"4815162342\"]);</script>";
+    // prefix `h(["` opens ( [ and the string → close `"` `]` `)`.
+    assert_eq!(
+        detect_js_breakout_with_marker(body, "4815162342").as_deref(),
+        Some("\"])")
+    );
+}
+
+#[test]
+fn test_detect_js_breakout_picks_innermost_script_opener() {
+    // With an earlier closed <script> and a second open one containing the
+    // marker, `rfind("<script")` lands on the second opener, so the prefix is
+    // local to the script the marker actually lives in.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!(
+        "<script>var done = true;</script>\n<script>obj({{a:\"{}\"</script>",
+        marker
+    );
+    assert_eq!(detect_js_breakout(&body).as_deref(), Some("\"})"));
+}
+
+#[test]
+fn test_detect_injection_context_attribute_double_quote() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<img alt=\"{}\">", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::Attribute(Some(DelimiterType::DoubleQuote))
+    );
+}
+
+#[test]
+fn test_detect_injection_context_attribute_name_slot() {
+    // Reflection lands as a free attribute *name* inside an existing tag
+    // (e.g. `<div id='x' MARKER>`). The HTML5 parser treats MARKER as a
+    // boolean attribute, so the value-side scan finds nothing — but the
+    // position is exploitable via bare event-handler attributes
+    // (`onmouseover=alert(1)`). Classifying as Attribute(None) routes
+    // payload generation to the unquoted-attribute branch that emits
+    // them; previously this fell through to Html(None) and dalfox tried
+    // `<svg…>` tag payloads that just become more attribute names.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<div id='x' {}>more</div>", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(ctx, InjectionContext::Attribute(None));
+}
+
+#[test]
+fn test_detect_injection_context_url_attribute_double_quote() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<iframe src=\"{}\"></iframe>", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::AttributeUrl(Some(DelimiterType::DoubleQuote))
+    );
+}
+
+#[test]
+fn test_detect_injection_context_attribute_unquoted_with_document_quotes() {
+    // When marker is in an unquoted attribute value on a page with other quoted attributes,
+    // it should be detected as Attribute(None) instead of picking up outer quotes.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!(
+        "<div class=\"container\"><input type=\"text\" value={}><div class=\"footer\"></div>",
+        marker
+    );
+    let ctx = detect_injection_context(&body);
+    assert_eq!(ctx, InjectionContext::Attribute(None));
+}
+
+#[test]
+fn test_detect_injection_context_attribute_single_quote_with_document_quotes() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!(
+        "<div class=\"container\"><input type=\"text\" value='{}'><div class=\"footer\"></div>",
+        marker
+    );
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::Attribute(Some(DelimiterType::SingleQuote))
+    );
+}
+
+#[test]
+fn test_detect_injection_context_onload_attribute_is_javascript() {
+    // Event-handler attributes (`on*`) hold JavaScript source, not
+    // HTML — escaping `'` / `"` produces JS-breakout payloads. Regression
+    // for xss-game level 4: marker lives inside
+    // `<img onload="startTimer('MARKER');">` and was previously
+    // bucketed as `Attribute(SingleQuote)`, so the scanner sent HTML
+    // tag breakouts that the browser serialised back into the JS
+    // string instead of executing.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<img onload=\"startTimer('{}');\">", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::Javascript(Some(DelimiterType::SingleQuote))
+    );
+}
+
+#[test]
+fn test_detect_injection_context_onerror_double_quote_is_javascript() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<img src=x onerror='alert(\"{}\")'>", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::Javascript(Some(DelimiterType::DoubleQuote))
+    );
+}
+
+#[test]
+fn test_detect_injection_context_non_on_attribute_stays_attribute() {
+    // Confirm we didn't accidentally promote regular attribute echoes.
+    // `on` prefix alone isn't enough — needs a full handler name.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<input value=\"{}\" name=\"ones\">", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(
+        ctx,
+        InjectionContext::Attribute(Some(DelimiterType::DoubleQuote))
+    );
+}
+
+// --- Framework innerHTML sink detection ---
+
+#[test]
+fn test_framework_html_sink_recognises_vue_v_html() {
+    let marker = crate::scanning::markers::bracketed_marker();
+    let body = format!("<div v-html=\"{}\"></div>", marker);
+    assert_eq!(detect_framework_html_sink(&body, marker), Some("v-html"));
+}
+
+#[test]
+fn test_framework_html_sink_rejects_quoted_html_substring_in_data_bind() {
+    // `data-bind="text: 'html: link'"` shares the `html:` substring
+    // with a real innerHTML sink clause but lives inside a quoted
+    // string — Knockout binds `text:` here, not `html:`. The
+    // boundary-aware parser must skip the false positive.
+    let marker = crate::scanning::markers::bracketed_marker();
+    let body = format!("<div data-bind=\"text: 'html: {} link'\"></div>", marker);
+    assert_eq!(detect_framework_html_sink(&body, marker), None);
+}
+
+#[test]
+fn test_framework_html_sink_recognises_data_bind_html_after_comma() {
+    // Multi-clause `data-bind` where `html:` is the second binding.
+    // The clause boundary detector must accept `,` and whitespace
+    // before `html:`, not just position 0.
+    let marker = crate::scanning::markers::bracketed_marker();
+    let body = format!("<div data-bind=\"text: name, html: '{}'\"></div>", marker);
+    assert_eq!(detect_framework_html_sink(&body, marker), Some("data-bind"));
+}
+
+#[test]
+fn test_framework_html_sink_recognises_knockout_html_clause() {
+    // Knockout `data-bind` accepts multiple clauses. Only the `html:`
+    // clause maps to innerHTML — pure `text:` bindings escape input
+    // and should not be tagged as a sink.
+    let marker = crate::scanning::markers::bracketed_marker();
+    let html_bind = format!("<div data-bind=\"html: '{}'\"></div>", marker);
+    assert_eq!(
+        detect_framework_html_sink(&html_bind, marker),
+        Some("data-bind")
+    );
+
+    let text_bind = format!("<div data-bind=\"text: '{}'\"></div>", marker);
+    assert_eq!(detect_framework_html_sink(&text_bind, marker), None);
+}
+
+#[test]
+fn test_framework_html_sink_recognises_angular_ng_bind_html() {
+    let marker = crate::scanning::markers::bracketed_marker();
+    let body = format!("<div ng-bind-html=\"{}\"></div>", marker);
+    assert_eq!(
+        detect_framework_html_sink(&body, marker),
+        Some("ng-bind-html")
+    );
+}
+
+#[test]
+fn test_framework_html_sink_recognises_angular_property_binding() {
+    // Angular 2+ uses `[innerHTML]` for property binding to innerHTML.
+    let marker = crate::scanning::markers::bracketed_marker();
+    let body = format!("<div [innerHTML]=\"{}\"></div>", marker);
+    assert_eq!(
+        detect_framework_html_sink(&body, marker),
+        Some("ng-bind-html")
+    );
+}
+
+#[test]
+fn test_framework_html_sink_ignores_plain_text_reflection() {
+    let marker = crate::scanning::markers::bracketed_marker();
+    let body = format!("<div>Hello {}</div>", marker);
+    assert_eq!(detect_framework_html_sink(&body, marker), None);
+}
+
+#[test]
+fn test_framework_html_sink_ignores_non_sink_attribute() {
+    let marker = crate::scanning::markers::bracketed_marker();
+    let body = format!("<input value=\"{}\">", marker);
+    assert_eq!(detect_framework_html_sink(&body, marker), None);
+}
+
+#[test]
+fn test_framework_html_sink_returns_none_for_missing_marker() {
+    let marker = crate::scanning::markers::bracketed_marker();
+    assert_eq!(
+        detect_framework_html_sink("<html><body>no marker</body></html>", marker),
+        None
+    );
+}
+
+#[test]
+fn test_framework_html_sink_rejects_mixed_attribute_sinks() {
+    // Marker shows up in BOTH `v-html` AND `ng-bind-html`. The
+    // exploitation path is ambiguous, so we conservatively return
+    // None and fall back to the generic attribute label.
+    let marker = crate::scanning::markers::bracketed_marker();
+    let body = format!(
+        "<div v-html=\"{}\"></div><div ng-bind-html=\"{}\"></div>",
+        marker, marker
+    );
+    assert_eq!(detect_framework_html_sink(&body, marker), None);
+}
+
+#[tokio::test]
+async fn test_probe_dictionary_params_returns_when_wordlist_file_missing() {
+    let target = parse_target("http://127.0.0.1:1").expect("parse target");
+    let mut args = default_scan_args();
+    args.mining_dict_word = Some("/definitely/not/found/dalfox-wordlist.txt".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    probe_dictionary_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    assert!(reflection_params.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_probe_body_params_without_data_is_noop() {
+    let target = parse_target("http://127.0.0.1:1").expect("parse target");
+    let args = default_scan_args();
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+
+    probe_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+    assert!(reflection_params.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_probe_json_body_params_returns_for_invalid_or_non_object_data() {
+    let target = parse_target("http://127.0.0.1:1").expect("parse target");
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+
+    let mut invalid_json_args = default_scan_args();
+    invalid_json_args.data = Some("{not-json".to_string());
+    probe_json_body_params(
+        &target,
+        &invalid_json_args,
+        reflection_params.clone(),
+        semaphore.clone(),
+        None,
+    )
+    .await;
+    assert!(reflection_params.lock().await.is_empty());
+
+    let mut non_object_json_args = default_scan_args();
+    non_object_json_args.data = Some("[1,2,3]".to_string());
+    probe_json_body_params(
+        &target,
+        &non_object_json_args,
+        reflection_params.clone(),
+        semaphore,
+        None,
+    )
+    .await;
+    assert!(reflection_params.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_mine_parameters_skip_mining_leaves_params_untouched() {
+    let mut target = parse_target("http://127.0.0.1:1").expect("parse target");
+    let mut args = default_scan_args();
+    args.skip_mining = true;
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    mine_parameters(
+        &mut target,
+        &args,
+        reflection_params.clone(),
+        semaphore,
+        None,
+    )
+    .await;
+
+    assert!(reflection_params.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_mine_parameters_dom_only_on_unreachable_target_does_not_panic() {
+    let mut target = parse_target("http://127.0.0.1:1").expect("parse target");
+    let mut args = default_scan_args();
+    args.skip_mining = false;
+    args.skip_mining_dict = true;
+    args.skip_mining_dom = false;
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    mine_parameters(
+        &mut target,
+        &args,
+        reflection_params.clone(),
+        semaphore,
+        None,
+    )
+    .await;
+
+    assert!(reflection_params.lock().await.is_empty());
+}
+
+async fn dom_mining_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let marker = params.get("search").cloned().unwrap_or_default();
+    Html(format!(
+        "<form><input id=\"search\" name=\"search\" value=\"seed\"></form><div>{}</div>",
+        marker
+    ))
+}
+
+async fn start_dom_mining_server() -> SocketAddr {
+    let app = Router::new().route("/dom-mining", get(dom_mining_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+#[tokio::test]
+async fn test_probe_response_id_params_discovers_reflected_input_name() {
+    let addr = start_dom_mining_server().await;
+    let target = parse_target(&format!("http://{}:{}/dom-mining", addr.ip(), addr.port()))
+        .expect("parse target");
+    let args = default_scan_args();
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+
+    probe_response_id_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(params.iter().any(|p| {
+        p.name == "search"
+            && p.location == Location::Query
+            && p.value == crate::scanning::markers::bracketed_marker()
+    }));
+}
+
+// --- Context detection: CSS / HTML text / inner-marker / empty marker ---
+
+#[test]
+fn test_detect_injection_context_css_style_block() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!(
+        "<html><head><style>.x{{ color: \"{}\"; }}</style></head></html>",
+        marker
+    );
+    let ctx = detect_injection_context(&body);
+    assert!(
+        matches!(ctx, InjectionContext::Css(_)),
+        "expected Css context, got {:?}",
+        ctx
+    );
+}
+
+#[test]
+fn test_detect_injection_context_plain_html_text_node() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<html><body><div>{}</div></body></html>", marker);
+    let ctx = detect_injection_context(&body);
+    assert_eq!(ctx, InjectionContext::Html(None));
+}
+
+#[test]
+fn test_detect_injection_context_uses_inner_marker_branch() {
+    // bracketed_marker() embeds inner_marker(), exercising the
+    // inner-marker fast path in detect_injection_context.
+    let body = format!(
+        "<html><body><p>{}</p></body></html>",
+        crate::scanning::markers::bracketed_marker()
+    );
+    let ctx = detect_injection_context(&body);
+    assert_eq!(ctx, InjectionContext::Html(None));
+}
+
+#[test]
+fn test_detect_injection_context_with_marker_returns_html_when_marker_missing() {
+    let ctx = detect_injection_context_with_marker("<html></html>", "ZZ_NOT_PRESENT_ZZ");
+    assert_eq!(ctx, InjectionContext::Html(None));
+}
+
+#[test]
+fn test_framework_html_sink_returns_none_for_empty_marker() {
+    assert_eq!(
+        detect_framework_html_sink("<div v-html=\"x\"></div>", ""),
+        None
+    );
+}
+
+// --- Pure-helper coverage: make_any_param / collapse_mined_params ---
+
+#[test]
+fn test_make_any_param_fills_classification_and_context() {
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<div>{} '\"<>(){{}}</div>", marker);
+    let p = make_any_param(Location::Query, Some(&body), None);
+    assert_eq!(p.name, "any");
+    assert_eq!(p.location, Location::Query);
+    assert_eq!(p.value, crate::scanning::markers::bracketed_marker());
+    // Marker lives in a plain text node here, so context is generic HTML.
+    assert_eq!(p.injection_context, Some(InjectionContext::Html(None)));
+    let valid = p.valid_specials.expect("valid specials populated");
+    let invalid = p.invalid_specials.expect("invalid specials populated");
+    // Specials seen in body should be in `valid`; absent ones in `invalid`.
+    assert!(valid.contains(&'<'));
+    assert!(valid.contains(&'>'));
+    assert!(invalid.contains(&'\\'));
+}
+
+/// With no response body to classify, `any` inherits the measurements of a
+/// param the *stage itself mined* — an actual observation of how an arbitrary
+/// name behaves at this location. It must never inherit them from a param the
+/// target really carries, or a finding ends up reporting one parameter's
+/// evidence under another parameter's name.
+#[test]
+fn test_make_any_param_inherits_mined_sample_metadata() {
+    let mined = Param {
+        injection_context: Some(InjectionContext::Html(None)),
+        valid_specials: Some(vec!['<', '>']),
+        invalid_specials: Some(vec!['"']),
+        ..Param::new("mined_word", "MINEDVALUE", Location::Query)
+    };
+    let p = make_any_param(Location::Query, None, Some(&mined));
+    assert_eq!(p.name, "any");
+    assert_eq!(p.value, "MINEDVALUE");
+    assert_eq!(p.valid_specials, Some(vec!['<', '>']));
+    assert_eq!(p.invalid_specials, Some(vec!['"']));
+
+    // No sample at all still yields a usable param: payload selection needs an
+    // injection context, so the generic HTML default stands in.
+    let bare = make_any_param(Location::Body, None, None);
+    assert_eq!(bare.location, Location::Body);
+    assert_eq!(bare.injection_context, Some(InjectionContext::Html(None)));
+}
+
+fn bare_param(name: &str, location: Location) -> Param {
+    Param::new(name, format!("{name}_value"), location)
+}
+
+fn names_at(params: &[Param], location: Location) -> Vec<&str> {
+    params
+        .iter()
+        .filter(|p| p.location == location)
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
+/// Collapse folds away only what the *current mining stage* discovered.
+///
+/// Regression guard for the `any` false positive: on a page that echoes its
+/// whole query string, collapse used to clear every Query param — including the
+/// ones Stage 1 discovery had already confirmed reflect. The genuinely
+/// vulnerable parameter was deleted before Stage 3 saw it, so the scan reported
+/// a POC against `any` (a parameter the app does not have) and reported zero
+/// findings for the real one.
+#[tokio::test]
+async fn test_collapse_mined_params_keeps_discovered_params_and_folds_only_mined() {
+    let params = Arc::new(Mutex::new(vec![
+        bare_param("q_real", Location::Query),
+        bare_param("h", Location::Header),
+    ]));
+    // Snapshot is taken before the stage mines anything, exactly as the
+    // probe_* functions do.
+    let preexisting = snapshot_param_slots(&params).await;
+    params
+        .lock()
+        .await
+        .extend([bare_param("mined_a", Location::Query), {
+            let mut p = bare_param("mined_b", Location::Query);
+            p.valid_specials = Some(vec!['<']);
+            p
+        }]);
+
+    collapse_mined_params(&params, &preexisting, Location::Query, None).await;
+
+    let guard = params.lock().await;
+    assert_eq!(
+        names_at(&guard, Location::Query),
+        vec!["q_real", "any"],
+        "the discovered Query param must survive and `any` is appended, not substituted"
+    );
+    assert_eq!(
+        names_at(&guard, Location::Header),
+        vec!["h"],
+        "params at other locations are untouched"
+    );
+    // `any` samples a mined param, never the target's own parameter.
+    let any_q = guard
+        .iter()
+        .find(|p| p.name == "any")
+        .expect("any query param present");
+    assert_eq!(any_q.value, "mined_a_value");
+}
+
+/// Two stages can collapse the same location (dictionary mining, then DOM
+/// mining). The second must replace the first `any` rather than stack a
+/// duplicate injection point on top of it.
+#[tokio::test]
+async fn test_collapse_mined_params_replaces_a_previous_any_instead_of_duplicating() {
+    let params = Arc::new(Mutex::new(vec![bare_param("q_real", Location::Query)]));
+    let first_stage = snapshot_param_slots(&params).await;
+    collapse_mined_params(&params, &first_stage, Location::Query, None).await;
+
+    // Second stage snapshots *after* the first collapse, so `any` is in its
+    // preexisting set — the dedupe has to be explicit.
+    let second_stage = snapshot_param_slots(&params).await;
+    collapse_mined_params(&params, &second_stage, Location::Query, None).await;
+
+    let guard = params.lock().await;
+    assert_eq!(names_at(&guard, Location::Query), vec!["q_real", "any"]);
+}
+
+/// A target may genuinely carry a parameter called `any`. It is a discovered
+/// param like any other, so collapse must keep it — and must not stack the
+/// synthetic stand-in on top of it.
+#[tokio::test]
+async fn test_collapse_mined_params_preserves_a_real_param_named_any() {
+    let params = Arc::new(Mutex::new(vec![{
+        let mut p = bare_param("any", Location::Query);
+        p.valid_specials = Some(vec!['<', '>']);
+        p
+    }]));
+    let preexisting = snapshot_param_slots(&params).await;
+    params
+        .lock()
+        .await
+        .push(bare_param("mined_word", Location::Query));
+
+    collapse_mined_params(&params, &preexisting, Location::Query, None).await;
+
+    let guard = params.lock().await;
+    assert_eq!(names_at(&guard, Location::Query), vec!["any"]);
+    let real = &guard[0];
+    assert_eq!(
+        real.value, "any_value",
+        "the target's own `any` keeps its discovered value"
+    );
+    assert_eq!(
+        real.valid_specials,
+        Some(vec!['<', '>']),
+        "and its measured specials — the synthetic must not overwrite them"
+    );
+}
+
+/// The same guard for a non-Query location: a Body collapse must not wipe the
+/// body fields the user supplied via `-d`.
+#[tokio::test]
+async fn test_collapse_mined_params_scopes_to_one_location() {
+    let params = Arc::new(Mutex::new(vec![
+        bare_param("username", Location::Body),
+        bare_param("q_real", Location::Query),
+    ]));
+    let preexisting = snapshot_param_slots(&params).await;
+    params
+        .lock()
+        .await
+        .push(bare_param("mined_body", Location::Body));
+
+    collapse_mined_params(&params, &preexisting, Location::Body, None).await;
+
+    let guard = params.lock().await;
+    assert_eq!(names_at(&guard, Location::Body), vec!["username", "any"]);
+    assert_eq!(
+        names_at(&guard, Location::Query),
+        vec!["q_real"],
+        "a Body collapse must not add or remove Query params"
+    );
+}
+
+// --- Server-driven coverage for probe_* functions ---
+
+/// RAII guard that writes a wordlist to a unique temp path and removes
+/// it on drop — so panicking assertions don't leak files into temp_dir.
+struct TempWordlist {
+    path: std::path::PathBuf,
+}
+
+impl TempWordlist {
+    fn new(tag: &str, contents: &str) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "dalfox-test-{}-{}-{}.txt",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::write(&path, contents).expect("write wordlist");
+        Self { path }
+    }
+    fn as_str(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempWordlist {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn reflect_all_query_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let mut body = String::from("<html><body>");
+    for v in params.values() {
+        body.push_str(&format!("<div>{}</div>", v));
+    }
+    body.push_str("</body></html>");
+    Html(body)
+}
+
+async fn start_reflect_all_server() -> SocketAddr {
+    let app = Router::new().route("/r", get(reflect_all_query_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+#[tokio::test]
+async fn test_probe_dictionary_params_discovers_with_custom_wordlist() {
+    let addr = start_reflect_all_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/r", addr.ip(), addr.port())).expect("parse target");
+
+    // Small wordlist (<= SENTINEL_PROBE_COUNT*5) → sentinel pre-probe is skipped.
+    let wordlist = TempWordlist::new("wordlist", "foo\nbar\nbaz\n");
+
+    let mut args = default_scan_args();
+    args.mining_dict_word = Some(wordlist.as_str());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_dictionary_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.name == "foo" && p.location == Location::Query),
+        "expected 'foo' to be discovered, got {:?}",
+        params.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn custom_wordlist_strips_a_leading_utf8_bom() {
+    async fn reflect_secret(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+        Html(format!(
+            "<html><body>{}</body></html>",
+            params.get("secret").map(String::as_str).unwrap_or("")
+        ))
+    }
+
+    let app = Router::new().route("/r", get(reflect_secret));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    let target = parse_target(&format!("http://{addr}/r")).expect("target parses");
+    let wordlist = TempWordlist::new("bom-wordlist", "\u{feff}secret\n");
+    let mut args = default_scan_args();
+    args.mining_dict_word = Some(wordlist.as_str());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    probe_dictionary_params(
+        &target,
+        &args,
+        reflection_params.clone(),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+    )
+    .await;
+
+    let params = reflection_params.lock().await;
+    assert!(
+        params
+            .iter()
+            .any(|param| param.name == "secret" && param.location == Location::Query),
+        "a BOM-prefixed custom wordlist must still probe its first name, got {:?}",
+        params.iter().map(|param| &param.name).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_probe_dictionary_params_sentinel_pre_probe_collapses() {
+    let addr = start_reflect_all_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/r", addr.ip(), addr.port())).expect("parse target");
+
+    // Wordlist length > SENTINEL_PROBE_COUNT*5 triggers sentinel pre-probe.
+    // The server reflects every query param, so every sentinel reflects and
+    // pre_collapse_query_probe returns Some(..) → mining short-circuits to `any`.
+    let mut words = String::new();
+    for i in 0..50 {
+        words.push_str(&format!("p_{}\n", i));
+    }
+    let wordlist = TempWordlist::new("collapse-wordlist", &words);
+
+    let mut args = default_scan_args();
+    args.mining_dict_word = Some(wordlist.as_str());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_dictionary_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    // After sentinel collapse with an empty starting set we expect exactly
+    // one synthetic 'any' Query param — nothing from the wordlist iteration.
+    assert_eq!(
+        params.len(),
+        1,
+        "expected exactly one param after collapse, got {:?}",
+        params
+    );
+    let only = &params[0];
+    assert_eq!(only.name, "any");
+    assert_eq!(only.location, Location::Query);
+}
+
+async fn reflect_body_handler(body: axum::body::Bytes) -> Html<String> {
+    let s = String::from_utf8_lossy(&body).into_owned();
+    let pairs: Vec<(String, String)> = form_urlencoded::parse(s.as_bytes())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let mut body = String::from("<html><body>");
+    for (_, v) in pairs {
+        body.push_str(&format!("<div>{}</div>", v));
+    }
+    body.push_str("</body></html>");
+    Html(body)
+}
+
+async fn start_body_reflect_server() -> SocketAddr {
+    let app = Router::new().route("/b", axum::routing::post(reflect_body_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+#[tokio::test]
+async fn test_probe_body_params_discovers_reflected_form_field() {
+    let addr = start_body_reflect_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/b", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some("user=alice&token=t".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.location == Location::Body && (p.name == "user" || p.name == "token")),
+        "expected a body param discovered, got {:?}",
+        params.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+}
+
+async fn reflect_last_form_q(body: axum::body::Bytes) -> Html<String> {
+    let pairs: Vec<(String, String)> = form_urlencoded::parse(&body)
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    let last = pairs
+        .iter()
+        .filter(|(name, _)| name == "q")
+        .map(|(_, value)| value.as_str())
+        .next_back()
+        .unwrap_or("");
+    Html(format!("<html><body>{last}</body></html>"))
+}
+
+#[tokio::test]
+async fn body_discovery_payload_reaches_last_duplicate_form_value() {
+    // Discovery substitutes every duplicate form key. The actual scan sender
+    // must do the same for applications that read the last occurrence.
+    let app = Router::new().route("/b", axum::routing::post(reflect_last_form_q));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let mut target = parse_target(&format!("http://{addr}/b")).expect("target parses");
+    target.data = Some("q=first&q=last".to_string());
+    let mut args = default_scan_args();
+    args.data = target.data.clone();
+
+    let client = target.build_client_or_default();
+    let control = client
+        .post(target.url.clone())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("q=first&q=control")
+        .send()
+        .await
+        .expect("control request should reach the test server");
+    assert_eq!(
+        control.text().await.expect("read control response"),
+        "<html><body>control</body></html>"
+    );
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    probe_body_params(
+        &target,
+        &args,
+        reflection_params.clone(),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+    )
+    .await;
+    let param = reflection_params
+        .lock()
+        .await
+        .iter()
+        .find(|param| param.name == "q" && param.location == Location::Body)
+        .expect("body discovery should find q using its all-duplicate probe")
+        .clone();
+
+    let target = Arc::new(target);
+    let client = target.build_client_or_default();
+    let response =
+        crate::scanning::url_inject::build_inject_request(&client, &target, &param, "PAY")
+            .send()
+            .await
+            .expect("scan injection request should reach the mock server");
+    let reflected = response.text().await.expect("read response");
+    assert_eq!(
+        reflected, "<html><body>PAY</body></html>",
+        "the last-value body parameter must receive the scan payload"
+    );
+}
+
+#[tokio::test]
+async fn imported_raw_http_and_har_bodies_are_mined_without_cli_data() {
+    // Request imports store their captured body on Target, not ScanArgs.data.
+    // The analysis stage must pass that body into the body miners or both
+    // import paths silently scan a POST without ever testing its fields.
+    let addr = start_body_reflect_server().await;
+    let url = format!("http://{}:{}/b", addr.ip(), addr.port());
+    let raw = format!(
+        "POST {url} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nuser=alice&token=t",
+        addr.ip(),
+        addr.port()
+    );
+    let raw_target =
+        crate::target_parser::parse_raw_http_request(&raw).expect("raw request parses");
+
+    let har = format!(
+        r#"{{"log":{{"entries":[{{"request":{{"method":"POST","url":"{url}","headers":[{{"name":"Content-Type","value":"application/x-www-form-urlencoded"}}],"postData":{{"mimeType":"application/x-www-form-urlencoded","text":"user=alice&token=t"}}}}}}]}}}}"#
+    );
+    let har_target = crate::target_parser::parse_har(&har)
+        .expect("HAR parses")
+        .into_iter()
+        .next()
+        .expect("HAR has one request");
+
+    for mut target in [raw_target, har_target] {
+        let mut args = default_scan_args();
+        args.skip_discovery = true;
+        args.skip_mining = true;
+        assert!(args.data.is_none(), "test must not pass a CLI body");
+
+        crate::parameter_analysis::analyze_parameters(&mut target, &args, None).await;
+
+        assert!(
+            target
+                .reflection_params
+                .iter()
+                .any(|param| param.location == Location::Body && param.name == "user"),
+            "imported {} body field was never tested: {:?}",
+            target.method,
+            target
+                .reflection_params
+                .iter()
+                .map(|param| (&param.name, &param.location))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+async fn reflect_json_handler(body: axum::body::Bytes) -> Html<String> {
+    let s = String::from_utf8_lossy(&body).into_owned();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&s).unwrap_or(serde_json::Value::Object(Default::default()));
+    let mut body = String::from("<html><body>");
+    if let Some(obj) = parsed.as_object() {
+        for (_, v) in obj {
+            if let Some(s) = v.as_str() {
+                body.push_str(&format!("<div>{}</div>", s));
+            }
+        }
+    }
+    body.push_str("</body></html>");
+    Html(body)
+}
+
+async fn start_json_reflect_server() -> SocketAddr {
+    let app = Router::new().route("/j", axum::routing::post(reflect_json_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+#[tokio::test]
+async fn test_probe_json_body_params_discovers_reflected_top_level_key() {
+    let addr = start_json_reflect_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/j", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some(r#"{"name":"a","tag":"b"}"#.to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_json_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.location == Location::JsonBody && (p.name == "name" || p.name == "tag")),
+        "expected a JSON-body param discovered, got {:?}",
+        params.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+}
+
+/// The user's own `-d` keys are never folded into a synthetic `any`, however
+/// many of them an echoing page reflects (the EWMA fires at 15 attempts).
+#[tokio::test]
+async fn test_probe_body_params_keeps_every_echoing_d_key() {
+    let addr = start_body_reflect_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/b", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some(
+        (0..20)
+            .map(|i| format!("f{i}=v{i}"))
+            .collect::<Vec<_>>()
+            .join("&"),
+    );
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let names: Vec<String> = reflection_params
+        .lock()
+        .await
+        .iter()
+        .filter(|p| p.location == Location::Body)
+        .map(|p| p.name.clone())
+        .collect();
+    assert_eq!(
+        names.len(),
+        20,
+        "all 20 -d keys must survive, got {names:?}"
+    );
+    assert!(!names.iter().any(|n| n == "any"), "got {names:?}");
+}
+
+#[tokio::test]
+async fn test_probe_json_body_params_keeps_every_echoing_d_key() {
+    let addr = start_json_reflect_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/j", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    let obj: serde_json::Map<String, serde_json::Value> = (0..20)
+        .map(|i| (format!("f{i}"), serde_json::Value::String(format!("v{i}"))))
+        .collect();
+    args.data = Some(serde_json::Value::Object(obj).to_string());
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_json_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let names: Vec<String> = reflection_params
+        .lock()
+        .await
+        .iter()
+        .filter(|p| p.location == Location::JsonBody)
+        .map(|p| p.name.clone())
+        .collect();
+    assert_eq!(
+        names.len(),
+        20,
+        "all 20 -d keys must survive, got {names:?}"
+    );
+    assert!(!names.iter().any(|n| n == "any"), "got {names:?}");
+}
+
+/// A JSON / XML / GraphQL `-d` body is not form data: form-parsing it keys one
+/// pair on the whole body text, which a body-echoing endpoint reflects.
+#[tokio::test]
+async fn test_probe_body_params_skips_non_form_bodies() {
+    let addr = start_raw_body_reflect_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/r", addr.ip(), addr.port())).expect("parse target");
+    for data in [
+        r#"{"a":"b"}"#,
+        r#"[{"a":"b"}]"#,
+        r#"<?xml version="1.0"?><a>b</a>"#,
+        r#"{"query":"query($x:String){f(x:$x)}","variables":{"x":"1"}}"#,
+    ] {
+        let mut args = default_scan_args();
+        args.data = Some(data.to_string());
+        let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        probe_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+        let params = reflection_params.lock().await.clone();
+        assert!(
+            params.is_empty(),
+            "{data}: no Body param for a non-form body, got {params:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_mine_parameters_runs_dom_against_reflecting_server() {
+    let addr = start_dom_mining_server().await;
+    let mut target = parse_target(&format!("http://{}:{}/dom-mining", addr.ip(), addr.port()))
+        .expect("parse target");
+    let mut args = default_scan_args();
+    // Skip dictionary mining (uses default GF list — slow + irrelevant here),
+    // exercise the DOM mining branch of `mine_parameters` end-to-end.
+    args.skip_mining = false;
+    args.skip_mining_dict = true;
+    args.skip_mining_dom = false;
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    mine_parameters(
+        &mut target,
+        &args,
+        reflection_params.clone(),
+        semaphore,
+        None,
+    )
+    .await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params.iter().any(|p| p.name == "search"),
+        "expected DOM mining to discover 'search', got {:?}",
+        params.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_mine_parameters_seeds_explicit_body_params_under_skip_mining() {
+    // Regression: `--skip-mining` switches off *discovery* of parameters the
+    // user did not name, but body params supplied via `-d` are explicit input.
+    // They have no entry point other than the body probes, so skipping them
+    // dropped the entire POST/JSON body surface — even with `-p name:body`.
+    let addr = start_body_reflect_server().await;
+    let mut target =
+        parse_target(&format!("http://{}:{}/b", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.skip_mining = true;
+    args.method = "POST".to_string();
+    args.data = Some("user=alice&token=t".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    mine_parameters(
+        &mut target,
+        &args,
+        reflection_params.clone(),
+        semaphore,
+        None,
+    )
+    .await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.location == Location::Body && (p.name == "user" || p.name == "token")),
+        "explicit -d body params must be seeded even under --skip-mining, got {:?}",
+        params
+            .iter()
+            .map(|p| (&p.name, &p.location))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_mine_parameters_seeds_explicit_body_params_under_skip_mining_dict() {
+    // `--skip-mining-dict` skips the slow dictionary brute-force but must not
+    // drop explicit `-d` body params (they used to live inside that gate).
+    let addr = start_body_reflect_server().await;
+    let mut target =
+        parse_target(&format!("http://{}:{}/b", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.skip_mining = false;
+    args.skip_mining_dict = true;
+    args.skip_mining_dom = true;
+    args.method = "POST".to_string();
+    args.data = Some("user=alice&token=t".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    mine_parameters(
+        &mut target,
+        &args,
+        reflection_params.clone(),
+        semaphore,
+        None,
+    )
+    .await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.location == Location::Body && (p.name == "user" || p.name == "token")),
+        "explicit -d body params must be seeded even under --skip-mining-dict, got {:?}",
+        params
+            .iter()
+            .map(|p| (&p.name, &p.location))
+            .collect::<Vec<_>>()
+    );
+}
+
+async fn reflect_raw_body_handler(body: axum::body::Bytes) -> Html<String> {
+    // Echo the raw request body. A multipart/form-data body carries each text
+    // field's value verbatim, so the probe marker shows up in the response.
+    Html(format!(
+        "<html><body>{}</body></html>",
+        String::from_utf8_lossy(&body)
+    ))
+}
+
+async fn start_raw_body_reflect_server() -> SocketAddr {
+    let app = Router::new().route("/r", axum::routing::post(reflect_raw_body_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+async fn record_multipart_timing(
+    axum::extract::State(timestamps): axum::extract::State<Arc<Mutex<Vec<tokio::time::Instant>>>>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Html<String> {
+    let (parts, body) = request.into_parts();
+    if parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("multipart/form-data"))
+    {
+        timestamps.lock().await.push(tokio::time::Instant::now());
+    }
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    Html(format!(
+        "<html><body>{}</body></html>",
+        String::from_utf8_lossy(&body)
+    ))
+}
+
+async fn start_multipart_timing_server() -> (SocketAddr, Arc<Mutex<Vec<tokio::time::Instant>>>) {
+    let timestamps = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/r", axum::routing::any(record_multipart_timing))
+        .with_state(timestamps.clone());
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    (addr, timestamps)
+}
+
+#[tokio::test]
+async fn test_probe_multipart_params_seeds_explicit_field() {
+    // `-p file:multipart` is a known multipart sink. Before, MultipartBody
+    // params were only seeded from discovered HTML forms, so this explicit
+    // injection point had no entry point. Now `-d` + `-p :multipart` seeds it.
+    let addr = start_raw_body_reflect_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/r", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.method = "POST".to_string();
+    args.data = Some("file=a&other=b".to_string());
+    args.param = vec!["file:multipart".to_string()];
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_multipart_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.name == "file" && p.location == Location::MultipartBody),
+        "explicit -p file:multipart must seed a MultipartBody param, got {:?}",
+        params
+            .iter()
+            .map(|p| (&p.name, &p.location))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_probe_multipart_params_honors_delay_between_probes() {
+    // `--delay` paces body/JSON/XML probes, but multipart mining used to send
+    // its serialized probes back-to-back. The request counter is process
+    // global, so share the same lock as run_scan tests while exercising it.
+    let _serial = crate::REQUEST_COUNTER_TEST_LOCK.lock().await;
+    let (addr, timestamps) = start_multipart_timing_server().await;
+    let mut target =
+        parse_target(&format!("http://{}:{}/r", addr.ip(), addr.port())).expect("parse target");
+    target.method = "POST".to_string();
+    target.delay = 250;
+    let mut args = default_scan_args();
+    args.method = "POST".to_string();
+    args.data = Some("first=one&second=two".to_string());
+    args.param = vec![
+        "first:multipart".to_string(),
+        "second:multipart".to_string(),
+    ];
+
+    probe_multipart_params(
+        &target,
+        &args,
+        Arc::new(Mutex::new(Vec::<Param>::new())),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+    )
+    .await;
+
+    let timestamps = timestamps.lock().await;
+    assert_eq!(
+        timestamps.len(),
+        2,
+        "both multipart probes should reach the server"
+    );
+    let interval = timestamps[1].duration_since(timestamps[0]);
+    assert!(
+        interval >= Duration::from_millis(200),
+        "multipart probes arrived {interval:?} apart despite --delay 250"
+    );
+}
+
+#[tokio::test]
+async fn test_probe_multipart_params_noop_without_multipart_spec() {
+    // Multipart is opt-in: with `-d` but no `-p :multipart`, this is a no-op
+    // (we don't re-send every body as multipart).
+    let target = parse_target("http://127.0.0.1:1").expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some("file=a".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    probe_multipart_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+    assert!(reflection_params.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_mine_parameters_declared_multipart_target_mines_every_field_as_multipart() {
+    // An OpenAPI / Postman import that declared `multipart/form-data` sets
+    // `Target::multipart`: every field is a multipart field without `-p`, and
+    // the urlencoded body probe stays out (it would duplicate each slot).
+    let addr = start_raw_body_reflect_server().await;
+    let mut target =
+        parse_target(&format!("http://{}:{}/r", addr.ip(), addr.port())).expect("parse target");
+    target.method = "POST".to_string();
+    target.multipart = true;
+    let mut args = default_scan_args();
+    args.skip_mining = true;
+    args.method = "POST".to_string();
+    args.data = Some("note=a&title=b".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    mine_parameters(
+        &mut target,
+        &args,
+        reflection_params.clone(),
+        semaphore,
+        None,
+    )
+    .await;
+
+    let mut got: Vec<(String, Location)> = reflection_params
+        .lock()
+        .await
+        .iter()
+        .map(|p| (p.name.clone(), p.location.clone()))
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            ("note".to_string(), Location::MultipartBody),
+            ("title".to_string(), Location::MultipartBody)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_mine_parameters_raw_http_multipart_capture_mines_its_fields() {
+    // A captured (Burp / raw-http) `multipart/form-data` request keeps its
+    // body verbatim. Every multipart reader parsed `data` as urlencoded, so
+    // the capture yielded zero parameters and the scan reported clean
+    // without testing one field.
+    let addr = start_raw_body_reflect_server().await;
+    let raw = format!(
+        "POST /r HTTP/1.1\r\nHost: {addr}\r\n\
+         Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryAb12\r\n\r\n\
+         ------WebKitFormBoundaryAb12\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\na\r\n\
+         ------WebKitFormBoundaryAb12\r\nContent-Disposition: form-data; name=\"up\"; filename=\"x.txt\"\r\n\
+         Content-Type: text/plain\r\n\r\nb\r\n\
+         ------WebKitFormBoundaryAb12--\r\n"
+    );
+    let mut target = crate::target_parser::parse_raw_http_request(&raw).expect("raw http");
+    let mut args = default_scan_args();
+    args.skip_mining = true;
+    args.data = target.data.clone();
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    mine_parameters(
+        &mut target,
+        &args,
+        reflection_params.clone(),
+        Arc::new(tokio::sync::Semaphore::new(2)),
+        None,
+    )
+    .await;
+
+    let mut got: Vec<(String, Location)> = reflection_params
+        .lock()
+        .await
+        .iter()
+        .map(|p| (p.name.clone(), p.location.clone()))
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            ("note".to_string(), Location::MultipartBody),
+            ("up".to_string(), Location::MultipartBody)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_mine_parameters_multipart_survives_same_named_body_param() {
+    // `-d file=a -p file:multipart`: `probe_body_params` seeds `file` as a Body
+    // param from the same `-d`, but the multipart slot must still be seeded —
+    // otherwise the `-p file:multipart` location filter drops the Body entry
+    // and nothing is left to scan.
+    let addr = start_raw_body_reflect_server().await;
+    let mut target =
+        parse_target(&format!("http://{}:{}/r", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.skip_mining = true;
+    args.method = "POST".to_string();
+    args.data = Some("file=a".to_string());
+    args.param = vec!["file:multipart".to_string()];
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    mine_parameters(
+        &mut target,
+        &args,
+        reflection_params.clone(),
+        semaphore,
+        None,
+    )
+    .await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.name == "file" && p.location == Location::MultipartBody),
+        "multipart slot for `file` must be seeded even when a Body `file` exists, got {:?}",
+        params
+            .iter()
+            .map(|p| (&p.name, &p.location))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_has_knockout_html_clause_boundary_cases() {
+    // True: `html:` clause at a real binding boundary.
+    assert!(has_knockout_html_clause("html: foo"));
+    assert!(has_knockout_html_clause("text: name, html: bar"));
+    // Semicolon is also a clause separator in Knockout bindings.
+    assert!(has_knockout_html_clause("text: name; html: bar"));
+    // Leading whitespace before the first clause is fine.
+    assert!(has_knockout_html_clause("   html: bar"));
+    // Whitespace is allowed between the `html` token and its `:`.
+    assert!(has_knockout_html_clause("html : bar"));
+    assert!(has_knockout_html_clause("text: name, html\t: bar"));
+    // Case-insensitive token match.
+    assert!(has_knockout_html_clause("HTML: bar"));
+
+    // False: `html:` only appears inside a quoted clause value.
+    assert!(!has_knockout_html_clause("text: 'html: link'"));
+    assert!(!has_knockout_html_clause("text: \"html: link\""));
+    // False: a `html`-prefixed identifier that is not the `html` clause.
+    assert!(!has_knockout_html_clause("htmlish: bar"));
+    assert!(!has_knockout_html_clause("htmlContent: bar"));
+    // False: no html clause at all, and the empty attribute.
+    assert!(!has_knockout_html_clause("text: foo"));
+    assert!(!has_knockout_html_clause(""));
+}
+
+/// A page with exactly 15 distinct field names that echoes *every* query
+/// parameter. 15 is deliberate: the sentinel pre-probe only runs above
+/// `SENTINEL_PROBE_COUNT * 5`, so this shape slips past it and forces the
+/// post-bucket adaptive EWMA collapse instead.
+async fn reflect_everything_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let echoed: String = params.values().cloned().collect::<Vec<_>>().join(" ");
+    let mut form = String::from("<form>");
+    for i in 0..15 {
+        form.push_str(&format!("<input id=\"f{i}\" name=\"f{i}\" value=\"seed\">"));
+    }
+    form.push_str("</form>");
+    Html(format!("{form}<div>{echoed}</div>"))
+}
+
+async fn start_reflect_everything_server() -> SocketAddr {
+    let app = Router::new().route("/echo-all", get(reflect_everything_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+/// DOM mining against a reflect-everything page must collapse to the single
+/// synthetic `any` param instead of reporting one finding per field. This is an
+/// anti-amplification guard: without it the scan fans every payload out across
+/// every echoed name, which is where request counts explode on self-reflecting
+/// endpoints. The collapse block had no coverage at all.
+#[tokio::test]
+async fn test_probe_response_id_params_collapses_reflect_everything_page_to_any() {
+    let addr = start_reflect_everything_server().await;
+    let target = parse_target(&format!("http://{}:{}/echo-all", addr.ip(), addr.port()))
+        .expect("parse target");
+    let args = default_scan_args();
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+
+    probe_response_id_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    let query_params: Vec<_> = params
+        .iter()
+        .filter(|p| p.location == Location::Query)
+        .collect();
+    assert_eq!(
+        query_params.len(),
+        1,
+        "a reflect-everything page must collapse to exactly one Query param, got: {:?}",
+        params.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        query_params[0].name, "any",
+        "the collapsed param must be the synthetic `any`"
+    );
+    assert!(
+        query_params[0].injection_context.is_some(),
+        "the collapsed param must keep an injection context so payload selection still works"
+    );
+}
+
+/// The collapse rewrites the Query slice in place, so params discovered through
+/// other channels (a mined Body param, here) must survive it. Dropping them
+/// would silently un-scan every non-query surface on any self-reflecting page.
+#[tokio::test]
+async fn test_dom_mining_collapse_preserves_non_query_params() {
+    let addr = start_reflect_everything_server().await;
+    let target = parse_target(&format!("http://{}:{}/echo-all", addr.ip(), addr.port()))
+        .expect("parse target");
+    let args = default_scan_args();
+    let reflection_params = Arc::new(Mutex::new(vec![Param::new(
+        "body_field".to_string(),
+        "v".to_string(),
+        Location::Body,
+    )]));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+
+    probe_response_id_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.name == "body_field" && p.location == Location::Body),
+        "the pre-existing Body param must survive the Query collapse, got: {:?}",
+        params
+            .iter()
+            .map(|p| (&p.name, &p.location))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        params
+            .iter()
+            .filter(|p| p.location == Location::Query)
+            .count(),
+        1,
+        "still exactly one collapsed Query param"
+    );
+}
+
+#[test]
+fn test_detect_js_breakout_scans_a_huge_body_without_copying_it() {
+    // Smoke test at the `read_body_capped` ceiling: a 16 MiB body must not make
+    // breakout detection blow up. Deliberately NOT claimed as the regression
+    // test for the allocation — one 16 MiB `to_ascii_lowercase` is ~30 ms, so a
+    // wall-clock assertion cannot tell the allocating implementation from the
+    // allocation-free one. What the allocation-free search actually buys is
+    // recall, and that IS pinned:
+    // `test_detect_js_breakout_still_works_behind_a_large_inline_script` fails
+    // if any search window is reintroduced.
+    let marker = crate::scanning::markers::open_marker();
+    let body = format!("<script>{}\"{}", "var pad = 1;\n".repeat(1_300_000), marker);
+    assert!(
+        body.len() > 15 * 1024 * 1024,
+        "body is {} bytes",
+        body.len()
+    );
+    let start = std::time::Instant::now();
+    let _ = detect_js_breakout(&body);
+    assert!(
+        start.elapsed().as_secs() < 10,
+        "breakout detection took {:?} on a {} MiB body",
+        start.elapsed(),
+        body.len() / (1024 * 1024)
+    );
+}
+
+#[test]
+fn test_detect_js_breakout_still_works_behind_a_large_inline_script() {
+    // A framework app routinely inlines a serialized state blob or a whole
+    // bundle in one `<script>`, and a reflection after several hundred KiB of
+    // it is ordinary. At the original 64 KiB window such a reflection silently
+    // lost its computed closer and fell back to the fixed catalog — a recall
+    // loss on exactly the nested JS contexts this computation exists to cover.
+    let marker = crate::scanning::markers::open_marker();
+    let filler = "var pad = 1;\n".repeat(40_000); // ~520 KiB
+    let body = format!("<script>{filler}foo(\"{marker}\");</script>");
+    assert_eq!(detect_js_breakout(&body).as_deref(), Some("\")"));
+}
+
+#[tokio::test]
+async fn test_probe_body_params_mines_a_name_already_discovered_in_the_query() {
+    // The ordinary `dalfox scan '…?q=x' -d 'q=y'` shape. Stage 1 discovery has
+    // already put a *query* `q` in `reflection_params`; the body `q` is a
+    // different wire slot and must still be mined. Keying the skip on the name
+    // alone meant it never was — so a vulnerable body parameter was not merely
+    // unreported, it was never probed.
+    let addr = start_body_reflect_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/b", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some("q=y".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(vec![Param::new(
+        "q".to_string(),
+        "x".to_string(),
+        Location::Query,
+    )]));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.name == "q" && p.location == Location::Body),
+        "body slot `q` was not mined because the query `q` shadowed it, got {:?}",
+        params
+            .iter()
+            .map(|p| (p.name.clone(), format!("{:?}", p.location)))
+            .collect::<Vec<_>>()
+    );
+    // The pre-existing query param must survive untouched.
+    assert!(
+        params
+            .iter()
+            .any(|p| p.name == "q" && p.location == Location::Query),
+        "the pre-existing query param was dropped, got {:?}",
+        params
+            .iter()
+            .map(|p| (p.name.clone(), format!("{:?}", p.location)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_probe_json_body_params_mines_a_name_already_discovered_in_the_query() {
+    // Same shape for the JSON body stage.
+    let addr = start_json_reflect_server().await;
+    let mut target =
+        parse_target(&format!("http://{}:{}/j", addr.ip(), addr.port())).expect("parse target");
+    target.method = "POST".to_string();
+    target.data = Some("{\"q\":\"y\"}".to_string());
+    let mut args = default_scan_args();
+    args.data = Some("{\"q\":\"y\"}".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(vec![Param::new(
+        "q".to_string(),
+        "x".to_string(),
+        Location::Query,
+    )]));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_json_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    assert!(
+        params
+            .iter()
+            .any(|p| p.name == "q" && p.location == Location::JsonBody),
+        "JSON body slot `q` was shadowed by the query `q`, got {:?}",
+        params
+            .iter()
+            .map(|p| (p.name.clone(), format!("{:?}", p.location)))
+            .collect::<Vec<_>>()
+    );
+}
+
+// --- GraphQL variable mining ---
+
+async fn graphql_reflect_handler(body: String) -> Html<String> {
+    // Reflect every string value inside `variables` into the HTML body raw.
+    let mut echo = String::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+        && let Some(vars) = v.get("variables")
+    {
+        fn walk(v: &serde_json::Value, out: &mut String) {
+            match v {
+                serde_json::Value::String(s) => {
+                    out.push_str(s);
+                    out.push(' ');
+                }
+                serde_json::Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        walk(vars, &mut echo);
+    }
+    Html(format!("<html><body><div>{}</div></body></html>", echo))
+}
+
+async fn start_graphql_server() -> SocketAddr {
+    use axum::routing::post;
+    let app = Router::new().route("/graphql", post(graphql_reflect_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+#[tokio::test]
+async fn probe_graphql_params_seeds_reflected_variable() {
+    let addr = start_graphql_server().await;
+    let target = parse_target(&format!("http://{}:{}/graphql", addr.ip(), addr.port()))
+        .expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some(
+        r#"{"query":"mutation($n:String!){add(name:$n){id}}","variables":{"n":"seed"}}"#
+            .to_string(),
+    );
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_graphql_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    let gql: Vec<_> = params
+        .iter()
+        .filter(|p| p.location == Location::GraphqlBody)
+        .collect();
+    assert_eq!(
+        gql.len(),
+        1,
+        "expected one GraphQL variable param, got {params:?}"
+    );
+    assert_eq!(gql[0].name, "variables.n");
+    assert!(
+        gql[0].pre_encoding_pipeline.is_some(),
+        "GraphQL param must carry a whole-request rebuild pipeline"
+    );
+}
+
+#[tokio::test]
+async fn probe_graphql_params_noop_on_plain_json_body() {
+    // FP control: a non-GraphQL JSON body seeds zero GraphQL params even
+    // against a reflecting server.
+    let addr = start_graphql_server().await;
+    let target = parse_target(&format!("http://{}:{}/graphql", addr.ip(), addr.port()))
+        .expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some(r#"{"name":"seed","page":2}"#.to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_graphql_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    assert!(
+        reflection_params.lock().await.is_empty(),
+        "plain JSON body must not seed GraphQL params"
+    );
+}
+
+#[tokio::test]
+async fn probe_json_body_params_defers_graphql_body() {
+    // The JSON body probe must hand off GraphQL bodies to `probe_graphql_params`
+    // rather than mining the top-level `query`/`variables` keys (which would
+    // garble the request by replacing the `variables` object with a marker).
+    let addr = start_graphql_server().await;
+    let target = parse_target(&format!("http://{}:{}/graphql", addr.ip(), addr.port()))
+        .expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some(
+        r#"{"query":"mutation($n:String!){add(name:$n){id}}","variables":{"n":"seed"}}"#
+            .to_string(),
+    );
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_json_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    assert!(
+        reflection_params.lock().await.is_empty(),
+        "JSON body probe must skip GraphQL bodies (no top-level query/variables mining)"
+    );
+}
+
+// --- XML / SOAP body mining ---
+
+async fn xml_reflect_handler(body: String) -> Html<String> {
+    // Reflect the first <msg>…</msg> text raw into an HTML page.
+    let echo = body
+        .split_once("<msg>")
+        .and_then(|(_, rest)| rest.split_once("</msg>"))
+        .map(|(inner, _)| inner.to_string())
+        .unwrap_or_default();
+    Html(format!("<html><body><p>{}</p></body></html>", echo))
+}
+
+async fn start_xml_server() -> SocketAddr {
+    use axum::routing::post;
+    let app = Router::new().route("/xml", post(xml_reflect_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+fn xml_target(addr: &SocketAddr) -> Target {
+    let mut t =
+        parse_target(&format!("http://{}:{}/xml", addr.ip(), addr.port())).expect("parse target");
+    t.headers
+        .push(("Content-Type".to_string(), "application/xml".to_string()));
+    t
+}
+
+#[tokio::test]
+async fn probe_xml_body_params_seeds_reflected_text_node() {
+    let addr = start_xml_server().await;
+    let target = xml_target(&addr);
+    let mut args = default_scan_args();
+    args.data = Some("<req><item id=\"1\">x</item><msg>seed</msg></req>".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_xml_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+
+    let params = reflection_params.lock().await.clone();
+    let msg = params
+        .iter()
+        .find(|p| p.name == "msg" && p.location == Location::XmlBody)
+        .expect("msg text node seeded");
+    assert!(
+        msg.pre_encoding_pipeline.is_some(),
+        "XML param must carry a Splice pipeline"
+    );
+    // The pipeline rebuilds the whole document with the payload in <msg>.
+    let body = msg
+        .pre_encoding_pipeline
+        .as_ref()
+        .unwrap()
+        .apply("<svg/onload=alert(1)>")
+        .expect("apply");
+    assert_eq!(
+        body,
+        "<req><item id=\"1\">x</item><msg><svg/onload=alert(1)></msg></req>"
+    );
+}
+
+#[tokio::test]
+async fn probe_xml_body_params_noop_without_xml_content_type() {
+    // FP control: an XML-looking body but no XML content-type and no `<?xml`
+    // prolog must not be treated as XML.
+    let addr = start_xml_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/xml", addr.ip(), addr.port())).expect("parse target"); // no Content-Type header
+    let mut args = default_scan_args();
+    args.data = Some("<req><msg>seed</msg></req>".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_xml_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+    assert!(reflection_params.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn probe_xml_body_params_noop_on_json_body() {
+    // FP control: a JSON body with an (incorrect) XML content-type still
+    // tokenizes to no XML leaves, so nothing is seeded.
+    let addr = start_xml_server().await;
+    let target = xml_target(&addr);
+    let mut args = default_scan_args();
+    args.data = Some(r#"{"msg":"seed"}"#.to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_xml_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+    assert!(reflection_params.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn probe_xml_body_params_fires_on_openapi_vendor_xml_body() {
+    // An OpenAPI `application/vnd.*+xml` request body keeps its declared
+    // Content-Type; it is XML and must be mined as XML, not as a form.
+    let addr = start_xml_server().await;
+    let spec = format!(
+        r#"{{"openapi":"3.0.0","servers":[{{"url":"http://{addr}"}}],"paths":{{"/xml":{{"post":{{
+          "requestBody":{{"content":{{"application/vnd.acme+xml":{{"example":"<req><msg>seed</msg></req>"}}}}}}}}}}}}}}"#
+    );
+    let target = crate::target_parser::parse_openapi(&spec, None)
+        .expect("spec parses")
+        .targets
+        .remove(0);
+    let mut args = default_scan_args();
+    args.data = target.data.clone();
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_xml_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+    assert!(
+        reflection_params
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.name == "msg" && p.location == Location::XmlBody)
+    );
+}
+
+#[tokio::test]
+async fn probe_xml_body_params_fires_on_xml_prolog_without_content_type() {
+    // An `<?xml` prolog is a strong enough signal to probe even when the user
+    // forgot the Content-Type header.
+    let addr = start_xml_server().await;
+    let target =
+        parse_target(&format!("http://{}:{}/xml", addr.ip(), addr.port())).expect("parse target");
+    let mut args = default_scan_args();
+    args.data = Some("<?xml version=\"1.0\"?><req><msg>seed</msg></req>".to_string());
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+    probe_xml_body_params(&target, &args, reflection_params.clone(), semaphore, None).await;
+    assert!(
+        reflection_params
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.name == "msg" && p.location == Location::XmlBody)
+    );
+}
+
+/// The script body starts after the open tag's real `>`, not one inside a
+/// quoted attribute value — otherwise the prefix begins with `b">` and the
+/// computed closer is wrong.
+#[test]
+fn test_detect_js_breakout_with_marker_skips_quoted_gt_in_open_tag() {
+    let body = "<script data-x=\"a>b\">h([\"4815162342\"]);</script>";
+    assert_eq!(
+        detect_js_breakout_with_marker(body, "4815162342").as_deref(),
+        Some("\"])")
+    );
+}
+
+/// The dictionary stage re-fetches a remote wordlist whenever the startup
+/// fetch left nothing usable cached (it failed, or came back partial). That
+/// retry must go out on the scan's own network settings: it fetched with
+/// `RemoteFetchOptions::default()`, so under `--proxy` the wordlist request
+/// bypassed the proxy and went direct.
+#[tokio::test]
+async fn dictionary_remote_wordlist_fetch_goes_through_proxy() {
+    use axum::extract::Request;
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let log = seen.clone();
+    // Plain-HTTP forward proxy: reqwest sends the absolute-form URI here.
+    let app = Router::new().fallback(move |req: Request| {
+        let log = log.clone();
+        async move {
+            log.lock().unwrap().push(req.uri().to_string());
+            "proxiedword\n"
+        }
+    });
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind proxy");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // `.invalid` never resolves, so only the proxy can answer this fetch.
+    let provider = "dictproxytest";
+    crate::payload::register_wordlist_provider(
+        provider,
+        vec!["http://dalfox-dict-proxy-test.invalid/wl.txt".to_string()],
+    );
+    let target = parse_target("http://127.0.0.1:1/").expect("parse target");
+    let mut args = default_scan_args();
+    args.remote_wordlists = vec![provider.to_string()];
+    args.proxy = Some(format!("http://{proxy_addr}"));
+
+    let reflection_params = Arc::new(Mutex::new(Vec::<Param>::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    probe_dictionary_params(&target, &args, reflection_params, semaphore, None).await;
+
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|u| u.contains("dalfox-dict-proxy-test.invalid")),
+        "remote wordlist fetch must honor --proxy, proxy saw {seen:?}"
+    );
+}

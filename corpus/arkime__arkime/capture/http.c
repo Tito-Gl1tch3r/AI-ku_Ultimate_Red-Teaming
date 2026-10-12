@@ -1,0 +1,1244 @@
+/******************************************************************************/
+/* http.c  -- Functions dealing with http connections.
+ *
+ * Copyright 2012-2017 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define CURL_DISABLE_DEPRECATION
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <arpa/inet.h>
+#include <curl/curl.h>
+#include "arkime.h"
+#include "zlib.h"
+#include <errno.h>
+
+//#define ARKIME_HTTP_DEBUG
+
+extern ArkimeConfig_t        config;
+
+struct arkimehttpserver_t;
+typedef struct arkimehttpserver_t ArkimeHttpServer_t;
+
+typedef struct arkimehttprequest_t {
+    struct arkimehttprequest_t *rqt_next, *rqt_prev;
+
+    ArkimeHttpResponse_cb func;
+    ArkimeHttpRead_cb    rfunc;
+    gpointer              uw;
+
+    ArkimeHttpServer_t   *server;
+    CURL                 *easy;
+    char                  url[1024];
+    char                  key[1024];
+
+    uint8_t              *dataIn;
+    uint32_t              used;
+    uint32_t              size;
+
+    struct curl_slist    *headerList;
+    char                 *dataOut;
+    uint32_t              dataOutLen;
+    uint16_t              snamePos;
+    int16_t               retries;
+    uint8_t               priority;
+} ArkimeHttpRequest_t;
+
+typedef struct {
+    struct arkimehttprequest_t *rqt_next, *rqt_prev;
+    int                         rqt_count;
+} ArkimeHttpRequestHead_t;
+
+typedef struct arkimehttpconn_t {
+    struct arkimehttpconn_t *h_next, *h_prev;
+    uint32_t                 h_hash;
+    short                    h_bucket;
+
+    uint8_t                  sessionId[ARKIME_SESSIONID_LEN];
+    int                      fd;
+} ArkimeHttpConn_t;
+
+typedef struct arkimehttpconnhead_t {
+    struct arkimehttpconn_t *h_next, *h_prev;
+    short                    h_count;
+
+} ArkimeHttpConnHead_t;
+
+typedef struct {
+    char    *clientCert;
+    char    *clientKey;
+    char    *clientKeyPass;
+} ArkimeClientAuth_t;
+
+LOCAL HASH_VAR(s_, connections, ArkimeHttpConnHead_t, 119);
+LOCAL ARKIME_LOCK_DEFINE(connections);
+
+#define PRIORITY_MAX ARKIME_HTTP_PRIORITY_NORMAL
+LOCAL ArkimeHttpRequestHead_t requests[PRIORITY_MAX + 1];
+LOCAL int                     requestsTimer;
+LOCAL ARKIME_LOCK_DEFINE(requests);
+
+LOCAL uint64_t connectionsSet[2048];
+
+typedef struct {
+    ArkimeHttpServer_t  *server;
+    char                *name;
+    time_t               allowedAtSeconds;
+} ArkimeHttpServerName_t;
+
+struct arkimehttpserver_t {
+    uint64_t                 dropped;
+    GHashTable              *fd2ev;
+    ArkimeHttpServerName_t  *snames;
+    ArkimeClientAuth_t      *clientAuth;
+    char                   **defaultHeaders;
+    char                    *userpwd;
+    char                    *aws_sigv4;
+    uint64_t                 timeout;
+    int                      snamesCnt;
+    int                      snamesPos;
+    char                     compress;
+    char                     printErrors;
+    char                     insecure;
+    char                     dontFreeResponse;
+    uint16_t                 maxConns;
+    uint16_t                 maxOutstandingRequests;
+    uint16_t                 outstanding;
+    uint16_t                 outstandingPri[ARKIME_HTTP_PRIORITY_DROPABLE + 1];
+    uint16_t                 connections;
+    uint16_t                 maxRetries;
+
+    ARKIME_LOCK_EXTERN(syncRequest);
+    ArkimeHttpRequest_t      syncRequest;
+    CURL                    *multi;
+    guint                    multiTimer;
+    int                      multiRunning;
+
+    ArkimeHttpHeader_cb      headerCb;
+};
+
+LOCAL __thread z_stream *z_strm;
+LOCAL GPtrArray *z_strms;
+LOCAL ARKIME_LOCK_DEFINE(z_strms);
+
+LOCAL gboolean arkime_http_send_timer_callback(gpointer);
+LOCAL void arkime_http_add_request(ArkimeHttpServer_t *server, ArkimeHttpRequest_t *request, int priority);
+
+LOCAL uint32_t httpVLanVNI;
+
+LOCAL GHashTable *servers;
+
+/******************************************************************************/
+LOCAL int arkime_http_conn_cmp(const void *keyv, const ArkimeHttpConn_t *conn)
+{
+    return memcmp(keyv, conn->sessionId, conn->sessionId[0]) == 0;
+}
+/******************************************************************************/
+LOCAL size_t arkime_http_curl_write_callback(void *contents, size_t size, size_t nmemb, void *requestP)
+{
+    ArkimeHttpRequest_t *request = requestP;
+
+    if (size != 0 && nmemb > (SIZE_MAX / size))
+        return 0;
+    size_t sz = size * nmemb;
+    if (sz > 0x7FFFFFFF)
+        return 0;
+
+    if (request->rfunc) {
+        if (!request->rfunc(contents, sz, request->uw))
+            return sz;
+        return 0;
+    }
+
+    if (!request->dataIn) {
+        double cl;
+        curl_easy_getinfo(request->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl);
+        if (cl < 0 || cl > 0x7FFFFFFF)
+            cl = sz;
+        if (cl > 0x400000)
+            cl = 0x400000;
+        request->used = sz;
+        request->size = MAX(sz, (uint32_t)cl);
+        request->dataIn = ARKIME_SIZE_ALLOC("dataIn", request->size + 1);
+        memcpy(request->dataIn, contents, sz);
+        return sz;
+    }
+
+    if ((size_t)request->used + sz > 0x7FFFFFFF)
+        return 0;
+    if (request->used + sz > request->size) {
+        request->size += request->used + sz;
+        ARKIME_SIZE_REALLOC("dataIn", request->dataIn, request->size + 1);
+    }
+
+    memcpy(request->dataIn + request->used, contents, sz);
+    request->used += sz;
+    return sz;
+}
+/******************************************************************************/
+uint8_t *arkime_http_send_sync(void *serverV, const char *method, const char *key, int32_t key_len, char *data, uint32_t data_len, char **headers, size_t *return_len, int *code)
+{
+    ArkimeHttpServer_t        *server = serverV;
+    struct curl_slist         *headerList = NULL;
+
+    if (return_len)
+        *return_len = 0;
+
+    CURL *easy;
+
+    if (headers) {
+        for (int i = 0; headers[i]; i++) {
+            headerList = curl_slist_append(headerList, headers[i]);
+        }
+    }
+
+    if (server->defaultHeaders) {
+        for (int i = 0; server->defaultHeaders[i]; i++) {
+            headerList = curl_slist_append(headerList, server->defaultHeaders[i]);
+        }
+    }
+
+    ARKIME_LOCK(server->syncRequest);
+    if (!server->syncRequest.easy) {
+        easy = server->syncRequest.easy = curl_easy_init();
+        if (config.debug >= 2) {
+            curl_easy_setopt(easy, CURLOPT_VERBOSE, 1);
+        }
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, arkime_http_curl_write_callback);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA, (void *)&server->syncRequest);
+        curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(easy, CURLOPT_TIMEOUT, server->timeout);
+        curl_easy_setopt(easy, CURLOPT_TCP_KEEPALIVE, 1L);
+    } else {
+        easy = server->syncRequest.easy;
+    }
+
+    if (server->insecure) {
+        curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
+    if (config.caTrustFile) {
+        curl_easy_setopt(easy, CURLOPT_CAINFO, config.caTrustFile);
+    }
+
+    // Send client certs if so configured
+    if (server->clientAuth) {
+        curl_easy_setopt(easy, CURLOPT_SSLCERT, server->clientAuth->clientCert);
+        curl_easy_setopt(easy, CURLOPT_SSLKEY, server->clientAuth->clientKey);
+        if (server->clientAuth->clientKeyPass) {
+            curl_easy_setopt(easy, CURLOPT_SSLKEYPASSWD, server->clientAuth->clientKeyPass);
+        }
+    }
+
+    if (method[0] != 'G') {
+        curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, method);
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, data_len);
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDS, data);
+    } else {
+        curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, NULL);
+        curl_easy_setopt(easy, CURLOPT_HTTPGET, 1L);
+    }
+
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, "arkime");
+
+    if (headerList) {
+        curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headerList);
+    } else {
+        // Clear any headerList from a previous request on this reused easy handle
+        curl_easy_setopt(easy, CURLOPT_HTTPHEADER, NULL);
+    }
+
+    if (server->userpwd) {
+        curl_easy_setopt(easy, CURLOPT_USERPWD, server->userpwd);
+    }
+
+    if (server->aws_sigv4) {
+        curl_easy_setopt(easy, CURLOPT_AWS_SIGV4, server->aws_sigv4);
+    }
+
+    if (key_len == -1)
+        key_len = strlen(key);
+
+    if (key_len > 1000) {
+        LOG("ERROR - Dropping request, URL too long: %.*s", key_len, key);
+        if (code)
+            *code = 0;
+        return NULL;
+    }
+
+    memcpy(server->syncRequest.key, key, key_len);
+    server->syncRequest.key[key_len] = 0;
+    server->syncRequest.retries = server->maxRetries;
+
+    while (1) {
+        ARKIME_LOCK(requests);
+        arkime_http_add_request(server, &server->syncRequest, -1);
+        ARKIME_UNLOCK(requests);
+
+        server->syncRequest.used = 0;
+        int res = curl_easy_perform(easy);
+
+        if (res != CURLE_OK) {
+            if (server->syncRequest.retries >= 0) {
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                server->snames[server->syncRequest.snamePos].allowedAtSeconds = now.tv_sec + 30;
+                LOG("Retry %s error '%s'", server->syncRequest.url, curl_easy_strerror(res));
+                server->syncRequest.retries--;
+                continue;
+            }
+            LOG("libcurl failure %s error '%s'", server->syncRequest.url, curl_easy_strerror(res));
+            ARKIME_UNLOCK(server->syncRequest);
+
+            if (headerList) {
+                curl_slist_free_all(headerList);
+            }
+            return 0;
+        }
+        break;
+    }
+
+    if (headerList) {
+        curl_slist_free_all(headerList);
+    }
+
+    if (server->syncRequest.dataIn)
+        server->syncRequest.dataIn[server->syncRequest.used] = 0;
+
+    if (return_len)
+        *return_len = server->syncRequest.used;
+
+    long responseCode;
+    curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &responseCode);
+    if (code)
+        *code = responseCode;
+
+    if (config.logESRequests || (server->printErrors && responseCode / 100 != 2)) {
+        double totalTime;
+        double connectTime;
+        double uploadSize;
+        double downloadSize;
+
+        curl_easy_getinfo(easy, CURLINFO_TOTAL_TIME, &totalTime);
+        curl_easy_getinfo(easy, CURLINFO_CONNECT_TIME, &connectTime);
+        curl_easy_getinfo(easy, CURLINFO_SIZE_UPLOAD, &uploadSize);
+        curl_easy_getinfo(easy, CURLINFO_SIZE_DOWNLOAD, &downloadSize);
+
+        LOG("%d/%d SYNC %ld %s %.0lf/%.0lf %.0lfms %.0lfms",
+            1, 1,
+            responseCode,
+            server->syncRequest.url,
+            uploadSize,
+            downloadSize,
+            connectTime * 1000,
+            totalTime * 1000);
+    }
+
+    uint8_t *dataIn = server->syncRequest.dataIn;
+    server->syncRequest.dataIn = 0;
+
+    ARKIME_UNLOCK(server->syncRequest);
+    return dataIn;
+}
+/******************************************************************************/
+LOCAL void arkime_http_add_request(ArkimeHttpServer_t *server, ArkimeHttpRequest_t *request, int priority)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    int startPos = server->snamesPos;
+    int offset = 0;
+
+    while (server->snames[server->snamesPos].allowedAtSeconds > now.tv_sec) {
+        server->snames[server->snamesPos].allowedAtSeconds -= offset;
+        server->snamesPos = (server->snamesPos + 1) % server->snamesCnt;
+        if (startPos == server->snamesPos)
+            offset = 1;
+    }
+
+    request->snamePos = server->snamesPos;
+    server->snamesPos = (server->snamesPos + 1) % server->snamesCnt;
+
+    const char *host = server->snames[request->snamePos].name;
+    snprintf(request->url, sizeof(request->url), "%s%s", host, request->key);
+
+    curl_easy_setopt(request->easy, CURLOPT_URL, request->url);
+
+    if (priority >= 0) {
+        if (priority > PRIORITY_MAX) {
+            priority = PRIORITY_MAX;
+        }
+        curl_easy_setopt(request->easy, CURLOPT_OPENSOCKETDATA, &server->snames[request->snamePos]);
+        curl_easy_setopt(request->easy, CURLOPT_CLOSESOCKETDATA, &server->snames[request->snamePos]);
+
+#ifdef ARKIME_HTTP_DEBUG
+        LOG("HTTPDEBUG INCR %p %d %s", request, server->outstanding, request->url);
+#endif
+        server->outstanding++;
+        server->outstandingPri[request->priority]++;
+
+        DLL_PUSH_TAIL(rqt_, &requests[priority], request);
+
+        if (!requestsTimer)
+            requestsTimer = g_timeout_add(0, arkime_http_send_timer_callback, NULL);
+    }
+}
+/******************************************************************************/
+LOCAL void arkime_http_curlm_check_multi_info(ArkimeHttpServer_t *server)
+{
+    char *eff_url;
+    CURLMsg *msg;
+    int msgs_left;
+    ArkimeHttpRequest_t *request;
+    CURL *easy;
+
+    while ((msg = curl_multi_info_read(server->multi, &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) {
+            easy = msg->easy_handle;
+            curl_easy_getinfo(easy, CURLINFO_PRIVATE, (void *)&request);
+            curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &eff_url);
+
+            long   responseCode;
+            curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &responseCode);
+
+            if (config.logESRequests || (server->printErrors && responseCode / 100 != 2)) {
+                double totalTime;
+                double connectTime;
+                double uploadSize;
+                double downloadSize;
+
+                curl_easy_getinfo(easy, CURLINFO_TOTAL_TIME, &totalTime);
+                curl_easy_getinfo(easy, CURLINFO_CONNECT_TIME, &connectTime);
+                curl_easy_getinfo(easy, CURLINFO_SIZE_UPLOAD, &uploadSize);
+                curl_easy_getinfo(easy, CURLINFO_SIZE_DOWNLOAD, &downloadSize);
+
+                LOG("%d/%d ASYNC %ld %s %.0lf/%.0lf %.0lfms %.0lfms",
+                    request->server->outstanding,
+                    request->server->connections,
+                    responseCode,
+                    request->url,
+                    uploadSize,
+                    downloadSize,
+                    connectTime * 1000,
+                    totalTime * 1000);
+            }
+
+#ifdef ARKIME_HTTP_DEBUG
+            LOG("HTTPDEBUG DECR %p %d %s", request, server->outstanding, request->url);
+#endif
+
+            if (responseCode == 0 && request->retries >= 0) {
+                curl_multi_remove_handle(server->multi, easy);
+
+                request->retries--;
+                if (request->dataIn) {
+                    if (!server->dontFreeResponse)
+                        ARKIME_SIZE_FREE("dataIn", request->dataIn);
+                    request->dataIn = 0;
+                }
+                request->used = 0;
+                request->size = 0;
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                ARKIME_LOCK(requests);
+                server->snames[request->snamePos].allowedAtSeconds = now.tv_sec + 30;
+                server->outstanding--;
+                server->outstandingPri[request->priority]--;
+                arkime_http_add_request(server, request, request->priority);
+                ARKIME_UNLOCK(requests);
+            } else {
+
+                if (server->printErrors && responseCode / 100 != 2) {
+                    if (arkime_memstr((char *)request->dataIn, MIN(request->used, 1000), "version conflict, current version", 33)) {
+                        LOG("See the FAQ - https://arkime.com/faq#version-conflict");
+                    }
+                    LOG("Response length=%u :>\n%.*s", request->used, MIN(request->used, 4000), request->dataIn);
+                }
+
+                if (request->func) {
+                    if (request->dataIn)
+                        request->dataIn[request->used] = 0;
+                    request->func(responseCode, request->dataIn, request->used, request->uw);
+                }
+                if (request->dataIn) {
+                    if (!server->dontFreeResponse)
+                        ARKIME_SIZE_FREE("dataIn", request->dataIn);
+                    request->dataIn = 0;
+                }
+                if (request->dataOut) {
+                    ARKIME_SIZE_FREE("dataOut", request->dataOut);
+                }
+                if (request->headerList) {
+                    curl_slist_free_all(request->headerList);
+                }
+                curl_multi_remove_handle(server->multi, easy);
+                curl_easy_cleanup(easy);
+
+                ARKIME_LOCK(requests);
+                server->outstanding--;
+                server->outstandingPri[request->priority]--;
+                ARKIME_UNLOCK(requests);
+
+                ARKIME_TYPE_FREE(ArkimeHttpRequest_t, request);
+            }
+        }
+    }
+}
+/******************************************************************************/
+LOCAL gboolean arkime_http_watch_callback(int fd, GIOCondition condition, gpointer serverV)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    int action = ((condition & G_IO_IN) ? CURL_CSELECT_IN : 0) |
+                 ((condition & G_IO_OUT) ? CURL_CSELECT_OUT : 0) |
+                 ((condition & (G_IO_HUP | G_IO_ERR)) ? CURL_CSELECT_ERR : 0);
+
+    curl_multi_socket_action(server->multi, fd, action, &server->multiRunning);
+    arkime_http_curlm_check_multi_info(server);
+    return TRUE;
+}
+/******************************************************************************/
+LOCAL int arkime_http_curlm_socket_callback(CURL *UNUSED(easy), curl_socket_t fd, int what, void *serverV, void *evP)
+{
+    ArkimeHttpServer_t        *server = serverV;
+    long                       ev = (long)evP;
+
+    switch (what) {
+    case CURL_POLL_REMOVE:
+        g_source_remove(ev);
+        curl_multi_assign(server->multi, fd, 0);
+        break;
+    default:
+        if (ev != 0) {
+            g_source_remove(ev);
+        }
+
+        ev = arkime_watch_fd(fd, ((what & CURL_POLL_IN) ? ARKIME_GIO_READ_COND : 0) | ((what & CURL_POLL_OUT) ? ARKIME_GIO_WRITE_COND : 0), arkime_http_watch_callback, server);
+        curl_multi_assign(server->multi, fd, (void *)ev);
+    }
+
+    return 0;
+}
+/******************************************************************************/
+/* Called by glib when our timeout expires */
+LOCAL gboolean arkime_http_timer_callback(gpointer serverV)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    curl_multi_socket_action(server->multi, CURL_SOCKET_TIMEOUT, 0, &server->multiRunning);
+    arkime_http_curlm_check_multi_info(server);
+
+    server->multiTimer = 0;
+    return G_SOURCE_REMOVE;
+}
+/******************************************************************************/
+LOCAL int arkime_http_curlm_timeout_callback(CURLM *UNUSED(multi), long timeout_ms, void *serverV)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    if (timeout_ms == -1) {
+        if (server->multiTimer) {
+            g_source_remove(server->multiTimer);
+            server->multiTimer = 0;
+        }
+        return CURLE_OK;
+    }
+
+    if (server->multiTimer) {
+        g_source_remove(server->multiTimer);
+    }
+    server->multiTimer = g_timeout_add(timeout_ms, arkime_http_timer_callback, server);
+
+    return CURLE_OK;
+}
+
+/******************************************************************************/
+LOCAL size_t arkime_http_curlm_header_function(char *buffer, size_t size, size_t nitems, void *requestP)
+{
+    ArkimeHttpRequest_t *request = requestP;
+    int sz = size * nitems;
+    int i = sz;
+
+    while (i > 0 && (buffer[i - 1] == '\r' || buffer[i - 1] == '\n')) {
+        buffer[i - 1] = 0;
+        i--;
+    }
+
+    char *colon = memchr(buffer, ':', sz);
+    if (!colon)
+        return sz;
+
+    const char *end = buffer + i;
+    *colon = 0;
+    colon++;
+    while (colon < end && isspace((unsigned char) *colon)) colon++;
+
+    int valueLen = (int)(end - colon);
+    if (valueLen < 0) valueLen = 0;
+    request->server->headerCb(request->url, buffer, colon, valueLen, request->uw);
+    return sz;
+}
+/******************************************************************************/
+LOCAL gboolean arkime_http_curl_watch_open_callback(int fd, GIOCondition condition, gpointer snameV)
+{
+    ArkimeHttpServerName_t    *sname = snameV;
+    ArkimeHttpServer_t        *server = sname->server;
+
+
+    struct sockaddr_storage localAddressStorage, remoteAddressStorage;
+
+    socklen_t addressLength = sizeof(localAddressStorage);
+    int rc = getsockname(fd, (struct sockaddr *)&localAddressStorage, &addressLength);
+    if (rc != 0)
+        return CURLE_OK;
+
+    addressLength = sizeof(remoteAddressStorage);
+    rc = getpeername(fd, (struct sockaddr *)&remoteAddressStorage, &addressLength);
+    if (rc != 0)
+        return CURLE_OK;
+
+    uint8_t sessionId[ARKIME_SESSIONID_LEN];
+    int  localPort, remotePort;
+    char remoteIp[INET6_ADDRSTRLEN + 2];
+    if (localAddressStorage.ss_family == AF_INET) {
+        struct sockaddr_in *localAddress = (struct sockaddr_in *)&localAddressStorage;
+        struct sockaddr_in *remoteAddress = (struct sockaddr_in *)&remoteAddressStorage;
+        arkime_session_id(sessionId, localAddress->sin_addr.s_addr, localAddress->sin_port,
+                          remoteAddress->sin_addr.s_addr, remoteAddress->sin_port, httpVLanVNI, httpVLanVNI);
+        localPort = ntohs(localAddress->sin_port);
+        remotePort = ntohs(remoteAddress->sin_port);
+        inet_ntop(AF_INET, &remoteAddress->sin_addr, remoteIp, sizeof(remoteIp));
+    } else {
+        struct sockaddr_in6 *localAddress = (struct sockaddr_in6 *)&localAddressStorage;
+        struct sockaddr_in6 *remoteAddress = (struct sockaddr_in6 *)&remoteAddressStorage;
+        arkime_session_id6(sessionId, localAddress->sin6_addr.s6_addr, localAddress->sin6_port,
+                           remoteAddress->sin6_addr.s6_addr, remoteAddress->sin6_port, httpVLanVNI, httpVLanVNI);
+        localPort = ntohs(localAddress->sin6_port);
+        remotePort = ntohs(remoteAddress->sin6_port);
+        inet_ntop(AF_INET6, &remoteAddress->sin6_addr, remoteIp + 1, sizeof(remoteIp) - 2);
+        remoteIp[0] = '[';
+        g_strlcat(remoteIp, "]", sizeof(remoteIp));
+    }
+
+    if (config.logHTTPConnections) {
+        LOG("Connected %d/%d - %s   %d->%s:%d - fd:%d",
+            server->outstanding,
+            server->connections,
+            sname->name,
+            localPort,
+            remoteIp,
+            remotePort,
+            fd);
+    }
+
+    ArkimeHttpConn_t *conn;
+
+    ARKIME_LOCK(connections);
+    if ((unsigned)fd >= ARRAY_LEN(connectionsSet) * 64) {
+        LOG("ERROR - fd %d exceeds connectionsSet capacity", fd);
+        ARKIME_UNLOCK(connections);
+        return CURLE_OK;
+    }
+    BIT_SET(fd, connectionsSet);
+    HASH_FIND(h_, connections, sessionId, conn);
+    if (!conn) {
+        conn = ARKIME_TYPE_ALLOC0(ArkimeHttpConn_t);
+
+        HASH_ADD(h_, connections, sessionId, conn);
+        memcpy(&conn->sessionId, sessionId, sessionId[0]);
+        conn->fd = fd;
+        server->connections++;
+    } else {
+        char buf[1000];
+        LOG("ERROR - Already added %x %s", condition, arkime_session_id_string(sessionId, buf));
+    }
+    ARKIME_UNLOCK(connections);
+
+    arkime_http_curlm_check_multi_info(server);
+
+    return CURLE_OK;
+}
+/******************************************************************************/
+LOCAL curl_socket_t arkime_http_curl_open_callback(void *snameV, curlsocktype UNUSED(purpose), struct curl_sockaddr *addr)
+{
+    ArkimeHttpServerName_t    *sname = snameV;
+    ArkimeHttpServer_t        *server = sname->server;
+
+    int fd = socket(addr->family, addr->socktype, addr->protocol);
+    if (fd < 0) {
+        LOG("ERROR - socket() failed: %s", strerror(errno));
+        return CURL_SOCKET_BAD;
+    }
+
+    long ev = arkime_watch_fd(fd, G_IO_OUT | G_IO_IN, arkime_http_curl_watch_open_callback, snameV);
+    g_hash_table_insert(server->fd2ev, (void *)(long)fd, (void *)(long)ev);
+    return fd;
+}
+/******************************************************************************/
+LOCAL int arkime_http_curl_close_callback(void *snameV, curl_socket_t fd)
+{
+    ArkimeHttpServerName_t    *sname = snameV;
+    ArkimeHttpServer_t        *server = sname->server;
+
+    if ((unsigned)fd >= ARRAY_LEN(connectionsSet) * 64 || ! BIT_ISSET(fd, connectionsSet)) {
+        long ev = (long)g_hash_table_lookup(server->fd2ev, (void *)(long)fd);
+        LOG("Couldn't connect %s (%d, %ld) ", sname->name, fd, ev);
+        close(fd);
+        GSource *source = g_main_context_find_source_by_id(NULL, ev);
+        if (source)
+            g_source_destroy(source);
+        g_hash_table_remove(server->fd2ev, (void *)(long)fd);
+        return 0;
+    }
+
+    struct sockaddr_storage localAddressStorage, remoteAddressStorage;
+    gboolean                haveAddrs = FALSE;
+
+    socklen_t addressLength = sizeof(localAddressStorage);
+    if (getsockname(fd, (struct sockaddr *)&localAddressStorage, &addressLength) == 0) {
+        addressLength = sizeof(remoteAddressStorage);
+        if (getpeername(fd, (struct sockaddr *)&remoteAddressStorage, &addressLength) == 0)
+            haveAddrs = TRUE;
+    }
+
+    uint8_t sessionId[ARKIME_SESSIONID_LEN];
+    int  localPort = 0, remotePort = 0;
+    char remoteIp[INET6_ADDRSTRLEN + 2] = "-";
+    if (!haveAddrs) {
+        // Socket already dead (e.g. reset), can't compute the sessionId, but
+        // still must clean up the tracking state below, finding conn by fd
+        long ev = (long)g_hash_table_lookup(server->fd2ev, (void *)(long)fd);
+        GSource *source = g_main_context_find_source_by_id(NULL, ev);
+        if (source)
+            g_source_destroy(source);
+        g_hash_table_remove(server->fd2ev, (void *)(long)fd);
+    } else if (localAddressStorage.ss_family == AF_INET) {
+        struct sockaddr_in *localAddress = (struct sockaddr_in *)&localAddressStorage;
+        struct sockaddr_in *remoteAddress = (struct sockaddr_in *)&remoteAddressStorage;
+        arkime_session_id(sessionId, localAddress->sin_addr.s_addr, localAddress->sin_port,
+                          remoteAddress->sin_addr.s_addr, remoteAddress->sin_port, httpVLanVNI, httpVLanVNI);
+        localPort = ntohs(localAddress->sin_port);
+        remotePort = ntohs(remoteAddress->sin_port);
+        inet_ntop(AF_INET, &remoteAddress->sin_addr, remoteIp, sizeof(remoteIp));
+    } else {
+        struct sockaddr_in6 *localAddress = (struct sockaddr_in6 *)&localAddressStorage;
+        struct sockaddr_in6 *remoteAddress = (struct sockaddr_in6 *)&remoteAddressStorage;
+        arkime_session_id6(sessionId, localAddress->sin6_addr.s6_addr, localAddress->sin6_port,
+                           remoteAddress->sin6_addr.s6_addr, remoteAddress->sin6_port, httpVLanVNI, httpVLanVNI);
+        localPort = ntohs(localAddress->sin6_port);
+        remotePort = ntohs(remoteAddress->sin6_port);
+        inet_ntop(AF_INET6, &remoteAddress->sin6_addr, remoteIp + 1, sizeof(remoteIp) - 2);
+        remoteIp[0] = '[';
+        g_strlcat(remoteIp, "]", sizeof(remoteIp));
+    }
+
+
+    ArkimeHttpConn_t *conn = NULL;
+    if ((unsigned)fd < ARRAY_LEN(connectionsSet) * 64)
+        BIT_CLR(fd, connectionsSet);
+
+    ARKIME_LOCK(connections);
+    if (haveAddrs) {
+        HASH_FIND(h_, connections, sessionId, conn);
+    } else {
+        // Couldn't compute the sessionId, find the entry by fd instead
+        ArkimeHttpConn_t *c;
+        HASH_FORALL2(h_, connections, c) {
+            if (c->fd == fd) {
+                conn = c;
+                break;
+            }
+        }
+    }
+    if (conn) {
+        HASH_REMOVE(h_, connections, conn);
+        ARKIME_TYPE_FREE(ArkimeHttpConn_t, conn);
+    }
+    ARKIME_UNLOCK(connections);
+
+    server->connections--;
+
+    if (config.logHTTPConnections) {
+        LOG("Close %d/%d - %s   %d->%s:%d fd:%d removed: %s",
+            server->outstanding,
+            server->connections,
+            sname->name,
+            localPort,
+            remoteIp,
+            remotePort,
+            fd,
+            conn ? "true" : "false");
+    }
+
+    close(fd);
+    return 0;
+}
+/******************************************************************************/
+LOCAL gboolean arkime_http_send_timer_callback(gpointer UNUSED(unused))
+{
+    while (1) {
+        ArkimeHttpRequest_t *request;
+        ARKIME_LOCK(requests);
+        for (int r = 0; r <= PRIORITY_MAX; r++) {
+            DLL_POP_HEAD(rqt_, &requests[r], request);
+            if (request)
+                break;
+        }
+
+        if (!request) {
+            requestsTimer = 0;
+            ARKIME_UNLOCK(requests);
+            return G_SOURCE_REMOVE;
+        }
+        ARKIME_UNLOCK(requests);
+
+#ifdef ARKIME_HTTP_DEBUG
+        LOG("HTTPDEBUG DO %p %d %s", request, request->server->outstanding, request->url);
+#endif
+        curl_multi_add_handle(request->server->multi, request->easy);
+
+        /* Kick-start the transfer immediately after adding the handle.
+         * This is the recommended libcurl pattern for event-driven
+         * curl_multi_socket usage - ensures the transfer begins without
+         * waiting for the next timer or socket event. */
+        curl_multi_socket_action(request->server->multi, CURL_SOCKET_TIMEOUT, 0, &request->server->multiRunning);
+    }
+
+    return G_SOURCE_REMOVE;
+}
+/******************************************************************************/
+gboolean arkime_http_send(void *serverV, const char *method, const char *key, int32_t key_len, char *data, uint32_t data_len, char **headers, gboolean droppable, ArkimeHttpResponse_cb func, gpointer uw)
+{
+    return arkime_http_schedule(serverV, method, key, key_len, data, data_len, headers, droppable ? ARKIME_HTTP_PRIORITY_DROPABLE : ARKIME_HTTP_PRIORITY_NORMAL, func, uw);
+}
+/******************************************************************************/
+gboolean arkime_http_schedule2(void *serverV, const char *method, const char *key, int32_t key_len, char *data, uint32_t data_len, char **headers, int priority, ArkimeHttpResponse_cb func, ArkimeHttpRead_cb rfunc, gpointer uw)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    if (key_len == -1)
+        key_len = strlen(key);
+
+    if (key_len > 1000) {
+        LOG("ERROR - Dropping request, URL too long: %.*s", key_len, key);
+        ARKIME_THREAD_INCR(server->dropped);
+        if (data) {
+            ARKIME_SIZE_FREE("data", data);
+        }
+        return 1;
+    }
+
+    // Are we overloaded
+    if (!config.quitting && server->outstanding > server->maxOutstandingRequests) {
+        int drop = FALSE;
+        if (priority == ARKIME_HTTP_PRIORITY_DROPABLE) {
+            LOG("WARNING - Dropping request to overwhelmed server, please see https://arkime.com/faq#error-dropping-request for help! size: %u queue: %u path: %.*s", data_len, server->outstanding, key_len, key);
+            drop = TRUE;
+        } else if (priority == ARKIME_HTTP_PRIORITY_NORMAL && server->outstanding > server->maxOutstandingRequests * 2) {
+            LOG("ERROR - Dropping request to overwhelmed server, please see https://arkime.com/faq#error-dropping-request for help! size: %u queue: %u path: %.*s", data_len, server->outstanding, key_len, key);
+            drop = TRUE;
+        }
+
+        if (drop) {
+            ARKIME_THREAD_INCR(server->dropped);
+
+            if (data) {
+                ARKIME_SIZE_FREE("data", data);
+            }
+            return 1;
+        }
+    }
+
+    ArkimeHttpRequest_t       *request = ARKIME_TYPE_ALLOC0(ArkimeHttpRequest_t);
+
+    if (headers) {
+        for (int i = 0; headers[i]; i++) {
+            request->headerList = curl_slist_append(request->headerList, headers[i]);
+        }
+    }
+
+    request->priority = MIN(priority, ARKIME_HTTP_PRIORITY_DROPABLE);
+
+    if (priority == ARKIME_HTTP_PRIORITY_DROPABLE)
+        request->retries = 0;
+    else
+        request->retries = server->maxRetries;
+
+    if (server->defaultHeaders) {
+        for (int i = 0; server->defaultHeaders[i]; i++) {
+            request->headerList = curl_slist_append(request->headerList, server->defaultHeaders[i]);
+        }
+    }
+
+    // Do we need to compress item
+    if (server->compress && data && data_len > 860) {
+        char            *buf = arkime_http_get_buffer(data_len);
+        int              ret;
+
+        if (z_strm == NULL) {
+            z_strm = ARKIME_TYPE_ALLOC0(z_stream);
+            deflateInit2(z_strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 16 + 15, 8, Z_DEFAULT_STRATEGY);
+            ARKIME_LOCK(z_strms);
+            g_ptr_array_add(z_strms, z_strm);
+            ARKIME_UNLOCK(z_strms);
+        }
+        z_strm->avail_in   = data_len;
+        z_strm->next_in    = (uint8_t *)data;
+        z_strm->avail_out  = data_len;
+        z_strm->next_out   = (uint8_t *)buf;
+        ret = deflate(z_strm, Z_FINISH);
+        if (ret == Z_STREAM_END) {
+            request->headerList = curl_slist_append(request->headerList, "Content-Encoding: gzip");
+            ARKIME_SIZE_FREE("data", data);
+            data_len = data_len - z_strm->avail_out;
+            data     = buf;
+        } else {
+            ARKIME_SIZE_FREE("data", buf);
+        }
+
+        deflateReset(z_strm);
+    }
+
+    request->server     = server;
+    request->func       = func;
+    request->rfunc      = rfunc;
+    request->uw         = uw;
+    request->dataOut    = data;
+    request->dataOutLen = data_len;
+
+    request->easy = curl_easy_init();
+    if (config.debug >= 2) {
+        curl_easy_setopt(request->easy, CURLOPT_VERBOSE, 1);
+    }
+
+    if (server->insecure) {
+        curl_easy_setopt(request->easy, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(request->easy, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
+    if (config.caTrustFile) {
+        curl_easy_setopt(request->easy, CURLOPT_CAINFO, config.caTrustFile);
+    }
+
+    // Send client certs if so configured
+    if (server->clientAuth) {
+        curl_easy_setopt(request->easy, CURLOPT_SSLCERT, server->clientAuth->clientCert);
+        curl_easy_setopt(request->easy, CURLOPT_SSLKEY, server->clientAuth->clientKey);
+        if (server->clientAuth->clientKeyPass) {
+            curl_easy_setopt(request->easy, CURLOPT_SSLKEYPASSWD, server->clientAuth->clientKeyPass);
+        }
+    }
+
+    curl_easy_setopt(request->easy, CURLOPT_WRITEFUNCTION, arkime_http_curl_write_callback);
+    curl_easy_setopt(request->easy, CURLOPT_WRITEDATA, (void *)request);
+    curl_easy_setopt(request->easy, CURLOPT_PRIVATE, (void *)request);
+    curl_easy_setopt(request->easy, CURLOPT_OPENSOCKETFUNCTION, arkime_http_curl_open_callback);
+    curl_easy_setopt(request->easy, CURLOPT_CLOSESOCKETFUNCTION, arkime_http_curl_close_callback);
+    curl_easy_setopt(request->easy, CURLOPT_ACCEPT_ENCODING, ""); // https://curl.haxx.se/libcurl/c/CURLOPT_ACCEPT_ENCODING.html
+    curl_easy_setopt(request->easy, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(request->easy, CURLOPT_USERAGENT, "arkime");
+
+    if (request->headerList) {
+        curl_easy_setopt(request->easy, CURLOPT_HTTPHEADER, request->headerList);
+    }
+
+    if (server->userpwd) {
+        curl_easy_setopt(request->easy, CURLOPT_USERPWD, server->userpwd);
+    }
+
+    if (server->aws_sigv4) {
+        curl_easy_setopt(request->easy, CURLOPT_AWS_SIGV4, server->aws_sigv4);
+    }
+
+    if (method[0] != 'G') {
+        curl_easy_setopt(request->easy, CURLOPT_CUSTOMREQUEST, method);
+        curl_easy_setopt(request->easy, CURLOPT_INFILESIZE, data_len);
+        curl_easy_setopt(request->easy, CURLOPT_POSTFIELDSIZE, data_len);
+        curl_easy_setopt(request->easy, CURLOPT_POSTFIELDS, data);
+    } else {
+        curl_easy_setopt(request->easy, CURLOPT_CUSTOMREQUEST, NULL);
+        curl_easy_setopt(request->easy, CURLOPT_HTTPGET, 1L);
+    }
+
+
+    if (server->headerCb) {
+        curl_easy_setopt(request->easy, CURLOPT_HEADERFUNCTION, arkime_http_curlm_header_function);
+        curl_easy_setopt(request->easy, CURLOPT_HEADERDATA, request);
+    }
+
+    curl_easy_setopt(request->easy, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(request->easy, CURLOPT_TIMEOUT, server->timeout);
+
+    memcpy(request->key, key, key_len);
+    request->key[key_len] = 0;
+
+    ARKIME_LOCK(requests);
+    arkime_http_add_request(server, request, priority);
+    ARKIME_UNLOCK(requests);
+    return 0;
+}
+
+/******************************************************************************/
+gboolean arkime_http_schedule(void *serverV, const char *method, const char *key, int32_t key_len, char *data, uint32_t data_len, char **headers, int priority, ArkimeHttpResponse_cb func, gpointer uw)
+{
+    return arkime_http_schedule2(serverV, method, key, key_len, data, data_len, headers, priority, func, NULL, uw);
+}
+
+/******************************************************************************/
+uint8_t *arkime_http_get(void *serverV, const char *key, int key_len, size_t *mlen)
+{
+    return arkime_http_send_sync(serverV, "GET", key, key_len, NULL, 0, NULL, mlen, NULL);
+}
+
+/******************************************************************************/
+int arkime_http_queue_length(const void *serverV)
+{
+    const ArkimeHttpServer_t  *server = serverV;
+    return server ? server->outstanding : 0;
+}
+/******************************************************************************/
+int arkime_http_queue_length_best(const void *serverV)
+{
+    const ArkimeHttpServer_t  *server = serverV;
+    return server ? server->outstandingPri[ARKIME_HTTP_PRIORITY_BEST] : 0;
+}
+/******************************************************************************/
+uint64_t arkime_http_dropped_count(const void *serverV)
+{
+    const ArkimeHttpServer_t  *server = serverV;
+    return server ? server->dropped : 0;
+}
+/******************************************************************************/
+void arkime_http_set_header_cb(void *serverV, ArkimeHttpHeader_cb cb)
+{
+    ArkimeHttpServer_t        *server = serverV;
+    server->headerCb                  = cb;
+}
+/******************************************************************************/
+void arkime_http_free_server(void *serverV)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    if (server->multiTimer) {
+        g_source_remove(server->multiTimer);
+    }
+
+    // Finish any still running requests
+    while (server->multiRunning) {
+        curl_multi_socket_action(server->multi, CURL_SOCKET_TIMEOUT, 0, &server->multiRunning);
+        arkime_http_curlm_check_multi_info(server);
+    }
+
+    // Free sync info
+    if (server->syncRequest.easy) {
+        curl_easy_cleanup(server->syncRequest.easy);
+        server->syncRequest.easy = 0;
+    }
+
+    if (server->syncRequest.dataIn)
+        ARKIME_SIZE_FREE("dataIn", server->syncRequest.dataIn);
+
+    if (server->clientAuth) {
+        ARKIME_TYPE_FREE(ArkimeClientAuth_t, server->clientAuth);
+    }
+
+    free(server->userpwd);
+    free(server->aws_sigv4);
+
+    // Free multi info
+    curl_multi_cleanup(server->multi);
+
+
+    for (int i = 0; i < server->snamesCnt; i++) {
+        g_free(server->snames[i].name);
+    }
+    free(server->snames);
+
+    g_hash_table_destroy(server->fd2ev);
+
+    ARKIME_TYPE_FREE(ArkimeHttpServer_t, server);
+}
+/******************************************************************************/
+void arkime_http_set_headers(void *serverV, char **headers)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    server->defaultHeaders = headers;
+}
+/******************************************************************************/
+void arkime_http_set_retries(void *serverV, uint16_t retries)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    server->maxRetries = retries;
+}
+/******************************************************************************/
+void arkime_http_set_timeout(void *serverV, uint64_t timeout)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    server->timeout = timeout;
+}
+/******************************************************************************/
+void arkime_http_set_client_cert(void *serverV, char *clientCert,
+                                 char *clientKey, char *clientKeyPass)
+{
+    ArkimeHttpServer_t        *server = serverV;
+    if (server->clientAuth != NULL) {
+        ARKIME_TYPE_FREE(ArkimeClientAuth_t, server->clientAuth);
+    }
+    ArkimeClientAuth_t *clientAuth = ARKIME_TYPE_ALLOC0(ArkimeClientAuth_t);
+
+    clientAuth->clientCert = clientCert;
+    clientAuth->clientKey  = clientKey;
+    clientAuth->clientKeyPass = clientKeyPass;
+
+    server->clientAuth = clientAuth;
+}
+/******************************************************************************/
+void arkime_http_set_print_errors(void *serverV)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    server->printErrors = 1;
+}
+/******************************************************************************/
+void arkime_http_set_userpwd(void *serverV, const char *userpwd)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    server->userpwd = strdup(userpwd);
+}
+/******************************************************************************/
+void arkime_http_set_aws_sigv4(void *serverV, const char *aws_sigv4)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    free(server->aws_sigv4);
+    server->aws_sigv4 = strdup(aws_sigv4);
+}
+/******************************************************************************/
+void arkime_http_set_dont_free_response(void *serverV)
+{
+    ArkimeHttpServer_t        *server = serverV;
+
+    server->dontFreeResponse = 1;
+}
+/******************************************************************************/
+gboolean arkime_http_is_arkime(uint32_t hash, uint8_t *sessionId)
+{
+    ArkimeHttpConn_t *conn;
+
+    ARKIME_LOCK(connections);
+    HASH_FIND_HASH(h_, connections, hash, sessionId, conn);
+    ARKIME_UNLOCK(connections);
+    return (conn ? 1 : 0);
+}
+/******************************************************************************/
+void *arkime_http_create_server(const char *hostnames, int maxConns, int maxOutstandingRequests, int compress)
+{
+    ArkimeHttpServer_t *server = ARKIME_TYPE_ALLOC0(ArkimeHttpServer_t);
+
+    int i;
+    char **names = g_strsplit(hostnames, ",", 0);
+    for (i = 0; names[i]; i++) {
+        // Count entries
+    }
+    server->snames = malloc(i * sizeof(ArkimeHttpServerName_t));
+    server->maxConns = maxConns;
+    server->maxOutstandingRequests = maxOutstandingRequests;
+    server->compress = compress;
+    server->maxRetries = 2;
+    server->clientAuth = NULL;
+    server->timeout = 120;
+
+    for (i = 0; names[i]; i++) {
+        g_strstrip(names[i]);
+        if (!names[i][0])
+            continue;
+        server->snames[server->snamesCnt].server            = server;
+        server->snames[server->snamesCnt].name              = g_strdup(names[i]);
+        server->snames[server->snamesCnt].allowedAtSeconds  = 0;
+        server->snamesCnt++;
+    }
+    g_strfreev(names);
+
+    if (server->snamesCnt == 0) {
+        LOGEXIT("ERROR - No valid endpoints in string '%s'", hostnames);
+    }
+
+    server->insecure = config.insecure; // Default to global setting
+
+    // If https to localhost or 127.0.0.1 we don't check the cert
+    for (i = 0; !server->insecure && i < server->snamesCnt; i++) {
+        const char *name = server->snames[i].name;
+        if ((strncmp("https://localhost", name, 17) == 0 || strncmp("https://127.0.0.1", name, 17) == 0) &&
+            (name[17] == 0 || name[17] == ':' || name[17] == '/')) {
+            LOG("WARNING - Using insecure mode for %s", name);
+            server->insecure = 1;
+        }
+    }
+
+    server->multi = curl_multi_init();
+    curl_multi_setopt(server->multi, CURLMOPT_SOCKETFUNCTION, arkime_http_curlm_socket_callback);
+    curl_multi_setopt(server->multi, CURLMOPT_SOCKETDATA, server);
+    curl_multi_setopt(server->multi, CURLMOPT_TIMERFUNCTION, arkime_http_curlm_timeout_callback);
+    curl_multi_setopt(server->multi, CURLMOPT_TIMERDATA, server);
+    curl_multi_setopt(server->multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, server->maxConns);
+    curl_multi_setopt(server->multi, CURLMOPT_MAXCONNECTS, server->maxConns);
+
+    server->multiTimer = g_timeout_add(50, arkime_http_timer_callback, server);
+
+    server->fd2ev = g_hash_table_new(NULL, NULL);
+
+    ARKIME_LOCK_INIT(server->syncRequest);
+
+    httpVLanVNI = arkime_config_int(NULL, "httpVLanVNI", 0, 0, 0xffffff);
+
+    return server;
+}
+/******************************************************************************/
+void *arkime_http_get_or_create_server(const char *name, const char *hostnames, int maxConns, int maxOutstandingRequests, int compress, int *isNew)
+{
+    void *server = g_hash_table_lookup(servers, name);
+    if (!server) {
+        if (isNew)
+            *isNew = 1;
+        server = arkime_http_create_server(hostnames, maxConns, maxOutstandingRequests, compress);
+        arkime_http_set_timeout(server, 0);
+        g_hash_table_insert(servers, g_strdup(name), server);
+    } else {
+        if (isNew)
+            *isNew = 0;
+    }
+    return server;
+}
+/******************************************************************************/
+void arkime_http_init()
+{
+    curl_global_init(CURL_GLOBAL_SSL);
+
+    HASH_INIT(h_, connections, arkime_session_hash, (HASH_CMP_FUNC)arkime_http_conn_cmp);
+    for (int r = 0; r <= PRIORITY_MAX; r++) {
+        DLL_INIT(rqt_, &requests[r]);
+    }
+
+    servers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, arkime_http_free_server);
+    z_strms = g_ptr_array_new();
+
+    // Can NOT have config_ calls here since need to fetch config
+}
+/******************************************************************************/
+void arkime_http_exit()
+{
+    for (uint32_t i = 0; i < z_strms->len; i++) {
+        z_stream *zs = g_ptr_array_index(z_strms, i);
+        deflateEnd(zs);
+        ARKIME_TYPE_FREE(z_stream, zs);
+    }
+    g_ptr_array_free(z_strms, TRUE);
+    curl_global_cleanup();
+}

@@ -1,0 +1,170 @@
+import { asyncExec } from '@env-spec/utils/exec-helpers';
+import { type CiEnvInfo, type DeploymentEnvironment } from '@varlock/ci-env-info';
+import { SchemaError } from './errors';
+
+export type BuiltinVarDef = {
+  name: string;
+  description: string;
+  /** Data type name for this builtin var (defaults to 'string') */
+  type?: string;
+  resolver: (
+    ciEnv: CiEnvInfo, processEnv: Record<string, string | undefined>,
+  ) => string | boolean | undefined | Promise<string | undefined>;
+  /**
+   * Warning to surface when the builtin's own resolver produced the value and something
+   * in the schema actually reads it (e.g. VARLOCK_ENV being a low-confidence guess)
+   */
+  usageWarning?: (
+    ciEnv: CiEnvInfo, processEnv: Record<string, string | undefined>,
+  ) => SchemaError | undefined;
+};
+
+/**
+ * Detect if we're running in a test environment.
+ * This check runs first, even before CI detection.
+ */
+function detectTestEnvironment(env: Record<string, string | undefined>): boolean {
+  return !!(
+    env.NODE_ENV === 'test'
+    || env.JEST_WORKER_ID
+    || env.VITEST
+    || env.VITEST_POOL_ID
+  );
+}
+
+/**
+ * Infer deployment environment from branch name.
+ * Used when CI is detected but platform doesn't provide explicit environment.
+ */
+function inferFromBranch(branch: string): DeploymentEnvironment {
+  const lower = branch.toLowerCase();
+  if (['main', 'master', 'production', 'prod'].includes(lower)) return 'production';
+  if (['staging', 'stage', 'develop', 'dev'].includes(lower)) return 'staging';
+  if (['qa', 'test'].includes(lower)) return 'test';
+  return 'preview';
+}
+
+/**
+ * Attempt to get the current git branch via `git branch --show-current`.
+ * Returns undefined if git is unavailable, not in a git repo, or in a detached HEAD state.
+ */
+async function getGitBranch(): Promise<string | undefined> {
+  try {
+    const { stdout } = await asyncExec('git branch --show-current', { timeout: 3000 });
+    const branch = stdout.trim();
+    return branch || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Multi-tier environment detection strategy:
+ * 1. Test environment detection (NODE_ENV=test, JEST_WORKER_ID, VITEST, etc.)
+ * 2. Platform-provided environment (Vercel VERCEL_ENV, Netlify CONTEXT)
+ * 3. Branch name inference (main/master→production, staging/develop→staging, others→preview)
+ * 4. deployed in CI → preview
+ * 5. not CI, default to development
+ */
+function inferVarlockEnv(ciEnv: CiEnvInfo, processEnv: Record<string, string | undefined>): {
+  env: DeploymentEnvironment,
+  /** true when nothing identified the environment and we fell back to a bare guess */
+  isGuess: boolean,
+} {
+  // Tier 1: Test detection (runs first, even in CI)
+  if (detectTestEnvironment(processEnv)) return { env: 'test', isGuess: false };
+
+  // Tier 2: Platform-provided (Vercel, Netlify, etc.)
+  if (ciEnv.environment) return { env: ciEnv.environment, isGuess: false };
+
+  // Tier 3: Branch inference (when in CI with branch info)
+  if (ciEnv.isCI && ciEnv.branch) return { env: inferFromBranch(ciEnv.branch), isGuess: false };
+
+  // Tier 4: deployed in CI = preview
+  if (ciEnv.isCI) return { env: 'preview', isGuess: true };
+
+  // Tier 5: not CI, default to development
+  return { env: 'development', isGuess: false };
+}
+
+export const BUILTIN_VARS: Record<string, BuiltinVarDef> = {
+  VARLOCK_ENV: {
+    name: 'VARLOCK_ENV',
+    description: 'Auto-detected deployment environment (development, preview, staging, production, test)',
+    resolver: (ciEnv, processEnv) => inferVarlockEnv(ciEnv, processEnv).env,
+    usageWarning: (ciEnv, processEnv) => {
+      const { env, isGuess } = inferVarlockEnv(ciEnv, processEnv);
+      if (!isGuess) return;
+      const where = ciEnv.name ?? 'this CI environment';
+      return new SchemaError(
+        `VARLOCK_ENV guessed "${env}" - ${where} does not report a deployment environment or branch`,
+        {
+          isWarning: true,
+          tip: [
+            'set the environment explicitly in this platform\'s env settings, e.g. VARLOCK_ENV=production',
+            'or override your own env flag if you derive it from $VARLOCK_ENV (e.g. APP_ENV=production)',
+          ],
+        },
+      );
+    },
+  },
+  VARLOCK_IS_CI: {
+    name: 'VARLOCK_IS_CI',
+    description: 'Whether running in a CI environment',
+    type: 'boolean',
+    resolver: (ciEnv) => ciEnv.isCI,
+  },
+  VARLOCK_BRANCH: {
+    name: 'VARLOCK_BRANCH',
+    description: 'Current git branch name. In CI, sourced from platform environment variables. Locally (non-CI), auto-detected via `git branch --show-current`.',
+    resolver: (ciEnv) => ciEnv.branch ?? (!ciEnv.isCI ? getGitBranch() : undefined),
+  },
+  VARLOCK_PR_NUMBER: {
+    name: 'VARLOCK_PR_NUMBER',
+    description: 'Pull request number if in PR context',
+    resolver: (ciEnv) => ciEnv.prNumber?.toString(),
+  },
+  VARLOCK_COMMIT_SHA: {
+    name: 'VARLOCK_COMMIT_SHA',
+    description: 'Full commit SHA',
+    resolver: (ciEnv) => ciEnv.commitSha,
+  },
+  VARLOCK_COMMIT_SHA_SHORT: {
+    name: 'VARLOCK_COMMIT_SHA_SHORT',
+    description: 'Short (7-char) commit SHA',
+    resolver: (ciEnv) => ciEnv.commitShaShort,
+  },
+  VARLOCK_PLATFORM: {
+    name: 'VARLOCK_PLATFORM',
+    description: 'CI platform name (e.g., "GitHub Actions", "Vercel")',
+    resolver: (ciEnv) => ciEnv.name,
+  },
+  VARLOCK_BUILD_URL: {
+    name: 'VARLOCK_BUILD_URL',
+    description: 'Link to the CI build/deploy',
+    type: 'url',
+    resolver: (ciEnv) => ciEnv.buildUrl,
+  },
+  VARLOCK_REPO: {
+    name: 'VARLOCK_REPO',
+    description: 'Repository name in owner/repo format',
+    resolver: (ciEnv) => ciEnv.fullRepoName,
+  },
+  VARLOCK_RUNTIME: {
+    name: 'VARLOCK_RUNTIME',
+    description: 'Current JS runtime (e.g., "node", "bun", "deno", "workerd")',
+    resolver: (ciEnv) => ciEnv.runtime.runtime,
+  },
+  VARLOCK_OS: {
+    name: 'VARLOCK_OS',
+    description: 'Current OS platform (e.g., "darwin", "win32", "linux")',
+    resolver: (ciEnv) => ciEnv.os.platform,
+  },
+};
+
+/**
+ * Check if a key is a builtin VARLOCK_* variable.
+ */
+export function isBuiltinVar(key: string): boolean {
+  return key in BUILTIN_VARS;
+}

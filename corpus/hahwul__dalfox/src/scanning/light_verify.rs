@@ -1,0 +1,103 @@
+use crate::parameter_analysis::Param;
+use crate::target_parser::Target;
+use reqwest::Client;
+
+/// Lightweight (non-headless) verification for DOM-XSS candidates.
+/// Heuristics:
+/// - Build injected URL with provided payload and fetch once.
+/// - If the response is a browser-parsed markup document and contains the raw
+///   payload, mark verified.
+/// - Else, if response contains the class marker and a matching element exists, mark verified.
+/// - Else, if CSP likely blocks inline handlers ('unsafe-inline' missing), add note.
+///
+/// Returns: (verified, response_text, note)
+pub async fn verify_dom_xss_light_with_client(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    payload: &str,
+) -> (bool, Option<String>, Option<String>) {
+    // Shared with the reflection and DOM-verify paths. This path used to
+    // build its own request and omitted the urlencoded `Content-Type`, so a
+    // form-parsing server never bound the param and light verification came
+    // back negative on Body params.
+    //
+    // Send the as-sent value (pre-encoding applied, like every other injection
+    // path) but keep the raw `payload` for the body checks below: the server
+    // decodes it and reflects the raw content.
+    let sent = crate::encoding::pre_encoding::apply_param_encoding(payload, param);
+    let request = crate::scanning::url_inject::build_inject_request(client, target, param, &sent);
+
+    let mut note: Option<String> = None;
+    // Honor --rate-limit and count this verification re-request.
+    crate::record_outbound_request().await;
+    let sent_resp = request.send().await;
+    // Counted as a transport failure like every other direct send, so a
+    // verification request that never answered is not read as a clean miss.
+    if sent_resp.is_err() {
+        crate::tick_request_failure();
+    }
+    if let Ok(resp) = sent_resp {
+        // `--ignore-return`: a status the operator excluded never verifies.
+        if target.ignore_return.contains(&resp.status().as_u16()) {
+            return (
+                false,
+                None,
+                Some("status ignored — DOM verify skipped".to_string()),
+            );
+        }
+        // Browsers do not render the body of a 3xx response, so any apparent
+        // reflection/marker evidence inside that body cannot be exploited.
+        // Skip body-based verification entirely on redirects.
+        if resp.status().is_redirection() {
+            return (
+                false,
+                None,
+                Some("3xx response — DOM verify skipped".to_string()),
+            );
+        }
+        // Extract needed header values without cloning the entire HeaderMap
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let csp = resp
+            .headers()
+            .get("Content-Security-Policy")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        if let Ok(text) = crate::utils::http::read_body_counted(resp).await {
+            let marker_evidence =
+                crate::scanning::check_dom_verification::classify_dom_evidence_for_response(
+                    payload, &text, &ct,
+                ) == Some(crate::scanning::check_dom_verification::DomEvidenceKind::Marker);
+            // 1) Payload reflection present after normalization
+            if crate::scanning::check_reflection::classify_reflection(&text, payload).is_some() {
+                if marker_evidence {
+                    return (true, Some(text), Some("marker-reflected".to_string()));
+                }
+                note = Some("payload reflection without marker evidence".to_string());
+            }
+            // 2) Marker element present
+            if marker_evidence {
+                return (true, Some(text), Some("marker element present".to_string()));
+            }
+            // 3) CSP hint
+            if let Some(cspv) = csp {
+                let has_unsafe_inline = cspv
+                    .split(';')
+                    .any(|d| d.contains("script-src") && d.contains("'unsafe-inline'"));
+                if !has_unsafe_inline {
+                    note = Some("CSP may block inline handlers".to_string());
+                }
+            }
+            return (false, Some(text), note);
+        }
+    }
+    (false, None, note)
+}
+
+#[cfg(test)]
+mod tests;

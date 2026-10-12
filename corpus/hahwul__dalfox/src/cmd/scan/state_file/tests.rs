@@ -1,0 +1,817 @@
+//! `--state-file` resume behavior. The contract these pin down: a completed
+//! target is skipped exactly once the configuration still matches, and every
+//! other outcome (cancelled, error, torn line, changed config) is retried.
+
+use super::*;
+use std::io::Read;
+
+/// Unique scratch path per test. `Instant`-derived names collide when two
+/// tests land in the same tick (see the HAR-fixture fix in #1284), so the name
+/// is derived from a per-process counter plus the test-supplied label.
+fn scratch(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "dalfox_state_{}_{}_{}.jsonl",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed),
+        label
+    ));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+fn read(path: &std::path::Path) -> String {
+    let mut s = String::new();
+    std::fs::File::open(path)
+        .expect("state file exists")
+        .read_to_string(&mut s)
+        .expect("state file is utf-8");
+    s
+}
+
+fn args_with(path: &std::path::Path) -> ScanArgs {
+    ScanArgs {
+        state_file: Some(path.to_string_lossy().to_string()),
+        silence: true,
+        ..Default::default()
+    }
+}
+
+fn test_target(url: &str, method: &str) -> crate::target_parser::Target {
+    let mut target = crate::target_parser::Target::for_url(url::Url::parse(url).unwrap());
+    target.method = method.to_string();
+    target
+}
+
+fn record(sf: &StateFile, url: &str, method: &str, outcome: TargetOutcome) {
+    sf.record(&test_target(url, method), outcome);
+}
+
+fn is_completed(sf: &StateFile, url: &str, method: &str) -> bool {
+    sf.is_completed(&test_target(url, method))
+}
+
+#[test]
+fn new_file_gets_a_header_and_no_completions() {
+    let path = scratch("new");
+    let args = args_with(&path);
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+
+    assert_eq!(sf.completed_count(), 0);
+    assert!(sf.reset_reason.is_none(), "a first run is not a reset");
+
+    let contents = read(&path);
+    let header: serde_json::Value =
+        serde_json::from_str(contents.lines().next().unwrap()).expect("header is JSON");
+    assert_eq!(header["dalfox_state"], STATE_FORMAT_VERSION);
+    assert_eq!(header["config_hash"], config_hash(&args));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn completed_targets_are_skipped_on_the_next_run() {
+    let path = scratch("resume");
+    let args = args_with(&path);
+
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/?q=1", "GET", TargetOutcome::Completed);
+        record(&sf, "https://b.test/?q=1", "POST", TargetOutcome::Completed);
+    }
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert_eq!(sf.completed_count(), 2);
+    assert!(is_completed(&sf, "https://a.test/?q=1", "GET"));
+    assert!(is_completed(&sf, "https://b.test/?q=1", "POST"));
+    // The method is part of the identity: the same URL under another method is
+    // a different target and must still be scanned.
+    assert!(!is_completed(&sf, "https://a.test/?q=1", "POST"));
+    assert!(!is_completed(&sf, "https://c.test/?q=1", "GET"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A target whose findings are still only in memory is not skippable until the
+/// report holding them is out: a process that dies between the two leaves it
+/// to be scanned again.
+#[test]
+fn a_deferred_completion_is_not_skippable_until_committed() {
+    let path = scratch("deferred");
+    let args = args_with(&path);
+
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        sf.defer_completed(&test_target("https://a.test/?q=1", "GET"));
+        record(&sf, "https://b.test/?q=1", "GET", TargetOutcome::Completed);
+        // "Killed" here: dropped without commit_deferred.
+    }
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert!(!is_completed(&sf, "https://a.test/?q=1", "GET"));
+    assert!(is_completed(&sf, "https://b.test/?q=1", "GET"));
+    drop(sf);
+
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        sf.defer_completed(&test_target("https://a.test/?q=1", "GET"));
+        sf.commit_deferred();
+        sf.commit_deferred(); // draining twice must not re-append
+    }
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert!(is_completed(&sf, "https://a.test/?q=1", "GET"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn changed_raw_http_request_body_is_not_skipped_as_completed() {
+    let path = scratch("raw-http-body");
+    let first = crate::target_parser::parse_raw_http_request(
+        "POST http://example.test/submit HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nold=1",
+    )
+    .expect("parse first capture");
+    let changed = crate::target_parser::parse_raw_http_request(
+        "POST http://example.test/submit HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nnew=1",
+    )
+    .expect("parse changed capture");
+    assert_eq!(first.url, changed.url);
+    assert_eq!(first.method, changed.method);
+    assert_ne!(first.data, changed.data);
+
+    let args = args_with(&path);
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        sf.record(&first, TargetOutcome::Completed);
+    }
+    assert!(
+        !read(&path).contains("old=1"),
+        "the state file must fingerprint raw request data without persisting its contents"
+    );
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert!(
+        !sf.is_completed(&changed),
+        "a captured request with a different body can test different parameters and must not reuse the prior completion"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// The core safety rule of the feature: only `completed` may be skipped.
+// A target cut short by Ctrl-C / --scan-timeout, or dropped in preflight, has
+// unknown coverage — skipping it would silently drop it from the campaign.
+#[test]
+fn cancelled_and_error_targets_are_retried() {
+    let path = scratch("retry");
+    let args = args_with(&path);
+
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Cancelled);
+        record(&sf, "https://b.test/", "GET", TargetOutcome::Error);
+        record(&sf, "https://c.test/", "GET", TargetOutcome::Completed);
+    }
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert_eq!(sf.completed_count(), 1);
+    assert!(!is_completed(&sf, "https://a.test/", "GET"));
+    assert!(!is_completed(&sf, "https://b.test/", "GET"));
+    assert!(is_completed(&sf, "https://c.test/", "GET"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_last_recorded_outcome_controls_resume() {
+    let path = scratch("latest-outcome");
+    let args = args_with(&path);
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Completed);
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Cancelled);
+    }
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert!(
+        !is_completed(&sf, "https://a.test/", "GET"),
+        "a later cancelled/error record means the most recent attempt has unknown coverage"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// A retried target whose previous line was `cancelled` completes, then the
+// run-wide transport-loss check downgrades it again. The dedup must compare
+// against the `completed` line this run just wrote, not the `cancelled` one it
+// loaded — otherwise the downgrade is dropped as a duplicate and the next run
+// skips a target whose coverage is unknown.
+#[test]
+fn a_downgrade_after_this_runs_completion_is_not_deduped_against_the_loaded_outcome() {
+    let path = scratch("downgrade-after-retry");
+    let args = args_with(&path);
+    let target = test_target("https://a.test/", "GET");
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        sf.record(&target, TargetOutcome::Cancelled);
+    }
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+        sf.record(&target, TargetOutcome::Completed);
+        sf.downgrade_completed(sf.identity(&target));
+    }
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert!(
+        !sf.is_completed(&target),
+        "the downgrade must land after this run's completion: {}",
+        read(&path)
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// The downgrade only rewrites a `completed` record. A target that is down on
+// every run records `error`; re-labelling it `cancelled` each time would
+// alternate two lines per run forever.
+#[test]
+fn a_downgrade_leaves_retryable_outcomes_alone() {
+    let path = scratch("downgrade-bounded");
+    let args = args_with(&path);
+    let down = test_target("https://down.test/", "GET");
+    let never = test_target("https://never.test/", "GET");
+
+    for _ in 0..4 {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        sf.record(&down, TargetOutcome::Error);
+        sf.downgrade_completed(sf.identity(&down));
+        // Nothing on record at all: nothing to downgrade either.
+        sf.downgrade_completed(sf.identity(&never));
+    }
+
+    let contents = read(&path);
+    assert_eq!(
+        contents.lines().count(),
+        2,
+        "header + one `error` line, not one or two per run: {contents}"
+    );
+    assert!(!contents.contains("cancelled"), "{contents}");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// A hard kill can leave the final line half-written. That line is skipped, and
+// every complete record before it still counts — losing the whole file to one
+// torn tail would defeat the point of an append-only log.
+#[test]
+fn a_torn_final_line_is_skipped_and_earlier_records_survive() {
+    let path = scratch("torn");
+    let args = args_with(&path);
+
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Completed);
+    }
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append");
+        write!(f, "{{\"target\":\"https://b.test/\",\"meth").expect("torn write");
+    }
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert_eq!(sf.corrupt_lines, 1);
+    assert!(is_completed(&sf, "https://a.test/", "GET"));
+    assert!(sf.reset_reason.is_none(), "a torn tail is not a reset");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// The resumed run's first record must not be glued onto the torn fragment, or
+// that target is lost and the "unreadable line" warning never goes away.
+#[test]
+fn a_record_appended_after_a_torn_tail_stays_readable() {
+    let path = scratch("torn-append");
+    let args = args_with(&path);
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Completed);
+    }
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(f, "{{\"target\":\"https://b.test/\",\"meth").unwrap();
+    }
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+        record(&sf, "https://c.test/", "GET", TargetOutcome::Completed);
+    }
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens again");
+    assert!(is_completed(&sf, "https://c.test/", "GET"));
+    assert!(is_completed(&sf, "https://a.test/", "GET"));
+    assert_eq!(sf.corrupt_lines, 1, "only the torn fragment is unreadable");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// `echo > scan.state` leaves one byte, so a length check alone skipped the
+// header and the next run refused the file dalfox itself had just written.
+#[test]
+fn a_whitespace_only_file_gets_a_header_and_stays_resumable() {
+    let path = scratch("blank");
+    let args = args_with(&path);
+    std::fs::write(&path, "\n").unwrap();
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Completed);
+    }
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("resumes");
+    assert!(is_completed(&sf, "https://a.test/", "GET"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// Changing a scan-affecting flag means the recorded targets were tested under
+// different settings, so they are not comparable: the file resets rather than
+// skipping targets the new configuration has never covered.
+#[test]
+fn a_changed_configuration_resets_the_file() {
+    let path = scratch("rehash");
+    let args = args_with(&path);
+
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Completed);
+    }
+
+    let changed = ScanArgs {
+        deep_scan: true,
+        ..args_with(&path)
+    };
+    let sf = StateFile::open(path.to_str().unwrap(), &changed).expect("reopens");
+    assert!(sf.reset_reason.is_some(), "a config change must reset");
+    assert_eq!(sf.completed_count(), 0);
+
+    // Reset starts a *new* file, and the header carries the new hash so the
+    // next run matches this one.
+    let contents = read(&path);
+    assert_eq!(
+        contents.lines().count(),
+        1,
+        "the fresh file holds only its header: {contents}"
+    );
+    let header: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+    assert_eq!(header["config_hash"], config_hash(&changed));
+
+    // The prior file is real work — an authenticated campaign resumed with a
+    // rotated cookie lands here — so it is moved aside, never destroyed.
+    let backup = sf.reset_backup.clone().expect("the old file is kept");
+    let kept = read(std::path::Path::new(&backup));
+    assert!(
+        kept.contains("https://a.test/"),
+        "the discarded completions must still be recoverable: {kept}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&backup);
+}
+
+// A readable file that is not a state file is refused, not overwritten. One
+// typo (`--state-file urls.txt`) would otherwise eat the target list.
+#[test]
+fn a_file_that_is_not_a_state_file_is_refused_not_overwritten() {
+    let path = scratch("foreign");
+    let original = "https://a.test/?q=1\nhttps://b.test/?q=1\n";
+    std::fs::write(&path, original).expect("write");
+    let args = args_with(&path);
+
+    let Err(err) = StateFile::open(path.to_str().unwrap(), &args) else {
+        panic!("a foreign file must not be adopted as a state file");
+    };
+    assert!(
+        err.contains("not a dalfox state file"),
+        "the message has to name the problem: {err}"
+    );
+    assert_eq!(read(&path), original, "the file must be left untouched");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// The preview modes filter their plan through the recorded completions but
+// scan nothing, so they must not create, extend, or set aside the file.
+// Pricing out a different flag set with `--dry-run` is exactly when an
+// operator would otherwise lose a campaign to a hash mismatch.
+#[test]
+fn a_read_only_open_never_touches_the_file() {
+    let path = scratch("readonly");
+    let args = args_with(&path);
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Completed);
+    }
+    let before = read(&path);
+
+    // Same configuration: completions are still visible to the preview.
+    let sf = StateFile::open_read_only(path.to_str().unwrap(), &args).expect("opens read-only");
+    assert!(is_completed(&sf, "https://a.test/", "GET"));
+    record(&sf, "https://b.test/", "GET", TargetOutcome::Completed);
+    drop(sf);
+    assert_eq!(read(&path), before, "a preview may not write records");
+
+    // Changed configuration: the preview reports the mismatch but leaves both
+    // the file and any `.bak` sibling alone.
+    let changed = ScanArgs {
+        deep_scan: true,
+        ..args_with(&path)
+    };
+    let sf = StateFile::open_read_only(path.to_str().unwrap(), &changed).expect("opens read-only");
+    assert!(sf.reset_reason.is_some(), "the mismatch is still reported");
+    assert!(sf.reset_backup.is_none(), "a preview resets nothing");
+    drop(sf);
+    assert_eq!(read(&path), before, "a preview may not reset the file");
+    assert!(!std::path::Path::new(&format!("{}.bak", path.display())).exists());
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// A target that keeps failing must not add a line per run: the file would grow
+// until it crossed the read cap, and then the campaign could not be resumed at
+// all — the failure this feature exists to prevent, arrived at slowly.
+#[test]
+fn a_repeated_outcome_is_not_appended_again() {
+    let path = scratch("bounded");
+    let args = args_with(&path);
+
+    for _ in 0..5 {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://down.test/", "GET", TargetOutcome::Error);
+        record(&sf, "https://slow.test/", "GET", TargetOutcome::Cancelled);
+    }
+
+    let contents = read(&path);
+    assert_eq!(
+        contents.lines().count(),
+        3,
+        "header + one line per (target, outcome), not per run: {contents}"
+    );
+
+    // A target whose outcome *changes* is still recorded, or resume would
+    // never learn that a retried target finally completed.
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://slow.test/", "GET", TargetOutcome::Completed);
+    }
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert!(is_completed(&sf, "https://slow.test/", "GET"));
+    assert!(!is_completed(&sf, "https://down.test/", "GET"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// An existing file we cannot read is *not* reset: truncating it would destroy
+// a campaign's recorded progress sight unseen. The run stops and says so.
+#[test]
+fn an_unreadable_existing_file_fails_instead_of_being_truncated() {
+    let path = scratch("unreadable");
+    // A file over the read cap stands in for "exists, cannot be read back".
+    std::fs::write(&path, "x").expect("write");
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open");
+    f.set_len(MAX_STATE_FILE_BYTES + 1).expect("grow past cap");
+    drop(f);
+
+    let args = args_with(&path);
+    let Err(err) = StateFile::open(path.to_str().unwrap(), &args) else {
+        panic!("an unreadable state file must fail the run, not be overwritten");
+    };
+    assert!(err.contains("move it aside"), "actionable message: {err}");
+    assert!(
+        std::fs::metadata(&path).expect("still there").len() > MAX_STATE_FILE_BYTES,
+        "the file must be left exactly as it was"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// Output and pacing flags cannot change what a completed target covered, so
+// they must not invalidate progress — an operator who resumes with a longer
+// --scan-timeout or a different --format would otherwise redo the whole run.
+#[test]
+fn reporting_and_pacing_flags_do_not_change_the_hash() {
+    let base = ScanArgs::default();
+    let hash = config_hash(&base);
+
+    for tweak in [
+        ScanArgs {
+            format: "json".to_string(),
+            ..Default::default()
+        },
+        ScanArgs {
+            output: Some("out.json".to_string()),
+            ..Default::default()
+        },
+        ScanArgs {
+            silence: true,
+            ..Default::default()
+        },
+        ScanArgs {
+            baseline: Some("baseline.json".to_string()),
+            ..Default::default()
+        },
+        ScanArgs {
+            state_file: Some("other.state".to_string()),
+            ..Default::default()
+        },
+        ScanArgs {
+            scan_timeout: 600,
+            ..Default::default()
+        },
+        ScanArgs {
+            workers: 4,
+            ..Default::default()
+        },
+        ScanArgs {
+            delay: 250,
+            ..Default::default()
+        },
+        // The target list itself: one state file legitimately covers a shell
+        // loop of per-URL invocations.
+        ScanArgs {
+            targets: vec!["https://a.test/".to_string()],
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            config_hash(&tweak),
+            hash,
+            "this flag must not invalidate recorded progress: {:?}",
+            tweak
+        );
+    }
+}
+
+// The other direction: anything that changes which payloads are sent, which
+// parameters are found, or what counts as a finding must invalidate progress.
+#[test]
+fn scan_affecting_flags_change_the_hash() {
+    let base = config_hash(&ScanArgs::default());
+
+    for tweak in [
+        ScanArgs {
+            deep_scan: true,
+            ..Default::default()
+        },
+        ScanArgs {
+            encoders: vec!["base64".to_string()],
+            ..Default::default()
+        },
+        ScanArgs {
+            skip_mining: true,
+            ..Default::default()
+        },
+        ScanArgs {
+            skip_discovery: true,
+            ..Default::default()
+        },
+        ScanArgs {
+            waf_evasion: true,
+            ..Default::default()
+        },
+        ScanArgs {
+            custom_payload: Some("payloads.txt".to_string()),
+            ..Default::default()
+        },
+        ScanArgs {
+            max_payloads_per_param: 100,
+            ..Default::default()
+        },
+        ScanArgs {
+            cookies: vec!["session=abc".to_string()],
+            ..Default::default()
+        },
+        ScanArgs {
+            limit: Some(10),
+            ..Default::default()
+        },
+        // Both decide which findings count toward `--limit`'s early stop.
+        ScanArgs {
+            only_poc: vec!["v".to_string()],
+            ..Default::default()
+        },
+        ScanArgs {
+            min_confidence: Some("high".to_string()),
+            ..Default::default()
+        },
+        ScanArgs {
+            max_targets_per_host: 5,
+            ..Default::default()
+        },
+    ] {
+        assert_ne!(
+            config_hash(&tweak),
+            base,
+            "this flag changes coverage and must reset progress: {:?}",
+            tweak
+        );
+    }
+}
+
+// Records are appended, never rewritten, so a resumed run keeps the history of
+// every run before it in one file.
+#[test]
+fn records_from_later_runs_are_appended_to_the_same_file() {
+    let path = scratch("append");
+    let args = args_with(&path);
+
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("opens");
+        record(&sf, "https://a.test/", "GET", TargetOutcome::Completed);
+    }
+    {
+        let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+        record(&sf, "https://b.test/", "GET", TargetOutcome::Completed);
+    }
+
+    let contents = read(&path);
+    assert_eq!(
+        contents.lines().count(),
+        3,
+        "one header + two records: {contents}"
+    );
+
+    let sf = StateFile::open(path.to_str().unwrap(), &args).expect("reopens");
+    assert_eq!(sf.completed_count(), 2);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// A path that cannot be opened for writing fails the run up front. Discovering
+// after a two-hour scan that nothing was recorded is the exact failure the
+// feature exists to prevent.
+#[test]
+fn an_unwritable_path_is_an_error_not_a_silent_no_op() {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("dalfox_state_dir_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A directory can never be opened for writing.
+    let args = args_with(&dir);
+    let Err(err) = StateFile::open(dir.to_str().unwrap(), &args) else {
+        panic!("opening a directory as a state file must fail");
+    };
+    assert!(
+        err.contains("--state-file"),
+        "operator-facing message: {err}"
+    );
+
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
+fn credential_headers_are_recognised_by_name() {
+    for name in [
+        "Cookie",
+        "authorization",
+        "Proxy-Authorization",
+        "X-Api-Key",
+        "Partner-Api-Key",
+        "X-Auth-Token",
+        "X-CSRF-Token",
+        "X-XSRF-Token",
+        "X-Session-Token",
+        "X-Client-Session-Id",
+        "X-Amz-Security-Token",
+        "X-Access-Key",
+        "X-JWT-Assertion",
+    ] {
+        assert!(is_credential_header(name), "{name}");
+    }
+    // Ordinary headers that merely contain a credential-ish word.
+    for name in [
+        "User-Agent",
+        "Accept-Language",
+        "X-Forwarded-For",
+        "X-Tenant",
+        "X-Author",
+        "Author",
+        "X-Authority",
+        "Oauth-Scope",
+        "X-Session-Lang",
+        "X-Signature-Version",
+        "Tokenizer-Mode",
+    ] {
+        assert!(!is_credential_header(name), "{name}");
+    }
+}
+
+// Re-authenticating before a resume rotates credential values; that must not
+// reset the campaign. Adding a credential (a new name) still does.
+#[test]
+fn credential_values_do_not_change_the_hash_but_names_do() {
+    let with = |headers: &[&str], cookies: &[&str], raw: Option<&str>| {
+        config_hash(&ScanArgs {
+            headers: headers.iter().map(|s| s.to_string()).collect(),
+            cookies: cookies.iter().map(|s| s.to_string()).collect(),
+            cookie_from_raw: raw.map(str::to_string),
+            ..Default::default()
+        })
+    };
+    let base = with(
+        &["Authorization: Bearer a", "X-Tenant: acme"],
+        &["sid=a; lang=en"],
+        Some("req1.txt"),
+    );
+    assert_eq!(
+        base,
+        with(
+            &["Authorization: Bearer b", "X-Tenant: acme"],
+            &["sid=b; lang=ko"],
+            Some("req2.txt"),
+        )
+    );
+    assert_ne!(
+        base,
+        with(
+            &["Authorization: Bearer a", "X-Tenant: other"],
+            &["sid=a; lang=en"],
+            Some("req1.txt"),
+        ),
+        "a non-credential header value counts"
+    );
+    assert_ne!(
+        base,
+        with(
+            &["Authorization: Bearer a", "X-Tenant: acme"],
+            &["sid=a; lang=en; csrf=x"],
+            Some("req1.txt"),
+        ),
+        "an added cookie counts"
+    );
+}
+
+// Run-wide credentials (-H / --cookies) rotate on re-login and are left out;
+// the same header inside an imported capture defines a distinct request.
+#[test]
+fn target_identity_ignores_only_run_wide_credential_values() {
+    let t = |cookie: &str, auth: &str, tenant: &str| {
+        let mut t = test_target("http://example.test/a?q=1", "GET");
+        t.cookies = vec![("sid".to_string(), cookie.to_string())];
+        t.headers = vec![
+            ("Authorization".to_string(), auth.to_string()),
+            ("X-Tenant".to_string(), tenant.to_string()),
+        ];
+        t
+    };
+    let cli_for = |cookie: &str, auth: &str| {
+        CliCredentials::from_args(&ScanArgs {
+            headers: vec![format!("Authorization: {auth}")],
+            cookies: vec![format!("sid={cookie}")],
+            ..Default::default()
+        })
+    };
+    let (a, b) = (cli_for("a", "Bearer a"), cli_for("b", "Bearer b"));
+    assert_eq!(
+        target_identity(&t("a", "Bearer a", "acme"), &a),
+        target_identity(&t("b", "Bearer b", "acme"), &b),
+        "rotated run-wide credentials keep the identity"
+    );
+    assert_ne!(
+        target_identity(&t("a", "Bearer a", "acme"), &a),
+        target_identity(&t("a", "Bearer a", "other"), &a),
+    );
+    // No run-wide credentials: the capture's own values count.
+    let none = CliCredentials::default();
+    assert_ne!(
+        target_identity(&t("a", "Bearer tenant-a", "acme"), &none),
+        target_identity(&t("a", "Bearer tenant-b", "acme"), &none),
+        "captures differing only by Authorization are distinct requests"
+    );
+}
+
+// `-H 'Cookie: …'` is lifted into `target.cookies` at target resolution, so a
+// rotated session in that header must still resume rather than reset.
+#[test]
+fn target_identity_ignores_rotated_cookie_header_values() {
+    let identity = |sid: &str| {
+        let args = ScanArgs {
+            headers: vec![format!("Cookie: sid={sid}; lang=en")],
+            ..Default::default()
+        };
+        let mut t = test_target("http://example.test/a?q=1", "GET");
+        t.cookies = vec![
+            ("sid".to_string(), sid.to_string()),
+            ("lang".to_string(), "en".to_string()),
+        ];
+        target_identity(&t, &CliCredentials::from_args(&args))
+    };
+    assert_eq!(identity("a"), identity("b"));
+}

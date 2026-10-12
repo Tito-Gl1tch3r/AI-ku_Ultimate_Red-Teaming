@@ -1,0 +1,893 @@
+/* Copyright 2012-2017 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include "arkime.h"
+
+//#define SMBDEBUG
+
+extern ArkimeConfig_t   config;
+
+LOCAL  int domainField;
+LOCAL  int userField;
+LOCAL  int hostField;
+LOCAL  int osField;
+LOCAL  int verField;
+LOCAL  int fnField;
+LOCAL  int shareField;
+LOCAL  int dialectField;
+
+#define MAX_SMB_BUFFER 8192
+#define MAX_SMB1_DIALECTS 10
+typedef struct {
+    char               buf[2][MAX_SMB_BUFFER];
+    uint32_t           remlen[2];
+    short              buflen[2];
+    uint16_t           flags2[2];
+    uint8_t            version[2];
+    char               state[2];
+    char               nextState[2];
+    uint32_t           nextRemlen[2];
+    uint16_t           andxOffset[2];
+    char              *dialects[MAX_SMB1_DIALECTS];
+    uint8_t            dialectsLen;
+} SMBInfo_t;
+
+// States
+#define SMB_NETBIOS             0
+#define SMB_SMBHEADER           1
+#define SMB_SKIP                2
+#define SMB1_TREE_CONNECT_ANDX 10
+#define SMB1_DELETE            11
+#define SMB1_OPEN_ANDX         12
+#define SMB1_CREATE_ANDX       13
+#define SMB1_SETUP_ANDX        14
+#define SMB1_NEGOTIATE_REQ     15
+#define SMB1_NEGOTIATE_RSP     16
+#define SMB1_ANDX_SKIP         17
+
+#define SMB2_TREE_CONNECT      20
+#define SMB2_CREATE            21
+#define SMB2_NEGOTIATE         22
+
+// SMB1 Flags
+#define SMB1_FLAGS_REPLY       0x80
+#define SMB1_FLAGS2_UNICODE    0x8000
+
+// SMB2 Flags
+#define SMB2_FLAGS_SERVER_TO_REDIR 0x00000001
+
+/******************************************************************************/
+LOCAL void smb_add_string(ArkimeSession_t *session, int field, const char *buf, int len, int useunicode)
+{
+    if (len == 0)
+        return;
+
+    GError *error = 0;
+    gsize bread, bwritten;
+
+    if (useunicode) {
+        char *out = g_convert(buf, len, "utf-8", "ucs-2le", &bread, &bwritten, &error);
+        if (error) {
+            if (config.debug)
+                LOG("ERROR %s", error->message);
+            g_error_free(error);
+        } else {
+            if (!arkime_field_string_add(field, session, out, -1, FALSE)) {
+                g_free(out);
+            }
+        }
+    } else {
+        arkime_field_string_add(field, session, buf, len, TRUE);
+    }
+}
+/******************************************************************************/
+// 2.2.13 AUTHENTICATE_MESSAGE from  http://download.microsoft.com/download/9/5/E/95EF66AF-9026-4BB0-A41D-A4F81802D92C/[MS-NLMP].pdf
+LOCAL void smb_security_blob(ArkimeSession_t *session, uint8_t *data, int len)
+{
+    BSB bsb;
+
+    /* Some clients put raw NTLMSSP directly in the SMB security blob (no
+     * GSS-API/SPNEGO wrapping); detect and dispatch to the shared decoder. */
+    if (len >= 8 && memcmp(data, "NTLMSSP\0", 8) == 0) {
+        arkime_parsers_ntlm_decode(session, data, len);
+        return;
+    }
+
+    BSB_INIT(bsb, data, len);
+
+    uint32_t apc, atag, alen;
+    uint8_t *value = arkime_parsers_asn_get_tlv(&bsb, &apc, &atag, &alen);
+
+    if (!value || atag != 1)
+        return;
+
+    BSB_INIT(bsb, value, alen);
+    value = arkime_parsers_asn_get_tlv(&bsb, &apc, &atag, &alen);
+
+    if (!value || atag != 16)
+        return;
+
+    BSB_INIT(bsb, value, alen);
+    value = arkime_parsers_asn_get_tlv(&bsb, &apc, &atag, &alen);
+    if (!value || atag != 2)
+        return;
+
+    BSB_INIT(bsb, value, alen);
+    value = arkime_parsers_asn_get_tlv(&bsb, &apc, &atag, &alen);
+
+    if (!value || atag != 4 || alen < 7 || memcmp("NTLMSSP", value, 7) != 0)
+        return;
+
+    /* Also feed the full NTLMSSP blob to the shared decoder so user/host/domain
+     * land in the global ntlm.* fields alongside the legacy smb.* fields. */
+    arkime_parsers_ntlm_decode(session, value, alen);
+
+    /* Woot, have the part we need to decode */
+    BSB_INIT(bsb, value, alen);
+    BSB_IMPORT_skip(bsb, 8);
+
+    int type = 0;
+    BSB_LIMPORT_u32(bsb, type);
+
+    if (type != 3) // auth type
+        return;
+
+    uint32_t lens[6], offsets[6];
+    for (int i = 0; i < ARRAY_LEN(lens); i++) {
+        BSB_LIMPORT_u16(bsb, lens[i]);
+        BSB_IMPORT_skip(bsb, 2);
+        BSB_LIMPORT_u32(bsb, offsets[i]);
+
+        if (BSB_IS_ERROR(bsb) || offsets[i] > BSB_SIZE(bsb) || lens[i] > BSB_SIZE(bsb) - offsets[i]) {
+            arkime_session_add_tag(session, "smb:bad-security-blob");
+            return;
+        }
+    }
+
+    if (BSB_IS_ERROR(bsb))
+        return;
+
+    if (lens[2]) {
+        smb_add_string(session, domainField, (char *)value + offsets[2], lens[2], TRUE);
+    }
+    if (lens[3]) {
+        smb_add_string(session, userField, (char *)value + offsets[3], lens[3], TRUE);
+    }
+    if (lens[4]) {
+        smb_add_string(session, hostField, (char *)value + offsets[4], lens[4], TRUE);
+    }
+}
+/******************************************************************************/
+LOCAL void smb1_str_null_split(char *buf, int len, char **out, int max)
+{
+    memset(out, 0, max * sizeof(char *));
+    int start = 0;
+    for (int i = 0, p = 0; i < len && p < max; i++) {
+        if (buf[i] == 0) {
+            out[p] = buf + start;
+            start = i + 1;
+            p++;
+        }
+    }
+}
+/******************************************************************************/
+LOCAL void smb1_parse_osverdomain(ArkimeSession_t *session, char *buf, int len, int useunicode)
+{
+    char        *out;
+    gsize        bread, bwritten;
+    GError      *error = 0;
+
+    if (useunicode)
+        out = g_convert(buf, len, "utf-8", "ucs-2le", &bread, &bwritten, &error);
+    else {
+        out = buf;
+        bwritten = len;
+    }
+
+    if (error) {
+        if (config.debug)
+            LOG("ERROR %s", error->message);
+        g_error_free(error);
+        return;
+    }
+
+    char *outs[3];
+    smb1_str_null_split(out, bwritten, outs, 3);
+
+    if (outs[0] && *outs[0])
+        arkime_field_string_add(osField, session, outs[0], -1, TRUE);
+    if (outs[1] && *outs[1])
+        arkime_field_string_add(verField, session, outs[1], -1, TRUE);
+    if (outs[2] && *outs[2])
+        arkime_field_string_add(domainField, session, outs[2], -1, TRUE);
+
+    if (useunicode) {
+        g_free(out);
+    }
+}
+/******************************************************************************/
+LOCAL void smb1_parse_userdomainosver(ArkimeSession_t *session, char *buf, int len, int useunicode)
+{
+    char        *out;
+    gsize        bread, bwritten;
+    GError      *error = 0;
+
+    if (useunicode)
+        out = g_convert(buf, len, "utf-8", "ucs-2le", &bread, &bwritten, &error);
+    else {
+        out = buf;
+        bwritten = len;
+    }
+
+    if (error) {
+        if (config.debug)
+            LOG("ERROR %s", error->message);
+        g_error_free(error);
+        return;
+    }
+
+    char *outs[4];
+    smb1_str_null_split(out, bwritten, outs, 4);
+
+    if (outs[0] && *outs[0])
+        arkime_field_string_add(userField, session, outs[0], -1, TRUE);
+    if (outs[1] && *outs[1])
+        arkime_field_string_add(domainField, session, outs[1], -1, TRUE);
+    if (outs[2] && *outs[2])
+        arkime_field_string_add(osField, session, outs[2], -1, TRUE);
+    if (outs[3] && *outs[3])
+        arkime_field_string_add(verField, session, outs[3], -1, TRUE);
+
+    if (useunicode) {
+        g_free(out);
+    }
+}
+/******************************************************************************/
+LOCAL void smb1_parse_negotiate_request(SMBInfo_t *smb, char *buf, int len)
+{
+    BSB bsb;
+    BSB_INIT(bsb, buf, len);
+
+    if (smb->dialectsLen >= MAX_SMB1_DIALECTS)
+        return;
+
+    while (BSB_REMAINING(bsb) > 0) {
+        BSB_IMPORT_skip(bsb, 1);
+        const char *start = (char *)BSB_WORK_PTR(bsb);
+        while (BSB_REMAINING(bsb) > 0 && *(BSB_WORK_PTR(bsb)) != 0)
+            BSB_IMPORT_skip(bsb, 1);
+        if (BSB_REMAINING(bsb) == 0)
+            break;
+        smb->dialects[smb->dialectsLen] = g_strdup(start);
+        smb->dialectsLen++;
+        if (smb->dialectsLen >= MAX_SMB1_DIALECTS)
+            break;
+        BSB_IMPORT_skip(bsb, 1);
+    }
+}
+/******************************************************************************/
+/* Subtract the bytes a command handler consumed from the declared NetBIOS
+ * message length. Malformed messages (bogus wordcount/offset/length fields)
+ * can consume past the message end; clamp instead of underflowing *remlen. */
+LOCAL void smb_remlen_consume(uint32_t *remlen, const uint8_t *start, const uint8_t *now)
+{
+    uint32_t consumed = (uint32_t)(now - start);
+    if (consumed > *remlen)
+        *remlen = 0;
+    else
+        *remlen -= consumed;
+}
+/******************************************************************************/
+LOCAL char smb1_request_state(uint8_t cmd)
+{
+    switch (cmd) {
+    case 0x06:
+        return SMB1_DELETE;
+    case 0x2d:
+        return SMB1_OPEN_ANDX;
+    case 0x72:
+        return SMB1_NEGOTIATE_REQ;
+    case 0x73:
+        return SMB1_SETUP_ANDX;
+    case 0x75:
+        return SMB1_TREE_CONNECT_ANDX;
+    case 0xa2:
+        return SMB1_CREATE_ANDX;
+    case 0x24: // LOCKING_ANDX
+    case 0x2e: // READ_ANDX
+    case 0x2f: // WRITE_ANDX
+    case 0x74: // LOGOFF_ANDX
+        return SMB1_ANDX_SKIP;
+    default:
+        return SMB_SKIP;
+    }
+}
+/******************************************************************************/
+// An AndX block names the next command and its offset from the SMB header, limit this
+// block to the bytes before it and queue the next one
+LOCAL void smb1_andx_next(SMBInfo_t *smb, const BSB *bsb, uint32_t *remlen, int which)
+{
+    if (*remlen < 5 || BSB_REMAINING(*bsb) < 5 || BSB_WORK_PTR(*bsb)[0] < 2)
+        return;
+
+    const uint8_t *p = BSB_WORK_PTR(*bsb);
+    const uint8_t  cmd = p[1];
+    const uint16_t offset = p[3] | (p[4] << 8);
+
+    if (cmd == 0xff || offset <= smb->andxOffset[which] || offset - smb->andxOffset[which] > *remlen)
+        return;
+
+    smb->nextRemlen[which] = *remlen - (offset - smb->andxOffset[which]);
+    smb->nextState[which] = smb1_request_state(cmd);
+    *remlen = offset - smb->andxOffset[which];
+    smb->andxOffset[which] = offset;
+}
+/******************************************************************************/
+LOCAL int smb1_parse(ArkimeSession_t *session, SMBInfo_t *smb, BSB *bsb, char *state, uint32_t *remlen, int which)
+{
+    const uint8_t *start = BSB_WORK_PTR(*bsb);
+
+    switch (*state) {
+    case SMB_SMBHEADER: {
+        uint8_t  cmd    = 0;
+        uint8_t  flags = 0;
+        if (BSB_REMAINING(*bsb) < 32) {
+            return 1;
+        }
+        BSB_IMPORT_skip(*bsb, 4);
+        BSB_IMPORT_u08(*bsb, cmd);
+        BSB_IMPORT_skip(*bsb, 4);
+        BSB_IMPORT_u08(*bsb, flags);
+        BSB_LIMPORT_u16(*bsb, smb->flags2[which]);
+        BSB_IMPORT_skip(*bsb, 20);
+        smb->andxOffset[which] = 32;
+        if ((flags & SMB1_FLAGS_REPLY) == 0) {
+            *state = smb1_request_state(cmd);
+        } else {
+            switch (cmd) {
+            case 0x72:
+                *state = SMB1_NEGOTIATE_RSP;
+                break;
+            default:
+                *state = SMB_SKIP;
+            }
+        }
+#ifdef SMBDEBUG
+        LOG("%d cmd: %x flags2: %x newstate: %d remlen: %u", which, cmd, smb->flags2[which], *state, *remlen);
+#endif
+        break;
+    }
+    case SMB1_CREATE_ANDX:
+    case SMB1_OPEN_ANDX: {
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        smb1_andx_next(smb, bsb, remlen, which);
+        BSB mbsb; // clamp parsing to this message so bogus lengths can't reach the next one
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        int wordcount = 0;
+        BSB_IMPORT_u08(mbsb, wordcount);
+        BSB_IMPORT_skip(mbsb, wordcount * 2 + 3);
+        if (!BSB_IS_ERROR(mbsb))
+            smb_add_string(session, fnField, (char *)BSB_WORK_PTR(mbsb), BSB_REMAINING(mbsb), smb->flags2[which] & SMB1_FLAGS2_UNICODE);
+        break;
+    }
+    case SMB1_DELETE: {
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        BSB mbsb;
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        int wordcount = 0;
+        BSB_IMPORT_u08(mbsb, wordcount);
+        BSB_IMPORT_skip(mbsb, wordcount * 2 + 3);
+        if (!BSB_IS_ERROR(mbsb))
+            smb_add_string(session, fnField, (char *)BSB_WORK_PTR(mbsb), BSB_REMAINING(mbsb), smb->flags2[which] & SMB1_FLAGS2_UNICODE);
+        break;
+    }
+    case SMB1_TREE_CONNECT_ANDX: {
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        smb1_andx_next(smb, bsb, remlen, which);
+        BSB mbsb;
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        int passlength = 0;
+        BSB_IMPORT_skip(mbsb, 6);
+        BSB_IMPORT_u16(mbsb, passlength);
+        BSB_IMPORT_skip(mbsb, 2 + passlength);
+
+        uint32_t offset = (BSB_POSITION(mbsb) % 2 == 0) ? 2 : 1;
+
+        if (BSB_IS_ERROR(mbsb) || offset > BSB_REMAINING(mbsb)) {
+            break;
+        }
+        smb_add_string(session, shareField, (char *)BSB_WORK_PTR(mbsb) + offset, BSB_REMAINING(mbsb) - offset, smb->flags2[which] & SMB1_FLAGS2_UNICODE);
+        break;
+    }
+
+    case SMB1_SETUP_ANDX: { // http://msdn.microsoft.com/en-us/library/ee441849.aspx
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        smb1_andx_next(smb, bsb, remlen, which);
+        BSB mbsb;
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        int wordcount = 0;
+        BSB_IMPORT_u08(mbsb, wordcount);
+
+        if (wordcount == 12) {
+            BSB_IMPORT_skip(mbsb, 14);
+
+            int securitylen = 0;
+            BSB_LIMPORT_u16(mbsb, securitylen);
+
+            BSB_IMPORT_skip(mbsb, 10);
+
+            if (BSB_IS_ERROR(mbsb) || securitylen > (int)BSB_REMAINING(mbsb)) {
+                break;
+            }
+            smb_security_blob(session, BSB_WORK_PTR(mbsb), securitylen);
+            BSB_IMPORT_skip(mbsb, securitylen);
+
+            uint32_t offset = (BSB_POSITION(mbsb) % 2 == 0) ? 0 : 1;
+            BSB_IMPORT_skip(mbsb, offset);
+
+            if (!BSB_IS_ERROR(mbsb)) {
+                smb1_parse_osverdomain(session, (char *)BSB_WORK_PTR(mbsb), BSB_REMAINING(mbsb), smb->flags2[which] & SMB1_FLAGS2_UNICODE);
+            }
+        } else if (wordcount == 13) {
+            BSB_IMPORT_skip(mbsb, 14);
+
+            int ansipw = 0;
+            BSB_LIMPORT_u16(mbsb, ansipw);
+            int upw = 0;
+            BSB_LIMPORT_u16(mbsb, upw);
+
+            BSB_IMPORT_skip(mbsb, 10 + ansipw + upw);
+
+            uint32_t offset = (BSB_POSITION(mbsb) % 2 == 0) ? 0 : 1;
+            BSB_IMPORT_skip(mbsb, offset);
+
+            if (!BSB_IS_ERROR(mbsb)) {
+                smb1_parse_userdomainosver(session, (char *)BSB_WORK_PTR(mbsb), BSB_REMAINING(mbsb), smb->flags2[which] & SMB1_FLAGS2_UNICODE);
+            }
+        }
+
+        break;
+    }
+    case SMB1_ANDX_SKIP: {
+        // Unhandled AndX request, find the chained command before skipping this one
+        if (*remlen >= 5 && BSB_REMAINING(*bsb) < 5) {
+            return 1;
+        }
+        smb1_andx_next(smb, bsb, remlen, which);
+        *state = SMB_SKIP;
+        break;
+    }
+    case SMB1_NEGOTIATE_REQ: {
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        BSB mbsb;
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        BSB_LIMPORT_skip(mbsb, 1); // wordcount
+
+        int bytecount = 0;
+        BSB_LIMPORT_u16(mbsb, bytecount);
+
+        if (bytecount > 0 && !BSB_IS_ERROR(mbsb))
+            smb1_parse_negotiate_request(smb, (char *)BSB_WORK_PTR(mbsb), BSB_REMAINING(mbsb));
+
+        break;
+    }
+    case SMB1_NEGOTIATE_RSP: {
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        BSB mbsb;
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        int wordcount = 0;
+        BSB_IMPORT_u08(mbsb, wordcount);
+
+        if (wordcount < 13) {
+            break;
+        }
+
+        uint16_t dialect = 0;
+        BSB_LIMPORT_u16(mbsb, dialect);
+        if (!BSB_IS_ERROR(mbsb) && dialect < smb->dialectsLen) {
+            arkime_field_string_add(dialectField, session, smb->dialects[dialect], -1, TRUE);
+        }
+
+        break;
+    }
+    } /* switch */
+
+    smb_remlen_consume(remlen, start, BSB_WORK_PTR(*bsb));
+    return 0;
+}
+/******************************************************************************/
+LOCAL int smb2_parse(ArkimeSession_t *session, SMBInfo_t *smb, BSB *bsb, char *state, uint32_t *remlen, int which)
+{
+    const uint8_t *start = BSB_WORK_PTR(*bsb);
+
+    switch (*state) {
+    case SMB_SMBHEADER: {
+        uint16_t  flags = 0;
+        uint16_t  cmd = 0;
+        uint32_t  nextCommand = 0;
+
+        if (BSB_REMAINING(*bsb) < 64) {
+            return 1;
+        }
+        if (*remlen < 64) {
+            // Message declared less data (via the NETBIOS length) than a full SMB2 header
+            // needs - malformed/too short. Skip it rather than reading past remlen and
+            // underflowing *remlen below.
+            *state = SMB_SKIP;
+            break;
+        }
+        BSB_IMPORT_skip(*bsb, 12);
+        BSB_LIMPORT_u16(*bsb, cmd);
+        BSB_IMPORT_skip(*bsb, 2);
+        BSB_LIMPORT_u32(*bsb, flags);
+        BSB_LIMPORT_u32(*bsb, nextCommand);
+        BSB_IMPORT_skip(*bsb, 40);
+
+        if ((flags & SMB2_FLAGS_SERVER_TO_REDIR) == 0) {
+            switch (cmd) {
+            case 0x03:
+                *state = SMB2_TREE_CONNECT;
+                break;
+            case 0x05:
+                *state = SMB2_CREATE;
+                break;
+            default:
+                *state = SMB_SKIP;
+            }
+        } else {
+            switch (cmd) {
+            case 0x00:
+                *state = SMB2_NEGOTIATE;
+                break;
+            default:
+                *state = SMB_SKIP;
+            }
+        }
+#ifdef SMBDEBUG
+        LOG("%d cmd: %x flags: %x newstate: %d remlen: %u", which, cmd, flags, *state, *remlen);
+#endif
+        smb_remlen_consume(remlen, start, BSB_WORK_PTR(*bsb));
+
+        // Compound request or response, the next header is nextCommand bytes from this one
+        if (nextCommand >= 64 && nextCommand - 64 <= *remlen) {
+            smb->nextRemlen[which] = *remlen - (nextCommand - 64);
+            smb->nextState[which] = SMB_SMBHEADER;
+            *remlen = nextCommand - 64;
+        }
+        break;
+    }
+    case SMB2_NEGOTIATE: {
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        BSB mbsb; // clamp parsing to this message so bogus lengths can't reach the next one
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        BSB_IMPORT_skip(mbsb, 4);
+
+        uint16_t  dialect = 0;
+        BSB_LIMPORT_u16(mbsb, dialect);
+        if (!BSB_IS_ERROR(mbsb) && dialect != 0 && dialect != 0x02FF) {
+            char str[13];
+            snprintf(str, sizeof(str), "SMB %d.%d.%d", (dialect >> 8) & 0xf, (dialect >> 4) & 0xf, dialect & 0xf);
+            arkime_field_string_add(dialectField, session, str, -1, TRUE);
+        }
+
+        break;
+    }
+    case SMB2_TREE_CONNECT: {
+        uint16_t  pathoffset = 0;
+        uint16_t  pathlen = 0;
+
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        BSB mbsb;
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        BSB_IMPORT_skip(mbsb, 4);
+        BSB_LIMPORT_u16(mbsb, pathoffset);
+        BSB_LIMPORT_u16(mbsb, pathlen);
+        if (BSB_IS_ERROR(mbsb) || pathoffset < (64 + 8)) {
+            break;
+        }
+        pathoffset -= (64 + 8);
+        BSB_IMPORT_skip(mbsb, pathoffset);
+
+        if (!BSB_IS_ERROR(mbsb) && pathlen <= BSB_REMAINING(mbsb)) {
+            smb_add_string(session, shareField, (char *)BSB_WORK_PTR(mbsb), pathlen, TRUE); // SMB2 strings are always UTF-16LE
+        }
+
+        break;
+    }
+    case SMB2_CREATE: {
+        uint16_t  nameoffset = 0;
+        uint16_t  namelen = 0;
+
+        if (BSB_REMAINING(*bsb) < *remlen) {
+            return 1;
+        }
+        BSB mbsb;
+        BSB_IMPORT_bsb(*bsb, mbsb, *remlen);
+        *remlen = 0;
+        *state = SMB_NETBIOS;
+
+        BSB_IMPORT_skip(mbsb, 44);
+        BSB_LIMPORT_u16(mbsb, nameoffset);
+        BSB_LIMPORT_u16(mbsb, namelen);
+        if (BSB_IS_ERROR(mbsb) || nameoffset < (64 + 48)) {
+            break;
+        }
+        nameoffset -= (64 + 48);
+        BSB_IMPORT_skip(mbsb, nameoffset);
+
+        if (!BSB_IS_ERROR(mbsb) && namelen <= BSB_REMAINING(mbsb)) {
+            gsize bread, bwritten;
+            GError      *error = 0;
+            char *out = g_convert((char *)BSB_WORK_PTR(mbsb), namelen, "utf-8", "ucs-2le", &bread, &bwritten, &error);
+            if (error) {
+                LOG_RATE(5, "ERROR %s", error->message);
+                g_error_free(error);
+            } else {
+                if (!arkime_field_string_add(fnField, session, out, -1, FALSE)) {
+                    g_free(out);
+                }
+            }
+        }
+
+        break;
+    }
+    }
+
+    return 0;
+}
+/******************************************************************************/
+LOCAL int smb_parser(ArkimeSession_t *session, void *uw, const uint8_t *data, int remaining, int which)
+{
+    SMBInfo_t            *smb          = uw;
+    char                 *state        = &smb->state[which];
+    char                 *buf          = smb->buf[which];
+    short                *buflen       = &smb->buflen[which];
+    uint32_t             *remlen       = &smb->remlen[which];
+
+#ifdef SMBDEBUG
+    LOG("ENTER: remaining: %d state: %d buflen: %d remlen: %u", remaining, *state, *buflen, *remlen);
+#endif
+
+    while (remaining > 0) {
+        BSB bsb;
+        int done = 0;
+
+        if (*buflen == 0) {
+            BSB_INIT(bsb, data, remaining);
+            data += remaining;
+            remaining = 0;
+        } else {
+            int len = MIN(remaining, MAX_SMB_BUFFER - (*buflen));
+            memcpy(buf + (*buflen), data, len);
+            (*buflen) += len;
+            remaining -= len;
+            data += len;
+            BSB_INIT(bsb, buf, *buflen);
+        }
+
+        if (*state != SMB_SKIP && *state != SMB1_ANDX_SKIP && *remlen > MAX_SMB_BUFFER) {
+#ifndef FUZZLOCH
+            LOG("WARNING - Not enough room to parse SMB packet of size %u", *remlen);
+#endif
+            arkime_parsers_unregister(session, smb);
+            return 0;
+        }
+
+        while (!done && BSB_REMAINING(bsb) > 0) {
+#ifdef SMBDEBUG
+            LOG(" S: bsbremaining: %u remaining: %d state: %d buflen: %d remlen: %u done: %d", (uint32_t)BSB_REMAINING(bsb), remaining, *state, *buflen, *remlen, done);
+#endif
+            switch (*state) {
+            case SMB_NETBIOS:
+                if (BSB_REMAINING(bsb) < 5) {
+                    done = 1;
+                    break;
+                }
+
+                uint8_t nbType = 0;
+                BSB_IMPORT_u08(bsb, nbType);
+                BSB_IMPORT_u24(bsb, *remlen);
+                if (nbType != 0 || *remlen < 32) {
+                    // Too short to contain even a minimal SMB header; skip the bytes.
+                    *state = SMB_SKIP;
+                    break;
+                }
+                // Peek at SMBHEADER for version
+                smb->version[which] = *(BSB_WORK_PTR(bsb));
+                *state = SMB_SMBHEADER;
+                break;
+            case SMB_SKIP:
+                if (BSB_REMAINING(bsb) < *remlen) {
+                    *remlen -= BSB_REMAINING(bsb);
+                    BSB_IMPORT_skip(bsb, BSB_REMAINING(bsb));
+                } else {
+                    BSB_IMPORT_skip(bsb, *remlen);
+                    *remlen = 0;
+                    *state = SMB_NETBIOS;
+                }
+                break;
+            default:
+                if (smb->version[which] == 0xff) {
+                    done = smb1_parse(session, smb, &bsb, state, remlen, which);
+                } else {
+                    done = smb2_parse(session, smb, &bsb, state, remlen, which);
+                }
+            }
+
+            // Continue with the next command of a compound or AndX chain
+            if (*state == SMB_NETBIOS && smb->nextRemlen[which]) {
+                *remlen = smb->nextRemlen[which];
+                *state = smb->nextState[which];
+                smb->nextRemlen[which] = 0;
+            }
+
+#ifdef SMBDEBUG
+            LOG(" E: bsbremaining: %u remaining: %d state: %d buflen: %d remlen: %u done: %d", (uint32_t)BSB_REMAINING(bsb), remaining, *state, *buflen, *remlen, done);
+#endif
+        }
+
+        if (BSB_IS_ERROR(bsb)) {
+            arkime_parsers_unregister(session, smb);
+            return 0;
+        }
+
+        if (BSB_REMAINING(bsb) > 0 && BSB_WORK_PTR(bsb) != (uint8_t *)buf) {
+#ifdef SMBDEBUG
+            //LOG("  Moving data %ld %s", BSB_REMAINING(bsb), arkime_session_id_string(session->protocol, session->addr1, session->port1, session->addr2, session->port2));
+#endif
+            if (BSB_REMAINING(bsb) > MAX_SMB_BUFFER) {
+                LOG("WARNING - Not enough room to parse SMB packet of size %u", (uint32_t)BSB_REMAINING(bsb));
+                arkime_parsers_unregister(session, smb);
+                return 0;
+            }
+            memmove(buf, BSB_WORK_PTR(bsb), BSB_REMAINING(bsb));
+        }
+        *buflen = BSB_REMAINING(bsb);
+    }
+    return 0;
+}
+/******************************************************************************/
+LOCAL void smb_free(ArkimeSession_t UNUSED(*session), void *uw)
+{
+    SMBInfo_t            *smb          = uw;
+
+    for (int i = 0; i < smb->dialectsLen; i++) {
+        g_free(smb->dialects[i]);
+    }
+
+    ARKIME_TYPE_FREE(SMBInfo_t, smb);
+}
+/******************************************************************************/
+LOCAL void smb_register(ArkimeSession_t *session)
+{
+    if (arkime_session_has_protocol(session, "smb"))
+        return;
+
+    arkime_session_add_protocol(session, "smb");
+
+    SMBInfo_t            *smb          = ARKIME_TYPE_ALLOC0(SMBInfo_t);
+
+    arkime_parsers_register(session, smb_parser, smb, smb_free);
+}
+/******************************************************************************/
+LOCAL void smb_classify(ArkimeSession_t *session, const uint8_t *data, int UNUSED(len), int UNUSED(which), void *UNUSED(uw))
+{
+    if (data[4] != 0xff && data[4] != 0xfe)
+        return;
+
+    smb_register(session);
+}
+/******************************************************************************/
+// NetBIOS session request, SMB over TCP/139 starts with this instead of an SMB message
+LOCAL void smb_nbss_classify(ArkimeSession_t *session, const uint8_t *data, int len, int UNUSED(which), void *UNUSED(uw))
+{
+    if (len < 72 || data[4] != 0x20)
+        return;
+
+    smb_register(session);
+}
+/******************************************************************************/
+void arkime_parser_init()
+{
+    shareField = arkime_field_define("smb", "termfield",
+                                     "smb.share", "Share", "smb.share",
+                                     "SMB shares connected to",
+                                     ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                     (char *)NULL);
+
+    fnField = arkime_field_define("smb", "termfield",
+                                  "smb.fn", "Filename", "smb.filename",
+                                  "SMB files opened, created, deleted",
+                                  ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                  (char *)NULL);
+
+    osField = arkime_field_define("smb", "termfield",
+                                  "smb.os", "OS", "smb.os",
+                                  "SMB OS information",
+                                  ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                  (char *)NULL);
+
+    domainField = arkime_field_define("smb", "termfield",
+                                      "smb.domain", "Domain", "smb.domain",
+                                      "SMB domain",
+                                      ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                      (char *)NULL);
+
+    verField = arkime_field_define("smb", "termfield",
+                                   "smb.ver", "Version", "smb.version",
+                                   "SMB Version information",
+                                   ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                   (char *)NULL);
+
+    dialectField = arkime_field_define("smb", "termfield",
+                                       "smb.dialect", "Dialect", "smb.dialect",
+                                       "SMB Dialect information",
+                                       ARKIME_FIELD_TYPE_STR,  0,
+                                       (char *)NULL);
+
+    userField = arkime_field_define("smb", "termfield",
+                                    "smb.user", "User", "smb.user",
+                                    "SMB User",
+                                    ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                    "category", "user",
+                                    (char *)NULL);
+
+    hostField = arkime_field_define("smb", "termfield",
+                                    "host.smb", "SMB Host", "smb.host",
+                                    "SMB Host name",
+                                    ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                    "category", "host",
+                                    "aliases", "[\"smb.host\"]",
+                                    (char *)NULL);
+
+    arkime_field_define("smb", "lotextfield",
+                        "host.smb.tokens", "Hostname Tokens", "smb.hostTokens",
+                        "SMB Host Tokens",
+                        ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_FAKE,
+                        "aliases", "[\"smb.host.tokens\"]",
+                        (char *)NULL);
+
+    arkime_parsers_classifier_register_tcp("smb", NULL, 5, (uint8_t *)"SMB", 3, smb_classify);
+    arkime_parsers_classifier_register_tcp("smb", NULL, 0, (uint8_t *)"\x81\x00", 2, smb_nbss_classify);
+}

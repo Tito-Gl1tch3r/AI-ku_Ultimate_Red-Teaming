@@ -1,0 +1,190 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using AsmResolver.Collections;
+using AsmResolver.DotNet.Signatures;
+using AsmResolver.PE.DotNet.Metadata.Tables;
+
+namespace AsmResolver.DotNet
+{
+    /// <summary>
+    /// Represents a reference to a generic method that is instantiated with type arguments.
+    /// </summary>
+    public partial class MethodSpecification : MetadataMember, IMethodDescriptor, IHasCustomAttribute
+    {
+        /// <summary> The internal custom attribute list. </summary>
+        /// <remarks> This value may not be initialized. Use <see cref="CustomAttributes"/> instead.</remarks>
+        protected IList<CustomAttribute>? CustomAttributesInternal;
+
+        /// <summary>
+        /// Creates a new empty method specification.
+        /// </summary>
+        /// <param name="token">The token of the specification.</param>
+        protected MethodSpecification(MetadataToken token)
+            : base(token)
+        {
+        }
+
+        /// <summary>
+        /// Creates a new reference to a generic instantiation of a method.
+        /// </summary>
+        /// <param name="method">The method to instantiate.</param>
+        /// <param name="signature">The instantiation signature.</param>
+        public MethodSpecification(IMethodDefOrRef? method, GenericInstanceMethodSignature? signature)
+            : this(method, signature, true)
+        {
+        }
+
+        /// <summary>
+        /// Creates a new reference to a generic instantiation of a method.
+        /// </summary>
+        /// <param name="method">The method to instantiate.</param>
+        /// <param name="signature">The instantiation signature.</param>
+        /// <param name="verify"><c>true</c> if <paramref name="signature"/> should be verified for compatibility with the provided method, <c>false</c> otherwise.</param>
+        public MethodSpecification(IMethodDefOrRef? method, GenericInstanceMethodSignature? signature, bool verify)
+            : this(new MetadataToken(TableIndex.MethodSpec,0))
+        {
+            Method = method;
+            Signature = signature;
+
+            if (verify
+                && method?.Signature is not null
+                && signature is not null
+                && method.Signature.GenericParameterCount != signature.TypeArguments.Count)
+            {
+                throw new ArgumentException(
+                    $"Expected {method.Signature.GenericParameterCount} type arguments but {signature.TypeArguments.Count} were given.");
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the method that was instantiated.
+        /// </summary>
+        [LazyProperty]
+        public partial IMethodDefOrRef? Method
+        {
+            get;
+            set;
+        }
+
+        MethodSignature? IMethodDescriptor.Signature => Method?.Signature;
+
+        /// <summary>
+        /// Gets or sets the generic instantiation of the method.
+        /// </summary>
+        [LazyProperty]
+        public partial GenericInstanceMethodSignature? Signature
+        {
+            get;
+            set;
+        }
+
+        /// <summary>
+        /// Gets or sets the name of the method specification.
+        /// </summary>
+        public Utf8String Name => Method?.Name ?? NullName;
+
+        string? INameProvider.Name => Name;
+
+        /// <inheritdoc />
+        public string FullName => MemberNameGenerator.GetMethodFullName(this);
+
+        /// <inheritdoc />
+        public ModuleDefinition? ContextModule => Method?.ContextModule;
+
+        /// <summary>
+        /// Gets the declaring type of the method.
+        /// </summary>
+        public ITypeDefOrRef? DeclaringType => Method?.DeclaringType;
+
+        ITypeDescriptor? IMemberDescriptor.DeclaringType => DeclaringType;
+
+        /// <inheritdoc />
+        public virtual bool HasCustomAttributes => CustomAttributesInternal is { Count: > 0 };
+
+        /// <inheritdoc />
+        public IList<CustomAttribute> CustomAttributes
+        {
+            get
+            {
+                if (CustomAttributesInternal is null)
+                    Interlocked.CompareExchange(ref CustomAttributesInternal, GetCustomAttributes(), null);
+                return CustomAttributesInternal;
+            }
+        }
+
+        ResolutionStatus IMemberDescriptor.Resolve(RuntimeContext? context, out IMemberDefinition? definition)
+        {
+            var status = Resolve(context, out var method);
+            definition = method;
+            return status;
+        }
+
+        /// <inheritdoc />
+        public ResolutionStatus Resolve(RuntimeContext? context, out MethodDefinition? definition)
+        {
+            if (Method is null)
+            {
+                definition = null;
+                return ResolutionStatus.InvalidReference;
+            }
+
+            return Method.Resolve(context, out definition);
+        }
+
+        /// <inheritdoc />
+        public bool IsImportedInModule(ModuleDefinition module)
+        {
+            return (Method?.IsImportedInModule(module) ?? false)
+                   && (Signature?.IsImportedInModule(module) ?? false);
+        }
+
+        /// <summary>
+        /// Imports the method specification using the provided reference importer.
+        /// </summary>
+        /// <param name="importer">The reference importer to use.</param>
+        /// <returns>The imported method specification.</returns>
+        public MethodSpecification ImportWith(ReferenceImporter importer) => importer.ImportMethod(this);
+
+        /// <inheritdoc />
+        IMethodDescriptor IMethodDescriptor.ImportWith(ReferenceImporter importer) => ImportWith(importer);
+
+        /// <inheritdoc />
+        IMemberDescriptor IMemberDescriptor.ImportWith(ReferenceImporter importer) => ImportWith(importer);
+
+        /// <inheritdoc />
+        IImportable IImportable.ImportWith(ReferenceImporter importer) => ImportWith(importer);
+
+        /// <summary>
+        /// Obtains the instantiated method.
+        /// </summary>
+        /// <returns>The method.</returns>
+        /// <remarks>
+        /// This method is called upon initialization of the <see cref="Method"/> property.
+        /// </remarks>
+        protected virtual IMethodDefOrRef? GetMethod() => null;
+
+        /// <summary>
+        /// Obtains the method instantiation signature.
+        /// </summary>
+        /// <returns>The signature.</returns>
+        /// <remarks>
+        /// This method is called upon initialization of the <see cref="Signature"/> property.
+        /// </remarks>
+        protected virtual GenericInstanceMethodSignature? GetSignature() => null;
+
+        /// <summary>
+        /// Obtains the list of custom attributes assigned to the member.
+        /// </summary>
+        /// <returns>The attributes</returns>
+        /// <remarks>
+        /// This method is called upon initialization of the <see cref="CustomAttributes"/> property.
+        /// </remarks>
+        protected virtual IList<CustomAttribute> GetCustomAttributes() =>
+            new OwnedCollection<IHasCustomAttribute, CustomAttribute>(this);
+
+        /// <inheritdoc />
+        public override string ToString() => FullName;
+    }
+
+}

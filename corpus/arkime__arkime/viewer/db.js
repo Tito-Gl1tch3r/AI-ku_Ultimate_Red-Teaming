@@ -1,0 +1,1924 @@
+/******************************************************************************/
+/* db.js -- Lowlevel and highlevel functions dealing with the database
+ *
+ * Copyright 2012-2016 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+'use strict';
+
+const os = require('os');
+const fs = require('fs');
+const util = require('util');
+const async = require('async');
+const { Client } = require('@elastic/elasticsearch');
+const User = require('../common/user');
+const ArkimeUtil = require('../common/arkimeUtil');
+const { LRUCache } = require('lru-cache');
+const DbESImpl = require('./db.es');
+const DbSQLiteImpl = require('./db.sqlite');
+
+const cache10 = new LRUCache({ max: 1000, ttl: 1000 * 10 });
+const cache60 = new LRUCache({ max: 1000, ttl: 1000 * 60 });
+const esId2Info = new Map();
+const esId2InfoLoadedCluster = new Map();
+
+const Db = exports;
+
+const internals = {
+  fileId2File: new Map(),
+  fileName2File: new Map(),
+  shortcutsCache: new Map(),
+  shortcutsCacheTS: new Map(),
+  sessionIndices: ['sessions2-*', 'partial-sessions3-*', 'sessions3-*'],
+  queryExtraIndicesRegex: [],
+  remoteShortcutsIndex: undefined,
+  localShortcutsIndex: undefined,
+  localShortcutsVersion: -1 // always start with -1 so there's an initial sync of shortcuts from user's es db
+};
+
+function checkURLs (nodes) {
+  if (nodes === undefined) {
+    return;
+  }
+
+  if (Array.isArray(nodes)) {
+    for (const node of nodes) {
+      if (!node.includes('://')) {
+        console.log(`ERROR - endpoint url '${node}' must contain ://`);
+        process.exit(1);
+      }
+    }
+  } else if (!nodes.includes('://')) {
+    console.log(`ERROR - endpoint url '${nodes}' must contain ://`);
+    process.exit(1);
+  }
+}
+
+// True if the index name (string, comma list, or array) refers to sessions
+function isSessionsIndex (index) {
+  if (!index) { return false; }
+  if (Array.isArray(index)) { return index.some(isSessionsIndex); }
+  return String(index).split(',').some((item) => {
+    item = item.trim();
+    if (item === 'sessions*') { return true; }
+    if (item.startsWith('partial-')) { item = item.substring(8); }
+    return /(^|_)sessions[23]($|[-*])/.test(item);
+  });
+}
+
+Db.initialize = async (info) => {
+  internals.multiES = info.multiES === 'true' || info.multiES === true || false;
+  delete info.multiES;
+
+  internals.debug = info.debug || 0;
+  delete info.debug;
+
+  internals.maxConcurrentShardRequests = info.maxConcurrentShardRequests;
+  delete info.maxConcurrentShardRequests;
+
+  internals.info = info;
+
+  checkURLs(info.host);
+  checkURLs(info.usersHost);
+
+  internals.prefix = ArkimeUtil.formatPrefix(info.prefix);
+  internals.usersPrefix = ArkimeUtil.formatPrefix(info.usersPrefix ?? info.prefix);
+
+  internals.nodeName = info.nodeName;
+  delete info.nodeName;
+  internals.hostName = info.hostName;
+  delete info.hostName;
+
+  internals.esProfile = info.esProfile || false;
+  delete info.esProfile;
+
+  internals.regressionTests = info.regressionTests ?? false;
+
+  const esSSLOptions = { rejectUnauthorized: !internals.info.insecure };
+  if (internals.info.caTrustFile) { esSSLOptions.ca = ArkimeUtil.certificateFileToArray(internals.info.caTrustFile); }
+  if (info.esClientKey) {
+    esSSLOptions.key = fs.readFileSync(info.esClientKey);
+    esSSLOptions.cert = fs.readFileSync(info.esClientCert);
+    if (info.esClientKeyPass) {
+      esSSLOptions.passphrase = info.esClientKeyPass;
+    }
+  }
+
+  const esClientOptions = {
+    node: internals.info.host,
+    maxRetries: 2,
+    requestTimeout: (parseInt(info.requestTimeout, 10) + 30) * 1000 || 330000,
+    ssl: esSSLOptions
+  };
+
+  if (info.esApiKey) {
+    esClientOptions.auth = {
+      apiKey: info.esApiKey
+    };
+  } else if (info.esBasicAuth) {
+    let basicAuth = info.esBasicAuth;
+    if (!basicAuth.includes(':')) {
+      basicAuth = Buffer.from(basicAuth, 'base64').toString();
+    }
+    basicAuth = ArkimeUtil.splitRemain(basicAuth, ':', 1);
+    esClientOptions.auth = {
+      username: basicAuth[0],
+      password: basicAuth[1]
+    };
+  }
+
+  internals.client7 = new Client(esClientOptions);
+
+  if (info.usersHost) {
+    User.initialize({
+      insecure: info.insecure,
+      caTrustFile: info.caTrustFile,
+      requestTimeout: info.requestTimeout,
+      node: info.usersHost,
+      clientKey: info.esClientKey,
+      clientCert: info.esClientCert,
+      clientKeyPass: info.esClientKeyPass,
+      apiKey: info.usersEsApiKey,
+      basicAuth: info.usersEsBasicAuth,
+      prefix: internals.usersPrefix,
+      getCurrentUserCB: info.getCurrentUserCB,
+      noUsersCheck: info.noUsersCheck
+    });
+  } else {
+    User.initialize({
+      insecure: info.insecure,
+      caTrustFile: info.caTrustFile,
+      requestTimeout: info.requestTimeout,
+      node: info.host,
+      clientKey: info.esClientKey,
+      clientCert: info.esClientCert,
+      clientKeyPass: info.esClientKeyPass,
+      apiKey: info.esApiKey,
+      basicAuth: info.esBasicAuth,
+      prefix: internals.prefix,
+      readOnly: internals.multiES,
+      getCurrentUserCB: info.getCurrentUserCB,
+      noUsersCheck: info.noUsersCheck
+    });
+  }
+
+  internals.usersClient7 = User.getClient();
+
+  // Initialize the users DB backend for views, shareables, etc.
+  if (internals.usersClient7) {
+    internals.usersImpl = new DbESImpl(internals.usersClient7, internals.usersPrefix);
+  } else {
+    const dbUrl = User.getDbUrl();
+    if (dbUrl?.startsWith('sqlite')) {
+      internals.usersImpl = new DbSQLiteImpl(ArkimeUtil.createSQLiteDB(dbUrl));
+    } else if (dbUrl?.startsWith('redis') || dbUrl?.startsWith('lmdb')) {
+      console.log(`WARN - views/shareables not yet supported for '${dbUrl}', using ES only`);
+    } else {
+      console.log(`ERROR - Don't understand users db impl for '${dbUrl}'`);
+      process.exit(1);
+    }
+  }
+
+  // Initialize the sessions DB backend. sessionsImpl serves sessions indices
+  // and may be replaced by an alternate backend; esImpl always exists
+  // and serves everything else.
+  internals.esImpl = new DbESImpl(internals.client7, internals.prefix, { Db, internals, fixIndex });
+  internals.sessionsImpl = internals.esImpl;
+
+  // Replace tag implementation
+  if (internals.multiES) {
+    Db.isLocalView = (node) => { return false; };
+    internals.prefix = 'MULTIPREFIX_';
+  }
+
+  if (internals.debug) {
+    console.log(`prefix:${internals.prefix} usersPrefix:${internals.usersPrefix}`);
+  }
+
+  // build regular expressions for the user-specified extra query index patterns
+  if (Array.isArray(info.queryExtraIndices)) {
+    internals.sessionIndices = [...new Set([...['sessions2-*', 'partial-sessions3-*', 'sessions3-*'], ...info.queryExtraIndices])];
+    delete internals.aliasesCache;
+    for (const pattern of info.queryExtraIndices) {
+      internals.queryExtraIndicesRegex.push(ArkimeUtil.wildcardToRegexp(pattern));
+    }
+    if (internals.debug > 2) {
+      console.log(`defaultIndexPatterns: ${internals.sessionIndices}`);
+    }
+  }
+
+  // Update aliases cache so -shrink/-reindex works
+  if (internals.nodeName !== undefined) {
+    Db.getAliasesCache();
+    setInterval(() => { Db.getAliasesCache(); }, 2 * 60 * 1000);
+  }
+
+  internals.localShortcutsIndex = fixIndex('lookups');
+  if (internals.info.usersHost && internals.usersPrefix !== undefined) {
+    internals.remoteShortcutsIndex = `${internals.usersPrefix}lookups`;
+  } else { // there is no remote shortcuts index, just set it to local
+    internals.remoteShortcutsIndex = internals.localShortcutsIndex;
+  }
+
+  if (internals.debug > 1) {
+    console.log(`remoteShortcutsIndex: ${internals.remoteShortcutsIndex} localShortcutsIndex: ${internals.localShortcutsIndex}`);
+  }
+
+  try {
+    const { body: data } = await internals.client7.info();
+    if (data.version.distribution === 'opensearch') {
+      if (data.version.number.match(/^[0]/)) {
+        console.log(`ERROR - OpenSearch ${data.version.number} not supported, OpenSearch 1.0.0 or later required.`);
+        process.exit(1);
+      }
+    } else {
+      if (data.version.number.match(/^([0-6]|7\.[0-9]\.)/)) {
+        console.log(`ERROR - Elasticsearch ${data.version.number} not supported, Elasticsearch 7.10.0 or later required.`);
+        process.exit(1);
+      }
+    }
+  } catch (err) {
+    ArkimeUtil.searchErrorMsg(err, internals.info.host, 'Getting OpenSearch/Elasticsearch info failed');
+    process.exit(1);
+  }
+};
+
+/// ///////////////////////////////////////////////////////////////////////////////
+/// / Low level functions to convert from no prefix to having a prefix
+/// ///////////////////////////////////////////////////////////////////////////////
+function fixIndex (index) {
+  if (index === undefined || index === '_all') { return index; }
+
+  if (index === 'sessions*') {
+    // Didn't used to have a prefix, don't use one for sessions2
+    if (internals.prefix === 'arkime_') {
+      return `sessions2*,${internals.prefix}sessions3*`;
+    }
+    return `${internals.prefix}sessions2*,${internals.prefix}sessions3*`;
+  }
+
+  // Turn into array if comma separated
+  if (index.includes(',')) {
+    index = index.split(',');
+  }
+
+  if (Array.isArray(index)) {
+    return index.map((val) => {
+      if (val.startsWith(internals.prefix)) {
+        return val;
+      } else {
+        return fixIndex(val);
+      }
+    }).join(',');
+  }
+
+  // Don't fix extra user-specified indexes from the queryExtraIndices
+  if (internals.queryExtraIndicesRegex.some(re => re.test(index))) {
+    return index;
+  }
+
+  // Make sure partial-${prefix}index format
+  if (index.startsWith('partial-')) {
+    if (!index.substring(8).startsWith(internals.prefix)) {
+      index = 'partial-' + internals.prefix + index.substring(8);
+    }
+    return index;
+  }
+
+  // If prefix isn't there, add it. But don't add it for sessions2 unless really set.
+  if (!index.startsWith(internals.prefix) && (!index.startsWith('sessions2') || internals.prefix !== 'arkime_')) {
+    index = internals.prefix + index;
+  }
+
+  if (internals.aliasesCache && !internals.aliasesCache[index]) {
+    if (internals.aliasesCache['partial-' + index]) {
+      index = 'partial-' + index;
+    } else if (internals.aliasesCache[index + '-shrink']) {
+      // If the index doesn't exist but the shrink version does exist, add -shrink
+      index += '-shrink';
+    } else if (internals.aliasesCache[index + '-reindex']) {
+      // If the index doesn't exist but the reindex version does exist, add -reindex
+      index += '-reindex';
+    }
+  }
+
+  return index;
+}
+Db.fixIndex = fixIndex;
+
+Db.merge = (to, from) => {
+  for (const key in from) {
+    if (Object.prototype.hasOwnProperty.call(from, key)) {
+      to[key] = from[key];
+    }
+  }
+};
+
+Db.get = async (index, id) => {
+  return internals.client7.get({ index: fixIndex(index), id });
+};
+
+Db.getWithOptions = async (index, id, options) => {
+  const params = { index: fixIndex(index), id };
+  Db.merge(params, options);
+  return internals.client7.get(params);
+};
+
+// Fields too hard to leave as arrays for now
+const singletonFields = {
+  'destination.ip': true,
+  'destination.port': true,
+  'destination.packets': true,
+  'destination.bytes': true,
+  dstPayload8: true,
+  'server.bytes': true,
+  'server.packets': true,
+  'destination.geo.country_iso_code': true,
+  'destination.as.full': true,
+  dstRIR: true,
+
+  'source.ip': true,
+  'source.port': true,
+  'source.packets': true,
+  'source.bytes': true,
+  srcPayload8: true,
+  'client.bytes': true,
+  'client.packets': true,
+  'source.geo.country_iso_code': true,
+  'source.as.full': true,
+  srcRIR: true,
+
+  firstPacket: true,
+  lastPacket: true,
+  '@timestamp': true,
+  ipProtocol: true,
+  node: true,
+  srcNode: true,
+  'tcpflags.rst': true,
+  'tcpflags.syn': true,
+  'tcpflags.srcZero': true,
+  'tcpflags.psh': true,
+  'tcpflags.dstZero': true,
+  'tcpflags.syn-ack': true,
+  'tcpflags.fin': true,
+  'tcpflags.ack': true,
+  'tcpflags.urg': true,
+  'network.community_id': true,
+  totDataBytes: true,
+  'network.bytes': true,
+  'network.packets': true,
+  rootId: true
+};
+
+const dedupFields = {
+  'dns.host': true,
+  'dns.mailserverHost': true,
+  'dns.opcode': true,
+  'dns.status': true,
+  'dns.qt': true,
+  'dns.qc': true
+};
+
+const dateFields = {
+  firstPacket: true,
+  lastPacket: true,
+  '@timestamp': true,
+  'cert.notBefore': true,
+  'cert.notAfter': true
+};
+
+// Change foo.bar to foo: {bar:}
+// Unarray singleton fields
+// Change string dates to MS
+function fixSessionFields (fields, unflatten) {
+  if (!fields) { return; }
+  if (unflatten) {
+    fields.source = Object.create(null);
+    fields.source.as = Object.create(null);
+    fields.source.geo = Object.create(null);
+    fields.destination = Object.create(null);
+    fields.destination.as = Object.create(null);
+    fields.destination.geo = Object.create(null);
+    fields.client = Object.create(null);
+    fields.server = Object.create(null);
+  }
+  for (const f in fields) {
+    const path = f.split('.');
+    if (ArkimeUtil.isPP(path)) { continue; }
+    let key = fields;
+
+    // No dot in name, maybe no change
+    if (path.length === 1) {
+      if (fields[f].length > 0 && (singletonFields[f] || f.endsWith('Cnt') || f.endsWith('-cnt'))) {
+        fields[f] = fields[f][0];
+      }
+      if (dateFields[f]) {
+        fields[f] = Date.parse(fields[f]);
+      }
+      continue;
+    }
+
+    // Dot in name, will be moving
+    let value = fields[f];
+    if (dateFields[f]) {
+      for (let v = 0; v < value.length; v++) {
+        value[v] = Date.parse(value[v]);
+      }
+    }
+    if (singletonFields[f] || f.endsWith('Cnt') || f.endsWith('-cnt')) {
+      value = value[0];
+    }
+    if (dedupFields[f]) {
+      value = [...new Set(value)].sort();
+    }
+    if (!unflatten) {
+      fields[f] = value;
+      continue;
+    }
+    delete fields[f];
+    for (let i = 0; i < path.length; i++) {
+      if (i === path.length - 1) {
+        key[path[i]] = value;
+        break;
+      } else if (key[path[i]] === undefined) {
+        key[path[i]] = Object.create(null);
+      }
+      key = key[path[i]];
+    }
+  }
+}
+
+async function fixPacketPos (fields) {
+  if (!fields.packetPos || fields.packetPos.length === 0) {
+    return;
+  }
+
+  try {
+    const fileInfo = await Db.fileIdToFile(fields.node, -1 * fields.packetPos[0]);
+    if (internals.debug > 2) {
+      console.log('GETSESSION - fixPacketPos', fileInfo);
+    }
+
+    if (!fileInfo || !fileInfo.packetPosEncoding) {
+      return;
+    }
+
+    if (fileInfo.packetPosEncoding === 'gap0') {
+      // Neg numbers aren't encoded, if pos is 0 same gap as last gap, otherwise last + pos
+      let last = 0;
+      let lastgap = 0;
+      for (let i = 0, ilen = fields.packetPos.length; i < ilen; i++) {
+        if (fields.packetPos[i] < 0) {
+          last = 0;
+        } else {
+          if (fields.packetPos[i] === 0) {
+            fields.packetPos[i] = last + lastgap;
+          } else {
+            lastgap = fields.packetPos[i];
+            fields.packetPos[i] += last;
+          }
+          last = fields.packetPos[i];
+        }
+      }
+      return;
+    } else if (fileInfo.packetPosEncoding === 'localIndex') {
+      // Neg numbers aren't encoded, use var length encoding, if pos is 0 same gap as last gap, otherwise last + pos
+      if (await Db.isLocalView(fields.node)) {
+        const newPacketPos = [];
+        await async.forEachOfSeries(fields.packetPos, async (item, key) => {
+          if (key % 3 !== 0) { return; } // Only look at every 3rd item
+
+          let fd;
+          try {
+            const idToFileInfo = await Db.fileIdToFile(fields.node, -1 * item);
+            fd = fs.openSync(idToFileInfo.indexFilename, 'r');
+            if (!fd) { return; }
+            const buffer = Buffer.alloc(fields.packetPos[key + 2]);
+            fs.readSync(fd, buffer, 0, buffer.length, fields.packetPos[key + 1]);
+            let last = 0;
+            let lastgap = 0;
+            let num = 0;
+            let mult = 1;
+            newPacketPos.push(item);
+            for (let i = 0; i < buffer.length; i++) {
+              const x = buffer.readUInt8(i);
+              // high bit set when last
+              if (x & 0x80) { // eslint-disable-line no-bitwise
+                num = num + (x & 0x7f) * mult; // eslint-disable-line no-bitwise
+                if (num !== 0) {
+                  lastgap = num;
+                }
+                last += lastgap;
+                newPacketPos.push(last);
+                num = 0;
+                mult = 1;
+              } else {
+                num = num + x * mult;
+                mult *= 128; // Javascript can't shift large numbers, so mult
+              }
+            }
+          } catch (e) {
+            console.log(e);
+          } finally {
+            if (fd) {
+              try {
+                fs.closeSync(fd);
+              } catch (closeErr) {
+                console.log('Error closing file:', closeErr);
+              }
+            }
+          }
+          return;
+        });
+        fields.packetPos = newPacketPos;
+        return;
+      } else {
+        delete fields.packetPos; // can't decode remote
+        return;
+      }
+    } else {
+      console.log('Unknown packetPosEncoding', fileInfo);
+      return;
+    }
+  } catch (err) {
+    return;
+  }
+}
+
+async function fixFileIds (fields) {
+  if (!fields || !fields.node) { return; }
+
+  try {
+    const stat = await Db.arkimeNodeStatsCache(fields.node);
+    fields.nodehost = stat.hostname;
+  } catch (err) {
+    // Ignore error
+  }
+
+  if (!fields.fileId) {
+    fields.fileId = [];
+    return;
+  }
+
+  const files = [];
+  for (const item of fields.fileId) {
+    try {
+      const file = await Db.fileIdToFile(fields.node, item);
+      if (file && file.locked === 1) {
+        files.push(file.name);
+      }
+    } catch (ferr) {
+      // Ignore error
+    }
+  }
+  fields.fileId = files;
+}
+
+// Get a session from OpenSearch/Elasticsearch and decode packetPos if requested
+Db.getSession = async (id, options, cb) => {
+  if (internals.debug > 2) {
+    console.log('GETSESSION -', id, options);
+  }
+
+  try {
+    if (!options) {
+      options = { _source: ['cert', 'dns', 'zeekintel'], fields: ['*'] };
+    }
+    const query = { query: { ids: { values: [Db.sid2Id(id)] } }, _source: options._source, fields: options.fields };
+
+    const unflatten = options?.arkime_unflatten ?? true;
+    const params = Object.create(null);
+    Db.merge(params, options);
+    delete params._source;
+    delete params.fields;
+    delete params.arkime_unflatten;
+    delete params.final;
+
+    const index = Db.sid2Index(id, { multiple: true });
+
+    let results = await internals.sessionsImpl.searchSessions(index, query, params);
+    if (internals.debug > 2) {
+      console.log('GETSESSION - search results', JSON.stringify(results, false, 2));
+    }
+    if (!results.hits || !results.hits.hits || results.hits.hits.length === 0) {
+      if (options.final === true) {
+        delete options.final;
+        return cb ? cb('Not found') : Promise.reject('Not found');
+      }
+      options.final = true;
+      if (!await internals.sessionsImpl.refreshForNotFoundRetry(index)) {
+        return cb ? cb('Not found') : Promise.reject('Not found');
+      }
+      return Db.getSession(id, options, cb);
+    }
+    const session = results.hits.hits[0];
+    session.found = true;
+    if (session.fields && session._source && session._source.cert) {
+      session.fields.cert = session._source.cert;
+    }
+    if (session.fields && session._source && session._source.dns) {
+      session.fields.dns = session._source.dns;
+    }
+    if (session.fields && session._source && session._source.zeekintel) {
+      session.fields.zeekintel = session._source.zeekintel;
+    }
+    delete session._source;
+    fixSessionFields(session.fields, unflatten);
+    if (session.fields.packetPos !== undefined) {
+      await fixPacketPos(session.fields);
+    }
+    await fixFileIds(session.fields ?? session._source);
+    return cb ? cb(null, session) : session;
+  } catch (err) {
+    return cb ? cb(err) : Promise.reject(err);
+  }
+};
+
+Db.index = async (index, id, doc) => {
+  return internals.client7.index({ index: fixIndex(index), body: doc, id });
+};
+
+Db.indexNow = async (index, id, doc) => {
+  return internals.client7.index({
+    index: fixIndex(index), body: doc, id, refresh: true
+  });
+};
+
+Db.search = async (index, query, options) => {
+  query.profile = internals.esProfile;
+
+  const params = {
+    index: fixIndex(index),
+    body: query,
+    rest_total_hits_as_int: true
+  };
+
+  let cancelId = null;
+  if (options && options.cancelId) {
+    // use opaqueId option so the task can be cancelled
+    cancelId = { opaqueId: options.cancelId };
+    delete options.cancelId;
+  }
+
+  Db.merge(params, options);
+
+  try {
+    const { body: results } = await internals.client7.search(params, cancelId);
+    if (!internals.debug && internals.esProfile) {
+      console.log('QUERY:', JSON.stringify(query, false, 2));
+      console.log('RESPONSE:', JSON.stringify(results, false, 2));
+    }
+
+    return results;
+  } catch (err) {
+    const esError = err?.meta?.body?.error;
+    if (esError?.type === 'index_not_found_exception') {
+      console.log(`OpenSearch/Elasticsearch Search Error - index not found: ${esError.index ?? params.index}`);
+    } else if (esError && internals.debug < 2) {
+      console.log(`OpenSearch/Elasticsearch Search Error - ${esError.type}: ${esError.root_cause?.[0]?.reason ?? esError.reason}`);
+    } else {
+      console.trace(`OpenSearch/Elasticsearch Search Error - query: ${JSON.stringify(params, false, 2)} err:`, util.inspect(err, null, 20));
+    }
+    throw err;
+  }
+};
+
+Db.cancelByOpaqueId = async (cancelId, cluster) => {
+  const { body: results } = await internals.client7.tasks.list({
+    detailed: false,
+    group_by: 'parents',
+    cluster
+  });
+
+  let found = false;
+
+  for (const resultKey in results.tasks) {
+    const result = results.tasks[resultKey];
+    if (result.headers &&
+      result.headers['X-Opaque-Id'] &&
+      result.headers['X-Opaque-Id'] === cancelId) {
+      found = true;
+      // don't need to wait for task to cancel, just break out and return
+      internals.client7.tasks.cancel({ taskId: resultKey, cluster });
+      break;
+    }
+  }
+
+  if (!found) { // not found, return error
+    throw new Error('Cancel ID not found, cannot cancel OpenSearch/Elasticsearch task(s)');
+  }
+
+  return 'OpenSearch/Elasticsearch task cancelled successfully';
+};
+
+Db.searchScroll = async (index, query, options, cb) => {
+  const impl = isSessionsIndex(index) ? internals.sessionsImpl : internals.esImpl;
+  return impl.searchScroll(index, query, options, cb);
+};
+
+Db.searchScrollIterator = async function* (index, query, options) {
+  const impl = isSessionsIndex(index) ? internals.sessionsImpl : internals.esImpl;
+  yield * impl.searchScrollIterator(index, query, options);
+};
+
+Db.searchSessions = function (index, query, options, cb) {
+  if (cb === undefined) {
+    return new Promise((resolve, reject) => {
+      Db.searchSessions(index, query, options, (err, result) => {
+        err ? reject(err) : resolve(result);
+      });
+    });
+  }
+
+  if (!options) { options = {}; }
+  const unflatten = options.arkime_unflatten ?? true;
+  const params = { preference: 'primaries', ignore_unavailable: 'true' };
+  if (internals.maxConcurrentShardRequests) { params.maxConcurrentShardRequests = internals.maxConcurrentShardRequests; }
+  Db.merge(params, options);
+  delete params.arkime_unflatten;
+  Db.searchScroll(index, query, params, async (err, result) => {
+    if (err || result.hits.hits.length === 0) { return cb(err, result); }
+
+    for (const hit of result.hits.hits) {
+      fixSessionFields(hit.fields, unflatten);
+      if (hit.fields?.packetPos !== undefined) {
+        await fixPacketPos(hit.fields);
+      }
+      await fixFileIds(hit.fields);
+    }
+    return cb(null, result);
+  });
+};
+
+Db.searchSessionsIterator = async function* (index, query, options) {
+  if (!options) { options = {}; }
+  const unflatten = options.arkime_unflatten ?? true;
+  const params = { preference: 'primaries', ignore_unavailable: 'true' };
+  if (internals.maxConcurrentShardRequests) { params.maxConcurrentShardRequests = internals.maxConcurrentShardRequests; }
+  Db.merge(params, options);
+  delete params.arkime_unflatten;
+
+  for await (const chunk of Db.searchScrollIterator(index, query, params)) {
+    for (const hit of chunk.hits.hits) {
+      fixSessionFields(hit.fields, unflatten);
+      if (hit.fields?.packetPos !== undefined) {
+        await fixPacketPos(hit.fields);
+      }
+      await fixFileIds(hit.fields);
+    }
+    yield chunk;
+  }
+};
+
+Db.msearchSessions = async (index, queries, options) => {
+  return internals.sessionsImpl.msearchSessions(index, queries, options);
+};
+
+Db.scroll = async (params) => {
+  params.rest_total_hits_as_int = true;
+  return internals.client7.scroll(params);
+};
+
+// Ignore errors when we try to clear a scroll that doesn't exist
+Db.clearScroll = async (params) => {
+  try {
+    await internals.client7.clearScroll(params);
+  } catch (err) {
+  }
+};
+
+Db.deleteDocument = async (index, id, options) => {
+  const impl = isSessionsIndex(index) ? internals.sessionsImpl : internals.esImpl;
+  return impl.deleteDocument(index, id, options);
+};
+
+// This API does not call fixIndex
+Db.deleteIndex = async (index, options) => {
+  const params = { index };
+  Db.merge(params, options);
+  return internals.client7.indices.delete(params);
+};
+
+// This API does not call fixIndex
+Db.optimizeIndex = async (index, options) => {
+  const params = { index, maxNumSegments: 1 };
+  Db.merge(params, options);
+  return internals.client7.indices.forcemerge(params);
+};
+
+// This API does not call fixIndex
+Db.closeIndex = async (index, options) => {
+  const params = { index };
+  Db.merge(params, options);
+  return internals.client7.indices.close(params);
+};
+
+// This API does not call fixIndex
+Db.openIndex = async (index, options) => {
+  const params = { index };
+  Db.merge(params, options);
+  return internals.client7.indices.open(params);
+};
+
+// This API does not call fixIndex
+Db.shrinkIndex = async (index, options) => {
+  const params = { index, target: `${index}-shrink` };
+  Db.merge(params, options);
+  return internals.client7.indices.shrink(params);
+};
+
+Db.indexStats = async (index) => {
+  return internals.client7.indices.stats({ index: fixIndex(index) });
+};
+
+Db.getAliases = async (index) => {
+  return internals.client7.indices.getAlias({ index: fixIndex(index) });
+};
+
+Db.getAliasesCache = async () => {
+  if (internals.aliasesCache && internals.aliasesCacheTimeStamp > Date.now() - 5000) {
+    return internals.aliasesCache;
+  }
+
+  const index = internals.sessionIndices;
+
+  try {
+    const { body: aliases } = await Db.getAliases(index);
+    internals.aliasesCacheTimeStamp = Date.now();
+    internals.aliasesCache = aliases;
+    return aliases;
+  } catch (err) {
+    console.log('ERROR - fetching aliases', err.toString());
+  }
+};
+
+Db.health = async (cluster) => {
+  const { body: data } = await internals.client7.info({ cluster });
+  const { body: result } = await internals.client7.cluster.health({ cluster });
+  result.version = data.version.number;
+  return result;
+};
+
+Db.indices = async (index, cluster) => {
+  return internals.client7.cat.indices({
+    format: 'json',
+    index,
+    bytes: 'b',
+    h: 'health,status,index,uuid,pri,rep,docs.count,store.size,cd,segmentsCount,pri.search.query_current,memoryTotal',
+    cluster
+  });
+};
+
+Db.indicesSettings = async (index, cluster) => {
+  return internals.client7.indices.getSettings({
+    flat_settings: true,
+    index: fixIndex(index),
+    cluster
+  });
+};
+
+Db.setIndexSettings = async (index, options) => {
+  // Users might be on a different cluster
+  if ((index === '*' || index.includes('users')) && internals.info.usersHost) {
+    try {
+      await internals.usersClient7.indices.putSettings({
+        index,
+        body: options.body,
+        timeout: '10m',
+        master_timeout: '10m',
+        cluster: options.cluster
+      });
+    } catch (err) {
+      console.log('ERROR - updating users index settings', JSON.stringify(err, null, 2));
+    }
+  }
+
+  try {
+    const { body: response } = await internals.client7.indices.putSettings({
+      index,
+      body: options.body,
+      timeout: '10m',
+      master_timeout: '10m',
+      cluster: options.cluster
+    });
+    return response;
+  } catch (err) {
+    console.log('ERROR - index settings', JSON.stringify(err, null, 2));
+    cache10.clear();
+    cache60.clear();
+    throw err;
+  }
+};
+
+Db.clearCache = async (cluster) => {
+  return internals.client7.indices.clearCache({ cluster });
+};
+
+Db.shards = async (options) => {
+  return internals.client7.cat.shards({
+    format: 'json',
+    bytes: 'b',
+    h: 'index,shard,prirep,state,docs,store,ip,node,ur,uf,fm,sm,ud',
+    cluster: options?.cluster
+  });
+};
+
+Db.allocation = async (cluster) => {
+  return internals.client7.cat.allocation({ format: 'json', bytes: 'b', cluster });
+};
+
+Db.recovery = async (sortField, activeOnly, cluster) => {
+  return internals.client7.cat.recovery({
+    format: 'json',
+    bytes: 'b',
+    s: sortField,
+    active_only: activeOnly,
+    cluster
+  });
+};
+
+Db.master = async (cluster) => {
+  return internals.client7.cat.master({ format: 'json', cluster });
+};
+
+Db.getClusterSettings = async (options) => {
+  return internals.client7.cluster.getSettings(options);
+};
+
+Db.getClusterSettingsCache = async (options) => {
+  const key = 'clusterSettings-' + JSON.stringify(options);
+  let value = cache60.get(key);
+  if (value) {
+    return value;
+  }
+  value = await internals.client7.cluster.getSettings(options);
+  cache60.set(key, value);
+  return value;
+};
+
+Db.putClusterSettings = async (options) => {
+  cache60.keys().filter((v) => v.startsWith('clusterSettings-')).forEach((v) => cache60.delete(v));
+  options.timeout = '10m';
+  options.master_timeout = '10m';
+  return internals.client7.cluster.putSettings(options);
+};
+
+Db.tasks = async (options) => {
+  return internals.client7.tasks.list({ detailed: true, group_by: 'parents', cluster: options.cluster });
+};
+
+Db.taskCancel = async (taskId, cluster) => {
+  return internals.client7.tasks.cancel({ taskId, cluster });
+};
+
+Db.nodesStats = async (options) => {
+  return internals.client7.nodes.stats(options);
+};
+
+Db.nodesInfo = async (options) => {
+  return internals.client7.nodes.info(options);
+};
+
+Db.update = async (index, id, doc, options) => {
+  const params = {
+    id,
+    body: doc,
+    timeout: '10m',
+    retry_on_conflict: 3,
+    index: fixIndex(index)
+  };
+  Db.merge(params, options);
+  return internals.client7.update(params);
+};
+
+Db.updateSession = async (index, id, doc) => {
+  return internals.sessionsImpl.updateSession(index, id, doc);
+};
+
+Db.close = async () => {
+  User.close();
+  internals.sessionsImpl.close();
+  return internals.client7.close();
+};
+
+Db.reroute = async (cluster, commands) => {
+  return internals.client7.cluster.reroute({
+    timeout: '10m',
+    master_timeout: '10m',
+    retry_failed: true,
+    cluster,
+    body: { commands }
+  });
+};
+
+Db.allocationExplain = async (cluster, index, shard, primary) => {
+  const params = { cluster };
+
+  // If specific shard info is provided, include it in the request body
+  if (index != null && shard != null && primary != null) {
+    params.body = {
+      index,
+      shard: parseInt(shard),
+      primary: primary === 'true' || primary === true
+    };
+  }
+
+  return internals.client7.cluster.allocationExplain(params);
+};
+
+Db.flush = async (index, cluster) => {
+  if (index === 'users') {
+    return User.flush(cluster);
+  } else if (index === 'lookups' || index === 'views' || index === 'shareables') {
+    return internals.usersImpl.flush(index, cluster);
+  } else {
+    return internals.client7.indices.flush({ index: fixIndex(index), cluster });
+  }
+};
+
+Db.refresh = async (index, cluster) => {
+  if (index === 'users') {
+    return User.flush(cluster);
+  } else if (index === 'lookups' || index === 'views' || index === 'shareables') {
+    return internals.usersImpl.refresh(index, cluster);
+  } else {
+    return internals.client7.indices.refresh({ index: fixIndex(index), cluster });
+  }
+};
+
+Db.addTagsToSession = async (index, id, tags, cluster) => {
+  return internals.sessionsImpl.addTagsToSession(index, id, tags, cluster);
+};
+
+Db.removeTagsFromSession = async (index, id, tags, cluster) => {
+  return internals.sessionsImpl.removeTagsFromSession(index, id, tags, cluster);
+};
+
+Db.addHuntToSession = async (index, id, huntId, huntName) => {
+  return internals.sessionsImpl.addHuntToSession(index, id, huntId, huntName);
+};
+
+Db.removeHuntFromSession = async (index, id, huntId, huntName) => {
+  return internals.sessionsImpl.removeHuntFromSession(index, id, huntId, huntName);
+};
+
+/// ///////////////////////////////////////////////////////////////////////////////
+/// / High level functions
+/// ///////////////////////////////////////////////////////////////////////////////
+Db.flushCache = function () {
+  internals.fileId2File.clear();
+  internals.fileName2File.clear();
+  User.flushCache();
+  internals.shortcutsCache.clear();
+  delete internals.aliasesCache;
+  Db.getAliasesCache();
+  cache10.clear();
+  cache60.clear();
+};
+
+function twoDigitString (value) {
+  return (value < 10) ? ('0' + value) : value.toString();
+}
+
+// History DB interactions
+Db.historyIt = async function (doc, cluster) {
+  const d = new Date(Date.now());
+  const jan = new Date(d.getUTCFullYear(), 0, 0);
+  const iname = internals.prefix + 'history_v1-' +
+    twoDigitString(d.getUTCFullYear() % 100) + 'w' +
+    twoDigitString(Math.floor((d - jan) / 604800000));
+
+  return internals.client7.index({
+    index: iname, body: doc, refresh: true, timeout: '10m', cluster
+  });
+};
+Db.searchHistory = async (query) => {
+  return internals.client7.search({
+    index: internals.prefix === 'arkime_' ? 'history_v1-*,arkime_history_v1-*' : fixIndex('history_v1-*'),
+    body: query,
+    rest_total_hits_as_int: true
+  });
+};
+Db.countHistory = async (cluster) => {
+  return internals.client7.count({
+    index: internals.prefix === 'arkime_' ? 'history_v1-*,arkime_history_v1-*' : fixIndex('history_v1-*'),
+    ignore_unavailable: true,
+    cluster
+  });
+};
+Db.deleteHistory = async (id, index, cluster) => {
+  return internals.client7.delete({
+    index, id, refresh: true, cluster
+  });
+};
+
+// Hunt DB interactions
+Db.createHunt = async (doc, cluster) => {
+  return internals.client7.index({
+    index: fixIndex('hunts'), body: doc, refresh: 'wait_for', timeout: '10m', cluster
+  });
+};
+Db.searchHunt = async (query, cluster) => {
+  return internals.client7.search({
+    index: fixIndex('hunts'), body: query, rest_total_hits_as_int: true, cluster
+  });
+};
+Db.countHunts = async (cluster) => {
+  return internals.client7.count({ index: fixIndex('hunts'), cluster });
+};
+Db.deleteHunt = async (id, cluster) => {
+  return internals.client7.delete({
+    index: fixIndex('hunts'), id, refresh: true, cluster
+  });
+};
+Db.updateHunt = async (id, doc, cluster) => {
+  const params = {
+    refresh: true,
+    retry_on_conflict: 3,
+    index: fixIndex('hunts'),
+    body: { doc },
+    id,
+    timeout: '10m',
+    cluster
+  };
+
+  return internals.client7.update(params);
+};
+Db.getHunt = async (id, cluster) => {
+  return internals.client7.get({ index: fixIndex('hunts'), id, cluster });
+};
+
+// fetches the version of the shortcuts from the users backend
+async function getShortcutsVersion () {
+  return internals.usersImpl.getShortcutsVersion();
+}
+// increments the shortcuts version so local ES nodes know to sync
+async function setShortcutsVersion () {
+  return internals.usersImpl.setShortcutsVersion();
+}
+// updates the shortcuts in the local ES db if they are out of sync with the users backend
+// the users backend (ES or SQLite) is the source of truth, local ES nodes are replicas for session queries
+Db.updateLocalShortcuts = async () => {
+  if (!internals.info.usersHost ||
+     !internals.info.isPrimaryViewer || // If no isPrimaryViewer then we aren't actually viewer, don't do this
+    !internals.info.isPrimaryViewer() ||
+    internals.info.host === internals.info.usersHost) {
+    return;
+  }
+
+  if (internals.multiES) { return; } // don't sync shortcuts for multies
+  if (!internals.usersImpl) { return; } // no users backend configured
+
+  const msg = `updating local shortcuts (${internals.info.host}/${internals.localShortcutsIndex}) from users backend`;
+
+  try {
+    // fetch the version of the users backend shortcuts to check if the local shortcuts index
+    // is up to date. if not, something has changed and we need to sync
+    const version = await getShortcutsVersion();
+
+    if (version === internals.localShortcutsVersion) { return; } // versions match, stop!
+
+    console.log(msg);
+
+    internals.shortcutsCache.clear(); // Clear cache when updating
+    // fetch shortcuts from users backend and local ES index
+    const [remoteShortcuts, { body: localResults }] = await Promise.all([
+      internals.usersImpl.getAllShortcuts(),
+      Db.searchShortcutsLocal({ size: 10000 })
+    ]);
+
+    // compare the local shortcuts to the remote shortcuts to determine
+    // if any shortcuts have been deleted from the users backend
+    for (const localShortcut of localResults.hits.hits) {
+      let missing = true;
+      for (const remoteShortcut of remoteShortcuts) {
+        if (remoteShortcut.id === localShortcut._id) {
+          missing = false;
+          break;
+        }
+      }
+      if (missing) {
+        if (internals.debug > 1) {
+          console.log(`SHORTCUT - deleting ${localShortcut._id} ${localShortcut._source.name} locally`);
+        }
+        await internals.client7.delete({
+          index: internals.localShortcutsIndex,
+          id: localShortcut._id,
+          refresh: true
+        });
+      }
+    }
+
+    // compare remote shortcuts to local shortcuts to determine if any
+    // shortcuts have been added or updated from the users backend
+    let changed = false;
+    for (const remoteShortcut of remoteShortcuts) {
+      let missing = true;
+      for (const localShortcut of localResults.hits.hits) {
+        if (remoteShortcut.id === localShortcut._id) {
+          missing = false;
+          if (remoteShortcut.version !== localShortcut._version) {
+            if (internals.debug > 1) {
+              console.log(`SHORTCUT - update from remote ${remoteShortcut.id} ${remoteShortcut.source.name}`);
+            }
+            await internals.client7.index({
+              id: remoteShortcut.id,
+              index: internals.localShortcutsIndex,
+              body: remoteShortcut.source,
+              version_type: 'external',
+              version: remoteShortcut.version
+            });
+            changed = true;
+          }
+        }
+      }
+      if (missing) {
+        if (internals.debug > 1) {
+          console.log(`SHORTCUT - add from remote ${remoteShortcut.id} ${remoteShortcut.source.name}`);
+        }
+        await internals.client7.index({
+          id: remoteShortcut.id,
+          index: internals.localShortcutsIndex,
+          body: remoteShortcut.source,
+          version_type: 'external',
+          version: remoteShortcut.version
+        });
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await internals.client7.indices.refresh({ index: internals.localShortcutsIndex });
+    }
+
+    internals.localShortcutsVersion = version;
+  } catch (err) {
+    console.log(`ERROR - ${msg}:`, err);
+  }
+};
+Db.searchShortcuts = async (params) => {
+  return internals.usersImpl.searchShortcuts(params);
+};
+Db.searchShortcutsLocal = async (query) => {
+  return internals.client7.search({
+    index: internals.localShortcutsIndex, body: query, rest_total_hits_as_int: true, version: true
+  });
+};
+Db.numberOfShortcuts = async (params) => {
+  return internals.usersImpl.numberOfShortcuts(params);
+};
+Db.createShortcut = async (doc) => {
+  internals.shortcutsCache.clear();
+  await setShortcutsVersion();
+  const id = await internals.usersImpl.createShortcut(doc);
+  await Db.updateLocalShortcuts();
+  return id;
+};
+Db.deleteShortcut = async (id) => {
+  internals.shortcutsCache.clear();
+  await setShortcutsVersion();
+  await internals.usersImpl.deleteShortcut(id);
+  await Db.updateLocalShortcuts();
+};
+Db.setShortcut = async (id, doc) => {
+  internals.shortcutsCache.clear();
+  await setShortcutsVersion();
+  await internals.usersImpl.setShortcut(id, doc);
+  await Db.updateLocalShortcuts();
+};
+Db.getShortcut = async (id) => {
+  return internals.usersImpl.getShortcut(id);
+};
+Db.deleteAllShortcuts = async () => {
+  internals.shortcutsCache.clear();
+  await internals.usersImpl.deleteAllShortcuts();
+  await setShortcutsVersion();
+};
+Db.getShortcutsCache = async (user) => {
+  const cshortcuts = internals.shortcutsCache.get(user.userId);
+  if (cshortcuts && internals.shortcutsCacheTS.get(user.userId) > Date.now() - 30000) {
+    return cshortcuts;
+  }
+
+  const roles = [...await user.getRoles()]; // es requires an array for terms search
+
+  // only get shortcuts for this user or shared
+  const query = {
+    query: {
+      bool: {
+        should: [
+          { terms: { roles } }, // shared via user role
+          { term: { users: user.userId } }, // shared via userId
+          { term: { userId: user.userId } } // created by this user
+        ]
+      }
+    },
+    sort: { name: { order: 'asc' } },
+    size: 10000
+  };
+
+  const { body: { hits: shortcuts } } = await Db.searchShortcutsLocal(query);
+
+  const shortcutsMap = {};
+  for (const shortcut of shortcuts.hits) {
+    // need the whole object to test for type mismatch
+    shortcutsMap[shortcut._source.name] = shortcut;
+  }
+
+  internals.shortcutsCache.set(user.userId, shortcutsMap);
+  internals.shortcutsCacheTS.set(user.userId, Date.now());
+
+  return shortcutsMap;
+};
+
+Db.searchViews = async (params) => {
+  return internals.usersImpl.searchViews(params);
+};
+Db.numberOfViews = async (params) => {
+  return internals.usersImpl.numberOfViews(params);
+};
+Db.createView = async (doc) => {
+  return internals.usersImpl.createView(doc);
+};
+Db.deleteView = async (id) => {
+  return internals.usersImpl.deleteView(id);
+};
+Db.deleteAllViews = async () => {
+  return internals.usersImpl.deleteAllViews();
+};
+Db.setView = async (id, doc) => {
+  return internals.usersImpl.setView(id, doc);
+};
+Db.getView = async (id) => {
+  return internals.usersImpl.getView(id);
+};
+Db.getViewByIdOrName = async (idOrName, user, roles) => {
+  return internals.usersImpl.getViewByIdOrName(idOrName, user, roles);
+};
+
+Db.searchShareables = async (params) => {
+  return internals.usersImpl.searchShareables(params);
+};
+
+Db.numberOfShareables = async (params) => {
+  return internals.usersImpl.numberOfShareables(params);
+};
+
+Db.createShareable = async (doc) => {
+  return internals.usersImpl.createShareable(doc);
+};
+
+Db.deleteShareable = async (id) => {
+  return internals.usersImpl.deleteShareable(id);
+};
+
+Db.deleteAllShareables = async () => {
+  return internals.usersImpl.deleteAllShareables();
+};
+
+Db.setShareable = async (id, doc) => {
+  return internals.usersImpl.setShareable(id, doc);
+};
+
+Db.getShareable = async (id) => {
+  return internals.usersImpl.getShareable(id);
+};
+
+Db.arkimeNodeStats = async (nodeName) => {
+  try {
+    const { body: stat } = await Db.get('stats', nodeName);
+    return stat._source;
+  } catch (err) {
+    throw new Error('Unknown node');
+  }
+};
+
+Db.arkimeNodeStatsCache = async function (nodeName) {
+  const key = `arkimeNodeStats-${nodeName}`;
+  let stat = cache60.get(key);
+  if (stat) {
+    return stat;
+  }
+
+  stat = await Db.arkimeNodeStats(nodeName);
+  cache60.set(key, stat);
+  return stat;
+};
+
+Db.healthCache = async (cluster) => {
+  const key = `health-${cluster}`;
+  const value = cache10.get(key);
+
+  if (value !== undefined) {
+    return value;
+  }
+
+  const health = await Db.health(cluster);
+  const { body: doc } = await internals.client7.indices.getTemplate({
+    name: fixIndex('sessions3_template'),
+    filter_path: '**._meta',
+    cluster
+  });
+  if (cluster === undefined) {
+    health.molochDbVersion = doc[fixIndex('sessions3_template')].mappings._meta.molochDbVersion;
+  }
+  cache10.set(key, health);
+  return health;
+};
+
+Db.nodesInfoCache = async (cluster) => {
+  const key = `nodesInfoCache-${cluster}`;
+  const value = cache10.get(key);
+
+  if (value !== undefined) {
+    return value;
+  }
+
+  const { body: data } = await Db.nodesInfo({ cluster });
+  cache10.set(key, data);
+  return data;
+};
+
+Db.masterCache = async (cluster) => {
+  const key = `master-${cluster}`;
+  const value = cache10.get(key);
+
+  if (value !== undefined) {
+    return value;
+  }
+
+  const { body: data } = await Db.master(cluster);
+  cache10.set(key, data);
+  return data;
+};
+
+Db.loadESId2Info = async (cluster) => {
+  if (esId2InfoLoadedCluster.has(cluster)) { return; }
+
+  const query = {
+    size: 10000,
+    query: {
+      wildcard: {
+        nodeName: 'es:*'
+      }
+    },
+    cluster
+  };
+
+  const data = await Db.search('dstats', query);
+  if (!data.hits) { return; }
+  for (const hit of data.hits.hits) {
+    const id = hit._id.substring(3);
+    const nodeName = hit._source.nodeName.substring(3);
+    const hostname = hit._source.hostname.substring(3);
+    esId2Info.set(`${cluster}-${id}`, { nodeName, hostname });
+  }
+  esId2InfoLoadedCluster.set(cluster, true);
+};
+
+Db.getESId2Node = (id, cluster) => {
+  const node = esId2Info.get(`${cluster}-${id}`);
+  if (!node) { return node; }
+  return node.nodeName;
+};
+
+Db.updateESId2Info = async (id, nodeName, hostname, cluster) => {
+  const key = `${cluster}-${id}`;
+  if (esId2Info.has(key) && esId2Info.get(key).nodeName === nodeName && esId2Info.get(key).hostname === hostname) {
+    return;
+  }
+
+  esId2Info.set(key, { nodeName, hostname });
+  await Db.index('dstats', `es:${id}`, { nodeName: `es:${nodeName}`, hostname: `es:${hostname}` });
+};
+
+Db.nodesStatsCache = async (cluster) => {
+  const key = `nodesStats-${cluster}`;
+  const value = cache10.get(key);
+
+  if (value !== undefined) {
+    return value;
+  }
+
+  const { body: data } = await Db.nodesStats({
+    metric: 'jvm,process,fs,os,indices,thread_pool',
+    cluster
+  });
+
+  const nodeKeys = Object.keys(data.nodes);
+
+  for (let n = 0, nlen = nodeKeys.length; n < nlen; n++) {
+    const node = data.nodes[nodeKeys[n]];
+    Db.updateESId2Info(nodeKeys[n], node.name, node.host, cluster);
+  }
+  cache10.set(key, data);
+  return data;
+};
+
+Db.indicesCache = async (cluster) => {
+  const key = `indices-${cluster}`;
+  const value = cache10.get(key);
+
+  if (value !== undefined) {
+    return value;
+  }
+
+  const { body: indices } = await Db.indices('_all', cluster);
+  cache10.set(key, indices);
+  return indices;
+};
+
+Db.indicesSettingsCache = async (cluster) => {
+  const key = `indicesSettings-${cluster}`;
+  const value = cache10.get(key);
+
+  if (value !== undefined) {
+    return value;
+  }
+
+  const { body: indicesSettings } = await Db.indicesSettings('_all', cluster);
+  cache10.set(key, indicesSettings);
+  return indicesSettings;
+};
+
+Db.hostnameToNodeids = async (hostname) => {
+  const query = { query: { match: { hostname } } };
+  const sdata = await Db.search('stats', query);
+  // If results, return array of _id, otherwise empty array
+  return sdata?.hits?.hits?.map(hit => hit._id) ?? [];
+};
+
+Db.fileIdToFile = async (node, num) => {
+  const key = node + '!' + num;
+  const info = internals.fileId2File.get(key);
+  if (info !== undefined) {
+    return info;
+  }
+
+  let file = null;
+  try {
+    const { body: fresult } = await Db.get('files', node + '-' + num);
+    file = fresult._source;
+    internals.fileId2File.set(key, file);
+    internals.fileName2File.set(file.name, file);
+  } catch (err) { // Cache file is unknown
+    internals.fileId2File.delete(key);
+  }
+  return file;
+};
+
+Db.fileNameToFiles = async (fileName) => {
+  let query;
+  if (fileName[0] === '/' && fileName[fileName.length - 1] === '/') {
+    query = { query: { regexp: { name: fileName.substring(1, fileName.length - 1) } }, sort: [{ num: { order: 'desc' } }] };
+  } else if (fileName.indexOf('*') !== -1) {
+    query = { query: { wildcard: { name: fileName } }, sort: [{ num: { order: 'desc' } }] };
+  }
+
+  // Not wildcard/regex check the cache
+  if (!query) {
+    if (internals.fileName2File.has(fileName)) {
+      return [internals.fileName2File.get(fileName)];
+    }
+    query = { size: 100, query: { term: { name: fileName } }, sort: [{ num: { order: 'desc' } }] };
+  }
+
+  try {
+    const data = await Db.search('files', query);
+    if (!data.hits) {
+      return null;
+    }
+    const files = [];
+    for (const hit of data.hits.hits) {
+      const file = hit._source;
+      const key = file.node + '!' + file.num;
+      internals.fileId2File.set(key, file);
+      internals.fileName2File.set(file.name, file);
+      files.push(file);
+    }
+    return files;
+  } catch (err) {
+    return null;
+  }
+};
+
+Db.getSequenceNumber = async (sName) => {
+  const { body: sinfo } = await Db.index('sequence', sName, {});
+  return sinfo._version;
+};
+
+Db.numberOfDocuments = async (index, options) => {
+  const impl = isSessionsIndex(index) ? internals.sessionsImpl : internals.esImpl;
+  return impl.numberOfDocuments(index, options);
+};
+
+Db.checkVersion = async function (minVersion) {
+  const match = process.versions.node.match(/^(\d+)\.(\d+)\.(\d+)/);
+  const nodeVersion = parseInt(match[1], 10) * 10000 + parseInt(match[2], 10) * 100 + parseInt(match[3], 10);
+  if (nodeVersion < 200900) {
+    console.log(`ERROR - Need node 20 (20.9 or higher) or node 22, currently using ${process.version}`);
+    process.exit(1);
+  } else if (nodeVersion >= 230000) {
+    console.log(`ERROR - Node version ${process.version} is not supported, please use node 20 (20.9 or higher) or node 22`);
+    process.exit(1);
+  }
+
+  for (const index of ['stats', 'dstats', 'sequence']) {
+    try {
+      await Db.indexStats(index);
+    } catch (err) {
+      console.log(`ERROR - Issue with '${fixIndex(index)}' index, make sure 'db/db.pl <host:port> init' has been run.\n`, err);
+      process.exit(1);
+    }
+  }
+
+  if (!internals.multiES) {
+    const { body: doc } = await internals.client7.indices.getMapping({
+      index: fixIndex('files'),
+    });
+
+    const fname = fixIndex('files_v30');
+    if (doc[fname]?.mappings?.properties?.name?.type !== 'keyword') {
+      console.log(`ERROR - Issue with '${fixIndex('files')}' index, use 'db/db.pl http://<host:port> repair' to fix.\n`);
+      if (internals.debug) {
+        console.log(JSON.stringify(doc, null, 2));
+      }
+      process.exit(1);
+    }
+  }
+
+  await ArkimeUtil.checkArkimeSchemaVersion(internals.client7, internals.prefix, minVersion);
+};
+
+Db.isLocalView = async function (node) {
+  if (node === internals.nodeName) {
+    if (internals.debug > 1) {
+      console.log(`DEBUG: node:${node} is local view because equals ${internals.nodeName}`);
+    }
+    return true;
+  }
+
+  try {
+    const stat = await Db.arkimeNodeStatsCache(node);
+    if (stat.hostname !== os.hostname() && stat.hostname !== internals.hostName) {
+      if (internals.debug > 1) {
+        console.log(`DEBUG: node:${node} is NOT local view because ${stat.hostname} != ${os.hostname()} or --host ${internals.hostName}`);
+      }
+      return false;
+    } else {
+      if (internals.debug > 1) {
+        console.log(`DEBUG: node:${node} is local view because ${stat.hostname} == ${os.hostname()} or --host ${internals.hostName}`);
+      }
+      return true;
+    }
+  } catch (err) {
+    if (internals.debug > 1) {
+      console.log(`DEBUG: node:${node} is NOT local view because error ${err} ${os.hostname()} ${internals.hostName}`);
+    }
+    return false;
+  }
+};
+
+Db.deleteFile = async (node, id, path) => {
+  try {
+    await fs.promises.unlink(path);
+  } catch (err) {
+    console.log('EXPIRE - error deleting file', node, id, path, err);
+  }
+  await Db.deleteDocument('files', id);
+};
+
+Db.session2Sid = function (item) {
+  // ver can be 2@ (sessions2), 3@ (sessions3), or x@ (user-specified queryExtraIndices)
+  const ver = internals.queryExtraIndicesRegex.some(re => re.test(item._index)) ? 'x@' : item._index.includes('sessions2') ? '2@' : '3@';
+  if (ver === 'x@') {
+    // document from queryExtraIndices, format Sid as x@_index:_id
+    return ver + item._index + ':' + item._id;
+  } else if (item._id.length < 31) {
+    // sessions2 didn't have new arkime_ prefix
+    if (ver === '2@' && internals.prefix === 'arkime_') {
+      // sessions2-191021 191021-abcd => 2@191021:191021-abcd
+      return ver + item._index.substring(10) + ':' + item._id;
+    } else if (item._index.startsWith('partial-')) {
+      // partial-tests_sessions3-191021 191021-abcd => 3@191021:191021-abcd
+      return ver + item._index.substring(internals.prefix.length + 18) + ':' + item._id;
+    } else {
+      // tests_sessions3-191021 191021-abcd => 3@191021:191021-abcd
+      return ver + item._index.substring(internals.prefix.length + 10) + ':' + item._id;
+    }
+  } else {
+    // tests_sessions3-191021 191021-abcdefghijklmnopqrstuvwxyz => 3@191021-abcdefghijklmnopqrstuvwxyz
+    return ver + item._id;
+  }
+};
+
+Db.sid2Id = function (id) {
+  if (id[1] === '@') {
+    id = id.substr(2);
+  }
+
+  const colon = id.indexOf(':');
+  if (colon > 0) {
+    return id.substr(colon + 1);
+  }
+
+  return id;
+};
+
+Db.sid2Index = function (id, options) {
+  const colon = id.indexOf(':');
+
+  if (id[1] === '@') {
+    if (id[0] === 'x') {
+      // ver is x@, which indicates user-specified queryExtraIndices,
+      //   so the id will be formatted x@_index:_id
+      const index = id.substr(2, colon - 2);
+      if (colon > 2 && /^[\w.+-]+$/.test(index) && internals.queryExtraIndicesRegex.some(re => re.test(index))) {
+        return index;
+      } else {
+        throw new Error('Db.sid2Index: ERROR - queryExtraIndices regex did not match');
+      }
+    }
+
+    const indexDate = (colon > 0) ? id.substr(2, colon - 2) : id.substr(2, id.indexOf('-') - 2);
+    if ((id[0] !== '2' && id[0] !== '3') || !/^[\w-]+$/.test(indexDate)) {
+      throw new Error('Db.sid2Index: ERROR - invalid session id');
+    }
+    return 'sessions' + id[0] + '-' + indexDate;
+  }
+
+  const date = (colon > 0) ? id.substr(0, colon) : id.substr(0, id.indexOf('-'));
+  if (!/^[\w-]+$/.test(date)) {
+    throw new Error('Db.sid2Index: ERROR - invalid session id');
+  }
+
+  const s3 = 'sessions3-' + date;
+  const s2 = 'sessions2-' + date;
+
+  if (!internals.aliasesCache) {
+    return s3;
+  }
+
+  const fs2 = fixIndex(s2);
+
+  const results = [];
+
+  if (internals.aliasesCache[fs2] || internals.aliasesCache[fs2 + '-reindex'] || internals.aliasesCache[fs2 + '-shrink']) {
+    results.push(fs2);
+  }
+
+  const fs3 = fixIndex(s3);
+  if (internals.aliasesCache[fs3] || internals.aliasesCache['partial-' + fs3] || internals.aliasesCache[fs3 + '-reindex'] || internals.aliasesCache[fs3 + '-shrink']) {
+    results.push(fs3);
+  }
+
+  if (results.length > 1 && options?.multiple) {
+    return results;
+  }
+
+  return results[0] ?? fs3;
+};
+
+Db.loadFields = async () => {
+  return Db.search('fields', { size: 10000 });
+};
+
+Db.getSessionIndices = function (excludeExtra) {
+  return internals.sessionsImpl.getSessionIndices(excludeExtra);
+};
+
+Db.getIndices = async (startTime, stopTime, bounding, rotateIndex, extraIndices) => {
+  return internals.sessionsImpl.getIndices(startTime, stopTime, bounding, rotateIndex, extraIndices);
+};
+
+Db.getMinValue = async (index, field) => {
+  const impl = isSessionsIndex(index) ? internals.sessionsImpl : internals.esImpl;
+  return impl.getMinValue(index, field);
+};
+
+Db.getClusterDetails = async () => {
+  return internals.client7.get({ index: '_cluster', id: 'details' });
+};
+
+Db.getILMPolicy = async (cluster) => {
+  try {
+    const data = await internals.client7.ilm.getLifecycle({
+      policy: `${internals.prefix}molochsessions,${internals.prefix}molochhistory`,
+      cluster
+    });
+    return data.body;
+  } catch {
+    return {};
+  }
+};
+
+Db.setILMPolicy = async (ilmName, policy, cluster) => {
+  console.log('name', ilmName, 'policy', policy);
+  try {
+    const data = await internals.client7.ilm.putLifecycle({
+      policy: ilmName, body: { policy: policy.policy }, cluster
+    });
+    return data.body;
+  } catch (err) {
+    console.log('ERROR - setting ILM Policy', err);
+    throw err;
+  }
+};
+
+Db.getTemplate = async (templateName, cluster) => {
+  return internals.client7.indices.getTemplate({ name: fixIndex(templateName), flat_settings: true, cluster });
+};
+
+Db.putTemplate = async (templateName, body, cluster) => {
+  return internals.client7.indices.putTemplate({ name: fixIndex(templateName), body, cluster });
+};
+
+Db.setQueriesNode = async (node, force) => {
+  const namePid = `${node}-${process.pid}`;
+
+  // force is true we just rewrite the primary-viewer entry every time
+  if (force) {
+    await internals.client7.index({
+      id: 'primary-viewer',
+      index: fixIndex('queries'),
+      body: { name: namePid, lastRun: Date.now(), enabled: false }
+    });
+    return true;
+  }
+
+  // force is false. Try and update the previous record. If our record
+  // just update the time stamp. If not our record then take the record if
+  // timestamp is 1 min old. Otherwise noop.
+
+  const script = `
+    if (ctx._source.name == params.name) {
+      ctx._source.lastRun = ctx['_now'];
+    } else if (ctx['_now'] - ctx._source.lastRun >= 60000) {
+      ctx._source.lastRun = ctx['_now'];
+      ctx._source.name = params.name;
+    } else {
+      ctx.op = "none";
+    }
+  `;
+
+  const body = {
+    script: {
+      source: script,
+      lang: 'painless',
+      params: {
+        name: namePid
+      }
+    }
+  };
+  try {
+    const result = await internals.client7.update({
+      id: 'primary-viewer',
+      index: fixIndex('queries'),
+      body
+    });
+    return result.body.result === 'updated';
+  } catch (e) {
+    // There was no entry to update, just try and create a new record as ourself
+    try {
+      const result = await internals.client7.index({
+        id: 'primary-viewer',
+        index: fixIndex('queries'),
+        body: { name: namePid, lastRun: Date.now(), enabled: false },
+        op_type: 'create'
+      });
+      return result.body.result === 'created';
+    } catch (e2) {
+      return false;
+    }
+  }
+};
+
+Db.getQueriesNode = async () => {
+  try {
+    const { body: doc } = await internals.client7.get({
+      id: 'primary-viewer',
+      index: fixIndex('queries')
+    });
+    return {
+      node: doc._source?.name,
+      updateTime: doc._source?.lastRun
+    };
+  } catch (e) {
+    const { body: doc } = await internals.client7.indices.getMapping({
+      index: fixIndex('queries')
+    });
+    // Since queries is an alias we don't know the real index name here
+    const meta = doc[Object.keys(doc)[0]].mappings._meta;
+
+    return {
+      node: meta?.node,
+      updateTime: meta?.updateTime
+    };
+  }
+};
+
+Db.getQuery = async (id) => {
+  return internals.client7.get({ index: fixIndex('queries'), id });
+};

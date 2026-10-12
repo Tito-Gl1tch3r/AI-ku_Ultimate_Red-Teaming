@@ -1,0 +1,122 @@
+// MIT License
+//
+// Copyright (c) [2025] [c3rb3ru5d3d53c]
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::str::FromStr;
+
+/// Represents the different architectures of a binary.
+#[repr(u16)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Architecture {
+    /// 64-bit AMD architecture.
+    AMD64 = 0x00,
+    /// 32-bit Intel architecture.
+    I386 = 0x01,
+    /// 64-bit ARM architecture.
+    ARM64 = 0x02,
+    /// CIL
+    CIL = 0x03,
+    /// Unknown architecture.
+    UNKNOWN = 0x04,
+}
+
+impl<'de> Deserialize<'de> for Architecture {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Architecture::from_string(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for Architecture {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl Architecture {
+    pub const fn all() -> &'static [Self] {
+        &[Self::AMD64, Self::I386, Self::ARM64, Self::CIL]
+    }
+
+    pub fn to_vec() -> Vec<String> {
+        Self::all().iter().map(ToString::to_string).collect()
+    }
+}
+
+impl Architecture {
+    pub fn to_list() -> String {
+        Architecture::to_vec().join(", ")
+    }
+
+    pub fn from_string(s: &str) -> Result<Self, Error> {
+        match s.to_lowercase().as_str() {
+            "amd64" => Ok(Architecture::AMD64),
+            "i386" => Ok(Architecture::I386),
+            "arm64" | "aarch64" => Ok(Architecture::ARM64),
+            "cil" => Ok(Architecture::CIL),
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid or unsupported architecture: {}", s),
+            )),
+        }
+    }
+}
+
+/// Implements Display for `BinaryArchitecture` enum
+impl fmt::Display for Architecture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let architecture = match self {
+            Architecture::AMD64 => "amd64",
+            Architecture::I386 => "i386",
+            Architecture::ARM64 => "arm64",
+            Architecture::CIL => "cil",
+            Architecture::UNKNOWN => "unknown",
+        };
+        write!(f, "{}", architecture)
+    }
+}
+
+impl FromStr for Architecture {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "amd64" => Ok(Architecture::AMD64),
+            "i386" => Ok(Architecture::I386),
+            "arm64" | "aarch64" => Ok(Architecture::ARM64),
+            "cil" => Ok(Architecture::CIL),
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid or unsupported architecture: {}", s),
+            )
+            .to_string()),
+        }
+    }
+}

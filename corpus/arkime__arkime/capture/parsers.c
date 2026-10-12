@@ -1,0 +1,1982 @@
+/******************************************************************************/
+/* parsers.c  -- Functions for dealing with classification and parsers
+ *
+ * Copyright 2012-2017 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "arkime.h"
+#include <inttypes.h>
+#include <fcntl.h>
+#include "gmodule.h"
+#include "magic.h"
+
+//#define DEBUG_PARSERS 1
+
+/******************************************************************************/
+extern ArkimeConfig_t        config;
+LOCAL  gchar                 classTag[100];
+
+LOCAL  magic_t               cookie[ARKIME_MAX_PACKET_THREADS];
+
+extern uint8_t               arkime_char_to_hexstr[256][3];
+
+int    userField;
+
+enum ArkimeMagicMode { ARKIME_MAGICMODE_LIBMAGIC, ARKIME_MAGICMODE_BOTH, ARKIME_MAGICMODE_BASIC, ARKIME_MAGICMODE_NONE};
+
+LOCAL enum ArkimeMagicMode magicMode;
+
+/******************************************************************************/
+typedef struct {
+    union {
+        ArkimeParsersNamedFunc cb;
+        ArkimeParsersNamedFunc2 cb2;
+    };
+    void *cbuw;
+    int   isCb2;
+} ArkimeNamedFunc_t;
+
+typedef struct {
+    GPtrArray *funcs;
+    uint16_t   id;
+} ArkimeNamedInfo_t;
+
+// 64 is the max because of the u64 arkime_parsers_has_named_func
+#define MAX_NAMED_FUNCS  64
+
+uint64_t                 arkime_parsers_has_named_func;
+LOCAL uint16_t           namedFuncsMax = 0;
+LOCAL ArkimeNamedInfo_t *namedFuncsArr[MAX_NAMED_FUNCS];
+LOCAL GHashTable        *namedFuncsHash;
+LOCAL GHashTable        *subParserHash;
+/******************************************************************************/
+typedef struct {
+    char *filename;
+    int   extensionPos;
+} ArkimeFileWithExtension_t;
+
+typedef struct arkime_extensions {
+    const char               *extension;
+    ArkimeParserLoadFunc      loadFunc;
+    int                       loaded;
+} ArkimeExtensions_t;
+LOCAL GPtrArray *extensionsArr;
+
+/******************************************************************************/
+#define MAGIC_MATCH(offset, needle) memcmp(data+offset, needle, sizeof(needle)-1) == 0
+#define MAGIC_MATCH_LEN(offset, needle) ((len > (int)sizeof(needle)-1+offset) && (memcmp(data+offset, needle, sizeof(needle)-1) == 0))
+
+#define MAGIC_MEMSTR_LEN(offset, needle) ((len > (int)sizeof(needle)-1+offset) && (arkime_memstr(data+offset, len-offset, needle, sizeof(needle)-1)))
+
+#define MAGIC_STRCASE(offset, needle) strncasecmp(data+offset, needle, sizeof(needle)-1) == 0
+#define MAGIC_STRCASE_LEN(offset, needle) ((len > (int)sizeof(needle)-1+offset) && (strncasecmp(data+offset, needle, sizeof(needle)-1) == 0))
+
+#define MAGIC_RESULT(str) arkime_field_string_add(field, session, str, sizeof(str)-1, TRUE), str
+LOCAL const char *arkime_parsers_magic_basic(ArkimeSession_t *session, int field, const char *data, int len)
+{
+    switch (data[0]) {
+    case 0:
+        if (len > 10 && MAGIC_MATCH(4, "ftyp")) {
+            if (MAGIC_MATCH(8, "qt")) {
+                return MAGIC_RESULT("video/quicktime");
+            }
+            if (MAGIC_MATCH(8, "3g")) {
+                return MAGIC_RESULT("video/3gpp");
+            }
+        }
+        if (MAGIC_MATCH(0, "\000\001\000\000\000")) {
+            return MAGIC_RESULT("application/x-font-ttf");
+        }
+        if (MAGIC_MATCH_LEN(0, "\000\000\002\000\001\000")) {
+            return MAGIC_RESULT("image/x-win-bitmap");
+        }
+        if (MAGIC_MATCH(0, "\000asm")) {
+            return MAGIC_RESULT("application/wasm");
+        }
+        break;
+    case '\004':
+        if (MAGIC_MATCH(0, "\004\042M\030")) {
+            return MAGIC_RESULT("application/x-lz4");
+        }
+        break;
+    case '\032':
+        if (MAGIC_MATCH(0, "\x1a\x45\xdf\xa3")) {
+            if (MAGIC_MEMSTR_LEN(4, "webm")) {
+                return MAGIC_RESULT("video/webm");
+            }
+            if (MAGIC_MEMSTR_LEN(4, "matroska")) {
+                return MAGIC_RESULT("video/x-matroska");
+            }
+        }
+        break;
+    case '\037':
+        if (data[1] == '\213') {
+            return MAGIC_RESULT("application/x-gzip");
+        }
+        if (data[1] == '\235') {
+            return MAGIC_RESULT("application/x-compress");
+        }
+        break;
+#ifdef OID_DECODE_SOMEDAY
+    case 0x30:
+        if (len > 100 && (gchar)data[1] == (gchar)0x82) {
+            ArkimeASNSeq_t seq[5];
+            int num = arkime_parsers_asn_get_sequence(seq, 5, (uint8_t *)data, len, TRUE);
+            for (int i = 0; i < num; i++) {
+                if (seq[i].pc && seq[i].tag == 16) {
+                    BSB tbsb;
+                    BSB_INIT(tbsb, seq[i].value, seq[i].len);
+                    uint32_t ipc, itag, ilen;
+                    uint8_t *ivalue;
+                    ivalue = arkime_parsers_asn_get_tlv(&tbsb, &ipc, &itag, &ilen);
+                    if (itag != 6)
+                        continue;
+                    char oid[100];
+                    arkime_parsers_asn_decode_oid(oid, sizeof(oid), ivalue, ilen);
+                    printf("%s ", oid);
+                    arkime_print_hex_string(ivalue, ilen);
+                    if (ilen == 9 && MAGIC_MATCH(ivalue, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x05")) {
+                    }
+                }
+            }
+        }
+        break;
+#endif
+    case '\050':
+        if (MAGIC_MATCH(0, "\050\265\057\375")) {
+            return MAGIC_RESULT("application/zstd");
+        }
+        break;
+    case '7':
+        if (MAGIC_MATCH_LEN(0, "7z\274\257\047\034")) {
+            return MAGIC_RESULT("application/x-7z-compressed");
+        }
+        break;
+    case '!':
+        if (MAGIC_MATCH_LEN(1, "<arch>\ndebian-binary")) {
+            return MAGIC_RESULT("application/x-debian-package");
+        }
+        break;
+    case '#':
+        if (data[1] == '!') {
+            if (MAGIC_MEMSTR_LEN(3, "node")) {
+                return MAGIC_RESULT("application/javascript");
+            } else if (MAGIC_MEMSTR_LEN(3, "perl")) {
+                return MAGIC_RESULT("text/x-perl");
+            } else if (MAGIC_MEMSTR_LEN(3, "ruby")) {
+                return MAGIC_RESULT("text/x-ruby");
+            } else if (MAGIC_MEMSTR_LEN(3, "python")) {
+                return MAGIC_RESULT("text/x-python");
+            }
+            return MAGIC_RESULT("text/x-shellscript");
+        }
+        break;
+    case '%':
+        if (MAGIC_MATCH(0, "%PDF-")) {
+            return MAGIC_RESULT("application/pdf");
+        }
+        if (MAGIC_MATCH(0, "%!PS")) {
+            return MAGIC_RESULT("application/postscript");
+        }
+        break;
+    case '<':
+        switch (data[1]) {
+        case '!':
+            if (MAGIC_STRCASE_LEN(0, "<!doctype html")) {
+                return MAGIC_RESULT("text/html");
+            }
+            if (MAGIC_STRCASE_LEN(0, "<!doctype svg")) {
+                return MAGIC_RESULT("text/svg+xml");
+            }
+            break;
+        case '?':
+            if (MAGIC_STRCASE(0, "<?xml")) {
+                if (MAGIC_MEMSTR_LEN(5, "<svg")) {
+                    return MAGIC_RESULT("image/svg+xml");
+                }
+                return MAGIC_RESULT("text/xml");
+            }
+            if (MAGIC_STRCASE_LEN(2, "php") || MAGIC_STRCASE_LEN(2, " php")) {
+                return MAGIC_RESULT("text/x-php");
+            }
+            break;
+        case 'B':
+        case 'b':
+            if (MAGIC_STRCASE(0, "<body")) {
+                return MAGIC_RESULT("text/html");
+            }
+            break;
+        case 'H':
+        case 'h':
+            if (MAGIC_STRCASE(0, "<head")) {
+                return MAGIC_RESULT("text/html");
+            }
+            if (MAGIC_STRCASE(0, "<html")) {
+                return MAGIC_RESULT("text/html");
+            }
+            break;
+        case 's':
+        case 'S':
+            if (MAGIC_STRCASE(0, "<svg")) {
+                return MAGIC_RESULT("image/svg");
+            }
+            break;
+        }
+        break;
+    case '{':
+        if (data[1] == '"' && isalpha(data[2])) {
+            return MAGIC_RESULT("application/json");
+        }
+        if (MAGIC_MATCH(0, "{\\rtf")) {
+            return MAGIC_RESULT("text/rtf");
+        }
+        break;
+    case '8':
+        if (MAGIC_MATCH(0, "8BPS")) {
+            return MAGIC_RESULT("image/vnd.adobe.photoshop");
+        }
+        break;
+    case 'B':
+        if (data[1] == 'M') {
+            return MAGIC_RESULT("application/x-ms-bmp");
+        }
+
+        if (MAGIC_MATCH(0, "BZh")) {
+            return MAGIC_RESULT("application/x-bzip2");
+        }
+        break;
+    case 'C':
+        if (MAGIC_MATCH(0, "CWS")) {
+            return MAGIC_RESULT("application/x-shockwave-flash");
+        }
+        break;
+    case 'F':
+        if (MAGIC_MATCH(0, "FLV\001")) {
+            return MAGIC_RESULT("video/x-flv");
+        }
+        if (MAGIC_MATCH(0, "FWS")) {
+            return MAGIC_RESULT("application/x-shockwave-flash");
+        }
+        break;
+    case 'G':
+        if (MAGIC_MATCH(0, "GIF8")) {
+            return MAGIC_RESULT("image/gif");
+        }
+        if (len > 188 && data[2] == 0 && data[188] == 'G') {
+            return MAGIC_RESULT("video/mp2t");
+        }
+        break;
+    case 'f':
+        if (MAGIC_MATCH(0, "fLaC")) {
+            return MAGIC_RESULT("audio/flac");
+        }
+        break;
+    case 'i':
+        if (MAGIC_MATCH(0, "icns")) {
+            return MAGIC_RESULT("image/x-icns");
+        }
+        break;
+    case 'I':
+        if (MAGIC_MATCH(0, "ID3")) {
+            return MAGIC_RESULT("audio/mpeg");
+        }
+        if (MAGIC_MATCH(0, "II*\000")) {
+            return MAGIC_RESULT("image/tiff");
+        }
+        break;
+    case 'L':
+        if (MAGIC_MATCH_LEN(0, "L\000\000\000\001\024\002\000")) {
+            return MAGIC_RESULT("application/x-ms-shortcut");
+        }
+        break;
+    case 'M':
+        if (data[1] == 'Z') {
+            return MAGIC_RESULT("application/x-dosexec");
+        }
+        if (MAGIC_MATCH_LEN(0, "MSCF\000\000")) {
+            return MAGIC_RESULT("application/vnd.ms-cab-compressed");
+        }
+        if (MAGIC_MATCH(0, "MM\000*")) {
+            return MAGIC_RESULT("image/tiff");
+        }
+        if (MAGIC_MATCH(0, "M<\262\241")) {
+            return MAGIC_RESULT("application/vnd.tcpdump.pcap");
+        }
+        break;
+    case 'O':
+        if (len > 40 && MAGIC_MATCH(0, "OggS")) {
+            // https://speex.org/docs/manual/speex-manual/node8.html
+            if (MAGIC_MATCH(28, "Speex   ")) {
+                return MAGIC_RESULT("audio/ogg");
+            }
+
+            // https://xiph.org/flac/ogg_mapping.html
+            if (MAGIC_MATCH(29, "FLAC")) {
+                return MAGIC_RESULT("audio/ogg");
+            }
+
+            // https://xiph.org/vorbis/doc/Vorbis_I_spec.html
+            if (MAGIC_MATCH(28, "\001vorbis")) {
+                return MAGIC_RESULT("audio/ogg");
+            }
+
+            // https://www.theora.org/doc/Theora.pdf
+            if (MAGIC_MATCH(28, "\x80theora")) {
+                return MAGIC_RESULT("video/ogg");
+            }
+        } else if (MAGIC_MATCH(0, "OTTO")) {
+            return MAGIC_RESULT("application/vnd.ms-opentype");
+        }
+        break;
+    case 'P':
+        if (MAGIC_MATCH(0, "PK\003\004")) {
+            return MAGIC_RESULT("application/zip");
+        }
+        if (MAGIC_MATCH(0, "PK\005\006")) {
+            return MAGIC_RESULT("application/zip");
+        }
+        if (MAGIC_MATCH_LEN(0, "PK\x07\x08PK")) {
+            return MAGIC_RESULT("application/zip");
+        }
+        break;
+    case 'R':
+        if (MAGIC_MATCH(0, "RIFF")) {
+            if (MAGIC_MATCH_LEN(8, "WEBP")) {
+                return MAGIC_RESULT("image/webp");
+            }
+            if (MAGIC_MATCH_LEN(8, "AVI ")) {
+                return MAGIC_RESULT("video/x-msvideo");
+            }
+            return MAGIC_RESULT("audio/x-wav");
+        }
+        if (MAGIC_MATCH(0, "Rar!\x1a")) {
+            return MAGIC_RESULT("application/x-rar");
+        }
+        break;
+    case 'S':
+        if (MAGIC_MATCH_LEN(0, "SQLite format 3")) {
+            return MAGIC_RESULT("application/vnd.sqlite3");
+        }
+        break;
+    case 'W':
+        if (MAGIC_MATCH(0, "WAVE")) {
+            return MAGIC_RESULT("audio/x-wav");
+        }
+        break;
+    case 'd':
+        if (MAGIC_MATCH_LEN(0, "d8:announce")) {
+            return MAGIC_RESULT("application/x-bittorrent");
+        }
+        break;
+    case 'w':
+        if (MAGIC_MATCH(0, "wOFF")) {
+            return MAGIC_RESULT("application/font-woff");
+        }
+        if (MAGIC_MATCH(0, "wOF2")) {
+            return MAGIC_RESULT("application/font-woff2");
+        }
+        break;
+    case '\177':
+        if (len > 17 && MAGIC_MATCH(0, "\177ELF")) {
+            // e_type lives at offset 16, byte order comes from EI_DATA
+            const uint8_t etype = (data[5] == 2) ? data[17] : data[16];
+            if (etype == 3) { // ET_DYN, also how PIE executables are built
+                return MAGIC_RESULT("application/x-sharedlib");
+            }
+            return MAGIC_RESULT("application/x-executable");
+        }
+        break;
+    case '\xa1':
+        if (MAGIC_MATCH(0, "\xa1\xb2\xc3\xd4") || MAGIC_MATCH(0, "\xa1\xb2\x3c\x4d")) {
+            return MAGIC_RESULT("application/vnd.tcpdump.pcap");
+        }
+        break;
+    case '\xca':
+        if (MAGIC_MATCH(0, "\xca\xfe\xba\xbe")) {
+            // cafebabe is both a Mach-O universal binary and a java class file,
+            // Mach-O follows it with a small big endian architecture count
+            if (len > 7 && data[4] == 0 && data[5] == 0 && data[6] == 0 && (uint8_t)data[7] < 0x20) {
+                return MAGIC_RESULT("application/x-mach-binary");
+            }
+            return MAGIC_RESULT("application/x-java-applet");
+        }
+        break;
+    case '\xce':
+    case '\xcf':
+        if (MAGIC_MATCH(0, "\xce\xfa\xed\xfe") || MAGIC_MATCH(0, "\xcf\xfa\xed\xfe")) {
+            return MAGIC_RESULT("application/x-mach-binary");
+        }
+        break;
+    case '\xd0':
+        if (MAGIC_MATCH_LEN(0, "\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")) {
+            return MAGIC_RESULT("application/x-ole-storage");
+        }
+        break;
+    case '\xd4':
+        if (MAGIC_MATCH(0, "\xd4\xc3\xb2\xa1")) {
+            return MAGIC_RESULT("application/vnd.tcpdump.pcap");
+        }
+        break;
+    case '\xfe':
+        if (MAGIC_MATCH(0, "\xfe\xed\xfa\xce") || MAGIC_MATCH(0, "\xfe\xed\xfa\xcf")) {
+            return MAGIC_RESULT("application/x-mach-binary");
+        }
+        break;
+    case '\x89':
+        if (MAGIC_MATCH(0, "\x89PNG")) {
+            return MAGIC_RESULT("image/png");
+        }
+        break;
+    case '\375':
+        if (MAGIC_MATCH_LEN(0, "\3757zXZ")) {
+            return MAGIC_RESULT("application/x-xz");
+        }
+        break;
+    case '\377':
+        if (len > 10 && MAGIC_MATCH(0, "\377\330\377")) {
+            return MAGIC_RESULT("image/jpeg");
+        }
+        break;
+    case '\xed':
+        if (len > 10 && MAGIC_MATCH(0, "\xed\xab\xee\xdb")) {
+            return MAGIC_RESULT("application/x-rpm");
+        }
+        break;
+    } /* switch */
+
+    if (MAGIC_MATCH_LEN(257, "ustar")) {
+        return MAGIC_RESULT("application/x-tar");
+    }
+    if (MAGIC_MEMSTR_LEN(0, "document.write") ||
+        MAGIC_MEMSTR_LEN(0, "'use strict'")) {
+        return MAGIC_RESULT("text/javascript");
+    }
+    return NULL;
+}
+/******************************************************************************/
+const char *arkime_parsers_magic(ArkimeSession_t *session, int field, const char *data, int len)
+{
+    const char *m;
+    if (len < 5)
+        return NULL;
+
+    switch (magicMode) {
+    case ARKIME_MAGICMODE_BASIC:
+        return arkime_parsers_magic_basic(session, field, data, len);
+
+    case ARKIME_MAGICMODE_BOTH:
+        m = arkime_parsers_magic_basic(session, field, data, len);
+        if (m)
+            return m;
+
+    // Fall thru
+    case ARKIME_MAGICMODE_LIBMAGIC:
+        m = magic_buffer(cookie[session->thread], data, MIN(len, 50));
+        if (m) {
+            int mlen;
+            const char *semi = strchr(m, ';');
+            if (semi) {
+                mlen = semi - m;
+            } else {
+                mlen = strlen(m);
+            }
+            arkime_field_string_add(field, session, m, mlen, TRUE);
+
+            // Callers keep this past mid saves and libmagic reuses its buffer, so intern it
+            if (!semi)
+                return g_intern_string(m);
+
+            char buf[128];
+            mlen = MIN(mlen, (int)sizeof(buf) - 1);
+            memcpy(buf, m, mlen);
+            buf[mlen] = 0;
+            return g_intern_string(buf);
+        }
+        return NULL;
+    case ARKIME_MAGICMODE_NONE:
+    default:
+        return NULL;
+    }
+}
+/******************************************************************************/
+void arkime_parsers_initial_tag(ArkimeSession_t *session)
+{
+    if (config.nodeClass)
+        arkime_session_add_tag(session, classTag);
+
+    if (config.extraTags) {
+        for (int i = 0; config.extraTags[i]; i++) {
+            arkime_session_add_tag(session, config.extraTags[i]);
+        }
+    }
+
+    arkime_field_ops_run(session, &config.ops);
+}
+
+
+/*############################## ASN ##############################*/
+
+/******************************************************************************/
+uint8_t *arkime_parsers_asn_get_tlv(BSB *bsb, uint32_t *apc, uint32_t *atag, uint32_t *alen)
+{
+
+    if (BSB_REMAINING(*bsb) < 2)
+        goto get_tlv_error;
+
+    u_char ch = 0;
+    BSB_IMPORT_u08(*bsb, ch);
+
+    *apc = (ch >> 5) & 0x1;
+    *atag = 0;
+
+    if ((ch & 0x1f) ==  0x1f) {
+        while (BSB_REMAINING(*bsb)) {
+            BSB_IMPORT_u08(*bsb, ch);
+            (*atag) = ((*atag) << 7) | (ch & 0x7f);
+            if ((ch & 0x80) == 0)
+                break;
+            if ((*atag) & 0xFE000000)
+                goto get_tlv_error;
+        }
+        // The terminating long-form tag byte is consumed above; the length
+        // byte still needs to be imported separately.
+        BSB_IMPORT_u08(*bsb, ch);
+    } else {
+        *atag = ch & 0x1f;
+        BSB_IMPORT_u08(*bsb, ch);
+    }
+
+    if (BSB_IS_ERROR(*bsb) || ch == 0x80) {
+        goto get_tlv_error;
+    }
+
+    if (ch & 0x80) {
+        int cnt = ch & 0x7f;
+        (*alen) = 0;
+        if (cnt > 4) {
+            goto get_tlv_error;
+        }
+        while (cnt > 0 && BSB_REMAINING(*bsb)) {
+            BSB_IMPORT_u08(*bsb, ch);
+            (*alen) = ((*alen) << 8) | ch;
+            cnt--;
+        }
+        if (cnt > 0) {
+            goto get_tlv_error;
+        }
+    } else {
+        (*alen) = ch;
+    }
+
+    if (*alen > BSB_REMAINING(*bsb))
+        *alen = BSB_REMAINING(*bsb);
+
+    uint8_t *value;
+    BSB_IMPORT_ptr(*bsb, value, *alen);
+    if (BSB_IS_ERROR(*bsb)) {
+        goto get_tlv_error;
+    }
+
+    return value;
+
+get_tlv_error:
+    (*apc)  = 0;
+    (*alen) = 0;
+    (*atag) = 0;
+    return 0;
+}
+/******************************************************************************/
+int arkime_parsers_asn_get_sequence(ArkimeASNSeq_t *seqs, int maxSeq, const uint8_t *data, int len, gboolean wrapper)
+{
+    int num = 0;
+    BSB bsb;
+    BSB_INIT(bsb, data, len);
+    if (wrapper) {
+        uint32_t ipc, itag, ilen;
+        uint8_t *ivalue;
+        ivalue = arkime_parsers_asn_get_tlv(&bsb, &ipc, &itag, &ilen);
+        if (!ipc || itag != 16)
+            return 0;
+        BSB_INIT(bsb, ivalue, ilen);
+    }
+    while (BSB_NOT_ERROR(bsb) && num < maxSeq) {
+        seqs[num].value = arkime_parsers_asn_get_tlv(&bsb, &seqs[num].pc, &seqs[num].tag, &seqs[num].len);
+        if (seqs[num].value == 0)
+            break;
+#ifdef DEBUG_PARSERS
+        LOG("%d %p %u %u %u %u", num, seqs[num].value, seqs[num].pc, seqs[num].tag, seqs[num].len, BSB_IS_ERROR(bsb));
+#endif
+        num++;
+    }
+    return num;
+}
+/******************************************************************************/
+const char *arkime_parsers_asn_sequence_to_string(ArkimeASNSeq_t *seq, int *len)
+{
+    if (!seq->pc) {
+        *len = seq->len;
+        return (const char *)seq->value;
+    }
+
+    BSB bsb;
+    BSB_INIT(bsb, seq->value, seq->len);
+    uint32_t ipc, itag, ilen;
+    char *ivalue;
+    ivalue = (char *)arkime_parsers_asn_get_tlv(&bsb, &ipc, &itag, &ilen);
+    *len = ilen;
+    return ivalue;
+}
+/******************************************************************************/
+int arkime_parsers_asn_sequence_to_int(ArkimeASNSeq_t *seq)
+{
+    const uint8_t *value = seq->value;
+    int vlen = seq->len;
+
+    // If this is a constructed element, we need to unwrap the inner TLV
+    if (seq->pc) {
+        BSB bsb;
+        BSB_INIT(bsb, seq->value, seq->len);
+        uint32_t ipc, itag, ilen;
+        value = arkime_parsers_asn_get_tlv(&bsb, &ipc, &itag, &ilen);
+        if (!value)
+            return -1;
+        vlen = ilen;
+    }
+
+    if (vlen == 0 || vlen > 4)
+        return -1;
+
+    int result = 0;
+    for (int i = 0; i < vlen; i++) {
+        result = (result << 8) | value[i];
+    }
+    return result;
+}
+/******************************************************************************/
+void arkime_parsers_asn_decode_oid(char *buf, int bufsz, const uint8_t *oid, int len)
+{
+    int buflen = 0;
+    int first = TRUE;
+    uint64_t value = 0;
+
+    buf[0] = 0;
+
+    for (int pos = 0; pos < len; pos++) {
+        if (value & 0xFE00000000000000ULL)
+            break;
+        value = (value << 7) | (oid[pos] & 0x7f);
+        if (oid[pos] & 0x80) {
+            continue;
+        }
+
+        if (first) {
+            first = FALSE;
+            if (value < 40) {
+                buflen = arkime_snprintf_len(buf, bufsz, "0.%" PRIu64, value);
+            } else if (value < 80) {
+                buflen = arkime_snprintf_len(buf, bufsz, "1.%" PRIu64, value - 40);
+            } else {
+                buflen = arkime_snprintf_len(buf, bufsz, "2.%" PRIu64, value - 80);
+            }
+        } else if (buflen < bufsz) {
+            buflen += arkime_snprintf_len(buf + buflen, bufsz - buflen, ".%" PRIu64, value);
+        }
+
+        value = 0;
+    }
+}
+/******************************************************************************/
+#define char2num(ch) (isdigit(ch)?((ch) - '0'):0)
+#define str2num(str) (char2num((str)[0]) * 10 + char2num((str)[1]))
+#define str4num(str) (char2num((str)[0]) * 1000 + char2num((str)[1]) * 100 + char2num((str)[2]) * 10 + char2num((str)[3]))
+uint64_t arkime_parsers_asn_parse_time(ArkimeSession_t *session, uint32_t tag, uint8_t *value, uint32_t len)
+{
+    int        offset = 0;
+    struct tm  tm;
+    time_t     val;
+
+    // UTCTime
+    if (tag == 23 && len > 12) {
+        memset(&tm, 0, sizeof(tm));
+        if (len >= 17 && value[12] != 'Z')
+            offset = str2num(value + 13) * 3600 + str2num(value + 15) * 60;
+
+        if (value[12] == '+')
+            offset = -offset;
+
+        tm.tm_year = str2num(value + 0);
+        tm.tm_mon  = str2num(value + 2) - 1;
+        tm.tm_mday = str2num(value + 4);
+        tm.tm_hour = str2num(value + 6);
+        tm.tm_min  = str2num(value + 8);
+        tm.tm_sec  = str2num(value + 10);
+
+        if (tm.tm_year < 50)
+            tm.tm_year += 100;
+
+        val = timegm(&tm) + offset;
+        if (val < 0) {
+            val = 0;
+            arkime_session_add_tag(session, "cert:pre-epoch-time");
+        }
+        return val;
+    }
+    // GeneralizedTime
+    else if (tag == 24 && len >= 10) {
+        uint32_t pos;
+        memset(&tm, 0, sizeof(tm));
+        tm.tm_year = str4num(value + 0) - 1900;
+        tm.tm_mon  = str2num(value + 4) - 1;
+        tm.tm_mday = str2num(value + 6);
+        tm.tm_hour = str2num(value + 8);
+        if (len < 12 || value[10] == 'Z' || value[10] == '+' || value[10] == '-') {
+            pos = 10;
+            goto gtdone;
+        }
+
+        tm.tm_min  = str2num(value + 10);
+        if (len < 14 || value[12] == 'Z' || value[12] == '+' || value[12] == '-') {
+            pos = 12;
+            goto gtdone;
+        }
+        tm.tm_sec  = str2num(value + 12);
+        if (len < 15 || value[14] == 'Z' || value[14] == '+' || value[14] == '-') {
+            pos = 14;
+            goto gtdone;
+        }
+        if (value[14] == '.') {
+            pos = 18;
+        } else {
+            pos = 14;
+        }
+gtdone:
+        if (pos == len) {
+            val = timegm(&tm);
+        } else {
+            if (pos + 5 <= len && (value[pos] == '+' || value[pos] == '-')) {
+                offset = str2num(value + pos + 1) * 3600 + str2num(value + pos + 3) * 60;
+
+                if (value[pos] == '+')
+                    offset = -offset;
+            }
+            val = timegm(&tm) + offset;
+        }
+
+        if (val < 0) {
+            val = 0;
+            arkime_session_add_tag(session, "cert:pre-epoch-time");
+        }
+        return val;
+    }
+    return 0;
+}
+/******************************************************************************/
+LOCAL int ntlmDomainField;
+LOCAL int ntlmHostField;
+LOCAL int ntlmTargetField;
+LOCAL int ntlmVersionField;
+LOCAL int ntlmTypeField;
+
+#define NTLM_NEGOTIATE_UNICODE   0x00000001
+#define NTLM_NEGOTIATE_VERSION   0x02000000
+
+/******************************************************************************/
+LOCAL void arkime_ntlm_add_string(ArkimeSession_t *session, int field, BSB *sb, int unicode)
+{
+    if (field < 0 || BSB_IS_ERROR(*sb))
+        return;
+    uint32_t len = BSB_REMAINING(*sb);
+    const uint8_t *buf = BSB_WORK_PTR(*sb);
+    if (len == 0)
+        return;
+
+    if (unicode) {
+        GError *error = NULL;
+        gsize bread, bwritten;
+        char *out = g_convert((const char *)buf, len, "utf-8", "ucs-2le", &bread, &bwritten, &error);
+        if (error) {
+            if (config.debug)
+                LOG("ntlm utf-8 convert error: %s", error->message);
+            g_error_free(error);
+            return;
+        }
+        if (!out)
+            return;
+        if (!arkime_field_string_add(field, session, out, -1, FALSE))
+            g_free(out);
+    } else {
+        arkime_field_string_add(field, session, (const char *)buf, len, TRUE);
+    }
+}
+/******************************************************************************/
+/* Read an NTLMSSP "security buffer" descriptor (Len u16 LE, MaxLen u16 LE,
+ * Offset u32 LE) at byte offset `pos` inside `msg`. On success initializes
+ * `out` to span the payload region inside `msg` and returns TRUE. */
+LOCAL gboolean arkime_ntlm_secbuf(const uint8_t *msg, uint32_t msglen,
+                                  uint32_t pos, BSB *out)
+{
+    BSB_INIT(*out, NULL, 0);
+    if (pos > msglen || msglen - pos < 8)
+        return FALSE;
+
+    BSB hdr;
+    uint16_t slen = 0;
+    uint32_t soff = 0;
+    BSB_INIT(hdr, msg + pos, 8);
+    BSB_LIMPORT_u16(hdr, slen);
+    BSB_LIMPORT_skip(hdr, 2);              // skip MaxLen
+    BSB_LIMPORT_u32(hdr, soff);
+    if (BSB_IS_ERROR(hdr) || slen == 0)
+        return FALSE;
+    /* Overflow-safe bounds check: soff <= msglen AND slen <= msglen - soff. */
+    if (soff > msglen || slen > msglen - soff)
+        return FALSE;
+    BSB_INIT(*out, msg + soff, slen);
+    return TRUE;
+}
+/******************************************************************************/
+LOCAL void arkime_ntlm_add_version(ArkimeSession_t *session, BSB *vb)
+{
+    uint8_t  major = 0, minor = 0;
+    uint16_t build = 0;
+    BSB_LIMPORT_u08(*vb, major);
+    BSB_LIMPORT_u08(*vb, minor);
+    BSB_LIMPORT_u16(*vb, build);
+    if (BSB_IS_ERROR(*vb))
+        return;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%u.%u.%u", major, minor, build);
+    arkime_field_string_add(ntlmVersionField, session, buf, -1, TRUE);
+}
+/******************************************************************************/
+/* Decode an NTLMSSP message (Type 1/2/3) starting at `data` of length `dlen`.
+ * Safe to call on any buffer; if the signature/type/structure don't match,
+ * the function returns without modifying the session. See [MS-NLMP]. */
+void arkime_parsers_ntlm_decode(ArkimeSession_t *session,
+                                const uint8_t *data, uint32_t dlen)
+{
+    if (!data || dlen < 12)
+        return;
+    if (memcmp(data, "NTLMSSP\0", 8) != 0)
+        return;
+
+    BSB msg;
+    BSB_INIT(msg, data, dlen);
+    BSB_LIMPORT_skip(msg, 8); // already validated NTLMSSP signature
+
+    uint32_t mtype = 0;
+    BSB_LIMPORT_u32(msg, mtype);
+    if (BSB_IS_ERROR(msg) || mtype < 1 || mtype > 3)
+        return;
+
+    arkime_session_add_protocol(session, "ntlm");
+    arkime_field_int_add(ntlmTypeField, session, mtype);
+
+    uint32_t flags = 0;
+    uint32_t domainPos = 0, userPos = 0, hostPos = 0, targetPos = 0, versionPos = 0;
+
+    /* msg.ptr currently at offset 12 (after signature + mtype). */
+    switch (mtype) {
+    case 1: // NEGOTIATE_MESSAGE: flags @12
+        BSB_LIMPORT_u32(msg, flags);
+        domainPos  = 16;
+        hostPos    = 24;
+        versionPos = 32;
+        break;
+    case 2: // CHALLENGE_MESSAGE: target secbuf @12, flags @20
+        targetPos  = 12;
+        BSB_LIMPORT_skip(msg, 8);          // skip target secbuf
+        BSB_LIMPORT_u32(msg, flags);
+        versionPos = 48;
+        break;
+    case 3: // AUTHENTICATE_MESSAGE: lm/nt/domain/user/host/sessionkey, flags @60
+        domainPos  = 28;
+        userPos    = 36;
+        hostPos    = 44;
+        BSB_LIMPORT_skip(msg, 48);         // skip 6 secbufs (lm,nt,domain,user,host,sessionkey)
+        BSB_LIMPORT_u32(msg, flags);
+        versionPos = 64;
+        break;
+    }
+
+    if (BSB_IS_ERROR(msg))
+        return;
+
+    int unicode = (flags & NTLM_NEGOTIATE_UNICODE) ? 1 : 0;
+    if (mtype == 1)
+        unicode = 0; // Type 1 OemDomainName/OemWorkstationName are always OEM
+    BSB sb;
+
+    if (domainPos && arkime_ntlm_secbuf(data, dlen, domainPos, &sb))
+        arkime_ntlm_add_string(session, ntlmDomainField, &sb, unicode);
+    if (userPos && arkime_ntlm_secbuf(data, dlen, userPos, &sb))
+        arkime_ntlm_add_string(session, userField, &sb, unicode);
+    if (hostPos && arkime_ntlm_secbuf(data, dlen, hostPos, &sb))
+        arkime_ntlm_add_string(session, ntlmHostField, &sb, unicode);
+    if (targetPos && arkime_ntlm_secbuf(data, dlen, targetPos, &sb))
+        arkime_ntlm_add_string(session, ntlmTargetField, &sb, unicode);
+
+    if ((flags & NTLM_NEGOTIATE_VERSION) && versionPos) {
+        BSB vb;
+        BSB_INIT(vb, data, dlen);
+        BSB_LIMPORT_skip(vb, versionPos);
+        if (BSB_NOT_ERROR(vb) && BSB_REMAINING(vb) >= 8)
+            arkime_ntlm_add_version(session, &vb);
+    }
+}
+/******************************************************************************/
+/* Detect and decode a base64-encoded NTLMSSP message from a text line.
+ * Recognizes the base64 prefix of "NTLMSSP\0" ("TlRMTVNTUA"). Leading/trailing
+ * whitespace and CR/LF are tolerated. Returns TRUE if a message was dispatched. */
+gboolean arkime_parsers_ntlm_decode_base64(ArkimeSession_t *session,
+                                           const char *b64, int b64len)
+{
+    if (!b64 || b64len < 11)
+        return FALSE;
+
+    while (b64len > 0 && (*b64 == ' ' || *b64 == '\t')) {
+        b64++;
+        b64len--;
+    }
+    while (b64len > 0 && (b64[b64len - 1] == ' ' || b64[b64len - 1] == '\t' ||
+                          b64[b64len - 1] == '\r' || b64[b64len - 1] == '\n'))
+        b64len--;
+
+    if (b64len < 11 || memcmp(b64, "TlRMTVNTUA", 10) != 0)
+        return FALSE;
+
+#define NTLM_MAX_B64 16384
+    if (b64len > NTLM_MAX_B64)
+        b64len = NTLM_MAX_B64;
+
+    guchar decoded[(NTLM_MAX_B64 / 4) * 3 + 3];
+    gint state = 0;
+    guint save = 0;
+    gsize out_len = g_base64_decode_step(b64, b64len, decoded, &state, &save);
+
+    if (out_len < 12)
+        return FALSE;
+
+    arkime_parsers_ntlm_decode(session, decoded, out_len);
+    return TRUE;
+}
+/******************************************************************************/
+LOCAL int filewext_cmp(const void *a, const void *b)
+{
+    return strcmp(((ArkimeFileWithExtension_t *)a)->filename, ((ArkimeFileWithExtension_t *)b)->filename);
+}
+/******************************************************************************/
+LOCAL int arkime_parsers_load_so(const char *path)
+{
+    GModule *parser = g_module_open(path, 0); /*G_MODULE_BIND_LAZY | G_MODULE_BIND_LOCAL);*/
+
+    if (!parser) {
+        LOG("ERROR - Couldn't load parser from '%s'\n%s", path, g_module_error());
+        return 1;
+    }
+
+    ArkimePluginInitFunc parser_init;
+
+    if (!g_module_symbol(parser, "arkime_parser_init", (gpointer *)(char *)&parser_init) || parser_init == NULL) {
+        LOG("ERROR - Module %s doesn't have an arkime_parser_init", path);
+        g_module_close(parser);
+        return 1;
+    }
+
+    parser_init();
+    return 0;
+}
+/******************************************************************************/
+int arkime_parsers_load()
+{
+    ArkimeStringHashStd_t loaded;
+    HASH_INIT(s_, loaded, arkime_string_hash, arkime_string_cmp);
+
+    ArkimeString_t *hstring;
+    int count = 0;
+
+    char **disableParsers = arkime_config_str_list(NULL, "disableParsers", "arp.so");
+    for (int d = 0; disableParsers[d]; d++) {
+        hstring = ARKIME_TYPE_ALLOC0(ArkimeString_t);
+        hstring->str = disableParsers[d];
+        hstring->len = strlen(disableParsers[d]);
+        HASH_ADD(s_, loaded, hstring->str, hstring);
+    }
+
+    for (int d = 0; config.parsersDir[d]; d++) {
+        GError      *error = 0;
+        GDir *dir = g_dir_open(config.parsersDir[d], 0, &error);
+
+        if (error) {
+            LOG("Error with %s: %s", config.parsersDir[d], error->message);
+            g_error_free(error);
+            if (dir)
+                g_dir_close(dir);
+            continue;
+        }
+
+        if (!dir)
+            continue;
+
+        const gchar               *filename;
+        ArkimeFileWithExtension_t  files[100];
+        int                        flen = 0;
+
+        while ((filename = g_dir_read_name(dir)) && flen < 100) {
+            // Skip hidden files/directories
+            if (filename[0] == '.')
+                continue;
+
+            guint e;
+            for (e = 0; e < extensionsArr->len; e++) {
+                ArkimeExtensions_t *ext = (ArkimeExtensions_t *)g_ptr_array_index(extensionsArr, e);
+                if (!ext->loaded && g_str_has_suffix(filename, ext->extension)) {
+                    break;
+                }
+            }
+
+            if (e == extensionsArr->len) {
+                continue;
+            }
+
+            HASH_FIND(s_, loaded, filename, hstring);
+            if (hstring) {
+                if (config.debug) {
+                    LOG("Skipping %s in %s since already loaded", filename, config.parsersDir[d]);
+                }
+                continue; /* Already loaded */
+            }
+
+            files[flen].filename = g_strdup(filename);
+            files[flen].extensionPos = e;
+            flen++;
+        }
+
+        qsort((void *)files, (size_t)flen, sizeof(ArkimeFileWithExtension_t), filewext_cmp);
+
+        for (int i = 0; i < flen; i++) {
+            gchar *path = g_build_filename(config.parsersDir[d], files[i].filename, NULL);
+
+            int rc = ((ArkimeExtensions_t *)g_ptr_array_index(extensionsArr, files[i].extensionPos))->loadFunc(path);
+
+            if (rc != 0) {
+                g_free(files[i].filename);
+                g_free(path);
+                continue;
+            }
+
+            hstring = ARKIME_TYPE_ALLOC0(ArkimeString_t);
+            hstring->str = files[i].filename;
+            hstring->len = strlen(files[i].filename);
+            HASH_ADD(s_, loaded, hstring->str, hstring);
+            count++;
+
+            if (config.debug)
+                LOG("Loaded %s", path);
+
+            g_free(path);
+        }
+        g_dir_close(dir);
+    }
+
+    for (guint e = 0; e < extensionsArr->len; e++) {
+        ArkimeExtensions_t *ext = (ArkimeExtensions_t *)g_ptr_array_index(extensionsArr, e);
+        ext->loaded = 1;
+    }
+
+    HASH_FORALL_POP_HEAD2(s_, loaded, hstring) {
+        g_free(hstring->str);
+        ARKIME_TYPE_FREE(ArkimeString_t, hstring);
+    }
+    g_free(disableParsers); // NOT g_strfreev, because using the pointers
+
+    return count;
+}
+/******************************************************************************/
+void arkime_parsers_register_load_extension(const char *extension, ArkimeParserLoadFunc loadFunc)
+{
+    if (extension[0] != '.') {
+        LOGEXIT("ERROR - Extension '%s' must start with a .", extension);
+    }
+    if (!extensionsArr) {
+        extensionsArr = g_ptr_array_new_full(4, NULL);
+    }
+    ArkimeExtensions_t *ext = ARKIME_TYPE_ALLOC0(ArkimeExtensions_t);
+    ext->extension = extension;
+    ext->loadFunc = loadFunc;
+    g_ptr_array_add(extensionsArr, ext);
+}
+/******************************************************************************/
+void arkime_parsers_init()
+{
+    if (!namedFuncsHash)
+        namedFuncsHash = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    subParserHash = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    if (config.nodeClass)
+        snprintf(classTag, sizeof(classTag), "class:%s", config.nodeClass);
+
+    arkime_field_define("general", "integer",
+                        "session.segments", "Session Segments", "segmentCnt",
+                        "Number of segments in session so far",
+                        0,  ARKIME_FIELD_FLAG_FAKE,
+                        (char *)NULL);
+
+    arkime_field_define("general", "integer",
+                        "session.length", "Session Length", "length",
+                        "Session Length in milliseconds so far",
+                        0,  ARKIME_FIELD_FLAG_FAKE,
+                        (char *)NULL);
+
+    userField = arkime_field_define("general", "lotermfield",
+                                    "user", "User", "user",
+                                    "External user set for session",
+                                    ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT | ARKIME_FIELD_FLAG_LINKED_SESSIONS,
+                                    "category", "user",
+                                    (char *)NULL);
+
+    ntlmDomainField = arkime_field_define("ntlm", "termfield",
+                                          "ntlm.domain", "NTLM Domain", "ntlm.domain",
+                                          "NTLMSSP domain or target realm",
+                                          ARKIME_FIELD_TYPE_STR_HASH, ARKIME_FIELD_FLAG_CNT,
+                                          (char *)NULL);
+
+    ntlmHostField = arkime_field_define("ntlm", "termfield",
+                                        "ntlm.host", "NTLM Host", "ntlm.host",
+                                        "NTLMSSP workstation/host name",
+                                        ARKIME_FIELD_TYPE_STR_HASH, ARKIME_FIELD_FLAG_CNT,
+                                        "category", "host",
+                                        (char *)NULL);
+
+    ntlmTargetField = arkime_field_define("ntlm", "termfield",
+                                          "ntlm.targetName", "NTLM Target Name", "ntlm.targetName",
+                                          "NTLMSSP server-advertised target name (Type 2)",
+                                          ARKIME_FIELD_TYPE_STR_HASH, ARKIME_FIELD_FLAG_CNT,
+                                          (char *)NULL);
+
+    ntlmVersionField = arkime_field_define("ntlm", "termfield",
+                                           "ntlm.version", "NTLM Version", "ntlm.version",
+                                           "NTLMSSP client/server OS version (major.minor.build)",
+                                           ARKIME_FIELD_TYPE_STR_HASH, ARKIME_FIELD_FLAG_CNT,
+                                           (char *)NULL);
+
+    ntlmTypeField = arkime_field_define("ntlm", "integer",
+                                        "ntlm.type", "NTLM Message Type", "ntlm.type",
+                                        "NTLMSSP message type: 1=Negotiate, 2=Challenge, 3=Authenticate",
+                                        ARKIME_FIELD_TYPE_INT_GHASH, ARKIME_FIELD_FLAG_CNT,
+                                        (char *)NULL);
+
+    int flags = MAGIC_MIME;
+
+    char *strMagicMode = arkime_config_str(NULL, "magicMode", "both");
+
+    if (strcmp(strMagicMode, "libmagic") == 0) {
+        magicMode = ARKIME_MAGICMODE_LIBMAGIC;
+    } else if (strcmp(strMagicMode, "libmagicnotext") == 0) {
+        magicMode = ARKIME_MAGICMODE_LIBMAGIC;
+        flags |= MAGIC_NO_CHECK_TEXT;
+    } else if (strcmp(strMagicMode, "molochmagic") == 0) {
+        LOG("WARNING - magicMode of `molochmagic` no longer supported, switching to `both`");
+        magicMode = ARKIME_MAGICMODE_BOTH;
+    } else if (strcmp(strMagicMode, "basic") == 0) {
+        magicMode = ARKIME_MAGICMODE_BASIC;
+    } else if (strcmp(strMagicMode, "both") == 0) {
+        magicMode = ARKIME_MAGICMODE_BOTH;
+    } else if (strcmp(strMagicMode, "none") == 0) {
+        magicMode = ARKIME_MAGICMODE_NONE;
+    } else {
+        CONFIGEXIT("Unknown magicMode '%s'", strMagicMode);
+    }
+
+    g_free(strMagicMode);
+
+#ifdef MAGIC_NO_CHECK_COMPRESS
+    flags |= MAGIC_NO_CHECK_COMPRESS |
+             MAGIC_NO_CHECK_TAR      |
+             MAGIC_NO_CHECK_APPTYPE  |
+             MAGIC_NO_CHECK_ELF      |
+             MAGIC_NO_CHECK_TOKENS;
+#endif
+#ifdef MAGIC_NO_CHECK_CDF
+    flags |= MAGIC_NO_CHECK_CDF;
+#endif
+
+    if (magicMode == ARKIME_MAGICMODE_LIBMAGIC || magicMode == ARKIME_MAGICMODE_BOTH) {
+        for (int t = 0; t < config.packetThreads; t++) {
+            cookie[t] = magic_open(flags);
+            if (!cookie[t]) {
+                LOG("Error with libmagic %s", magic_error(cookie[t]));
+            } else {
+                magic_load(cookie[t], NULL);
+            }
+        }
+    }
+
+    arkime_parsers_register_load_extension(".so", arkime_parsers_load_so);
+
+    int count = arkime_parsers_load();
+    if (count == 0) {
+        LOG("WARNING - No parsers loaded, is parsersDir set correctly");
+    }
+
+    // Set tags field up AFTER loading plugins
+    config.tagsStringField = arkime_field_define("general", "termfield",
+                                                 "tags", "Tags", "tags",
+                                                 "Tags set for session",
+                                                 ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT | ARKIME_FIELD_FLAG_LINKED_SESSIONS,
+                                                 (char *)NULL);
+
+    arkime_field_define("general", "lotermfield",
+                        "asset", "Asset", "asset",
+                        "Asset name",
+                        ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT | ARKIME_FIELD_FLAG_LINKED_SESSIONS,
+                        (char *)NULL);
+
+    gsize keys_len;
+    gchar **keys = arkime_config_section_keys(NULL, "custom-fields", &keys_len);
+
+    for (int i = 0; i < (int)keys_len; i++) {
+        char *value = arkime_config_section_str(NULL, "custom-fields", keys[i], NULL);
+        if (!value)
+            CONFIGEXIT("Invalid value for '%s' in section [custom-fields]", keys[i]);
+
+        arkime_field_define_text_full(keys[i], value, NULL);
+        g_free(value);
+    }
+    g_strfreev(keys);
+
+
+    if (config.extraOps) {
+        const char *error = arkime_field_ops_parse(&config.ops, 0, config.extraOps);
+        if (error)
+            CONFIGEXIT("%s", error);
+    } else {
+        arkime_field_ops_init(&config.ops, 0, 0);
+    }
+}
+/******************************************************************************/
+void arkime_parsers_exit()
+{
+    if (magicMode == ARKIME_MAGICMODE_LIBMAGIC || magicMode == ARKIME_MAGICMODE_BOTH) {
+        for (int t = 0; t < config.packetThreads; t++) {
+            magic_close(cookie[t]);
+        }
+    }
+}
+/******************************************************************************/
+void arkime_print_hex_string(const uint8_t *data, unsigned int length)
+{
+    for (unsigned int i = 0; i < length; i++) {
+        printf("%02x", data[i]);
+    }
+
+    printf("\n");
+}
+/******************************************************************************/
+char *arkime_sprint_hex_string(char *buf, const uint8_t *data, unsigned int length)
+{
+    unsigned int i;
+
+    for (i = 0; i < length; i++) {
+        memcpy(buf + i * 2, arkime_char_to_hexstr[data[i]], 2);
+    }
+    buf[i * 2] = 0;
+    return buf;
+}
+/******************************************************************************/
+gboolean arkime_parsers_register2(ArkimeSession_t *session, ArkimeParserFunc func, void *uw, ArkimeParserFreeFunc ffunc, ArkimeParserSaveFunc sfunc)
+{
+#ifdef DEBUG_PARSERS
+    LOG("session: %p func: %p uw: %p", session, func, uw);
+#endif
+
+    // Check if this is a duplicate
+    for (int i = 0; i < session->parserNum; i++) {
+        if (session->parserInfo[i].parserFunc == func && session->parserInfo[i].uw == uw) {
+            return TRUE;
+        }
+    }
+
+    if (session->parserNum > 30) {
+        char ipStr[200];
+        arkime_session_pretty_string(session, ipStr, sizeof(ipStr));
+        LOG_RATE(10, "WARNING - Too many parsers registered: %d %s", session->parserNum, ipStr);
+        if (ffunc)
+            ffunc(session, uw);
+        return FALSE;
+    }
+
+    if (session->parserNum >= session->parserLen) {
+        if (session->parserLen == 0) {
+            session->parserLen = 2;
+        } else {
+            session->parserLen *= 1.67;
+        }
+        ARKIME_SIZE_REALLOC("parserInfo", session->parserInfo, sizeof(ArkimeParserInfo_t) * session->parserLen);
+    }
+
+    session->parserInfo[session->parserNum].parserFunc     = func;
+    session->parserInfo[session->parserNum].uw             = uw;
+    session->parserInfo[session->parserNum].parserFreeFunc = ffunc;
+    session->parserInfo[session->parserNum].parserSaveFunc = sfunc;
+
+    session->parserNum++;
+    return TRUE;
+}
+/******************************************************************************/
+gboolean arkime_parsers_replace(ArkimeSession_t *session, void *oldUw, ArkimeParserFunc func, void *uw, ArkimeParserFreeFunc ffunc, ArkimeParserSaveFunc sfunc)
+{
+    // Many parsers register with a NULL uw, so it can't identify a slot
+    for (int i = 0; oldUw && i < session->parserNum; i++) {
+        if (session->parserInfo[i].uw != oldUw || !session->parserInfo[i].parserFunc)
+            continue;
+
+        if (session->parserInfo[i].parserFreeFunc)
+            session->parserInfo[i].parserFreeFunc(session, oldUw);
+
+        session->parserInfo[i].parserFunc = func;
+        session->parserInfo[i].uw = uw;
+        session->parserInfo[i].parserFreeFunc = ffunc;
+        session->parserInfo[i].parserSaveFunc = sfunc;
+        return TRUE;
+    }
+
+    if (ffunc)
+        ffunc(session, uw);
+    return FALSE;
+}
+/******************************************************************************/
+gboolean arkime_parsers_has_registered(const ArkimeSession_t *session, ArkimeParserFunc func)
+{
+    for (int i = 0; i < session->parserNum; i++) {
+        if (session->parserInfo[i].parserFunc == func)
+            return TRUE;
+    }
+    return FALSE;
+}
+/******************************************************************************/
+void  arkime_parsers_unregister(ArkimeSession_t *session, void *uw)
+{
+    for (int i = 0; i < session->parserNum; i++) {
+        if (session->parserInfo[i].uw == uw && session->parserInfo[i].parserFunc != 0) {
+            if (session->parserInfo[i].parserFreeFunc) {
+                session->parserInfo[i].parserFreeFunc(session, uw);
+            }
+
+            memset(&session->parserInfo[i], 0, sizeof(session->parserInfo[i]));
+            break;
+        }
+    }
+}
+/******************************************************************************/
+typedef struct arkime_classify_t {
+    const char          *name;
+    void                *uw;
+    int                  offset;
+    const uint8_t       *match;
+    int                  matchlen;
+    int                  minlen;
+    ArkimeClassifyFunc   func;
+} ArkimeClassify_t;
+
+typedef struct {
+    ArkimeClassify_t   **arr;
+    short               size;
+    short               cnt;
+} ArkimeClassifyHead_t;
+
+LOCAL ArkimeClassifyHead_t classifiersTcp0;
+LOCAL ArkimeClassifyHead_t classifiersTcp1[256];
+LOCAL ArkimeClassifyHead_t classifiersTcp2[256][256];
+LOCAL ArkimeClassifyHead_t classifiersTcpPortSrc[0x10000];
+LOCAL ArkimeClassifyHead_t classifiersTcpPortDst[0x10000];
+
+LOCAL ArkimeClassifyHead_t classifiersSctp0;
+LOCAL ArkimeClassifyHead_t classifiersSctp1[256];
+LOCAL ArkimeClassifyHead_t classifiersSctp2[256][256];
+LOCAL ArkimeClassifyHead_t classifiersSctpPortSrc[0x10000];
+LOCAL ArkimeClassifyHead_t classifiersSctpPortDst[0x10000];
+LOCAL ArkimeClassifyHead_t classifiersSctpProtocol[256];
+
+LOCAL ArkimeClassifyHead_t classifiersUdp0;
+LOCAL ArkimeClassifyHead_t classifiersUdp1[256];
+LOCAL ArkimeClassifyHead_t classifiersUdp2[256][256];
+LOCAL ArkimeClassifyHead_t classifiersUdpPortSrc[0x10000];
+LOCAL ArkimeClassifyHead_t classifiersUdpPortDst[0x10000];
+
+/******************************************************************************/
+LOCAL void arkime_parsers_classifier_add(ArkimeClassifyHead_t *ch, ArkimeClassify_t *c)
+{
+    for (int i = 0; i < ch->cnt; i++) {
+        if (ch->arr[i]->offset == c->offset &&
+            ch->arr[i]->func == c->func &&
+            c->matchlen == ch->arr[i]->matchlen &&
+            strcmp(ch->arr[i]->name, c->name) == 0 &&
+            memcmp(ch->arr[i]->match, c->match, c->matchlen) == 0) {
+
+            if (config.debug > 1) {
+                LOG("Info, duplicate (could be normal) %s %s", c->name, c->match);
+            }
+            ARKIME_TYPE_FREE(ArkimeClassify_t, c);
+            return;
+        }
+    }
+    if (ch->cnt >= ch->size) {
+        if (ch->size == 0) {
+            ch->size = 2;
+        } else {
+            ch->size *= 1.67;
+        }
+        ARKIME_SIZE_REALLOC("ch arr", ch->arr, sizeof(ArkimeClassify_t *) * ch->size);
+    }
+
+    ch->arr[ch->cnt] = c;
+    ch->cnt++;
+}
+/******************************************************************************/
+LOCAL void arkime_parsers_classifier_add_port(ArkimeClassifyHead_t *ch, const char *name, void *uw, ArkimeClassifyFunc func)
+{
+    ArkimeClassify_t *c = ARKIME_TYPE_ALLOC0(ArkimeClassify_t);
+    c->name     = name;
+    c->uw       = uw;
+    c->func     = func;
+    arkime_parsers_classifier_add(ch, c);
+}
+/******************************************************************************/
+void arkime_parsers_classifier_register_port_internal(const char *name, void *uw, uint16_t port, uint32_t type, ArkimeClassifyFunc func, size_t sessionsize, int apiversion)
+{
+    if (sizeof(ArkimeSession_t) != sessionsize) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h\n %u != %u", name, (unsigned int)sizeof(ArkimeSession_t), (unsigned int)sessionsize);
+    }
+
+    if (ARKIME_API_VERSION != apiversion) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h\n %d %d", name, ARKIME_API_VERSION, apiversion);
+    }
+
+    if ((type & (ARKIME_PARSERS_PORT_UDP | ARKIME_PARSERS_PORT_TCP | ARKIME_PARSERS_PORT_SCTP)) == 0) {
+        CONFIGEXIT("Parser '%s' has empty type", name);
+    }
+
+    if (config.debug > 1)
+        LOG("adding %s port:%u type:%02x uw:%p", name, port, type, uw);
+
+    // Each list gets its own allocation since arkime_parsers_classifier_add frees duplicates
+    if (type & ARKIME_PARSERS_PORT_TCP_SRC)
+        arkime_parsers_classifier_add_port(&classifiersTcpPortSrc[port], name, uw, func);
+    if (type & ARKIME_PARSERS_PORT_TCP_DST)
+        arkime_parsers_classifier_add_port(&classifiersTcpPortDst[port], name, uw, func);
+
+    if (type & ARKIME_PARSERS_PORT_UDP_SRC)
+        arkime_parsers_classifier_add_port(&classifiersUdpPortSrc[port], name, uw, func);
+    if (type & ARKIME_PARSERS_PORT_UDP_DST)
+        arkime_parsers_classifier_add_port(&classifiersUdpPortDst[port], name, uw, func);
+
+    if (type & ARKIME_PARSERS_PORT_SCTP_SRC)
+        arkime_parsers_classifier_add_port(&classifiersSctpPortSrc[port], name, uw, func);
+    if (type & ARKIME_PARSERS_PORT_SCTP_DST)
+        arkime_parsers_classifier_add_port(&classifiersSctpPortDst[port], name, uw, func);
+}
+/******************************************************************************/
+void arkime_parsers_classifier_register_tcp_internal(const char *name, void *uw, int offset, const uint8_t *match, int matchlen, ArkimeClassifyFunc func, size_t sessionsize, int apiversion)
+{
+    if (sizeof(ArkimeSession_t) != sessionsize) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h\n %u != %u", name, (unsigned int)sizeof(ArkimeSession_t), (unsigned int)sessionsize);
+    }
+
+    if (ARKIME_API_VERSION != apiversion) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h\n %d %d", name, ARKIME_API_VERSION, apiversion);
+    }
+
+    if (!match && matchlen != 0)
+        CONFIGEXIT("Can't have a null match for %s", name);
+
+    ArkimeClassify_t *c = ARKIME_TYPE_ALLOC0(ArkimeClassify_t);
+    c->name     = name;
+    c->uw       = uw;
+    c->offset   = offset;
+    c->match    = match;
+    c->matchlen = matchlen;
+    c->minlen   = matchlen + offset;
+    c->func     = func;
+
+    if (config.debug > 1) {
+        char hex[1000];
+        arkime_sprint_hex_string(hex, match, matchlen);
+        LOG("adding %s matchlen:%d offset:%d match %.*s (0x%s)", name, matchlen, offset, matchlen, match, hex);
+    }
+    if (matchlen == 0 || offset != 0) {
+        arkime_parsers_classifier_add(&classifiersTcp0, c);
+    } else if (matchlen == 1) {
+        arkime_parsers_classifier_add(&classifiersTcp1[(uint8_t)match[0]], c);
+    } else  {
+        c->match += 2;
+        c->matchlen -= 2;
+        arkime_parsers_classifier_add(&classifiersTcp2[(uint8_t)match[0]][(uint8_t)match[1]], c);
+    }
+}
+/******************************************************************************/
+void arkime_parsers_classifier_register_udp_internal(const char *name, void *uw, int offset, const uint8_t *match, int matchlen, ArkimeClassifyFunc func, size_t sessionsize, int apiversion)
+{
+    if (sizeof(ArkimeSession_t) != sessionsize) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h", name);
+    }
+
+    if (ARKIME_API_VERSION != apiversion) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h", name);
+    }
+
+    if (!match && matchlen != 0)
+        CONFIGEXIT("Can't have a null match for %s", name);
+
+    ArkimeClassify_t *c = ARKIME_TYPE_ALLOC0(ArkimeClassify_t);
+    c->name     = name;
+    c->uw       = uw;
+    c->offset   = offset;
+    c->match    = match;
+    c->matchlen = matchlen;
+    c->minlen   = matchlen + offset;
+    c->func     = func;
+
+    if (config.debug > 1)
+        LOG("adding %s matchlen:%d offset:%d match %s ", name, matchlen, offset, match);
+    if (matchlen == 0 || offset != 0) {
+        arkime_parsers_classifier_add(&classifiersUdp0, c);
+    } else if (matchlen == 1) {
+        arkime_parsers_classifier_add(&classifiersUdp1[(uint8_t)match[0]], c);
+    } else  {
+        c->match += 2;
+        c->matchlen -= 2;
+        arkime_parsers_classifier_add(&classifiersUdp2[(uint8_t)match[0]][(uint8_t)match[1]], c);
+    }
+}
+/******************************************************************************/
+void arkime_parsers_classifier_register_sctp_internal(const char *name, void *uw, int offset, const uint8_t *match, int matchlen, ArkimeClassifyFunc func, size_t sessionsize, int apiversion)
+{
+    if (sizeof(ArkimeSession_t) != sessionsize) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h\n %u != %u", name, (unsigned int)sizeof(ArkimeSession_t), (unsigned int)sessionsize);
+    }
+
+    if (ARKIME_API_VERSION != apiversion) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h\n %d %d", name, ARKIME_API_VERSION, apiversion);
+    }
+
+    if (!match && matchlen != 0)
+        CONFIGEXIT("Can't have a null match for %s", name);
+
+    ArkimeClassify_t *c = ARKIME_TYPE_ALLOC0(ArkimeClassify_t);
+    c->name     = name;
+    c->uw       = uw;
+    c->offset   = offset;
+    c->match    = match;
+    c->matchlen = matchlen;
+    c->minlen   = matchlen + offset;
+    c->func     = func;
+
+    if (config.debug > 1) {
+        char hex[1000];
+        arkime_sprint_hex_string(hex, match, matchlen);
+        LOG("adding %s matchlen:%d offset:%d match %.*s (0x%s)", name, matchlen, offset, matchlen, match, hex);
+    }
+    if (matchlen == 0 || offset != 0) {
+        arkime_parsers_classifier_add(&classifiersSctp0, c);
+    } else if (matchlen == 1) {
+        arkime_parsers_classifier_add(&classifiersSctp1[(uint8_t)match[0]], c);
+    } else  {
+        c->match += 2;
+        c->matchlen -= 2;
+        arkime_parsers_classifier_add(&classifiersSctp2[(uint8_t)match[0]][(uint8_t)match[1]], c);
+    }
+}
+/******************************************************************************/
+void arkime_parsers_classifier_register_sctp_protocol_internal(const char *name, void *uw, uint32_t protocol, ArkimeClassifyFunc func, size_t sessionsize, int apiversion)
+{
+    if (sizeof(ArkimeSession_t) != sessionsize) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h\n %u != %u", name, (unsigned int)sizeof(ArkimeSession_t), (unsigned int)sessionsize);
+    }
+
+    if (ARKIME_API_VERSION != apiversion) {
+        CONFIGEXIT("Parser '%s' built with different version of arkime.h\n %d %d", name, ARKIME_API_VERSION, apiversion);
+    }
+
+    if (protocol > 255) {
+        CONFIGEXIT("Parser '%s' protocol must be 0-255", name);
+    }
+
+    ArkimeClassify_t *c = ARKIME_TYPE_ALLOC0(ArkimeClassify_t);
+    c->name     = name;
+    c->uw       = uw;
+    c->func     = func;
+
+    if (config.debug > 1) {
+        LOG("adding %s protocol:%u", name, protocol);
+    }
+
+    arkime_parsers_classifier_add(&classifiersSctpProtocol[protocol], c);
+}
+/******************************************************************************/
+void arkime_parsers_classify_udp(ArkimeSession_t *session, const uint8_t *data, int remaining, int which)
+{
+    if (remaining < 2)
+        return;
+
+#ifdef DEBUG_PARSERS
+    char buf[101];
+    LOG("len: %d direction: %d hex: %s data: %.*s", remaining, which, arkime_sprint_hex_string(buf, data, MIN(remaining, 50)), MIN(remaining, 50), data);
+#endif
+
+    for (int i = 0; i < classifiersUdpPortSrc[session->port1].cnt; i++) {
+        classifiersUdpPortSrc[session->port1].arr[i]->func(session, data, remaining, which, classifiersUdpPortSrc[session->port1].arr[i]->uw);
+    }
+
+    for (int i = 0; i < classifiersUdpPortDst[session->port2].cnt; i++) {
+        classifiersUdpPortDst[session->port2].arr[i]->func(session, data, remaining, which, classifiersUdpPortDst[session->port2].arr[i]->uw);
+    }
+
+    // Skip byte-based UDP classifiers on the DNS port
+    if (session->port1 == 53 || session->port2 == 53)
+        goto after_byte_classifiers;
+
+    for (int i = 0; i < classifiersUdp0.cnt; i++) {
+        ArkimeClassify_t *c = classifiersUdp0.arr[i];
+        if (remaining >= c->minlen && memcmp(data + c->offset, c->match, c->matchlen) == 0) {
+            c->func(session, data, remaining, which, c->uw);
+        }
+    }
+
+    for (int i = 0; i < classifiersUdp1[data[0]].cnt; i++)
+        classifiersUdp1[data[0]].arr[i]->func(session, data, remaining, which, classifiersUdp1[data[0]].arr[i]->uw);
+
+    for (int i = 0; i < classifiersUdp2[data[0]][data[1]].cnt; i++) {
+        ArkimeClassify_t *c = classifiersUdp2[data[0]][data[1]].arr[i];
+        if (remaining >= c->minlen && memcmp(data + 2, c->match, c->matchlen) == 0) {
+            c->func(session, data, remaining, which, c->uw);
+        }
+    }
+
+after_byte_classifiers:
+    arkime_rules_run_after_classify(session);
+    if (config.yara && !config.yaraEveryPacket && !session->stopYara)
+        arkime_yara_execute(session, data, remaining, 0);
+}
+/******************************************************************************/
+void arkime_parsers_classify_tcp(ArkimeSession_t *session, const uint8_t *data, int remaining, int which)
+{
+#ifdef DEBUG_PARSERS
+    char buf[101];
+    LOG("len: %d direction: %d hex: %s data: %.*s", remaining, which, arkime_sprint_hex_string(buf, data, MIN(remaining, 50)), MIN(remaining, 50), data);
+#endif
+
+    if (remaining < 2)
+        return;
+
+    for (int i = 0; i < classifiersTcpPortSrc[session->port1].cnt; i++) {
+        classifiersTcpPortSrc[session->port1].arr[i]->func(session, data, remaining, which, classifiersTcpPortSrc[session->port1].arr[i]->uw);
+    }
+
+    for (int i = 0; i < classifiersTcpPortDst[session->port2].cnt; i++) {
+        classifiersTcpPortDst[session->port2].arr[i]->func(session, data, remaining, which, classifiersTcpPortDst[session->port2].arr[i]->uw);
+    }
+
+    for (int i = 0; i < classifiersTcp0.cnt; i++) {
+        ArkimeClassify_t *c = classifiersTcp0.arr[i];
+        if (remaining >= c->minlen && memcmp(data + c->offset, c->match, c->matchlen) == 0) {
+            c->func(session, data, remaining, which, c->uw);
+        }
+    }
+
+    for (int i = 0; i < classifiersTcp1[data[0]].cnt; i++) {
+        classifiersTcp1[data[0]].arr[i]->func(session, data, remaining, which, classifiersTcp1[data[0]].arr[i]->uw);
+    }
+
+    for (int i = 0; i < classifiersTcp2[data[0]][data[1]].cnt; i++) {
+        ArkimeClassify_t *c = classifiersTcp2[data[0]][data[1]].arr[i];
+        if (remaining >= c->minlen && memcmp(data + 2, c->match, c->matchlen) == 0) {
+            c->func(session, data, remaining, which, c->uw);
+        }
+    }
+
+    arkime_rules_run_after_classify(session);
+    if (config.yara && !config.yaraEveryPacket && !session->stopYara)
+        arkime_yara_execute(session, data, remaining, 0);
+}
+/******************************************************************************/
+void arkime_parsers_classify_sctp(ArkimeSession_t *session, uint32_t protocol, const uint8_t *data, int remaining, int which)
+{
+#ifdef DEBUG_PARSERS
+    char buf[101];
+    LOG("len: %d direction: %d hex: %s data: %.*s", remaining, which, arkime_sprint_hex_string(buf, data, MIN(remaining, 50)), MIN(remaining, 50), data);
+#endif
+
+    if (remaining < 2)
+        return;
+
+    if (protocol < 256) {
+        for (int i = 0; i < classifiersSctpProtocol[protocol].cnt; i++) {
+            classifiersSctpProtocol[protocol].arr[i]->func(session, data, remaining, which, classifiersSctpProtocol[protocol].arr[i]->uw);
+        }
+    }
+
+    for (int i = 0; i < classifiersSctpPortSrc[session->port1].cnt; i++) {
+        classifiersSctpPortSrc[session->port1].arr[i]->func(session, data, remaining, which, classifiersSctpPortSrc[session->port1].arr[i]->uw);
+    }
+
+    for (int i = 0; i < classifiersSctpPortDst[session->port2].cnt; i++) {
+        classifiersSctpPortDst[session->port2].arr[i]->func(session, data, remaining, which, classifiersSctpPortDst[session->port2].arr[i]->uw);
+    }
+
+    for (int i = 0; i < classifiersSctp0.cnt; i++) {
+        ArkimeClassify_t *c = classifiersSctp0.arr[i];
+        if (remaining >= c->minlen && memcmp(data + c->offset, c->match, c->matchlen) == 0) {
+            c->func(session, data, remaining, which, c->uw);
+        }
+    }
+
+    for (int i = 0; i < classifiersSctp1[data[0]].cnt; i++) {
+        classifiersSctp1[data[0]].arr[i]->func(session, data, remaining, which, classifiersSctp1[data[0]].arr[i]->uw);
+    }
+
+    for (int i = 0; i < classifiersSctp2[data[0]][data[1]].cnt; i++) {
+        ArkimeClassify_t *c = classifiersSctp2[data[0]][data[1]].arr[i];
+        if (remaining >= c->minlen && memcmp(data + 2, c->match, c->matchlen) == 0) {
+            c->func(session, data, remaining, which, c->uw);
+        }
+    }
+
+    arkime_rules_run_after_classify(session);
+    if (config.yara && !config.yaraEveryPacket && !session->stopYara)
+        arkime_yara_execute(session, data, remaining, 0);
+}
+
+/******************************************************************************/
+uint32_t arkime_parsers_add_named_func(const char *name, ArkimeParsersNamedFunc func)
+{
+    if (!namedFuncsHash)
+        namedFuncsHash = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    ArkimeNamedInfo_t *info = g_hash_table_lookup(namedFuncsHash, name);
+    if (!info) {
+        info = ARKIME_TYPE_ALLOC0(ArkimeNamedInfo_t);
+        info->funcs = g_ptr_array_new();
+        namedFuncsMax++; // Don't use 0
+        if (namedFuncsMax >= MAX_NAMED_FUNCS) {
+            LOGEXIT("ERROR - Too many named functions %s", name);
+            return 0;
+        }
+        info->id = namedFuncsMax;
+        namedFuncsArr[namedFuncsMax] = info;
+        g_hash_table_insert(namedFuncsHash, g_strdup(name), info);
+    }
+
+    if (!func)
+        return info->id;
+
+    arkime_parsers_has_named_func |= (1ULL << info->id);
+    ArkimeNamedFunc_t *funcInfo = ARKIME_TYPE_ALLOC0(ArkimeNamedFunc_t);
+    funcInfo->cb = func;
+    g_ptr_array_add(info->funcs, funcInfo);
+    return info->id;
+}
+/******************************************************************************/
+uint32_t arkime_parsers_add_named_func2(const char *name, ArkimeParsersNamedFunc2 func, void *cbuw)
+{
+    if (!namedFuncsHash)
+        namedFuncsHash = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    ArkimeNamedInfo_t *info = g_hash_table_lookup(namedFuncsHash, name);
+    if (!info) {
+        info = ARKIME_TYPE_ALLOC0(ArkimeNamedInfo_t);
+        info->funcs = g_ptr_array_new();
+        namedFuncsMax++; // Don't use 0
+        if (namedFuncsMax >= MAX_NAMED_FUNCS) {
+            LOGEXIT("ERROR - Too many named functions %s", name);
+            return 0;
+        }
+        info->id = namedFuncsMax;
+        namedFuncsArr[namedFuncsMax] = info;
+        g_hash_table_insert(namedFuncsHash, g_strdup(name), info);
+    }
+
+    if (!func)
+        return info->id;
+
+    arkime_parsers_has_named_func |= (1ULL << info->id);
+    ArkimeNamedFunc_t *funcInfo = ARKIME_TYPE_ALLOC0(ArkimeNamedFunc_t);
+    funcInfo->cb2 = func;
+    funcInfo->cbuw = cbuw;
+    funcInfo->isCb2 = 1;
+    g_ptr_array_add(info->funcs, funcInfo);
+    return info->id;
+}
+/******************************************************************************/
+void arkime_parsers_call_named_func(uint32_t id, ArkimeSession_t *session, const uint8_t *data, int len, void *uw)
+{
+    if (id == 0 || id > namedFuncsMax || !ARKIME_PARSERS_HAS_NAMED_FUNC(id))
+        return;
+    ArkimeNamedInfo_t *info = namedFuncsArr[id];
+    for (int i = 0; i < (int)info->funcs->len; i++) {
+        ArkimeNamedFunc_t *funcInfo = g_ptr_array_index(info->funcs, i);
+        if (funcInfo->isCb2) {
+            funcInfo->cb2(session, data, len, uw, funcInfo->cbuw);
+        } else {
+            funcInfo->cb(session, data, len, uw);
+        }
+    }
+}
+/******************************************************************************/
+ArkimeParserBuf_t *arkime_parser_buf_create()
+{
+    return arkime_parser_buf_create2(1024, 8192);
+}
+/******************************************************************************/
+ArkimeParserBuf_t *arkime_parser_buf_create2(uint16_t initialSize, uint16_t maxSize)
+{
+    if (initialSize == 0)
+        initialSize = 1;
+    if (maxSize < initialSize)
+        maxSize = initialSize;
+
+    ArkimeParserBuf_t *pb = ARKIME_TYPE_ALLOC0(ArkimeParserBuf_t);
+    pb->buf[0] = malloc(initialSize);
+    pb->buf[1] = malloc(initialSize);
+    pb->bufSize[0] = pb->bufSize[1] = initialSize;
+    pb->bufMax = maxSize;
+    return pb;
+}
+/******************************************************************************/
+LOCAL void arkime_parser_buf_grow(ArkimeParserBuf_t *pb, int which, int needed)
+{
+    if (needed <= pb->bufSize[which])
+        return;
+
+    // Double until we have enough, then clamp to bufMax or needed
+    int newSize = pb->bufSize[which];
+    while (newSize < needed)
+        newSize *= 2;
+    if (newSize > pb->bufMax)
+        newSize = MAX(pb->bufMax, needed);
+    if (newSize <= pb->bufSize[which])
+        return;
+
+    uint8_t *nb = realloc(pb->buf[which], newSize);
+    if (!nb)
+        return; // keep old buffer
+    pb->buf[which] = nb;
+    pb->bufSize[which] = newSize;
+}
+/******************************************************************************/
+int arkime_parser_buf_add(ArkimeParserBuf_t *pb, int which, const uint8_t *data, int len)
+{
+    if (len <= 0)
+        return 0;
+
+    // First skip any bytes that skipping[which] requires
+    if (pb->skipping[which] > 0) {
+        if (pb->skipping[which] >= len) {
+            pb->skipping[which] -= len;
+            return 0;
+        }
+        data += pb->skipping[which];
+        len -= pb->skipping[which];
+        pb->skipping[which] = 0;
+    }
+
+    // Caller couldn't drain a full buffer. Parsers compare message bodies to bufMax,
+    // so leave room for framing bytes before deciding they are stuck
+    if (pb->len[which] >= pb->bufMax + 16)
+        return -1;
+
+    // Grow the buffer if needed, may go past bufMax by one add
+    if (pb->len[which] + len > pb->bufSize[which]) {
+        arkime_parser_buf_grow(pb, which, pb->len[which] + len);
+    }
+
+    // Calculate available space
+    int available = (int)pb->bufSize[which] - pb->len[which];
+    int tocopy = (len < available) ? len : available;
+
+    if (tocopy > 0) {
+        memcpy(pb->buf[which] + pb->len[which], data, tocopy);
+        pb->len[which] += tocopy;
+    }
+
+    return (available < len) ? -1 : 0;
+}
+/******************************************************************************/
+int arkime_parser_buf_del(ArkimeParserBuf_t *pb, int which, int len)
+{
+    if (len <= 0)
+        return 0;
+
+    if (len >= pb->len[which]) {
+        pb->len[which] = 0;
+    } else {
+        memmove(pb->buf[which], pb->buf[which] + len, pb->len[which] - len);
+        pb->len[which] -= len;
+    }
+    return 0;
+}
+/******************************************************************************/
+void arkime_parser_buf_skip(ArkimeParserBuf_t *pb, int which, int skip)
+{
+    if (skip <= 0)
+        return;
+
+    if (skip <= pb->len[which]) {
+        arkime_parser_buf_del(pb, which, skip);
+    } else {
+        pb->skipping[which] += skip - pb->len[which];
+        pb->len[which] = 0;
+    }
+}
+/******************************************************************************/
+void arkime_parser_buf_free(ArkimeParserBuf_t *pb)
+{
+    if (pb->buf[0]) free(pb->buf[0]);
+    if (pb->buf[1]) free(pb->buf[1]);
+    ARKIME_TYPE_FREE(ArkimeParserBuf_t, pb);
+}
+/******************************************************************************/
+void arkime_parser_buf_session_free(ArkimeSession_t *UNUSED(session), void *uw)
+{
+    ArkimeParserBuf_t *pb = uw;
+    if (pb->buf[0]) free(pb->buf[0]);
+    if (pb->buf[1]) free(pb->buf[1]);
+    ARKIME_TYPE_FREE(ArkimeParserBuf_t, pb);
+}
+/******************************************************************************/
+// Sub-parser registration - allows parsers like M3UA, DCE/RPC to have sub-parsers register with them
+// The key is a hex string that identifies what protocol/interface to parse
+void arkime_parsers_register_sub(const char *parserName, const char *hexKey, ArkimeParserFunc func, void *uw)
+{
+    GHashTable *parserTable = g_hash_table_lookup(subParserHash, parserName);
+    if (!parserTable) {
+        parserTable = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+        g_hash_table_insert(subParserHash, g_strdup(parserName), parserTable);
+    }
+
+    ArkimeParserInfo_t *info = ARKIME_TYPE_ALLOC0(ArkimeParserInfo_t);
+    info->parserFunc = func;
+    info->uw = uw;
+    g_hash_table_insert(parserTable, g_strdup(hexKey), info);
+}
+/******************************************************************************/
+// Generic sub-parser callback: tags the session with `uw` as a protocol string.
+// Useful for register_sub callers that only need to label the session.
+int arkime_parsers_add_protocol_cb(ArkimeSession_t *session, void *uw, const uint8_t *UNUSED(data), int UNUSED(remaining), int UNUSED(which))
+{
+    arkime_session_add_protocol(session, (const char *)uw);
+    return 0;
+}
+/******************************************************************************/
+GHashTable *arkime_parsers_get_sub(const char *parserName)
+{
+    GHashTable *parserTable = g_hash_table_lookup(subParserHash, parserName);
+    if (!parserTable) {
+        parserTable = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+        g_hash_table_insert(subParserHash, g_strdup(parserName), parserTable);
+    }
+    return parserTable;
+}

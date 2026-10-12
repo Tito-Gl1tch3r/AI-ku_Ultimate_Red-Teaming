@@ -1,0 +1,352 @@
+/******************************************************************************/
+/* config.js -- Code dealing with the config file, command line arguments,
+ *              and dropping privileges
+ *
+ * Copyright 2012-2016 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+'use strict';
+
+/// ///////////////////////////////////////////////////////////////////////////////
+/// / Command Line Parsing
+/// ///////////////////////////////////////////////////////////////////////////////
+const os = require('os');
+const version = require('../common/version');
+const Auth = require('../common/auth');
+const ArkimeConfig = require('../common/arkimeConfig');
+
+const internals = {
+  hostName: os.hostname(),
+  fields: [],
+  fieldsMap: {},
+  categories: {},
+  options: new Map(),
+  debugged: new Map()
+};
+
+class Config {
+  static get debug () {
+    return ArkimeConfig.debug;
+  }
+
+  static get regressionTests () {
+    return ArkimeConfig.regressionTests;
+  }
+
+  static esProfile = false;
+
+  static keyFileData;
+  static certFileData;
+
+  // ----------------------------------------------------------------------------
+  static processArgs () {
+    const args = [];
+    const doverrides = [];
+    for (let i = 0, ilen = process.argv.length; i < ilen; i++) {
+      if (process.argv[i] === '--host') {
+        i++;
+        internals.hostName = process.argv[i];
+      } else if (process.argv[i] === '-n' || process.argv[i] === '--node') {
+        i++;
+        internals.nodeName = process.argv[i];
+      } else if (process.argv[i] === '-o' || process.argv[i] === '--option') {
+        i++;
+        const equal = process.argv[i].indexOf('=');
+        if (equal === -1) {
+          console.log('Missing equal sign in', process.argv[i]);
+          process.exit(1);
+        }
+
+        const key = process.argv[i].slice(0, equal);
+        const value = process.argv[i].slice(equal + 1);
+        if (key.includes('.')) {
+          ArkimeConfig.setOverride(key, value);
+        } else {
+          // Need to do later since nodeName can change
+          doverrides.push({ key, value });
+        }
+      } else if (process.argv[i] === '--esprofile') {
+        Config.esProfile = true;
+      } else {
+        args.push(process.argv[i]);
+      }
+    }
+    process.argv = args;
+
+    if (!internals.nodeName) {
+      internals.nodeName = internals.hostName.split('.')[0];
+    }
+
+    for (const obj of doverrides) {
+      ArkimeConfig.setOverride(`default.${obj.key}`, obj.value);
+      ArkimeConfig.setOverride(`${internals.nodeName}.${obj.key}`, obj.value);
+    }
+  }
+
+  /// ///////////////////////////////////////////////////////////////////////////////
+  // Config File & Dropping Privileges
+  /// ///////////////////////////////////////////////////////////////////////////////
+
+  // ----------------------------------------------------------------------------
+  static sectionGet = ArkimeConfig.getFull;
+
+  // ----------------------------------------------------------------------------
+  static getFull (node, key, defaultValue) {
+    return ArkimeConfig.getFull([node, ArkimeConfig.getFull([node], 'nodeClass'), 'default'], key, defaultValue);
+  }
+
+  // ----------------------------------------------------------------------------
+  static get = ArkimeConfig.get;
+
+  static getInt = ArkimeConfig.getInt;
+
+  static getFloat = ArkimeConfig.getFloat;
+
+  static getBool = ArkimeConfig.getBool;
+
+  // ----------------------------------------------------------------------------
+  // Return an array split on separator, remove leading/trailing spaces, remove empty elements
+  static getArray = ArkimeConfig.getArray;
+
+  // ----------------------------------------------------------------------------
+  // Return an array split on separator, remove leading/trailing spaces, remove empty elements given a node
+  static getFullArray (node, key, defaultValue, sep) {
+    return ArkimeConfig.getFullArray([node, ArkimeConfig.getFull([node], 'nodeClass'), 'default'], key, defaultValue, sep);
+  }
+
+  // ----------------------------------------------------------------------------
+  static isHTTPS (node) {
+    return Config.getFull(node ?? internals.nodeName, 'keyFile') &&
+           Config.getFull(node ?? internals.nodeName, 'certFile');
+  }
+
+  // ----------------------------------------------------------------------------
+  static basePath () {
+    return Config.getFull(internals.nodeName, 'webBasePath', '/');
+  }
+
+  // ----------------------------------------------------------------------------
+  static nodeName () {
+    return internals.nodeName;
+  }
+
+  // ----------------------------------------------------------------------------
+  static hostName () {
+    return internals.hostName;
+  }
+
+  // ----------------------------------------------------------------------------
+  static arkimeWebURL () {
+    return ArkimeConfig.webURL(() => `${Config.hostName()}${Config.basePath()}`, Config.isHTTPS());
+  }
+
+  // ----------------------------------------------------------------------------
+  static keys (section) {
+    return Object.keys(ArkimeConfig.getSection(section) ?? {});
+  }
+
+  // ----------------------------------------------------------------------------
+  static headers (section) {
+    const csection = ArkimeConfig.getSection(section);
+    if (csection === undefined) { return []; }
+    const keys = Object.keys(csection);
+    const headers = keys.map((key) => {
+      const obj = { name: key };
+      for (const element of csection[key].split(';')) {
+        const i = element.indexOf(':');
+        if (i === -1) {
+          continue;
+        }
+
+        const parts = [element.slice(0, i), element.slice(i + 1)];
+        if (parts[1] === 'true') {
+          parts[1] = true;
+        } else if (parts[1] === 'false') {
+          parts[1] = false;
+        }
+        obj[parts[0]] = parts[1];
+      }
+      return obj;
+    });
+
+    return headers;
+  }
+
+  // ----------------------------------------------------------------------------
+  // Both levels are null prototype on purpose. Callers look these maps up by a
+  // name that often comes from a request (a sensor, node or cluster name), and a
+  // plain {} would answer __proto__ / constructor / toString with an inherited
+  // value instead of undefined -- which reads as "this name is configured".
+  // It also keeps a literal __proto__ key in the config file an ordinary entry
+  // rather than something that silently replaces the map's prototype.
+  static configMap (section, dSection, d) {
+    const data = ArkimeConfig.getSection(section) ?? ArkimeConfig.getSection(dSection) ?? d;
+    if (data === undefined) { return Object.create(null); }
+    const keys = Object.keys(data);
+    const map = Object.create(null);
+    for (const key of keys) {
+      const obj = Object.create(null);
+      for (const element of data[key].split(';')) {
+        const i = element.indexOf(':');
+        if (i === -1) {
+          continue;
+        }
+
+        const parts = [element.slice(0, i), element.slice(i + 1)];
+        if (parts[1] === 'true') {
+          parts[1] = true;
+        } else if (parts[1] === 'false') {
+          parts[1] = false;
+        }
+        obj[parts[0]] = parts[1];
+      }
+      map[key] = obj;
+    }
+
+    return map;
+  }
+
+  /// ///////////////////////////////////////////////////////////////////////////////
+  // Fields
+  /// ///////////////////////////////////////////////////////////////////////////////
+  static getFields () {
+    return internals.fields;
+  }
+
+  // ----------------------------------------------------------------------------
+  static getFieldsMap () {
+    return internals.fieldsMap;
+  }
+
+  // ----------------------------------------------------------------------------
+  static getDBFieldsMap () {
+    return internals.dbFieldsMap;
+  }
+
+  // ----------------------------------------------------------------------------
+  static getDBField (field, property) {
+    if (internals.dbFieldsMap[field] === undefined) { return undefined; }
+    if (property === undefined) { return internals.dbFieldsMap[field]; }
+    return internals.dbFieldsMap[field][property];
+  }
+
+  // ----------------------------------------------------------------------------
+  static getCategories () {
+    return internals.categories;
+  }
+
+  // ----------------------------------------------------------------------------
+  static loadFields (data) {
+    internals.fields = [];
+    internals.fieldsMap = {};
+    internals.dbFieldsMap = {};
+    internals.categories = {};
+    const extraNames = [];
+    for (const field of data) {
+      const source = field._source;
+      source.exp = field._id;
+
+      if ((source.dbField2?.startsWith('http.request-') && !source.exp.startsWith('http.request.')) ||
+          (source.dbField2?.startsWith('http.response-') && !source.exp.startsWith('http.response.'))) {
+        continue;
+      }
+
+      // Add some transforms
+      if (!source.transform) {
+        if (source.exp === 'http.uri' || source.exp === 'http.uri.tokens') {
+          source.transform = 'removeProtocol';
+        }
+        if (source.exp === 'host' || source.exp.startsWith('host.')) {
+          source.transform = 'removeProtocolAndURI';
+        }
+      }
+
+      internals.fieldsMap[field._id] = source;
+      if (!source.noFacet) {
+        internals.dbFieldsMap[source.dbField] = source;
+        if (source.dbField2 !== undefined) {
+          internals.dbFieldsMap[source.dbField2] = source;
+        }
+      }
+      if (source.fieldECS !== undefined) {
+        extraNames.push([source.fieldECS, source, true]);
+      }
+      internals.fields.push(source);
+      if (!internals.categories[source.group]) {
+        internals.categories[source.group] = [];
+      }
+      internals.categories[source.group].push(source);
+      for (const alias of (source.aliases || [])) {
+        extraNames.push([alias, source, false]);
+      }
+    }
+
+    // Field docs can be written by sensors, so an ECS name or alias never takes over
+    // a real field, otherwise it could change how users' forced expressions compile
+    for (const [extraName, source, ecs] of extraNames) {
+      if (internals.fieldsMap[extraName] === undefined) {
+        internals.fieldsMap[extraName] = source;
+      }
+      if (ecs && internals.dbFieldsMap[extraName] === undefined) {
+        internals.dbFieldsMap[extraName] = source;
+      }
+    }
+
+    for (const cat in internals.categories) {
+      internals.categories[cat] = internals.categories[cat].sort((a, b) => a.exp.localeCompare(b.exp));
+    }
+  }
+
+  /// ///////////////////////////////////////////////////////////////////////////////
+  // Initialize Auth
+  /// ///////////////////////////////////////////////////////////////////////////////
+
+  static async initialize (options) {
+    const sections = [internals.nodeName];
+    if (internals.nodeName !== 'cont3xt') {
+      sections.push('default');
+    }
+
+    ArkimeConfig.loaded(() => {
+      // If add user is called with cont3xt/parliament don't need default section, everything else does
+      if (internals.nodeName !== 'cont3xt' && internals.nodeName !== 'parliament' && ArkimeConfig.getSection('default') === undefined) {
+        console.log('WARNING - [default] section missing from', ArkimeConfig.configFile);
+        // process.exit(1);
+      }
+
+      const nodeClass = ArkimeConfig.getFull([internals.nodeName], 'nodeClass');
+      if (nodeClass && ArkimeConfig.getSection(nodeClass) !== undefined) {
+        sections.splice(1, 0, nodeClass);
+      }
+    }, true);
+
+    ArkimeConfig.registerValidated({
+      uploadFileSizeLimit: { type: 'int', min: 0 },
+      maxSessionsQueried: { type: 'int', min: 0 },
+      elasticsearch: { type: 'urls' },
+      usersElasticsearch: { type: 'urls' }
+    });
+
+    await ArkimeConfig.initialize({
+      defaultConfigFile: `${version.config_prefix}/etc/config.ini`,
+      defaultSections: sections
+    });
+
+    if (options?.initAuth) {
+      await Auth.initialize({
+        appAdminRole: 'arkimeAdmin',
+        basePath: Config.basePath(),
+        passwordSecretSection: internals.nodeName === 'cont3xt' ? 'cont3xt' : 'default',
+        hostVar: 'viewHost',
+        s2s: true,
+        s2sRegressionTests: !!Config.get('s2sRegressionTests')
+      });
+    }
+  }
+}
+
+Config.processArgs();
+
+module.exports = Config;

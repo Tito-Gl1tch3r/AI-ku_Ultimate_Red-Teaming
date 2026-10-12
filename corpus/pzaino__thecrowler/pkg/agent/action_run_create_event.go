@@ -1,0 +1,182 @@
+// Copyright 2023 Paolo Fabio Zaino, all rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package agent provides the agent functionality for the CROWler.
+package agent
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	cdb "github.com/pzaino/thecrowler/pkg/database"
+)
+
+// CreateEventAction creates a database event
+type CreateEventAction struct{}
+
+// Name returns the name of the action
+func (e *CreateEventAction) Name() string {
+	return "CreateEvent"
+}
+
+// Execute creates a database event
+func (e *CreateEventAction) Execute(params map[string]interface{}) (map[string]interface{}, error) {
+	rval := make(map[string]interface{})
+	rval[StrResponse] = nil
+	rval[StrConfig] = nil
+
+	config, err := getConfig(params)
+	if err != nil {
+		rval[StrStatus] = StatusError
+		rval[StrMessage] = err.Error()
+		return rval, err
+	}
+	rval[StrConfig] = config
+
+	dbHandler, ok := config["db_handler"].(cdb.Handler)
+	if !ok {
+		rval[StrStatus] = StatusError
+		rval[StrMessage] = "missing 'db_handler' parameter in config section"
+		return rval, fmt.Errorf("missing 'db_handler' parameter")
+	}
+
+	eventRaw, err := getInput(params)
+	if err != nil {
+		rval[StrStatus] = StatusError
+		rval[StrMessage] = err.Error()
+		return rval, err
+	}
+
+	// Canonical input context: $response is the previous step's payload.
+	ictx := NewInputContext(params)
+	resolveField := func(raw string) (string, error) {
+		return ResolveString(ictx, raw)
+	}
+
+	// Transform eventRaw into an event struct
+	event := cdb.Event{}
+	event.Details = eventRaw
+	if params["event_type"] != nil {
+		eType, _ := params["event_type"].(string)
+		resolved, err := resolveField(eType)
+		if err != nil {
+			rval[StrStatus] = StatusError
+			rval[StrMessage] = err.Error()
+			return rval, err
+		}
+		event.Type = strings.TrimSpace(resolved)
+	}
+	if params["source"] != nil {
+		eSource, _ := params["source"].(string)
+		resolved, err := resolveField(eSource)
+		if err != nil {
+			rval[StrStatus] = StatusError
+			rval[StrMessage] = err.Error()
+			return rval, err
+		}
+		eSourceInt, err := strconv.ParseUint(resolved, 10, 64)
+		if err != nil {
+			rval[StrStatus] = StatusError
+			rval[StrMessage] = fmt.Sprintf("invalid source ID: %v", err)
+			return rval, err
+		}
+		event.SourceID = eSourceInt
+	} else {
+		event.SourceID = 0
+	}
+	// Check if there is a timestamp params
+	if params["timestamp"] != nil {
+		eTimestamp, _ := params["timestamp"].(string)
+		resolved, err := resolveField(eTimestamp)
+		if err != nil {
+			rval[StrStatus] = StatusError
+			rval[StrMessage] = err.Error()
+			return rval, err
+		}
+		// convert eTimestamp to a time.Time
+		t, err := time.Parse("2006-01-02 15:04:05", resolved)
+		if err != nil {
+			rval[StrStatus] = StatusError
+			rval[StrMessage] = fmt.Sprintf("invalid timestamp: %v", err)
+			return rval, err
+		}
+		event.Timestamp = t.Format("2006-01-02 15:04:05")
+	} else {
+		now := time.Now()
+		event.Timestamp = string(now.Format("2006-01-02 15:04:05"))
+	}
+	// Check if there is a Severity params
+	if params["severity"] != nil {
+		eSeverity, _ := params["severity"].(string)
+		resolved, err := resolveField(eSeverity)
+		if err != nil {
+			rval[StrStatus] = StatusError
+			rval[StrMessage] = err.Error()
+			return rval, err
+		}
+		event.Severity = strings.ToUpper(strings.TrimSpace(resolved))
+	} else {
+		event.Severity = "medium"
+	}
+	// ExpiresAt
+	if params["expires_at"] != nil {
+		eExpiresAt, _ := params["expires_at"].(string)
+		resolved, err := resolveField(eExpiresAt)
+		if err != nil {
+			rval[StrStatus] = StatusError
+			rval[StrMessage] = err.Error()
+			return rval, err
+		}
+		event.ExpiresAt = resolved
+	}
+	// Check if there is a Details params
+	if params["details"] != nil {
+		eDetails, _ := params["details"].(map[string]interface{})
+		resolved, err := ResolveValue(ictx, eDetails)
+		if err != nil {
+			rval[StrStatus] = StatusError
+			rval[StrMessage] = err.Error()
+			return rval, err
+		}
+		event.Details, _ = resolved.(map[string]interface{})
+	}
+
+	// Cap I/O by the remaining group time budget when propagated; fail
+	// fast without touching the driver when it is already exhausted. The
+	// driver's own timeouts stay the backstop for in-flight calls.
+	timeout, ok := eventActionTimeout(params)
+	if !ok {
+		err := fmt.Errorf("constraint gate denied action CreateEvent: time_budget exceeded")
+		rval[StrStatus] = StatusError
+		rval[StrMessage] = err.Error()
+		return rval, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	result, err := cdb.CreateEvent(ctx, &dbHandler, event)
+	cancel()
+	if err != nil {
+		rval[StrStatus] = StatusError
+		rval[StrMessage] = fmt.Sprintf("failed to create event: %v", err)
+		return rval, fmt.Errorf("failed to create event: %v", err)
+	}
+
+	rval[StrResponse] = result
+	rval[StrStatus] = StatusSuccess
+	rval[StrMessage] = "event created successfully"
+
+	return rval, nil
+}

@@ -1,0 +1,1047 @@
+package listener
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/chainreactors/IoM-go/consts"
+	mtls "github.com/chainreactors/IoM-go/mtls"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/IoM-go/proto/services/listenerrpc"
+	"github.com/chainreactors/malice-network/helper/utils/fileutils"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+
+	"github.com/chainreactors/logs"
+	"github.com/chainreactors/malice-network/helper/cryptography"
+	"github.com/chainreactors/malice-network/helper/utils"
+	"github.com/chainreactors/malice-network/server/internal/configs"
+	"github.com/chainreactors/malice-network/server/internal/core"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+)
+
+var (
+	currentListener  *listener
+	listenerGlobalMu sync.Mutex
+	// ListenerSessions 在 listener 层维护的 Sessions map (rawID -> Session)
+)
+
+func setCurrentListener(lns *listener) {
+	listenerGlobalMu.Lock()
+	currentListener = lns
+	listenerGlobalMu.Unlock()
+}
+
+func clearCurrentListener(lns *listener) {
+	listenerGlobalMu.Lock()
+	if currentListener == lns {
+		currentListener = nil
+	}
+	listenerGlobalMu.Unlock()
+}
+
+func CloseCurrentListener() error {
+	listenerGlobalMu.Lock()
+	lns := currentListener
+	listenerGlobalMu.Unlock()
+	if lns == nil {
+		return nil
+	}
+	return lns.Close()
+}
+
+var openListenerJobStream = func(client listenerrpc.ListenerRPCClient, ctx context.Context) (listenerrpc.ListenerRPC_JobStreamClient, error) {
+	return client.JobStream(ctx)
+}
+
+func sendListenerRegistration(lns *listener, pipelines *clientpb.Pipelines) error {
+	if lns == nil || lns.Rpc == nil {
+		return errors.New("listener rpc client is nil")
+	}
+	_, err := lns.Rpc.RegisterListener(lns.Context(), &clientpb.RegisterListener{
+		Name:      lns.Name,
+		Host:      lns.IP,
+		Pipelines: pipelines,
+	})
+	return err
+}
+
+var registerListenerRPC = func(lns *listener) error {
+	return sendListenerRegistration(lns, nil)
+}
+
+var reregisterListenerRPC = func(lns *listener) error {
+	return sendListenerRegistration(lns, lns.runtimeSnapshot())
+}
+
+var waitListenerReconnect = func(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+const (
+	listenerReconnectMinDelay = 100 * time.Millisecond
+	listenerReconnectMaxDelay = 5 * time.Second
+)
+
+func NewListener(clientConf *mtls.ClientConfig, cfg *configs.ListenerConfig, serverEnable bool) error {
+	if clientConf == nil {
+		return errors.New("listener auth is nil")
+	}
+	options, err := mtls.GetGrpcOptions([]byte(clientConf.CACertificate), []byte(clientConf.Certificate), []byte(clientConf.PrivateKey), clientConf.Type)
+	if err != nil {
+		return err
+	}
+	options = append(options,
+		grpc.WithChainUnaryInterceptor(listenerIdentityUnaryClientInterceptor(cfg.Name)),
+		grpc.WithChainStreamInterceptor(listenerIdentityStreamClientInterceptor(cfg.Name)),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var address = clientConf.Address()
+	if serverEnable && cfg.Enable {
+		address = fmt.Sprintf("%s:%d", "127.0.0.1", clientConf.Port)
+	}
+	conn, err := grpc.DialContext(ctx, address, options...)
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %v", err)
+	}
+
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	lns := &listener{
+		Rpc:       listenerrpc.NewListenerRPCClient(conn),
+		Name:      cfg.Name,
+		IP:        cfg.IP,
+		pipelines: core.NewPipelines(),
+		conn:      conn,
+		cfg:       cfg,
+		websites:  make(map[string]*Website),
+		ctx:       runtimeCtx,
+		cancel:    runtimeCancel,
+	}
+	lns.shutdown = lns.Close
+	lns.pipelineRPC = &reversePipelineRPC{ListenerRPCClient: lns.Rpc}
+
+	if err = registerListenerRPC(lns); err != nil {
+		runtimeCancel()
+		_ = conn.Close()
+		return err
+	}
+	core.GoGuarded("listener-job-stream:"+lns.ID(), lns.Handler, core.LogGuardedError("listener-job-stream:"+lns.ID()))
+	setCurrentListener(lns)
+
+	for _, tcpPipeline := range cfg.TcpPipelines {
+		pipeline, err := tcpPipeline.ToProtobuf(lns.Name)
+		if err != nil {
+			logs.Log.Errorf("listener - build_tcp_pipeline_failed error=%q", err)
+			continue
+		}
+		err = lns.RegisterAndStart(pipeline)
+		if err != nil {
+			logs.Log.Errorf("listener - start_tcp_pipeline_failed name=%s error=%q", tcpPipeline.Name, err)
+		}
+	}
+
+	for _, httpPipeline := range cfg.HttpPipelines {
+		pipeline, err := httpPipeline.ToProtobuf(lns.Name)
+		if err != nil {
+			logs.Log.Errorf("listener - build_http_pipeline_failed error=%q", err)
+			continue
+		}
+		err = lns.RegisterAndStart(pipeline)
+		if err != nil {
+			logs.Log.Errorf("listener - start_http_pipeline_failed name=%s error=%q", httpPipeline.Name, err)
+		}
+	}
+
+	for _, bindPipeline := range cfg.BindPipelineConfig {
+		pipeline, err := bindPipeline.ToProtobuf(lns.Name)
+		if err != nil {
+			logs.Log.Errorf("listener - build_bind_pipeline_failed error=%q", err)
+			continue
+		}
+		err = lns.RegisterAndStart(pipeline)
+		if err != nil {
+			logs.Log.Errorf("listener - start_bind_pipeline_failed name=%s error=%q", bindPipeline.Name, err)
+		}
+	}
+
+	if err := cfg.ValidateREMNames(); err != nil {
+		return err
+	}
+	for _, rem := range cfg.REMs {
+		if !rem.Enable {
+			continue
+		}
+		pipeline, err := rem.ToProtobuf(lns.Name)
+		if err != nil {
+			logs.Log.Errorf("listener - build_rem_failed name=%s error=%q", rem.Name, err)
+			continue
+		}
+
+		_, err = lns.Rpc.RegisterRem(lns.Context(), pipeline)
+		if err != nil {
+			logs.Log.Errorf("listener - register_rem_failed name=%s error=%q", rem.Name, err)
+			continue
+		}
+
+		_, err = lns.Rpc.StartRem(lns.Context(), &clientpb.CtrlPipeline{
+			Name:       pipeline.Name,
+			ListenerId: lns.ID(),
+		})
+
+		if err != nil {
+			logs.Log.Errorf("listener - start_rem_failed name=%s error=%q", rem.Name, err)
+		}
+	}
+
+	for _, newWebsite := range cfg.Websites {
+		if !newWebsite.Enable {
+			continue
+		}
+		tls, err := newWebsite.TlsConfig.ReadCert()
+		if err != nil {
+			logs.Log.Errorf("listener - read_website_cert_failed name=%s error=%q", newWebsite.WebsiteName, err)
+			continue
+		}
+
+		web := &clientpb.Website{
+			Root: newWebsite.RootPath,
+			Port: uint32(newWebsite.Port),
+		}
+		pipe := &clientpb.Pipeline{
+			Name:       newWebsite.WebsiteName,
+			ListenerId: lns.Name,
+			Body: &clientpb.Pipeline_Web{
+				Web: web,
+			},
+			Tls: tls.ToProtobuf(),
+		}
+
+		contents := map[string]*clientpb.WebContent{}
+		contentFailed := false
+		for _, content := range newWebsite.WebContents {
+			contents[content.Path], err = content.ToProtobuf()
+			if err != nil {
+				logs.Log.Errorf("listener - build_website_content_failed path=%s error=%q", content.Path, err)
+				contentFailed = true
+				break
+			}
+		}
+		if contentFailed {
+			continue
+		}
+		web.Contents = contents
+		_, err = lns.Rpc.RegisterWebsite(lns.Context(), pipe)
+		if err != nil {
+			logs.Log.Errorf("listener - register_website_failed name=%s error=%q", newWebsite.WebsiteName, err)
+			continue
+		}
+
+		if pipe.Tls.Enable && !pipe.Tls.Acme {
+			_, err = lns.Rpc.GenerateSelfCert(lns.Context(), pipe)
+		} else if pipe.Tls.Enable && pipe.Tls.Acme {
+			_, err = lns.Rpc.GenerateAcmeCert(lns.Context(), pipe)
+		}
+		if err != nil {
+			logs.Log.Errorf("listener - generate_website_cert_failed name=%s error=%q", newWebsite.WebsiteName, err)
+			continue
+		}
+
+		_, err = lns.Rpc.StartWebsite(lns.Context(), &clientpb.CtrlPipeline{
+			Name:       newWebsite.WebsiteName,
+			ListenerId: lns.Name,
+			Pipeline:   pipe,
+		})
+		if err != nil {
+			logs.Log.Errorf("listener - start_website_failed name=%s error=%q", newWebsite.WebsiteName, err)
+		}
+	}
+
+	return nil
+}
+
+type listener struct {
+	Rpc         listenerrpc.ListenerRPCClient
+	pipelineRPC pipelineRPCClient
+	Name        string
+	IP          string
+	pipelines   core.Pipelines
+	conn        *grpc.ClientConn
+	cfg         *configs.ListenerConfig
+	websites    map[string]*Website
+	websitesMu  sync.RWMutex
+	shutdown    func() error
+	ctx         context.Context
+	cancel      context.CancelFunc
+	retireOnce  sync.Once
+	closeOnce   sync.Once
+	closeErr    error
+}
+
+func (lns *listener) Close() error {
+	if lns == nil {
+		return nil
+	}
+	lns.closeOnce.Do(func() {
+		lns.closeErr = lns.close()
+	})
+	return lns.closeErr
+}
+
+func (lns *listener) close() error {
+	var errs []error
+
+	if lns.cancel != nil {
+		lns.cancel()
+	}
+
+	for _, pipeline := range lns.pipelines.ToProtobuf().GetPipelines() {
+		if pipeline == nil {
+			continue
+		}
+		runtime := lns.pipelines.Get(pipeline.Name)
+		if runtime == nil {
+			continue
+		}
+		if err := runtime.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := lns.cleanupForwardPipelineRuntime(runtime.ID()); err != nil {
+			errs = append(errs, err)
+		}
+		lns.pipelines.Delete(pipeline.Name)
+	}
+
+	for _, website := range lns.drainWebsites() {
+		if website == nil {
+			continue
+		}
+		if err := website.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close website %s: %w", website.Name, err))
+		}
+	}
+
+	if lns.conn != nil {
+		if err := lns.conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	clearCurrentListener(lns)
+
+	return errors.Join(errs...)
+}
+
+func (lns *listener) RegisterAndStart(pipeline *clientpb.Pipeline) error {
+	if !pipeline.Enable {
+		return nil
+	}
+
+	var err error
+	// 如果启用了安全模式，生成密钥对
+	//if pipeline.Secure != nil && pipeline.Secure.Enable {
+	//	err = lns.generateSecureKeyPair(pipeline)
+	//	if err != nil {
+	//		return err
+	//	}
+	//}
+
+	_, err = lns.Rpc.RegisterPipeline(lns.Context(), pipeline)
+	if err != nil {
+		return err
+	}
+
+	if pipeline.Tls.Enable && !pipeline.Tls.Acme {
+		_, err = lns.Rpc.GenerateSelfCert(lns.Context(), pipeline)
+	} else if pipeline.Tls.Enable && pipeline.Tls.Acme {
+		_, err = lns.Rpc.GenerateAcmeCert(lns.Context(), pipeline)
+	}
+	if err != nil {
+		return err
+	}
+
+	_, err = lns.Rpc.StartPipeline(lns.Context(), &clientpb.CtrlPipeline{
+		Name:       pipeline.Name,
+		ListenerId: lns.ID(),
+		Pipeline:   pipeline,
+	})
+	if err != nil {
+		return err
+	}
+
+	lns.autoBuild(lns.cfg.AutoBuildConfig, pipeline)
+	return nil
+}
+
+func (lns *listener) ID() string {
+	return lns.Name
+}
+
+func (lns *listener) ToProtobuf() *clientpb.Listener {
+	return &clientpb.Listener{
+		Id: lns.ID(),
+	}
+}
+
+func (lns *listener) Context() context.Context {
+	ctx := lns.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return metadata.NewOutgoingContext(ctx, metadata.Pairs(
+		"listener_id", lns.Name,
+		"listener_ip", lns.IP,
+	),
+	)
+}
+
+func (lns *listener) Handler() error {
+	needsRegistration := false
+	reconnectDelay := listenerReconnectMinDelay
+	for {
+		ctx := lns.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		if needsRegistration {
+			if err := reregisterListenerRPC(lns); err != nil {
+				logs.Log.Warnf("listener.%s - reregister_failed error=%q", lns.ID(), err)
+				if !waitListenerReconnect(ctx, reconnectDelay) {
+					return nil
+				}
+				reconnectDelay = nextListenerReconnectDelay(reconnectDelay)
+				continue
+			}
+			needsRegistration = false
+			reconnectDelay = listenerReconnectMinDelay
+		}
+
+		opened, err := lns.runJobStreamOnce()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err != nil {
+			logs.Log.Warnf("listener.%s - job_stream_disconnected error=%q", lns.ID(), err)
+		}
+		if opened {
+			needsRegistration = true
+		}
+		if !waitListenerReconnect(ctx, reconnectDelay) {
+			return nil
+		}
+		reconnectDelay = nextListenerReconnectDelay(reconnectDelay)
+	}
+}
+
+func (lns *listener) runtimeSnapshot() *clientpb.Pipelines {
+	snapshot := &clientpb.Pipelines{}
+	for _, pipeline := range lns.pipelines.ToProtobuf().GetPipelines() {
+		if pipeline == nil || !pipeline.GetEnable() {
+			continue
+		}
+		pipeline.ListenerId = lns.ID()
+		snapshot.Pipelines = append(snapshot.Pipelines, pipeline)
+	}
+	for _, website := range lns.snapshotWebsites() {
+		if website == nil || !website.Enable {
+			continue
+		}
+		pipeline := website.ToProtobuf()
+		pipeline.ListenerId = lns.ID()
+		snapshot.Pipelines = append(snapshot.Pipelines, pipeline)
+	}
+	return snapshot
+}
+
+func (lns *listener) getWebsite(name string) *Website {
+	lns.websitesMu.RLock()
+	defer lns.websitesMu.RUnlock()
+	return lns.websites[name]
+}
+
+func (lns *listener) setWebsite(name string, website *Website) {
+	lns.websitesMu.Lock()
+	if lns.websites == nil {
+		lns.websites = make(map[string]*Website)
+	}
+	lns.websites[name] = website
+	lns.websitesMu.Unlock()
+}
+
+func (lns *listener) removeWebsite(name string) {
+	lns.websitesMu.Lock()
+	delete(lns.websites, name)
+	lns.websitesMu.Unlock()
+}
+
+func (lns *listener) snapshotWebsites() []*Website {
+	lns.websitesMu.RLock()
+	defer lns.websitesMu.RUnlock()
+	websites := make([]*Website, 0, len(lns.websites))
+	for _, website := range lns.websites {
+		websites = append(websites, website)
+	}
+	return websites
+}
+
+func (lns *listener) drainWebsites() []*Website {
+	lns.websitesMu.Lock()
+	defer lns.websitesMu.Unlock()
+	websites := make([]*Website, 0, len(lns.websites))
+	for _, website := range lns.websites {
+		websites = append(websites, website)
+	}
+	lns.websites = make(map[string]*Website)
+	return websites
+}
+
+func nextListenerReconnectDelay(current time.Duration) time.Duration {
+	next := current * 2
+	if next > listenerReconnectMaxDelay {
+		return listenerReconnectMaxDelay
+	}
+	return next
+}
+
+func (lns *listener) runJobStreamOnce() (bool, error) {
+	stream, err := openListenerJobStream(lns.Rpc, lns.Context())
+	if err != nil {
+		return false, fmt.Errorf("open listener job stream: %w", err)
+	}
+	defer core.ListenerSessions.AbortSnapshot()
+
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			return true, fmt.Errorf("listener %s job stream recv: %w", lns.ID(), err)
+		}
+
+		status := lns.handleJobCtrl(msg)
+		if status == nil {
+			continue
+		}
+		if err := stream.Send(status); err != nil {
+			return true, fmt.Errorf("listener %s job stream send: %w", lns.ID(), err)
+		}
+	}
+}
+
+func (lns *listener) handleJobCtrl(msg *clientpb.JobCtrl) *clientpb.JobStatus {
+	if msg == nil {
+		return nil
+	}
+	var handlerErr error
+	switch msg.Ctrl {
+	case consts.CtrlPipelineStart:
+		handlerErr = lns.handlerStart(msg.Job)
+	case consts.CtrlPipelineStop, consts.CtrlRemStop:
+		handlerErr = lns.handlerStop(msg.Job)
+	case consts.CtrlPipelineSync:
+		handlerErr = lns.syncPipeline(msg.Job)
+	case consts.CtrlWebsiteStart:
+		handlerErr = lns.handleStartWebsite(msg.Job)
+	case consts.CtrlWebsiteStop:
+		handlerErr = lns.handleStopWebsite(msg.Job)
+	case consts.CtrlWebsiteRegister:
+		handlerErr = lns.handleRegisterWebsite(msg.Job)
+	case consts.CtrlWebContentAdd:
+		handlerErr = lns.handleWebContentAdd(msg)
+	case consts.CtrlWebContentUpdate:
+		handlerErr = lns.handleWebContentUpdate(msg)
+	case consts.CtrlWebContentRemove:
+		handlerErr = lns.handleWebContentRemove(msg.Job)
+	case consts.CtrlWebContentAddArtifact:
+		handlerErr = lns.handleAmountArtifact(msg)
+	case consts.CtrlRemStart:
+		handlerErr = lns.handleStartRem(msg.Job)
+	case consts.CtrlRemAgentCtrl:
+		handlerErr = lns.handlerRemAgentCtrl(msg.Job)
+	case consts.CtrlRemAgentLog:
+		handlerErr = lns.handlerRemAgentLog(msg.Job)
+	case consts.CtrlRemAgentStop:
+		handlerErr = lns.handlerRemAgentStop(msg.Job)
+	case consts.CtrlRemAgentReconfigure:
+		handlerErr = lns.handlerRemAgentReconfigure(msg.Job)
+	case core.CtrlListenerSessionSnapshotBegin:
+		core.ListenerSessions.BeginSnapshot()
+		return nil
+	case consts.CtrlListenerSyncSession:
+		core.ListenerSessions.AddSnapshot(msg.Session)
+		return nil
+	case core.CtrlListenerSessionSnapshotEnd:
+		core.ListenerSessions.CommitSnapshot()
+		return nil
+	case consts.CtrlListenerRetire:
+		handlerErr = lns.handleRetire(msg.Retire)
+	}
+
+	jobName := ""
+	if msg.Job != nil {
+		jobName = msg.Job.Name
+	}
+	status := &clientpb.JobStatus{
+		ListenerId: lns.ID(),
+		Ctrl:       msg.Ctrl,
+		CtrlId:     msg.Id,
+		Job:        msg.Job,
+	}
+	if handlerErr != nil {
+		status.Status = consts.CtrlStatusFailed
+		status.Error = handlerErr.Error()
+		logs.Log.Errorf("listener.%s - job_ctrl_failed listener=%s ctrl_id=%d job=%s ctrl=%s error=%q", lns.ID(), lns.ID(), msg.Id, jobName, msg.Ctrl, handlerErr)
+	} else {
+		status.Status = consts.CtrlStatusSuccess
+		logs.Log.Importantf("listener.%s - job_ctrl_success listener=%s ctrl_id=%d job=%s ctrl=%s", lns.ID(), lns.ID(), msg.Id, jobName, msg.Ctrl)
+	}
+	return status
+}
+
+func (lns *listener) handlerStart(job *clientpb.Job) error {
+	pipeline, err := lns.startPipeline(job.GetPipeline())
+	if err != nil {
+		return err
+	}
+	if lns.Rpc != nil {
+		_, err = lns.Rpc.SyncPipeline(lns.Context(), pipeline.ToProtobuf())
+		if err != nil {
+			return err
+		}
+	}
+	job.Name = pipeline.ID()
+	job.Pipeline = pipeline.ToProtobuf()
+	return nil
+}
+
+func (lns *listener) autoBuild(autoBuild *configs.AutoBuildConfig, pipeline *clientpb.Pipeline) {
+	if autoBuild == nil || !autoBuild.Enable || len(autoBuild.Target) == 0 || len(autoBuild.Pipeline) == 0 {
+		logs.Log.Debugf("not set auto_build/target/pipeline, skip auto build")
+		return
+	}
+
+	if !utils.StringInSlice(pipeline.Name, autoBuild.Pipeline) {
+		logs.Log.Debugf("%s pieline not auto build list", pipeline.Name)
+		return
+	}
+
+	if !(pipeline.Type == consts.TCPPipeline || pipeline.Type == consts.HTTPPipeline || pipeline.Type == consts.RemPipeline) {
+		logs.Log.Debugf("%s pieline not support auto build", pipeline.Type)
+		return
+	}
+
+	for _, target := range autoBuild.Target {
+		targetMap, ok := consts.GetBuildTarget(target)
+		if !ok {
+			logs.Log.Warnf("invalid build target: %s, skip auto build", target)
+			continue
+		}
+
+		if autoBuild.BuildPulse {
+			if err := lns.executeBuild(pipeline.Name+"_default", &clientpb.Artifact{
+				Target:   target,
+				Platform: targetMap.OS,
+				Arch:     targetMap.Arch,
+				Type:     consts.CommandBuildPulse,
+				Pipeline: pipeline.Name,
+			}); err != nil {
+				logs.Log.Warnf("Error building %s: %v", target, err)
+			}
+		}
+
+		if err := lns.executeBuild(pipeline.Name+"_default", &clientpb.Artifact{
+			Target:   target,
+			Platform: targetMap.OS,
+			Arch:     targetMap.Arch,
+			Type:     consts.CommandBuildBeacon,
+			Pipeline: pipeline.Name,
+		}); err != nil {
+			logs.Log.Warnf("Error building %s: %v", target, err)
+		}
+	}
+}
+
+// 执行构建
+func (lns *listener) executeBuild(profileName string, artifact *clientpb.Artifact) error {
+
+	resp, err := lns.Rpc.CheckSource(lns.Context(), &clientpb.BuildConfig{
+		Target: artifact.Target,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = lns.Rpc.FindArtifact(lns.Context(), artifact)
+	if err == nil {
+		return nil
+	} else {
+		err = nil
+	}
+	_, err = lns.Rpc.Build(lns.Context(), &clientpb.BuildConfig{
+		Target:      artifact.Target,
+		ProfileName: profileName,
+		BuildType:   artifact.Type,
+		Source:      resp.Source,
+	})
+	return err
+}
+
+func (lns *listener) syncPipeline(pipeline *clientpb.Job) error {
+	p := lns.pipelines.Get(pipeline.Name)
+	if p == nil {
+		return fmt.Errorf("pipeline %s not found", pipeline.Name)
+	}
+
+	_, err := lns.Rpc.SyncPipeline(lns.Context(), p.ToProtobuf())
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (lns *listener) startPipeline(pipelinepb *clientpb.Pipeline) (core.Pipeline, error) {
+	var err error
+	if pipelinepb == nil {
+		return nil, fmt.Errorf("pipeline is nil")
+	}
+
+	// Keep active pipelines idempotent, but replace a runtime that previously
+	// failed and marked itself disabled.
+	if existing := lns.pipelines.Get(pipelinepb.Name); existing != nil {
+		state := existing.ToProtobuf()
+		if state != nil && state.Enable {
+			return existing, nil
+		}
+		if err := errors.Join(existing.Close(), lns.cleanupForwardPipelineRuntime(existing.ID())); err != nil {
+			return nil, fmt.Errorf("cleanup stale pipeline %s: %w", existing.ID(), err)
+		}
+		lns.pipelines.Delete(existing.ID())
+	}
+
+	var p core.Pipeline
+	switch pipelinepb.Body.(type) {
+	case *clientpb.Pipeline_Tcp:
+		p, err = NewTcpPipeline(lns.pipelineRPC, pipelinepb)
+	case *clientpb.Pipeline_Bind:
+		p, err = NewBindPipeline(lns.pipelineRPC, pipelinepb)
+	case *clientpb.Pipeline_Http:
+		p, err = NewHttpPipeline(lns.pipelineRPC, pipelinepb)
+	case *clientpb.Pipeline_Custom:
+		p = NewCustomPipeline(pipelinepb)
+	default:
+		// Fallback: treat any unknown body as custom pipeline.
+		p = NewCustomPipeline(pipelinepb)
+	}
+	if err != nil {
+		return nil, err
+	}
+	err = p.Start()
+	if err != nil {
+		return nil, err
+	}
+	lns.pipelines.Add(p)
+	return p, nil
+}
+
+func (lns *listener) handlerStop(job *clientpb.Job) error {
+	if job == nil || job.GetPipeline() == nil || job.GetPipeline().GetName() == "" {
+		return errors.New("pipeline is required")
+	}
+	pipeline := job.GetPipeline()
+	p := lns.pipelines.Get(pipeline.Name)
+	if p == nil {
+		job.Name = pipeline.Name
+		logs.Log.Infof("listener.%s - pipeline_already_stopped name=%s", lns.ID(), pipeline.Name)
+		return nil
+	}
+	job.Name = p.ID()
+	if err := p.Close(); err != nil {
+		return err
+	}
+	cleanupErr := lns.cleanupForwardPipelineRuntime(p.ID())
+	lns.pipelines.Delete(p.ID())
+	return cleanupErr
+}
+
+func (lns *listener) cleanupForwardPipelineRuntime(pipelineID string) error {
+	if pipelineID == "" {
+		return nil
+	}
+	var release func()
+	var streamErr error
+	if rpc, ok := lns.pipelineRPC.(*forwardPipelineRPC); ok {
+		release, streamErr = rpc.retireStream(lns.ID(), pipelineID)
+		defer release()
+	}
+	forwardErr := core.Forwarders.Remove(core.PipelineRuntimeKey(lns.ID(), pipelineID))
+	return errors.Join(streamErr, forwardErr)
+}
+
+func (lns *listener) handleStartWebsite(job *clientpb.Job) error {
+	pipe := job.GetPipeline()
+	if pipe == nil {
+		return errors.New("pipeline is nil")
+	}
+
+	// Idempotency: website already started in this listener process.
+	if existing := lns.getWebsite(pipe.Name); existing != nil && existing.Enable {
+		_, err := lns.Rpc.SyncPipeline(lns.Context(), existing.ToProtobuf())
+		return err
+	}
+
+	web := pipe.GetWeb()
+
+	website, err := StartWebsite(lns.Rpc, job.GetPipeline(), web.Contents)
+	if err != nil {
+		return err
+	}
+	lns.setWebsite(pipe.Name, website)
+	_, err = lns.Rpc.SyncPipeline(lns.Context(), website.ToProtobuf())
+	if err != nil {
+		return err
+	}
+	job.GetPipeline().Enable = true
+	return nil
+}
+
+func (lns *listener) handleStopWebsite(job *clientpb.Job) error {
+	if job == nil || job.GetPipeline() == nil || job.GetPipeline().GetName() == "" {
+		return errors.New("website pipeline is required")
+	}
+	pipe := job.GetPipeline()
+	w := lns.getWebsite(pipe.Name)
+	if w == nil {
+		job.Name = pipe.Name
+		logs.Log.Infof("listener.%s - website_already_stopped name=%s", lns.ID(), pipe.Name)
+		return nil
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	lns.removeWebsite(pipe.Name)
+	return nil
+}
+
+func (lns *listener) handleRegisterWebsite(job *clientpb.Job) error {
+	pipe := job.GetPipeline()
+	if pipe == nil {
+		return errors.New("pipeline is nil")
+	}
+	web := pipe.GetWeb()
+	if web == nil {
+		return errors.New("website is nil")
+	}
+
+	websiteDir, err := fileutils.SafeJoin(configs.WebsitePath, pipe.Name)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(websiteDir, 0o700); err != nil {
+		return err
+	}
+
+	for _, content := range web.Contents {
+		if content == nil {
+			continue
+		}
+
+		nameHint := content.File
+		if nameHint == "" {
+			switch {
+			case content.Id != "":
+				nameHint = content.Id
+			case content.Path != "":
+				nameHint = content.Path
+			default:
+				return errors.New("web content missing file/path/id")
+			}
+		}
+
+		fileName, err := fileutils.SanitizeBasename(nameHint)
+		if err != nil {
+			return err
+		}
+		filePath, err := fileutils.SafeJoin(websiteDir, fileName)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filePath, content.Content, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (lns *listener) handleWebContentAdd(job *clientpb.JobCtrl) error {
+	pipe := job.GetJob()
+	w := lns.getWebsite(pipe.Name)
+	if w == nil {
+		return errors.New("website not found")
+	}
+	if err := w.AddContent(job.Content); err != nil {
+		return err
+	}
+	job.Job.Contents = map[string]*clientpb.WebContent{
+		job.Content.Path: &clientpb.WebContent{
+			Id:   job.Content.Path,
+			Path: job.Content.Path,
+		},
+	}
+	return nil
+}
+
+func (lns *listener) handleAmountArtifact(job *clientpb.JobCtrl) error {
+	pipe := job.GetJob()
+	w := lns.getWebsite(pipe.Pipeline.Name)
+	if w == nil {
+		return errors.New("website not found")
+	}
+
+	en := output.Encode(job.Content.Path)
+
+	w.mu.Lock()
+	w.Artifact[en] = &clientpb.WebContent{
+		Path: job.Content.Path,
+	}
+	w.mu.Unlock()
+
+	job.Job.Contents = map[string]*clientpb.WebContent{
+		job.Content.Path: &clientpb.WebContent{
+			Id:   job.Content.Path,
+			Path: en,
+		},
+	}
+	return nil
+}
+
+func (lns *listener) handleWebContentUpdate(job *clientpb.JobCtrl) error {
+	pipe := job.GetJob()
+	w := lns.getWebsite(pipe.Name)
+	if w == nil {
+		return errors.New("website not found")
+	}
+	return w.AddContent(job.Content)
+}
+
+func (lns *listener) handleWebContentRemove(job *clientpb.Job) error {
+	pipe := job.GetPipeline()
+	web := pipe.GetWeb()
+	w := lns.getWebsite(pipe.Name)
+	if w == nil {
+		return errors.New("website not found")
+	}
+	w.mu.Lock()
+	for path := range web.Contents {
+		delete(w.Content, webContentRouteKey(path))
+	}
+	w.mu.Unlock()
+	return nil
+}
+
+func (lns *listener) handleStartRem(job *clientpb.Job) error {
+	pipe := job.GetPipeline()
+	if pipe == nil {
+		return errors.New("pipeline is nil")
+	}
+	pipe.Ip = lns.IP
+
+	// Idempotency: REM already started in this listener process.
+	if existing := lns.pipelines.Get(pipe.Name); existing != nil {
+		remPipeline, ok := existing.(*REM)
+		if ok && remPipeline.enabled() {
+			// Still healthy — just sync its current state.
+			_, err := lns.Rpc.SyncPipeline(lns.Context(), existing.ToProtobuf())
+			return err
+		}
+		// Dead pipeline (crashed via runtimeErrorHandler) — remove the stale
+		// entry so we can create a fresh one below.
+		if err := existing.Close(); err != nil {
+			return fmt.Errorf("cleanup stale REM pipeline %s: %w", existing.ID(), err)
+		}
+		lns.pipelines.Delete(existing.ID())
+	}
+
+	rem, err := NewRem(lns.Rpc, pipe)
+	if err != nil {
+		return err
+	}
+
+	err = rem.Start()
+	if err != nil {
+		return err
+	}
+
+	_, syncErr := lns.Rpc.SyncPipeline(lns.Context(), rem.ToProtobuf())
+	if syncErr != nil {
+		return errors.Join(syncErr, rem.Close())
+	}
+
+	lns.pipelines.Add(rem)
+	job.Name = rem.ID()
+	return nil
+}
+
+// generateSecureKeyPair 为pipeline生成安全密钥对
+// 生成两对密钥：server密钥对和implant密钥对，然后进行交换分发
+func (lns *listener) generateSecureKeyPair(pipeline *clientpb.Pipeline) error {
+	// 检查是否已经有密钥对
+	if pipeline.Secure != nil &&
+		pipeline.Secure.ServerKeypair != nil &&
+		pipeline.Secure.ImplantKeypair != nil &&
+		pipeline.Secure.ServerKeypair.PrivateKey != "" &&
+		pipeline.Secure.ImplantKeypair.PublicKey != "" {
+		logs.Log.Infof("secure - pipeline_keypair_exists pipeline=%s action=skip_generation", pipeline.Name)
+		return nil
+	}
+
+	logs.Log.Infof("secure - generate_keypairs pipeline=%s count=2", pipeline.Name)
+
+	// 生成Server密钥对
+	serverKeyPair, err := cryptography.RandomAgeKeyPair()
+	if err != nil {
+		return fmt.Errorf("failed to generate server keypair: %v", err)
+	}
+
+	// 生成Implant密钥对
+	implantKeyPair, err := cryptography.RandomAgeKeyPair()
+	if err != nil {
+		return fmt.Errorf("failed to generate implant keypair: %v", err)
+	}
+
+	// 确保SecureConfig存在
+	if pipeline.Secure == nil {
+		pipeline.Secure = &clientpb.Secure{
+			Enable: true,
+		}
+	}
+
+	// 创建Server密钥对
+	pipeline.Secure.ServerKeypair = &clientpb.KeyPair{
+		PublicKey:  serverKeyPair.Public,
+		PrivateKey: serverKeyPair.Private, // Pipeline保存server私钥，用于解密implant发来的数据
+	}
+
+	// 创建Implant密钥对
+	pipeline.Secure.ImplantKeypair = &clientpb.KeyPair{
+		PublicKey:  implantKeyPair.Public, // Pipeline保存implant公钥，用于加密发给implant的数据
+		PrivateKey: implantKeyPair.Private,
+	}
+
+	logs.Log.Infof("secure - generated_keypairs pipeline=%s", pipeline.Name)
+	logs.Log.Infof("secure - pipeline_stores pipeline=%s values=server_private_key,implant_public_key", pipeline.Name)
+
+	return nil
+}

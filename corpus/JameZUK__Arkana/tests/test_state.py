@@ -1,0 +1,479 @@
+"""Unit tests for arkana/state.py — AnalyzerState and session management."""
+import os
+import time
+import threading
+import pytest
+
+from arkana.state import (
+    AnalyzerState,
+    StateProxy,
+    get_current_state,
+    set_current_state,
+    get_or_create_session_state,
+    activate_session_state,
+    get_all_session_states,
+    get_session_key_from_context,
+    MAX_COMPLETED_TASKS,
+    SESSION_TTL_SECONDS,
+    _default_state,
+    _current_state_var,
+    _session_registry,
+    _registry_lock,
+)
+
+
+# ---------------------------------------------------------------------------
+# AnalyzerState basics
+# ---------------------------------------------------------------------------
+
+class TestAnalyzerState:
+    def test_initial_state(self):
+        s = AnalyzerState()
+        assert s.filepath is None
+        assert s.pe_data is None
+        assert s.pe_object is None
+        assert s.pefile_version is None
+        assert s.loaded_from_cache is False
+        assert s.allowed_paths is None
+        assert s.samples_path is None
+        assert s.angr_project is None
+        assert s.angr_cfg is None
+        assert s.angr_hooks == {}
+        assert s.background_tasks == {}
+
+    def test_touch_updates_last_active(self):
+        s = AnalyzerState()
+        t1 = s.last_active
+        time.sleep(0.01)
+        s.touch()
+        assert s.last_active > t1
+
+
+# ---------------------------------------------------------------------------
+# Background task management
+# ---------------------------------------------------------------------------
+
+class TestBackgroundTasks:
+    def test_set_and_get_task(self):
+        s = AnalyzerState()
+        s.set_task("t1", {"status": "running", "data": 42})
+        task = s.get_task("t1")
+        assert task["status"] == "running"
+        assert task["data"] == 42
+
+    def test_get_nonexistent_task(self):
+        s = AnalyzerState()
+        assert s.get_task("nonexistent") is None
+
+    def test_get_task_returns_copy(self):
+        s = AnalyzerState()
+        s.set_task("t1", {"status": "running"})
+        task = s.get_task("t1")
+        task["status"] = "modified"
+        # Original should be unchanged
+        assert s.get_task("t1")["status"] == "running"
+
+    def test_update_task(self):
+        s = AnalyzerState()
+        s.set_task("t1", {"status": "running", "progress": 0})
+        s.update_task("t1", progress=50, status="running")
+        task = s.get_task("t1")
+        assert task["progress"] == 50
+
+    def test_update_nonexistent_task(self):
+        s = AnalyzerState()
+        # Should not raise
+        s.update_task("nonexistent", status="running")
+
+    def test_get_all_task_ids(self):
+        s = AnalyzerState()
+        s.set_task("a", {"status": "running"})
+        s.set_task("b", {"status": "completed"})
+        ids = s.get_all_task_ids()
+        assert set(ids) == {"a", "b"}
+
+    def test_evict_old_tasks(self):
+        s = AnalyzerState()
+        # Add more than MAX_COMPLETED_TASKS completed tasks
+        for i in range(MAX_COMPLETED_TASKS + 10):
+            s.set_task(f"task-{i}", {
+                "status": "completed",
+                "created_at_epoch": float(i),
+            })
+        # Should have evicted the oldest ones
+        assert len([
+            t for t in s.background_tasks.values()
+            if t["status"] == "completed"
+        ]) <= MAX_COMPLETED_TASKS
+
+    def test_running_tasks_not_evicted(self):
+        s = AnalyzerState()
+        s.set_task("running-1", {"status": "running", "created_at_epoch": 0.0})
+        for i in range(MAX_COMPLETED_TASKS + 5):
+            s.set_task(f"done-{i}", {
+                "status": "completed",
+                "created_at_epoch": float(i + 1),
+            })
+        # Running task should still be there
+        assert s.get_task("running-1") is not None
+
+
+# ---------------------------------------------------------------------------
+# Path sandboxing
+# ---------------------------------------------------------------------------
+
+class TestPathSandboxing:
+    def test_no_restriction(self):
+        s = AnalyzerState()
+        s.allowed_paths = None
+        # Should not raise
+        s.check_path_allowed("/any/path")
+
+    def test_allowed_path(self, tmp_path):
+        s = AnalyzerState()
+        s.allowed_paths = [str(tmp_path)]
+        test_file = tmp_path / "test.bin"
+        test_file.touch()
+        # Should not raise
+        s.check_path_allowed(str(test_file))
+
+    def test_disallowed_path(self, tmp_path):
+        s = AnalyzerState()
+        s.allowed_paths = [str(tmp_path / "allowed")]
+        with pytest.raises(RuntimeError, match="Access denied"):
+            s.check_path_allowed("/etc/passwd")
+
+    def test_exact_path_match(self, tmp_path):
+        test_file = tmp_path / "exact.bin"
+        test_file.touch()
+        s = AnalyzerState()
+        s.allowed_paths = [str(test_file)]
+        # Exact path should be allowed
+        s.check_path_allowed(str(test_file))
+
+    def test_relative_traversal_blocked(self, tmp_path):
+        """Relative path traversal (../../) should be resolved and blocked."""
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        s = AnalyzerState()
+        s.allowed_paths = [str(allowed)]
+        # Construct a path that traverses out of the allowed directory
+        traversal_path = str(allowed / ".." / ".." / "etc" / "passwd")
+        with pytest.raises(RuntimeError, match="Access denied"):
+            s.check_path_allowed(traversal_path)
+
+    def test_symlink_resolved_and_blocked(self, tmp_path):
+        """Symlinks pointing outside allowed dirs should be blocked."""
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_text("sensitive")
+        # Create a symlink inside allowed that points outside
+        link = allowed / "sneaky_link"
+        link.symlink_to(secret)
+        s = AnalyzerState()
+        s.allowed_paths = [str(allowed)]
+        with pytest.raises(RuntimeError, match="Access denied"):
+            s.check_path_allowed(str(link))
+
+    def test_symlink_within_allowed_ok(self, tmp_path):
+        """Symlinks that resolve within allowed dirs should pass."""
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        real_file = allowed / "real.bin"
+        real_file.write_bytes(b"\x00")
+        link = allowed / "link.bin"
+        link.symlink_to(real_file)
+        s = AnalyzerState()
+        s.allowed_paths = [str(allowed)]
+        # Should not raise — symlink target is inside allowed
+        s.check_path_allowed(str(link))
+
+    def test_similar_prefix_dir_blocked(self, tmp_path):
+        """A dir whose name starts with the allowed dir name should be blocked."""
+        allowed = tmp_path / "data"
+        allowed.mkdir()
+        evil = tmp_path / "data_evil"
+        evil.mkdir()
+        evil_file = evil / "payload.bin"
+        evil_file.write_bytes(b"\x00")
+        s = AnalyzerState()
+        s.allowed_paths = [str(allowed)]
+        with pytest.raises(RuntimeError, match="Access denied"):
+            s.check_path_allowed(str(evil_file))
+
+    def test_nested_allowed_path(self, tmp_path):
+        """Files in subdirectories of allowed paths should pass."""
+        allowed = tmp_path / "samples"
+        allowed.mkdir()
+        nested = allowed / "subdir" / "deep"
+        nested.mkdir(parents=True)
+        test_file = nested / "file.bin"
+        test_file.write_bytes(b"\x00")
+        s = AnalyzerState()
+        s.allowed_paths = [str(allowed)]
+        # Should not raise
+        s.check_path_allowed(str(test_file))
+
+    def test_multiple_allowed_paths(self, tmp_path):
+        """Check that any of the allowed paths is accepted."""
+        dir_a = tmp_path / "dir_a"
+        dir_b = tmp_path / "dir_b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        file_b = dir_b / "file.bin"
+        file_b.write_bytes(b"\x00")
+        s = AnalyzerState()
+        s.allowed_paths = [str(dir_a), str(dir_b)]
+        # File is in dir_b which is allowed
+        s.check_path_allowed(str(file_b))
+
+
+# ---------------------------------------------------------------------------
+# Angr state management
+# ---------------------------------------------------------------------------
+
+class TestAngrState:
+    def test_set_and_get_angr_results(self):
+        s = AnalyzerState()
+        s.set_angr_results("proj", "cfg", {"loops": []}, {"config": True})
+        proj, cfg = s.get_angr_snapshot()
+        assert proj == "proj"
+        assert cfg == "cfg"
+        assert s.angr_loop_cache == {"loops": []}
+
+    def test_reset_angr(self):
+        s = AnalyzerState()
+        s.set_angr_results("proj", "cfg", {}, {})
+        s.angr_hooks = {"0x1000": {"nop": True}}
+        s.reset_angr()
+        proj, cfg = s.get_angr_snapshot()
+        assert proj is None
+        assert cfg is None
+        assert s.angr_hooks == {}
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+class TestSessionManagement:
+    def setup_method(self):
+        """Snapshot session registry before each test."""
+        with _registry_lock:
+            self._original_keys = set(_session_registry.keys())
+
+    def teardown_method(self):
+        """Remove sessions created during the test and reset contextvar."""
+        set_current_state(None)
+        with _registry_lock:
+            new_keys = set(_session_registry.keys()) - self._original_keys
+            for key in new_keys:
+                _session_registry.pop(key, None)
+
+    def test_default_session_returns_default_state(self):
+        result = get_or_create_session_state("default")
+        assert result is _default_state
+
+    def test_new_session_creates_state(self):
+        s = get_or_create_session_state("test-session-unique-1")
+        assert isinstance(s, AnalyzerState)
+        assert s is not _default_state
+
+    def test_same_session_returns_same_state(self):
+        s1 = get_or_create_session_state("test-session-unique-2")
+        s2 = get_or_create_session_state("test-session-unique-2")
+        assert s1 is s2
+
+    def test_activate_session_state(self):
+        s = activate_session_state("test-session-unique-3")
+        assert get_current_state() is s
+
+    def test_get_all_session_states_includes_default(self):
+        states = get_all_session_states()
+        assert _default_state in states
+
+    def test_session_key_from_context_default(self):
+        # Non-context object should return "default"
+        key = get_session_key_from_context(object())
+        assert key == "default"
+
+    def test_session_key_from_none(self):
+        key = get_session_key_from_context(None)
+        assert key == "default"
+
+
+# ---------------------------------------------------------------------------
+# StateProxy
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Artifact management
+# ---------------------------------------------------------------------------
+
+class TestArtifacts:
+    def test_register_artifact(self):
+        s = AnalyzerState()
+        art = s.register_artifact(
+            path="/tmp/test.bin",
+            sha256="abc123",
+            md5="def456",
+            size=1024,
+            source_tool="refinery_xor",
+            description="Test artifact",
+            detected_type="pe",
+        )
+        assert art["path"] == "/tmp/test.bin"
+        assert art["sha256"] == "abc123"
+        assert art["md5"] == "def456"
+        assert art["size"] == 1024
+        assert art["source_tool"] == "refinery_xor"
+        assert art["description"] == "Test artifact"
+        assert art["detected_type"] == "pe"
+        assert art["id"].startswith("art_")
+        assert "created_at" in art
+
+    def test_register_returns_copy(self):
+        s = AnalyzerState()
+        art = s.register_artifact("/tmp/a.bin", "sha", "md5", 10, "tool", "desc")
+        art["path"] = "modified"
+        # Original should be unchanged
+        assert s.artifacts[0]["path"] == "/tmp/a.bin"
+
+    def test_get_artifacts_all(self):
+        s = AnalyzerState()
+        s.register_artifact("/a", "s1", "m1", 10, "tool_a", "desc a")
+        s.register_artifact("/b", "s2", "m2", 20, "tool_b", "desc b")
+        arts = s.get_artifacts()
+        assert len(arts) == 2
+
+    def test_get_artifacts_filtered(self):
+        s = AnalyzerState()
+        s.register_artifact("/a", "s1", "m1", 10, "tool_a", "desc a")
+        s.register_artifact("/b", "s2", "m2", 20, "tool_b", "desc b")
+        s.register_artifact("/c", "s3", "m3", 30, "tool_a", "desc c")
+        arts = s.get_artifacts(source_tool="tool_a")
+        assert len(arts) == 2
+        assert all(a["source_tool"] == "tool_a" for a in arts)
+
+    def test_get_artifacts_returns_copies(self):
+        s = AnalyzerState()
+        s.register_artifact("/a", "s1", "m1", 10, "tool", "desc")
+        arts = s.get_artifacts()
+        arts[0]["path"] = "modified"
+        assert s.artifacts[0]["path"] == "/a"
+
+    def test_get_all_artifacts_snapshot(self):
+        s = AnalyzerState()
+        s.register_artifact("/a", "s1", "m1", 10, "tool", "desc")
+        s.register_artifact("/b", "s2", "m2", 20, "tool", "desc")
+        snap = s.get_all_artifacts_snapshot()
+        assert len(snap) == 2
+        # Verify it's a copy
+        snap[0]["path"] = "modified"
+        assert s.artifacts[0]["path"] == "/a"
+
+    def test_clear_artifacts(self):
+        s = AnalyzerState()
+        s.register_artifact("/a", "s1", "m1", 10, "tool", "desc")
+        s.register_artifact("/b", "s2", "m2", 20, "tool", "desc")
+        count = s.clear_artifacts()
+        assert count == 2
+        assert s.artifacts == []
+        assert s._artifacts_counter == 0
+
+    def test_clear_empty_artifacts(self):
+        s = AnalyzerState()
+        count = s.clear_artifacts()
+        assert count == 0
+
+    def test_artifact_ids_are_unique(self):
+        s = AnalyzerState()
+        art1 = s.register_artifact("/a", "s1", "m1", 10, "tool", "desc")
+        art2 = s.register_artifact("/b", "s2", "m2", 20, "tool", "desc")
+        assert art1["id"] != art2["id"]
+
+    def test_artifact_without_detected_type(self):
+        s = AnalyzerState()
+        art = s.register_artifact("/a", "s1", "m1", 10, "tool", "desc")
+        assert art["detected_type"] is None
+
+    def test_thread_safety(self):
+        """Concurrent artifact registrations should not corrupt state."""
+        s = AnalyzerState()
+        errors = []
+
+        def register(n):
+            try:
+                for i in range(50):
+                    s.register_artifact(f"/t{n}_{i}", f"s{n}_{i}", f"m{n}_{i}", i, "tool", "desc")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=register, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert len(s.artifacts) == 200  # 4 threads × 50 artifacts
+
+
+class TestStateProxy:
+    def teardown_method(self):
+        set_current_state(None)
+
+    def test_proxy_delegates_to_current_state(self):
+        proxy = StateProxy()
+        # By default, delegates to _default_state
+        s = AnalyzerState()
+        s.filepath = "/test/path"
+        set_current_state(s)
+        assert proxy.filepath == "/test/path"
+
+    def test_proxy_setattr(self):
+        proxy = StateProxy()
+        s = AnalyzerState()
+        set_current_state(s)
+        proxy.filepath = "/new/path"
+        assert s.filepath == "/new/path"
+
+    def test_proxy_repr(self):
+        proxy = StateProxy()
+        r = repr(proxy)
+        assert "StateProxy" in r
+
+    def test_proxy_fallback_to_default_state(self):
+        """When no state is set in contextvar, proxy falls back to _default_state."""
+        proxy = StateProxy()
+        set_current_state(None)
+        # Should not raise — falls back to _default_state
+        assert proxy.filepath is None or proxy.filepath == _default_state.filepath
+
+    def test_proxy_method_delegation(self):
+        """Proxy delegates method calls to the underlying state."""
+        proxy = StateProxy()
+        s = AnalyzerState()
+        set_current_state(s)
+        # Test add_note via proxy
+        proxy.add_note("test note", category="general")
+        notes = proxy.get_notes()
+        assert len(notes) == 1
+        assert notes[0]["content"] == "test note"
+
+    def test_proxy_different_states_per_contextvar(self):
+        """Different contextvar values give different states via proxy."""
+        proxy = StateProxy()
+        s1 = AnalyzerState()
+        s1.filepath = "/file1"
+        s2 = AnalyzerState()
+        s2.filepath = "/file2"
+
+        set_current_state(s1)
+        assert proxy.filepath == "/file1"
+
+        set_current_state(s2)
+        assert proxy.filepath == "/file2"

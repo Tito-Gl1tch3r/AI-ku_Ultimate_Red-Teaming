@@ -1,0 +1,741 @@
+"""Provenance: a file or a recorded operation traced to the registered evidence
+it came from, through recorded links only.
+
+The finding resolver searched for candidates after the fact: the first ingest
+in the trail, a registered file under a folder input, any file with an equal
+hash wherever it sat, the last entry that wrote a path. Here each link is one
+the case recorded (a registered path, a folder's manifest, an operation's
+recorded output at the same path with the same hash, a recorded mount, an
+operation's recorded inputs), and a trace that can't be built says where it
+breaks: FULL, DECLARED, AMBIGUOUS or BROKEN.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+
+import pytest
+from sift_common import provenance as pv
+
+from .provenance_case import TrailCase, sha
+
+
+@pytest.fixture
+def c(tmp_path):
+    return TrailCase(tmp_path / "case")
+
+
+def test_the_case_is_read_once_with_each_entrys_line_bytes(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    root = c.register(z)
+    line = c.op("sift-mcp", "sift-tester-20261009-001", tool="run_command")
+    c.op("opensearch-mcp", "opensearch-tester-20261009-001", tool="idx_search")
+    with open(c.d / "audit" / "sift-mcp.jsonl", "a") as f:
+        f.write("not json\n")  # skipped
+    case = pv.load_case(c.d)
+    assert case.roots == [root]
+    ((entry, raw),) = case.by_id["sift-tester-20261009-001"]
+    assert raw == line and entry["tool"] == "run_command"
+    assert set(case.by_id) == {
+        "sift-tester-20261009-001",
+        "opensearch-tester-20261009-001",
+    }
+
+
+def test_an_operation_the_trail_doesnt_hold_is_a_named_break(c):
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-404")
+    assert t.grade == "BROKEN" and t.break_["kind"] == "no-entry"
+    assert "sift-tester-20261009-404" in t.reason
+    assert t.as_dict()["break"] == t.break_ and t.as_dict()["grade"] == "BROKEN"
+
+
+def test_a_file_with_no_recorded_origin_is_a_named_break_with_a_fix(c):
+    loose = c.file("extractions/loose/sample2.raw", "sample two")
+    t = pv.trace_file(pv.load_case(c.d), loose, sha(loose))
+    assert t.grade == "BROKEN" and t.break_["kind"] == "no-recorded-origin"
+    assert t.reason == "no recorded origin: made outside recorded tools"
+    assert loose in t.break_["detail"] and t.break_["fix"]
+    assert (t.root, t.roots, t.links, t.candidates) == (None, [], [], [])
+
+
+def test_an_entry_line_hash_is_the_sha256_of_its_bytes():
+    assert pv.entry_sha256(b'{"a": 1}') == hashlib.sha256(b'{"a": 1}').hexdigest()
+
+
+def test_a_registered_file_links_by_its_path_with_the_registry_hash(c, tmp_path):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    root = c.register(z)
+    with open(z, "w") as f:
+        f.write(
+            "changed after registration"
+        )  # not re-hashed: that's the approval check's
+    link = tmp_path / "via-link.7z"
+    link.symlink_to(z)
+    for p in (z, str(link)):
+        t = pv.trace_file(pv.load_case(c.d), p, "")
+        assert t.grade == "FULL" and t.root["path"] == root["path"], t
+        assert t.root["sha256"] == root["sha256"] and t.roots == [t.root]
+        (first,) = t.links
+        assert first["method"] == "registered-path"
+        assert first["to"] == {"path": root["path"], "sha256": root["sha256"]}
+
+
+def test_a_file_in_a_registered_folders_manifest_links_by_the_manifest(c):
+    f1 = c.file(
+        "evidence/kape/C/Windows/System32/winevt/Logs/System.evtx", "system evtx"
+    )
+    folder = c.register_folder(str(c.d / "evidence/kape"))
+    t = pv.trace_file(pv.load_case(c.d), f1, sha(f1))
+    assert t.grade == "FULL" and t.root["sha256"] == sha(f1), t
+    assert t.root["path"] == f1 and t.root["folder"] == folder["path"]
+    assert [link["method"] for link in t.links] == ["manifest"]
+
+
+def test_a_folder_file_outside_its_manifest_or_behind_a_changed_one_doesnt_link(c):
+    f1 = c.file("evidence/kape/a.evtx", "a")
+    folder = c.register_folder(str(c.d / "evidence/kape"))
+    late = c.file("evidence/kape/late.evtx", "added later")
+    case = pv.load_case(c.d)
+    assert pv.trace_file(case, late, sha(late)).break_["kind"] == "no-recorded-origin"
+    manifest = c.d / folder["manifest_path"]
+    manifest.write_bytes(manifest.read_bytes() + b" ")
+    assert pv.trace_file(pv.load_case(c.d), f1, sha(f1)).grade == "BROKEN"
+
+
+def test_an_input_that_is_the_registered_folder_itself_traces_to_the_folder(c):
+    c.file("evidence/kape/C/System.evtx", "system evtx")
+    folder = c.register_folder(str(c.d / "evidence/kape"))
+    t = pv.trace_file(pv.load_case(c.d), str(c.d / "evidence/kape"))
+    assert t.grade == "FULL", t
+    assert t.root == {"path": folder["path"], "sha256": folder["manifest_sha256"],
+                      "label": "examiner-registered"}  # fmt: skip
+    assert [link["method"] for link in t.links] == ["registered-path"]
+
+
+def test_vol_on_sample_two_traces_through_the_7z_extraction_to_the_7z(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s1, s2 = c.extract("sift-tester-20261009-001", z)
+    c.run(
+        "sift-tester-20261009-002", ["vol", "-f", s2, "windows.pslist"], [s2], "PID 4\n"
+    )
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+    assert t.grade == "FULL", t
+    assert t.root == {"path": z, "sha256": sha(z), "label": "examiner-registered"}
+    assert [(link["method"], link["audit_id"]) for link in t.links] == [
+        ("registered-path", ""),
+        ("recorded-id", "sift-tester-20261009-001"),
+        ("hash+place", "sift-tester-20261009-001"),
+        ("recorded-id", "sift-tester-20261009-002"),
+    ]
+    assert t.links[2]["to"] == {"path": s2, "sha256": sha(s2)}
+    assert "sample1" not in str(t.as_dict())
+
+
+def test_an_unrecorded_copy_of_the_7z_doesnt_link_by_its_hash(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    copy = c.file(
+        "extractions/work/copy-of-mem.7z", "7z bytes"
+    )  # same hash, other path
+    c.run("sift-tester-20261009-001", ["7z", "x", copy], [copy], "sample2.raw\n")
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-001")
+    assert t.grade == "BROKEN" and t.break_["kind"] == "no-recorded-origin", t
+    assert t.reason == "no recorded origin: made outside recorded tools"
+
+
+def test_an_output_at_the_same_path_with_another_hash_doesnt_link(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    _, s2 = c.extract("sift-tester-20261009-001", z)
+    with open(s2, "w") as f:
+        f.write("rewritten after the extraction")
+    t = pv.trace_file(pv.load_case(c.d), s2, sha(s2))
+    assert t.break_["kind"] == "no-recorded-origin" and sha(s2) in t.break_["detail"]
+
+
+def test_an_input_hashed_in_the_background_links_through_its_completed_job(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    _, s2 = c.extract("sift-tester-20261009-001", z)
+    c.op(
+        "file-identity",
+        "fileidentity-tester-20261009-001",
+        tool="hash_complete",
+        job_id="hash-0123456789abcdef",
+        path=s2,
+        sha256=sha(s2),
+    )
+    t = pv.trace_file(pv.load_case(c.d), s2, "pending:hash-0123456789abcdef")
+    assert t.grade == "FULL" and t.links[-1]["from"]["sha256"] == sha(s2), t
+    unclosed = pv.trace_file(pv.load_case(c.d), s2, "pending:hash-fedcba9876543210")
+    assert unclosed.break_["kind"] == "hash-pending", unclosed
+
+
+def test_sample_two_extracted_twice_to_one_path_is_ambiguous_naming_both(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s2 = c.file("extractions/shared/sample2.raw", "sample two")
+    for aid in ("sift-tester-20261009-001", "sift-tester-20261009-002"):
+        c.op("sift-mcp", aid, tool="run_command", params={"command": ["7z", "x", z]},
+             input_files=[z], input_sha256s=[""],
+             result_summary={"output_files": [s2], "output_sha256s": [sha(s2)]})  # fmt: skip
+    c.run("sift-tester-20261009-003", ["vol", "-f", s2], [s2], "PID 4\n")
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-003")
+    assert t.grade == "AMBIGUOUS", t  # never the last writer
+    assert {x["audit_id"] for x in t.candidates} == {
+        "sift-tester-20261009-001", "sift-tester-20261009-002",
+    }  # fmt: skip
+    assert "2 operations" in t.reason
+
+
+def test_one_id_on_two_entries_is_ambiguous_never_the_last_copy(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s1, s2 = c.extract("sift-tester-20261009-001", z)
+    c.run("sift-tester-20261009-002", ["vol", "-f", s1], [s1], "PID 4\n")
+    c.run("sift-tester-20261009-002", ["vol", "-f", s2], [s2], "PID 4\n")
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+    assert t.grade == "AMBIGUOUS" and len(t.candidates) == 2, t
+    assert len({x["entry_sha256"] for x in t.candidates}) == 2
+
+
+def test_an_operation_whose_inputs_reach_two_roots_is_full_listing_both(c):
+    """RECmd on SYSTEM and SOFTWARE: two inputs, two roots, both recorded."""
+    a = c.file("evidence/SYSTEM", "system hive")
+    b = c.file("evidence/SOFTWARE", "software hive")
+    c.register(a)
+    c.register(b)
+    c.run("sift-tester-20261009-001", ["RECmd", a, b], [a, b], "ControlSet001\n")
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-001")
+    assert t.grade == "FULL" and t.root["path"] == a, t
+    assert [r["path"] for r in t.roots] == [a, b] and t.candidates == []
+
+
+@pytest.mark.parametrize("hook", [True, False], ids=["hook and declared", "declared"])
+def test_a_bash_extraction_declared_with_log_external_action_is_declared(c, hook):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s2 = c.file("extractions/bash/sample2.raw", "sample two")
+    if hook:  # the hook records the command, not what it made
+        c.op("claude-code", "hook-tester-20261009-001", tool="Bash",
+             params={"command": f"7z x {z} -oextractions/bash"})  # fmt: skip
+    c.op("case-mcp", "case-tester-20261009-001", tool="log_external_action",
+         params={"command": f"7z x {z} -oextractions/bash", "purpose": "p"},
+         result_summary={"output_files": [s2], "output_sha256s": [sha(s2)]},
+         input_files=[z], declared=True)  # fmt: skip
+    c.run("sift-tester-20261009-002", ["vol", "-f", s2], [s2], "PID 4\n")
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+    assert t.grade == "DECLARED" and t.root["path"] == z, t
+    methods = {(link["method"], link["audit_id"]) for link in t.links}
+    assert ("declared", "case-tester-20261009-001") in methods
+    assert "case-tester-20261009-001" in t.reason
+
+
+def test_an_operation_with_no_recorded_inputs_is_a_named_break(c):
+    c.op("sift-mcp", "sift-tester-20261009-001", tool="run_command",
+         params={"command": ["hostname"]}, result_summary={"exit_code": 0})  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-001")
+    assert t.grade == "BROKEN" and t.break_["kind"] == "no-inputs", t
+
+
+def test_each_link_carries_its_entry_lines_hash_and_the_root_its_label(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    _, s2 = c.extract("sift-tester-20261009-001", z)
+    c.run("sift-tester-20261009-002", ["vol", "-f", s2], [s2], "PID 4\n")
+    lines = (c.d / "audit" / "sift-mcp.jsonl").read_bytes().splitlines()
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+    by = {(link["method"], link["audit_id"]): link for link in t.links}
+    for method, aid, n in (("recorded-id", "sift-tester-20261009-001", 0),
+                           ("hash+place", "sift-tester-20261009-001", 0),
+                           ("recorded-id", "sift-tester-20261009-002", 1)):  # fmt: skip
+        assert by[(method, aid)]["entry_sha256"] == hashlib.sha256(lines[n]).hexdigest()
+    for link in t.links:
+        assert set(link) == {"method", "audit_id", "entry_sha256", "from", "to"}
+
+
+@pytest.mark.parametrize(
+    "extra,label",
+    [({}, "examiner-registered"), ({"registered_via": "mcp"}, "AI-registered"),
+     ({"acquired_by": "wt-tester-20261009-005"}, "acquired by wt-tester-20261009-005")],
+    ids=["examiner", "the AI", "an acquisition"],
+)  # fmt: skip
+def test_the_root_says_who_registered_it(c, extra, label):
+    mem = c.file("evidence/acquired/mem.raw", "acquired memory")
+    c.register(mem, **extra)
+    c.run("sift-tester-20261009-001", ["vol", "-f", mem], [mem], "PID 4\n")
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-001")
+    assert t.grade == "FULL" and t.root["label"] == label, t
+
+
+def _mounted(c, st_dev, **read):
+    a = c.file("evidence/imgA.raw", "image A")
+    c.register(a)
+    mp = str(c.d / "mnt")
+    sec = c.file("mnt/Windows/System32/winevt/Logs/Security.evtx", "evtx inside A")
+    c.mount("sift-tester-20261009-001", a, mp, 2049, ts="2026-10-09T01:00:00Z")
+    c.run("sift-tester-20261009-002", ["EvtxECmd", "-f", sec], [sec], "4624 alice\n",
+          input_realpaths=[sec], input_st_devs=[st_dev],
+          ts=read.pop("ts", "2026-10-09T02:00:00Z"), **read)  # fmt: skip
+    return a, pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+
+
+def test_a_read_through_a_recorded_mount_links_by_the_mount_to_the_image(c):
+    a, t = _mounted(c, 2049)
+    assert t.grade == "FULL" and t.root["path"] == a, t
+    assert [(link["method"], link["audit_id"]) for link in t.links] == [
+        ("registered-path", ""),
+        ("recorded-id", "sift-tester-20261009-001"),
+        ("recorded-mount", "sift-tester-20261009-001"),
+        ("recorded-id", "sift-tester-20261009-002"),
+    ]
+
+
+def test_another_filesystem_under_the_mount_point_breaks(c):
+    _, t = _mounted(c, 64768)
+    assert t.grade == "BROKEN" and t.break_["kind"] == "mount-mismatch", t
+
+
+def test_a_read_after_its_mounts_unmount_or_before_the_mount_breaks(c):
+    c.umount(
+        "sift-tester-20261009-009", str(c.d / "mnt"), 2049, ts="2026-10-09T01:30:00Z"
+    )
+    _, t = _mounted(c, 2049)  # read at 02:00, after the 01:30 unmount
+    assert t.break_["kind"] == "mount-mismatch", t
+    _, early = _mounted(
+        TrailCase(c.d.parent / "case2"), 2049, ts="2026-10-09T00:30:00Z"
+    )
+    assert early.break_["kind"] == "mount-mismatch", early
+
+
+def test_an_unmount_of_another_mount_at_that_point_doesnt_end_it(c):
+    c.umount(
+        "sift-tester-20261009-009", str(c.d / "mnt"), 77, ts="2026-10-09T01:30:00Z"
+    )
+    _, t = _mounted(c, 2049)
+    assert t.grade == "FULL", t
+
+
+def test_every_trace_an_ingest_would_refuse_says_why(c):
+    """An ingest accepts an input whose trace is FULL and refuses any other with
+    its break's fix, or its reason."""
+    assert "FULL" in pv.trace_file.__doc__ and "refuse" in pv.trace_file.__doc__
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s2 = c.file("extractions/shared/sample2.raw", "sample two")
+    for aid in ("sift-tester-20261009-001", "sift-tester-20261009-002"):
+        c.op("sift-mcp", aid, tool="run_command", input_files=[z], input_sha256s=[""],
+             result_summary={"output_files": [s2], "output_sha256s": [sha(s2)]})  # fmt: skip
+    loose = c.file("extractions/loose/x.raw", "x")
+    case = pv.load_case(c.d)
+    for t in (pv.trace_file(case, s2, sha(s2)), pv.trace_file(case, loose, sha(loose))):
+        assert t.grade != "FULL" and ((t.break_ or {}).get("fix") or t.reason), t
+    assert pv.trace_file(case, z).grade == "FULL"
+
+
+def _two_hives(c):
+    a = c.file("evidence/SYSTEM", "system hive")
+    b = c.file("evidence/SOFTWARE", "software hive")
+    c.register(a)
+    c.register(b)
+    return a, b
+
+
+def test_an_input_the_ai_listed_that_isnt_in_the_command_is_declared(c):
+    a, b = _two_hives(c)
+    c.run("sift-tester-20261009-001", ["RECmd", "-f", a], [a, b], "ControlSet001\n",
+          method="llm")  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-001")
+    assert t.grade == "DECLARED" and b in t.reason, t
+    (declared,) = [link for link in t.links if link["method"] == "declared"]
+    assert (
+        declared["from"]["path"] == b
+        and declared["audit_id"] == "sift-tester-20261009-001"
+    )
+    c.run("sift-tester-20261009-002", ["RECmd", "-f", a], [a], "ControlSet001\n",
+          method="llm")  # fmt: skip
+    assert pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002").grade == "FULL"
+
+
+@pytest.mark.parametrize("mark", [{"found": "declared"}, {"declared": True}])
+def test_an_input_marked_declared_on_its_own_record_is_declared(c, mark):
+    a, b = _two_hives(c)
+    c.op("sift-mcp", "sift-tester-20261009-001", tool="run_command",
+         params={"command": ["RECmd", "-f", a]},
+         inputs=[{"path": a, "realpath": a, "st_dev": 2049, "found": "parsed"},
+                 {"path": b, "realpath": b, "st_dev": 2049, **mark}])  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-001")
+    assert t.grade == "DECLARED" and [r["path"] for r in t.roots] == [a, b], t
+
+
+@pytest.mark.parametrize("mnt_id,grade", [(2049, "FULL"), (77, "BROKEN")],
+                         ids=["same mount id", "another mount id"])  # fmt: skip
+def test_where_both_record_a_mount_id_they_must_match(c, mnt_id, grade):
+    _, t = _mounted(c, 2049, input_mnt_ids=[mnt_id])  # the mount recorded 2049
+    assert t.grade == grade, t
+
+
+def test_an_output_recorded_on_its_own_record_links_by_hash_and_place(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s2 = c.file("extractions/op-1/sample2.raw", "sample two")
+    c.op("sift-mcp", "sift-tester-20261009-001", tool="run_command",
+         params={"command": ["7z", "x", z]}, inputs=[{"path": z, "realpath": z}],
+         outputs=[{"path": s2, "sha256": sha(s2), "size": 10}])  # fmt: skip
+    t = pv.trace_file(pv.load_case(c.d), s2, sha(s2))
+    assert t.grade == "FULL" and t.root["path"] == z, t
+    assert t.links[-1]["method"] == "hash+place"
+
+
+def test_a_wintools_op_links_by_its_case_relative_sift_paths(c):
+    """wintools records each file's SIFT path relative to the case ('/'
+    separators); its Windows path is never compared."""
+    hive = c.file("evidence/SYSTEM", "system hive")
+    c.register(hive)
+    csv = c.file("work/recmd/out.csv", "ControlSet001,1\n")
+    c.op("wintools-mcp", "wt-tester-20261009-003", tool="run_windows_command",
+         params={"command": ["RECmd.exe", "-f", "C:\\cases\\x\\evidence\\SYSTEM"]},
+         inputs=[{"path": "C:\\cases\\x\\evidence\\SYSTEM", "sift_path": "evidence/SYSTEM"}],
+         outputs=[{"path": "C:\\cases\\x\\work\\recmd\\out.csv",
+                   "share_path": "work\\recmd\\out.csv", "sift_path": "work/recmd/out.csv",
+                   "sha256": sha(csv)}])  # fmt: skip
+    t = pv.trace_file(pv.load_case(c.d), csv, sha(csv))
+    assert t.grade == "FULL" and t.root["path"] == hive, t
+    assert [link["method"] for link in t.links] == [
+        "registered-path", "recorded-id", "hash+place",
+    ]  # fmt: skip
+
+
+def test_with_one_timestamp_the_trails_order_says_whether_the_mount_was_live(c):
+    """Entries written within one clock tick share a timestamp: the order they
+    were written in decides whether a read came before the unmount."""
+    a = c.file("evidence/imgA.raw", "image A")
+    c.register(a)
+    mp = str(c.d / "mnt")
+    sec = c.file("mnt/Security.evtx", "evtx inside A")
+    c.mount("sift-tester-20261009-001", a, mp, 2049)
+    c.run("sift-tester-20261009-002", ["EvtxECmd", "-f", sec], [sec], "4624\n",
+          input_realpaths=[sec], input_st_devs=[2049])  # fmt: skip
+    c.umount("sift-tester-20261009-003", mp, 2049)
+    c.run("sift-tester-20261009-004", ["EvtxECmd", "-f", sec], [sec], "4624\n",
+          input_realpaths=[sec], input_st_devs=[2049])  # fmt: skip
+    case = pv.load_case(c.d)
+    assert pv.trace_op(case, "sift-tester-20261009-002").grade == "FULL"
+    assert (
+        pv.trace_op(case, "sift-tester-20261009-004").break_["kind"] == "mount-mismatch"
+    )
+
+
+# --- an output recorded while its hash was pending resolves through its job -----
+
+
+def _pending_extraction(c, job="hash-0123456789abcdef"):
+    """A 7z extraction whose large output was recorded as `pending:<job>`, then
+    read by vol: file identity hashes outputs over the inline limit in the
+    background."""
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s2 = c.file("extractions/x1/sample2.raw", "sample two")
+    c.op("sift-mcp", "sift-tester-20261009-001", tool="run_command",
+         params={"command": ["7z", "x", z], "purpose": "p"},
+         input_files=[z], input_sha256s=[""], input_detection_method="parsed",
+         result_summary={"exit_code": 0, "output_files": [s2],
+                         "output_sha256s": [f"pending:{job}"]})  # fmt: skip
+    return z, s2
+
+
+def _read(c, s2):
+    c.run("sift-tester-20261009-002", ["vol", "-f", s2, "windows.pslist"], [s2],
+          "PID 4 System\n", ts="2026-10-09T00:00:05Z")  # fmt: skip
+    return pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+
+
+def test_a_pending_output_links_through_its_completed_job(c):
+    z, s2 = _pending_extraction(c)
+    c.op("file-identity", "fileidentity-tester-20261009-001", tool="hash_complete",
+         job_id="hash-0123456789abcdef", path=s2, sha256=sha(s2),
+         ts="2026-10-09T00:00:02Z")  # fmt: skip
+    t = _read(c, s2)
+    assert t.grade == "FULL" and t.root["sha256"] == sha(z), t.as_dict()
+    job = [l for l in t.links if l["audit_id"] == "fileidentity-tester-20261009-001"]
+    assert job and job[0]["method"] == "recorded-id", t.links
+
+
+def test_a_pending_output_whose_job_is_still_running_is_a_named_break(c):
+    _z, s2 = _pending_extraction(c)
+    t = _read(c, s2)
+    assert (t.grade, t.break_["kind"]) == ("BROKEN", "hash-pending"), t.as_dict()
+    assert "hash pending (job hash-0123456789abcdef)" in t.reason
+
+
+def test_a_pending_output_whose_job_failed_breaks_with_its_reason(c):
+    _z, s2 = _pending_extraction(c)
+    c.op("file-identity", "fileidentity-tester-20261009-001", tool="hash_failed",
+         job_id="hash-0123456789abcdef", path=s2, error="OSError: [Errno 5] EIO",
+         ts="2026-10-09T00:00:02Z")  # fmt: skip
+    t = _read(c, s2)
+    assert (t.grade, t.break_["kind"]) == ("BROKEN", "hash-failed"), t.as_dict()
+    assert "EIO" in t.reason
+
+
+# --- only an earlier operation can be a file's origin ---------------------------
+
+
+def test_an_operation_after_the_read_is_never_the_files_origin(c):
+    """Read at 01:00 a file made outside the tools; at 02:00 an op wrote the same
+    bytes to the same path. The read's file has no recorded origin."""
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s2 = c.file("extractions/x1/sample2.raw", "sample two")
+    c.run("sift-tester-20261009-002", ["vol", "-f", s2, "windows.pslist"], [s2],
+          "PID 4\n", ts="2026-10-09T01:00:00Z")  # fmt: skip
+    c.op("sift-mcp", "sift-tester-20261009-003", tool="run_command",
+         params={"command": ["7z", "x", z], "purpose": "p"}, ts="2026-10-09T02:00:00Z",
+         input_files=[z], input_sha256s=[""], input_detection_method="parsed",
+         result_summary={"exit_code": 0, "output_files": [s2],
+                         "output_sha256s": [sha(s2)]})  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+    assert (t.grade, t.break_["kind"]) == ("BROKEN", "no-recorded-origin"), t.as_dict()
+
+
+def test_a_later_identical_write_leaves_the_earlier_origin_alone(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    _s1, s2 = c.extract("sift-tester-20261009-001", z)  # 00:00
+    c.run("sift-tester-20261009-002", ["vol", "-f", s2, "windows.pslist"], [s2],
+          "PID 4\n", ts="2026-10-09T01:00:00Z")  # fmt: skip
+    c.op("sift-mcp", "sift-tester-20261009-003", tool="run_command",  # same path, bytes
+         params={"command": ["7z", "x", z], "purpose": "p"}, ts="2026-10-09T02:00:00Z",
+         input_files=[z], input_sha256s=[""], input_detection_method="parsed",
+         result_summary={"exit_code": 0, "output_files": [s2],
+                         "output_sha256s": [sha(s2)]})  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+    assert t.grade == "FULL", t.as_dict()
+    assert "sift-tester-20261009-003" not in {l["audit_id"] for l in t.links}
+
+
+def test_a_producer_whose_id_is_on_two_entries_is_ambiguous(c):
+    """Reached as a file's origin, not only through trace_op."""
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    _s1, s2 = c.extract("sift-tester-20261009-001", z)
+    c.op("opensearch-mcp", "sift-tester-20261009-001", tool="idx_search")  # same id
+    c.run("sift-tester-20261009-002", ["vol", "-f", s2, "windows.pslist"], [s2],
+          "PID 4\n", ts="2026-10-09T01:00:00Z")  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), "sift-tester-20261009-002")
+    assert t.grade == "AMBIGUOUS", t.as_dict()
+    assert [x["audit_id"] for x in t.candidates] == ["sift-tester-20261009-001"] * 2
+
+
+def test_with_no_read_time_only_a_mount_still_live_links(c):
+    """An ingest checks a file directly, with no read time: the mount must not
+    have been unmounted."""
+    a, _ = _mounted(c, 2049)
+    sec = str(c.d / "mnt/Windows/System32/winevt/Logs/Security.evtx")
+    live = pv.trace_file(pv.load_case(c.d), sec, sha(sec), st_dev=2049)
+    assert live.grade == "FULL" and live.root["path"] == a, live.as_dict()
+    c.umount("sift-tester-20261009-009", str(c.d / "mnt"), 2049,
+             ts="2026-10-09T03:00:00Z")  # fmt: skip
+    ended = pv.trace_file(pv.load_case(c.d), sec, sha(sec), st_dev=2049)
+    assert ended.break_["kind"] == "mount-mismatch", ended.as_dict()
+    assert "no read time" in ended.reason
+
+
+# --- tracing many files reads each manifest and each entry's outputs once -------
+
+
+def test_tracing_a_folders_members_reads_its_manifest_and_outputs_once(c, monkeypatch):
+    """A KAPE folder's files traced input by input, at ingest: linear, not
+    quadratic."""
+    k = c.d / "evidence" / "kape"
+    files = [c.file(f"evidence/kape/f{n}.evtx", f"evtx {n}") for n in range(40)]
+    c.register_folder(str(k))
+    for n in range(10):
+        c.run(f"sift-tester-20261009-1{n:02d}", ["true"], [], "")
+    counts = {"rows": 0, "outputs": 0}
+    rows, outputs = pv._manifest_rows, pv._outputs
+
+    def counted_rows(*a):
+        counts["rows"] += 1
+        return rows(*a)
+
+    def counted_outputs(*a):
+        counts["outputs"] += 1
+        return outputs(*a)
+
+    monkeypatch.setattr(pv, "_manifest_rows", counted_rows)
+    monkeypatch.setattr(pv, "_outputs", counted_outputs)
+    case = pv.load_case(c.d)
+    assert all(pv.trace_file(case, f, sha(f)).grade == "FULL" for f in files)
+    for f in files:  # and not as roots: through the outputs
+        pv.trace_file(case, f + ".copy", sha(f))
+    assert counts == {"rows": 1, "outputs": 10}, counts
+
+
+def test_an_empty_file_never_links_by_hash_and_place(c):
+    """Every empty file has one hash: it says nothing about where it came from."""
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    empty = c.file("extractions/x1/empty.log", b"")
+    c.op("sift-mcp", "sift-tester-20261009-001", tool="run_command",
+         params={"command": ["7z", "x", z], "purpose": "p"},
+         input_files=[z], input_sha256s=[""], input_detection_method="parsed",
+         result_summary={"exit_code": 0, "output_files": [empty],
+                         "output_sha256s": [sha(empty)]})  # fmt: skip
+    t = pv.trace_file(pv.load_case(c.d), empty, sha(empty))
+    assert (t.grade, t.break_["kind"]) == ("BROKEN", "no-recorded-origin"), t.as_dict()
+
+
+def test_a_registered_input_recorded_with_another_hash_breaks(c):
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    t = pv.trace_file(pv.load_case(c.d), z, "ab" * 32)
+    assert (t.grade, t.break_["kind"]) == ("BROKEN", "hash-mismatch"), t.as_dict()
+    assert pv.trace_file(pv.load_case(c.d), z, sha(z)).grade == "FULL"
+    assert pv.trace_file(pv.load_case(c.d), z, "").grade == "FULL"  # none recorded
+
+
+def test_a_producer_in_another_log_at_the_same_time_is_still_the_origin(c):
+    """Logs have no order between them: a tie in time is "later" only within
+    one log, where the trail says which came first."""
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    _s1, s2 = c.extract("sift-tester-20261009-001", z, log="sift-mcp")
+    c.op("opensearch-ingest-1", "opensearch-ingest-1-20261009-001", tool="ingest_vol3",
+         input_files=[s2], input_sha256s=[sha(s2)],
+         input_detection_method="parsed")  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), "opensearch-ingest-1-20261009-001")
+    assert t.grade == "FULL", t.as_dict()
+
+
+# --- a job's closing entry, mounts across logs, and many-file jobs ---------------
+
+
+def test_a_pending_output_whose_closing_entrys_id_is_on_two_entries_is_ambiguous(c):
+    z, s2 = _pending_extraction(c)
+    c.op("file-identity", "fileidentity-tester-20261009-001", tool="hash_complete",
+         job_id="hash-0123456789abcdef", path=s2, sha256=sha(s2),
+         ts="2026-10-09T00:00:02Z")  # fmt: skip
+    c.op("sift-mcp", "fileidentity-tester-20261009-001", tool="run_command")  # same id
+    t = _read(c, s2)
+    assert t.grade == "AMBIGUOUS", t.as_dict()
+
+
+def test_two_closing_entries_for_one_job_and_file_that_disagree_are_ambiguous(c):
+    z, s2 = _pending_extraction(c)
+    for n, h in ((1, sha(s2)), (2, "ab" * 32)):
+        c.op("file-identity", f"fileidentity-tester-20261009-00{n}", tool="hash_complete",
+             job_id="hash-0123456789abcdef", path=s2, sha256=h,
+             ts="2026-10-09T00:00:02Z")  # fmt: skip
+    t = _read(c, s2)
+    assert t.grade == "AMBIGUOUS", t.as_dict()
+    assert {x["audit_id"] for x in t.candidates} == {
+        "fileidentity-tester-20261009-001", "fileidentity-tester-20261009-002"}  # fmt: skip
+
+
+@pytest.mark.parametrize("log", ["aaa-reader", "zzz-reader"])
+def test_a_read_at_the_mounts_time_in_another_log_links_whatever_the_logs_names(c, log):
+    """Logs have no order between them: a tie in time across logs never
+    decides whether the mount was live, so the log's name can't either."""
+    a = c.file("evidence/imgA.raw", "image A")
+    c.register(a)
+    mp = str(c.d / "mnt")
+    sec = c.file("mnt/Windows/System32/winevt/Logs/Security.evtx", "evtx inside A")
+    c.mount("sift-tester-20261009-001", a, mp, 2049, ts="2026-10-09T01:00:00Z")
+    c.op(log, f"{log}-20261009-001", tool="EvtxECmd", ts="2026-10-09T01:00:00Z",
+         input_files=[sec], input_sha256s=[sha(sec)], input_realpaths=[sec],
+         input_st_devs=[2049], input_detection_method="parsed")  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), f"{log}-20261009-001")
+    assert t.grade == "FULL", t.as_dict()
+
+
+def test_tracing_a_many_file_jobs_outputs_reads_each_row_once(c, monkeypatch):
+    """One background job closing 200 files: each file's lookup is indexed,
+    not a scan of every row."""
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    files = [c.file(f"extractions/x1/s{n}.raw", f"sample {n}") for n in range(200)]
+    c.op("sift-mcp", "sift-tester-20261009-001", tool="run_command",
+         params={"command": ["7z", "x", z], "purpose": "p"},
+         input_files=[z], input_sha256s=[""], input_detection_method="parsed",
+         result_summary={"exit_code": 0, "output_files": files,
+                         "output_sha256s": ["pending:hash-many"] * len(files)})  # fmt: skip
+    c.op("file-identity", "fileidentity-tester-20261009-001", tool="hash_complete",
+         job_id="hash-many", files=[{"path": f, "sha256": sha(f)} for f in files],
+         ts="2026-10-09T00:00:02Z")  # fmt: skip
+    case = pv.load_case(c.d)
+    calls = [0]
+    realpath = pv.os.path.realpath
+
+    def counted(p, **kw):
+        calls[0] += 1
+        return realpath(p, **kw)
+
+    monkeypatch.setattr(pv.os.path, "realpath", counted)
+    assert all(pv.trace_file(case, f, sha(f)).grade == "FULL" for f in files)
+    assert calls[0] < 20 * len(files), calls[0]  # linear: a scan per lookup was ~108
+
+
+def test_a_pending_output_whose_job_is_ambiguous_isnt_passed_over_for_another(c):
+    """Its closings disagree: that origin can't be named, so another producer
+    at the same path doesn't make the trace FULL."""
+    z, s2 = _pending_extraction(c)
+    for n, h in ((1, sha(s2)), (2, "ab" * 32)):
+        c.op("file-identity", f"fileidentity-tester-20261009-00{n}", tool="hash_complete",
+             job_id="hash-0123456789abcdef", path=s2, sha256=h,
+             ts="2026-10-09T00:00:02Z")  # fmt: skip
+    c.op("sift-mcp", "sift-tester-20261009-005", tool="run_command",  # another writer
+         params={"command": ["cp", z, s2], "purpose": "p"}, ts="2026-10-09T00:00:03Z",
+         input_files=[z], input_sha256s=[""], input_detection_method="parsed",
+         result_summary={"exit_code": 0, "output_files": [s2],
+                         "output_sha256s": [sha(s2)]})  # fmt: skip
+    t = _read(c, s2)
+    assert t.grade == "AMBIGUOUS", t.as_dict()
+
+
+def test_a_file_under_two_mounts_live_at_its_read_is_ambiguous(c):
+    """Two mounts at one point, tied in time across logs, same st_dev; the read
+    names no mount id. Neither is the first."""
+    a = c.file("evidence/imgA.raw", "image A")
+    b = c.file("evidence/imgB.raw", "image B")
+    c.register(a)
+    c.register(b)
+    mp = str(c.d / "mnt")
+    sec = c.file("mnt/Windows/System32/winevt/Logs/Security.evtx", "evtx")
+    ts = "2026-10-09T01:00:00Z"
+    c.mount("sift-tester-20261009-001", a, mp, 2049, ts=ts)
+    c.umount("sift-tester-20261009-002", mp, 2049, ts=ts)
+    c.op("opensearch-ingest-1", "opensearch-ingest-1-20261009-001", tool="mount_image",
+         ts=ts, input_files=[b], input_sha256s=[""], input_detection_method="parsed",
+         mount={"image": b, "points": [{"target": mp, "realpath": os.path.realpath(mp),
+                                         "st_dev": 2049, "mnt_id": 4242}]})  # fmt: skip
+    c.op("zzz-reader", "zzz-reader-20261009-001", tool="EvtxECmd", ts=ts,
+         input_files=[sec], input_sha256s=[sha(sec)], input_realpaths=[sec],
+         input_st_devs=[2049], input_detection_method="parsed")  # fmt: skip
+    t = pv.trace_op(pv.load_case(c.d), "zzz-reader-20261009-001")
+    assert t.grade == "AMBIGUOUS", t.as_dict()
+
+
+def test_an_ambiguous_job_after_a_pending_one_still_makes_the_trace_ambiguous(c):
+    """The order of the outputs never decides: a running job first, then a job
+    whose closings disagree, then a writer with the matching hash."""
+    z = c.file("evidence/mem.7z", "7z bytes")
+    c.register(z)
+    s2 = c.file("extractions/x1/sample2.raw", "sample two")
+    for n, h in (
+        (1, "pending:hash-running"),
+        (2, "pending:hash-disagree"),
+        (3, sha(s2)),
+    ):
+        c.op("sift-mcp", f"sift-tester-20261009-00{n}", tool="run_command",
+             params={"command": ["7z", "x", z], "purpose": "p"},
+             input_files=[z], input_sha256s=[""], input_detection_method="parsed",
+             result_summary={"exit_code": 0, "output_files": [s2],
+                             "output_sha256s": [h]})  # fmt: skip
+    for n, h in ((1, sha(s2)), (2, "ab" * 32)):
+        c.op("file-identity", f"fileidentity-tester-20261009-00{n}", tool="hash_complete",
+             job_id="hash-disagree", path=s2, sha256=h)  # fmt: skip
+    t = pv.trace_file(pv.load_case(c.d), s2, sha(s2))
+    assert t.grade == "AMBIGUOUS", t.as_dict()

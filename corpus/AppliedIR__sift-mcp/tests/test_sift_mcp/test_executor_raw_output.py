@@ -1,0 +1,208 @@
+"""A tool's output is kept as the bytes it wrote.
+
+The executor decoded stdout as UTF-8 (bad bytes replaced) and saved and
+hashed that re-encoded text, so the saved file and its hash weren't the
+tool's output. The decoded text is now only for the response; what is saved
+and hashed is the raw bytes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import pytest
+from sift_mcp.executor import execute
+
+OUT = b"PID\tName\n1337\tevil\xe9.exe\n\xff\xfe"  # not UTF-8
+ERR = b"warning: \x80 bad byte\n"
+
+
+@pytest.fixture
+def no_case(monkeypatch, tmp_path):
+    monkeypatch.delenv("VHIR_CASE_DIR", raising=False)
+    monkeypatch.setattr("sift_mcp.executor.resolve_case_dir", lambda: "")
+    monkeypatch.delenv("SIFT_MAX_OUTPUT", raising=False)
+    return tmp_path
+
+
+def _writes(out: bytes, err: bytes = b"") -> list[str]:
+    code = f"import sys; sys.stdout.buffer.write({out!r}); sys.stderr.buffer.write({err!r})"
+    return [sys.executable, "-c", code]
+
+
+def test_saved_stdout_and_stderr_are_the_bytes_the_tool_wrote(no_case):
+    r = execute(_writes(OUT, ERR), save_output=True, save_dir=str(no_case / "out"))
+    assert Path(r["output_file"]).read_bytes() == OUT
+    assert r["output_sha256"] == hashlib.sha256(OUT).hexdigest()
+    assert Path(r["stderr_file"]).read_bytes() == ERR
+    assert r["stderr_sha256"] == hashlib.sha256(ERR).hexdigest()
+    assert r["stdout"] == OUT.decode("utf-8", errors="replace")  # the response's text
+
+
+def test_the_output_hash_is_there_when_nothing_was_saved(no_case):
+    r = execute(_writes(OUT))
+    assert "output_file" not in r
+    assert r["output_sha256"] == hashlib.sha256(OUT).hexdigest()
+    assert execute(_writes(b""))["output_sha256"] == hashlib.sha256(b"").hexdigest()
+
+
+def test_run_command_reports_and_records_the_output_hash(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".vhir").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("VHIR_EXAMINER", "examiner1")
+    for var in (
+        "VHIR_CASE_DIR",
+        "VHIR_AUDIT_DIR",
+        "VHIR_ACTIVE_CASE",
+        "SIFT_MAX_OUTPUT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    case = tmp_path / "case"
+    case.mkdir()
+    (case / "CASE.yaml").write_text("case_id: case\nstatus: open\n")
+    (home / ".vhir" / "active_case").write_text(str(case))
+    from sift_mcp.server import create_server
+
+    script = tmp_path / "tool.py"  # run_command refuses ";" in an argument
+    script.write_text(_writes(OUT)[2].replace("; ", "\n"))
+    r = asyncio.run(
+        create_server().call_tool(
+            "run_command", {"command": [sys.executable, str(script)], "purpose": "t"}
+        )
+    )
+    r = json.loads((r[0] if isinstance(r, tuple) else r)[0].text)
+    entry = json.loads((case / "audit" / "sift-mcp.jsonl").read_text().splitlines()[-1])
+    assert r["output_sha256"] == hashlib.sha256(OUT).hexdigest()
+    assert entry["result_summary"]["output_sha256"] == hashlib.sha256(OUT).hexdigest()
+
+
+def test_in_a_case_every_output_is_kept_whatever_its_size(tmp_path, monkeypatch):
+    """A 51-byte pslist a finding cites is kept, as its exact bytes, without
+    save_output; an output with no bytes saves no file."""
+    case = tmp_path / "case"
+    case.mkdir()
+    (case / "CASE.yaml").write_text("case_id: case\n")
+    monkeypatch.setenv("VHIR_CASE_DIR", str(case))
+    monkeypatch.delenv("SIFT_MAX_OUTPUT", raising=False)
+    r = execute(_writes(OUT))  # save_output not set
+    saved = Path(r["output_file"])
+    assert saved.parent == case / "extractions" and saved.read_bytes() == OUT
+    assert "output_file" not in execute(_writes(b""))
+
+
+def test_a_hash_of_output_cut_at_the_limit_says_it_covers_a_prefix(
+    no_case, monkeypatch
+):
+    monkeypatch.setenv("SIFT_MAX_OUTPUT", "20000")
+    r = execute(_writes(b"x" * 50000))
+    assert r["output_sha256_scope"] == "prefix"
+    assert (
+        r["output_sha256"] == hashlib.sha256(b"x" * r["stdout_total_bytes"]).hexdigest()
+    )
+    assert execute(_writes(OUT))["output_sha256_scope"] == "full"
+
+
+def test_run_command_records_the_scope_of_its_output_hash(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".vhir").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("VHIR_EXAMINER", "examiner1")
+    monkeypatch.setenv("SIFT_MAX_OUTPUT", "20000")
+    for var in ("VHIR_CASE_DIR", "VHIR_AUDIT_DIR", "VHIR_ACTIVE_CASE"):
+        monkeypatch.delenv(var, raising=False)
+    case = tmp_path / "case"
+    case.mkdir()
+    (case / "CASE.yaml").write_text("case_id: case\nstatus: open\n")
+    (home / ".vhir" / "active_case").write_text(str(case))
+    from sift_mcp.server import create_server
+
+    script = tmp_path / "big.py"
+    script.write_text("import sys\nsys.stdout.write('x' * 50000)\n")
+    r = asyncio.run(
+        create_server().call_tool(
+            "run_command", {"command": [sys.executable, str(script)], "purpose": "t"}
+        )
+    )
+    r = json.loads((r[0] if isinstance(r, tuple) else r)[0].text)
+    s = json.loads((case / "audit" / "sift-mcp.jsonl").read_text().splitlines()[-1])
+    s = s["result_summary"]
+    assert s["output_sha256_scope"] == "prefix" and r["output_sha256_scope"] == "prefix"
+    assert s["output_sha256"] == hashlib.sha256(b"x" * s["stdout_bytes"]).hexdigest()
+
+
+class _Frozen:
+    """One UTC second for every save."""
+
+    @staticmethod
+    def now(tz=None):
+        from datetime import datetime as real
+
+        return real(2026, 10, 9, 12, 0, 0, tzinfo=tz)
+
+
+def _case(tmp_path, monkeypatch):
+    case = tmp_path / "case"
+    case.mkdir()
+    (case / "CASE.yaml").write_text("case_id: case\nstatus: open\n")
+    monkeypatch.setenv("VHIR_CASE_DIR", str(case))
+    monkeypatch.delenv("SIFT_MAX_OUTPUT", raising=False)
+    monkeypatch.setattr("sift_mcp.executor.datetime", _Frozen)
+    return case
+
+
+def test_two_runs_in_one_second_keep_two_files_under_their_own_ids(
+    tmp_path, monkeypatch
+):
+    case = _case(tmp_path, monkeypatch)
+    ids = iter(["sift-examiner1-20261009-001", "sift-examiner1-20261009-002"])
+    runs = [
+        execute(_writes(out), op_id=lambda: next(ids)) for out in (b"one\n", b"two\n")
+    ]
+    for run, out, n in zip(runs, (b"one\n", b"two\n"), ("001", "002"), strict=True):
+        saved = Path(run["output_file"])
+        assert saved.parent == case / "extractions" / f"sift-examiner1-20261009-{n}"
+        assert saved.read_bytes() == out and run["op_id"].endswith(n)
+        assert run["output_sha256"] == hashlib.sha256(out).hexdigest()
+
+
+def test_two_saves_to_one_folder_in_one_second_dont_overwrite(no_case, monkeypatch):
+    monkeypatch.setattr("sift_mcp.executor.datetime", _Frozen)
+    out = no_case / "out"
+    a = execute(_writes(b"one\n"), save_output=True, save_dir=str(out))
+    b = execute(_writes(b"two\n"), save_output=True, save_dir=str(out))
+    assert a["output_file"] != b["output_file"]
+    assert Path(a["output_file"]).read_bytes() == b"one\n"
+    assert Path(b["output_file"]).read_bytes() == b"two\n"
+
+
+def test_run_command_saves_each_output_under_its_audit_id(tmp_path, monkeypatch):
+    case = _case(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    (home / ".vhir").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("VHIR_EXAMINER", "examiner1")
+    for var in ("VHIR_AUDIT_DIR", "VHIR_ACTIVE_CASE"):
+        monkeypatch.delenv(var, raising=False)
+    from sift_mcp.server import create_server
+
+    server = create_server()
+    for out in ("one", "two"):
+        script = tmp_path / f"{out}.py"
+        script.write_text(f"print({out!r})\n")
+        asyncio.run(server.call_tool(
+            "run_command", {"command": [sys.executable, str(script)], "purpose": "t"}))  # fmt: skip
+    entries = [
+        json.loads(x)
+        for x in (case / "audit" / "sift-mcp.jsonl").read_text().splitlines()
+    ]
+    assert len({e["audit_id"] for e in entries}) == 2
+    for e, out in zip(entries, (b"one\n", b"two\n"), strict=True):
+        saved = Path(e["result_summary"]["output_file"])
+        assert saved.parent == case / "extractions" / e["audit_id"]
+        assert saved.read_bytes() == out
+        assert e["result_summary"]["output_sha256"] == hashlib.sha256(out).hexdigest()

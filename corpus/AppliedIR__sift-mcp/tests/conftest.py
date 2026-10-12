@@ -1,0 +1,62 @@
+"""Shared test fixtures for the Valhuntir SIFT monorepo."""
+
+import atexit
+import os
+import shutil
+import tempfile
+
+import pytest
+
+# Tests run under a temporary HOME: some activate cases and write audit entries
+# for real. Only the model cache below is reached through the real one. Product
+# modules read Path.home() when imported (case-mcp's _ACTIVE_CASE_FILE, the
+# gateway's state directory), so this runs when the root conftest is imported,
+# before any child conftest or test module.
+_ORIGINAL_HOME = os.environ.get("HOME", "")
+_TEST_HOME = tempfile.mkdtemp(prefix="sift-mcp-tests-home-")
+atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
+os.environ["HOME"] = _TEST_HOME
+if _ORIGINAL_HOME:
+    # forensic-rag's embedding model cache.
+    os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_ORIGINAL_HOME, ".cache"))
+for _var in ("VHIR_CASE_DIR", "VHIR_AUDIT_DIR"):
+    os.environ.pop(_var, None)
+
+
+@pytest.fixture(autouse=True)
+def _vhir_ledger_dir(tmp_path_factory, monkeypatch):
+    """vhir's case lock and signed ledger live in /var/lib/vhir/ledger/,
+    which the installer and `vhir update` make. A test that reaches them
+    (through vhir, or forensic-mcp's copy of the lock) gets its own folder,
+    never the box's. Nothing to do with a vhir from before the ledger."""
+    folder = tmp_path_factory.mktemp("vhir-ledger")
+    try:  # forensic-mcp's copy of the case lock, in the same folder
+        from forensic_mcp.case import manager
+
+        monkeypatch.setattr(manager, "LEDGER_DIR", folder, raising=False)
+    except ImportError:
+        pass
+    try:
+        from vhir_cli import ledger
+    except ImportError:
+        return
+    monkeypatch.setattr(ledger, "LEDGER_DIR", folder)
+    # and the rest of /var/lib/vhir that verify and signing read: the 0.6
+    # file and the keys folder (a vhir from before signing has neither)
+    try:
+        from vhir_cli import keys, verification
+    except ImportError:
+        return
+    monkeypatch.setattr(
+        verification, "VERIFICATION_DIR", tmp_path_factory.mktemp("vhir-0.6")
+    )
+    monkeypatch.setattr(keys, "KEYS_DIR", tmp_path_factory.mktemp("vhir-keys"))
+
+
+@pytest.fixture
+def tmp_case_dir(tmp_path):
+    """Create a temporary case directory with flat structure."""
+    case_dir = tmp_path / "test-case"
+    case_dir.mkdir()
+    (case_dir / "audit").mkdir()
+    return case_dir

@@ -1,0 +1,968 @@
+use crate::parameter_analysis::Param;
+use reqwest::{Client, redirect::Policy};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use url::Url;
+
+mod har;
+mod openapi;
+mod postman;
+pub use har::{is_har_content, parse_har};
+pub use openapi::parse_openapi;
+pub use postman::parse_postman;
+
+/// Most targets one imported document (HAR, OpenAPI, Postman) may expand to.
+/// Set far above any realistic capture or spec; it only exists so a
+/// large-but-valid document can't amplify into multi-GiB resident memory
+/// (each Target plus the downstream dedup/host-group copies). Truncation is
+/// surfaced as a warning.
+pub(crate) const MAX_IMPORT_TARGETS: usize = 1_000_000;
+
+/// Most bytes (URL + headers + body) one spec operation / collection request
+/// may expand to. A `$ref` to a large `example`, or a `{{var}}` to a large
+/// value, can be repeated thousands of times inside a single request; past
+/// this the request is skipped instead of amplifying a small document into
+/// gigabytes. Far above any real API request.
+pub(crate) const MAX_IMPORT_REQUEST_BYTES: usize = 4 << 20;
+
+/// Skip reason for a request past [`MAX_IMPORT_REQUEST_BYTES`].
+pub(crate) fn too_large(noun: &str) -> String {
+    format!("{noun} expands past {} MiB", MAX_IMPORT_REQUEST_BYTES >> 20)
+}
+
+/// Methods a spec import does not scan. HEAD and OPTIONS responses carry no
+/// body to reflect into; DELETE with placeholder ids would have discovery,
+/// mining and every payload hit a destructive endpoint. Counted, not silent.
+pub(crate) fn is_unscanned_spec_method(method: &str) -> bool {
+    ["HEAD", "OPTIONS", "DELETE"]
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(method))
+}
+
+/// Most skip reasons a [`SpecImport`] stores. Consumers show the count and a
+/// short sample; a junk-heavy 256 MiB document would otherwise keep a reason
+/// string per entry, gigabytes in all.
+pub(crate) const MAX_SKIP_REASONS: usize = 16;
+
+/// What a spec import (`-i openapi` / `-i postman`) produced: the targets plus
+/// a human-readable reason for the first operations or requests that were
+/// skipped. A bad entry never aborts the import — the same per-entry leniency
+/// a target list gets — so the caller reports the skips and scans the rest.
+#[derive(Debug, Default)]
+pub struct SpecImport {
+    pub targets: Vec<Target>,
+    /// Reasons for the first [`MAX_SKIP_REASONS`] skips.
+    pub skipped: Vec<String>,
+    /// Every skip, including those past the stored reasons.
+    pub skipped_total: usize,
+    /// DELETE / HEAD / OPTIONS operations left out by policy (see
+    /// [`is_unscanned_spec_method`]) — not errors, reported separately.
+    pub unscanned_methods: usize,
+}
+
+impl SpecImport {
+    pub(crate) fn skip(&mut self, reason: String) {
+        self.skipped_total += 1;
+        if self.skipped.len() < MAX_SKIP_REASONS {
+            self.skipped.push(reason);
+        }
+    }
+}
+
+/// Request headers imported from a document (HAR entry, OpenAPI header
+/// parameter, Postman header), split the way the request builders want them:
+/// `Cookie` into per-cookie pairs (so cookie injection and composition work
+/// and no duplicate `Cookie` header goes out), `User-Agent` lifted into its
+/// own field, HTTP/2 pseudo-headers, hop-by-hop/length/encoding headers and
+/// anything reqwest cannot put on an HTTP/1.1 wire dropped. One copy of these
+/// rules for every import path, so they cannot drift apart.
+#[derive(Debug, Default)]
+pub(crate) struct ImportedHeaders {
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) cookies: Vec<(String, String)>,
+    pub(crate) user_agent: Option<String>,
+}
+
+impl ImportedHeaders {
+    pub(crate) fn push(&mut self, name: &str, value: &str) {
+        let name = name.trim();
+        // HTTP/2 pseudo-headers (:method, :path, :scheme, :authority) are not
+        // valid on the wire for reqwest's HTTP/1.1 requests.
+        if name.is_empty() || name.starts_with(':') {
+            return;
+        }
+        if name.eq_ignore_ascii_case("cookie") {
+            for kv in value.split(';') {
+                if let Some((k, v)) = kv.trim().split_once('=') {
+                    self.push_cookie(k, v);
+                }
+            }
+            return;
+        }
+        if is_skippable_request_header(name) {
+            return;
+        }
+        // Drop any header reqwest can't put on an HTTP/1.1 wire (a
+        // space-bearing name, a control byte such as CR/LF in the value, …).
+        // Forwarded verbatim it would fail the reachability probe and every
+        // scan request, silently marking a live target unreachable. The
+        // User-Agent rides on every request too, so it is gated the same.
+        if !is_forwardable_header(name, value) {
+            crate::dbg_log!(
+                "dropping unsendable imported header {:?} (name/value rejected by HTTP/1.1)",
+                name
+            );
+            return;
+        }
+        if name.eq_ignore_ascii_case("user-agent") {
+            self.user_agent = Some(value.to_string());
+            return;
+        }
+        self.headers.push((name.to_string(), value.to_string()));
+    }
+
+    /// Add one cookie pair. An empty name is invalid and would re-serialize as
+    /// a malformed `=val` segment; a `;` would split into extra cookies once
+    /// the pairs are composed back into one `Cookie` header; and a pair that
+    /// isn't a sendable header value (a control byte) would make
+    /// that composed header — and with it every request — fail at send. All
+    /// of those are dropped rather than forwarded.
+    pub(crate) fn push_cookie(&mut self, name: &str, value: &str) {
+        let (name, value) = (name.trim(), value.trim());
+        if name.is_empty()
+            || name.contains(['=', ',', ' ', ';'])
+            || value.contains(';')
+            || !is_forwardable_header("Cookie", &format!("{name}={value}"))
+        {
+            return;
+        }
+        self.cookies.push((name.to_string(), value.to_string()));
+    }
+}
+
+/// Cache key capturing the inputs that affect Client construction:
+/// timeout, optional proxy URL, follow-redirects policy, and whether TLS
+/// certificate verification is skipped (`insecure`). The scheme/host are
+/// NOT part of the key because reqwest::Client manages per-host connection
+/// pools internally — one Client safely serves any number of hosts.
+type ClientCacheKey = (u64, Option<String>, bool, bool);
+
+/// Most proxy-keyed Clients the cache holds. The no-proxy keyspace is bounded
+/// by the timeout caps, but a server/MCP caller chooses the proxy string
+/// freely (any host, port or query), and each distinct one used to mint a
+/// permanent entry. Past this, one proxy-keyed entry is evicted per insert;
+/// in-flight clones keep working, a later build just re-pools.
+const MAX_PROXY_CLIENTS: usize = 64;
+
+/// Process-wide cache of reqwest::Clients keyed by ClientCacheKey. Each
+/// cached entry is cheap to clone (reqwest::Client is internally Arc'd).
+/// This collapses what was previously one fresh Client per call site
+/// (10+ sites, called per-target and per-payload) into a small fixed
+/// number of pooled clients, which prevents the connection storm that
+/// otherwise turned localhost requests into spurious ECONNREFUSED at
+/// high worker counts.
+fn client_cache() -> &'static Mutex<HashMap<ClientCacheKey, Client>> {
+    static CACHE: OnceLock<Mutex<HashMap<ClientCacheKey, Client>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub url: Url,
+    pub method: String,
+    pub data: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub cookies: Vec<(String, String)>,
+    pub user_agent: Option<String>,
+    pub reflection_params: Vec<Param>,
+    pub timeout: u64,
+    pub delay: u64,
+    pub proxy: Option<String>,
+    pub workers: usize,
+    pub follow_redirects: bool,
+    pub ignore_return: Vec<u16>,
+    pub waf_info: Option<crate::waf::WafDetectionResult>,
+    pub csp_analysis: Option<crate::payload::xss_csp_bypass::CspAnalysis>,
+    pub tech_info: Option<crate::scanning::tech_detect::TechDetectionResult>,
+    /// Per-target WAF-bypass telemetry. Populated during preflight when a
+    /// WAF is detected and bypass is enabled; left `None` otherwise so
+    /// the no-WAF path pays no overhead.
+    pub mutation_stats: Option<Arc<crate::waf::bypass::MutationStats>>,
+    /// Extra inter-request pause (ms) applied to injection sends once a WAF
+    /// is detected, sourced from the matched WAF's `extra_delay_hint_ms`.
+    /// 0 when no WAF was detected or `--waf-bypass off`. Set during preflight
+    /// analysis; consumed by the reflection / DOM injection paths so the hint
+    /// actually paces requests instead of only surfacing in JSON meta.
+    pub waf_extra_delay_ms: u64,
+    /// Skip TLS/SSL certificate verification when building the HTTP client
+    /// (`danger_accept_invalid_certs`). Defaults to `true` so the scanner
+    /// trusts self-signed / expired / hostname-mismatched certs out of the
+    /// box (`--insecure`); set to `false` (`--insecure=false`) to enforce
+    /// certificate validation.
+    pub insecure: bool,
+    /// The request body is `multipart/form-data` (an imported OpenAPI /
+    /// Postman request declared it). `data` still holds the fields
+    /// form-urlencoded — the shape every multipart builder reads — and this
+    /// flag makes body mining test them as `MultipartBody` fields instead of
+    /// as an urlencoded body the endpoint would not parse.
+    pub multipart: bool,
+}
+
+impl Target {
+    /// The `User-Agent` to actually put on the wire, or `None` for "leave it
+    /// to the HTTP client".
+    ///
+    /// `user_agent` carries two spellings of the same thing: `None`, and the
+    /// `Some("")` sentinel that every entry point normalizes to when the
+    /// operator supplied no override (`job::runner::hydrate_target`,
+    /// `cmd::scan::input`). Reading the field directly means remembering to
+    /// empty-check, and three of the four call sites that did so forgot —
+    /// putting a literal blank `User-Agent:` on probe and blind-XSS requests,
+    /// a fingerprint no ordinary client sends. Go through here instead.
+    pub(crate) fn effective_user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref().filter(|ua| !ua.is_empty())
+    }
+
+    /// Identity of this target within one run: URL, method, and a digest of
+    /// the request body. `exact` dedup collapses on it, and every per-target
+    /// record (`target_summary`, skips, session loss, finding attribution via
+    /// `origin_target`) is keyed by it — so an OpenAPI / HAR import with
+    /// `GET`, `POST` and `PUT` on one URL gets one record each instead of
+    /// sharing a skip or a finding count (#1527).
+    ///
+    /// The body is hashed rather than inlined: it can be MiBs. Headers and
+    /// cookies stay out on purpose — a browser HAR repeats one URL with a
+    /// drifting `Cookie` / `Referer` / `If-None-Match`, and keying on those
+    /// would turn every such repeat into another full scan of the same
+    /// injection points.
+    pub(crate) fn state_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let body = self
+            .data
+            .as_deref()
+            .map(|d| hex::encode(Sha256::digest(d.as_bytes())))
+            .unwrap_or_default();
+        format!("{}|{}|{}", self.url, self.method, body)
+    }
+
+    /// Construct a `Target` for `url` with empty request fields (method `GET`,
+    /// no data/headers/cookies) and scan-context fields at their parse-time
+    /// defaults. `resolve_targets` overwrites timeout/delay/proxy/workers/etc.
+    /// from the CLI args before scanning, so those values here are just
+    /// placeholders that keep unit-level parsing self-contained. Callers fill
+    /// the request-specific fields via struct-update syntax, e.g.
+    /// `Target { method, data, ..Target::for_url(url) }`.
+    pub(crate) fn for_url(url: Url) -> Self {
+        Target {
+            url,
+            method: "GET".to_string(),
+            data: None,
+            headers: vec![],
+            cookies: vec![],
+            user_agent: None,
+            reflection_params: vec![],
+            timeout: 10,
+            delay: 0,
+            proxy: None,
+            workers: 10,
+            follow_redirects: false,
+            ignore_return: vec![],
+            waf_info: None,
+            csp_analysis: None,
+            tech_info: None,
+            mutation_stats: None,
+            waf_extra_delay_ms: 0,
+            // Scanner default: trust self-signed / staging certs unless the
+            // caller explicitly opts into validation (`--insecure=false`).
+            insecure: true,
+            multipart: false,
+        }
+    }
+
+    /// Parse the method string into a `reqwest::Method`, defaulting to GET on failure.
+    /// This avoids repeating `.method.parse().unwrap_or(reqwest::Method::GET)` everywhere.
+    pub(crate) fn parse_method(&self) -> reqwest::Method {
+        self.method.parse().unwrap_or(reqwest::Method::GET)
+    }
+
+    /// Build a reqwest Client, falling back to a default Client on error.
+    /// Logs a warning in debug mode if the build fails.
+    ///
+    /// Returns a clone of a cached Client when one already exists for the
+    /// (timeout, proxy, follow_redirects) tuple, so call sites that previously
+    /// allocated a fresh Client per invocation (parameter mining, reflection
+    /// checks, blind callbacks, etc.) now share a pooled connection set.
+    pub(crate) fn build_client_or_default(&self) -> Client {
+        self.build_client().unwrap_or_else(|e| {
+            // The default client carries no proxy, no `insecure` posture, and
+            // no timeout. Dropping the proxy silently is the one fallback that
+            // is a scope hazard rather than a mild degradation — the operator
+            // asked for their traffic to go through a proxy and it would go
+            // DIRECT — so warn unconditionally in that case (not just under
+            // --debug), even though `--proxy` is now validated up front and this
+            // path is only reachable on a rarer, non-proxy build failure.
+            if self.proxy.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+                eprintln!(
+                    "[warn] HTTP client build failed ({e}); the configured proxy is NOT in effect and requests will go direct"
+                );
+            } else if crate::DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[warn] failed to build client: {}, using default", e);
+            }
+            Client::new()
+        })
+    }
+
+    pub(crate) fn build_client(&self) -> Result<Client, Box<dyn std::error::Error>> {
+        // Library consumers may build clients without going through `main()`,
+        // so make sure the ring crypto provider is installed first.
+        crate::ensure_crypto_provider();
+        // Resolve any proxy up front so the cache key reflects what the client
+        // will ACTUALLY use, not the raw string. A malformed proxy is silently
+        // unusable (matching prior behavior) — but if it still contributed to
+        // the key, each distinct malformed (or merely varied) proxy string
+        // would mint a permanent, never-evicted entry in the process-wide
+        // client cache, growing memory without bound in a long-running
+        // server/MCP daemon. Collapsing unusable proxies onto the no-proxy key
+        // makes garbage-proxy spam inert while keeping the legitimate (small)
+        // proxy keyspace cached.
+        let proxy = self
+            .proxy
+            .as_deref()
+            .and_then(|p| reqwest::Proxy::all(p).ok());
+        let proxy_key = if proxy.is_some() {
+            self.proxy.clone()
+        } else {
+            None
+        };
+        let key = (
+            self.timeout,
+            proxy_key,
+            self.follow_redirects,
+            self.insecure,
+        );
+        // Fast path: return a cached Client if one matches the key.
+        if let Ok(guard) = client_cache().lock()
+            && let Some(c) = guard.get(&key)
+        {
+            return Ok(c.clone());
+        }
+
+        // Slow path: build a fresh Client and insert into cache. We don't hold
+        // the lock during build to avoid serializing concurrent first-touches
+        // for distinct keys; the small race that may build the same key twice
+        // is harmless (the loser's value is dropped on insert).
+        let mut client_builder = Client::builder()
+            .timeout(Duration::from_secs(self.timeout))
+            // reqwest reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY by default;
+            // `--proxy` is applied below and still takes effect.
+            .no_proxy()
+            // Insecure mode for scanner (default on; `--insecure=false` to
+            // enforce TLS certificate validation).
+            .danger_accept_invalid_certs(self.insecure);
+
+        if let Some(proxy) = proxy {
+            client_builder = client_builder.proxy(proxy);
+        }
+
+        if self.follow_redirects {
+            client_builder = client_builder.redirect(same_host_redirect_policy(10));
+        } else {
+            client_builder = client_builder.redirect(Policy::none());
+        }
+
+        let client = client_builder.build()?;
+        if let Ok(mut guard) = client_cache().lock() {
+            if key.1.is_some()
+                && !guard.contains_key(&key)
+                && guard.keys().filter(|k| k.1.is_some()).count() >= MAX_PROXY_CLIENTS
+                && let Some(old) = guard.keys().find(|k| k.1.is_some()).cloned()
+            {
+                guard.remove(&old);
+            }
+            guard.insert(key, client.clone());
+        }
+        Ok(client)
+    }
+}
+
+/// Redirect policy for `--follow-redirects`: follow a redirect only while the
+/// chain stays on the origin that was originally requested.
+///
+/// `Policy::limited` follows anywhere, and the transport's own protection is
+/// not enough to make that safe for a scanner. reqwest strips only
+/// `Authorization`, `Cookie`, `cookie2`, `Proxy-Authorization` and
+/// `WWW-Authenticate` when a hop changes host, so a custom credential header
+/// (`-H "X-Api-Key: ..."`, which this project's own config template suggests)
+/// survives the very first hop off-target. Worse, the strip does not persist:
+/// each redirected request is rebuilt from the *original* header map and the
+/// scrub compares the next URL against the immediately preceding hop only. A
+/// target that answers `302 -> attacker/a`, with `attacker/a` answering
+/// `302 -> attacker/b`, therefore delivers the operator's full `Cookie` and
+/// `Authorization` on that second, same-host hop. 307/308 replay the request
+/// body across the same chain.
+///
+/// Anchoring on `previous[0]` — the URL that started the chain, per reqwest's
+/// own definition — rather than on the scan target keeps this free of
+/// per-target state, which matters because clients are cached under a key of
+/// `(timeout, proxy, follow_redirects, insecure)` and are shared across every
+/// target in a scan.
+///
+/// An off-origin hop is stopped rather than turned into an error: the caller
+/// then simply sees the 3xx response, which is the graceful outcome for a
+/// scanner. What counts as staying on the origin is
+/// [`crate::utils::http::same_origin_or_tls_upgrade`], shared with the
+/// form-action gates so the two cannot drift.
+pub(crate) fn same_host_redirect_policy(max_hops: usize) -> Policy {
+    Policy::custom(move |attempt| {
+        // Absent only if this is not a redirect chain at all.
+        let Some(origin) = attempt.previous().first() else {
+            return attempt.follow();
+        };
+        let next = attempt.url();
+        if !crate::utils::http::same_origin_or_tls_upgrade(origin, next) {
+            crate::dbg_log!(
+                "not following redirect {} -> {} (leaves the originally requested host; \
+                 credentials are not sent off-origin)",
+                origin,
+                next
+            );
+            return attempt.stop();
+        }
+        // Mirrors `Policy::limited`: `previous[0]` is the initial URL, not a
+        // redirection, so the count is compared with `>`.
+        if attempt.previous().len() > max_hops {
+            return attempt.error("too many redirects");
+        }
+        attempt.follow()
+    })
+}
+
+/// Absolute-URI schemes that appear in crawl output but have no HTTP
+/// authority, so they must never be rewritten into a target. Only the
+/// authority-less (`scheme:rest`) spellings need listing: anything written
+/// `scheme://…` is already rejected by the generic check in [`parse_target`].
+const NON_FETCHABLE_SCHEMES: &[&str] = &[
+    "about",
+    "bitcoin",
+    "callto",
+    "cid",
+    "data",
+    "fb-messenger",
+    "geo",
+    "intent",
+    "itms-apps",
+    "itms-services",
+    "javascript",
+    "magnet",
+    "mailto",
+    "market",
+    "mid",
+    "msteams",
+    "news",
+    "sms",
+    "skype",
+    "spotify",
+    "tel",
+    "tg",
+    "urn",
+    "viber",
+    "vbscript",
+    "webcal",
+    "whatsapp",
+    "zoommtg",
+];
+
+pub fn parse_target(s: &str) -> Result<Target, Box<dyn std::error::Error>> {
+    // RFC 3986 schemes are case-insensitive. Previously `HTTP://x` got
+    // double-prefixed because the case-sensitive check missed the
+    // uppercase scheme and the fallback rewrote it as
+    // `http://HTTP://x`, which then DNS-failed.
+    let lower = s.to_ascii_lowercase();
+    let url_str = if lower.starts_with("http://") || lower.starts_with("https://") {
+        s.to_string()
+    } else {
+        // Reject an explicit non-http(s) authority-form scheme rather than
+        // silently prepending `http://`. Without this, `ftp://127.0.0.1/x`
+        // became `http://ftp//127.0.0.1/x` — the scheme token `ftp` was parsed
+        // as the host and DNS-resolved, surfacing a misleading
+        // DNS_RESOLUTION_FAILED instead of an actionable error. Mirrors the
+        // `http|https`-only restriction the HAR import path already enforces.
+        // Anchored on a contiguous RFC-3986 `scheme://` so scheme-less inputs
+        // (`host:port/path`, `user:pass@host`, or a `://` that appears only
+        // inside the query) keep working unchanged.
+        if let Some(i) = lower.find("://") {
+            let scheme = &lower[..i];
+            let valid_scheme = !scheme.is_empty()
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.');
+            if valid_scheme {
+                return Err(format!(
+                    "unsupported URL scheme '{scheme}://' (only http and https are supported)"
+                )
+                .into());
+            }
+        }
+        // Non-hierarchical absolute URIs (`mailto:`, `javascript:`, `tel:`, …)
+        // carry no authority at all, so prefixing `http://` invents one out of
+        // the path: `mailto:security@corp.example` became
+        // `http://mailto:security@corp.example/`, i.e. an unrequested scan of
+        // `corp.example` sending `mailto` / `security` as basic-auth
+        // credentials. Crawl dumps (`gau`, `katana`, `waybackurls`) are full of
+        // these lines, and the target-list path now *skips* what it cannot
+        // parse, so rejecting them here drops them instead of minting a target
+        // on a host nobody asked for.
+        //
+        // Matched against a fixed list rather than by shape, because
+        // `scheme:rest` and the scheme-less `user:pass@host` form — which must
+        // keep working — are structurally identical.
+        //
+        // A digit after the colon means `host:port`, not `scheme:rest`, and
+        // several list entries double as ordinary service names on a container
+        // network (`data:8080`, `news:3000`, `market:8080`). No registered
+        // non-hierarchical scheme takes a bare number for its whole body, so
+        // that one test separates the two readings without weakening the
+        // `mailto:` / `javascript:` / `tel:` case.
+        if let Some((prefix, rest)) = lower.split_once(':')
+            && !rest.starts_with(|c: char| c.is_ascii_digit())
+            && NON_FETCHABLE_SCHEMES.contains(&prefix)
+        {
+            return Err(format!(
+                "unsupported URL scheme '{prefix}:' (only http and https are supported)"
+            )
+            .into());
+        }
+        format!("http://{}", s)
+    };
+    let url = Url::parse(&url_str)?;
+    Ok(Target::for_url(url))
+}
+
+/// Parse a target string that may be in "METHOD URL [BODY]" format.
+/// Returns (method, url, optional_body).
+/// If the string doesn't start with a known HTTP method, it returns ("GET", original_string, None).
+pub fn parse_method_url_body(s: &str) -> (String, String, Option<String>) {
+    // Use splitn(3, ' ') to preserve spaces in the body portion (e.g., "POST url name=John Doe")
+    let parts: Vec<&str> = s.splitn(3, ' ').collect();
+
+    if parts.len() >= 2 {
+        let potential_method = parts[0].to_uppercase();
+        if is_known_http_method(&potential_method) {
+            let url = parts[1].to_string();
+            let body = parts
+                .get(2)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            return (potential_method, url, body);
+        }
+    }
+
+    // Not in METHOD URL [BODY] format, return as-is with GET method
+    ("GET".to_string(), s.to_string(), None)
+}
+
+/// Methods recognized in `METHOD URL [BODY]` shorthand and raw-HTTP request lines.
+/// Includes RFC 10008 QUERY (safe/idempotent with a body).
+const KNOWN_HTTP_METHODS: [&str; 8] = [
+    "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "QUERY",
+];
+
+#[inline]
+fn is_known_http_method(method: &str) -> bool {
+    KNOWN_HTTP_METHODS.iter().any(|m| m.eq(&method))
+}
+
+/// Parse a target string that may be in "METHOD URL [BODY]" format or a plain URL.
+/// This is a wrapper around parse_target that handles the METHOD URL [BODY] format.
+pub fn parse_target_with_method(s: &str) -> Result<Target, Box<dyn std::error::Error>> {
+    let (method, url_str, body) = parse_method_url_body(s);
+    let mut target = parse_target(&url_str)?;
+    target.method = method;
+    target.data = body;
+    Ok(target)
+}
+
+/// Detect if the provided text looks like a raw HTTP request (starts with METHOD SP URI SP HTTP/x.y)
+/// Drop a leading UTF-8 BOM.
+///
+/// `str::trim_start` leaves U+FEFF in place — it is not `White_Space` — so
+/// every text entry point that inspects the first bytes has to remove it
+/// explicitly, or a file saved by Notepad, Excel or PowerShell parses wrong.
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
+pub fn is_raw_http_request(s: &str) -> bool {
+    // Strip a UTF-8 BOM before looking at the method: `str::trim_start` does not
+    // remove U+FEFF (it is not `White_Space`), and Notepad / Excel /
+    // PowerShell's `Out-File` all write one. Without this the method reads as
+    // `\u{feff}GET`, detection fails, and the request file is handed to the
+    // URL-list path — which tries to parse `Host: example.com:8080` as a URL
+    // and aborts the run. `is_har_content` already strips it.
+    let first = strip_bom(s).lines().next().unwrap_or("").trim_start();
+    let mut it = first.split_whitespace();
+    if let Some(method) = it.next()
+        && is_known_http_method(method)
+        && first.contains(" HTTP/")
+    {
+        return true;
+    }
+    false
+}
+
+/// Request headers that must not be forwarded verbatim from an imported request
+/// (raw HTTP or HAR). `Content-Length`/`Transfer-Encoding` are recomputed by
+/// reqwest from the actual (payload-injected) body — a stale value mis-frames
+/// the request and truncates the body, so injected params are never seen.
+/// `Accept-Encoding` is left to reqwest so its transparent decompression stays
+/// on (a manual value yields compressed gibberish the markers never match).
+/// `Host` is set from the URL and the rest are hop-by-hop headers tied to the
+/// original connection. `Cookie`/`User-Agent` are handled separately by callers
+/// and are intentionally not listed here. Shared with the HAR import path.
+pub(crate) fn is_skippable_request_header(name: &str) -> bool {
+    const SKIP: &[&str] = &[
+        "host",
+        "content-length",
+        "accept-encoding",
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "transfer-encoding",
+        "upgrade",
+        "te",
+    ];
+    SKIP.iter().any(|s| name.eq_ignore_ascii_case(s))
+}
+
+/// Whether a header imported verbatim from a raw HTTP request or a HAR capture
+/// can actually be put on an HTTP/1.1 wire.
+///
+/// reqwest validates header names/values lazily — a bad one is accepted by
+/// `RequestBuilder::header()` and only rejected at `send()`. Since the imported
+/// headers are attached to *every* request for the target, a single unsendable
+/// header (an empty name, an HTTP/2 pseudo-header like `:authority` that survives
+/// a copy-as-curl / HTTP/2 capture, a name containing a space, or a value
+/// carrying a control byte such as NUL) fails the reachability probe and every
+/// scan request — so a live target is silently reported unreachable and nothing
+/// is tested. Such headers can't be sent on HTTP/1.1 anyway, so drop them at
+/// import (the caller logs the drop) rather than poisoning the whole scan.
+///
+/// Shared by [`parse_raw_http_request`] and the HAR import path so both agree.
+pub(crate) fn is_forwardable_header(name: &str, value: &str) -> bool {
+    use reqwest::header::{HeaderName, HeaderValue};
+    HeaderName::try_from(name).is_ok() && HeaderValue::from_str(value).is_ok()
+}
+
+/// The body of a raw HTTP request: everything after the blank line that ends
+/// the header block, byte-for-byte apart from one optional trailing newline.
+/// `None` when there is no separator or nothing follows it.
+///
+/// Operates on the original text rather than on a `lines()` re-join so that
+/// CRLF line endings *inside* the body survive: a `multipart/form-data` body
+/// captured from a real request uses CRLF around its boundaries, and RFC 7578
+/// parsers that match `\r\n--boundary` see zero parts once those become bare
+/// LFs.
+///
+/// Two details that a naive "find the first \r\n\r\n" gets wrong:
+///
+/// * **The separator must be found the same way the header loop finds it.**
+///   That loop ends on the first line whose `trim_end()` is empty, so a
+///   separator line carrying stray whitespace (`\r\n \r\n`) ends the headers
+///   there. Scanning for a literal `\r\n\r\n` would miss it and report no
+///   body at all, silently dropping every body parameter from the scan.
+/// * **A trailing newline is a file artifact, not body content.** Every text
+///   editor terminates a file with one, and the old `lines()` fold dropped it.
+///   Keeping it verbatim appended a `\n` to the last body parameter's value,
+///   which then rode along percent-encoded (`b=2%0A`) on every request of the
+///   scan. Exactly one trailing terminator is removed, so a multipart body's
+///   internal CRLFs — and its `--boundary--` close delimiter — are untouched.
+fn raw_http_body(raw: &str) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    let mut line_start = 0usize;
+    let body_start = loop {
+        if line_start >= bytes.len() {
+            return None;
+        }
+        let rel_end = raw[line_start..]
+            .find('\n')
+            .map(|r| line_start + r)
+            .unwrap_or(bytes.len());
+        let line = &raw[line_start..rel_end];
+        let next = (rel_end + 1).min(bytes.len());
+        if line.trim_end().is_empty() {
+            break next;
+        }
+        line_start = next;
+    };
+    let mut body = &raw[body_start..];
+    // Drop one trailing terminator (CRLF or LF), never more.
+    if let Some(stripped) = body.strip_suffix("\r\n") {
+        body = stripped;
+    } else if let Some(stripped) = body.strip_suffix('\n') {
+        body = stripped;
+    }
+    (!body.is_empty()).then_some(body)
+}
+
+/// Parse a raw HTTP request into a Target.
+/// Supports:
+/// - Request line with absolute-form URI: GET http://example.com/path HTTP/1.1
+/// - Origin-form + Host header:         GET /path HTTP/1.1 + Host: example.com[:port]
+/// - Cookies collected from Cookie header
+/// - Body captured after the first blank line
+pub fn parse_raw_http_request(raw: &str) -> Result<Target, Box<dyn std::error::Error>> {
+    // Same BOM strip as `is_raw_http_request`. Forcing `-i raw-http` on a
+    // BOM-prefixed file used to parse the method as `\u{feff}GET` — accepted
+    // silently here, then rejected by every request built from it.
+    let mut lines = strip_bom(raw).lines();
+
+    // 1) Request line
+    let request_line = lines.next().ok_or("empty raw http request")?.trim();
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or("invalid request line: missing method")?
+        .to_string();
+    let uri = parts
+        .next()
+        .ok_or("invalid request line: missing request-target")?;
+    // HTTP version is optional; for origin-form it hints at the scheme below.
+    let http_version = parts.next().unwrap_or("");
+
+    // 2) Headers (until blank line)
+    let mut headers_vec: Vec<(String, String)> = Vec::new();
+    let mut cookies_vec: Vec<(String, String)> = Vec::new();
+    let mut host_header: Option<String> = None;
+    // HTTP/2 pseudo-headers from a copy-as-HTTP/2 capture. Never forwarded
+    // (they are not HTTP/1.1 headers), but they say where the request went.
+    let mut pseudo_scheme: Option<String> = None;
+    let mut pseudo_authority: Option<String> = None;
+    let mut user_agent: Option<String> = None;
+
+    // Collect raw header lines first (simple unfold; folded headers are uncommon and deprecated)
+    let mut header_raw: Vec<String> = Vec::new();
+    for line in lines.by_ref() {
+        let l = line.trim_end();
+        if l.is_empty() {
+            break;
+        }
+        header_raw.push(l.to_string());
+    }
+
+    for h in header_raw {
+        if let Some((pseudo, value)) = h.strip_prefix(':').and_then(|p| p.split_once(':')) {
+            let value = value.trim();
+            if pseudo.trim().eq_ignore_ascii_case("scheme") {
+                pseudo_scheme = Some(value.to_ascii_lowercase());
+            } else if pseudo.trim().eq_ignore_ascii_case("authority") && !value.is_empty() {
+                pseudo_authority = Some(value.to_string());
+            }
+            continue;
+        }
+        if let Some((name, value)) = h.split_once(':') {
+            let name_trim = name.trim().to_string();
+            let value_trim = value.trim().to_string();
+
+            if name_trim.eq_ignore_ascii_case("host") {
+                host_header = Some(value_trim.clone());
+                // No need to forward Host to reqwest; it sets Host automatically from URL.
+            } else if name_trim.eq_ignore_ascii_case("cookie") {
+                // Split cookies into vector. Do NOT also keep the original Cookie
+                // header: leaving it in `headers_vec` makes per-cookie probing
+                // emit both the original and the mutated Cookie (reqwest appends),
+                // so the server may take the un-injected value and the payload
+                // never lands. `apply_headers_ua_cookies` rebuilds a single,
+                // correct Cookie header from `cookies_vec`/overrides — mirror HAR.
+                for kv in value_trim.split(';') {
+                    let kv = kv.trim();
+                    if let Some((k, v)) = kv.split_once('=') {
+                        let k = k.trim();
+                        // Skip empty-name pairs (e.g. a leading `=val` or `;=v;`
+                        // segment): an empty cookie name is invalid and would
+                        // re-serialize into a malformed `=val` Cookie segment.
+                        if k.is_empty() {
+                            continue;
+                        }
+                        cookies_vec.push((k.to_string(), v.trim().to_string()));
+                    }
+                }
+            } else if name_trim.eq_ignore_ascii_case("user-agent")
+                && is_forwardable_header(&name_trim, &value_trim)
+            {
+                user_agent = Some(value_trim.clone());
+                headers_vec.push((name_trim, value_trim));
+            } else if !is_skippable_request_header(&name_trim) {
+                // Drop stale `Content-Length`/`Transfer-Encoding` (reqwest
+                // recomputes them from the injected body — a stale value
+                // truncates it) and hop-by-hop/`Accept-Encoding` headers, the
+                // same set the HAR import path strips.
+                //
+                // Also drop any header reqwest can't put on the wire — an empty
+                // name (`: value`), an HTTP/2 pseudo-header (`:authority: …`,
+                // which the origin-form request line carries instead and which
+                // a copy-as-curl / HTTP/2 capture routinely includes), a
+                // space-bearing name, or a control byte in the value. Forwarded
+                // verbatim, one of these fails the reachability probe and every
+                // scan request, so the live target is silently reported
+                // unreachable. Mirrors the HAR import path.
+                if is_forwardable_header(&name_trim, &value_trim) {
+                    headers_vec.push((name_trim, value_trim));
+                } else {
+                    crate::dbg_log!(
+                        "dropping unsendable raw-http header {:?} (name/value rejected by HTTP/1.1)",
+                        name_trim
+                    );
+                }
+            }
+        }
+    }
+
+    // 3) Body — sliced verbatim out of the original text after the blank line
+    //    that ends the header block.
+    //
+    //    Rebuilding it by joining `lines()` with `\n` corrupted every body whose
+    //    line endings are load-bearing: a `multipart/form-data` body captured
+    //    from a real request uses CRLF around its boundaries, and RFC 7578
+    //    parsers that match `\r\n--boundary` see *zero* parts once the CRLFs
+    //    become bare LFs. The same fold also swallowed a leading blank line.
+    let data = raw_http_body(raw).map(str::to_string);
+
+    // 4) Build URL
+    let url = if uri.starts_with("http://") || uri.starts_with("https://") {
+        // absolute-form URI in request line
+        Url::parse(uri)?
+    } else {
+        // origin-form; need Host header (or an HTTP/2 `:authority`)
+        // A `:authority` at all is itself an HTTP/2+ signal (hence TLS), so
+        // note it before `.or()` consumes it into `host`.
+        let had_pseudo_authority = pseudo_authority.is_some();
+        let host = host_header
+            .or(pseudo_authority)
+            .ok_or("missing Host header for origin-form request")?;
+        // An origin-form request line carries no scheme, so everything here is
+        // a hint. A `:scheme` pseudo-header is the request's own statement.
+        // Failing that, any HTTP/2+ signal — an `HTTP/2`/`HTTP/3` request line
+        // *or* a `:scheme`/`:authority` pseudo-header (a copy-as-HTTP/2 capture
+        // may carry the pseudo-headers but no version token) — means TLS:
+        // browsers only speak those over TLS, and a proxy capture of an HTTPS
+        // site records exactly that shape with a bare `Host: app`, so defaulting
+        // to `http` scanned a redirect (or nothing) instead of the captured
+        // page. Otherwise default to http, unless the Host names port 443.
+        let version = http_version.to_ascii_uppercase();
+        let http2_signal = version.starts_with("HTTP/2")
+            || version.starts_with("HTTP/3")
+            || pseudo_scheme.is_some()
+            || had_pseudo_authority;
+        let scheme = match pseudo_scheme.as_deref() {
+            Some("https") => "https",
+            Some("http") => "http",
+            _ if http2_signal => "https",
+            _ if host.ends_with(":443") => "https",
+            _ => "http",
+        };
+        let base = format!("{}://{}", scheme, host);
+        // An origin-form request-target is an absolute path on `host`, so it is
+        // appended to `base` textually rather than joined. `Url::join` treats a
+        // `//…`-prefixed target as an RFC 3986 network-path reference and parses
+        // its first segment as a *new authority* — so `GET //evil.com/admin`
+        // with `Host: internal.local` would silently retarget the scan at
+        // `http://evil.com/admin`, dropping the Host header entirely. Such
+        // double-slash paths turn up in real proxy captures (buggy client-side
+        // URL joins). Concatenating keeps the authority pinned to `host`, and
+        // still normalizes dot-segments and percent-encodes exactly as `join`
+        // did for the ordinary single-slash case. Non-path forms (`*`,
+        // authority-form) don't start with `/`, so they fall back to `join`.
+        if uri.starts_with('/') {
+            Url::parse(&format!("{}{}", base, uri))?
+        } else {
+            Url::parse(&base)?.join(uri)?
+        }
+    };
+
+    Ok(Target {
+        method,
+        multipart: data.as_deref().is_some_and(is_raw_multipart),
+        data,
+        headers: headers_vec,
+        cookies: cookies_vec,
+        user_agent,
+        ..Target::for_url(url)
+    })
+}
+
+/// Whether `data` is a captured `multipart/form-data` body (see
+/// [`raw_multipart_fields`]).
+pub(crate) fn is_raw_multipart(data: &str) -> bool {
+    raw_multipart_fields(data).is_some()
+}
+
+/// The fields of a `multipart/form-data` body kept as captured on the wire
+/// (raw HTTP, HAR, `-d`): each part's `name` with its content, in order. The
+/// boundary is read off the body's own first line, so no `Content-Type` is
+/// needed. `None` when `data` is not such a body, which callers read as
+/// urlencoded.
+pub(crate) fn raw_multipart_fields(data: &str) -> Option<Vec<(String, String)>> {
+    let boundary = data
+        .lines()
+        .next()?
+        .trim_end_matches('\r')
+        .strip_prefix("--")
+        .filter(|b| !b.is_empty() && !b.contains(char::is_whitespace))?;
+    let delimiter = format!("--{boundary}");
+    let mut fields = Vec::new();
+    for part in data.split(delimiter.as_str()).skip(1) {
+        if part.starts_with("--") {
+            break; // close delimiter
+        }
+        let part = part
+            .strip_prefix("\r\n")
+            .or_else(|| part.strip_prefix('\n'))
+            .unwrap_or(part);
+        let Some((head, body)) = part
+            .split_once("\r\n\r\n")
+            .or_else(|| part.split_once("\n\n"))
+        else {
+            continue;
+        };
+        let Some(name) = head.lines().find_map(content_disposition_name) else {
+            continue;
+        };
+        let value = body
+            .strip_suffix("\r\n")
+            .or_else(|| body.strip_suffix('\n'))
+            .unwrap_or(body);
+        fields.push((name, value.to_string()));
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// The field `name` of a `Content-Disposition: form-data` header line.
+/// Attributes are split on `;` before matching so a `filename="…"` — which
+/// contains `name="` as a substring — can't be mistaken for the field name.
+pub(crate) fn content_disposition_name(line: &str) -> Option<String> {
+    let line = line.trim();
+    if !line
+        .get(..20)
+        .is_some_and(|p| p.eq_ignore_ascii_case("content-disposition:"))
+    {
+        return None;
+    }
+    line.split(';').skip(1).find_map(|attr| {
+        let value = attr.trim().strip_prefix("name=")?.trim();
+        Some(
+            value
+                .strip_prefix('"')
+                .and_then(|v| v.split_once('"').map(|(n, _)| n))
+                .unwrap_or(value)
+                .to_string(),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod raw_http_tests;

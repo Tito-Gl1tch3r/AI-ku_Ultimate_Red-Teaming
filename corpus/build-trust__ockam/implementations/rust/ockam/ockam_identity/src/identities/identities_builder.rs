@@ -1,0 +1,94 @@
+use ockam_core::compat::sync::Arc;
+#[cfg(feature = "storage")]
+use ockam_core::Result;
+#[cfg(feature = "storage")]
+use ockam_node::database::SqlxDatabase;
+use ockam_vault::storage::SecretsRepository;
+
+use crate::identities::storage::CredentialRepository;
+use crate::identities::{ChangeHistoryRepository, Identities};
+use crate::purpose_keys::storage::PurposeKeysRepository;
+use crate::{IdentityAttributesRepository, Vault};
+
+/// Builder for Identities services
+#[derive(Clone)]
+pub struct IdentitiesBuilder {
+    pub(crate) vault: Vault,
+    pub(crate) change_history_repository: Arc<dyn ChangeHistoryRepository>,
+    pub(crate) identity_attributes_repository: Arc<dyn IdentityAttributesRepository>,
+    pub(crate) purpose_keys_repository: Arc<dyn PurposeKeysRepository>,
+    pub(crate) cached_credentials_repository: Arc<dyn CredentialRepository>,
+}
+
+/// Return a default identities
+#[cfg(feature = "storage")]
+pub async fn identities() -> Result<Arc<Identities>> {
+    Ok(Identities::builder().await?.build())
+}
+
+/// Return identities backed by a specific database
+#[cfg(feature = "storage")]
+pub fn create(database: SqlxDatabase, node_name: &str) -> Arc<Identities> {
+    Identities::create_with_node(database, node_name).build()
+}
+
+impl IdentitiesBuilder {
+    /// With Software Vault with given secrets repository
+    pub fn with_secrets_repository(mut self, repository: Arc<dyn SecretsRepository>) -> Self {
+        self.vault = Vault::create_with_secrets_repository(repository);
+        self
+    }
+
+    /// Set a Vault
+    pub fn with_vault(mut self, vault: Vault) -> Self {
+        self.vault = vault;
+        self
+    }
+
+    /// Set a specific repository for identities
+    pub fn with_change_history_repository(
+        mut self,
+        repository: Arc<dyn ChangeHistoryRepository>,
+    ) -> Self {
+        self.change_history_repository = repository;
+        self
+    }
+
+    /// Set a specific repository for identity attributes
+    pub fn with_identity_attributes_repository(
+        mut self,
+        repository: Arc<dyn IdentityAttributesRepository>,
+    ) -> Self {
+        self.identity_attributes_repository = repository;
+        self
+    }
+
+    /// Set a specific repository for Purpose Keys
+    pub fn with_purpose_keys_repository(
+        mut self,
+        repository: Arc<dyn PurposeKeysRepository>,
+    ) -> Self {
+        self.purpose_keys_repository = repository;
+        self
+    }
+
+    /// Set a specific repository for Cached Credentials
+    pub fn with_cached_credential_repository(
+        mut self,
+        repository: Arc<dyn CredentialRepository>,
+    ) -> Self {
+        self.cached_credentials_repository = repository;
+        self
+    }
+
+    /// Build identities
+    pub fn build(self) -> Arc<Identities> {
+        Arc::new(Identities::new(
+            self.vault,
+            self.change_history_repository,
+            self.identity_attributes_repository,
+            self.purpose_keys_repository,
+            self.cached_credentials_repository,
+        ))
+    }
+}

@@ -1,0 +1,117 @@
+package addon
+
+import (
+	"fmt"
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	"github.com/chainreactors/IoM-go/proto/services/clientrpc"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/client/repl"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/chainreactors/malice-network/helper/utils/pe"
+	"github.com/chainreactors/mals"
+	"github.com/kballard/go-shellquote"
+	"github.com/spf13/cobra"
+	"math"
+	"os"
+	"path/filepath"
+)
+
+type loadedAddon struct {
+	Command *cobra.Command
+	Func    *mals.MalFunction
+}
+
+func LoadAddonCmd(cmd *cobra.Command, con *core.Console) {
+	path := cmd.Flags().Arg(0)
+	module, _ := cmd.Flags().GetString("module")
+	name, _ := cmd.Flags().GetString("name")
+	//method, _ := cmd.Flags().GetString("method")
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	if module == "" {
+		module = pe.CheckExtModule(path)
+	}
+
+	session := con.GetInteractive()
+
+	if repl.CmdExist(con.ImplantMenu(), name) {
+		con.Log.Warnf("%s alread exist, please use -n/--name to specify a new name\n", name)
+		return
+	}
+
+	task, err := LoadAddon(con.Rpc, session, name, path, module)
+	if err != nil {
+		con.Log.Errorf("%s\n", err)
+		return
+	}
+
+	session.Console(task, string(*con.App.Shell().Line()))
+
+	con.AddCallback(task, func(_ *clientpb.TaskContext) {
+		updatedSession := session
+		if refreshed, err := con.UpdateSession(session.SessionId); err == nil && refreshed != nil {
+			updatedSession = refreshed
+		} else if err != nil {
+			con.Log.Warnf("refresh addon session %s failed: %v\n", session.SessionId, err)
+		}
+		if err := RefreshAddonCommand(updatedSession.Addons, con); err != nil {
+			con.Log.Warnf("refresh addon commands failed: %v\n", err)
+		}
+	})
+
+}
+
+func LoadAddon(rpc clientrpc.MaliceRPCClient, sess *client.Session, name, path, depend string) (*clientpb.Task, error) {
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return rpc.LoadAddon(sess.Context(), &implantpb.LoadAddon{
+		Name:   name,
+		Depend: depend,
+		Bin:    content,
+	})
+}
+
+func RegisterAddonCmd(addon *implantpb.Addon, con *core.Console) (*loadedAddon, error) {
+	addonCmd := &cobra.Command{
+		Use:   addon.Name,
+		Short: fmt.Sprintf("%s %s", addon.Depend, addon.Name),
+		Run: func(cmd *cobra.Command, args []string) {
+			ExecuteAddonCmd(cmd, con)
+		},
+		GroupID: consts.AddonGroup,
+	}
+
+	common.BindFlag(addonCmd, common.ExecuteFlagSet, common.SacrificeFlagSet)
+	return &loadedAddon{
+		Command: addonCmd,
+		Func: core.WrapImplantFunc(con, func(rpc clientrpc.MaliceRPCClient, sess *client.Session, args string, sac *implantpb.SacrificeProcess) (*clientpb.Task, error) {
+			cmdline, err := shellquote.Split(args)
+			if err != nil {
+				return nil, err
+			}
+			return ExecuteAddon(rpc, sess, addon.Name, cmdline, true, math.MaxUint32, sess.Os.Arch, "", sac)
+		}, output.ParseBinaryResponse),
+	}, nil
+}
+
+func RefreshAddonCommand(addons []*implantpb.Addon, con *core.Console) error {
+	implantCmd := con.ImplantMenu()
+	common.RemoveCommandsByGroup(implantCmd, consts.AddonGroup)
+	for _, addon := range addons {
+		loaded, err := RegisterAddonCmd(addon, con)
+		if err != nil {
+			return err
+		}
+		implantCmd.AddCommand(loaded.Command)
+	}
+	return nil
+}

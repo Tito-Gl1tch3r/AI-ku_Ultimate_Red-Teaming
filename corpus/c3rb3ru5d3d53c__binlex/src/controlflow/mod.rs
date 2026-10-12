@@ -1,0 +1,60 @@
+// MIT License
+//
+// Copyright (c) [2025] [c3rb3ru5d3d53c]
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+pub mod block;
+pub mod function;
+pub mod graph;
+pub mod instruction;
+pub mod reference;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityKind {
+    Instruction,
+    Block,
+    Function,
+}
+
+pub use block::Block;
+pub use block::BlockJson;
+pub use block::BlockJsonDeserializer;
+pub use function::Function;
+pub use function::FunctionJson;
+pub use function::FunctionJsonDeserializer;
+pub use graph::Graph;
+pub use graph::GraphQueue;
+pub use graph::GraphQueueSnapshot;
+pub use graph::GraphSnapshot;
+pub use instruction::FloatOperand;
+pub use instruction::ImmediateOperand;
+pub use instruction::Instruction;
+pub use instruction::InstructionDetail;
+pub use instruction::InstructionDetailKind;
+pub use instruction::InstructionJson;
+pub use instruction::InstructionRecord;
+pub use instruction::MemoryOperand;
+pub use instruction::Operand;
+pub use instruction::OperandKind;
+pub use instruction::RegisterOperand;
+pub use instruction::SpecialOperand;
+pub use reference::Reference;

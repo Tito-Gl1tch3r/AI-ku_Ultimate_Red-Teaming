@@ -1,0 +1,615 @@
+//! Discovery surface: form. See the module docs in `mod.rs`.
+
+use super::*;
+use std::collections::HashSet;
+
+/// Discover POST form parameters by parsing HTML forms from the GET response.
+#[cfg(test)]
+pub async fn check_form_discovery(
+    target: &Target,
+    reflection_params: Arc<Mutex<Vec<Param>>>,
+    semaphore: Arc<Semaphore>,
+) {
+    check_form_discovery_with(target, &ScanArgs::default(), reflection_params, semaphore).await;
+}
+
+/// [`check_form_discovery`] under the scan's `args`, which can keep form fields
+/// whose submission did not echo the probe marker.
+///
+/// That happens under `--sxss`. Every probe here keeps a field only
+/// when the marker comes back in the *immediate* response, which a stored sink
+/// by definition fails: a comment form's write endpoint answers "saved" and
+/// the value surfaces later, on the page that lists comments. Dropping those
+/// fields left the scan with nothing to test, so `--sxss` against the canonical
+/// form-backed stored sink reported clean without ever requesting the
+/// retrieval URL. Kept fields carry `form_action_url` / `form_origin_url`, which
+/// is what the stored-XSS stages resolve their check URLs from, and the
+/// Stage-0 probe still drops any field whose value is never stored.
+pub(crate) async fn check_form_discovery_with(
+    target: &Target,
+    args: &ScanArgs,
+    reflection_params: Arc<Mutex<Vec<Param>>>,
+    semaphore: Arc<Semaphore>,
+) {
+    let keep_unreflected = args.sxss;
+    // Only discover forms when the target doesn't already have POST data
+    if target.data.is_some() || target.method.eq_ignore_ascii_case("POST") {
+        return;
+    }
+
+    let client = target.build_client_or_default();
+    let test_value = crate::scanning::markers::bracketed_marker();
+
+    // Fetch the page via GET to find forms
+    let method = reqwest::Method::GET;
+    let request = crate::utils::build_request(&client, target, method, target.url.clone(), None);
+    crate::record_outbound_request().await;
+    let html = match crate::utils::http::send_counted(request).await {
+        Ok(resp) => match crate::utils::http::read_body_counted(resp).await {
+            Ok(text) => text,
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+
+    /// Most fields probed per discovered form. See the truncation site below:
+    /// the probing cost is quadratic in the field count, so this bounds what a
+    /// single hostile (or generated) page can make a scan spend.
+    const MAX_FORM_FIELDS: usize = 200;
+
+    /// Most distinct forms probed per page, and most distinct inline-JSON /
+    /// `JSON.stringify` key sets. Each costs a probe per field, and nothing
+    /// else bounded how many a page could declare: a page of 400 000 tiny
+    /// forms was 800 000 discovery requests. Identical forms (same action,
+    /// method, encoding and field names — a product grid's add-to-cart forms)
+    /// are folded first, so the cap only bites on genuinely distinct ones.
+    const MAX_DISTINCT_FORMS: usize = 100;
+
+    // Fully-owned form descriptor extracted from the HTML. Keeping these as
+    // Send-safe `String` / `Url` lets the scraper document get dropped before
+    // the async probing loop below, which is a prerequisite for ever moving
+    // this function off the current_thread runtime.
+    struct FormInfo {
+        url: url::Url,
+        is_post: bool,
+        is_multipart: bool,
+        fields: Vec<(String, String)>,
+    }
+
+    // Parse forms in a tight scope so `scraper::Html` (which is !Send) never
+    // escapes. Collect into `Vec<FormInfo>` before touching any await.
+    let forms: Vec<FormInfo> = {
+        let document = crate::utils::html::parse_document_bounded(&html);
+        let form_sel = selectors::form();
+        let input_sel = selectors::input_textarea_select();
+
+        let mut out = Vec::new();
+        let mut seen_forms: HashSet<(String, bool, bool, Vec<String>)> = HashSet::new();
+        for form in document.select(form_sel) {
+            if out.len() >= MAX_DISTINCT_FORMS {
+                crate::dbg_log!(
+                    "page declares more than {} distinct forms; probing the first {}",
+                    MAX_DISTINCT_FORMS,
+                    MAX_DISTINCT_FORMS
+                );
+                break;
+            }
+            let form_method = form.value().attr("method").unwrap_or("get");
+            let is_post = form_method.eq_ignore_ascii_case("post");
+            let enctype = form.value().attr("enctype").unwrap_or("");
+            let is_multipart = enctype.eq_ignore_ascii_case("multipart/form-data");
+
+            // Only probe forms whose action the scan is allowed to send the
+            // operator's credentials to; see the resolver for what that means
+            // and why the action attribute cannot be trusted.
+            let action = form.value().attr("action").unwrap_or("");
+            let Some(form_url) =
+                crate::utils::http::resolve_probeable_form_action(&target.url, action)
+                    .filter(|u| args.url_in_scope(u.as_str()))
+            else {
+                continue;
+            };
+
+            let mut fields: Vec<(String, String)> = Vec::new();
+            for input in form.select(input_sel) {
+                let name = input.value().attr("name").unwrap_or("").to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let value = input.value().attr("value").unwrap_or("").to_string();
+                fields.push((name, value));
+            }
+            if fields.is_empty() {
+                continue;
+            }
+            // Cap the field list. Probing a form is O(fields²) in work *and* in
+            // bytes: each field gets its own request, and each of those
+            // requests rebuilds the entire multipart body. A page serving a
+            // form with 50 000 inputs therefore costs 50 000 requests carrying
+            // ~2.5e9 field copies between them. `MAX_DISCOVERED_PARAMS` bounds
+            // the params a scan carries, but only *after* discovery has already
+            // paid for them, and only on the server/MCP paths.
+            //
+            // Note what is capped: the number of fields *probed*, not the field
+            // list itself. Truncating `fields` looked equivalent but was not —
+            // the same vector builds the submitted body, so a >200-field form
+            // would be probed with an incomplete body. Servers reject a form
+            // submission missing its required fields, so those probes come back
+            // non-reflecting and the form can lose discovery of *every* one of
+            // its parameters, not just the ones past the cap.
+            if fields.len() > MAX_FORM_FIELDS {
+                crate::dbg_log!(
+                    "form at {} has {} fields; probing the first {} (all are still submitted)",
+                    form_url,
+                    fields.len(),
+                    MAX_FORM_FIELDS
+                );
+            }
+
+            // The same form repeated (one per product row, per comment, …)
+            // probes the same slots with the same request shape.
+            let form_key = (
+                form_url.to_string(),
+                is_post,
+                is_multipart,
+                fields.iter().map(|(name, _)| name.clone()).collect(),
+            );
+            if !seen_forms.insert(form_key) {
+                continue;
+            }
+
+            out.push(FormInfo {
+                url: form_url,
+                is_post,
+                is_multipart,
+                fields,
+            });
+        }
+        out
+    };
+
+    let mut batch: Vec<Param> = Vec::new();
+
+    for FormInfo {
+        url: form_url,
+        is_post,
+        is_multipart,
+        fields,
+    } in forms
+    {
+        if is_post && is_multipart {
+            // Multipart form: test each field via multipart/form-data POST
+            for (field_idx, (field_name, field_value)) in
+                fields.iter().enumerate().take(MAX_FORM_FIELDS)
+            {
+                let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
+                let mut form = reqwest::multipart::Form::new();
+                for (i, (n, v)) in fields.iter().enumerate() {
+                    if i == field_idx {
+                        form = form.text(n.clone(), test_value.to_string());
+                    } else {
+                        form = form.text(n.clone(), v.clone());
+                    }
+                }
+                let rb = crate::utils::build_body_request_base(
+                    &client,
+                    target,
+                    reqwest::Method::POST,
+                    form_url.clone(),
+                    None,
+                )
+                .multipart(form);
+                crate::record_outbound_request().await;
+                if let Some(param) = form_field_param(
+                    crate::utils::http::send_counted(rb).await,
+                    keep_unreflected,
+                    Param {
+                        form_action_url: Some(form_url.to_string()),
+                        form_origin_url: Some(target.url.to_string()),
+                        ..Param::new(
+                            field_name.clone(),
+                            field_value.clone(),
+                            crate::parameter_analysis::Location::MultipartBody,
+                        )
+                    },
+                )
+                .await
+                {
+                    batch.push(param);
+                }
+                if target.delay > 0 {
+                    sleep(Duration::from_millis(target.delay)).await;
+                }
+            }
+        } else if is_post {
+            // Pre-encode field names and values once for form body construction
+            let encoded_fields: Vec<(String, String)> = fields
+                .iter()
+                .map(|(n, v)| {
+                    let enc_n =
+                        url::form_urlencoded::byte_serialize(n.as_bytes()).collect::<String>();
+                    let enc_v =
+                        url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>();
+                    (enc_n, enc_v)
+                })
+                .collect();
+            let encoded_test_value: String =
+                url::form_urlencoded::byte_serialize(test_value.as_bytes()).collect();
+
+            // Test each field for reflection via POST
+            for (field_idx, (field_name, field_value)) in
+                fields.iter().enumerate().take(MAX_FORM_FIELDS)
+            {
+                let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
+                // Build body by joining pre-encoded pairs, substituting the target field
+                let body = encoded_fields.iter().enumerate().fold(
+                    String::new(),
+                    |mut acc, (i, (enc_n, enc_v))| {
+                        if !acc.is_empty() {
+                            acc.push('&');
+                        }
+                        acc.push_str(enc_n);
+                        acc.push('=');
+                        if i == field_idx {
+                            acc.push_str(&encoded_test_value);
+                        } else {
+                            acc.push_str(enc_v);
+                        }
+                        acc
+                    },
+                );
+                let m = reqwest::Method::POST;
+                let rb = crate::utils::build_body_request_base(
+                    &client,
+                    target,
+                    m,
+                    form_url.clone(),
+                    Some(body),
+                );
+                let rb = crate::utils::apply_header_overrides(
+                    rb,
+                    &[(
+                        "Content-Type".to_string(),
+                        "application/x-www-form-urlencoded".to_string(),
+                    )],
+                );
+                crate::record_outbound_request().await;
+                if let Some(param) = form_field_param(
+                    crate::utils::http::send_counted(rb).await,
+                    keep_unreflected,
+                    Param {
+                        form_action_url: Some(form_url.to_string()),
+                        form_origin_url: Some(target.url.to_string()),
+                        ..Param::new(
+                            field_name.clone(),
+                            field_value.clone(),
+                            crate::parameter_analysis::Location::Body,
+                        )
+                    },
+                )
+                .await
+                {
+                    batch.push(param);
+                }
+                if target.delay > 0 {
+                    sleep(Duration::from_millis(target.delay)).await;
+                }
+            }
+        } else {
+            // GET form: test each field as query parameter on the form action URL.
+            // Capped like the POST and multipart branches above: this loop was
+            // the one that was not, so a page serving a GET form with 50 000
+            // inputs bought 50 000 requests (each rebuilding the whole query
+            // string) while the debug log above still claimed only the first
+            // `MAX_FORM_FIELDS` were probed.
+            for (field_name, field_value) in fields.iter().take(MAX_FORM_FIELDS) {
+                let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
+                let mut test_url = form_url.clone();
+                // Build query: set all fields, replace target field with test value
+                {
+                    let mut pairs: Vec<(String, String)> = test_url
+                        .query_pairs()
+                        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                        .collect();
+                    let action_names: HashSet<String> =
+                        pairs.iter().map(|(name, _)| name.clone()).collect();
+                    for (n, v) in &fields {
+                        let value = if n == field_name {
+                            test_value.to_string()
+                        } else {
+                            v.clone()
+                        };
+                        if action_names.contains(n) {
+                            // Like the scan sender, replace every existing
+                            // occurrence of a tested key so an earlier page
+                            // query value cannot hide the probe from
+                            // first-value servers.
+                            for (action_name, action_value) in &mut pairs {
+                                if action_name == n {
+                                    *action_value = value.clone();
+                                }
+                            }
+                        } else {
+                            pairs.push((n.clone(), value));
+                        }
+                    }
+                    // A browser GET form replaces the action URL's query.
+                    // Dalfox crafts this probe URL directly: retain unrelated
+                    // static action params such as `mode=search`, replacing
+                    // colliding keys and appending only new field names.
+                    let mut query = test_url.query_pairs_mut();
+                    query.clear();
+                    query.extend_pairs(&pairs);
+                }
+                let m = reqwest::Method::GET;
+                let rb = crate::utils::build_request(&client, target, m, test_url.clone(), None);
+                crate::record_outbound_request().await;
+                if let Some(param) = form_field_param(
+                    crate::utils::http::send_counted(rb).await,
+                    keep_unreflected,
+                    Param {
+                        form_action_url: Some(form_url.to_string()),
+                        form_origin_url: Some(target.url.to_string()),
+                        ..Param::new(
+                            field_name.clone(),
+                            field_value.clone(),
+                            crate::parameter_analysis::Location::Query,
+                        )
+                    },
+                )
+                .await
+                {
+                    batch.push(param);
+                }
+                if target.delay > 0 {
+                    sleep(Duration::from_millis(target.delay)).await;
+                }
+            }
+        }
+
+        // Also try JSON body if the form has a single text-like field
+        if fields.len() <= 3 {
+            let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
+            let json_body = {
+                let mut map = serde_json::Map::new();
+                for (n, _) in &fields {
+                    map.insert(n.clone(), serde_json::Value::String(test_value.to_string()));
+                }
+                serde_json::Value::Object(map).to_string()
+            };
+            let m = reqwest::Method::POST;
+            let rb = crate::utils::build_body_request_base(
+                &client,
+                target,
+                m,
+                form_url.clone(),
+                Some(json_body),
+            );
+            let rb = crate::utils::apply_header_overrides(
+                rb,
+                &[("Content-Type".to_string(), "application/json".to_string())],
+            );
+            crate::record_outbound_request().await;
+            if let Ok(resp) = crate::utils::http::send_counted(rb).await
+                && let Ok(text) = crate::utils::http::read_body_counted(resp).await
+                && crate::scanning::markers::probe_reflected(&text)
+            {
+                let analysis = ReflectionAnalysis::of(&text);
+                for (field_name, field_value) in &fields {
+                    batch.push(
+                        Param {
+                            form_action_url: Some(form_url.to_string()),
+                            form_origin_url: Some(target.url.to_string()),
+                            ..Param::new(
+                                field_name.clone(),
+                                field_value.clone(),
+                                crate::parameter_analysis::Location::JsonBody,
+                            )
+                        }
+                        .with_analysis(&analysis),
+                    );
+                }
+            }
+        }
+    }
+
+    // Detect inline JSON object hints in page body (e.g., {"name":"value"} in text or code).
+    // This catches cases where the page documents a JSON API without using JSON.stringify.
+    {
+        static JSON_INLINE_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let inline_re = JSON_INLINE_RE.get_or_init(|| {
+            regex::Regex::new(r#"\{["\s]*"(\w+)"["\s]*:["\s]*"[^"]*"[^}]*\}"#)
+                .expect("inline JSON regex is valid")
+        });
+        let mut seen_key_sets: HashSet<Vec<String>> = HashSet::new();
+        for caps in inline_re.captures_iter(&html) {
+            if seen_key_sets.len() >= MAX_DISTINCT_FORMS {
+                break;
+            }
+            let full = caps.get(0).map_or("", |m| m.as_str());
+            // Try to parse as JSON
+            if let Ok(serde_json::Value::Object(obj)) =
+                serde_json::from_str::<serde_json::Value>(full)
+            {
+                let keys: Vec<String> = obj.keys().cloned().collect();
+                if keys.is_empty() {
+                    continue;
+                }
+                // Skip if all keys are already known
+                let all_known = {
+                    let guard = reflection_params.lock().await;
+                    keys.iter().all(|k| {
+                        guard
+                            .iter()
+                            .any(|p| p.name == *k && matches!(p.location, Location::JsonBody))
+                    })
+                };
+                if all_known {
+                    continue;
+                }
+                // The same object repeated on the page (a list of records,
+                // a documented example) probes the same keys again.
+                let mut key_set = keys.clone();
+                key_set.sort();
+                if !seen_key_sets.insert(key_set) {
+                    continue;
+                }
+
+                // Each probe re-sends the whole object, so cost is keys^2 bytes;
+                // probe only the first MAX_FORM_FIELDS keys (full body kept).
+                for key in keys.iter().take(MAX_FORM_FIELDS) {
+                    let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in &obj {
+                        if k == key {
+                            map.insert(
+                                k.clone(),
+                                serde_json::Value::String(test_value.to_string()),
+                            );
+                        } else {
+                            map.insert(k.clone(), v.clone());
+                        }
+                    }
+                    let json_body = serde_json::Value::Object(map).to_string();
+                    let m = reqwest::Method::POST;
+                    let rb = crate::utils::build_body_request_base(
+                        &client,
+                        target,
+                        m,
+                        target.url.clone(),
+                        Some(json_body),
+                    );
+                    let rb = crate::utils::apply_header_overrides(
+                        rb,
+                        &[("Content-Type".to_string(), "application/json".to_string())],
+                    );
+                    crate::record_outbound_request().await;
+                    if let Ok(resp) = crate::utils::http::send_counted(rb).await
+                        && let Ok(text) = crate::utils::http::read_body_counted(resp).await
+                        && crate::scanning::markers::probe_reflected(&text)
+                    {
+                        batch.push(
+                            Param {
+                                form_action_url: Some(target.url.to_string()),
+                                form_origin_url: Some(target.url.to_string()),
+                                ..Param::new(
+                                    key.clone(),
+                                    "a".to_string(),
+                                    crate::parameter_analysis::Location::JsonBody,
+                                )
+                            }
+                            .with_reflection_analysis(&text),
+                        );
+                    }
+                    if target.delay > 0 {
+                        sleep(Duration::from_millis(target.delay)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Also detect JSON POST endpoints from JavaScript (XHR / fetch with JSON.stringify)
+    // Look for patterns like: JSON.stringify({"key":"value",...})
+    {
+        let re = json_stringify_regex();
+        let mut seen_key_sets: HashSet<Vec<String>> = HashSet::new();
+        for caps in re.captures_iter(&html) {
+            if seen_key_sets.len() >= MAX_DISTINCT_FORMS {
+                break;
+            }
+            if let Some(inner) = caps.get(1) {
+                // Parse key names from the JSON-like object literal
+                let key_re = json_key_regex();
+                let mut json_fields: Vec<(String, String)> = Vec::new();
+                for kcap in key_re.captures_iter(inner.as_str()) {
+                    if let Some(k) = kcap.get(1) {
+                        json_fields.push((k.as_str().to_string(), "a".to_string()));
+                    }
+                }
+                if json_fields.is_empty() {
+                    continue;
+                }
+                let key_set: Vec<String> = json_fields.iter().map(|(k, _)| k.clone()).collect();
+                if !seen_key_sets.insert(key_set) {
+                    continue;
+                }
+
+                // Try JSON body with each field replaced by test_value
+                for (field_name, field_value) in json_fields.iter().take(MAX_FORM_FIELDS) {
+                    let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
+                    let mut map = serde_json::Map::new();
+                    for (n, v) in &json_fields {
+                        if n == field_name {
+                            map.insert(
+                                n.clone(),
+                                serde_json::Value::String(test_value.to_string()),
+                            );
+                        } else {
+                            map.insert(n.clone(), serde_json::Value::String(v.clone()));
+                        }
+                    }
+                    let json_body = serde_json::Value::Object(map).to_string();
+                    let m = reqwest::Method::POST;
+                    let rb = crate::utils::build_body_request_base(
+                        &client,
+                        target,
+                        m,
+                        target.url.clone(),
+                        Some(json_body),
+                    );
+                    let rb = crate::utils::apply_header_overrides(
+                        rb,
+                        &[("Content-Type".to_string(), "application/json".to_string())],
+                    );
+                    crate::record_outbound_request().await;
+                    if let Ok(resp) = crate::utils::http::send_counted(rb).await
+                        && let Ok(text) = crate::utils::http::read_body_counted(resp).await
+                        && crate::scanning::markers::probe_reflected(&text)
+                    {
+                        batch.push(
+                            Param {
+                                form_action_url: Some(target.url.to_string()),
+                                form_origin_url: Some(target.url.to_string()),
+                                ..Param::new(
+                                    field_name.clone(),
+                                    field_value.clone(),
+                                    crate::parameter_analysis::Location::JsonBody,
+                                )
+                            }
+                            .with_reflection_analysis(&text),
+                        );
+                    }
+                    if target.delay > 0 {
+                        sleep(Duration::from_millis(target.delay)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    if !batch.is_empty() {
+        let mut guard = reflection_params.lock().await;
+        guard.extend(batch);
+    }
+}
+
+/// Turn one form-field probe response into a discovered param: kept with its
+/// reflection analysis when the marker echoed, kept bare when it did not but
+/// `keep_unreflected` asks for it (`--sxss`, see [`check_form_discovery_with`]),
+/// dropped otherwise. A probe that never got a response keeps nothing either
+/// way — an unreachable form is not evidence of a stored sink.
+async fn form_field_param(
+    sent: Result<reqwest::Response, reqwest::Error>,
+    keep_unreflected: bool,
+    param: Param,
+) -> Option<Param> {
+    let text = crate::utils::http::read_body_counted(sent.ok()?)
+        .await
+        .ok()?;
+    if crate::scanning::markers::probe_reflected(&text) {
+        Some(param.with_reflection_analysis(&text))
+    } else {
+        keep_unreflected.then_some(param)
+    }
+}

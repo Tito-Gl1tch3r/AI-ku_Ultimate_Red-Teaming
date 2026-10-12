@@ -1,0 +1,855 @@
+using ImGuiNET;
+using Microsoft.Xna.Framework.Input;
+using OpenKh.Common;
+using OpenKh.Engine.Renders;
+using OpenKh.Kh2;
+using OpenKh.Kh2.Extensions;
+using OpenKh.Tools.Common;
+using OpenKh.Tools.Common.CustomImGui;
+using OpenKh.Tools.LayoutEditor.Dialogs;
+using OpenKh.Tools.LayoutEditor.Interfaces;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Numerics;
+using System.Windows;
+using Xe.Tools.Wpf.Dialogs;
+
+using static OpenKh.Tools.Common.CustomImGui.ImGuiEx;
+
+namespace OpenKh.Tools.LayoutEditor
+{
+    public class App : IEditorSettings, IDisposable
+    {
+        private static readonly List<FileDialogFilter> Filters = FileDialogFilterComposer
+            .Compose()
+            .AddPatterns("All supported files", "2ld;*.lad;*.2dd;*.map;P_*.a.*;00font.bar;10font.bar")
+            .AddExtensions("2LD Layout container file", "2ld", "lad")
+            .AddExtensions("2DD Sequence container file", "2dd")
+            .AddExtensions("MAP file", "map")
+            .AddExtensions("Character file", "a.*")
+            .AddPatterns("00font and 10font", "00font.bar", "10font.bar")
+            .AddAllFiles();
+        private static readonly List<FileDialogFilter> ImzFilter = FileDialogFilterComposer
+            .Compose()
+            .AddExtensions("Image container IMGZ", "imz")
+            .AddAllFiles();
+        private static readonly List<FileDialogFilter> ImdFilter = FileDialogFilterComposer
+            .Compose()
+            .AddExtensions("Image IMGD", "imd")
+            .AddAllFiles();
+        private const string DefaultName = "FAKE";
+
+        private readonly MonoGameImGuiBootstrap _bootstrap;
+        private bool _exitFlag = false;
+
+        private string _animationName;
+        private string _spriteName;
+        private string _fileName;
+        private ToolInvokeDesc _toolInvokeDesc;
+        private IApp _app;
+
+        private bool _linkToPcsx2;
+        private ProcessStream _processStream;
+        private int _processOffset;
+
+        private const string LinkToPcsx2ActionName = "Open file and link it to PCSX2";
+        private const string ResourceSelectionDialogTitle = "Resource selection";
+        private const string PreviewTitle = "In-Game Preview Target";
+        private const string TargetSelectTitle = "In-Game Target Selection";
+
+        private bool _isResourceSelectionDialogOpening;
+        private bool _isResourceSelectingLayout;
+
+        private bool _isPrevDialogOpening;
+        private bool _isTargetDialogOpening;
+
+        private PreviewTargetDialog _prevDialog;
+        private TargetSelectionDialog _targetDialog;
+        private ResourceSelectionDialog _resourceSelectionDialog;
+
+
+        private Dictionary<Keys, Action> _keyMapping = new Dictionary<Keys, Action>();
+
+        public event IEditorSettings.ChangeBackground OnChangeBackground;
+
+        public string Title
+        {
+            get
+            {
+                var contentName = IsBar ? $"{AnimationName ?? DefaultName},{TextureName ?? DefaultName} | " : string.Empty;
+                var fileName = IsToolDesc ? _toolInvokeDesc.Title : (FileName ?? "untitled");
+                if (_processStream != null)
+                    fileName = $"{fileName}@pcsx2:{_processOffset}";
+
+                return $"{contentName}{fileName} | {MonoGameImGuiBootstrap.ApplicationName}";
+            }
+        }
+
+        private string FileName
+        {
+            get => _fileName;
+            set
+            {
+                _fileName = value;
+                UpdateTitle();
+            }
+        }
+
+        public bool IsToolDesc => _toolInvokeDesc != null;
+        public ISaveBar CurrentEditor { get; private set; }
+
+        public bool IsBar { get; set; }
+
+        public string AnimationName
+        {
+            get => _animationName;
+            set => _animationName = value.Length > 4 ? value.Substring(0, 4) : value;
+        }
+
+        public string TextureName
+        {
+            get => _spriteName;
+            set => _spriteName = value.Length > 4 ? value.Substring(0, 4) : value;
+        }
+
+        public bool CheckerboardBackground { get; set; }
+
+        public bool UseBlankBackground
+        {
+            get => Settings.Default.UseBlankBackground;
+            set
+            {
+                Settings.Default.UseBlankBackground = value;
+                Settings.Default.Save();
+            }
+        }
+
+        public ColorF EditorBackground
+        {
+            get
+            {
+                if (UseBlankBackground)
+                    return new ColorF(0f, 0f, 0f, 0f); // Fully transparent
+
+                return new ColorF(Settings.Default.BgColorR, Settings.Default.BgColorG,
+                    Settings.Default.BgColorB, 1f);
+            }
+            set
+            {
+                Settings.Default.BgColorR = value.R;
+                Settings.Default.BgColorG = value.G;
+                Settings.Default.BgColorB = value.B;
+                Settings.Default.Save();
+            }
+        }
+
+        public bool ShowViewportOriginal
+        {
+            get => Settings.Default.ShowViewportOriginal;
+            set
+            {
+                Settings.Default.ShowViewportOriginal = value;
+                Settings.Default.Save();
+            }
+        }
+
+        public bool ShowViewportRemix
+        {
+            get => Settings.Default.ShowViewportRemix;
+            set
+            {
+                Settings.Default.ShowViewportRemix = value;
+                Settings.Default.Save();
+            }
+        }
+
+        public bool ShowViewportReFined
+        {
+            get => Settings.Default.ShowViewportReFined;
+            set
+            {
+                Settings.Default.ShowViewportReFined = value;
+                Settings.Default.Save();
+            }
+        }
+
+        public bool IsViewportOnTop
+        {
+            get => Settings.Default.IsViewportOnTop;
+            set
+            {
+                Settings.Default.IsViewportOnTop = value;
+                Settings.Default.Save();
+            }
+        }
+
+        public App(MonoGameImGuiBootstrap bootstrap)
+        {
+            _bootstrap = bootstrap;
+            _bootstrap.Title = Title;
+            AddKeyMapping(Keys.O, MenuFileOpenWithoutPcsx2);
+            AddKeyMapping(Keys.L, MenuFileOpenPcsx2);
+            AddKeyMapping(Keys.S, MenuFileSave);
+        }
+
+        public bool MainLoop()
+        {
+            ProcessKeyMapping();
+
+            bool dummy = true;
+            if (ImGui.BeginPopupModal(ResourceSelectionDialogTitle, ref dummy,
+                ImGuiWindowFlags.Popup | ImGuiWindowFlags.Modal | ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                _resourceSelectionDialog.Run();
+                ImGui.EndPopup();
+
+                if (_resourceSelectionDialog.HasResourceBeenSelected)
+                {
+                    if (_isResourceSelectingLayout)
+                        OpenLayoutEditor(_resourceSelectionDialog.SelectedAnimation,
+                            _resourceSelectionDialog.SelectedTexture);
+                    else
+                        OpenSequenceEditor(_resourceSelectionDialog.SelectedAnimation,
+                            _resourceSelectionDialog.SelectedTexture);
+                }
+            }
+
+            if (ImGui.BeginPopupModal(PreviewTitle, ref dummy,
+                ImGuiWindowFlags.Popup | ImGuiWindowFlags.Modal | ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                _prevDialog.Run();
+                ImGui.EndPopup();
+            }
+
+            if (ImGui.BeginPopupModal(TargetSelectTitle, ref dummy,
+            ImGuiWindowFlags.Popup | ImGuiWindowFlags.Modal | ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                _targetDialog.Run();
+                ImGui.EndPopup();
+
+                if (_targetDialog.HasTargetBeenSelected)
+                {
+                    var _fetchFile = CurrentEditor.SaveAnimation("comw");
+                    var _memStream = new MemoryStream((int)_fetchFile.Stream.Length);
+
+                    ulong _offset = _fetchFile.Type == Bar.EntryType.Seqd ? (ulong)0x00 : (ulong)0x20;
+
+                    _fetchFile.Stream.Position = 0;
+                    _fetchFile.Stream.CopyTo(_memStream);
+
+                    Hypervisor.WriteArray(_prevDialog.FetchedPointer + (ulong)_targetDialog.SelectedAnimation.Offset + _offset, _memStream.ToArray(), true);
+
+                    _prevDialog = null;
+                    _targetDialog = null;
+                }
+            }
+
+            ImGuiEx.MainWindow(() =>
+            {
+                MainMenu();
+                MainWindow();
+            });
+
+            if (_isResourceSelectionDialogOpening)
+            {
+                ImGui.OpenPopup(ResourceSelectionDialogTitle);
+                _isResourceSelectionDialogOpening = false;
+            }
+
+            if (_isPrevDialogOpening)
+            {
+                ImGui.OpenPopup(PreviewTitle);
+                _isPrevDialogOpening = false;
+            }
+
+            if (_prevDialog != null && _prevDialog.FetchedFile != null && _targetDialog == null)
+            {
+                var _barFile = _prevDialog.FetchedFile;
+
+                var sequenceEntry = _barFile.FirstOrDefault(x => x.Type == Bar.EntryType.Seqd);
+                var layoutEntry = _barFile.FirstOrDefault(x => x.Type == Bar.EntryType.Layout);
+
+                _targetDialog = new TargetSelectionDialog(_barFile, sequenceEntry == null ? Bar.EntryType.Layout : Bar.EntryType.Seqd);
+
+                ImGui.OpenPopup(TargetSelectTitle);
+                _isTargetDialogOpening = true;
+            }
+
+            return _exitFlag;
+        }
+
+        public void Dispose()
+        {
+            CloseProcessStream();
+        }
+
+        private void MainWindow()
+        {
+            if (_app != null)
+            {
+                _app.Run();
+            }
+            else
+            {
+                ImGui.Text("No files loaded at the moment");
+            }
+        }
+
+        void MainMenu()
+        {
+            ForMenuBar(() =>
+            {
+                ForMenu("File", () =>
+                {
+                    ForMenuItem("Open...", "CTRL+O", MenuFileOpenWithoutPcsx2);
+                    ForMenuItem($"{LinkToPcsx2ActionName}...", "CTRL+L", MenuFileOpenPcsx2);
+                    ForMenuItem("Save", "CTRL+S", MenuFileSave, CurrentEditor != null);
+                    ForMenuItem("Save as...", MenuFileSaveAs, CurrentEditor != null);
+                    ImGui.Separator();
+                    ForMenuItem("Export Animation/Layout...", MenuFileExportAnimation, CurrentEditor != null);
+                    ForMenuItem("Export Texture(s)...", MenuFileExportTexture, CurrentEditor != null);
+                    ForMenuItem("Export Layout as Animated GIF...", MenuFileExportLayoutAsGif, CurrentEditor is AppLayoutEditor);
+                    ForMenuItem("Export Layout as PNG Sequence...", MenuFileExportLayoutAsPngSequence, CurrentEditor is AppLayoutEditor);
+                    ImGui.Separator();
+                    ForMenuItem("Preview In-Game...", MenuFilePreview, CurrentEditor != null);
+                    ImGui.Separator();
+                    ForMenu("Preferences", () =>
+                    {
+                        // Add the blank background toggle FIRST
+                        ForMenuCheck("Use blank background", () => UseBlankBackground, x =>
+                        {
+                            UseBlankBackground = x;
+                            OnChangeBackground?.Invoke(this, this);
+                        });
+
+                        // Then the color picker (disabled when blank is on)
+                        ImGui.BeginDisabled(UseBlankBackground);
+                        var editorBackground = new Vector3(EditorBackground.R,
+                            EditorBackground.G, EditorBackground.B);
+                        if (ImGui.ColorEdit3("Background color", ref editorBackground))
+                        {
+                            EditorBackground = new ColorF(editorBackground.X,
+                                editorBackground.Y, editorBackground.Z, 1f);
+                            OnChangeBackground?.Invoke(this, this);
+                        }
+                        ImGui.EndDisabled();
+
+                        ForMenuCheck("Show PS2 viewport", () => ShowViewportOriginal, x => ShowViewportOriginal = x);
+                        ForMenuCheck("Show ReMIX viewport", () => ShowViewportRemix, x => ShowViewportRemix = x);
+                        ForMenuCheck("Show Re:Fined viewport", () => ShowViewportReFined, x => ShowViewportReFined = x);
+                        ForMenuCheck("Viewport always on top", () => IsViewportOnTop, x => IsViewportOnTop = x);
+                    });
+                    ImGui.Separator();
+                    ForMenuItem("Exit", MenuFileExit);
+                });
+                _app?.Menu();
+                ForMenu("Help", () =>
+                {
+                    ForMenuItem("About", ShowAboutDialog);
+                });
+            });
+        }
+
+        private void MenuFileOpen()
+        {
+            FileDialog.OnOpen(fileName =>
+            {
+                OpenFile(fileName);
+            }, Filters);
+        }
+
+        private void MenuFilePreview()
+        {
+            OpenPreviewDialog();
+        }
+
+        private void MenuFileOpenWithoutPcsx2()
+        {
+            _linkToPcsx2 = false;
+            CloseProcessStream();
+            MenuFileOpen();
+        }
+
+        private void MenuFileOpenPcsx2()
+        {
+            CloseProcessStream();
+            var processes = Process.GetProcessesByName("pcsx2");
+            if (processes.Length == 0)
+            {
+                ShowLinkPcsx2ErrorProcessNotFound();
+                return;
+            }
+
+            _linkToPcsx2 = true;
+            MenuFileOpen();
+        }
+
+        private void MenuFileSave()
+        {
+            if (!string.IsNullOrEmpty(FileName))
+                SaveFile(FileName, FileName);
+            else
+                MenuFileSaveAs();
+        }
+
+        private void MenuFileSaveAs()
+        {
+            FileDialog.OnSave(fileName =>
+            {
+                SaveFile(FileName, fileName);
+                FileName = fileName;
+            }, Filters);
+        }
+
+        private void MenuFileExportAnimation()
+        {
+            if (CurrentEditor == null)
+                return;
+
+            var animationEntry = CurrentEditor.SaveAnimation(AnimationName ?? "export");
+
+            // Determine file extension based on Type (EntryType)
+            string extension = animationEntry.Type == Bar.EntryType.Layout ? "lad" : "sed";
+            string filterName = animationEntry.Type == Bar.EntryType.Layout ? "Layout file" : "Sequence file";
+
+            var exportFilter = FileDialogFilterComposer
+                .Compose()
+                .AddExtensions(filterName, extension)
+                .AddAllFiles();
+
+            FileDialog.OnSave(fileName =>
+            {
+                try
+                {
+                    using var stream = File.Create(fileName);
+                    animationEntry.Stream.SetPosition(0).CopyTo(stream);
+                    MessageBox.Show($"Animation/Layout exported successfully to:\n{fileName}",
+                        "Export Successful", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch (Exception ex)
+                {
+                    ShowError($"Failed to export animation/layout:\n{ex.Message}");
+                }
+            }, exportFilter);
+        }
+
+        private void MenuFileExportTexture()
+        {
+            if (CurrentEditor == null)
+                return;
+
+            var textureEntry = CurrentEditor.SaveTexture(TextureName ?? "export");
+
+            // Determine file extension based on Type (EntryType)
+            string extension = textureEntry.Type == Bar.EntryType.Imgz ? "imz" : "imd";
+            string filterName = textureEntry.Type == Bar.EntryType.Imgz ? "Image container IMGZ" : "Image IMGD";
+
+            var exportFilter = FileDialogFilterComposer
+                .Compose()
+                .AddExtensions(filterName, extension)
+                .AddAllFiles();
+
+            FileDialog.OnSave(fileName =>
+            {
+                try
+                {
+                    using var stream = File.Create(fileName);
+                    textureEntry.Stream.SetPosition(0).CopyTo(stream);
+                    MessageBox.Show($"Texture(s) exported successfully to:\n{fileName}",
+                        "Export Successful", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch (Exception ex)
+                {
+                    ShowError($"Failed to export texture(s):\n{ex.Message}");
+                }
+            }, exportFilter);
+        }
+
+        private void MenuFileExit() => _exitFlag = true;
+
+        public void OpenToolDesc(ToolInvokeDesc toolInvokeDesc)
+        {
+            _toolInvokeDesc = toolInvokeDesc;
+            OpenFile(_toolInvokeDesc.ActualFileName);
+        }
+
+        public void OpenFile(string fileName, bool doNotShowLayoutSelectionDialog = false)
+        {
+            try
+            {
+                bool isSuccess;
+                if (File.OpenRead(fileName).Using(Layout.IsValid))
+                {
+                    IEnumerable<Imgd> imgd = null;
+                    FileDialog.OnOpen(texFileName =>
+                    {
+                        imgd = File.OpenRead(texFileName).Using(Imgz.Read);
+                    }, ImzFilter);
+
+                    if (imgd != null)
+                    {
+                        using var layoutStream = File.OpenRead(fileName);
+                        OpenLayoutEditor(layoutStream, imgd);
+                        isSuccess = true;
+                        IsBar = false;
+                    }
+                    else
+                        isSuccess = false;
+                }
+                else if (File.OpenRead(fileName).Using(Sequence.IsValid))
+                {
+                    ShowError("SED files can not be opened directly.");
+                    isSuccess = false;
+                    IsBar = false;
+                }
+                else if (File.OpenRead(fileName).Using(Bar.IsValid))
+                {
+                    isSuccess = OpenBarContent(ReadBarEntriesFromFileName(fileName), doNotShowLayoutSelectionDialog);
+                    IsBar = true;
+                }
+                else
+                {
+                    ShowError("File not recognized.");
+                    isSuccess = false;
+                }
+
+                if (isSuccess)
+                    FileName = fileName;
+            }
+            catch (Exception ex)
+            {
+                ShowError(ex.Message);
+            }
+        }
+
+        public void SaveFile(string previousFileName, string fileName)
+        {
+            if (!IsBar)
+            {
+                var entry = CurrentEditor.SaveAnimation("dummy");
+                using var stream = File.Create(fileName);
+                entry.Stream.SetPosition(0).CopyTo(stream);
+            }
+            else
+            {
+                SaveFileAsBar(previousFileName, fileName);
+            }
+        }
+
+        public void SaveFileAsBar(string previousFileName, string fileName)
+        {
+            var existingEntries = File.Exists(previousFileName) ?
+                ReadBarEntriesFromFileName(previousFileName) : new List<Bar.Entry>();
+
+            var animationEntry = CurrentEditor.SaveAnimation(AnimationName);
+            if (_processStream != null)
+            {
+                animationEntry.Stream.SetPosition(0);
+                _processStream.SetPosition(_processOffset);
+                animationEntry.Stream.CopyTo(_processStream);
+                animationEntry.Stream.SetPosition(0);
+            }
+
+            var newEntries = existingEntries
+                .AddOrReplace(animationEntry)
+                .AddOrReplace(CurrentEditor.SaveTexture(TextureName));
+            File.Create(fileName).Using(stream => Bar.Write(stream, newEntries));
+
+            if (IsToolDesc)
+                _toolInvokeDesc.ContentChange = ToolInvokeDesc.ContentChangeInfo.File;
+        }
+
+        private static IEnumerable<Bar.Entry> ReadBarEntriesFromFileName(string fileName) =>
+            File.OpenRead(fileName).Using(stream =>
+            {
+                if (!Bar.IsValid(stream))
+                    throw new InvalidDataException("Not a bar file");
+
+                return Bar.Read(stream);
+            });
+
+        private bool OpenBarContent(IEnumerable<Bar.Entry> entries, bool doNotShowLayoutSelectionDialog = false)
+        {
+            var layoutEntries = entries.Count(x => x.Type == Bar.EntryType.Layout);
+            var sequenceEntries = entries.Count(x => x.Type == Bar.EntryType.Seqd);
+
+            if (DoesContainSequenceAnimations(entries))
+                return Open2dd(entries);
+            if (DoesContainLayoutAnimations(entries))
+                return Open2ld(entries, doNotShowLayoutSelectionDialog);
+
+            throw new Exception("The specified file does not contain any sequence or layout content to be played.");
+        }
+
+        private bool Open2ld(IEnumerable<Bar.Entry> entries, bool doNotShowLayoutSelectionDialog = false)
+        {
+            var layoutEntries = entries.Count(x => x.Type == Bar.EntryType.Layout);
+            int imagesEntries = entries.Count(x => x.Type == Bar.EntryType.Imgz);
+
+            if (layoutEntries == 0)
+                throw new Exception("No layout found.");
+            if (imagesEntries == 0)
+                throw new Exception("No image container found.");
+            if (layoutEntries > 1 || imagesEntries > 1)
+            {
+                OpenResourceSelectionDialog(entries, Bar.EntryType.Layout, Bar.EntryType.Imgz);
+                return true;
+            }
+
+            var layoutEntry = entries.First(x => x.Type == Bar.EntryType.Layout);
+            var textureContainerEntry = entries.First(x => x.Type == Bar.EntryType.Imgz);
+            OpenLayoutEditor(layoutEntry, textureContainerEntry);
+            return true;
+        }
+
+        private bool Open2dd(IEnumerable<Bar.Entry> entries)
+        {
+            var sequenceEntries = entries.Count(x => x.Type == Bar.EntryType.Seqd);
+            int imagesEntries = entries.Count(x => x.Type == Bar.EntryType.Imgd);
+
+            if (sequenceEntries == 0)
+                throw new Exception("No sequence found.");
+            if (imagesEntries == 0)
+                throw new Exception("No image found.");
+            if (sequenceEntries > 1 || imagesEntries > 1)
+            {
+                OpenResourceSelectionDialog(entries, Bar.EntryType.Seqd, Bar.EntryType.Imgd);
+                return true;
+            }
+
+            var sequenceEntry = entries.First(x => x.Type == Bar.EntryType.Seqd);
+            var textureEntry = entries.First(x => x.Type == Bar.EntryType.Imgd);
+            OpenSequenceEditor(sequenceEntry, textureEntry);
+            return true;
+        }
+
+        private void OpenResourceSelectionDialog(IEnumerable<Bar.Entry> entries,
+            Bar.EntryType animationType, Bar.EntryType textureType)
+        {
+            _resourceSelectionDialog = new ResourceSelectionDialog(
+                entries, animationType, textureType);
+            _isResourceSelectionDialogOpening = true;
+            _isResourceSelectingLayout = animationType == Bar.EntryType.Layout;
+        }
+
+        public void OpenPreviewDialog()
+        {
+            _prevDialog = new PreviewTargetDialog();
+            _isPrevDialogOpening = true;
+        }
+
+        private void OpenSequenceEditor(Bar.Entry sequenceEntry, Bar.Entry textureEntry)
+        {
+            AnimationName = sequenceEntry.Name;
+            TextureName = textureEntry.Name;
+
+            if (_linkToPcsx2)
+            {
+                _linkToPcsx2 = false;
+                if (!LinkSeqdToPcs2(sequenceEntry.Stream))
+                    return;
+            }
+
+            var app = new AppSequenceEditor(_bootstrap,
+                this,
+                Sequence.Read(sequenceEntry.Stream.SetPosition(0)),
+                Imgd.Read(textureEntry.Stream));
+            _app = app;
+            CurrentEditor = app;
+        }
+
+        private void OpenLayoutEditor(Bar.Entry layoutEntry, Bar.Entry textureContainerEntry)
+        {
+            AnimationName = layoutEntry.Name;
+            TextureName = textureContainerEntry.Name;
+            OpenLayoutEditor(layoutEntry.Stream, Imgz.Read(textureContainerEntry.Stream));
+        }
+
+        private void OpenLayoutEditor(Stream layoutStream, IEnumerable<Imgd> images)
+        {
+            if (_linkToPcsx2)
+            {
+                _linkToPcsx2 = false;
+                if (!LinkLaydToPcs2(layoutStream))
+                    return;
+            }
+
+            var app = new AppLayoutEditor(_bootstrap,
+                this,
+                Layout.Read(layoutStream.SetPosition(0)),
+                images);
+            _app = app;
+            CurrentEditor = app;
+        }
+
+        private void UpdateTitle()
+        {
+            _bootstrap.Title = Title;
+        }
+
+        private void AddKeyMapping(Keys key, Action action)
+        {
+            _keyMapping[key] = action;
+        }
+
+        private void ProcessKeyMapping()
+        {
+            var k = Keyboard.GetState();
+
+            // Check if Ctrl is pressed
+            if (k.IsKeyDown(Keys.LeftControl) || k.IsKeyDown(Keys.RightControl))
+            {
+                var keys = k.GetPressedKeys();
+                foreach (var key in keys)
+                {
+                    if (_keyMapping.TryGetValue(key, out var action))
+                    {
+                        // Execute the action regardless of modal state
+                        action();
+                    }
+                }
+            }
+        }
+
+        private bool LinkLaydToPcs2(Stream stream) =>
+            LinkToPcs2(stream, Layout.MagicCodeValidator, 0x1c);
+
+        private bool LinkSeqdToPcs2(Stream stream) =>
+            LinkToPcs2(stream, Sequence.MagicCodeValidator, 0x2c);
+
+        private bool LinkToPcs2(Stream stream, uint magicCode, int headerLength)
+        {
+            var process = Process.GetProcessesByName("pcsx2").FirstOrDefault();
+            if (process == null)
+            {
+                ShowLinkPcsx2ErrorProcessNotFound();
+                return false;
+            }
+
+            var processStream = new ProcessStream(process, ToolConstants.Pcsx2BaseAddress, ToolConstants.Ps2MemoryLength);
+            var bufferedStream = new BufferedStream(processStream, 0x10000);
+
+            var header = stream.SetPosition(sizeof(uint)).ReadBytes(headerLength);
+            while (bufferedStream.Position < bufferedStream.Length)
+            {
+                if (bufferedStream.ReadUInt32() == magicCode)
+                {
+                    // header matches. Check if the rest of 0x2c SEQD header matches as well...
+                    if (header.SequenceEqual(bufferedStream.ReadBytes(headerLength)))
+                    {
+                        _processStream = processStream;
+                        _processOffset = (int)(bufferedStream.Position - headerLength - sizeof(uint));
+                        return true;
+                    }
+                }
+            }
+
+            ShowLinkPcsx2ErrorFileNotFound();
+            CloseProcessStream();
+            return false;
+        }
+
+        private void CloseProcessStream()
+        {
+            _processStream?.Dispose();
+            _processStream = null;
+        }
+
+        private void MenuFileExportLayoutAsPngSequence()
+        {
+            if (!(CurrentEditor is AppLayoutEditor layoutEditor))
+            {
+                ShowError("This feature is only available for Layout files (2LD).");
+                return;
+            }
+
+            // Let user select a folder
+            using (var folderDialog = new System.Windows.Forms.FolderBrowserDialog())
+            {
+                folderDialog.Description = "Select folder to save PNG sequence";
+                folderDialog.ShowNewFolderButton = true;
+
+                if (folderDialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+                {
+                    try
+                    {
+                        int frameCount = layoutEditor.ExportCurrentLayoutAsPngSequence(folderDialog.SelectedPath);
+
+                        MessageBox.Show(
+                            $"PNG sequence exported successfully!\n\n" +
+                            $"Location: {folderDialog.SelectedPath}\n" +
+                            $"Frames: {frameCount} files (frame_0000.png to frame_{frameCount - 1:D4}.png)\n\n",
+                            "Export Successful",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Information);
+                    }
+                    catch (Exception ex)
+                    {
+                        ShowError($"Failed to export PNG sequence:\n{ex.Message}");
+                    }
+                }
+            }
+        }
+
+        private void MenuFileExportLayoutAsGif()
+        {
+            if (!(CurrentEditor is AppLayoutEditor layoutEditor))
+            {
+                ShowError("This feature is only available for Layout files (2LD).");
+                return;
+            }
+
+            var gifFilter = FileDialogFilterComposer
+                .Compose()
+                .AddExtensions("Animated GIF", "gif")
+                .AddAllFiles();
+
+            FileDialog.OnSave(fileName =>
+            {
+                try
+                {
+                    // Default settings optimized for quality and reasonable speed
+                    // frameDelay: 33ms = ~30 FPS, 50ms = 20 FPS (smoother, less flicker)
+                    // quality: 1 = best quality (slower), 10 = balanced, 20 = fastest (lower quality)
+                    int frameDelay = 33;
+                    int quality = 10;
+
+                    layoutEditor.ExportCurrentLayoutAsGif(fileName, frameDelay, quality);
+
+                    MessageBox.Show(
+                        $"Animated GIF exported successfully to:\n{fileName}\n\n" +
+                        $"Settings: {1000 / frameDelay} FPS, Quality: {quality}/20\n\n" +
+                        $"Note: GIF format has inherent flickering on fast color transitions due to 256-color palette limitation per frame.",
+                        "Export Successful",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                }
+                catch (Exception ex)
+                {
+                    ShowError($"Failed to export animated GIF:\n{ex.Message}");
+                }
+            }, gifFilter);
+        }
+
+        private static bool DoesContainSequenceAnimations(IEnumerable<Bar.Entry> entries) =>
+            entries.Any(x => x.Type == Bar.EntryType.Seqd);
+
+        private static bool DoesContainLayoutAnimations(IEnumerable<Bar.Entry> entries) =>
+            entries.Any(x => x.Type == Bar.EntryType.Layout);
+
+        private static void ShowLinkPcsx2ErrorProcessNotFound() =>
+            ShowError("No PCSX2 process found.\nPlease run PCSX2 with Kingdom Hearts II/Re:CoM first and try again.", LinkToPcsx2ActionName);
+
+        private static void ShowLinkPcsx2ErrorFileNotFound() =>
+            ShowError("The file you specified can not be found on the running game.", LinkToPcsx2ActionName);
+
+        public static void ShowError(string message, string title = "Error") =>
+            MessageBox.Show(message, title, MessageBoxButton.OK, MessageBoxImage.Error);
+
+        private void ShowAboutDialog() =>
+            MessageBox.Show("OpenKH is amazing.");
+    }
+}

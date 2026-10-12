@@ -1,0 +1,1095 @@
+/// <reference path="../../globals.d.ts" />
+import _ from '@env-spec/utils/my-dash';
+import {
+  ParsedEnvSpecFunctionArgs, ParsedEnvSpecFunctionCall, ParsedEnvSpecStaticValue,
+  parseEnvSpecDotEnvFile,
+  type ParsedEnvSpecDecorator,
+} from '@env-spec/parser';
+import { EnvGraphDataSource } from './data-source';
+import type { ConfigItem } from './config-item';
+import {
+  StaticValueResolver, ArrayLiteralResolver, ObjectLiteralResolver, type Resolver, convertParsedValueToResolvers,
+  getMalformedFunctionCallError,
+} from './resolver';
+import { ResolutionError, SchemaError, type VarlockError } from './errors';
+import type { EnvGraph } from './env-graph';
+import { parseKeyFilterArgs, applyKeyFilter, type KeyFilter } from './key-filter';
+import { parseDuration } from '../../lib/duration';
+import {
+  BUILT_IN_TRANSFORM_SCHEME_SPECS, PROXY_APPROVAL_EACH_VALUES, REMOVED_PROXY_RULE_OPTIONS,
+  parseProxySubstitutionTarget, validateProxyTransformConfig,
+} from '../../proxy/types';
+
+
+export abstract class DecoratorInstance {
+  get name() { return this.parsedDecorator.name; }
+  get isFunctionCall() { return !!this.parsedDecorator.isBareFnCall; }
+
+  // decorator value/args are translated into a resolver when we process the decorator
+  _decValueResolver?: Resolver;
+  get decValueResolver() {
+    return this._decValueResolver;
+  }
+
+  abstract readonly isRootDecorator: boolean;
+  abstract readonly dataSource: EnvGraphDataSource;
+  abstract readonly parsedDecorator: ParsedEnvSpecDecorator;
+
+  abstract graph: EnvGraph;
+
+  _errors: Array<VarlockError> = [];
+
+  get schemaErrors(): Array<VarlockError> {
+    return [
+      ...this._errors.filter((e) => e instanceof SchemaError),
+      ...this._decValueResolver?.schemaErrors || [],
+    ];
+  }
+
+  // error encountered during `execute` function
+  get _executionError(): VarlockError | undefined {
+    return this._errors.find((e) => e instanceof ResolutionError);
+  }
+
+  get errors(): Array<VarlockError> {
+    return [
+      ...this._errors,
+      ...this._decValueResolver?.schemaErrors || [],
+    ];
+  }
+
+  private decoratorDef?: ItemDecoratorDef | RootDecoratorDef;
+  get incompatibleWith() {
+    return this.decoratorDef?.incompatibleWith;
+  }
+  get isFunctionOrValue() {
+    return !!(this.decoratorDef as ItemDecoratorDef | undefined)?.isFunctionOrValue;
+  }
+  /** Purely informational — excluded from the schema fingerprint (see `inert`). */
+  get isInert() {
+    return !!this.decoratorDef?.inert;
+  }
+
+  private processed = false;
+  private processedData: any;
+  async process() {
+    if (this.processed) return;
+    this.processed = true;
+
+    if (!this.graph) throw new Error('expected graph to be set');
+
+    try {
+      const decRegistry = this.isRootDecorator
+        ? this.graph.rootDecoratorsRegistry
+        : this.graph.itemDecoratorsRegistry;
+      this.decoratorDef = decRegistry[this.name];
+      if (!this.decoratorDef) {
+        // decorators like @todo and @see are common in comments and should only warn
+        const commentLikeDecorators = ['todo', 'see', 'note'];
+        const nameLower = this.name.toLowerCase().replace(/:$/, '');
+        if (commentLikeDecorators.includes(nameLower)) {
+          const hint = nameLower === 'see'
+            ? ' - use @docs() to link documentation'
+            : ' - did you mean to write a comment?';
+          throw new SchemaError(`@${this.name} is not a valid decorator${hint}`, { isWarning: true });
+        }
+
+        if (this.parsedDecorator.hasInvalidName) {
+          throw new SchemaError(`"@${this.name}" is not a valid decorator name - only letters, numbers, and underscores are allowed`);
+        }
+
+        // check if the decorator exists in the other registry (misplaced)
+        const otherRegistry = this.isRootDecorator
+          ? this.graph.itemDecoratorsRegistry
+          : this.graph.rootDecoratorsRegistry;
+        if (otherRegistry[this.name]) {
+          if (this.isRootDecorator) {
+            throw new SchemaError(`@${this.name} is an item decorator and cannot be used in the file header - it must be attached to a config item`);
+          } else {
+            throw new SchemaError(`@${this.name} is a root decorator and cannot be attached to a config item - it must be in the file header (before the first config item)`);
+          }
+        }
+        throw new SchemaError(`Unknown decorator: @${this.name}`);
+      }
+
+
+      // unquoted value that looks like a fn call but did not parse as one
+      const malformedFnCall = getMalformedFunctionCallError(
+        this.parsedDecorator.value,
+        { decoratorName: this.name, strayText: this.parsedDecorator.strayText },
+      );
+      if (malformedFnCall) {
+        this._errors.push(malformedFnCall);
+      } else if (this.parsedDecorator.strayText) {
+        // stray text found after this decorator (e.g. `# @dec some text`)
+        this._errors.push(new SchemaError(
+          `Unexpected text "${this.parsedDecorator.strayText}" after @${this.name} - use another # for trailing comments`,
+          { isWarning: true },
+        ));
+      }
+
+      // validate function-call vs value syntax. A decorator marked
+      // `isFunctionOrValue` accepts either form (e.g. @proxy(...) or @proxy=x);
+      // the two are kept mutually exclusive per item in ConfigItem.process.
+      if (!(this.decoratorDef as ItemDecoratorDef).isFunctionOrValue) {
+        if (this.decoratorDef.isFunction && !this.isFunctionCall) {
+          throw new SchemaError(
+            `@${this.name} must be used as a function call - use @${this.name}(...) instead of @${this.name}=value`,
+          );
+        }
+        if (!this.decoratorDef.isFunction && this.isFunctionCall) {
+          // bare fn-call syntax `@name(...)` is reserved for repeatable decorators (e.g. @docs()).
+          // A single-use decorator that accepts an options-object value declares an
+          // `objectValueExample`; use it to guide users who tried `@name(...)` toward the
+          // object form `@name={...}`, so the per-decorator knowledge stays on the def.
+          const { objectValueExample } = this.decoratorDef;
+          if (objectValueExample) {
+            // Echo the options the user actually passed; fall back to the def's
+            // example when they called it with none (`@name()`), so the suggestion
+            // is always a usable object form rather than `@name={}`.
+            const providedArgs = this.parsedDecorator.bareFnArgs?.values ?? [];
+            const optsStr = providedArgs.length
+              ? `{${providedArgs.map((v) => v.toString()).join(', ')}}`
+              : objectValueExample;
+            throw new SchemaError(
+              `@${this.name} is single-use and cannot be called like @${this.name}(...). To pass options, use an object value: @${this.name}=${optsStr}`,
+            );
+          }
+          throw new SchemaError(
+            `@${this.name} cannot be used as a function call - use @${this.name}=value instead of @${this.name}(...)`,
+          );
+        }
+      }
+
+      // some decorators (currently @type) consume their raw parsed value directly rather
+      // than through the resolver system - nested type calls like array(enum(a, b)) are
+      // not resolver functions, so converting them would produce bogus "unknown function"
+      // errors. Those decorators opt out of value-resolver creation entirely.
+      if (this.decoratorDef.skipValueResolver) return;
+
+      // this is so we can deal with bare fn-call decorators, where args are not a single
+      // resolvable value - so instead we make a new dummy resolver holding the args
+      if (
+        this.decoratorDef.useFnArgsResolver
+        && (
+          this.parsedDecorator.value instanceof ParsedEnvSpecFunctionCall
+          || this.parsedDecorator.value instanceof ParsedEnvSpecFunctionArgs
+        )
+      ) {
+        const fnArgsValue = this.parsedDecorator.value instanceof ParsedEnvSpecFunctionCall
+          ? this.parsedDecorator.value.data.args
+          : this.parsedDecorator.value;
+        this._decValueResolver = convertParsedValueToResolvers(
+          fnArgsValue,
+          this.dataSource,
+          this.graph.registeredResolverFunctions,
+        );
+      } else {
+        this._decValueResolver = convertParsedValueToResolvers(
+          this.parsedDecorator.value,
+          this.dataSource,
+          this.graph.registeredResolverFunctions,
+        );
+      }
+
+      if (this.decValueResolver) {
+        // process value resolver
+        await this.decValueResolver.process(this);
+
+        // process decorator according to definition
+        // which can return another function, to be called later
+        this.processedData = await this.decoratorDef.process?.(this.decValueResolver);
+      }
+    } catch (e) {
+      this._errors.push(e instanceof SchemaError ? e : new SchemaError(e as Error));
+    }
+  }
+  async execute() {
+    await this.decoratorDef!.execute?.(this.processedData);
+  }
+
+  resolvedValue?: any;
+  isResolved = false;
+
+  async resolve() {
+    if (this.isResolved) return this.resolvedValue;
+
+    await this.process();
+    // decorators that skip value-resolver creation (see process()) have nothing to resolve
+    if (this.decoratorDef?.skipValueResolver) {
+      this.isResolved = true;
+      return this.resolvedValue;
+    }
+    if (!this.decValueResolver) {
+      // process() already recorded schema errors, don't throw again
+      if (this._errors.length) return;
+      throw new Error('expected decorator to have a value resolver');
+    }
+    try {
+      this.resolvedValue = await this.decValueResolver.resolve();
+    } catch (err) {
+      this._errors.push(err as any);
+      return;
+    }
+
+    this.isResolved = true;
+    return this.resolvedValue;
+  }
+}
+
+export class ItemDecoratorInstance extends DecoratorInstance {
+  isRootDecorator = false;
+
+  constructor(
+    readonly configItem: ConfigItem,
+    readonly dataSource: EnvGraphDataSource,
+    readonly parsedDecorator: ParsedEnvSpecDecorator,
+  ) {
+    super();
+  }
+  get graph() { return this.dataSource.graph!; }
+}
+
+export class RootDecoratorInstance extends DecoratorInstance {
+  isRootDecorator = true;
+  constructor(
+    readonly dataSource: EnvGraphDataSource,
+    readonly parsedDecorator: ParsedEnvSpecDecorator,
+  ) {
+    super();
+  }
+  get graph() { return this.dataSource.graph!; }
+}
+
+
+
+// ~ setValuesBulk helpers ----------------------------------------
+
+function detectBulkFormat(data: string): 'json' | 'env' {
+  return data.trimStart().startsWith('{') ? 'json' : 'env';
+}
+
+function parseJsonBulkValues(data: string): Record<string, { value: string | number | boolean }> {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(data);
+  } catch (err) {
+    throw new SchemaError(`@setValuesBulk: invalid JSON data - ${(err as Error).message}`);
+  }
+  if (!_.isPlainObject(parsed)) {
+    throw new SchemaError('@setValuesBulk: JSON data must be a flat object');
+  }
+  const result: Record<string, { value: string | number | boolean }> = {};
+  for (const [key, val] of Object.entries(parsed)) {
+    if (val === null || val === undefined) continue; // skip nulls
+    if (_.isPlainObject(val) || _.isArray(val)) {
+      throw new SchemaError(`@setValuesBulk: JSON value for "${key}" must be a scalar, not an object or array`);
+    }
+    result[key] = { value: val as string | number | boolean };
+  }
+  return result;
+}
+
+function parseEnvBulkValues(
+  data: string,
+): Record<string, { value: string, description?: string }> {
+  let parsedFile;
+  try {
+    parsedFile = parseEnvSpecDotEnvFile(data);
+  } catch (err) {
+    throw new SchemaError(`@setValuesBulk: failed to parse env data - ${(err as Error).message}`);
+  }
+  const result: Record<string, { value: string, description?: string }> = {};
+  for (const item of parsedFile.configItems) {
+    if (item.value instanceof ParsedEnvSpecFunctionCall) {
+      throw new SchemaError(
+        `@setValuesBulk: env format does not support function calls for "${item.key}".`
+        + ' Use single quotes for literal values or use format=json instead.',
+      );
+    }
+    if (item.value instanceof ParsedEnvSpecStaticValue) {
+      result[item.key] = {
+        value: String(item.value.unescapedValue ?? ''),
+        description: item.description || undefined,
+      };
+    } else {
+      // undefined value (empty assignment like `KEY=`)
+      result[item.key] = { value: '', description: item.description || undefined };
+    }
+  }
+  return result;
+}
+
+// ~ Root decorators ----------------------------------------
+export type RootDecoratorDef<Processed = any> = {
+  name: string,
+  description?: string;
+  isFunction?: boolean;
+  /**
+   * Opt in to sharing this `@name` with an item decorator of the same name. Both defs must
+   * set it, and placement validation then routes header uses here and item uses to the item
+   * def (see `_validateDecoratorPlacement`). Used by `@proxy`: detached rules in the header,
+   * attached rules on an item. Without this, a cross-registry name is rejected as an
+   * accidental collision, since it would otherwise be shadowed.
+   */
+  allowDualPlacement?: boolean;
+  /** Purely informational (no effect on resolved values/behavior) → excluded from the schema fingerprint. */
+  inert?: boolean;
+  deprecated?: boolean | string;
+  incompatibleWith?: Array<string>;
+  /**
+   * A single-use decorator whose value is an options OBJECT (`@name={a=b}`). Set to an
+   * example options string (e.g. `{egress="strict"}`): when someone mistakenly calls it as
+   * `@name(...)`, the generic validation uses this to point them at the object form, so
+   * this per-decorator detail lives on the def instead of in the shared handler.
+   */
+  objectValueExample?: string;
+  process?: (decoratorValue: Resolver) => (Processed | Promise<Processed>);
+  execute?: (executeInput: Processed) => void | Promise<void>;
+  useFnArgsResolver?: boolean,
+  /**
+   * Skip value-resolver creation entirely - for decorators whose raw parsed value is
+   * consumed by other machinery (e.g. `@type`, where nested calls like `enum(a, b)`
+   * are type specs, not resolver functions).
+   */
+  skipValueResolver?: boolean,
+};
+
+/**
+ * Validate that a `@proxy` list option (`domain`/`method`/`keys`) is either a
+ * single string value or an array literal of non-empty static strings. When
+ * `requireArray` is set the single form is rejected (used for `keys`, which is
+ * always a list). Single non-array values are accepted as-is and validated at
+ * resolve time, so dynamic expressions (e.g. `domain=concat(...)`) still work.
+ */
+function assertProxyStringListArg(
+  resolver: Resolver | undefined,
+  option: string,
+  requireArray: boolean,
+): void {
+  if (!resolver) return;
+  if (resolver instanceof ArrayLiteralResolver) {
+    const els = resolver.arrArgs ?? [];
+    if (!els.length) throw new SchemaError(`@proxy: ${option} array cannot be empty`);
+    for (const el of els) {
+      if (!el.isStatic || typeof el.staticValue !== 'string' || !el.staticValue.trim()) {
+        throw new SchemaError(`@proxy: ${option} entries must be non-empty strings`);
+      }
+    }
+    return;
+  }
+  if (requireArray) {
+    throw new SchemaError(`@proxy: ${option} must be an array literal, e.g. ${option}=[ITEM_A, ITEM_B]`);
+  }
+}
+
+/**
+ * Shared validation for the function form of `@proxy(...)` — used by both the
+ * root (detached) and item (attached) registrations so their rules stay
+ * consistent. Requires `domain`; accepts `domain`/`method` as a string or array
+ * literal and `keys` as an array literal; rejects positional args; validates the
+ * approval options.
+ */
+const VALID_PROXY_OPTIONS = ['domain', 'path', 'method', 'keys', 'block', 'approval', 'substituteIn', 'rules', 'transform'] as const;
+/** Per-entry options inside the `rules=[{...}]` array form. Each entry is a
+ * policy refinement for the parent's `domain`, so it cannot re-set `domain` or
+ * `keys` (injection is controlled by the parent rule). */
+const VALID_PROXY_RULE_ENTRY_OPTIONS = ['path', 'method', 'block', 'approval', 'substituteIn'] as const;
+
+/** Reject an option that used to exist with its migration, before the generic
+ * unknown-option sweep turns it into a bare "unknown option" error. */
+function assertNoRemovedProxyOptions(keys: Array<string>): void {
+  for (const key of keys) {
+    const removed = REMOVED_PROXY_RULE_OPTIONS[key];
+    if (removed) throw new SchemaError(removed);
+  }
+}
+/** Inner options of the `approval={...}` object form. */
+const VALID_APPROVAL_OPTIONS = ['enabled', 'each', 'maxDuration'] as const;
+
+const REDACT_OPTIONS = ['console', 'stdout'];
+
+/**
+ * A resolved boolean setting, accepting the string forms `true`/`false` too: a reference to an
+ * item overridden from the environment (`SHOULD_REDACT=false varlock run ...`) resolves to a
+ * string. Static values are still required to be real booleans (checked in `process`).
+ */
+function coerceResolvedBoolean(value: unknown): boolean | undefined {
+  if (_.isBoolean(value)) return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+  }
+  return undefined;
+}
+
+/**
+ * Normalize a resolved `@redact` value (or its deprecated alias `@redactLogs`) into the two
+ * runtime settings.
+ * - `console`: patch console methods (on unless explicitly disabled)
+ * - `stdout`: redact process stdout/stderr when not a TTY. `undefined` = not set in the
+ *   schema, which `varlock run` treats as on and in-process stream patching treats as off
+ *   (for now - this becomes on by default in a future major)
+ *
+ * A bare `false` disables both. Returns an error message for an invalid (dynamic) value.
+ */
+export function parseRedactSetting(
+  value: unknown,
+  decoratorName = 'redact',
+): { console: boolean, stdout?: boolean } | { error: string } {
+  const bool = coerceResolvedBoolean(value);
+  if (value === undefined || bool === true) return { console: true };
+  if (bool === false) return { console: false, stdout: false };
+  if (_.isPlainObject(value)) {
+    const opts = value as Record<string, unknown>;
+    const parsed: { console: boolean, stdout?: boolean } = { console: true };
+    for (const key of Object.keys(opts)) {
+      if (!REDACT_OPTIONS.includes(key)) {
+        return { error: `@${decoratorName}: unknown option "${key}" (supported: ${REDACT_OPTIONS.join(', ')})` };
+      }
+      if (opts[key] === undefined) continue;
+      const optBool = coerceResolvedBoolean(opts[key]);
+      if (optBool === undefined) {
+        return { error: `@${decoratorName}: ${key} must resolve to a boolean (got ${JSON.stringify(opts[key])})` };
+      }
+      parsed[key as 'console' | 'stdout'] = optBool;
+    }
+    return parsed;
+  }
+  return { error: `@${decoratorName} must resolve to a boolean or an options object (got ${JSON.stringify(value)})` };
+}
+
+/** A static boolean option (`block`) must be a real boolean — a quoted `"true"`
+ * or `1` is a misconfiguration that would otherwise silently drop the option
+ * (turning a deny rule into a plain allow). Dynamic expressions are validated at
+ * resolve time. */
+function assertProxyBooleanArg(resolver: Resolver | undefined, option: string): void {
+  if (!resolver?.isStatic) return;
+  if (typeof resolver.staticValue !== 'boolean') {
+    throw new SchemaError(`@proxy: ${option} must be a boolean (true or false), not ${JSON.stringify(resolver.staticValue)}`);
+  }
+}
+
+/** A static `path` must be a single non-empty string (not an array/number). */
+function assertProxyStringArg(resolver: Resolver | undefined, option: string): void {
+  if (!resolver?.isStatic) return;
+  if (typeof resolver.staticValue !== 'string' || !resolver.staticValue.trim()) {
+    throw new SchemaError(`@proxy: ${option} must be a non-empty string`);
+  }
+}
+
+/**
+ * `substituteIn` is a single target or an array literal of targets, each one of
+ * `header`, `header:<name>`, `query`, `query:<param>`, or `body:<path>`. Statically
+ * validates literal entries via the shared target parser; dynamic expressions are
+ * re-checked at resolve time.
+ */
+function assertProxySubstituteInArg(resolver: Resolver | undefined): void {
+  if (!resolver) return;
+  const check = (v: unknown) => {
+    if (typeof v !== 'string') throw new SchemaError('@proxy: substituteIn entries must be strings, e.g. substituteIn=[header, body:client_secret]');
+    const parsed = parseProxySubstitutionTarget(v);
+    if (!parsed.ok) throw new SchemaError(`@proxy: ${parsed.error}`);
+  };
+  if (resolver instanceof ArrayLiteralResolver) {
+    const els = resolver.arrArgs ?? [];
+    if (!els.length) throw new SchemaError('@proxy: substituteIn array cannot be empty');
+    for (const el of els) {
+      if (el.isStatic) check(el.staticValue);
+    }
+    return;
+  }
+  if (resolver.isStatic) check(resolver.staticValue);
+}
+
+/**
+ * `approval` accepts either a boolean (`approval=true`) or an options object
+ * (`approval={each=request, maxDuration=15m}`); the object form implies approval
+ * is required unless `enabled=false`. Validates the inner options statically when
+ * they're literals; dynamic values are re-checked at resolve time.
+ */
+function assertProxyApprovalArg(resolver: Resolver | undefined): void {
+  if (!resolver) return;
+  if (resolver instanceof ObjectLiteralResolver) {
+    const inner = resolver.objArgs ?? {};
+    for (const key of Object.keys(inner)) {
+      if (!VALID_APPROVAL_OPTIONS.includes(key as typeof VALID_APPROVAL_OPTIONS[number])) {
+        throw new SchemaError(`@proxy: unknown approval option "${key}". Valid options: ${VALID_APPROVAL_OPTIONS.join(', ')}`);
+      }
+    }
+    const each = inner.each;
+    if (each?.isStatic && !(typeof each.staticValue === 'string' && PROXY_APPROVAL_EACH_VALUES.includes(each.staticValue as any))) {
+      throw new SchemaError(`@proxy: approval.each must be one of ${PROXY_APPROVAL_EACH_VALUES.join(', ')}`);
+    }
+    const maxDuration = inner.maxDuration;
+    if (maxDuration?.isStatic) {
+      try {
+        parseDuration(maxDuration.staticValue as string | number);
+      } catch {
+        throw new SchemaError('@proxy: approval.maxDuration must be a duration like "15m" or 0 (always ask)');
+      }
+    }
+    const enabled = inner.enabled;
+    if (enabled?.isStatic && typeof enabled.staticValue !== 'boolean') {
+      throw new SchemaError('@proxy: approval.enabled must be a boolean (true or false)');
+    }
+    return;
+  }
+  if (resolver.isStatic && typeof resolver.staticValue !== 'boolean') {
+    throw new SchemaError('@proxy: approval must be true/false or an options object, e.g. approval={each=request, maxDuration=15m}');
+  }
+}
+
+/**
+ * `transform` is an options object describing a request-transform scheme
+ * (`transform={scheme="hmac-sha256", stringToSign=..., signatureHeader=...}`).
+ * Statically validates the literal entries via the shared config validator
+ * (partial mode - dynamic entries re-check at resolve time). Placement-specific
+ * requirements (`secretKey` on detached rules) are enforced when rules are built.
+ */
+function assertProxyTransformArg(resolver: Resolver | undefined): void {
+  if (!resolver) return;
+  if (!(resolver instanceof ObjectLiteralResolver)) {
+    if (resolver.isStatic) {
+      throw new SchemaError('@proxy: transform must be an options object, e.g. transform={scheme="hmac-sha256", stringToSign="{timestamp}{method}{path}{body}", signatureHeader="X-Signature"}');
+    }
+    return; // dynamic expression - validated at resolve time
+  }
+  const inner = resolver.objArgs ?? {};
+  const staticEntries: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(inner)) {
+    // Include every key so unknown options fail loudly here; only static values
+    // get their content checked.
+    staticEntries[key] = val?.isStatic ? val.staticValue : undefined;
+  }
+  // Static pass knows only built-in schemes; a plugin scheme (or dynamic
+  // scheme value) defers entirely to resolve-time validation, which sees the
+  // full registry after plugins load.
+  const error = validateProxyTransformConfig(staticEntries, BUILT_IN_TRANSFORM_SCHEME_SPECS, { partial: true });
+  if (error) throw new SchemaError(`@proxy: ${error}`);
+}
+
+/**
+ * The `rules=[{...}]` form: a list of policy refinements that share the parent's
+ * `domain`. Each entry may set path/method/block/approval (but not domain/keys —
+ * injection is the parent rule's job). Statically validates literal entries; the
+ * resolve-time validator re-checks dynamic values.
+ */
+function assertProxyRulesArg(resolver: Resolver | undefined): void {
+  if (!resolver) return;
+  if (!(resolver instanceof ArrayLiteralResolver)) {
+    throw new SchemaError('@proxy: rules must be an array of rule objects, e.g. rules=[{path="/v1/**", block=true}]');
+  }
+  for (const entry of resolver.arrArgs ?? []) {
+    if (!(entry instanceof ObjectLiteralResolver)) {
+      throw new SchemaError('@proxy: each rules entry must be an object, e.g. {path="/v1/**", block=true}');
+    }
+    const inner = entry.objArgs ?? {};
+    assertNoRemovedProxyOptions(Object.keys(inner));
+    for (const key of Object.keys(inner)) {
+      if (!VALID_PROXY_RULE_ENTRY_OPTIONS.includes(key as typeof VALID_PROXY_RULE_ENTRY_OPTIONS[number])) {
+        throw new SchemaError(
+          `@proxy: unknown option "${key}" in a rules entry. Valid entry options: ${VALID_PROXY_RULE_ENTRY_OPTIONS.join(', ')} `
+            + '(domain and keys are set on the parent @proxy)',
+        );
+      }
+    }
+    assertProxyStringListArg(inner.method, 'method', false);
+    assertProxyStringArg(inner.path, 'path');
+    assertProxyBooleanArg(inner.block, 'block');
+    assertProxyApprovalArg(inner.approval);
+    assertProxySubstituteInArg(inner.substituteIn);
+  }
+}
+
+function validateProxyFunctionArgs(argsVal: Resolver): void {
+  if (!argsVal.objArgs?.domain) {
+    throw new SchemaError('@proxy: missing required "domain" option');
+  }
+
+  // Reject unknown options so a typo (e.g. `aproval=true`, `blok=true`) fails loudly
+  // instead of silently producing a permissive rule.
+  assertNoRemovedProxyOptions(Object.keys(argsVal.objArgs));
+  for (const key of Object.keys(argsVal.objArgs)) {
+    if (!VALID_PROXY_OPTIONS.includes(key as typeof VALID_PROXY_OPTIONS[number])) {
+      throw new SchemaError(
+        `@proxy: unknown option "${key}". Valid options: ${VALID_PROXY_OPTIONS.join(', ')}`,
+      );
+    }
+  }
+
+  assertProxyStringListArg(argsVal.objArgs.domain, 'domain', false);
+  assertProxyStringListArg(argsVal.objArgs?.method, 'method', false);
+  assertProxyStringListArg(argsVal.objArgs?.keys, 'keys', true);
+  assertProxyStringArg(argsVal.objArgs?.path, 'path');
+  assertProxyBooleanArg(argsVal.objArgs?.block, 'block');
+  assertProxyApprovalArg(argsVal.objArgs?.approval);
+  assertProxySubstituteInArg(argsVal.objArgs?.substituteIn);
+  assertProxyRulesArg(argsVal.objArgs?.rules);
+  assertProxyTransformArg(argsVal.objArgs?.transform);
+
+  if (argsVal.arrArgs?.length) {
+    throw new SchemaError('@proxy: positional args are not supported - use keys=[ITEM_A, ITEM_B] to attach items');
+  }
+}
+
+/**
+ * `@redact`: boolean (all log/output redaction on or off) or an options object, e.g.
+ * `@redact={console=true, stdout=true}`. Static values are checked here; dynamic values are
+ * validated after resolution (see parseRedactSetting).
+ */
+function redactRootDecorator(name: string, extra: Partial<RootDecoratorDef>): RootDecoratorDef {
+  return {
+    name,
+    objectValueExample: '{stdout=true}',
+    process: (decVal) => {
+      if (decVal.objArgs) {
+        for (const key in decVal.objArgs) {
+          if (!REDACT_OPTIONS.includes(key)) {
+            throw new SchemaError(`@${name}: unknown option "${key}" (supported: ${REDACT_OPTIONS.join(', ')})`);
+          }
+          const optResolver = decVal.objArgs[key];
+          if (optResolver?.isStatic && !_.isBoolean(optResolver.staticValue)) {
+            throw new SchemaError(`@${name}: ${key} must be a boolean (true or false)`);
+          }
+        }
+      } else if (decVal.isStatic && !_.isBoolean(decVal.staticValue)) {
+        throw new SchemaError(`@${name} must be a boolean, or an options object like @${name}={stdout=true}`);
+      }
+    },
+    ...extra,
+  };
+}
+
+// root decorators
+export const builtInRootDecorators: Array<RootDecoratorDef<any>> = [
+  {
+    name: 'envFlag',
+    deprecated: 'use @currentEnv instead',
+  },
+  {
+    name: 'currentEnv',
+    incompatibleWith: ['envFlag'],
+  },
+  {
+    name: 'defaultRequired',
+    process: (decVal) => {
+      if (
+        !decVal.isStatic
+        || ![true, false, 'infer'].includes(decVal.staticValue as any)
+      ) {
+        throw new Error('@defaultRequired decorator value must be set to a static value of true, false, or "infer"');
+      }
+    },
+  },
+  {
+    name: 'defaultSensitive',
+    process: (decVal) => {
+      if (
+        (decVal.isStatic && !_.isBoolean(decVal.staticValue))
+        || (!decVal.isStatic && decVal.fnName && decVal.fnName !== 'inferFromPrefix')
+      ) {
+        throw new Error('only true, false, or `inferFromPrefix()` is allowed for @defaultSensitive decorator');
+      }
+    },
+  },
+  {
+    name: 'defaultDynamic',
+    process: (decVal) => {
+      if (!decVal.isStatic || ![true, false, 'inferFromSensitive'].includes(decVal.staticValue as any)) {
+        throw new Error(
+          '@defaultDynamic decorator value must be a static value of true, false, or inferFromSensitive',
+        );
+      }
+    },
+  },
+  {
+    name: 'disable',
+  },
+  // NOTE: `@generate*` decorators (@generateTsTypes, @generatePythonEnv, the deprecated
+  // @generateTypes alias, plugin generators) are registered via the code-generator registry,
+  // not here — the `generate` prefix is reserved for code generators.
+  {
+    name: 'import',
+    isFunction: true,
+    process: (decVal) => {
+      if (!decVal.arrArgs || decVal.arrArgs.length === 0) {
+        throw new Error('@import decorator must have at least one argument - the path to import');
+      }
+      if (decVal.arrArgs.some((a) => !a.isStatic)) {
+        throw new Error('@import decorator cannot use any dynamic values - all args must be static');
+      }
+      // The 'enabled' named parameter is allowed and can be dynamic
+    },
+  },
+  {
+    name: 'plugin',
+    isFunction: true,
+  },
+  {
+    name: 'cache',
+    process: (decVal) => {
+      // dynamic values (e.g. forEnv(...)) are validated after resolution in finishLoad
+      if (!decVal.isStatic) return undefined;
+      const v = decVal.staticValue;
+      if (v === 'auto' || v === 'memory' || v === 'disk' || v === 'disabled') return v;
+      throw new Error('@cache decorator value must be one of: "auto", "memory", "disk", "disabled"');
+    },
+  },
+  // `@redact`, plus `@redactLogs` as its deprecated alias (the env graph warns on the alias
+  // and errors when both are present)
+  redactRootDecorator('redact', { incompatibleWith: ['redactLogs'] }),
+  redactRootDecorator('redactLogs', { deprecated: 'use @redact instead', incompatibleWith: ['redact'] }),
+  {
+    name: 'preventLeaks',
+  },
+  {
+    name: 'encryptInjectedEnv',
+  },
+  {
+    name: 'disableProcessEnvInjection',
+    // static-only: code generation reads this flag (it controls whether process.env is typed as
+    // populated), so an env-dependent value like forEnv(...) would make generated output differ
+    // per active environment
+    process: (decVal) => {
+      if (!decVal.isStatic || !_.isBoolean(decVal.staticValue)) {
+        throw new Error('@disableProcessEnvInjection must be a static boolean — env-dependent values would make generated code differ per environment');
+      }
+    },
+  },
+  {
+    // opt-in dotenv-style compatibility: items that resolve to undefined get injected into
+    // process.env (and shell exports) as empty strings instead of being left unset.
+    // static-only: code generation reads this flag (it controls whether process.env keys are
+    // typed as optional), so an env-dependent value would make generated output differ per
+    // active environment
+    name: 'injectUndefinedAsEmpty',
+    process: (decVal) => {
+      if (!decVal.isStatic || !_.isBoolean(decVal.staticValue)) {
+        throw new Error('@injectUndefinedAsEmpty must be a static boolean: env-dependent values would make generated code differ per environment');
+      }
+    },
+  },
+  {
+    // Single-use header config for the credential proxy. The proxy itself is
+    // driven by @proxy decorators on items; @proxyConfig only tunes proxy-wide
+    // settings (currently just egress). Value/object form: @proxyConfig={egress="strict"}.
+    name: 'proxyConfig',
+    objectValueExample: '{egress="strict"}',
+    process: (decValue) => {
+      if (decValue.objArgs === undefined) {
+        throw new SchemaError('@proxyConfig must be set to an options object, for example @proxyConfig={egress="strict"}');
+      }
+      for (const key in decValue.objArgs) {
+        if (key !== 'egress' && key !== 'reload') {
+          throw new SchemaError(`@proxyConfig: unknown option "${key}" (supported: egress, reload)`);
+        }
+      }
+      const egressResolver = decValue.objArgs.egress;
+      if (egressResolver?.isStatic) {
+        const egressValue = egressResolver.staticValue;
+        if (egressValue !== 'permissive' && egressValue !== 'strict') {
+          throw new SchemaError('@proxyConfig: egress must be "permissive" or "strict"');
+        }
+      }
+      const reloadResolver = decValue.objArgs.reload;
+      if (reloadResolver?.isStatic) {
+        const reloadValue = reloadResolver.staticValue;
+        if (reloadValue !== 'off' && reloadValue !== 'manual' && reloadValue !== 'auto') {
+          throw new SchemaError('@proxyConfig: reload must be "off", "manual", or "auto"');
+        }
+      }
+    },
+  },
+  {
+    name: 'proxy',
+    isFunction: true,
+    // detached rules in the header; the item decorator of the same name handles attached rules
+    allowDualPlacement: true,
+    useFnArgsResolver: true,
+    process: (argsVal) => validateProxyFunctionArgs(argsVal),
+  },
+  {
+    name: 'auditIgnorePaths',
+    isFunction: true,
+  },
+  {
+    name: 'auditIgnoreKeys',
+    isFunction: true,
+  },
+  {
+    name: 'auditExtraPatterns',
+    isFunction: true,
+  },
+  {
+    name: 'setValuesBulk',
+    isFunction: true,
+    process(argsVal) {
+      if (!argsVal.arrArgs || argsVal.arrArgs.length === 0) {
+        throw new SchemaError('@setValuesBulk requires at least one argument - the data resolver');
+      }
+      if (argsVal.arrArgs.length > 1) {
+        throw new SchemaError(
+          '@setValuesBulk expects only one positional argument - the data resolver.'
+          + ' Use pick=[...] / omit=[...] to filter keys.',
+        );
+      }
+      if (argsVal.objArgs) {
+        const validOptions = new Set(['format', 'createMissing', 'enabled', 'pick', 'omit']);
+        for (const key of Object.keys(argsVal.objArgs)) {
+          if (!validOptions.has(key)) {
+            throw new SchemaError(`@setValuesBulk: unknown option "${key}". Valid options: format, createMissing, enabled, pick, omit`);
+          }
+        }
+        // validate format option if static
+        const formatResolver = argsVal.objArgs.format;
+        if (formatResolver?.isStatic) {
+          const formatVal = formatResolver.staticValue;
+          if (formatVal !== 'json' && formatVal !== 'env') {
+            throw new SchemaError('@setValuesBulk: format must be "json" or "env"');
+          }
+        }
+        // validate createMissing option if static
+        const createMissingResolver = argsVal.objArgs.createMissing;
+        if (createMissingResolver?.isStatic) {
+          const cmVal = createMissingResolver.staticValue;
+          if (cmVal !== true && cmVal !== false) {
+            throw new SchemaError('@setValuesBulk: createMissing must be true or false');
+          }
+        }
+      }
+
+      // key filters: `pick=[...]` (allowlist) / `omit=[...]` (denylist). Default injects every key.
+      const keyFilter = parseKeyFilterArgs(argsVal.objArgs?.pick, argsVal.objArgs?.omit, '@setValuesBulk');
+
+      return {
+        graph: argsVal.dataSource!.graph!,
+        dataSource: argsVal.dataSource!,
+        argsResolver: argsVal,
+        keyFilter,
+      };
+    },
+    async execute(processedData) {
+      const {
+        graph, dataSource, argsResolver, keyFilter,
+      } = processedData as {
+        graph: EnvGraph;
+        dataSource: EnvGraphDataSource;
+        argsResolver: Resolver;
+        keyFilter?: KeyFilter;
+      };
+
+      // check enabled before resolving data - important so disabled sources don't trigger data fetching
+      const enabledResolver = argsResolver.objArgs?.enabled;
+      if (enabledResolver !== undefined) {
+        const enabledValue = await enabledResolver.resolve();
+        if (!_.isBoolean(enabledValue)) {
+          throw new SchemaError('@setValuesBulk: enabled must be a boolean');
+        }
+        if (!enabledValue) return; // disabled - skip data resolution entirely
+      }
+
+      // resolve the args
+      const resolved = await argsResolver.resolve() as { arr: Array<any>, obj: Record<string, any> };
+      const dataString = resolved.arr[0];
+      const format = resolved.obj?.format as string | undefined;
+      const createMissing = resolved.obj?.createMissing ?? false;
+
+      if (dataString === undefined || dataString === null || dataString === '') {
+        return; // empty data is a no-op
+      }
+
+      if (typeof dataString !== 'string') {
+        throw new SchemaError('@setValuesBulk: data resolver must return a string');
+      }
+
+      // detect or use explicit format
+      const effectiveFormat = format || detectBulkFormat(dataString);
+
+      // parse the data
+      let entries: Record<string, { value: string | number | boolean, description?: string }>;
+      if (effectiveFormat === 'json') {
+        entries = parseJsonBulkValues(dataString);
+      } else {
+        entries = parseEnvBulkValues(dataString);
+      }
+
+      // apply pick/omit key filter (no filter means inject everything)
+      applyKeyFilter(entries, keyFilter);
+
+      // dynamic import to avoid circular dependency
+      const { ConfigItem } = await import('./config-item');
+
+      for (const [key, entry] of Object.entries(entries)) {
+        const existsInSchema = key in graph.configSchema;
+
+        if (!existsInSchema && !createMissing) {
+          continue; // skip unknown keys when createMissing is false
+        }
+
+        // update or create the configItemDef on this data source
+        if (dataSource.configItemDefs[key]) {
+          // update existing def's resolver
+          dataSource.configItemDefs[key].resolver = new StaticValueResolver(entry.value);
+        } else {
+          // create a new configItemDef entry
+          dataSource.configItemDefs[key] = {
+            description: entry.description,
+            parsedValue: undefined,
+            resolver: new StaticValueResolver(entry.value),
+          };
+        }
+
+        // if key doesn't exist in configSchema and createMissing is true, create a new ConfigItem
+        if (!existsInSchema && createMissing) {
+          const newItem = new ConfigItem(graph, key);
+          graph.configSchema[key] = newItem;
+          await newItem.process();
+        }
+      }
+    },
+  },
+];
+
+// ~ Item decorators ----------------------------------------
+export type ItemDecoratorDef<T = any> = {
+  name: string,
+  incompatibleWith?: Array<string>;
+  isFunction?: boolean;
+  /**
+   * Opt in to sharing this `@name` with a root decorator of the same name — see
+   * `RootDecoratorDef.allowDualPlacement`. Both defs must set it.
+   */
+  allowDualPlacement?: boolean;
+  /** Purely informational (no effect on resolved values/behavior) → excluded from the schema fingerprint. */
+  inert?: boolean;
+  /**
+   * Allow BOTH the function form (`@name(...)`) and the value form (`@name=x`).
+   * The two forms are mutually exclusive on a single item (see ConfigItem.process).
+   * Used by `@proxy`: `@proxy(domain=...)` routes, `@proxy=passthrough|omit` are
+   * value-form modes. The `process` callback must handle both (discriminate on
+   * `decoratorValue.isStatic`).
+   */
+  isFunctionOrValue?: boolean;
+  deprecated?: boolean | string;
+  /** See {@link RootDecoratorDef.objectValueExample}. */
+  objectValueExample?: string;
+  process?: (decoratorValue: Resolver) => T | Promise<T>;
+  execute?: (executeInput: T) => void | Promise<void>;
+  useFnArgsResolver?: boolean,
+  /** See {@link RootDecoratorDef.skipValueResolver}. */
+  skipValueResolver?: boolean,
+};
+
+export const builtInItemDecorators: Array<ItemDecoratorDef<any>> = [
+  {
+    name: 'required',
+  },
+  {
+    name: 'optional',
+    incompatibleWith: ['required'],
+  },
+  {
+    name: 'sensitive',
+    objectValueExample: '{preventLeaks=false}',
+  },
+  {
+    name: 'public',
+    incompatibleWith: ['sensitive'],
+  },
+  {
+    name: 'internal',
+  },
+  {
+    name: 'dynamic',
+    incompatibleWith: ['static'],
+    process: (decVal) => {
+      // `boot` is the one non-boolean value: the item is bound at process start on each
+      // instance, so under `varlock freeze` its frozen value is only a default the env may
+      // override at boot. It must be written literally (a computed value would make the boot
+      // dependency check unreliable).
+      if (decVal.isStatic && typeof decVal.staticValue === 'string' && decVal.staticValue !== 'boot') {
+        throw new Error(`@dynamic must be true, false, or boot - got "${decVal.staticValue}"`);
+      }
+    },
+  },
+  {
+    name: 'static',
+    incompatibleWith: ['dynamic'],
+  },
+  {
+    name: 'type',
+    skipValueResolver: true,
+  },
+  {
+    name: 'example',
+    inert: true,
+  },
+  {
+    name: 'docsUrl',
+    deprecated: 'use `docs()` instead',
+    inert: true,
+  },
+  {
+    name: 'docs',
+    isFunction: true,
+    inert: true,
+  },
+  {
+    name: 'tag',
+    isFunction: true,
+  },
+  {
+    name: 'icon',
+    inert: true,
+  },
+  {
+    name: 'deprecated',
+    inert: true,
+  },
+  {
+    name: 'auditIgnore',
+  },
+  {
+    name: 'placeholder',
+    process: (decVal) => {
+      if (!decVal.isStatic || !_.isString(decVal.staticValue)) {
+        throw new SchemaError('@placeholder must be a static string value');
+      }
+    },
+  },
+  {
+    name: 'proxy',
+    isFunction: true,
+    isFunctionOrValue: true,
+    // attached rules on an item; the root decorator of the same name handles detached rules
+    allowDualPlacement: true,
+    useFnArgsResolver: true,
+    process: (decVal) => {
+      // Value form: @proxy=passthrough (inject the real value) or @proxy=omit
+      // (explicitly withhold from the proxied child).
+      if (decVal.isStatic) {
+        const mode = decVal.staticValue;
+        if (mode !== 'passthrough' && mode !== 'omit') {
+          throw new SchemaError(
+            '@proxy value must be "passthrough" or "omit" — or use @proxy(domain=...) to route a value through the proxy',
+          );
+        }
+        return;
+      }
+      // Function form: @proxy(domain=..., [path], [method], [block], [approval=true | approval={each, maxDuration, enabled}], [keys=[...]])
+      validateProxyFunctionArgs(decVal);
+    },
+  },
+
+  // test-only decorators — dropped in release builds
+  ...__VARLOCK_BUILD_TYPE__ === 'test' ? [
+    {
+      name: 'warn',
+      process() {
+        throw new SchemaError('test warning', { isWarning: true });
+      },
+    },
+  ] as Array<ItemDecoratorDef<any>> : [],
+];

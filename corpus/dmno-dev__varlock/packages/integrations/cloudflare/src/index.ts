@@ -1,0 +1,426 @@
+import path from 'node:path';
+import {
+  existsSync, readdirSync, unlinkSync,
+} from 'node:fs';
+import {
+  varlockVitePlugin, varlockLoadedEnv, varlockLastError, buildErrorPageHtml,
+} from '@varlock/vite-integration';
+import { cloudflare, type PluginConfig, type WorkerConfig } from '@cloudflare/vite-plugin';
+import { CLOUDFLARE_SSR_ENTRY_CODE, disableWranglerDotEnvAutoload, logVarlockEnvInjectionNotice } from './shared-ssr-entry-code';
+import { formatEnvLine } from './format-env-line';
+import { encryptEnvBlobSync, generateEncryptionKeyHex } from 'varlock/encrypt-env';
+import { serveFifoOrFile } from './serve-fifo-or-file';
+
+/** Name exposed by `@cloudflare/vite-plugin`'s main plugin object. */
+const CLOUDFLARE_PLUGIN_NAME = 'vite-plugin-cloudflare';
+
+
+
+// --- helpers for preview FIFO env injection --------------------------------
+
+const CF_SECRET_MAX_BYTES = 5120;
+
+/**
+ * Finds the `.dev.vars` paths next to each built `wrangler.json` in the build output.
+ * The CF plugin names output directories after the worker (e.g. `dist/test_worker/`),
+ * so we scan `dist/` subdirectories for the ones containing `wrangler.json`.
+ * A multi-worker project (`auxiliaryWorkers`) produces one directory per worker,
+ * and each needs its own env injection.
+ */
+function findDevVarsPaths(root: string): Array<string> {
+  const distDir = path.resolve(root, 'dist');
+  if (!existsSync(distDir)) return [];
+
+  const paths: Array<string> = [];
+  // Check immediate subdirectories of dist/ for wrangler.json
+  for (const entry of readdirSync(distDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const wranglerPath = path.join(distDir, entry.name, 'wrangler.json');
+    if (existsSync(wranglerPath)) {
+      paths.push(path.join(distDir, entry.name, '.dev.vars'));
+    }
+  }
+  return paths;
+}
+
+/**
+ * `.dev.vars` paths that would conflict with varlock's env injection.
+ *
+ * Wrangler looks for `.dev.vars` next to each worker's wrangler config, so a
+ * multi-worker project has one candidate per worker. The vite root is included
+ * too — it is where the file usually ends up, and it is the entry worker's
+ * config directory whenever `configPath` is left to auto-discovery.
+ *
+ * When `CLOUDFLARE_ENV` is set, wrangler prefers `.dev.vars.<env>` over the
+ * unsuffixed file, so both names are candidates in every directory.
+ *
+ * The entry worker's config path falls back to `CLOUDFLARE_VITE_WRANGLER_CONFIG_PATH`,
+ * matching the Cloudflare plugin's own resolution order. Both selectors come from
+ * `cloudflareEnvVars`, which the caller builds with the same `vite.loadEnv()` call
+ * the Cloudflare plugin makes — they can be set in a `.env` file rather than the
+ * real environment, and the plugin only copies them into `process.env` later, after
+ * this guard has already run.
+ */
+function devVarsGuardPaths(
+  root: string,
+  opts?: PluginConfig,
+  cloudflareEnvVars: Record<string, string> = {},
+): Array<string> {
+  const configPaths = [
+    opts?.configPath ?? cloudflareEnvVars.CLOUDFLARE_VITE_WRANGLER_CONFIG_PATH,
+    ...(opts?.auxiliaryWorkers ?? []).map((auxWorker) => auxWorker.configPath),
+  ];
+  const dirs = new Set<string>([root]);
+  for (const configPath of configPaths) {
+    if (configPath) dirs.add(path.dirname(path.resolve(root, configPath)));
+  }
+
+  const cloudflareEnv = cloudflareEnvVars.CLOUDFLARE_ENV;
+  const fileNames = cloudflareEnv ? [`.dev.vars.${cloudflareEnv}`, '.dev.vars'] : ['.dev.vars'];
+  return [...dirs].flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
+}
+
+/**
+ * The `CLOUDFLARE_*` values the Cloudflare plugin will resolve its config from,
+ * loaded exactly the way it does: `vite.loadEnv()` over the same mode and root,
+ * which merges matching `process.env` entries with any `.env` files.
+ *
+ * Imported dynamically because `vite` is an optional peer dep — it is always
+ * present when this plugin actually runs, but the import should not be hoisted
+ * into module scope for consumers who only import types.
+ */
+async function loadCloudflareEnvVars(mode: string, root: string): Promise<Record<string, string>> {
+  try {
+    const { loadEnv } = await import('vite');
+    return loadEnv(mode, root, ['CLOUDFLARE_']);
+  } catch {
+    // fall back to the real environment if vite cannot be resolved
+    return process.env as Record<string, string>;
+  }
+}
+
+function cleanupFile(filePath: string) {
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // may already be deleted
+  }
+}
+
+function chunkString(str: string, maxBytes: number): Array<string> {
+  const chunks: Array<string> = [];
+  let current = '';
+  let currentBytes = 0;
+  for (const char of str) {
+    const charBytes = Buffer.byteLength(char);
+    if (currentBytes + charBytes > maxBytes && current) {
+      chunks.push(current);
+      current = '';
+      currentBytes = 0;
+    }
+    current += char;
+    currentBytes += charBytes;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function formatDevVarsContent(
+  graph: { config: Record<string, { value: unknown }> },
+  serializedGraph: string,
+) {
+  const lines: Array<string> = [];
+  for (const key in graph.config) {
+    const item = graph.config[key];
+    if (item.value === undefined) continue;
+    const strValue = typeof item.value === 'string' ? item.value : JSON.stringify(item.value);
+    lines.push(formatEnvLine(key, strValue));
+  }
+  // include __VARLOCK_ENV for the varlock runtime,
+  // encrypt the blob if @encryptInjectedEnv is enabled or _VARLOCK_ENV_KEY is set
+  const encryptionRequired = !!varlockLoadedEnv?.settings?.encryptInjectedEnv;
+  let encryptionKey = process.env._VARLOCK_ENV_KEY;
+  if (encryptionRequired && !encryptionKey) {
+    // auto-generate a temporary key for dev mode
+    encryptionKey = generateEncryptionKeyHex();
+  }
+  let envBlob = serializedGraph;
+  if (encryptionKey) {
+    envBlob = encryptEnvBlobSync(envBlob, encryptionKey);
+    lines.push(formatEnvLine('_VARLOCK_ENV_KEY', encryptionKey));
+  }
+  // split into chunks if it exceeds CF's 5KB secret limit
+  if (Buffer.byteLength(envBlob) <= CF_SECRET_MAX_BYTES) {
+    lines.push(formatEnvLine('__VARLOCK_ENV', envBlob));
+  } else {
+    const chunks = chunkString(envBlob, CF_SECRET_MAX_BYTES);
+    lines.push(formatEnvLine('__VARLOCK_ENV_CHUNKS', String(chunks.length)));
+    for (let i = 0; i < chunks.length; i++) {
+      lines.push(formatEnvLine(`__VARLOCK_ENV_${i}`, chunks[i]));
+    }
+  }
+  return lines.join('\n');
+}
+
+// --- main plugin -----------------------------------------------------------
+
+/**
+ * Varlock Cloudflare Vite plugin — wraps `@cloudflare/vite-plugin` with
+ * automatic env var injection.
+ *
+ * For SvelteKit projects deploying via `@sveltejs/adapter-cloudflare`, use the
+ * standard `varlockVitePlugin` from `@varlock/vite-integration` instead — it
+ * auto-detects the Cloudflare adapter and uses an SSR-entry-based env loader,
+ * skipping `@cloudflare/vite-plugin` (which doesn't support SvelteKit).
+ *
+ * **Important:** Do not use a `.dev.vars` file alongside this plugin — varlock
+ * handles env injection automatically. The plugin will throw an error if a
+ * `.dev.vars` file is detected in your project root or build output.
+ *
+ * @example
+ * ```ts
+ * import { varlockCloudflareVitePlugin } from '@varlock/cloudflare-integration';
+ *
+ * export default defineConfig({
+ *   plugins: [
+ *     varlockCloudflareVitePlugin(),
+ *   ],
+ * });
+ * ```
+ */
+export function varlockCloudflareVitePlugin(
+  /**
+   * All options from the original Cloudflare Vite plugin are supported.
+   * @see https://developers.cloudflare.com/workers/vite-plugin/reference/api/
+   */
+  cloudflareOptions?: PluginConfig,
+  // Return Array<any> instead of Array<Plugin> to avoid symlink type conflicts.
+  // When this package is symlinked for local dev, TypeScript resolves `vite`'s
+  // Plugin type from this package's node_modules — a different copy than the
+  // consumer's — causing spurious type errors. Since Vite's `plugins` config
+  // is loosely typed, Array<any> is functionally equivalent.
+): Array<any> {
+  // Opt out of wrangler's redundant `.env`/`.dev.vars` auto-loading before the
+  // CF plugin resolves its config — varlock injects the resolved env itself.
+  disableWranglerDotEnvAutoload();
+
+  // --- conflict guard ---------------------------------------------------
+  // Error loudly if the user added `@cloudflare/vite-plugin` themselves.
+  const conflictGuard: import('vite').Plugin = {
+    name: 'varlock-cloudflare-conflict-guard',
+    async configResolved(config) {
+      const cfPluginCount = config.plugins.filter(
+        (p) => typeof p?.name === 'string' && p.name === CLOUDFLARE_PLUGIN_NAME,
+      ).length;
+      if (cfPluginCount > 1) {
+        throw new Error(
+          '[varlock] `@cloudflare/vite-plugin` is already present in your Vite plugins. '
+          + 'Remove it — `varlockCloudflareVitePlugin` injects (and configures) it for you.',
+        );
+      }
+
+      // Error if a .dev.vars file exists — it conflicts with varlock's env management.
+      // Wrangler reads `.dev.vars` from the directory holding each worker's config,
+      // so check every one of them, not just the vite root: values found there become
+      // `secret_text` bindings that overwrite the vars varlock injects, leaving the
+      // native `env` object disagreeing with varlock's own `ENV`.
+      //
+      // This runs in `configResolved` rather than a `config` hook so `root` is the
+      // final one — a plugin ordered after ours can still change it during `config`,
+      // and the Cloudflare plugin resolves its own worker configs from that final
+      // value. Checking earlier could inspect a directory nobody ends up using.
+      const { root, mode } = config;
+      const cloudflareEnvVars = await loadCloudflareEnvVars(mode, root);
+      for (const devVarsPath of devVarsGuardPaths(root, cloudflareOptions, cloudflareEnvVars)) {
+        if (!existsSync(devVarsPath)) continue;
+        throw new Error(
+          `[varlock] A .dev.vars file was found at ${path.relative(root, devVarsPath) || '.dev.vars'}, `
+          + 'which conflicts with varlock\'s env management.\n'
+          + 'Remove the .dev.vars file — varlock handles env injection automatically.',
+        );
+      }
+    },
+  };
+
+  // Detect dev vs build — set by a pre-enforce plugin before the cloudflare
+  // plugin evaluates its config callback.
+  let isDevMode = false;
+  const modeDetector: import('vite').Plugin = {
+    name: 'varlock-cloudflare-mode',
+    enforce: 'pre',
+    config(config, env) {
+      isDevMode = env.command === 'serve';
+    },
+  };
+
+  // Wraps a worker `config` customizer (the entry worker's, or an auxiliary
+  // worker's) so varlock's resolved env is merged into that worker's vars.
+  //
+  // Every worker environment the CF plugin creates gets the same injected SSR
+  // entry code, which calls `initVarlockEnv()` and throws if `__VARLOCK_ENV`
+  // is missing — so each worker needs the binding, not just the entry one.
+  // Auxiliary workers have their own per-worker customizer, which receives an
+  // extra `{ entryWorkerConfig }` argument we pass straight through.
+  const wrapWorkerConfig = (
+    userConfig: undefined | Partial<WorkerConfig> | ((...args: Array<any>) => Partial<WorkerConfig> | void),
+  ) => (cfg: WorkerConfig, ...rest: Array<any>) => {
+    let userResult: Partial<WorkerConfig> | undefined;
+    if (typeof userConfig === 'function') {
+      userResult = userConfig(cfg, ...rest) || undefined;
+    } else if (userConfig) {
+      userResult = userConfig;
+    }
+
+    // Only inject vars in dev — production gets them via varlock-wrangler deploy.
+    if (!isDevMode) return userResult;
+
+    // Reuse the env already loaded by the varlock vite plugin (avoids a duplicate CLI call).
+    // The vite plugin's reloadConfig() runs at module load time, before this callback.
+    const serializedGraph = process.env.__VARLOCK_ENV;
+    if (!varlockLoadedEnv || !serializedGraph || varlockLoadedEnv.errors) {
+      // vite plugin failed to load or config is invalid — it already showed the error.
+      // Return minimal vars so the cloudflare plugin doesn't crash,
+      // but don't inject real values.
+      return {
+        ...userResult,
+        vars: {
+          ...cfg.vars,
+          ...userResult?.vars,
+          ...(serializedGraph && { __VARLOCK_ENV: serializedGraph }),
+        },
+      };
+    }
+
+    const vars: Record<string, string> = {};
+    for (const key in varlockLoadedEnv.config) {
+      const { value } = varlockLoadedEnv.config[key] as { value: unknown };
+      if (value === undefined) continue;
+      vars[key] = typeof value === 'string' ? value : JSON.stringify(value);
+    }
+    return {
+      ...userResult,
+      vars: {
+        ...cfg.vars, ...userResult?.vars, ...vars, __VARLOCK_ENV: serializedGraph,
+      },
+    };
+  };
+
+  // Show an error page when config is invalid (cloudflare workers don't get
+  // the vite HMR error overlay since they run in a separate workerd runtime)
+  const errorPagePlugin: import('vite').Plugin = {
+    name: 'varlock-cloudflare-error-page',
+    configureServer(server) {
+      logVarlockEnvInjectionNotice();
+      // Return middleware — returning from configureServer adds it in the
+      // "post" phase, after internal vite middlewares
+      return () => {
+        server.middlewares.use((req, res, next) => {
+          if (!varlockLoadedEnv?.errors) return next();
+
+          res.statusCode = 500;
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          res.end(buildErrorPageHtml(varlockLastError));
+        });
+      };
+    },
+  };
+
+  const varlockPlugin = varlockVitePlugin({
+    ssrEdgeRuntime: true,
+    ssrEntryModuleIds: ['\0virtual:cloudflare/worker-entry'],
+    ssrEntryCode: [CLOUDFLARE_SSR_ENTRY_CODE],
+    isCloudflareTarget: true,
+    integrationTelemetry: {
+      name: __VARLOCK_INTEGRATION_NAME__,
+      version: __VARLOCK_INTEGRATION_VERSION__,
+    },
+  });
+
+  const cloudflarePlugin = cloudflare({
+    ...cloudflareOptions,
+    config: wrapWorkerConfig(cloudflareOptions?.config),
+    ...cloudflareOptions?.auxiliaryWorkers && {
+      auxiliaryWorkers: cloudflareOptions.auxiliaryWorkers.map((auxWorker) => ({
+        ...auxWorker,
+        config: wrapWorkerConfig('config' in auxWorker ? auxWorker.config : undefined),
+      })),
+    },
+  });
+
+  // --- preview env injector -----------------------------------------------
+  // During `vite preview`, the CF plugin reads `.dev.vars` from the build
+  // output directory (next to the built wrangler.json) to populate miniflare
+  // bindings. We serve env vars via a FIFO (named pipe) so secrets never
+  // touch disk. This plugin's `configurePreviewServer` runs before the CF
+  // plugin's because it appears earlier in the plugin array.
+  let resolvedRoot = '';
+  const previewEnvInjector: import('vite').Plugin = {
+    name: 'varlock-cloudflare-preview-env',
+    configResolved(config) {
+      resolvedRoot = config.root;
+    },
+    async configurePreviewServer(server) {
+      logVarlockEnvInjectionNotice();
+      if (!resolvedRoot) return;
+
+      // Find the build output directories containing wrangler.json — one per
+      // worker. The CF plugin names environments after the worker name (e.g.
+      // "test_worker"), so we scan the build output rather than guessing.
+      const devVarsPaths = findDevVarsPaths(resolvedRoot);
+      if (!devVarsPaths.length) return;
+
+      for (const devVarsPath of devVarsPaths) {
+        if (existsSync(devVarsPath)) {
+          throw new Error(
+            '[varlock] A .dev.vars file was found in the build output, which conflicts with varlock\'s env management.\n'
+            + 'Remove your project-root .dev.vars file — varlock handles env injection automatically.',
+          );
+        }
+      }
+
+      // Build dotenv-format content from the already-loaded env graph.
+      // The vite plugin's module-level reloadConfig() already populated
+      // varlockLoadedEnv and process.env.__VARLOCK_ENV.
+      const serializedGraph = process.env.__VARLOCK_ENV;
+      if (!serializedGraph || !varlockLoadedEnv) return;
+
+      const content = formatDevVarsContent(varlockLoadedEnv, serializedGraph);
+
+      // Write a temporary .dev.vars file for miniflare to pick up.
+      // On Unix we use a FIFO (named pipe) so secrets stay in memory.
+      // On Windows we fall back to a regular file.
+      const fifos = await Promise.all(
+        devVarsPaths.map((devVarsPath) => serveFifoOrFile(devVarsPath, content)),
+      );
+
+      const cleanup = () => {
+        for (const fifo of fifos) fifo.stop();
+        for (const devVarsPath of devVarsPaths) cleanupFile(devVarsPath);
+      };
+
+      // Clean up when the preview server shuts down.
+      const origClose = server.close.bind(server);
+      server.close = async () => {
+        cleanup();
+        return origClose();
+      };
+      // Also clean up on process exit.
+      const onExit = () => {
+        cleanup();
+      };
+      process.on('exit', onExit);
+      process.on('SIGINT', onExit);
+      process.on('SIGTERM', onExit);
+    },
+  };
+
+  return [
+    conflictGuard,
+    modeDetector,
+    previewEnvInjector,
+    errorPagePlugin,
+    varlockPlugin,
+    // cloudflare() may return a single plugin or an array
+    ...(Array.isArray(cloudflarePlugin) ? cloudflarePlugin : [cloudflarePlugin]),
+  ];
+}

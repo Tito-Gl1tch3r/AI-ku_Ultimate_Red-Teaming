@@ -1,0 +1,1379 @@
+// Copyright 2023 Paolo Fabio Zaino, all rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package agent provides the agent functionality for the CROWler.
+package agent
+
+/*
+  The CROWler is the foundation; the user builds and deploys autonomous or semi-autonomous agents that leverage CROWler's capabilities to perform high-level content discovery, threat simulation, and intelligence extraction.
+*/
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	cmn "github.com/pzaino/thecrowler/pkg/common"
+	cfg "github.com/pzaino/thecrowler/pkg/config"
+
+	"gopkg.in/yaml.v2"
+)
+
+var (
+	// AgentsEngine is the agent engine
+	AgentsEngine *JobEngine
+	// AgentsRegistry is the default agent configurations repository
+	AgentsRegistry *JobConfig
+)
+
+// RetryConfig defines retry behavior
+type RetryConfig struct {
+	MaxRetries int
+	BaseDelay  time.Duration
+	Backoff    float64
+	MaxDelay   time.Duration
+}
+
+type retryConfigSpec struct {
+	MaxRetries int     `json:"max_retries"`
+	BaseDelay  string  `json:"base_delay"`
+	Backoff    float64 `json:"backoff"`
+	MaxDelay   string  `json:"max_delay"`
+}
+
+func parseRetryConfig(raw any) (RetryConfig, bool, error) {
+	if raw == nil {
+		return RetryConfig{}, false, nil
+	}
+
+	if retry, ok := raw.(RetryConfig); ok {
+		return retry, true, nil
+	}
+
+	normalized := cmn.ConvertMapIIToSI(raw)
+
+	data, err := json.Marshal(normalized)
+	if err != nil {
+		return RetryConfig{}, false, fmt.Errorf(
+			"marshaling retry configuration: %w",
+			err,
+		)
+	}
+
+	var spec retryConfigSpec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return RetryConfig{}, false, fmt.Errorf(
+			"decoding retry configuration: %w",
+			err,
+		)
+	}
+
+	if spec.MaxRetries <= 0 {
+		return RetryConfig{}, false, fmt.Errorf(
+			"max_retries must be greater than zero",
+		)
+	}
+
+	baseDelay := 100 * time.Millisecond
+	if strings.TrimSpace(spec.BaseDelay) != "" {
+		baseDelay, err = time.ParseDuration(spec.BaseDelay)
+		if err != nil {
+			return RetryConfig{}, false, fmt.Errorf(
+				"invalid base_delay %q: %w",
+				spec.BaseDelay,
+				err,
+			)
+		}
+	}
+
+	backoff := spec.Backoff
+	if backoff == 0 {
+		backoff = 2
+	}
+	if backoff < 1 {
+		return RetryConfig{}, false, fmt.Errorf(
+			"backoff must be >= 1",
+		)
+	}
+
+	maxDelay := 5 * time.Second
+	if strings.TrimSpace(spec.MaxDelay) != "" {
+		maxDelay, err = time.ParseDuration(spec.MaxDelay)
+		if err != nil {
+			return RetryConfig{}, false, fmt.Errorf(
+				"invalid max_delay %q: %w",
+				spec.MaxDelay,
+				err,
+			)
+		}
+	}
+
+	if baseDelay <= 0 {
+		return RetryConfig{}, false, fmt.Errorf(
+			"base_delay must be greater than zero",
+		)
+	}
+
+	if maxDelay <= 0 {
+		return RetryConfig{}, false, fmt.Errorf(
+			"max_delay must be greater than zero",
+		)
+	}
+
+	return RetryConfig{
+		MaxRetries: spec.MaxRetries,
+		BaseDelay:  baseDelay,
+		Backoff:    backoff,
+		MaxDelay:   maxDelay,
+	}, true, nil
+}
+
+// JobConfig represents the structure of a job configuration file
+type JobConfig struct {
+	// FormatVersion is the compatibility contract marker for agents/job manifests.
+	// - v1: legacy jobs-only config (agent_identity omitted and derived at load time)
+	// - v2: identity-enabled config (agent_identity present)
+	// Backward-compatibility guarantee: jobs-only manifests MUST continue to parse and run unchanged.
+	FormatVersion string         `yaml:"format_version,omitempty" json:"format_version,omitempty"`
+	AgentIdentity *AgentIdentity `yaml:"agent_identity,omitempty" json:"agent_identity,omitempty"`
+	Jobs          []Job          `yaml:"jobs" json:"jobs"`
+	registry      *AgentRegistry `yaml:"-" json:"-"`
+}
+
+const (
+	// AgentFormatVersionV1 is the legacy compatibility marker for jobs-only config.
+	AgentFormatVersionV1 = "v1"
+	// AgentFormatVersionV2 marks identity-enabled config.
+	AgentFormatVersionV2 = "v2"
+)
+
+// AgentIdentity represents optional explicit identity metadata for an agent definition.
+type AgentIdentity struct {
+	AgentID      string            `yaml:"agent_id,omitempty" json:"agent_id,omitempty"`
+	Name         string            `yaml:"name,omitempty" json:"name,omitempty"`
+	Version      string            `yaml:"version,omitempty" json:"version,omitempty"`
+	AgentType    string            `yaml:"agent_type,omitempty" json:"agent_type,omitempty"`
+	Owner        string            `yaml:"owner,omitempty" json:"owner,omitempty"`
+	TrustLevel   string            `yaml:"trust_level,omitempty" json:"trust_level,omitempty"`
+	Capabilities []string          `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	Constraints  *AgentConstraints `yaml:"constraints,omitempty" json:"constraints,omitempty"`
+	Reasoning    string            `yaml:"reasoning_mode,omitempty" json:"reasoning_mode,omitempty"`
+	Memory       *AgentMemory      `yaml:"memory,omitempty" json:"memory,omitempty"`
+	Goal         string            `yaml:"goal,omitempty" json:"goal,omitempty"`
+	Description  string            `yaml:"description,omitempty" json:"description,omitempty"`
+	AuditTags    []string          `yaml:"audit_tags,omitempty" json:"audit_tags,omitempty"`
+	SelfModel    *AgentSelfModel   `yaml:"self_model,omitempty" json:"self_model,omitempty"`
+	Contract     *AgentContract    `yaml:"agent_contract,omitempty" json:"agent_contract,omitempty"`
+}
+
+// AgentConstraints defines safety and execution constraints for an agent identity.
+type AgentConstraints struct {
+	MaxSteps       int                 `yaml:"max_steps,omitempty" json:"max_steps,omitempty"`
+	TimeBudget     string              `yaml:"time_budget,omitempty" json:"time_budget,omitempty"`
+	ResourceLimits *AgentResourceLimit `yaml:"resource_limits,omitempty" json:"resource_limits,omitempty"`
+	EventRateLimit float64             `yaml:"event_rate_limit,omitempty" json:"event_rate_limit,omitempty"`
+}
+
+// AgentResourceLimit defines CPU/memory usage limits.
+type AgentResourceLimit struct {
+	CPUPercent float64 `yaml:"cpu_percent,omitempty" json:"cpu_percent,omitempty"`
+	MemoryMB   float64 `yaml:"memory_mb,omitempty" json:"memory_mb,omitempty"`
+}
+
+// AgentMemory defines memory retention scope for an agent.
+type AgentMemory struct {
+	Scope     string `yaml:"scope,omitempty" json:"scope,omitempty"`
+	Namespace string `yaml:"namespace,omitempty" json:"namespace,omitempty"`
+	TTL       string `yaml:"ttl,omitempty" json:"ttl,omitempty"`
+	Retention int    `yaml:"retention,omitempty" json:"retention,omitempty"`
+}
+
+// AgentSelfModel defines permissions related to self-modification.
+type AgentSelfModel struct {
+	CanModifyIdentity bool `yaml:"can_modify_identity,omitempty" json:"can_modify_identity,omitempty"`
+	CanSpawnAgents    bool `yaml:"can_spawn_agents,omitempty" json:"can_spawn_agents,omitempty"`
+	CanModifyJobs     bool `yaml:"can_modify_jobs,omitempty" json:"can_modify_jobs,omitempty"`
+}
+
+// AgentContract defines boundaries and assumptions for an agent.
+type AgentContract struct {
+	Guarantees       []string `yaml:"guarantees,omitempty" json:"guarantees,omitempty"`
+	Assumptions      []string `yaml:"assumptions,omitempty" json:"assumptions,omitempty"`
+	ForbiddenActions []string `yaml:"forbidden_actions,omitempty" json:"forbidden_actions,omitempty"`
+	FailurePolicy    string   `yaml:"failure_policy,omitempty" json:"failure_policy,omitempty"`
+}
+
+// Job represents a job configuration
+type Job struct {
+	Name           string           `yaml:"name" json:"name"`
+	Process        string           `yaml:"process" json:"process"`
+	TriggerType    string           `yaml:"trigger_type" json:"trigger_type"`
+	TriggerName    string           `yaml:"trigger_name" json:"trigger_name"`
+	Steps          []map[string]any `yaml:"steps" json:"steps"`
+	AgentsTimeout  int              `yaml:"timeout" json:"timeout"`
+	PluginsTimeout int              `yaml:"plugins_timeout" json:"plugins_timeout"`
+}
+
+// NewJobConfig creates a new job configuration
+func NewJobConfig() *JobConfig {
+	return &JobConfig{
+		registry: NewAgentRegistry(),
+	}
+}
+
+// LoadJob loads a job into the JobConfig
+func (jc *JobConfig) LoadJob(j Job) {
+	if jc == nil {
+		jc = NewJobConfig()
+	}
+	if jc.Jobs == nil {
+		jc.Jobs = make([]Job, 0)
+	}
+	jc.Jobs = append(jc.Jobs, j)
+}
+
+func (jc *JobConfig) ensureRegistry() {
+	if jc == nil {
+		return
+	}
+	if jc.registry == nil {
+		jc.registry = NewAgentRegistry()
+	}
+}
+
+// Registry exposes the live agent index for paths that need cross-agent
+// resolution outside the package (e.g. upload-time Decision target checks).
+func (jc *JobConfig) Registry() *AgentRegistry {
+	if jc == nil {
+		return nil
+	}
+	jc.ensureRegistry()
+	return jc.registry
+}
+
+// --- helpers: parsing and normalization ---
+
+// parseAgentsBytes decodes YAML or JSON into a JobConfig
+func parseAgentsBytes(data []byte, fileType string) (JobConfig, error) {
+	var cfg JobConfig
+	if err := ValidateAgentConfig(data, fileType, ValidationModeLenient, nil); err != nil {
+		return cfg, err
+	}
+	var err error
+	switch strings.ToLower(strings.TrimPrefix(fileType, ".")) {
+	case "yaml", "yml":
+		err = yaml.NewDecoder(bytes.NewReader(data)).Decode(&cfg)
+	case "json":
+		err = json.NewDecoder(bytes.NewReader(data)).Decode(&cfg)
+	default:
+		err = fmt.Errorf("unsupported file format: %s", fileType)
+	}
+	if err != nil {
+		return cfg, err
+	}
+	if err = cfg.normalizeAgentIdentity(); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+func normalizeAgentID(name string) string {
+	v := strings.ToLower(strings.TrimSpace(name))
+	if v == "" {
+		return "anonymous-agent"
+	}
+	v = strings.ReplaceAll(v, " ", "-")
+	v = strings.ReplaceAll(v, "/", "-")
+	v = strings.ReplaceAll(v, "_", "-")
+	return v
+}
+
+func (jc *JobConfig) normalizeAgentIdentity() error {
+	if jc == nil {
+		return nil
+	}
+
+	derivedName := ""
+	if len(jc.Jobs) > 0 {
+		derivedName = strings.TrimSpace(jc.Jobs[0].Name)
+	}
+
+	if jc.AgentIdentity == nil {
+		if strings.TrimSpace(jc.FormatVersion) == "" {
+			jc.FormatVersion = AgentFormatVersionV1
+		}
+		if derivedName == "" {
+			return nil
+		}
+		jc.AgentIdentity = &AgentIdentity{
+			Name:         derivedName,
+			AgentID:      normalizeAgentID(derivedName),
+			Version:      "0.0.0",
+			AgentType:    "executor",
+			TrustLevel:   "restricted",
+			Capabilities: []string{"all"},
+			Reasoning:    "fixed",
+			Memory:       &AgentMemory{Scope: "persistent"},
+			Contract:     &AgentContract{FailurePolicy: "emit_event"},
+		}
+		return nil
+	}
+
+	if strings.TrimSpace(jc.FormatVersion) == "" {
+		jc.FormatVersion = AgentFormatVersionV2
+	}
+
+	if derivedName != "" {
+		if strings.TrimSpace(jc.AgentIdentity.Name) == "" {
+			jc.AgentIdentity.Name = derivedName
+		} else if strings.TrimSpace(jc.AgentIdentity.Name) != derivedName {
+			return fmt.Errorf("agent_identity.name (%s) must match jobs[0].name (%s)", jc.AgentIdentity.Name, derivedName)
+		}
+	}
+
+	if strings.TrimSpace(jc.AgentIdentity.AgentID) == "" {
+		jc.AgentIdentity.AgentID = normalizeAgentID(jc.AgentIdentity.Name)
+	}
+	if strings.TrimSpace(jc.AgentIdentity.Version) == "" {
+		jc.AgentIdentity.Version = "0.0.0"
+	}
+	if strings.TrimSpace(jc.AgentIdentity.AgentType) == "" {
+		jc.AgentIdentity.AgentType = "executor"
+	}
+	if strings.TrimSpace(jc.AgentIdentity.TrustLevel) == "" {
+		jc.AgentIdentity.TrustLevel = "restricted"
+	}
+	// An explicit v2 identity without capabilities grants nothing: under
+	// enforcement every privileged action is denied (fail-closed). The
+	// omnipotent `all` fallback is isolated to v1-derived identities above.
+	if len(jc.AgentIdentity.Capabilities) == 0 {
+		jc.AgentIdentity.Capabilities = []string{}
+	}
+	if strings.TrimSpace(jc.AgentIdentity.Reasoning) == "" {
+		jc.AgentIdentity.Reasoning = "fixed"
+	}
+	if jc.AgentIdentity.Memory == nil {
+		jc.AgentIdentity.Memory = &AgentMemory{Scope: "persistent"}
+	} else if strings.TrimSpace(jc.AgentIdentity.Memory.Scope) == "" {
+		jc.AgentIdentity.Memory.Scope = "persistent"
+	}
+	if jc.AgentIdentity.Contract == nil {
+		jc.AgentIdentity.Contract = &AgentContract{FailurePolicy: "emit_event"}
+	} else if strings.TrimSpace(jc.AgentIdentity.Contract.FailurePolicy) == "" {
+		jc.AgentIdentity.Contract.FailurePolicy = "emit_event"
+	}
+
+	return nil
+}
+
+// applyGlobalParams merges AgentsTimeout/PluginsTimeout and GlobalParameters into every step
+func applyGlobalParams(cfg *JobConfig, agt cfg.AgentsConfig) {
+	globalParams := agt.GlobalParameters
+	if len(cfg.Jobs) == 0 || (len(globalParams) == 0 && agt.AgentsTimeout == 0 && agt.PluginsTimeout == 0) {
+		return
+	}
+	for i := range cfg.Jobs {
+		// Defaults for timeouts
+		if cfg.Jobs[i].AgentsTimeout == 0 {
+			cfg.Jobs[i].AgentsTimeout = agt.AgentsTimeout
+		}
+		if cfg.Jobs[i].PluginsTimeout == 0 {
+			cfg.Jobs[i].PluginsTimeout = agt.PluginsTimeout
+		}
+		// Ensure step params/config map exists, then merge global params
+		for j := range cfg.Jobs[i].Steps {
+			// Ensure "params" map exists
+			if _, ok := cfg.Jobs[i].Steps[j]["params"]; !ok {
+				cfg.Jobs[i].Steps[j]["params"] = make(map[interface{}]interface{})
+			}
+			// Ensure "config" inside params exists
+			if _, ok := cfg.Jobs[i].Steps[j]["params"].(map[interface{}]interface{})[StrConfig]; !ok {
+				cfg.Jobs[i].Steps[j]["params"].(map[interface{}]interface{})[StrConfig] = make(map[interface{}]interface{})
+			}
+			// Merge global parameters into params
+			if paramMap, ok := cfg.Jobs[i].Steps[j]["params"].(map[interface{}]interface{}); ok {
+				for k, v := range globalParams {
+					paramMap[k] = v
+				}
+			} else {
+				cmn.DebugMsg(cmn.DbgLvlError, "params field is not map[interface{}]interface{} but %T", cfg.Jobs[i].Steps[j]["params"])
+			}
+		}
+	}
+}
+
+// --- LOCAL loader (extracted from your current code) ---
+
+func loadAgentsFromLocal(paths []string) ([]JobConfig, error) {
+	if len(paths) == 0 {
+		paths = []string{"./agents/*.yaml"}
+	}
+
+	var out []JobConfig
+	for _, path := range paths {
+		// Expand wildcards
+		files, err := filepath.Glob(path)
+		if err != nil {
+			cmn.DebugMsg(cmn.DbgLvlError, "Error finding agent files: %v", err)
+			return nil, err
+		}
+		if len(files) == 0 {
+			continue
+		}
+
+		for _, filePath := range files {
+			ext := cmn.GetFileExt(filePath) // no dot, e.g., "yaml"
+			if ext != "" && ext != "yaml" && ext != "yml" && ext != "json" {
+				continue
+			}
+			cmn.DebugMsg(cmn.DbgLvlDebug, "Loading agents definition file: %s", filePath)
+
+			f, err := os.Open(filePath) //nolint:gosec
+			if err != nil {
+				return nil, fmt.Errorf("failed to open config file: %w", err)
+			}
+			data, rerr := io.ReadAll(f)
+			_ = f.Close()
+			if rerr != nil {
+				return nil, fmt.Errorf("failed to read config file: %w", rerr)
+			}
+
+			// Interpolate env vars
+			interpolated := cmn.InterpolateEnvVars(string(data))
+			cfg, err := parseAgentsBytes([]byte(interpolated), filepath.Ext(filePath))
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse config file %s: %w", filePath, err)
+			}
+			out = append(out, cfg)
+		}
+	}
+	return out, nil
+}
+
+// --- REMOTE loader (mirrors your plugins/rules remote approach) ---
+
+func loadAgentsFromRemote(agt cfg.AgentsConfig) ([]JobConfig, error) {
+	if agt.Path == nil {
+		return nil, fmt.Errorf("agents path is empty")
+	}
+
+	var out []JobConfig
+	for _, path := range agt.Path {
+		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+		if ext != "yaml" && ext != "yml" && ext != "json" {
+			// ignore unsupported types
+			continue
+		}
+
+		// protocol selection (http/https, ftp/ftps, s3); mirrors your existing code
+		var proto string
+		switch strings.ToLower(strings.TrimSpace(agt.Type)) {
+		case "http":
+			proto = "http"
+		case "ftp":
+			proto = "ftp"
+		default:
+			proto = "s3"
+		}
+		if agt.SSLMode == cmn.EnableStr && proto == "http" {
+			proto = "https"
+		}
+		if agt.SSLMode == cmn.EnableStr && proto == "ftp" {
+			proto = "ftps"
+		}
+
+		// URL compose
+		var url string
+		if agt.Port != "" && agt.Port != "80" && agt.Port != "443" {
+			url = fmt.Sprintf("%s://%s:%s/%s", proto, agt.Host, agt.Port, path)
+		} else {
+			url = fmt.Sprintf("%s://%s/%s", proto, agt.Host, path)
+		}
+		cmn.DebugMsg(cmn.DbgLvlDebug, "Downloading agents definition from %s", url)
+
+		// Download
+		body, err := cmn.FetchRemoteFile(url, agt.Timeout, agt.SSLMode)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch agents from %s: %w", url, err)
+		}
+
+		// Env interpolation, then parse
+		interpolated := cmn.InterpolateEnvVars(body)
+		cfg, err := parseAgentsBytes([]byte(interpolated), filepath.Ext(path))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse remote agents from %s: %w", url, err)
+		}
+		out = append(out, cfg)
+	}
+	return out, nil
+}
+
+// --- Public method with remote support ---
+
+// LoadConfig loads YAML/JSON Agent Definitions from local paths or remote hosts (http/ftp/s3)
+// and applies global parameters/timeouts from each AgentsConfig entry.
+func (jc *JobConfig) LoadConfig(agtConfigs []cfg.AgentsConfig) error {
+	jc.ensureRegistry()
+	for _, agt := range agtConfigs {
+		var chunks []JobConfig
+		var err error
+
+		if strings.TrimSpace(agt.Host) == "" {
+			// LOCAL
+			paths := agt.Path
+			if len(paths) == 0 {
+				paths = []string{"./agents/*.yaml"}
+			}
+			chunks, err = loadAgentsFromLocal(paths)
+			if err != nil {
+				return err
+			}
+		} else {
+			// REMOTE
+			chunks, err = loadAgentsFromRemote(agt)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Normalize and merge global params for each loaded chunk, then append
+		for idx := range chunks {
+			applyGlobalParams(&chunks[idx], agt)
+			def, err := chunks[idx].NormalizeToAgentDefinition(AgentSourceMetadata{
+				Location: strings.Join(agt.Path, ","),
+				Format:   strings.ToLower(strings.TrimSpace(agt.Type)),
+			})
+			if err != nil {
+				return err
+			}
+			if err := jc.registry.Register(def); err != nil {
+				return err
+			}
+			jc.Jobs = append(jc.Jobs, def.Jobs...)
+		}
+	}
+	return nil
+}
+
+// RegisterAgent registers an agent with the JobConfig
+func (jc *JobConfig) RegisterAgent(agent *JobConfig) {
+	if err := jc.RegisterAgentE(agent); err != nil {
+		cmn.DebugMsg(cmn.DbgLvlError, "failed to register agent: %v", err)
+	}
+}
+
+// RegisterAgentE normalizes and registers an agent, reporting normalization
+// and duplicate-registration failures to the caller so upload paths can roll
+// back already-written files instead of diverging from the registry.
+func (jc *JobConfig) RegisterAgentE(agent *JobConfig) error {
+	if jc == nil {
+		return fmt.Errorf("nil job config")
+	}
+	jc.ensureRegistry()
+	if agent == nil {
+		return fmt.Errorf("nil agent")
+	}
+	def, err := agent.NormalizeToAgentDefinition(AgentSourceMetadata{Location: "runtime"})
+	if err != nil {
+		return err
+	}
+	if err := jc.registry.Register(def); err != nil {
+		return err
+	}
+	jc.Jobs = append(jc.Jobs, def.Jobs...)
+	return nil
+}
+
+// GetAgentByName returns an agent by name
+func (jc *JobConfig) GetAgentByName(name string) (*JobConfig, bool) {
+	if jc == nil {
+		return nil, false
+	}
+	jc.ensureRegistry()
+
+	if a, ok := jc.registry.GetByName(name); ok {
+		return a.toJobConfig(), true
+	}
+
+	// Backward-compatible fallback: lookup by legacy job-group name.
+	for i := 0; i < len(jc.Jobs); i++ {
+		if strings.TrimSpace(jc.Jobs[i].Name) == name {
+			// Return the Job with the specified name inside a JobConfig struct
+			rjc := NewJobConfig()
+			rjc.Jobs = append(rjc.Jobs, jc.Jobs[i])
+			return rjc, true
+		}
+	}
+	return nil, false
+}
+
+// GetAgentsByEventType returns all agents that are triggered by a specific event type
+func (jc *JobConfig) GetAgentsByEventType(eventType string) ([]*JobConfig, bool) {
+	return jc.GetAgentsByTrigger("event", eventType)
+}
+
+// GetAgentsByTrigger returns all agents matching a trigger selector.
+func (jc *JobConfig) GetAgentsByTrigger(triggerType, triggerName string) ([]*JobConfig, bool) {
+	if jc == nil {
+		return nil, false
+	}
+	jc.ensureRegistry()
+
+	var agents []*JobConfig
+	defs := jc.registry.GetByTrigger(triggerType, triggerName)
+	for _, def := range defs {
+		cfg := NewJobConfig()
+		cfg.FormatVersion = def.FormatVersion
+		id := def.Identity
+		cfg.AgentIdentity = &id
+		for _, job := range def.Jobs {
+			if strings.ToLower(strings.TrimSpace(job.TriggerType)) == strings.ToLower(strings.TrimSpace(triggerType)) &&
+				strings.TrimSpace(job.TriggerName) == strings.TrimSpace(triggerName) {
+				cfg.Jobs = append(cfg.Jobs, job)
+			}
+		}
+		if len(cfg.Jobs) > 0 {
+			agents = append(agents, cfg)
+		}
+	}
+
+	if len(agents) > 0 {
+		return agents, true
+	}
+
+	// Backward-compatible fallback in case legacy callers only populated Jobs directly.
+	for i := 0; i < len(jc.Jobs); i++ {
+		if strings.ToLower(strings.TrimSpace(jc.Jobs[i].TriggerType)) == strings.ToLower(strings.TrimSpace(triggerType)) &&
+			strings.TrimSpace(jc.Jobs[i].TriggerName) == strings.TrimSpace(triggerName) {
+			rjc := NewJobConfig()
+			rjc.Jobs = append(rjc.Jobs, jc.Jobs[i])
+			agents = append(agents, rjc)
+		}
+	}
+
+	return agents, len(agents) > 0
+}
+
+// GetAgentByName returns an agent by name from the JobEngine
+func (je *JobEngine) GetAgentByName(name string) (*JobConfig, bool) {
+	return AgentsRegistry.GetAgentByName(name)
+}
+
+// GetAgentsByEventType returns all agents that are triggered by a specific event type from the JobEngine
+func (je *JobEngine) GetAgentsByEventType(eventType string) ([]*JobConfig, bool) {
+	return AgentsRegistry.GetAgentsByEventType(eventType)
+}
+
+// GetAgentsByTrigger returns all agents matching the provided trigger selector.
+func (je *JobEngine) GetAgentsByTrigger(triggerType, triggerName string) ([]*JobConfig, bool) {
+	return AgentsRegistry.GetAgentsByTrigger(triggerType, triggerName)
+}
+
+// ExecuteAgent executes a registered agent by agent ID or, if missing, by agent name.
+func (je *JobEngine) ExecuteAgent(agentRef string, inputCtx map[string]any) error {
+	_, err := je.ExecuteAgentResult(agentRef, inputCtx)
+	return err
+}
+
+// Delegated terminal-result semantics (no autonomous execution):
+//
+//   - one job group: that group's terminal step payload;
+//   - several serial groups: the last group's terminal payload;
+//   - any parallel groups: a map keyed by stable group name holding each
+//     group's terminal payload (duplicate names gain deterministic #2, #3
+//     suffixes in definition order);
+//   - no jobs or an empty group: an empty (non-nil) map;
+//   - failure: a nil map plus the error.
+//
+// The caller's group budget is charged exactly once for the delegation step
+// itself; the callee's groups are metered by their own independent budgets.
+
+// ExecuteAgentResult executes a registered agent and returns its terminal
+// result alongside the error. Existing error-only callers keep working
+// through ExecuteAgent.
+func (je *JobEngine) ExecuteAgentResult(agentRef string, inputCtx map[string]any) (any, error) {
+	lookup := strings.TrimSpace(agentRef)
+	if lookup == "" {
+		return nil, fmt.Errorf("missing agent reference")
+	}
+	if AgentsRegistry != nil {
+		AgentsRegistry.ensureRegistry()
+		if def, ok := AgentsRegistry.registry.GetByID(lookup); ok {
+			return je.executeAgentDefinitionResult(def, inputCtx)
+		}
+		if def, ok := AgentsRegistry.registry.GetByName(lookup); ok {
+			return je.executeAgentDefinitionResult(def, inputCtx)
+		}
+	}
+
+	if agent, ok := je.GetAgentByName(lookup); ok {
+		return je.executeJobsResult(agent, inputCtx)
+	}
+	return nil, fmt.Errorf("agent '%s' not found", lookup)
+}
+
+// executeJobsResult runs a raw job config (legacy path included) and returns
+// its terminal result.
+func (je *JobEngine) executeJobsResult(j *JobConfig, iCfg map[string]any) (any, error) {
+	if j != nil && j.AgentIdentity != nil {
+		if def, err := j.NormalizeToAgentDefinition(AgentSourceMetadata{Location: "runtime"}); err == nil {
+			return je.executeAgentDefinitionResult(def, iCfg)
+		}
+	}
+	return je.executeJobsWithContextResult(j, iCfg, AgentExecutionContext{}, cfg.AgentRuntimeConfig{})
+}
+
+func deepCopyJob(j Job) Job {
+	out := j // copy scalars
+
+	out.Steps = make([]map[string]any, len(j.Steps))
+	for i, step := range j.Steps {
+		m := make(map[string]any, len(step))
+		for k, v := range step {
+			m[k] = deepCloneStepValue(v)
+		}
+		out.Steps[i] = m
+	}
+
+	return out
+}
+
+// maxCloneDepth bounds recursive cloning: configs alias previous params maps,
+// so chains stay shallow in practice; beyond the bound values are shared by
+// reference instead of risking unbounded recursion on hostile input.
+const maxCloneDepth = 64
+
+// deepCloneStepValue deterministically clones step params so repeated and
+// concurrent runs cannot mutate the stored manifest through shared nested
+// maps or slices. Scalar and foreign values (handlers, drivers, registers)
+// are shared by reference; plain JSON containers are deep-copied, with
+// map[interface{}]interface{} normalized to map[string]any.
+func deepCloneStepValue(v any) any {
+	return deepCloneStepValueDepth(v, 0)
+}
+
+func deepCloneStepValueDepth(v any, depth int) any {
+	if depth > maxCloneDepth {
+		return v
+	}
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for key, item := range t {
+			out[key] = deepCloneStepValueDepth(item, depth+1)
+		}
+		return out
+	case map[interface{}]interface{}:
+		converted, ok := cmn.ConvertMapIIToSI(t).(map[string]any)
+		if !ok {
+			return v
+		}
+		return deepCloneStepValueDepth(converted, depth+1)
+	case []any:
+		out := make([]any, len(t))
+		for i, item := range t {
+			out[i] = deepCloneStepValueDepth(item, depth+1)
+		}
+		return out
+	case []map[string]any:
+		out := make([]map[string]any, len(t))
+		for i, item := range t {
+			if cloned, ok := deepCloneStepValueDepth(item, depth+1).(map[string]any); ok {
+				out[i] = cloned
+			} else {
+				out[i] = item
+			}
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// ExecuteJobs executes all jobs in the configuration
+func (je *JobEngine) ExecuteJobs(j *JobConfig, iCfg map[string]any) error {
+	if j != nil && j.AgentIdentity != nil {
+		if def, err := j.NormalizeToAgentDefinition(AgentSourceMetadata{Location: "runtime"}); err == nil {
+			return je.executeAgentDefinition(def, iCfg)
+		}
+	}
+	return je.executeJobsWithContext(j, iCfg, AgentExecutionContext{}, cfg.AgentRuntimeConfig{})
+}
+
+func (je *JobEngine) executeAgentDefinition(def *AgentDefinition, iCfg map[string]any) error {
+	if def == nil {
+		return fmt.Errorf("nil agent definition")
+	}
+	flags := runtimeFlagsFromConfig(iCfg)
+	ctx := newAgentExecutionContext(def.Identity, def.Source.Location)
+	if flags.IdentityEnforcement || flags.ContractEnforcement {
+		je.startGovernanceRun()
+	}
+	return je.executeJobsWithContext(def.toJobConfig(), iCfg, ctx, flags)
+}
+
+func (je *JobEngine) executeAgentDefinitionResult(def *AgentDefinition, iCfg map[string]any) (any, error) {
+	if def == nil {
+		return nil, fmt.Errorf("nil agent definition")
+	}
+	flags := runtimeFlagsFromConfig(iCfg)
+	ctx := newAgentExecutionContext(def.Identity, def.Source.Location)
+	if flags.IdentityEnforcement || flags.ContractEnforcement {
+		je.startGovernanceRun()
+	}
+	return je.executeJobsWithContextResult(def.toJobConfig(), iCfg, ctx, flags)
+}
+
+func (je *JobEngine) executeJobsWithContext(j *JobConfig, iCfg map[string]any, execCtx AgentExecutionContext, flags cfg.AgentRuntimeConfig) error {
+	_, err := je.executeJobsWithContextResult(j, iCfg, execCtx, flags)
+	return err
+}
+
+// groupOutcome carries one group's terminal payload (or failure) with its
+// stable definition-order key.
+type groupOutcome struct {
+	key      string
+	terminal any
+	err      error
+}
+
+// groupResultKeys assigns stable result keys in definition order, suffixing
+// duplicate group names deterministically (#2, #3, ...).
+func groupResultKeys(jobs []Job) []string {
+	keys := make([]string, len(jobs))
+	seen := map[string]int{}
+	for i, job := range jobs {
+		name := strings.TrimSpace(job.Name)
+		if name == "" {
+			name = fmt.Sprintf("group-%d", i)
+		}
+		seen[name]++
+		if seen[name] > 1 {
+			name = fmt.Sprintf("%s#%d", name, seen[name])
+		}
+		keys[i] = name
+	}
+	return keys
+}
+
+func (je *JobEngine) executeJobsWithContextResult(j *JobConfig, iCfg map[string]any, execCtx AgentExecutionContext, flags cfg.AgentRuntimeConfig) (any, error) {
+	// Create a waiting group for parallel group processing
+	var wg sync.WaitGroup
+
+	// Create a deep copy of j.Jobs to avoid modifying the original configuration
+	localJobs := make([]Job, len(j.Jobs))
+	for i, job := range j.Jobs {
+		localJobs[i] = deepCopyJob(job)
+	}
+
+	// Create a channel to collect parallel group outcomes
+	parallelOutcomes := make(chan groupOutcome, len(localJobs))
+	keys := groupResultKeys(localJobs)
+
+	var serialOutcomes []groupOutcome
+	parallelCount := 0
+
+	// Iterate over job groups
+	for idx, jobGroup := range localJobs {
+		cmn.DebugMsg(cmn.DbgLvlDebug, "[DEBUG-Agents] Executing Job Group: %s", jobGroup.Name)
+
+		// Add iCfg to the first step as StrConfig field
+		// this is the "base" configuration that will be passed to all steps
+		// and contains things like *wd and *dbHandler
+		if len(jobGroup.Steps) > 0 {
+			params, ok := jobGroup.Steps[0]["params"]
+			if !ok {
+				jobGroup.Steps[0]["params"] = make(map[string]interface{})
+			} else {
+				jobGroup.Steps[0]["params"] = cmn.ConvertMapIIToSI(params)
+			}
+
+			paramsMap, ok := jobGroup.Steps[0]["params"].(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid params for first step of job group '%s': expected mapping", jobGroup.Name)
+			}
+
+			// Seed the first step input from the invocation context (for
+			// example delegated payloads). Manifest-explicit input wins;
+			// without either, actions see whatever their own contract
+			// requires (some tolerate missing input, some error).
+			if inputVal, ok := iCfg[StrRequest]; ok && inputVal != nil {
+				if _, present := paramsMap[StrRequest]; !present {
+					paramsMap[StrRequest] = inputVal
+				}
+			}
+
+			// Ensure "StrConfig" exists within "params" and is a map[string]interface{}
+			if _, ok := paramsMap[StrConfig]; !ok || paramsMap[StrConfig] == nil {
+				paramsMap[StrConfig] = make(map[string]interface{})
+			}
+
+			configMap, ok := paramsMap[StrConfig].(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid config for first step of job group '%s': expected mapping", jobGroup.Name)
+			}
+
+			// Merge iCfg into configMap
+			for k, v := range iCfg {
+				k = strings.ToLower(strings.TrimSpace(k))
+				if k == "metadata" {
+					k = "meta_data"
+				}
+				configMap[k] = v
+				if k == "meta_data" {
+					cmn.DebugMsg(cmn.DbgLvlDebug3, "[DEBUG-Agents] Merged meta_data into job config: %v", v)
+				}
+			}
+		}
+
+		// log the configuration for debugging purposes
+		cmn.DebugMsg(cmn.DbgLvlDebug, "[DEBUG-Agents] Job Group Configuration: %v", jobGroup)
+
+		// Check if the group should run in parallel
+		if strings.ToLower(strings.TrimSpace(jobGroup.Process)) == "parallel" {
+			wg.Add(1)
+			parallelCount++
+
+			go func(
+				groupName string,
+				resultKey string,
+				jg []map[string]any,
+				identity *AgentIdentity,
+			) {
+				defer wg.Done()
+
+				terminal, err := executeJobGroup(
+					je,
+					jg,
+					identity,
+					execCtx,
+					flags,
+				)
+				if err != nil {
+					wrappedErr := fmt.Errorf(
+						"failed to execute job group '%s': %w",
+						groupName,
+						err,
+					)
+
+					cmn.DebugMsg(
+						cmn.DbgLvlError,
+						"[DEBUG-Agents] %v",
+						wrappedErr,
+					)
+
+					parallelOutcomes <- groupOutcome{key: resultKey, err: wrappedErr}
+					return
+				}
+
+				cmn.DebugMsg(
+					cmn.DbgLvlDebug,
+					"[DEBUG-Agents] Job Group '%s' completed successfully",
+					groupName,
+				)
+				parallelOutcomes <- groupOutcome{key: resultKey, terminal: terminal}
+			}(
+				jobGroup.Name,
+				keys[idx],
+				jobGroup.Steps,
+				j.AgentIdentity,
+			)
+
+		} else {
+			// Execute the group serially
+			terminal, err := executeJobGroup(je, jobGroup.Steps, j.AgentIdentity, execCtx, flags)
+			if err != nil {
+				return nil, fmt.Errorf("failed to execute job group '%s': %v", jobGroup.Name, err)
+			}
+			serialOutcomes = append(serialOutcomes, groupOutcome{key: keys[idx], terminal: terminal})
+			cmn.DebugMsg(cmn.DbgLvlDebug, "[DEBUG-Agents] Job Group '%s' completed successfully", jobGroup.Name)
+		}
+	}
+
+	// Wait for all parallel groups to finish
+	wg.Wait()
+	close(parallelOutcomes)
+	parallelByKey := make(map[string]any, parallelCount)
+	parallelErrs := make(map[string]error, parallelCount)
+	for outcome := range parallelOutcomes {
+		if outcome.err != nil {
+			parallelErrs[outcome.key] = outcome.err
+			continue
+		}
+		parallelByKey[outcome.key] = outcome.terminal
+	}
+	// Deterministic failure choice: the lowest definition-order group wins.
+	for _, key := range keys {
+		if err, failed := parallelErrs[key]; failed {
+			return nil, err
+		}
+	}
+	if parallelCount == 0 {
+		if len(serialOutcomes) == 0 {
+			return map[string]any{}, nil
+		}
+		return serialOutcomes[len(serialOutcomes)-1].terminal, nil
+	}
+	combined := make(map[string]any, len(serialOutcomes)+len(parallelByKey))
+	for _, outcome := range serialOutcomes {
+		combined[outcome.key] = outcome.terminal
+	}
+	for key, terminal := range parallelByKey {
+		combined[key] = terminal
+	}
+	return combined, nil
+}
+
+// executeJobGroup runs jobs in a group serially with a fresh per-group budget,
+// returning the terminal step payload.
+func executeJobGroup(je *JobEngine, steps []map[string]any, identity *AgentIdentity, execCtx AgentExecutionContext, flags cfg.AgentRuntimeConfig) (any, error) {
+	var budget *constraintBudgetManager
+	if flags.IdentityEnforcement && identity != nil {
+		b, err := newConstraintBudgetManager(*identity)
+		if err != nil {
+			return nil, err
+		}
+		budget = b
+		defer budget.release()
+	}
+	return executeJobGroupWithBudget(je, steps, identity, execCtx, flags, budget)
+}
+
+// executeJobGroupWithBudget runs jobs in a group serially against an existing
+// group budget, returning the terminal step payload. Fallback steps use this
+// variant so they are charged to the same group instead of receiving a fresh
+// budget. Only the budget owner (executeJobGroup) releases the context,
+// never a fallback invocation.
+func executeJobGroupWithBudget(je *JobEngine, steps []map[string]any, identity *AgentIdentity, execCtx AgentExecutionContext, flags cfg.AgentRuntimeConfig, budget *constraintBudgetManager) (any, error) {
+	lastResult := make(map[string]any)
+
+	if (flags.IdentityEnforcement || flags.ContractEnforcement) && identity != nil {
+		je.appendAudit(AuditEvent{
+			RunID:     execCtx.RunID,
+			TraceID:   execCtx.TraceID,
+			AgentID:   identity.AgentID,
+			AgentName: identity.Name,
+			Owner:     identity.Owner,
+			Outcome:   auditOutcomeAllowed,
+			Reason:    "identity_loaded",
+		})
+	}
+
+	// Execute each job in the group
+	for i := 0; i < len(steps); i++ {
+		step := &steps[i]
+
+		// Get the action name
+		actionName, ok := (*step)["action"].(string)
+		if !ok {
+			return nil, fmt.Errorf("missing 'action' field in job step")
+		}
+		params, _ := (*step)["params"].(map[string]interface{})
+		auditAgentID, auditAgentName, auditOwner := "", "", ""
+		if identity != nil {
+			auditAgentID = identity.AgentID
+			auditAgentName = identity.Name
+			auditOwner = identity.Owner
+		}
+		if params == nil {
+			params = map[string]interface{}{}
+			(*step)["params"] = params
+		}
+		if (flags.IdentityEnforcement || flags.ContractEnforcement) && identity != nil {
+			applyExecutionContext(params, execCtx, flags)
+			// Publish the group's deadline for context-aware actions.
+			propagateGroupDeadline(params, budget)
+		}
+		if flags.IdentityEnforcement && identity != nil {
+			if !capabilityAllowed(*identity, actionName) {
+				err := fmt.Errorf("capability gate denied action %s: capability %q missing", actionName, requiredCapabilityForActionName(actionName))
+				je.appendAudit(AuditEvent{RunID: execCtx.RunID, TraceID: execCtx.TraceID, AgentID: auditAgentID, AgentName: auditAgentName, Owner: auditOwner, Action: actionName, RequiredCapability: requiredCapabilityForActionName(actionName), Outcome: auditOutcomeDenied, Reason: err.Error()})
+				return nil, err
+			}
+			if strings.TrimSpace(actionName) == "DBQuery" {
+				if err := enforceDBQueryGate(je, params, *identity, execCtx, auditAgentID, auditAgentName, auditOwner); err != nil {
+					return nil, err
+				}
+			}
+			if !trustAllowed(*identity, actionName) {
+				err := fmt.Errorf("trust gate denied action %s: trust_level %q insufficient", actionName, identity.TrustLevel)
+				je.appendAudit(AuditEvent{RunID: execCtx.RunID, TraceID: execCtx.TraceID, AgentID: auditAgentID, AgentName: auditAgentName, Owner: auditOwner, Action: actionName, RequiredCapability: requiredCapabilityForActionName(actionName), Outcome: auditOutcomeDenied, Reason: err.Error()})
+				return nil, err
+			}
+			if err := budget.preStepCheck(actionName); err != nil {
+				je.appendAudit(AuditEvent{RunID: execCtx.RunID, TraceID: execCtx.TraceID, AgentID: auditAgentID, AgentName: auditAgentName, Owner: auditOwner, Action: actionName, RequiredCapability: requiredCapabilityForActionName(actionName), Outcome: auditOutcomeDenied, Reason: err.Error()})
+				return nil, err
+			}
+		}
+		if flags.ContractEnforcement && contractForbidsAction(identity, actionName) {
+			err := fmt.Errorf("contract gate denied action %s: forbidden_actions policy", actionName)
+			je.appendAudit(AuditEvent{RunID: execCtx.RunID, TraceID: execCtx.TraceID, AgentID: auditAgentID, AgentName: auditAgentName, Owner: auditOwner, Action: actionName, RequiredCapability: requiredCapabilityForActionName(actionName), Outcome: auditOutcomeDenied, Reason: err.Error()})
+			return nil, err
+		}
+		if flags.MemoryRuntime && je != nil {
+			if je.memory == nil {
+				je.memory = newAgentMemoryRuntime()
+			}
+			if err := je.memory.inject(params, identity); err != nil {
+				return nil, fmt.Errorf("memory runtime inject failed: %w", err)
+			}
+		}
+
+		// Wire the previous step's payload and config into this step's
+		// params. Type-safe: incompatible shapes yield descriptive errors,
+		// mappings merge into fresh maps, and stored manifests are never
+		// mutated (see the propagation contract on InputContext).
+		if i > 0 {
+			if err := mergeStepInput(params, lastResult[StrResponse]); err != nil {
+				return nil, fmt.Errorf("invalid step input for action %s: %w", actionName, err)
+			}
+		}
+		for k, v := range lastResult {
+			switch k {
+			case StrResponse:
+				continue
+			case StrConfig:
+				if err := mergePriorConfig(params, v); err != nil {
+					return nil, fmt.Errorf("invalid step config for action %s: %w", actionName, err)
+				}
+			default:
+				mergePriorResultKey(params, k, v)
+			}
+		}
+
+		action, exists := je.actions[actionName]
+		if !exists {
+			return nil, fmt.Errorf("unknown action: %s", actionName)
+		}
+
+		// Centralized attempt accounting: the pre-invocation budget check
+		// ran in the gate block above; every executed attempt is charged
+		// exactly once here, success or failure. Actions rejected before
+		// invocation (capability/contract/validation) are never charged.
+		result, err := action.Execute(params)
+		if flags.IdentityEnforcement && identity != nil {
+			budget.markActionExecuted(actionName)
+		}
+		if err != nil {
+			if rawRetry, hasRetry := (*step)["retry"]; hasRetry {
+				retryConfig, enabled, retryErr := parseRetryConfig(rawRetry)
+				if retryErr != nil {
+					return nil, fmt.Errorf(
+						"invalid retry configuration for action %s: %w",
+						actionName,
+						retryErr,
+					)
+				}
+
+				if enabled {
+					result, err = executeWithRetryBudget(
+						action,
+						params,
+						retryConfig,
+						actionName,
+						budget,
+					)
+				}
+			}
+
+			if err != nil {
+				policy := effectiveFailurePolicy(identity)
+				je.appendAudit(AuditEvent{RunID: execCtx.RunID, TraceID: execCtx.TraceID, AgentID: auditAgentID, AgentName: auditAgentName, Owner: auditOwner, Action: actionName, RequiredCapability: requiredCapabilityForActionName(actionName), CapabilitiesUsed: capabilitiesUsed(identity, actionName), Outcome: auditOutcomeError, Reason: err.Error(), FailurePolicy: policy})
+				if fallback, hasFallback := (*step)["fallback"].([]map[string]interface{}); hasFallback && policy != "continue" {
+					cmn.DebugMsg(cmn.DbgLvlError, "Action %s failed, executing fallback steps", actionName)
+					return executeJobGroupWithBudget(je, fallback, identity, execCtx, flags, budget)
+				}
+				switch policy {
+				case "continue":
+					continue
+				case "fallback":
+					if fallback, hasFallback := (*step)["fallback"].([]map[string]interface{}); hasFallback {
+						cmn.DebugMsg(cmn.DbgLvlError, "Action %s failed, executing fallback steps", actionName)
+						return executeJobGroupWithBudget(je, fallback, identity, execCtx, flags, budget)
+					}
+					return nil, fmt.Errorf("action %s failed: %v", actionName, err)
+				default:
+					return nil, fmt.Errorf("action %s failed: %v", actionName, err)
+				}
+			}
+		}
+
+		// Update the result for the next job in the group
+		lastResult = result
+		je.appendAudit(AuditEvent{RunID: execCtx.RunID, TraceID: execCtx.TraceID, AgentID: auditAgentID, AgentName: auditAgentName, Owner: auditOwner, Action: actionName, RequiredCapability: requiredCapabilityForActionName(actionName), CapabilitiesUsed: capabilitiesUsed(identity, actionName), Outcome: auditOutcomeAllowed, Reason: "action_completed"})
+		if flags.MemoryRuntime && je != nil && je.memory != nil {
+			if err := je.memory.persistStepResult(params, result, identity); err != nil {
+				return nil, fmt.Errorf("memory runtime persist failed: %w", err)
+			}
+		}
+	}
+	return terminalPayload(lastResult), nil
+}
+
+// terminalPayload extracts the terminal step payload from a group result
+// envelope. Groups that ran no steps yield an empty (non-nil) map.
+func terminalPayload(lastResult map[string]any) any {
+	if lastResult == nil {
+		return map[string]any{}
+	}
+	if payload, ok := lastResult[StrResponse]; ok {
+		return payload
+	}
+	return map[string]any{}
+}
+
+// executeWithRetry executes an action with retry logic
+func executeWithRetry(
+	action Action,
+	params map[string]any,
+	retryConfig RetryConfig,
+) (map[string]interface{}, error) {
+	return executeWithRetryBudget(action, params, retryConfig, "", nil)
+}
+
+// executeWithRetryBudget executes an action with retry logic. Every retry
+// attempt is budget-checked before it runs and charged exactly once
+// afterwards, success or failure. A nil budget preserves the legacy
+// unenforced behavior.
+func executeWithRetryBudget(
+	action Action,
+	params map[string]any,
+	retryConfig RetryConfig,
+	actionName string,
+	budget *constraintBudgetManager,
+) (map[string]interface{}, error) {
+	var (
+		lastError error
+		result    map[string]any
+	)
+
+	baseDelay := retryConfig.BaseDelay
+	if baseDelay <= 0 {
+		baseDelay = 100 * time.Millisecond
+	}
+
+	backoff := retryConfig.Backoff
+	if backoff < 1 {
+		backoff = 2
+	}
+
+	maxDelay := retryConfig.MaxDelay
+	if maxDelay <= 0 {
+		maxDelay = 5 * time.Second
+	}
+
+	for retry := 1; retry <= retryConfig.MaxRetries; retry++ {
+		delay := time.Duration(
+			float64(baseDelay) *
+				math.Pow(backoff, float64(retry-1)),
+		)
+
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+
+		// Jitter prevents thousands of failed event actions from
+		// hammering the DB again at exactly the same time.
+		jitterMax := delay / 2
+		if jitterMax > 0 {
+			delay += time.Duration(
+				rand.Int63n(int64(jitterMax) + 1), //nolint:gosec
+			)
+		}
+
+		cmn.DebugMsg(
+			cmn.DbgLvlWarn,
+			"Retrying action after failure: retry=%d/%d delay=%s",
+			retry,
+			retryConfig.MaxRetries,
+			delay,
+		)
+
+		time.Sleep(delay)
+
+		if budget != nil {
+			if err := budget.preStepCheck(actionName); err != nil {
+				return nil, err
+			}
+		}
+		result, lastError = action.Execute(params)
+		if budget != nil {
+			budget.markActionExecuted(actionName)
+		}
+		if lastError == nil {
+			return result, nil
+		}
+	}
+
+	return nil, fmt.Errorf(
+		"action failed after %d retries: %w",
+		retryConfig.MaxRetries,
+		lastError,
+	)
+}
+
+/*
+Example of a job configuration file in YAML format:
+
+jobs:
+  - name: "Serial Group 1"
+    process: "serial"
+	trigger_type: event
+	trigger_name: "event_name"
+    steps:
+      - action: "APIRequest"
+        params:
+          config:
+            url: "http://example.com/api/data"
+      - action: "AIInteraction"
+        params:
+          prompt: "Summarize the following data: $response"
+          config:
+            url: "https://api.openai.com/v1/completions"
+            api_key: "your_api_key"
+
+  - name: "Parallel Group 1"
+    process: "parallel"
+	trigger_type: event
+	trigger_name: "event_name"
+    steps:
+      - action: "DBQuery"
+        params:
+          type: "insert"
+          query: "INSERT INTO logs (message) VALUES ('Parallel job 1')"
+      - action: "RunCommand"
+        params:
+          command: "echo 'Parallel job 2'"
+
+  - name: "Serial Group 2"
+    process: "serial"
+	trigger_type: agent
+	trigger_name: "agent_name"
+    steps:
+      - action: "PluginExecution"
+        params:
+          plugin: ["example_plugin"]
+
+
+
+
+*/

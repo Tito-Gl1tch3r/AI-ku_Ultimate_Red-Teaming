@@ -1,0 +1,113 @@
+package models
+
+import (
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"time"
+
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/malice-network/helper/utils/fileutils"
+	"github.com/chainreactors/malice-network/server/internal/configs"
+	"github.com/gofrs/uuid"
+	"gorm.io/gorm"
+)
+
+// WebsiteContent - Single table that combines Website and WebContent
+type WebsiteContent struct {
+	ID        uuid.UUID `gorm:"primaryKey;->;<-:create;type:uuid;"`
+	CreatedAt time.Time `gorm:"->;<-:create;"`
+
+	File        string `gorm:""`
+	Path        string `gorm:"index:idx_website_contents_pipeline_path;"`
+	Name        string `gorm:""`
+	Size        uint64 `gorm:""`
+	Type        string `gorm:""`
+	ContentType string `gorm:""`
+	Comment     string `gorm:""`
+	Auth        string `gorm:""` // "user:pass" or empty; "none" = skip website default
+
+	Pipeline   *Pipeline `gorm:"foreignKey:PipelineID,ListenerID;references:Name,ListenerId;-:migration;"`
+	PipelineID string    `gorm:"type:string;index:idx_website_contents_pipeline_path;"`
+	ListenerID string    `gorm:"type:string;index:idx_website_contents_pipeline_path;"`
+}
+
+// BeforeCreate - GORM hook to automatically set values
+func (wc *WebsiteContent) BeforeCreate(tx *gorm.DB) (err error) {
+	wc.ID, err = uuid.NewV4()
+	if err != nil {
+		return err
+	}
+	wc.CreatedAt = time.Now()
+	return nil
+}
+
+// ToProtobuf - Converts to protobuf object
+func (wc *WebsiteContent) ToProtobuf(read bool) *clientpb.WebContent {
+	var data []byte
+	if read && wc.Type == "raw" {
+		contentPath, err := fileutils.SafeJoin(configs.WebsitePath, filepath.Join(wc.StorageKey(), wc.ID.String()))
+		if err == nil {
+			data, _ = os.ReadFile(contentPath)
+		}
+	}
+
+	listenerID := wc.ListenerID
+	if listenerID == "" && wc.Pipeline != nil {
+		listenerID = wc.Pipeline.ListenerId
+	}
+
+	return &clientpb.WebContent{
+		Id:          wc.ID.String(),
+		WebsiteId:   wc.PipelineID,
+		Path:        wc.Path,
+		Name:        wc.Name,
+		Size:        wc.Size,
+		Type:        wc.Type,
+		ContentType: wc.ContentType,
+		Comment:     wc.Comment,
+		Content:     data,
+		Url:         wc.URL(),
+		ListenerId:  listenerID,
+		Auth:        wc.Auth,
+	}
+}
+
+func (wc *WebsiteContent) StorageKey() string {
+	if wc.ListenerID == "" {
+		return wc.PipelineID
+	}
+	return filepath.Join(wc.ListenerID, wc.PipelineID)
+}
+
+func (wc *WebsiteContent) URL() string {
+	if wc.Pipeline == nil {
+		return ""
+	}
+	webPath := "/"
+	if wc.Pipeline != nil && wc.Pipeline.PipelineParams != nil && wc.Pipeline.WebPath != "" {
+		webPath = wc.Pipeline.WebPath
+	}
+	contentPath := path.Join(webPath, wc.Path)
+
+	if wc.Pipeline.PipelineParams != nil && wc.Pipeline.Tls != nil && wc.Pipeline.Tls.Enable {
+		return fmt.Sprintf("https://%s:%d%s", wc.Pipeline.IP, wc.Pipeline.Port, contentPath)
+	}
+	return fmt.Sprintf("http://%s:%d%s", wc.Pipeline.IP, wc.Pipeline.Port, contentPath)
+}
+
+func FromWebContentPb(content *clientpb.WebContent) *WebsiteContent {
+	return &WebsiteContent{
+		PipelineID:  content.WebsiteId,
+		ListenerID:  content.ListenerId,
+		File:        content.File,
+		Path:        content.Path,
+		Name:        content.Name,
+		Size:        content.Size,
+		Type:        content.Type,
+		ContentType: content.ContentType,
+		Comment:     content.Comment,
+		Auth:        content.Auth,
+	}
+}

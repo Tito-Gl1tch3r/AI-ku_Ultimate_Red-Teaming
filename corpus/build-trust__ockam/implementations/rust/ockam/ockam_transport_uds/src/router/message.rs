@@ -1,0 +1,58 @@
+use ockam_core::{deserialize, serialize, Address, Decodable, Encodable, Encoded, Message, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Message)]
+pub enum UdsRouterRequest {
+    /// Register a new client to this routing scope
+    Register {
+        /// Specify an accept scope for this client
+        accepts: Vec<Address>,
+        /// The clients own worker bus address
+        self_addr: Address,
+    },
+    /// Connect to a UDS Peer
+    Connect { peer: String },
+    /// Disconnect from a UDS Peer
+    Disconnect { peer: String },
+    /// Unregister (usually, after disconnection)
+    Unregister {
+        /// The clients own worker bus address
+        self_addr: Address,
+    },
+}
+
+impl Encodable for UdsRouterRequest {
+    fn encode(self) -> Result<Encoded> {
+        serialize(self)
+    }
+}
+
+impl Decodable for UdsRouterRequest {
+    fn decode(v: &[u8]) -> Result<Self> {
+        deserialize(v)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Message)]
+pub enum UdsRouterResponse {
+    /// Response containing a result when attempting to register a new client
+    Register(Result<()>),
+    /// Response containing an [`Address`] on successful connection to a peer
+    Connect(Result<Address>),
+    /// Response containing a result when attempting to disconnect from a peer
+    Disconnect(Result<()>),
+    /// Response containing a result when attempt to unregister
+    Unregister(Result<()>),
+}
+
+impl Encodable for UdsRouterResponse {
+    fn encode(self) -> Result<Encoded> {
+        serialize(self)
+    }
+}
+
+impl Decodable for UdsRouterResponse {
+    fn decode(v: &[u8]) -> Result<Self> {
+        deserialize(v)
+    }
+}

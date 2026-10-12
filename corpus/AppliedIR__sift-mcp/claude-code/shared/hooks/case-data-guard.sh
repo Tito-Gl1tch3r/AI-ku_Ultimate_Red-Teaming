@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+#
+# PreToolUse hook (Bash): refuse commands that would delete or overwrite case
+# records. A best-effort check of the commands listed below, not a security
+# boundary.
+#
+# Protected, under ${VHIR_CASES_DIR:-~/cases}: the case records at a case root
+# (findings.json, timeline.json, approvals.jsonl, iocs.json, evidence.json,
+# evidence-verified.json, todos.json, CASE.yaml, actions.jsonl,
+# pending-reviews.json), everything in
+# audit/, every existing file in evidence/ (and evidence/ while non-empty),
+# each non-empty case root and the cases root. Everything else is allowed:
+# other files, reports/, work/, .outputs/, extractions/, filing new files into
+# evidence/, and moving unprotected files into DELETE/. / and every directory
+# above the cases root (such as ~) are protected as wholes: find with -exec or
+# -delete rooted at one is blocked whatever its predicates.
+#
+# Blocked on a protected path: rm, rmdir, shred, unlink, truncate; mv from or
+# onto it; cp, install or ln onto it; > >> >| &> onto it; find rooted at it (or
+# at a case or the cases root) with -delete or -exec. Seen through: sudo, env,
+# VAR=val, nice, nohup, time, timeout, stdbuf, exec, command, if/then/do/{/!,
+# ; && || | & and newlines, $(...), cd, quoting, .., absolute command paths,
+# mv -t, find -H/-L/-P/-O/-D.
+# Not seen: bash -c/sh -c, xargs, scripts, tee, in-place editors (sed -i,
+# perl -i), git clean, rsync --delete,
+# tar --remove-files, dd of=, >& redirections, brace expansion, variables,
+# backquotes and a "$(...)" in double quotes; an operand after a $(...) inside
+# an argument (rm x$(true) findings.json); options of timeout -s and env -u;
+# an option value placed after the operands of cp, install or ln
+# (--suffix .bak, -m 0644); a single-operand ln (the link is created in the
+# current folder); a cd inside a subshell or one that fails (it's
+# applied to later commands);
+# anything after a # comment, on later lines too. A quoted '>' is read as a
+# redirection (a false block), and a quoted 'x$' before \( can be misread as
+# a $(.
+#
+# The command is tokenized only: it is never run, evaluated or expanded by a
+# shell. A block exits 2 with the reason on stderr (Claude Code shows it to
+# the model), and appends an "event": "refused" line to the active case's
+# audit file (Claude Code records no other trace of it); anything else exits
+# 0. A payload it can't read, or an error of its own, is blocked too (fail
+# closed): a check that can't reach a verdict mustn't look like one that
+# passed.
+#
+GUARD=$(
+    cat <<'PY'
+import glob, itertools, json, os, shlex, sys
+
+RECORDS = {"findings.json", "timeline.json", "approvals.jsonl", "iocs.json", "evidence.json",
+           "evidence-verified.json", "todos.json", "CASE.yaml", "actions.jsonl",
+           "pending-reviews.json"}
+# "(" opens a subshell or a find group: stripped like a keyword, so a find
+# expression stays in one segment; ")" is dropped.
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "}", "!", "fi", "done", "("}
+SEPS = {";", "&&", "||", "|", "&", "|&"}
+REDIRS = {">", ">>", ">|", "&>", "&>>"}
+WRAP = {"sudo", "env", "command", "nice", "nohup", "time", "timeout", "stdbuf", "exec"}
+CAP = 2000  # glob matches checked per argument (the 5-second bound)
+
+
+def refused(why, payload=None):
+    """The refusal's own line in the active case's audit file (no audit_id:
+    the command never ran). Best effort: the block stands whatever happens."""
+    try:
+        import datetime
+
+        case = os.environ.get("VHIR_CASE_DIR", "")
+        if not (case and os.path.isdir(case)):
+            with open(os.path.expanduser("~/.vhir/active_case")) as f:
+                case = f.read().strip()
+        if not (case.startswith("/") and os.path.isdir(case)):
+            return
+        audit = os.environ.get("VHIR_AUDIT_DIR", "")
+        if not (audit and os.path.isdir(audit)):
+            audit = os.path.join(case, "audit")
+            os.makedirs(audit, exist_ok=True)
+        p = payload if isinstance(payload, dict) else {}
+        ti = p.get("tool_input") if isinstance(p.get("tool_input"), dict) else {}
+        entry = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": "case-data-guard",
+            "event": "refused",
+            "command": str(ti.get("command", ""))[:2000],
+            "reason": why,
+            "cwd": str(p.get("cwd", "")),
+            "session_id": str(p.get("session_id", "")),
+            "tool_use_id": str(p.get("tool_use_id", "")),
+        }
+        with open(os.path.join(audit, "claude-code.jsonl"), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def block(why):
+    refused(why, globals().get("payload"))
+    print(f"BLOCKED: {why}. Case records, audit/ and evidence files are protected; "
+          "move other files to the case's DELETE/ directory instead.", file=sys.stderr)
+    sys.exit(2)
+
+
+def unreadable():
+    refused("the guard couldn't read the command", globals().get("payload"))
+    print("BLOCKED: the case-data guard couldn't read this command, so it was blocked "
+          "to be safe. If every command is blocked, the hook's input may have changed; "
+          "tell the examiner.", file=sys.stderr)
+    sys.exit(2)
+
+
+try:
+    payload = json.load(sys.stdin)
+    cmd = payload["tool_input"]["command"]  # not a string: the check below fails
+    base = payload.get("cwd") or os.getcwd()
+    cases = os.path.realpath(os.path.expanduser(os.environ.get("VHIR_CASES_DIR", "~/cases")))
+except Exception:
+    unreadable()
+
+
+def rel(p):
+    """Path components under the cases root (None if outside), and the real path."""
+    p = os.path.realpath(os.path.join(base, os.path.expanduser(p)))
+    if p != cases and not p.startswith(cases + "/"):
+        return None, p
+    return [x for x in p[len(cases):].split("/") if x], p
+
+
+def damage(p, new_ok=False):
+    """Whether deleting or overwriting p touches protected case data."""
+    parts, real = rel(p)
+    if parts is None:  # outside: only / and the directories above the cases root
+        return real == "/" or cases.startswith(real.rstrip("/") + "/")
+    if not parts:  # the cases root
+        return True
+    if len(parts) == 1:  # a case root (a plain file beside the cases isn't one)
+        return os.path.isdir(real) and bool(os.listdir(real))
+    top = parts[1]
+    if top == "audit" or (top in RECORDS and len(parts) == 2):
+        return True
+    if top == "evidence":
+        if len(parts) == 2:  # evidence/ itself, while it holds anything
+            return bool(os.listdir(real)) if os.path.isdir(real) else False
+        return os.path.lexists(real) or not new_ok
+    return False
+
+
+def could_hold_protected(pattern):
+    """Whether a glob's fixed prefix (up to its first wildcard) could reach protected data."""
+    fixed = []
+    for c in os.path.join(base, os.path.expanduser(pattern)).split("/"):
+        if any(ch in c for ch in "*?["):
+            break
+        fixed.append(c)
+    prefix = os.path.realpath("/".join(fixed) or "/")
+    if cases == prefix or cases.startswith(prefix.rstrip("/") + "/"):
+        return True
+    parts, _ = rel(prefix)
+    return parts is not None and (len(parts) <= 1 or parts[1] in ("audit", "evidence")
+                                  or (len(parts) == 2 and parts[1] in RECORDS))
+
+
+def expand(a):
+    """Glob matches (stdlib only, at most CAP), or the word itself."""
+    if not any(c in a for c in "*?["):
+        return [a]
+    hits = list(itertools.islice(glob.iglob(os.path.join(base, os.path.expanduser(a))), CAP + 1))
+    if len(hits) > CAP:
+        if could_hold_protected(a):
+            block(f"glob {a} has too many matches to check under the cases directory")
+        hits = hits[:CAP]
+    return hits or [a]
+
+
+def check(seg):
+    global base
+    seg = [t for t in seg if t != ")"]
+    for i, t in enumerate(seg[:-1]):
+        if t in REDIRS and any(damage(x, new_ok=True) for x in expand(seg[i + 1])):
+            block(f"redirection onto {seg[i + 1]}")
+    seg = [t for i, t in enumerate(seg) if t not in REDIRS and (i == 0 or seg[i - 1] not in REDIRS)]
+    while seg and (seg[0] in WRAP or seg[0] in KEYWORDS or ("=" in seg[0] and not seg[0].startswith("-"))):
+        w = seg.pop(0)
+        while seg and (seg[0].startswith("-") or "=" in seg[0] or (w == "timeout" and seg[0][:1].isdigit())):
+            o = seg.pop(0)
+            if (w, o) in (("sudo", "-u"), ("sudo", "-g"), ("nice", "-n")) and seg:
+                seg.pop(0)
+    if not seg:
+        return
+    name = os.path.basename(seg[0])
+    if name == "cd":
+        base = os.path.join(base, os.path.expanduser(seg[1] if len(seg) > 1 else "~"))
+        return
+    args, dd, tdir, it, no_t = [], False, None, iter(seg[1:]), False
+    for a in it:
+        if a == "--" and not dd:
+            dd = True
+        elif not dd and (a == "--no-target-directory" or (a[:2] != "--" and a[:1] == "-" and "T" in a)):
+            no_t = True
+        elif not dd and a in ("-t", "--target-directory"):
+            tdir = next(it, None)
+        elif not dd and a.startswith("--target-directory="):
+            tdir = a.split("=", 1)[1]
+        elif dd or not a.startswith("-"):
+            args += expand(a)
+    if tdir is not None:
+        args.append(tdir)
+    if name in ("rm", "rmdir", "shred", "unlink", "truncate"):
+        for a in args:
+            if damage(a):
+                block(f"{name} on {a}")
+    elif name in ("mv", "cp", "install", "ln") and len(args) >= 2:
+        dst = args[-1]
+        for s in args[:-1]:
+            if name == "mv" and damage(s):
+                block(f"mv away {s}")
+            into = not no_t and os.path.isdir(os.path.join(base, os.path.expanduser(dst)))
+            tgt = os.path.join(dst, os.path.basename(s)) if into else dst
+            if damage(tgt, new_ok=True):
+                block(f"{name} over {tgt}")
+    elif name == "find" and ("-delete" in seg or any(t in ("-exec", "-execdir") for t in seg)):
+        rest = seg[1:]
+        while rest and (rest[0] in ("-H", "-L", "-P", "-D") or rest[0].startswith("-O")):
+            if rest.pop(0) == "-D" and rest:  # find's options come before its roots
+                rest.pop(0)
+        roots = itertools.takewhile(lambda a: not a.startswith("-") and a not in ("!", "("), rest)
+        for r in [x for a in roots for x in expand(a)] or ["."]:  # every starting point
+            if damage(r):
+                block(f"find -delete/-exec under {r}")
+
+
+# A backslash-newline joins lines; any other newline separates commands (in
+# quotes it stays part of the word). Spaced, so "&&;" or ";;" can't form.
+try:  # a block exits through SystemExit, which this doesn't catch
+    text = cmd.replace("\\\n", "").replace("\n", " ; ")
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex) + [";"]
+    except ValueError:  # unbalanced quotes: fall back to plain words
+        tokens = text.split() + [";"]
+    seg = []
+    for t in tokens:
+        if t == "(" and seg and seg[-1].endswith("$"):  # $( starts a command
+            seg[-1] = seg[-1][:-1]
+            check(seg)
+            seg = []
+        elif t in SEPS:
+            check(seg)
+            seg = []
+        else:
+            seg.append(t)
+except Exception:
+    unreadable()
+sys.exit(0)
+PY
+)
+couldnt_run() {
+    echo "BLOCKED: the case-data guard couldn't run, so it was blocked to be safe." >&2
+    exit 2
+}
+# Fail closed: only the guard's own verdicts pass through. No script (cat
+# failed), no python3, or a Python that can't start all block.
+[ -n "$GUARD" ] || couldnt_run
+# -I: isolated, so nothing in the cwd (a planted shlex.py) or PYTHON* runs.
+python3 -I -c "$GUARD"
+rc=$?
+case $rc in 0 | 2) exit $rc ;; esac
+couldnt_run

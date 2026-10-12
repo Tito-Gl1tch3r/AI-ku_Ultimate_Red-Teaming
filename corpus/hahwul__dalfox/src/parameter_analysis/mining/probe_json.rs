@@ -1,0 +1,180 @@
+//! Mining: probe json. See module docs in `mod.rs`.
+
+use super::*;
+
+pub async fn probe_json_body_params(
+    target: &Target,
+    args: &ScanArgs,
+    reflection_params: Arc<Mutex<Vec<Param>>>,
+    semaphore: Arc<Semaphore>,
+    pb: Option<ShimmerSpinner>,
+) {
+    let arc_target = Arc::new(target.clone());
+    let silence = args.silence;
+    let client = target.build_client_or_default();
+
+    // Detect JSON body from args.data; only proceed if it's a JSON object
+    let base_json: serde_json::Value = match &args.data {
+        Some(d) => match serde_json::from_str::<serde_json::Value>(d) {
+            Ok(v) => v,
+            Err(_) => return, // not JSON
+        },
+        None => return,
+    };
+    if !base_json.is_object() {
+        return;
+    }
+    // A GraphQL request is JSON too, but its injection points live inside the
+    // `variables` object (handled by `probe_graphql_params`, which rebuilds the
+    // whole request per variable). Mining the top-level `query`/`variables`
+    // keys here would replace the `variables` object with a bare marker string
+    // and garble the request, so hand GraphQL bodies off entirely.
+    if let Some(data) = &args.data
+        && !crate::encoding::pipeline::infer_graphql_variable_fields(data).is_empty()
+    {
+        return;
+    }
+
+    // Collect top-level keys to mutate
+    let Some(obj) = base_json.as_object() else {
+        return;
+    };
+    let keys: Vec<String> = obj.keys().cloned().collect();
+
+    if let Some(ref pb) = pb {
+        pb.set_length(keys.len() as u64);
+        pb.set_message("Mining JSON body parameters");
+    }
+
+    // Adaptive EWMA stats shared across tasks
+    let stats = Arc::new(Mutex::new(MiningSampleStats::new()));
+
+    // Spawn tasks returning Option<Param> for batching
+    let mut handles: Vec<tokio::task::JoinHandle<Option<Param>>> = Vec::new();
+
+    // Slot-scoped, not name-scoped: a query or form `q` must not suppress
+    // mining of the JSON body's `q`. See `param_slot_key`. Collected once
+    // rather than re-scanned under the lock for every key.
+    let already_found: HashSet<String> = reflection_params
+        .lock()
+        .await
+        .iter()
+        .filter(|p| p.location == Location::JsonBody)
+        .map(|p| p.name.clone())
+        .collect();
+    // One shared copy of the parsed body. Each task clones it only once it
+    // holds a permit; cloning it per key up front kept a full copy alive per
+    // pending task (4 000 keys: ~1.5 GB RSS before the first response).
+    let base_json = Arc::new(base_json);
+
+    for param_name in keys {
+        if already_found.contains(&param_name) {
+            continue;
+        }
+
+        let client_clone = client.clone();
+        let url = target.url.clone();
+
+        let parsed_method = crate::scanning::url_inject::body_location_method(&target.method);
+        let target_clone = arc_target.clone();
+        let delay = target.delay;
+        let semaphore_clone = semaphore.clone();
+        let param_name_cloned = param_name.clone();
+        let pb_clone = pb.clone();
+        let stats_clone = stats.clone();
+        let base_json_clone = base_json.clone();
+
+        let handle = tokio::spawn(crate::with_job_scopes(
+            crate::JobScopes::capture(),
+            async move {
+                let permit = semaphore_clone
+                    .acquire()
+                    .await
+                    .expect("acquire semaphore permit");
+
+                // Build mutated JSON with this key set to marker
+                let mut root = (*base_json_clone).clone();
+                if let Some(map) = root.as_object_mut() {
+                    map.insert(
+                        param_name_cloned.clone(),
+                        serde_json::Value::String(
+                            crate::scanning::markers::bracketed_marker().to_string(),
+                        ),
+                    );
+                } else {
+                    let mut map = serde_json::Map::new();
+                    map.insert(
+                        param_name_cloned.clone(),
+                        serde_json::Value::String(
+                            crate::scanning::markers::bracketed_marker().to_string(),
+                        ),
+                    );
+                    root = serde_json::Value::Object(map);
+                }
+                let body = serde_json::to_string(&root).unwrap_or_else(|_| {
+                    format!(
+                        "{{\"{}\":\"{}\"}}",
+                        param_name_cloned,
+                        crate::scanning::markers::bracketed_marker()
+                    )
+                });
+
+                let base = crate::utils::build_body_request_base(
+                    &client_clone,
+                    &target_clone,
+                    parsed_method,
+                    url,
+                    Some(body),
+                );
+                let overrides = vec![("Content-Type".to_string(), "application/json".to_string())];
+                let request = crate::utils::apply_header_overrides(base, &overrides);
+
+                crate::record_outbound_request().await;
+                let resp = crate::utils::http::send_counted(request).await;
+
+                let mut discovered: Option<Param> = None;
+                if let Ok(r) = resp
+                    && let Ok(text) = crate::utils::http::read_body_counted(r).await
+                {
+                    let mut st = stats_clone.lock().await;
+                    st.record_attempt();
+                    if crate::scanning::markers::probe_reflected(&text) {
+                        st.record_reflection();
+                        // No EWMA fold: these names are the user's own `-d`
+                        // keys (bounded by the body), not wordlist guesses, so
+                        // an echoing page must not replace them with `any`.
+                        discovered = Some(
+                            Param::new(
+                                param_name_cloned.clone(),
+                                crate::scanning::markers::bracketed_marker().to_string(),
+                                Location::JsonBody,
+                            )
+                            .with_reflection_analysis(&text),
+                        );
+                        if !silence {
+                            eprintln!(
+                                "Discovered JSON body param: {} (EWMA {:.2}, {}/{})",
+                                param_name_cloned, st.ewma_ratio, st.reflections, st.attempts
+                            );
+                        }
+                    } else {
+                        st.record_non_reflection();
+                    }
+                }
+
+                if delay > 0 {
+                    sleep(Duration::from_millis(delay)).await;
+                }
+                drop(permit);
+                if let Some(ref pb) = pb_clone {
+                    pb.inc(1);
+                }
+                discovered
+            },
+        ));
+
+        handles.push(handle);
+    }
+
+    extend_with_joined(&reflection_params, handles).await;
+}

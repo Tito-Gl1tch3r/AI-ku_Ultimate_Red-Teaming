@@ -1,0 +1,998 @@
+//! `h5i websec`: the HTTP workbench, as an h5i plugin.
+//!
+//! Burp Suite is an HTTP workbench for humans. This is one for agents: read what
+//! a browser session sent, change a part of it, send it again, and compare the
+//! answers. The design is `docs/design/design-websec.md`.
+//!
+//! This binary holds no privilege of its own. Every verb here runs an `h5i
+//! browser` verb in a subprocess, which means a plugin cannot reach a session by
+//! any path the CLI does not already offer, and its requests are the engine's
+//! fetches: checked by the engine's policy, spent from the engine's budget,
+//! written into the engine's receipts. That is the whole reason a plugin is a
+//! separate process rather than something loaded into h5i (see `src/cli/
+//! plugin.rs`).
+//!
+//! What it adds over typing the underlying verbs is naming. `req_42` rather than
+//! a bare number, one noun for the workbench rather than verbs scattered through
+//! `h5i browser`, and defaults chosen for a loop rather than for a person
+//! reading a page.
+
+mod dom;
+mod experiment;
+mod finding;
+mod grpc;
+mod matrix;
+mod nuclei;
+mod read;
+mod view;
+
+use std::ffi::OsString;
+use std::process::Command;
+
+use clap::{Parser, Subcommand};
+
+/// The h5i that launched this plugin.
+///
+/// Passed in rather than found on `$PATH`: a plugin that guessed could compose
+/// verbs from a *different* build than the one the user ran, which would make
+/// "the same verbs a person types" quietly false.
+fn h5i() -> OsString {
+    std::env::var_os("H5I_BIN").unwrap_or_else(|| OsString::from("h5i"))
+}
+
+#[derive(Parser)]
+#[command(
+    name = "h5i websec",
+    version,
+    about = "An HTTP workbench for agents: read, edit, resend and compare what a session sent."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Verb,
+
+    /// Which session, when more than one is open.
+    #[arg(long, short = 's', global = true, value_name = "NAME")]
+    session: Option<String>,
+
+    /// Emit the JSON envelope instead of the text view.
+    ///
+    /// The text view is the message itself under one line of ids, which is
+    /// what a model reads best; the envelope is for a caller that parses.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Accepted and redundant: the text view is already the default.
+    #[arg(long, global = true, hide = true, conflicts_with = "json")]
+    human: bool,
+}
+
+#[derive(Subcommand)]
+enum Verb {
+    /// What this session sent, newest last.
+    Requests {
+        /// Only this method.
+        #[arg(long, value_name = "METHOD")]
+        method: Option<String>,
+        /// Only rows whose URL contains this.
+        #[arg(long, value_name = "TEXT")]
+        url_contains: Option<String>,
+        /// Only responses with this status.
+        #[arg(long, value_name = "CODE")]
+        status: Option<u16>,
+        /// Only `navigation`, `subresource`, `frame`, `redirect` or `replay`.
+        #[arg(long, value_name = "KIND")]
+        initiator: Option<String>,
+        /// Only what policy refused.
+        #[arg(long)]
+        denied_only: bool,
+        /// At most this many rows.
+        #[arg(long, value_name = "N")]
+        limit: Option<u64>,
+    },
+
+    /// One stored message, as it went out or as it came back.
+    Show {
+        /// `req_42`, `res_42`, or just `42`.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Print the exact message, body unbounded and unescaped.
+        ///
+        /// The default view is the same message with its body cut at 4 KiB and
+        /// control characters made inert; this is the bytes as they were.
+        #[arg(long)]
+        raw: bool,
+        /// Write the exact body to a file, or to stdout with `-`.
+        #[arg(long = "body-to", value_name = "PATH")]
+        body_to: Option<String>,
+    },
+
+    /// Send one of this session's requests again, with changes.
+    Replay {
+        /// `req_42`, or just `42`.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Set a request field; repeatable and ordered. Common TARGETs:
+        /// `method=POST`, `path=/other/url`, `query.KEY=v`, `header.NAME=v`,
+        /// `cookie.NAME=v`, `json.PATH=v`. JSON values are typed, nested by dots,
+        /// and arrays use numeric segments. Preserve numeric strings with
+        /// shell-safe quotes: `--set 'json.jsonrpc="2.0"'`. A leading `+` on one
+        /// target adds it if missing (`--set +query.debug=1`), the per-edit form
+        /// of `--create`.
+        #[arg(long = "set", value_name = "TARGET=VALUE")]
+        set: Vec<String>,
+        /// `multipart.userfile=./payload.jpg`: the value is the file's bytes.
+        ///
+        /// For the edits a command line cannot carry — a real image, a
+        /// polyglot, anything a magic-number check will read. Applied after
+        /// every `--set`.
+        #[arg(long = "set-file", value_name = "TARGET=PATH")]
+        set_file: Vec<String>,
+        /// Remove a target.
+        #[arg(long = "unset", value_name = "TARGET")]
+        unset: Vec<String>,
+        /// Add every query/cookie/form/json target the request lacks. Off by
+        /// default so a typo is caught, not sent (headers always upsert). To add
+        /// just one, prefix that `--set` target with `+` instead.
+        #[arg(long)]
+        create: bool,
+        /// Send it from another session, with that session's credentials.
+        #[arg(long = "as", value_name = "SESSION")]
+        as_session: Option<String>,
+        /// Carry the source session's `Cookie` and `Authorization` into the
+        /// other session. Only meaningful with `--as`.
+        #[arg(long)]
+        keep_credentials: bool,
+        /// Send it this many times and report the clock.
+        #[arg(long, value_name = "N")]
+        repeat: Option<u32>,
+        /// Release the repeats together, for a race.
+        #[arg(long)]
+        race: bool,
+        /// Stop at the first redirect and report it.
+        #[arg(long)]
+        no_follow: bool,
+        /// Start the page's network allowance again before sending, for a loop
+        /// that is deliberately long.
+        #[arg(long)]
+        reset_budget: bool,
+        /// Send this exact request-target, around the URL parser.
+        ///
+        /// A parsed URL resolves `.` and `..` and percent-decodes before the
+        /// request exists, so `/files/%252e%252e%252f` reaches the wire as
+        /// something the server was never asked for. With this the target is
+        /// written byte for byte, through the same policy and receipts.
+        #[arg(long = "raw-target", value_name = "TARGET")]
+        raw_target: Option<String>,
+        /// Preserve header-name casing while retaining edits and cookies.
+        #[arg(long = "raw-headers")]
+        raw_headers: bool,
+        /// Send once per line, as `query.id=./ids.txt`.
+        #[arg(long = "set-each", value_name = "TARGET=PATH")]
+        set_each: Option<String>,
+        /// Send a whole request, written byte for byte from this file.
+        ///
+        /// The general form of `--raw-target`, framing headers included and
+        /// recomputed by nothing, for request smuggling. `-` reads standard
+        /// input. Use it when `--set` cannot express the body.
+        #[arg(long = "raw-request", value_name = "PATH")]
+        raw_request: Option<String>,
+        /// After sending, print the decoded, untruncated response body to stdout
+        /// (the `curl` view). With `--set-each`/`--repeat`, each body under a
+        /// `--- res_<n> ---` line.
+        #[arg(long)]
+        body: bool,
+        /// Like `--body`, but print the whole response — status line, headers,
+        /// then body (as `show --raw` does), the `curl -i` view. Use it when the
+        /// answer is in a header. Wins over `--body` if both are given.
+        #[arg(long)]
+        raw: bool,
+    },
+
+    /// How two of this session's responses differ.
+    Diff {
+        #[arg(value_name = "ID")]
+        left: String,
+        #[arg(value_name = "ID")]
+        right: String,
+    },
+
+    /// Ask a stored response a question. Exits 0 when it holds, 1 when it does
+    /// not, 2 when it could not be asked.
+    Match {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long, value_name = "PATTERN")]
+        regex: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        contains: Option<String>,
+        #[arg(long = "json-path", value_name = "PATH[=VALUE]")]
+        json_path: Option<String>,
+        #[arg(long, value_name = "NAME[=VALUE]")]
+        header: Option<String>,
+        #[arg(long, value_name = "CODE")]
+        status: Option<u16>,
+        #[arg(long, value_name = "BYTES")]
+        longer_than: Option<u64>,
+        #[arg(long, value_name = "BYTES")]
+        shorter_than: Option<u64>,
+    },
+
+    /// Open a WebSocket, send frames, and report what came back.
+    Socket {
+        /// The `ws://` or `wss://` endpoint to open.
+        #[arg(value_name = "URL")]
+        url: String,
+        /// A text frame to send. Repeatable, sent in the order given.
+        #[arg(long = "send", value_name = "TEXT")]
+        send: Vec<String>,
+        /// How long to listen for replies, in milliseconds.
+        #[arg(long = "wait-ms", value_name = "MS")]
+        wait_ms: Option<u64>,
+    },
+
+    /// What this session reached, as origins and endpoints.
+    Sitemap,
+
+    /// Send one request many ways, and fold the answers into clusters.
+    ///
+    /// Intruder's shape, for a caller that is not looking at a screen. The
+    /// plan names the request, what varies and how the values combine:
+    ///
+    /// ```json
+    /// {"request": "req_42",
+    ///  "positions": [
+    ///    {"name": "user", "target": "query.user", "values_file": "users.txt"},
+    ///    {"name": "role", "target": "json.role", "values": ["user", "admin"]}],
+    ///  "strategy": "product",
+    ///  "baseline": "res_42",
+    ///  "extract": {"error": "regex:SQL error: (\\w+)"},
+    ///  "rate": 4}
+    /// ```
+    ///
+    /// The values are yours; nothing here generates one. What comes back is
+    /// the clusters, each naming every message it folded.
+    Experiment {
+        /// The experiment file. Relative paths inside it are read from beside
+        /// it, so a plan and its wordlist move together.
+        #[arg(value_name = "FILE")]
+        file: String,
+    },
+
+    /// Send one request under several identities and fold the answers.
+    ///
+    /// The boundary bug an agent misses is the one it cannot see: the same
+    /// request under user A and under user B, side by side. This sends it under
+    /// each identity you name and groups the answers, so two identities that saw
+    /// the same thing land in one class. The identities are sessions you already
+    /// hold; h5i adds none, the way it ships no wordlist. Whether a shared class
+    /// is a boundary that should have held is yours to conclude in a finding.
+    ///
+    /// ```text
+    /// h5i websec matrix req_42 --as anon,userB,admin
+    /// ```
+    Matrix {
+        /// The stored request to send, as `req_42` or `42`.
+        #[arg(value_name = "REQ")]
+        id: String,
+        /// The identities to send it under: session names, comma-separated.
+        /// Each is a session you already hold.
+        #[arg(long = "as", value_name = "SESSIONS", value_delimiter = ',')]
+        identities: Vec<String>,
+        /// An edit every send shares, as `--set` takes it; repeatable.
+        #[arg(long, value_name = "TARGET=VALUE")]
+        set: Vec<String>,
+        /// Sends per second, at most.
+        #[arg(long, value_name = "R")]
+        rate: Option<f64>,
+        /// Add a target that is not already there.
+        #[arg(long)]
+        create: bool,
+        /// Keep credentials that cross an origin boundary.
+        #[arg(long)]
+        keep_credentials: bool,
+        /// Start each identity's page allowance again before sending.
+        #[arg(long)]
+        reset_budget: bool,
+    },
+
+    /// What the agent concluded, and the evidence it stands on.
+    ///
+    /// h5i keeps the record and checks that the evidence exists. Whether the
+    /// claim is true is the agent's to say, which is why `--state` is free
+    /// text and nothing here reads it.
+    Finding {
+        #[command(subcommand)]
+        what: FindingVerb,
+    },
+
+    /// Run a multi-step flow with bindings between the steps.
+    ///
+    /// Steps run in order, bind response values, and stop on failure. A step may
+    /// carry an `expect`: a data-only verdict over its answer. When it does not
+    /// hold the run exits 1 (did not match), distinct from 2 (could not look):
+    ///
+    /// ```json
+    /// {"steps": [
+    ///   {"resend": 3, "extract": {"csrf": "regex:value=\"([^\"]+)\""}},
+    ///   {"resend": 5, "set": ["header.X-CSRF-Token=${csrf}", "json.role=admin"],
+    ///    "expect": {"all": [{"status": 200}, {"body": "regex:role.*admin"}]}}
+    /// ]}
+    /// ```
+    Sequence {
+        /// The sequence file.
+        #[arg(value_name = "FILE")]
+        file: String,
+        /// Set an initial `name=value` binding; repeatable.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        vars: Vec<String>,
+        /// Continue after failed steps.
+        #[arg(long)]
+        keep_going: bool,
+    },
+
+    /// Convert a Nuclei template into an h5i test, printed to stdout.
+    ///
+    /// The template's request becomes a request template, its matchers become an
+    /// `expect` verdict, and its regex extractors become bindings. It never emits
+    /// an oracle: an imported recipe is data, not code (design-flow-and-verdict.md
+    /// F7, F9). A construct with no data-only equivalent is refused rather than
+    /// lowered into a script.
+    ///
+    /// ```text
+    /// h5i websec import-nuclei cve-2021-1234.yaml > .h5i-tests/tests/cve.yaml
+    /// ```
+    #[command(name = "import-nuclei")]
+    ImportNuclei {
+        /// The Nuclei template file (YAML).
+        #[arg(value_name = "FILE")]
+        file: String,
+    },
+
+    /// Speak gRPC to a service: describe it, or call a method with JSON.
+    ///
+    /// The engine (`h5i browser grpc`) carries the bytes under this session's
+    /// policy and records each call, so a finding can cite it by message id.
+    Grpc {
+        #[command(subcommand)]
+        command: GrpcVerb,
+    },
+
+    /// Probe for prototype pollution and DOM-XSS source→sink flows.
+    ///
+    /// The DOM Invader analogue. `scan` drives client-side prototype-pollution
+    /// payloads through a session and reports what reached a sink; `node` runs
+    /// a Node target confined in a box and reports which `Object.prototype`
+    /// pollutions reach a dangerous sink. Both land their results as findings.
+    Dom {
+        #[command(subcommand)]
+        what: dom::DomVerb,
+    },
+}
+
+/// Where a call's descriptors come from: a `.proto`, a protoset, or the server.
+#[derive(clap::Args)]
+struct DescriptorSource {
+    /// The gRPC endpoint, `http://host:50051` or `https://host`. Required for
+    /// `call`, and for `--reflect`.
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    /// A `.proto` file to compile. Repeatable.
+    #[arg(long = "proto", value_name = "FILE")]
+    proto: Vec<String>,
+    /// An import root for `--proto`. Repeatable.
+    #[arg(long = "import-path", value_name = "DIR")]
+    import_path: Vec<String>,
+    /// A protoset: a serialized FileDescriptorSet (`protoc -o`, or `buf build`).
+    #[arg(long = "protoset", value_name = "FILE")]
+    protoset: Option<String>,
+    /// Ask the server for its descriptors over the reflection API.
+    #[arg(long)]
+    reflect: bool,
+    /// Skip TLS certificate verification, for a target under test.
+    #[arg(long)]
+    insecure: bool,
+}
+
+#[derive(Subcommand)]
+enum GrpcVerb {
+    /// List services, or describe one symbol: a service, message, or method.
+    Describe {
+        /// A `pkg.Service`, `pkg.Message`, or `pkg.Service/Method`. Omitted
+        /// lists every service.
+        #[arg(value_name = "SYMBOL")]
+        symbol: Option<String>,
+        #[command(flatten)]
+        src: DescriptorSource,
+    },
+    /// Call one method with a JSON request and print the JSON reply.
+    Call {
+        /// `pkg.Service/Method`.
+        #[arg(value_name = "METHOD")]
+        method: String,
+        /// The request message as JSON.
+        #[arg(long = "data", short = 'd', value_name = "JSON")]
+        data: String,
+        /// Read several response messages, for a server-streaming method.
+        #[arg(long = "server-streaming")]
+        server_streaming: bool,
+        /// `name:value` gRPC metadata, e.g. `authorization:Bearer x`. Repeatable.
+        #[arg(long = "metadata", value_name = "NAME:VALUE")]
+        metadata: Vec<String>,
+        #[command(flatten)]
+        src: DescriptorSource,
+    },
+}
+
+#[derive(Subcommand)]
+enum FindingVerb {
+    /// Write one down.
+    Create {
+        /// What it is, in one line.
+        #[arg(long, value_name = "TEXT")]
+        title: String,
+        /// Where it stands, in whatever words are useful. Free text: nothing
+        /// here reads it, so nothing here restricts it.
+        #[arg(long, value_name = "TEXT")]
+        state: Option<String>,
+        /// What was learned. Repeatable over the finding's life.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        /// Message ids it rests on, as `req_42,res_43`. Refused when this
+        /// session holds no such message.
+        #[arg(long, value_name = "IDS")]
+        evidence: Vec<String>,
+        /// A file that reproduces it: a sequence, or an experiment.
+        #[arg(long, value_name = "PATH")]
+        repro: Option<String>,
+    },
+    /// Every finding in this session, oldest first.
+    List {
+        /// Only findings whose state contains this.
+        #[arg(long, value_name = "TEXT")]
+        state: Option<String>,
+    },
+    /// One finding, with its notes and every change to it.
+    Show {
+        /// `finding_7`, or just `7`.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Change one. The title, state and repro replace; notes and evidence add.
+    Update {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        state: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        #[arg(long, value_name = "IDS")]
+        evidence: Vec<String>,
+        #[arg(long, value_name = "PATH")]
+        repro: Option<String>,
+    },
+}
+
+/// `req_42`, `res_42` and `42` all name sequence 42.
+///
+/// The prefixes exist because a finding reads better with them and because a
+/// request and its response share a number; neither is a different thing to
+/// look up. Anything else is refused rather than parsed as far as it goes: `42x`
+/// silently becoming 42 is how a loop tests the wrong request.
+pub fn sequence_of(id: &str) -> anyhow::Result<String> {
+    let bare = id
+        .strip_prefix("req_")
+        .or_else(|| id.strip_prefix("res_"))
+        .unwrap_or(id);
+    bare.parse::<u64>()
+        .map(|n| n.to_string())
+        .map_err(|_| anyhow::anyhow!("`{id}` is not a message id: try `req_42`, `res_42` or `42`"))
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if let Err(e) = run(cli) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+}
+
+/// Ask the running engine for something only it has: a live session's log is
+/// in its memory, not in a file.
+pub fn ask_browser(args: &[&str], session: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let mut command = Command::new(h5i());
+    command.arg("browser").args(args).arg("--json");
+    if let Some(name) = session {
+        command.arg("--session").arg(name);
+    }
+    let out = command
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run h5i: {e}"))?;
+    serde_json::from_slice(&out.stdout).map_err(|e| anyhow::anyhow!("h5i answered oddly: {e}"))
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
+    // The reading verbs are this binary's, and they read the store directly.
+    // Everything that sends is still `h5i browser`, below.
+    let root = h5i_core::browser_session::root()?;
+    let session = cli.session.clone();
+    let json_out = cli.json;
+    match &cli.command {
+        Verb::Show { id, raw, body_to } => {
+            let seq = sequence_of(id)?.parse::<u64>()?;
+            let part = if id.starts_with("res_") {
+                read::Part::Response
+            } else if id.starts_with("req_") {
+                read::Part::Request
+            } else {
+                read::Part::Both
+            };
+            return read::show(
+                &root,
+                session.as_deref(),
+                seq,
+                part,
+                *raw,
+                body_to.as_deref().map(std::path::Path::new),
+                json_out,
+            );
+        }
+        Verb::Diff { left, right } => {
+            return read::diff(
+                &root,
+                session.as_deref(),
+                sequence_of(left)?.parse::<u64>()?,
+                sequence_of(right)?.parse::<u64>()?,
+                json_out,
+            );
+        }
+        Verb::Match {
+            id,
+            regex,
+            contains,
+            json_path,
+            header,
+            status,
+            longer_than,
+            shorter_than,
+        } => {
+            // `name=value` splits on the first `=`, like an edit does, so a
+            // value containing one needs no escaping.
+            let split = |spec: &str| -> (String, Option<String>) {
+                match spec.split_once('=') {
+                    Some((name, value)) => (name.to_string(), Some(value.to_string())),
+                    None => (spec.to_string(), None),
+                }
+            };
+            let mut conditions = Vec::new();
+            if let Some(pattern) = regex {
+                conditions.push(read::Condition::Regex(pattern.clone()));
+            }
+            if let Some(text) = contains {
+                conditions.push(read::Condition::Contains(text.clone()));
+            }
+            if let Some(spec) = json_path {
+                let (path, value) = split(spec);
+                conditions.push(read::Condition::Json { path, value });
+            }
+            if let Some(spec) = header {
+                let (name, value) = split(spec);
+                conditions.push(read::Condition::Header { name, value });
+            }
+            if let Some(status) = status {
+                conditions.push(read::Condition::Status(*status));
+            }
+            if let Some(bytes) = longer_than {
+                conditions.push(read::Condition::LongerThan(*bytes));
+            }
+            if let Some(bytes) = shorter_than {
+                conditions.push(read::Condition::ShorterThan(*bytes));
+            }
+            return read::matches(
+                &root,
+                session.as_deref(),
+                sequence_of(id)?.parse::<u64>()?,
+                &conditions,
+                json_out,
+            );
+        }
+        Verb::Sitemap => return read::sitemap(&root, session.as_deref(), json_out),
+        Verb::Experiment { file } => {
+            return experiment::run(&root, session.as_deref(), file, json_out, &h5i());
+        }
+        Verb::Matrix {
+            id,
+            identities,
+            set,
+            rate,
+            create,
+            keep_credentials,
+            reset_budget,
+        } => {
+            return matrix::run(
+                &root,
+                session.as_deref(),
+                id,
+                identities,
+                set,
+                *rate,
+                *create,
+                *keep_credentials,
+                *reset_budget,
+                json_out,
+                &h5i(),
+            );
+        }
+        Verb::Finding { what } => {
+            return findings(&root, session.as_deref(), what, json_out);
+        }
+        Verb::ImportNuclei { file } => {
+            return nuclei::import(std::path::Path::new(file));
+        }
+        Verb::Grpc { command } => {
+            return grpc::run(session.as_deref(), command, json_out);
+        }
+        Verb::Dom { what } => {
+            return dom::run(&root, session.as_deref(), what, json_out);
+        }
+        _ => {}
+    }
+
+    let mut argv: Vec<String> = vec!["browser".to_string()];
+    // `replay --body`/`--raw`: print the stored response(s) instead of the JSON
+    // envelope (body only, or whole response for `--raw`).
+    let mut replaying = false;
+    let mut replay_body = false;
+    let mut replay_raw = false;
+    fn push(argv: &mut Vec<String>, args: &[&str]) {
+        argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    }
+    fn flag(argv: &mut Vec<String>, name: &str, value: Option<String>) {
+        if let Some(value) = value {
+            argv.push(format!("--{name}"));
+            argv.push(value);
+        }
+    }
+
+    match cli.command {
+        Verb::Requests {
+            method,
+            url_contains,
+            status,
+            initiator,
+            denied_only,
+            limit,
+        } => {
+            push(&mut argv, &["requests"]);
+            flag(&mut argv, "method", method);
+            flag(&mut argv, "url-contains", url_contains);
+            flag(&mut argv, "status", status.map(|s| s.to_string()));
+            flag(&mut argv, "initiator", initiator);
+            flag(&mut argv, "limit", limit.map(|s| s.to_string()));
+            if denied_only {
+                argv.push("--denied-only".into());
+            }
+        }
+        // Handled above, in this process: these read the store rather than
+        // send anything.
+        Verb::Show { .. }
+        | Verb::Diff { .. }
+        | Verb::Match { .. }
+        | Verb::Sitemap
+        | Verb::Experiment { .. }
+        | Verb::Matrix { .. }
+        | Verb::Finding { .. }
+        | Verb::ImportNuclei { .. }
+        | Verb::Grpc { .. }
+        | Verb::Dom { .. } => {
+            unreachable!("the verbs this process handles return before this")
+        }
+        Verb::Replay {
+            id,
+            set,
+            set_file,
+            unset,
+            create,
+            as_session,
+            keep_credentials,
+            repeat,
+            race,
+            no_follow,
+            reset_budget,
+            raw_target,
+            raw_request,
+            raw_headers,
+            set_each,
+            body,
+            raw,
+        } => {
+            replaying = true;
+            replay_body = body || raw;
+            replay_raw = raw;
+            let seq = sequence_of(&id)?;
+            push(&mut argv, &["resend"]);
+            argv.push(seq);
+            for spec in set {
+                argv.push("--set".into());
+                argv.push(spec);
+            }
+            for spec in set_file {
+                argv.push("--set-file".into());
+                argv.push(spec);
+            }
+            for spec in unset {
+                argv.push("--unset".into());
+                argv.push(spec);
+            }
+            if create {
+                argv.push("--create".into());
+            }
+            flag(&mut argv, "as", as_session);
+            if keep_credentials {
+                argv.push("--keep-credentials".into());
+            }
+            flag(&mut argv, "repeat", repeat.map(|n| n.to_string()));
+            if race {
+                argv.push("--race".into());
+            }
+            if no_follow {
+                argv.push("--no-follow".into());
+            }
+            if reset_budget {
+                argv.push("--reset-budget".into());
+            }
+            flag(&mut argv, "raw-target", raw_target);
+            flag(&mut argv, "raw-request", raw_request);
+            if raw_headers {
+                push(&mut argv, &["--raw-headers"]);
+            }
+            flag(&mut argv, "set-each", set_each);
+        }
+        Verb::Socket {
+            url,
+            send,
+            wait_ms,
+        } => {
+            push(&mut argv, &["socket"]);
+            argv.push(url);
+            for frame in send {
+                argv.push("--send".into());
+                argv.push(frame);
+            }
+            flag(&mut argv, "wait-ms", wait_ms.map(|ms| ms.to_string()));
+        }
+        Verb::Sequence {
+            file,
+            vars,
+            keep_going,
+        } => {
+            push(&mut argv, &["sequence"]);
+            argv.push(file);
+            for var in vars {
+                argv.push("--var".into());
+                argv.push(var);
+            }
+            if keep_going {
+                argv.push("--keep-going".into());
+            }
+        }
+    }
+
+    if let Some(session) = cli.session {
+        argv.push("--session".into());
+        argv.push(session);
+    }
+    // `replay` always asks for the envelope: its text view is drawn here, from
+    // the answer, because the engine has none of its own.
+    if cli.json || replaying {
+        argv.push("--json".into());
+    }
+
+    if !replaying {
+        let status = Command::new(h5i())
+            .args(&argv)
+            .status()
+            .map_err(|e| anyhow::anyhow!("could not run h5i: {e}"))?;
+        // The underlying verb's code, unchanged. `match` exits 1 for "did not
+        // match" and 2 for "could not look", and flattening those here would
+        // break every script built on them.
+        std::process::exit(status.code().unwrap_or(2));
+    }
+
+    // Snapshot the store so we know which messages the send adds (N for
+    // `--set-each`/`--repeat`).
+    let pre_seq = if replay_body {
+        read::latest_seq(&root, session.as_deref()).unwrap_or(None)
+    } else {
+        None
+    };
+    let out = Command::new(h5i())
+        .args(&argv)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run h5i: {e}"))?;
+    let code = out.status.code().unwrap_or(2);
+    if cli.json && !replay_body {
+        use std::io::Write;
+        std::io::stdout().write_all(&out.stdout)?;
+        std::process::exit(code);
+    }
+    let answer: Option<serde_json::Value> = serde_json::from_slice(&out.stdout).ok();
+    let Some(answer) = answer else {
+        // Not an envelope: whatever it is, it is the only account there is.
+        use std::io::Write;
+        std::io::stdout().write_all(&out.stdout)?;
+        std::process::exit(code);
+    };
+    if replay_body {
+        if !out.status.success() {
+            if let Err(why) = view::replay(&answer) {
+                eprintln!("{why}");
+            }
+            std::process::exit(code);
+        }
+        let seqs = read::seqs_after(&root, session.as_deref(), pre_seq).unwrap_or_default();
+        if seqs.is_empty() {
+            eprintln!(
+                "  note     : nothing to print — the session kept no messages \
+                 (open it with `--capture`)"
+            );
+        }
+        // More than one send (a sweep): label each so stdout can be split.
+        let multi = seqs.len() > 1;
+        let body_to = if replay_raw {
+            None
+        } else {
+            Some(std::path::Path::new("-"))
+        };
+        for seq in seqs {
+            if multi {
+                println!("--- res_{seq} ---");
+            }
+            read::show(
+                &root,
+                session.as_deref(),
+                seq,
+                read::Part::Response,
+                replay_raw,
+                body_to,
+                false,
+            )?;
+        }
+        std::process::exit(code);
+    }
+    match view::replay(&answer) {
+        Ok(text) => print!("{text}"),
+        Err(why) => eprintln!("{why}"),
+    }
+    std::process::exit(code);
+}
+
+/// `h5i websec finding`, all four of it.
+///
+/// In this process because a finding is a file beside the message store, and
+/// the plugin is what reads that store. Nothing here sends.
+fn findings(
+    root: &std::path::Path,
+    selector: Option<&str>,
+    what: &FindingVerb,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let session = read::resolve_for_reading(root, selector)?;
+    let store = read::store_dir(root, selector)?.1;
+    let log = finding::Findings::open(root, &session.id)?;
+
+    let show = |one: &finding::Finding| -> anyhow::Result<()> {
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(one)?);
+            return Ok(());
+        }
+        print!("{}", one.human());
+        Ok(())
+    };
+
+    match what {
+        FindingVerb::Create {
+            title,
+            state,
+            note,
+            evidence,
+            repro,
+        } => {
+            let evidence = finding::check_evidence(&store, evidence)?;
+            let id = log.next_id()?;
+            log.append(&finding::entry(
+                &id,
+                Some(title.as_str()),
+                state.as_deref(),
+                note.as_deref(),
+                evidence,
+                repro.as_deref(),
+            )?)?;
+            show(&log.find(&id)?)
+        }
+        FindingVerb::Update {
+            id,
+            title,
+            state,
+            note,
+            evidence,
+            repro,
+        } => {
+            let id = finding::normalise_id(id)?;
+            // Read first: an update to a finding that is not there would sit in
+            // the log as a second finding with a familiar name.
+            log.find(&id)?;
+            if title.is_none()
+                && state.is_none()
+                && note.is_none()
+                && evidence.is_empty()
+                && repro.is_none()
+            {
+                anyhow::bail!("`finding update` with nothing to change would only move its clock");
+            }
+            let evidence = finding::check_evidence(&store, evidence)?;
+            log.append(&finding::entry(
+                &id,
+                title.as_deref(),
+                state.as_deref(),
+                note.as_deref(),
+                evidence,
+                repro.as_deref(),
+            )?)?;
+            show(&log.find(&id)?)
+        }
+        FindingVerb::Show { id } => show(&log.find(id)?),
+        FindingVerb::List { state } => {
+            let all = log.read()?;
+            let kept: Vec<&finding::Finding> = all
+                .iter()
+                .filter(|one| match state {
+                    Some(want) => one.state.contains(want.as_str()),
+                    None => true,
+                })
+                .collect();
+            if json_out {
+                let rows: Vec<serde_json::Value> = kept.iter().map(|one| one.brief()).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "session": session.id,
+                        "findings": rows,
+                    }))?
+                );
+                return Ok(());
+            }
+            if kept.is_empty() {
+                println!("  no findings in session {}", session.id);
+                return Ok(());
+            }
+            for one in kept {
+                println!("{}", one.line());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sequence_of;
+
+    #[test]
+    fn a_message_id_is_read_with_or_without_its_prefix() {
+        assert_eq!(sequence_of("req_42").unwrap(), "42");
+        assert_eq!(sequence_of("res_42").unwrap(), "42");
+        assert_eq!(sequence_of("42").unwrap(), "42");
+    }
+
+    /// Parsing as far as it goes is how a loop tests the wrong request.
+    #[test]
+    fn something_that_is_not_an_id_is_refused_rather_than_salvaged() {
+        for bad in ["42x", "req_", "", "req_-1", "one"] {
+            assert!(sequence_of(bad).is_err(), "`{bad}` should be refused");
+        }
+    }
+}

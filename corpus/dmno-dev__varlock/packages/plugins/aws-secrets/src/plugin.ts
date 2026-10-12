@@ -1,0 +1,915 @@
+import {
+  type Resolver, type PluginCacheAccessor, plugin, resolveCacheTtl,
+} from 'varlock/plugin-lib';
+import { BUNDLED_ICONS } from './bundled-icons.gen';
+
+import { createHash } from 'node:crypto';
+import {
+  SecretsManagerClient,
+  GetSecretValueCommand,
+  type GetSecretValueCommandOutput,
+} from '@aws-sdk/client-secrets-manager';
+import {
+  SSMClient,
+  GetParameterCommand,
+  type GetParameterCommandOutput,
+} from '@aws-sdk/client-ssm';
+import { STSClient, AssumeRoleWithWebIdentityCommand } from '@aws-sdk/client-sts';
+import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
+import { getOidcToken } from '@env-spec/utils/oidc-tokens';
+
+const { ValidationError, SchemaError, ResolutionError } = plugin.ERRORS;
+
+const AWS_ICON = 'simple-icons:amazonwebservices';
+
+plugin.name = 'aws';
+const { debug } = plugin;
+debug('init - version =', plugin.version);
+plugin.icon = AWS_ICON;
+plugin.bundledIcons = BUNDLED_ICONS;
+
+// capture cache accessor while the plugin proxy context is active
+// (the `plugin` proxy is only valid during module initialization, not during resolve())
+let pluginCache: PluginCacheAccessor | undefined;
+try {
+  pluginCache = plugin.cache;
+} catch {
+  // cache not available (e.g., no encryption key)
+}
+
+plugin.standardVars = {
+  initDecorator: '@initAws',
+  params: {
+    region: { key: ['AWS_REGION', 'AWS_DEFAULT_REGION'] },
+    accessKeyId: { key: 'AWS_ACCESS_KEY_ID', dataType: 'awsAccessKey' },
+    secretAccessKey: { key: 'AWS_SECRET_ACCESS_KEY', dataType: 'awsSecretKey' },
+  },
+};
+
+const FIX_AUTH_TIP = [
+  'Verify your AWS credentials are configured correctly. Use one of the following options:',
+  '  1. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables',
+  '  2. Configure ~/.aws/credentials file (run: aws configure)',
+  '  3. Provide credentials explicitly via @initAws(accessKeyId=..., secretAccessKey=...)',
+  '  4. Use OIDC via @initAws(oidcRoleArn=...) for deployed environments (Vercel, GitHub Actions, etc.)',
+  '  5. Use IAM roles (if running on AWS infrastructure)',
+].join('\n');
+
+interface OidcCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  expiration: number;
+}
+
+class AwsPluginInstance {
+  private region?: string;
+  private accessKeyId?: string;
+  private secretAccessKey?: string;
+  private sessionToken?: string;
+  private profile?: string;
+  private namePrefix?: string;
+  private oidcRoleArn?: string;
+  private oidcSessionName?: string;
+  private oidcToken?: string;
+  private cachedOidcCredentials?: OidcCredentials;
+  /** optional cache TTL - when set, resolved values are cached */
+  cacheTtl?: string | number;
+
+  constructor(
+    readonly id: string,
+  ) {
+  }
+
+  /**
+   * @internal telemetry: which credential source this instance is configured for (fixed enum, no user input).
+   * Mirrors the precedence in getCredentials(): explicit keys > OIDC role > named profile > default chain.
+   */
+  get telemetryAuthMethod(): 'access_key' | 'oidc' | 'profile' | 'default_chain' {
+    if (this.accessKeyId && this.secretAccessKey) return 'access_key';
+    if (this.oidcRoleArn) return 'oidc';
+    if (this.profile) return 'profile';
+    return 'default_chain';
+  }
+
+  private _cacheKeyIdentity?: string;
+  /** short hash identifying which AWS account/region is being read, used to namespace cache keys */
+  get cacheKeyIdentity() {
+    this._cacheKeyIdentity ??= createHash('sha256')
+      .update(JSON.stringify([this.region, this.profile, this.accessKeyId, this.oidcRoleArn]))
+      .digest('hex')
+      .slice(0, 12);
+    return this._cacheKeyIdentity;
+  }
+
+  setAuth(
+    region?: any,
+    accessKeyId?: any,
+    secretAccessKey?: any,
+    sessionToken?: any,
+    profile?: any,
+    namePrefix?: any,
+    oidcRoleArn?: any,
+    oidcSessionName?: any,
+    oidcToken?: any,
+  ) {
+    this.region = region ? String(region) : undefined;
+    this.accessKeyId = accessKeyId ? String(accessKeyId) : undefined;
+    this.secretAccessKey = secretAccessKey ? String(secretAccessKey) : undefined;
+    this.sessionToken = sessionToken ? String(sessionToken) : undefined;
+    this.profile = profile;
+    this.namePrefix = namePrefix ? String(namePrefix) : undefined;
+    this.oidcRoleArn = oidcRoleArn ? String(oidcRoleArn) : undefined;
+    this.oidcSessionName = oidcSessionName ? String(oidcSessionName) : undefined;
+    this.oidcToken = oidcToken ? String(oidcToken) : undefined;
+    debug(
+      'aws instance',
+      this.id,
+      'set auth - region:',
+      this.region,
+      'profile:',
+      this.profile,
+      'hasAccessKey:',
+      !!this.accessKeyId,
+      'hasSecretKey:',
+      !!this.secretAccessKey,
+      'oidcRoleArn:',
+      this.oidcRoleArn,
+      'namePrefix:',
+      this.namePrefix,
+    );
+  }
+
+  private async getOidcCredentials(): Promise<OidcCredentials | undefined> {
+    // Return cached credentials if still valid (with 5 min buffer)
+    if (this.cachedOidcCredentials && this.cachedOidcCredentials.expiration > Date.now() + 5 * 60 * 1000) {
+      debug('Using cached OIDC credentials');
+      return this.cachedOidcCredentials;
+    }
+
+    // Get OIDC token - either explicit or auto-detected from platform
+    let jwt: string | undefined = this.oidcToken;
+    if (!jwt) {
+      const result = await getOidcToken('sts.amazonaws.com');
+      jwt = result?.token;
+    }
+
+    if (!jwt) {
+      debug('No OIDC token available');
+      return undefined;
+    }
+
+    debug('Exchanging OIDC token for AWS credentials via STS');
+    const stsClient = new STSClient({ region: this.region });
+    const response = await stsClient.send(new AssumeRoleWithWebIdentityCommand({
+      RoleArn: this.oidcRoleArn,
+      WebIdentityToken: jwt,
+      RoleSessionName: this.oidcSessionName || 'varlock-session',
+    }));
+
+    if (!response.Credentials?.AccessKeyId
+      || !response.Credentials?.SecretAccessKey
+      || !response.Credentials?.SessionToken) {
+      throw new SchemaError('STS AssumeRoleWithWebIdentity returned incomplete credentials', {
+        tip: 'Verify the IAM role trust policy allows your OIDC provider',
+      });
+    }
+
+    this.cachedOidcCredentials = {
+      accessKeyId: response.Credentials.AccessKeyId,
+      secretAccessKey: response.Credentials.SecretAccessKey,
+      sessionToken: response.Credentials.SessionToken,
+      expiration: response.Credentials.Expiration?.getTime() || Date.now() + 3600 * 1000,
+    };
+
+    debug('OIDC credentials obtained, expires:', new Date(this.cachedOidcCredentials.expiration).toISOString());
+    return this.cachedOidcCredentials;
+  }
+
+  private async getCredentials(): Promise<{ credentials?: any; credentialDescription: string }> {
+    if (this.accessKeyId && this.secretAccessKey) {
+      return {
+        credentials: {
+          accessKeyId: this.accessKeyId,
+          secretAccessKey: this.secretAccessKey,
+          sessionToken: this.sessionToken,
+        },
+        credentialDescription: 'explicit AWS credentials',
+      };
+    }
+
+    if (this.oidcRoleArn) {
+      const oidcCreds = await this.getOidcCredentials();
+      if (oidcCreds) {
+        return {
+          credentials: {
+            accessKeyId: oidcCreds.accessKeyId,
+            secretAccessKey: oidcCreds.secretAccessKey,
+            sessionToken: oidcCreds.sessionToken,
+          },
+          credentialDescription: 'OIDC credentials',
+        };
+      }
+    }
+
+    if (this.profile) {
+      // Use the full node provider chain (scoped to the named profile) rather than `fromIni` alone.
+      // `fromIni` does not fully resolve `credential_source` entries (e.g. `EcsContainer` /
+      // `Ec2InstanceMetadata`) used by container/instance roles, whereas the node provider chain
+      // delegates to the appropriate container/instance-metadata providers - matching the behavior
+      // of the AWS CLI and the SDK's default credential resolution.
+      return {
+        credentials: fromNodeProviderChain({ profile: this.profile }),
+        credentialDescription: `AWS profile: ${this.profile}`,
+      };
+    }
+
+    return { credentialDescription: 'default AWS credential chain' };
+  }
+
+  applyNamePrefix(name: string): string {
+    if (this.namePrefix) {
+      return this.namePrefix + name;
+    }
+    return name;
+  }
+
+  private secretsManagerClientPromise: Promise<SecretsManagerClient> | undefined;
+  async initSecretsManagerClient() {
+    if (this.secretsManagerClientPromise) return this.secretsManagerClientPromise;
+
+    this.secretsManagerClientPromise = (async () => {
+      try {
+        const { credentials, credentialDescription } = await this.getCredentials();
+        debug('Using', credentialDescription);
+
+        const client = new SecretsManagerClient({
+          region: this.region,
+          ...(credentials && { credentials }),
+        });
+        debug('AWS Secrets Manager client initialized for instance', this.id);
+        return client;
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        throw new SchemaError(`Failed to initialize AWS Secrets Manager client: ${errorMsg}`, {
+          tip: FIX_AUTH_TIP,
+        });
+      }
+    })();
+
+    return this.secretsManagerClientPromise;
+  }
+
+  private ssmClientPromise: Promise<SSMClient> | undefined;
+  async initSSMClient() {
+    if (this.ssmClientPromise) return this.ssmClientPromise;
+
+    this.ssmClientPromise = (async () => {
+      try {
+        const { credentials, credentialDescription } = await this.getCredentials();
+        debug('Using', credentialDescription);
+
+        const client = new SSMClient({
+          region: this.region,
+          ...(credentials && { credentials }),
+        });
+        debug('AWS SSM client initialized for instance', this.id);
+        return client;
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        throw new SchemaError(`Failed to initialize AWS SSM client: ${errorMsg}`, {
+          tip: FIX_AUTH_TIP,
+        });
+      }
+    })();
+
+    return this.ssmClientPromise;
+  }
+
+  async getSecret(secretId: string, jsonKey?: string): Promise<string> {
+    const client = await this.initSecretsManagerClient();
+    if (!client) throw new Error('Expected AWS Secrets Manager client to be initialized');
+
+    try {
+      const command = new GetSecretValueCommand({ SecretId: secretId });
+      const response: GetSecretValueCommandOutput = await client.send(command);
+
+      // Return SecretString if available, otherwise decode SecretBinary
+      let secretValue: string;
+      if (response.SecretString) {
+        secretValue = response.SecretString;
+      } else if (response.SecretBinary) {
+        // Decode binary secret
+        const buff = Buffer.from(response.SecretBinary);
+        secretValue = buff.toString('utf-8');
+      } else {
+        throw new ResolutionError('Secret data is empty');
+      }
+
+      return this.extractJsonKeyFromSecret(secretValue, jsonKey);
+    } catch (err: any) {
+      // Re-throw ResolutionError as-is
+      if (err instanceof ResolutionError) {
+        throw err;
+      }
+
+      let errorMessage = 'Failed to fetch secret';
+      let errorTip: string | undefined;
+
+      // Handle common AWS Secrets Manager errors
+      const errorName = err.name || err.__type || '';
+      const errorCode = err.$metadata?.httpStatusCode;
+
+      if (errorName === 'ResourceNotFoundException' || errorCode === 404) {
+        errorMessage = `Secret "${secretId}" not found`;
+        errorTip = [
+          'Verify the secret exists in AWS Secrets Manager',
+          `AWS Console: https://console.aws.amazon.com/secretsmanager/home?region=${this.region || 'us-east-1'}`,
+        ].join('\n');
+      } else if (errorName === 'AccessDeniedException' || errorCode === 403) {
+        errorMessage = `Permission denied accessing secret "${secretId}"`;
+        errorTip = [
+          'Ensure your IAM user/role has the required permissions',
+          'Required IAM policy:',
+          '{',
+          '  "Effect": "Allow",',
+          '  "Action": ["secretsmanager:GetSecretValue"],',
+          `  "Resource": "arn:aws:secretsmanager:${this.region || '*'}:*:secret:*"`,
+          '}',
+        ].join('\n');
+      } else if (errorName === 'InvalidRequestException') {
+        errorMessage = `Invalid request for secret "${secretId}"`;
+        errorTip = [
+          'Check the secret ID format:',
+          '  - Name: "my-secret"',
+          '  - ARN: "arn:aws:secretsmanager:region:account-id:secret:name-AbCdEf"',
+          '  - Partial ARN: "name-AbCdEf"',
+        ].join('\n');
+      } else if (
+        errorName.includes('Credential')
+        || errorMessage.includes('credentials')
+        || errorCode === 401
+      ) {
+        // Check if we're using explicit credentials or default chain
+        if (!this.accessKeyId && !this.profile) {
+          errorMessage = 'Authentication failed';
+          errorTip = [
+            err.message,
+            FIX_AUTH_TIP,
+          ].join('\n');
+        } else {
+          errorMessage = 'Authentication failed with provided credentials';
+          errorTip = 'Verify that your AWS credentials are valid and have the required permissions';
+        }
+      } else if (err.message) {
+        errorMessage = `AWS Secrets Manager error: ${err.message}`;
+      }
+
+      throw new ResolutionError(errorMessage, {
+        tip: errorTip,
+      });
+    }
+  }
+
+  async getParameter(name: string, jsonKey?: string): Promise<string> {
+    const client = await this.initSSMClient();
+    if (!client) throw new Error('Expected AWS SSM client to be initialized');
+
+    // Validate parameter name format before making the AWS call
+    if (!name.startsWith('/')) {
+      throw new ResolutionError(`Invalid AWS SSM parameter name: "${name}"`, {
+        tip: `SSM parameter names must start with "/"\n  Try: "/${name}"`,
+      });
+    }
+    // AWS reserves the /ssm prefix (case-insensitive)
+    if (/^\/ssm(\/|$)/i.test(name)) {
+      throw new ResolutionError(`Invalid AWS SSM parameter name: "${name}"`, {
+        tip: 'SSM parameter names cannot start with "/ssm" (AWS reserved prefix, case-insensitive)',
+      });
+    }
+    // Validate parameter name characters (letters, numbers, and . - _ / are allowed)
+    if (!/^[a-zA-Z0-9/._-]+$/.test(name)) {
+      const invalidChars = [...new Set(name.match(/[^a-zA-Z0-9/._-]/g) || [])].join('');
+      throw new ResolutionError(`Invalid AWS SSM parameter name: "${name}"`, {
+        tip: `SSM parameter names can only contain letters, numbers, and the symbols / . - _\n  Invalid character(s): ${invalidChars}`,
+      });
+    }
+
+    try {
+      const command = new GetParameterCommand({
+        Name: name,
+        WithDecryption: true,
+      });
+      const response: GetParameterCommandOutput = await client.send(command);
+
+      if (!response.Parameter?.Value) {
+        throw new ResolutionError('Parameter value is empty');
+      }
+
+      const paramValue = response.Parameter.Value;
+      return this.extractJsonKeyFromParameter(paramValue, jsonKey);
+    } catch (err: any) {
+      // Re-throw ResolutionError as-is
+      if (err instanceof ResolutionError) {
+        throw err;
+      }
+
+      let errorMessage = 'Failed to fetch parameter';
+      let errorTip: string | undefined;
+
+      // Handle common AWS Parameter Store errors
+      const errorName = err.name || err.__type || '';
+      const errorCode = err.$metadata?.httpStatusCode;
+
+      if (errorName === 'ParameterInvalidException' || errorName === 'ValidationException') {
+        errorMessage = `Invalid AWS SSM parameter name: "${name}"`;
+        errorTip = 'Parameter names must start with "/" and can only contain letters, numbers, and the symbols / . - _';
+      } else if (errorName === 'ParameterNotFound' || errorCode === 404) {
+        errorMessage = `Parameter "${name}" not found`;
+        errorTip = [
+          'Verify the parameter exists in AWS Systems Manager Parameter Store',
+          `AWS Console: https://console.aws.amazon.com/systems-manager/parameters?region=${this.region || 'us-east-1'}`,
+        ].join('\n');
+      } else if (errorName === 'AccessDeniedException' || errorCode === 403) {
+        errorMessage = `Permission denied accessing parameter "${name}"`;
+        errorTip = [
+          'Ensure your IAM user/role has the required permissions',
+          'Required IAM policy:',
+          '{',
+          '  "Effect": "Allow",',
+          '  "Action": ["ssm:GetParameter"],',
+          `  "Resource": "arn:aws:ssm:${this.region || '*'}:*:parameter/*"`,
+          '}',
+        ].join('\n');
+      } else if (
+        errorName.includes('Credential')
+        || errorMessage.includes('credentials')
+        || errorCode === 401
+      ) {
+        // Check if we're using explicit credentials or default chain
+        if (!this.accessKeyId && !this.profile) {
+          errorMessage = 'Authentication failed';
+          errorTip = [
+            err.message,
+            FIX_AUTH_TIP,
+          ].join('\n');
+        } else {
+          errorMessage = 'Authentication failed with provided credentials';
+          errorTip = 'Verify that your AWS credentials are valid and have the required permissions';
+        }
+      } else if (err.message) {
+        errorMessage = `AWS Parameter Store error: ${err.message}`;
+      }
+
+      throw new ResolutionError(errorMessage, {
+        tip: errorTip,
+      });
+    }
+  }
+
+  extractJsonKeyFromSecret(secretValue: string, jsonKey?: string): string {
+    if (!jsonKey) return secretValue;
+    try {
+      const parsed = JSON.parse(secretValue);
+      if (!(jsonKey in parsed)) {
+        throw new ResolutionError(`Key "${jsonKey}" not found in secret JSON`, {
+          tip: `Available keys: ${Object.keys(parsed).join(', ')}`,
+        });
+      }
+      return String(parsed[jsonKey]);
+    } catch (err) {
+      if (err instanceof ResolutionError) throw err;
+      throw new ResolutionError(`Failed to parse secret as JSON: ${err instanceof Error ? err.message : String(err)}`, {
+        tip: 'Ensure the secret value is valid JSON when extracting a specific key',
+      });
+    }
+  }
+
+  extractJsonKeyFromParameter(paramValue: string, jsonKey?: string): string {
+    if (!jsonKey) return paramValue;
+    try {
+      const parsed = JSON.parse(paramValue);
+      if (!(jsonKey in parsed)) {
+        throw new ResolutionError(`Key "${jsonKey}" not found in parameter JSON`, {
+          tip: `Available keys: ${Object.keys(parsed).join(', ')}`,
+        });
+      }
+      return String(parsed[jsonKey]);
+    } catch (err) {
+      if (err instanceof ResolutionError) throw err;
+      throw new ResolutionError(`Failed to parse parameter as JSON: ${err instanceof Error ? err.message : String(err)}`, {
+        tip: 'Ensure the parameter value is valid JSON when using the # syntax for key extraction',
+      });
+    }
+  }
+}
+
+const pluginInstances: Record<string, AwsPluginInstance> = {};
+
+/** @internal telemetry: which AWS services the schema references */
+let usedSecretsManager = false;
+let usedParameterStore = false;
+
+plugin.registerRootDecorator({
+  name: 'initAws',
+  description: 'Initialize an AWS plugin instance for awsSecret() and awsParam() resolvers',
+  isFunction: true,
+  async process(argsVal) {
+    const objArgs = argsVal.objArgs;
+    if (!objArgs) throw new SchemaError('Expected some args');
+
+    // Validate id is static
+    if (objArgs.id && !objArgs.id.isStatic) {
+      throw new SchemaError('Expected id to be static');
+    }
+    const id = String(objArgs?.id?.staticValue || '_default');
+    if (pluginInstances[id]) {
+      throw new SchemaError(`Instance with id "${id}" already initialized`);
+    }
+
+    // Region is required
+    if (!objArgs.region) {
+      throw new SchemaError('Region parameter is required');
+    }
+
+    pluginInstances[id] = new AwsPluginInstance(id);
+
+    return {
+      id,
+      profileResolver: objArgs.profile,
+      regionResolver: objArgs.region,
+      accessKeyIdResolver: objArgs.accessKeyId,
+      secretAccessKeyResolver: objArgs.secretAccessKey,
+      sessionTokenResolver: objArgs.sessionToken,
+      namePrefixResolver: objArgs.namePrefix,
+      oidcRoleArnResolver: objArgs.oidcRoleArn,
+      oidcSessionNameResolver: objArgs.oidcSessionName,
+      oidcTokenResolver: objArgs.oidcToken,
+      cacheTtlResolver: objArgs.cacheTtl,
+    };
+  },
+  async execute({
+    id,
+    profileResolver,
+    regionResolver,
+    accessKeyIdResolver,
+    secretAccessKeyResolver,
+    sessionTokenResolver,
+    namePrefixResolver,
+    oidcRoleArnResolver,
+    oidcSessionNameResolver,
+    oidcTokenResolver,
+    cacheTtlResolver,
+  }) {
+    const region = await regionResolver.resolve();
+    const accessKeyId = await accessKeyIdResolver?.resolve();
+    const secretAccessKey = await secretAccessKeyResolver?.resolve();
+    const sessionToken = await sessionTokenResolver?.resolve();
+    const profile = await profileResolver?.resolve();
+    const namePrefix = await namePrefixResolver?.resolve();
+    const oidcRoleArn = await oidcRoleArnResolver?.resolve();
+    const oidcSessionName = await oidcSessionNameResolver?.resolve();
+    const oidcToken = await oidcTokenResolver?.resolve();
+    pluginInstances[id].setAuth(
+      region,
+      accessKeyId,
+      secretAccessKey,
+      sessionToken,
+      profile,
+      namePrefix,
+      oidcRoleArn,
+      oidcSessionName,
+      oidcToken,
+    );
+    const cacheTtl = await resolveCacheTtl(cacheTtlResolver);
+    if (cacheTtl !== undefined) {
+      pluginInstances[id].cacheTtl = cacheTtl;
+    }
+  },
+});
+
+plugin.registerDataType({
+  name: 'awsAccessKey',
+  sensitive: false,
+  typeDescription: 'AWS access key ID for IAM authentication',
+  docs: [
+    {
+      description: 'Managing access keys for IAM users',
+      url: 'https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html',
+    },
+  ],
+  async validate(val): Promise<true> {
+    // AWS access keys are typically 20 characters and alphanumeric
+    if (!/^[A-Z0-9]{20}$/.test(val)) {
+      throw new ValidationError('Must be a 20-character alphanumeric string (typically starts with AKIA)');
+    }
+    return true;
+  },
+});
+
+plugin.registerDataType({
+  name: 'awsSecretKey',
+  sensitive: true,
+  typeDescription: 'AWS secret access key for IAM authentication',
+  docs: [
+    {
+      description: 'Managing access keys for IAM users',
+      url: 'https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html',
+    },
+  ],
+  async validate(val): Promise<true> {
+    // AWS secret keys are typically 40 characters
+    if (val.length !== 40) {
+      throw new ValidationError('Must be exactly 40 characters long');
+    }
+    return true;
+  },
+});
+
+plugin.registerResolverFunction({
+  name: 'awsSecret',
+  label: 'Fetch secret from AWS Secrets Manager',
+  argsSchema: {
+    type: 'mixed',
+    arrayMinLength: 0,
+  },
+  process() {
+    usedSecretsManager = true;
+    let instanceId: string;
+    let secretIdResolver: Resolver | undefined;
+    let inferredSecretName: string | undefined;
+    let keyResolver: Resolver | undefined;
+
+    // Check for named 'key' parameter
+    if (this.objArgs?.key) {
+      keyResolver = this.objArgs.key;
+    }
+
+    // No args - auto-infer from parent config item key
+    if (!this.arrArgs || this.arrArgs.length === 0) {
+      instanceId = '_default';
+      const parent = (this as any).parent;
+      const itemKey = parent?.key || '';
+      if (!itemKey) {
+        throw new SchemaError('Could not infer secret name - no parent config item key found', {
+          tip: 'Either provide a secret name as an argument, or ensure this is used within a config item',
+        });
+      }
+      // Use item key as-is (AWS allows underscores and mixed case)
+      inferredSecretName = itemKey;
+    } else if (this.arrArgs.length === 1) {
+      instanceId = '_default';
+      secretIdResolver = this.arrArgs[0];
+    } else if (this.arrArgs.length === 2) {
+      if (!(this.arrArgs[0].isStatic)) {
+        throw new SchemaError('Expected instance id to be a static value');
+      } else {
+        instanceId = String(this.arrArgs[0].staticValue);
+      }
+      secretIdResolver = this.arrArgs[1];
+    } else {
+      throw new SchemaError('Expected 0, 1, or 2 args');
+    }
+
+    if (!Object.values(pluginInstances).length) {
+      throw new SchemaError('No AWS plugin instances found', {
+        tip: 'Initialize at least one AWS plugin instance using the @initAws root decorator',
+      });
+    }
+
+    // Make sure instance id is valid
+    const selectedInstance = pluginInstances[instanceId];
+    if (!selectedInstance) {
+      if (instanceId === '_default') {
+        throw new SchemaError('AWS plugin instance (without id) not found', {
+          tip: [
+            'Either remove the `id` param from your @initAws call',
+            'or use `awsSecret(id, secretId)` to select an instance by id.',
+            `Possible ids are: ${Object.keys(pluginInstances).join(', ')}`,
+          ].join('\n'),
+        });
+      } else {
+        throw new SchemaError(`AWS plugin instance id "${instanceId}" not found`, {
+          tip: [`Valid ids are: ${Object.keys(pluginInstances).join(', ')}`].join('\n'),
+        });
+      }
+    }
+
+    return {
+      instanceId, secretIdResolver, inferredSecretName, keyResolver,
+    };
+  },
+  async resolve({
+    instanceId, secretIdResolver, inferredSecretName, keyResolver,
+  }) {
+    const selectedInstance = pluginInstances[instanceId];
+
+    let secretIdWithKey: string;
+    if (inferredSecretName) {
+      secretIdWithKey = inferredSecretName;
+    } else if (secretIdResolver) {
+      const secretId = await secretIdResolver.resolve();
+      if (typeof secretId !== 'string') {
+        throw new SchemaError('Expected secret ID to resolve to a string');
+      }
+      secretIdWithKey = secretId;
+    } else {
+      throw new SchemaError('No secret ID provided or inferred');
+    }
+
+    // Parse the secret ID for JSON key extraction (using # syntax)
+    let secretId: string;
+    let jsonKey: string | undefined;
+    const hashIndex = secretIdWithKey.indexOf('#');
+    if (hashIndex !== -1) {
+      secretId = secretIdWithKey.substring(0, hashIndex);
+      jsonKey = secretIdWithKey.substring(hashIndex + 1);
+    } else {
+      secretId = secretIdWithKey;
+    }
+
+    // Named 'key' parameter takes precedence over # syntax
+    if (keyResolver) {
+      const keyValue = await keyResolver.resolve();
+      if (typeof keyValue !== 'string') {
+        throw new SchemaError('Expected key parameter to resolve to a string');
+      }
+      jsonKey = keyValue;
+    }
+
+    // Apply namePrefix
+    const finalSecretId = selectedInstance.applyNamePrefix(secretId);
+
+    // check cache if cacheTtl is configured and cache is available
+    if (selectedInstance.cacheTtl !== undefined && pluginCache) {
+      // store the full secret payload, then apply jsonKey extraction per lookup.
+      // This avoids cache collisions between awsSecret("x#foo") and awsSecret("x#bar").
+      const cacheKey = `awsSecret:${instanceId}:${selectedInstance.cacheKeyIdentity}:${finalSecretId}`;
+      const fullSecretValue = await pluginCache.getOrSet(
+        cacheKey,
+        selectedInstance.cacheTtl,
+        async () => await selectedInstance.getSecret(finalSecretId),
+      );
+      if (typeof fullSecretValue !== 'string') {
+        throw new ResolutionError('Cached AWS secret value has unexpected type (expected string)');
+      }
+      return selectedInstance.extractJsonKeyFromSecret(fullSecretValue, jsonKey);
+    }
+
+    const secretValue = await selectedInstance.getSecret(finalSecretId, jsonKey);
+    return secretValue;
+  },
+});
+
+plugin.registerResolverFunction({
+  name: 'awsParam',
+  label: 'Fetch parameter from AWS Systems Manager Parameter Store',
+  argsSchema: {
+    type: 'mixed',
+    arrayMinLength: 0,
+  },
+  process() {
+    usedParameterStore = true;
+    let instanceId: string;
+    let parameterNameResolver: Resolver | undefined;
+    let inferredParamName: string | undefined;
+    let keyResolver: Resolver | undefined;
+
+    // Check for named 'key' parameter
+    if (this.objArgs?.key) {
+      keyResolver = this.objArgs.key;
+    }
+
+    // No args - auto-infer from parent config item key
+    if (!this.arrArgs || this.arrArgs.length === 0) {
+      instanceId = '_default';
+      const parent = (this as any).parent;
+      const itemKey = parent?.key || '';
+      if (!itemKey) {
+        throw new SchemaError('Could not infer parameter name - no parent config item key found', {
+          tip: 'Either provide a parameter name as an argument, or ensure this is used within a config item',
+        });
+      }
+      // Use item key as-is (AWS allows underscores and mixed case)
+      inferredParamName = itemKey;
+    } else if (this.arrArgs.length === 1) {
+      instanceId = '_default';
+      parameterNameResolver = this.arrArgs[0];
+    } else if (this.arrArgs.length === 2) {
+      if (!(this.arrArgs[0].isStatic)) {
+        throw new SchemaError('Expected instance id to be a static value');
+      } else {
+        instanceId = String(this.arrArgs[0].staticValue);
+      }
+      parameterNameResolver = this.arrArgs[1];
+    } else {
+      throw new SchemaError('Expected 0, 1, or 2 args');
+    }
+
+    if (!Object.values(pluginInstances).length) {
+      throw new SchemaError('No AWS plugin instances found', {
+        tip: 'Initialize at least one AWS plugin instance using the @initAws root decorator',
+      });
+    }
+
+    // Make sure instance id is valid
+    const selectedInstance = pluginInstances[instanceId];
+    if (!selectedInstance) {
+      if (instanceId === '_default') {
+        throw new SchemaError('AWS plugin instance (without id) not found', {
+          tip: [
+            'Either remove the `id` param from your @initAws call',
+            'or use `awsParam(id, parameterName)` to select an instance by id.',
+            `Possible ids are: ${Object.keys(pluginInstances).join(', ')}`,
+          ].join('\n'),
+        });
+      } else {
+        throw new SchemaError(`AWS plugin instance id "${instanceId}" not found`, {
+          tip: [`Valid ids are: ${Object.keys(pluginInstances).join(', ')}`].join('\n'),
+        });
+      }
+    }
+
+    return {
+      instanceId, parameterNameResolver, inferredParamName, keyResolver,
+    };
+  },
+  async resolve({
+    instanceId, parameterNameResolver, inferredParamName, keyResolver,
+  }) {
+    const selectedInstance = pluginInstances[instanceId];
+
+    let paramNameWithKey: string;
+    if (inferredParamName) {
+      paramNameWithKey = inferredParamName;
+    } else if (parameterNameResolver) {
+      const paramName = await parameterNameResolver.resolve();
+      if (typeof paramName !== 'string') {
+        throw new SchemaError('Expected parameter name to resolve to a string');
+      }
+      paramNameWithKey = paramName;
+    } else {
+      throw new SchemaError('No parameter name provided or inferred');
+    }
+
+    // Parse the parameter name for JSON key extraction (using # syntax)
+    let parameterName: string;
+    let jsonKey: string | undefined;
+    const hashIndex = paramNameWithKey.indexOf('#');
+    if (hashIndex !== -1) {
+      parameterName = paramNameWithKey.substring(0, hashIndex);
+      jsonKey = paramNameWithKey.substring(hashIndex + 1);
+    } else {
+      parameterName = paramNameWithKey;
+    }
+
+    // Named 'key' parameter takes precedence over # syntax
+    if (keyResolver) {
+      const keyValue = await keyResolver.resolve();
+      if (typeof keyValue !== 'string') {
+        throw new SchemaError('Expected key parameter to resolve to a string');
+      }
+      jsonKey = keyValue;
+    }
+
+    // Apply namePrefix
+    const finalParameterName = selectedInstance.applyNamePrefix(parameterName);
+
+    // check cache if cacheTtl is configured and cache is available
+    if (selectedInstance.cacheTtl !== undefined && pluginCache) {
+      // store the full parameter payload, then apply jsonKey extraction per lookup.
+      // This avoids cache collisions between awsParam("x#foo") and awsParam("x#bar").
+      const cacheKey = `awsParam:${instanceId}:${selectedInstance.cacheKeyIdentity}:${finalParameterName}`;
+      const fullParameterValue = await pluginCache.getOrSet(
+        cacheKey,
+        selectedInstance.cacheTtl,
+        async () => await selectedInstance.getParameter(finalParameterName),
+      );
+      if (typeof fullParameterValue !== 'string') {
+        throw new ResolutionError('Cached AWS parameter value has unexpected type (expected string)');
+      }
+      return selectedInstance.extractJsonKeyFromParameter(fullParameterValue, jsonKey);
+    }
+
+    const parameterValue = await selectedInstance.getParameter(finalParameterName, jsonKey);
+    return parameterValue;
+  },
+});
+
+// Anonymous, non-sensitive usage signals. Strictly sanitized before send.
+plugin.registerTelemetryAttributes(() => {
+  const instances = Object.values(pluginInstances);
+  const authMethods = new Set(instances.map((i) => i.telemetryAuthMethod));
+  return {
+    // standard attributes
+    instance_count: instances.length,
+    cache_enabled: instances.some((i) => i.cacheTtl != null),
+    // custom attributes
+    auth_access_key: authMethods.has('access_key'),
+    auth_oidc: authMethods.has('oidc'),
+    auth_profile: authMethods.has('profile'),
+    auth_default_chain: authMethods.has('default_chain'),
+    uses_secrets_manager: usedSecretsManager,
+    uses_parameter_store: usedParameterStore,
+  };
+});

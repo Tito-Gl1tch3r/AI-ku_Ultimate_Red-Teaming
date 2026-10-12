@@ -1,0 +1,679 @@
+"""The case-data guard blocks only real damage to case records.
+
+The PreToolUse hook gated on a TOOL_NAME env var Claude Code never sets and
+read the wrong payload field, so it never blocked anything. Now it blocks
+deleting or overwriting the protected case data (records, audit/, evidence
+files, case and cases roots) and allows everything else: other files,
+reports/, filing into evidence/, moving unprotected files into DELETE/.
+
+The real script runs with the documented payload. The cases directory is
+outside /tmp (the old guard allowed everything under /tmp/).
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+HOOK = (
+    Path(__file__).parent.parent.parent
+    / "claude-code"
+    / "shared"
+    / "hooks"
+    / "case-data-guard.sh"
+)
+SETTINGS = (
+    Path(__file__).parent.parent.parent / "claude-code" / "full" / "settings.json"
+)
+
+
+@pytest.fixture
+def box(tmp_path):
+    """A cases tree outside /tmp (VHIR_CASES_DIR) and scratch files outside it."""
+    if not os.access("/var/tmp", os.W_OK):
+        pytest.skip("needs a writable /var/tmp (cases must sit outside /tmp)")
+    root = Path(tempfile.mkdtemp(dir="/var/tmp", prefix="guard-"))
+    cases = root / "cases"
+    case = cases / "INC-1"
+    for d in (
+        "audit",
+        "evidence",
+        "reports/old",
+        "DELETE",
+        ".outputs",
+        "extractions",
+        "work",
+    ):
+        (case / d).mkdir(parents=True)
+    for f in (
+        "findings.json",
+        "timeline.json",
+        "approvals.jsonl",
+        "iocs.json",
+        "evidence.json",
+        "evidence-verified.json",
+        "todos.json",
+        "CASE.yaml",
+        "notes.txt",
+        "audit/forensic-mcp.jsonl",
+        "evidence/disk.E01",
+        "reports/draft.md",
+        "reports/a.tmp",
+        ".outputs/x",
+        "extractions/y",
+        "work/scratch.txt",
+        "actions.jsonl",
+        "pending-reviews.json",
+        "evidence/unregistered-notes.txt",
+    ):
+        (case / f).write_text("x\n")
+    (cases / "notes.md").write_text("x\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "x").write_text("x\n")
+    (out / "new.E01").write_text("x\n")
+    yield root, cases, case, out
+    shutil.rmtree(root)
+
+
+def run(box, cwd, cmd, timeout=30):
+    root, cases, case, out = box
+    payload = {
+        "session_id": "s",
+        "cwd": str(cwd),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd, "description": "d"},
+        "tool_use_id": "t",
+    }
+    return subprocess.run(
+        ["bash", str(HOOK)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+        env={"HOME": str(root), "PATH": "/usr/bin:/bin", "VHIR_CASES_DIR": str(cases)},
+        timeout=timeout,
+    )
+
+
+# (expected exit, label, cwd key, command template). {C} case, {CS} cases root, {O} outside.
+BLOCK = [
+    ("rm record", "C", "rm {C}/findings.json"),
+    ("rm -f record", "C", "rm -f {C}/timeline.json"),
+    ("rm -rf case root", "O", "rm -rf {C}"),
+    ("rmdir cases root", "O", "rmdir {CS}"),
+    ("mv record away", "C", "mv {C}/approvals.jsonl {O}/a"),
+    ("mv over record", "C", "mv {O}/x {C}/findings.json"),
+    ("find -delete in case", "C", "find {C} -name x -delete"),
+    ("redirect > record", "C", "echo x > {C}/findings.json"),
+    ("redirect >> record", "C", "echo x >> {C}/approvals.jsonl"),
+    ("truncate record", "C", "truncate -s 0 {C}/iocs.json"),
+    ("cp over record", "C", "cp {O}/x {C}/evidence.json"),
+    ("redirect > verified record", "C", "echo x > {C}/evidence-verified.json"),
+    ("rm verified record", "O", "rm {C}/evidence-verified.json"),
+    ("sudo rm", "C", "sudo rm {C}/todos.json"),
+    ("env prefix rm", "C", "env FOO=1 rm {C}/CASE.yaml"),
+    ("assign prefix rm", "C", "FOO=1 rm {C}/CASE.yaml"),
+    ("chain && 2nd seg", "C", "cd {O} && rm {C}/findings.json"),
+    ("chain ; 2nd seg", "C", "true; rm {C}/findings.json"),
+    ("pipe 2nd seg", "C", "echo | rm {C}/findings.json"),
+    ("newline 2nd line", "C", "echo hi\nrm {C}/findings.json"),
+    ("rm -rf audit/", "C", "rm -rf {C}/audit"),
+    ("rm evidence file", "C", "rm {C}/evidence/disk.E01"),
+    ("mv evidence rename", "C", "mv {C}/evidence/disk.E01 {C}/evidence/b.E01"),
+    ("cp over evidence", "C", "cp {O}/x {C}/evidence/disk.E01"),
+    ("quoted path", "C", 'rm "{C}/findings.json"'),
+    ("glob in case root", "C", "rm {C}/*.json"),
+    ("relative, cwd=case", "C", "rm findings.json"),
+    ("cd case && rel rm", "O", "cd {C} && rm findings.json"),
+    ("/bin/rm abs cmd", "C", "/bin/rm {C}/findings.json"),
+    ("unlink record", "C", "unlink {C}/findings.json"),
+    ("ancestor ..", "C", "rm -rf {C}/reports/.."),
+    ("rm -rf case/* (glob)", "C", "rm -rf {C}/*"),
+    ("rm actions.jsonl", "C", "rm {C}/actions.jsonl"),
+    ("rm pending-reviews.json", "C", "rm {C}/pending-reviews.json"),
+    ("rm unregistered evidence file", "C", "rm {C}/evidence/unregistered-notes.txt"),
+    ("rm -rf non-empty evidence/", "C", "rm -rf {C}/evidence"),
+    ("shred record", "C", "shred {C}/findings.json"),
+    ("sudo -u root rm", "C", "sudo -u root rm {C}/findings.json"),
+    ("nice -n 5 rm", "C", "nice -n 5 rm {C}/findings.json"),
+    ("timeout 5 rm", "C", "timeout 5 rm {C}/findings.json"),
+    ("if-then rm", "C", "if true; then rm {C}/findings.json; fi"),
+    ("brace group rm", "C", "{{ rm {C}/findings.json; }}"),
+    ("mv -t dir record", "C", "mv -t {O} {C}/findings.json"),
+    ("mv --target-directory=", "C", "mv --target-directory={O} {C}/findings.json"),
+    # Decision 9 (Steve: block): protected data can't be moved into DELETE/
+    ("mv record into DELETE/", "C", "mv {C}/findings.json {C}/DELETE/"),
+    (
+        "mv audit file into DELETE/",
+        "C",
+        "mv {C}/audit/forensic-mcp.jsonl {C}/DELETE/",
+    ),
+    ("mv evidence file into DELETE/", "C", "mv {C}/evidence/disk.E01 {C}/DELETE/"),
+    (
+        "two-step via DELETE/",
+        "C",
+        "mv {C}/findings.json {C}/DELETE/ && rm {C}/DELETE/findings.json",
+    ),
+    ("find group -delete", "C", "find {C} \\( -name x -o -name y \\) -delete"),
+    ("subshell rm", "C", "(rm {C}/findings.json)"),
+    ("find with two roots", "C", "find {O} {C} -name x -delete"),
+    ("backslash-newline rm", "C", "rm \\\n{C}/findings.json"),
+    ("&& at a line end", "C", "true &&\nrm {C}/findings.json"),
+    ("; at a line end", "C", "true;\nrm {C}/findings.json"),
+    ("blank line between", "C", "echo hi\n\nrm {C}/findings.json"),
+    ("quoted newline, then a redirect", "C", 'echo "a\nb" > "{C}/findings.json"'),
+    ("quoted newline in an rm word", "C", 'rm -f "notes\n" {C}/findings.json'),
+    ("find -L root", "O", "find -L {C} -delete"),
+    ("find -O3 -D tree root", "O", "find -O3 -D tree {C} -name x -exec rm {{}} +"),
+    ("rm inside $(...)", "C", "echo $(rm {C}/findings.json)"),
+    ("rm inside x=$(...)", "C", "x=$( rm {C}/findings.json )"),
+    ("cp -rT onto a case", "C", "cp -rT {O} {C}"),
+    ("redirect onto a glob", "C", "echo x > {C}/finding?.json"),
+    # Accepted, disclosed over-blocks (decision 8)
+    ("over-block: find case -delete", "C", "find {C} -name '*.tmp' -delete"),
+    (
+        "over-block: heredoc body",
+        "C",
+        "cat > {C}/reports/r.md <<'EOF'\nrm {C}/findings.json\nEOF",
+    ),
+]
+ALLOW = [
+    ("glob no-match in case root", "C", "rm -f {C}/*.tmp"),
+    ("cp FROM record (read)", "C", "cp {C}/findings.json {O}/f.json"),
+    ("cp -r FROM evidence", "C", "cp -r {C}/evidence {O}/ev"),
+    ("pipe read | jq", "C", "cat {C}/findings.json | jq ."),
+    ("redirect tool out to reports", "C", "python3 x.py > {C}/reports/out.txt 2>&1"),
+    ("rm -rf .outputs/*", "C", "rm -rf {C}/.outputs/*"),
+    (
+        "mkdir && mv into reports",
+        "C",
+        "mkdir -p {C}/reports/x && mv {O}/x {C}/reports/x/",
+    ),
+    ("rename in reports", "C", "mv {C}/reports/draft.md {C}/reports/final.md"),
+    ("tar case out", "C", "tar czf {O}/c.tgz {C}"),
+    ("find reports -delete", "C", "find {C}/reports -name '*.tmp' -delete"),
+    ("mv into DELETE/", "C", "mv {C}/notes.txt {C}/DELETE/notes.txt"),
+    ("mv report into DELETE/", "C", "mv {C}/reports/draft.md {C}/DELETE/"),
+    ("file into evidence/", "C", "mv {O}/new.E01 {C}/evidence/new.E01"),
+    ("cp into evidence/ dir", "C", "cp {O}/new.E01 {C}/evidence/"),
+    ("rm in reports/", "C", "rm {C}/reports/draft.md"),
+    ("rm -rf reports/old", "C", "rm -rf {C}/reports/old"),
+    ("glob in reports/", "C", "rm -f {C}/reports/*.tmp"),
+    ("redirect into reports/", "C", "echo x > {C}/reports/r.md"),
+    ("rm .outputs", "C", "rm {C}/.outputs/x"),
+    ("rm extractions", "C", "rm -rf {C}/extractions/y"),
+    ("read record", "C", "cat {C}/findings.json"),
+    ("rm outside cases", "C", "rm {O}/x"),
+    ("record name outside cases", "C", "echo '{{}}' > {O}/findings.json"),
+    ("rm non-record in case root", "C", "rm {C}/notes.txt"),
+    ("rm in work/", "C", "rm {C}/work/scratch.txt"),
+    ("rm a file beside the cases", "C", "rm {CS}/notes.md"),
+    (
+        "quoted arg mentioning record",
+        "C",
+        'grep "rm {C}/findings.json" {C}/reports/draft.md',
+    ),
+    ("quoted multi-line text mentioning rm", "C", 'echo "x\nrm {C}/findings.json"'),
+    ("find -L elsewhere", "C", "find -L {C}/reports -name x -delete"),
+    ("$(...) reading a record", "C", "echo $(cat {C}/findings.json)"),
+    # Disclosed as not seen: a # comment hides the rest of the command
+    (
+        "not seen: a command after a comment line",
+        "C",
+        "# tidy up\nrm {C}/findings.json",
+    ),
+    (
+        "not seen: an operand after $(...) in a word",
+        "C",
+        "rm x$(true) {C}/findings.json",
+    ),
+]
+
+
+def _fill(box, cwd_key, template):
+    root, cases, case, out = box
+    cmd = template.format(C=case, CS=cases, O=out)
+    return (case if cwd_key == "C" else out), cmd
+
+
+@pytest.mark.parametrize("label,cwd_key,template", BLOCK, ids=[r[0] for r in BLOCK])
+def test_blocks_damage_to_case_data(box, label, cwd_key, template):
+    cwd, cmd = _fill(box, cwd_key, template)
+    p = run(box, cwd, cmd)
+    assert p.returncode == 2, (cmd, p.stdout, p.stderr)  # E: exactly 2
+    assert p.stdout == "" and "BLOCKED" in p.stderr  # S: the reason on stderr only
+    assert "couldn't read" not in p.stderr  # its own reason, not the fail-closed one
+    assert "vhir case delete" not in p.stderr
+
+
+@pytest.mark.parametrize("label,cwd_key,template", ALLOW, ids=[r[0] for r in ALLOW])
+def test_allows_everything_else(box, label, cwd_key, template):
+    cwd, cmd = _fill(box, cwd_key, template)
+    p = run(box, cwd, cmd)
+    assert p.returncode == 0 and p.stdout == "" and p.stderr == "", (cmd, p.stderr)
+
+
+def test_x_the_command_is_never_executed(box):
+    root, cases, case, out = box
+    canary = out / "CANARY"
+    for cmd in (
+        f"echo $(>{canary})",
+        f"rm `>{canary}` x",
+        f"mv {case}/a{{,$(>{canary})}} {out}",
+    ):
+        run(box, case, cmd)
+        assert not canary.exists(), cmd
+
+
+def _wide(out):
+    """A small tree whose deep globs match astronomically many paths."""
+    w = out / "wide"
+    w.mkdir()
+    for i in range(12):
+        (w / f"l{i:02d}").symlink_to(".")
+    return w
+
+
+def test_t_a_pathological_glob_still_blocks_within_5_seconds(box):
+    root, cases, case, out = box
+    w = _wide(out)
+    t0 = time.monotonic()
+    p = run(box, case, f"rm {w}/*/*/*/*/*/* {case}/findings.json", timeout=60)
+    assert p.returncode == 2 and time.monotonic() - t0 < 5
+
+
+def test_the_cap_cannot_hide_a_record(box):
+    """`rm <case>/*` where the record comes after the guard's 2000-match cap
+    in directory order (the order glob yields)."""
+    root, cases, case, out = box
+    t2 = cases / "INC-T2"
+    t2.mkdir()
+    (t2 / "findings.json").write_text("x\n")
+    n = 0
+    while [e.name for e in os.scandir(t2)].index("findings.json") <= 2000:
+        if n >= 100_000:
+            pytest.skip("can't place the record beyond the cap on this filesystem")
+        for i in range(n, n + 5000):
+            (t2 / f"note{i:06d}.txt").touch()
+        n += 5000
+    t0 = time.monotonic()
+    p = run(box, t2, f"rm {t2}/*")
+    assert p.returncode == 2 and time.monotonic() - t0 < 5
+
+
+def test_anchor_a_large_glob_in_outputs_is_allowed(box):
+    root, cases, case, out = box
+    for i in range(5000):
+        (case / ".outputs" / f"o{i:05d}").touch()
+    t0 = time.monotonic()
+    p = run(box, case, f"rm -rf {case}/.outputs/*")
+    assert p.returncode == 0 and time.monotonic() - t0 < 5
+
+
+def test_d_the_settings_entry_still_runs_this_script():
+    entries = json.loads(SETTINGS.read_text())["hooks"]["PreToolUse"]
+    commands = [h["command"] for e in entries for h in e.get("hooks", [])]
+    assert any(c.endswith("/case-data-guard.sh") for c in commands)
+    assert os.access(HOOK, os.X_OK) and "TOOL_NAME" not in HOOK.read_text()
+
+
+def test_a_module_planted_in_the_cwd_is_not_imported(box):
+    root, cases, case, out = box
+    canary = out / "PLANTED"
+    for mod in ("shlex", "json", "glob"):
+        (case / f"{mod}.py").write_text(
+            f"open({str(canary)!r}, 'w').close()\nraise SystemExit(1)\n"
+        )
+    p = run(box, case, f"rm {case}/findings.json")
+    assert p.returncode == 2 and not canary.exists()
+
+
+# Fail closed: input the guard can't read, or an error of its own, blocks.
+def _raw(box, stdin):
+    root, cases, case, out = box
+    return subprocess.run(
+        ["bash", str(HOOK)],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        cwd=case,
+        env={"HOME": str(root), "PATH": "/usr/bin:/bin", "VHIR_CASES_DIR": str(cases)},
+        timeout=30,
+    )
+
+
+def _payload(**kw):
+    return json.dumps({"session_id": "s", "tool_name": "Bash", **kw})
+
+
+UNREADABLE = [
+    ("unparseable JSON", "{not json"),
+    ("empty stdin", ""),
+    ("a JSON list", "[]"),
+    ("no tool_input", _payload()),
+    ("tool_input a string", _payload(tool_input="rm findings.json")),
+    ("tool_input null", _payload(tool_input=None)),
+    ("no command", _payload(tool_input={"description": "d"})),
+    ("command null", _payload(tool_input={"command": None})),
+    ("command a number", _payload(tool_input={"command": 5})),
+    ("command a list", _payload(tool_input={"command": ["rm", "findings.json"]})),
+    # an error inside the check itself (os.path.join on a non-string cwd)
+    ("an unexpected error", _payload(tool_input={"command": "rm x"}, cwd=5)),
+]
+
+
+@pytest.mark.parametrize("label,stdin", UNREADABLE, ids=[r[0] for r in UNREADABLE])
+def test_input_the_guard_cannot_read_is_blocked(box, label, stdin):
+    p = _raw(box, stdin)
+    assert p.returncode == 2 and p.stdout == "", (label, p.stderr)
+    assert "couldn't read this command, so it was blocked" in p.stderr
+    assert "Traceback" not in p.stderr
+
+
+def test_anchor_an_empty_command_is_read_and_allowed(box):
+    p = _raw(box, _payload(tool_input={"command": ""}))
+    assert p.returncode == 0 and p.stderr == ""
+
+
+def test_without_python3_the_guard_blocks(box, tmp_path):
+    root, cases, case, out = box
+    bin_dir = tmp_path / "no-python"
+    bin_dir.mkdir()
+    (bin_dir / "cat").symlink_to(shutil.which("cat"))  # the script's own heredoc
+    p = subprocess.run(
+        ["/bin/bash", str(HOOK)],
+        input=_payload(tool_input={"command": "ls"}),
+        capture_output=True,
+        text=True,
+        cwd=case,
+        env={"HOME": str(root), "PATH": str(bin_dir), "VHIR_CASES_DIR": str(cases)},
+        timeout=30,
+    )
+    assert p.returncode == 2, p.stderr
+    assert "couldn't run, so it was blocked" in p.stderr
+
+
+def test_without_cat_the_script_is_empty_and_the_guard_blocks(box, tmp_path):
+    root, cases, case, out = box
+    bin_dir = tmp_path / "no-cat"
+    bin_dir.mkdir()
+    (bin_dir / "python3").symlink_to(shutil.which("python3"))
+    p = subprocess.run(
+        ["/bin/bash", str(HOOK)],
+        input=_payload(tool_input={"command": "ls"}),
+        capture_output=True,
+        text=True,
+        cwd=case,
+        env={"HOME": str(root), "PATH": str(bin_dir), "VHIR_CASES_DIR": str(cases)},
+        timeout=30,
+    )
+    assert p.returncode == 2, p.stderr
+    assert "couldn't run, so it was blocked" in p.stderr
+
+
+def test_a_python_that_cannot_start_blocks(box):
+    root, cases, case, out = box
+    p = subprocess.run(  # too little memory for the interpreter to initialise
+        ["/bin/bash", "-c", f"ulimit -v 12000; exec /bin/bash {HOOK}"],
+        input=_payload(tool_input={"command": "ls"}),
+        capture_output=True,
+        text=True,
+        cwd=case,
+        env={"HOME": str(root), "PATH": "/usr/bin:/bin", "VHIR_CASES_DIR": str(cases)},
+        timeout=30,
+    )
+    assert p.returncode == 2, p.stderr
+    assert "couldn't run, so it was blocked" in p.stderr
+
+
+# --- Empty folders, new files in evidence/, ~ destinations, find over a glob ---
+
+
+@pytest.fixture
+def more(box):
+    """The box plus an empty folder, two non-case folders and a case with no records."""
+    root, cases, case, out = box
+    (cases / "staging").mkdir()
+    (cases / "records-no-case-yaml").mkdir()
+    (cases / "records-no-case-yaml" / "findings.json").write_text("x\n")
+    (cases / "not-a-case").mkdir()
+    (cases / "not-a-case" / "file.txt").write_text("x\n")
+    second = cases / "INC-2"
+    (second / "evidence").mkdir(parents=True)
+    (second / "CASE.yaml").write_text("x\n")
+    (out / "findings.json").write_text("x\n")
+    (out / "disk.E01").write_text("x\n")
+    return box, second
+
+
+def _run_more(more, cwd_key, template):
+    box, second = more
+    root, cases, case, out = box
+    cmd = template.format(C=case, SECOND=second, CS=cases, O=out)
+    return run(box, {"C": case, "CS": cases, "O": out}[cwd_key], cmd)
+
+
+MORE_ALLOW = [
+    ("rmdir of an empty folder under the cases root", "O", "rmdir {CS}/staging"),
+    ("rmdir of an empty folder, cwd the cases root", "CS", "rmdir staging"),
+    ("rmdir of an empty folder spelled with ~", "O", "rmdir ~/cases/staging"),
+    ("rm -rf of an empty folder under the cases root", "O", "rm -rf {CS}/staging"),
+    ("mv of an empty folder out of the cases root", "O", "mv {CS}/staging {O}/st"),
+    ("> creates a new file in evidence/", "C", "echo hi > {C}/evidence/newfile.txt"),
+    (">> creates a new file in evidence/", "C", "echo hi >> {C}/evidence/newlog.txt"),
+    (
+        "> creates a new evidence file by ~ path",
+        "O",
+        "echo hi > ~/cases/INC-1/evidence/new2.txt",
+    ),
+    (
+        "> creates the first file in an empty evidence/",
+        "C",
+        "echo hi > {SECOND}/evidence/first.txt",
+    ),
+    ("cp into a case root by ~ path", "O", "cp {O}/x ~/cases/INC-1/"),
+    ("cp into evidence/ by ~ path", "O", "cp {O}/new.E01 ~/cases/INC-1/evidence/"),
+    (
+        "cp into evidence by ~ path, no trailing slash",
+        "O",
+        "cp {O}/new.E01 ~/cases/INC-1/evidence",
+    ),
+    ("mv into evidence/ by ~ path", "O", "mv {O}/new.E01 ~/cases/INC-1/evidence/"),
+    (
+        "find over a glob of reports/ with -delete",
+        "C",
+        "find {C}/reports/* -name '*.tmp' -delete",
+    ),
+    (
+        "find over two roots that hold no case data",
+        "O",
+        "find {O}/x {C}/reports/* -name '*.tmp' -delete",
+    ),
+]
+MORE_BLOCK = [
+    (
+        "rm -rf of a folder holding a record but no CASE.yaml",
+        "O",
+        "rm -rf {CS}/records-no-case-yaml",
+    ),
+    (
+        "rm -rf of a non-empty folder under the cases root",
+        "O",
+        "rm -rf {CS}/not-a-case",
+    ),
+    ("> onto an existing evidence file", "C", "echo x > {C}/evidence/disk.E01"),
+    (">> onto an existing evidence file", "C", "echo x >> {C}/evidence/disk.E01"),
+    ("> creating a record that is absent", "C", "echo x > {SECOND}/findings.json"),
+    (
+        "cp a record into a case root by ~ path",
+        "O",
+        "cp {O}/findings.json ~/cases/INC-1/",
+    ),
+    (
+        "cp over an evidence file by ~ path",
+        "O",
+        "cp {O}/disk.E01 ~/cases/INC-1/evidence/",
+    ),
+    (
+        "cp -t a record into a case root by ~ path",
+        "O",
+        "cp -t ~/cases/INC-1/ {O}/findings.json",
+    ),
+    ("find over a glob of a case with -delete", "O", "find {C}/* -delete"),
+    (
+        "find over a glob of a case, -name and -delete",
+        "O",
+        "find {C}/* -name '*.json' -delete",
+    ),
+    (
+        "find over a glob of a case with -exec rm",
+        "O",
+        "find {C}/* -name '*.json' -exec rm {{}} +",
+    ),
+    (
+        "find over a glob of the cases root with -delete",
+        "O",
+        "find {CS}/* -name x -delete",
+    ),
+    (
+        "find with a second root that is a glob of a case",
+        "O",
+        "find {O}/x {C}/* -delete",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,cwd_key,template", MORE_ALLOW, ids=[r[0] for r in MORE_ALLOW]
+)
+def test_allows_empty_folders_new_evidence_and_tilde_destinations(
+    more, label, cwd_key, template
+):
+    p = _run_more(more, cwd_key, template)
+    assert p.returncode == 0 and p.stdout == "" and p.stderr == "", (template, p.stderr)
+
+
+@pytest.mark.parametrize(
+    "label,cwd_key,template", MORE_BLOCK, ids=[r[0] for r in MORE_BLOCK]
+)
+def test_blocks_records_existing_evidence_and_find_over_globs(
+    more, label, cwd_key, template
+):
+    p = _run_more(more, cwd_key, template)
+    assert p.returncode == 2, (template, p.stdout, p.stderr)
+    assert p.stdout == "" and "BLOCKED" in p.stderr
+
+
+# --- / and the directories above the cases root ---
+
+
+@pytest.fixture
+def above(box):
+    """The box plus files in its home (the box root, which holds the cases root)."""
+    root, cases, case, out = box
+    (root / "scratch" / "x").mkdir(parents=True)
+    (root / "a").write_text("x\n")
+    (root / "case").mkdir()  # its name is a prefix of "cases"; it isn't above it
+    return box
+
+
+def _run_above(above, template):
+    root, cases, case, out = above
+    return run(above, out, template.format(CS=cases, O=out))
+
+
+ABOVE_BLOCK = [
+    ("rm -rf of home, which holds the cases root", "rm -rf ~"),
+    ("rm -rf of home with a trailing slash", "rm -rf ~/"),
+    ("rm -rf of the directory above home", "rm -rf ~/.."),
+    ("rm -rf of /", "rm -rf /"),
+    ("rm -rf of everything under /", "rm -rf /*"),
+    ("rm -rf of the cases root's parent spelled with ..", "rm -rf {CS}/.."),
+    ("rm -rf .. from a folder in home", "cd ~/scratch && rm -rf .."),
+    ("mv of home elsewhere", "mv ~ /tmp/x"),
+    ("cp -rT onto home", "cp -rT x ~"),
+    ("find from home with -delete", "find ~ -name findings.json -delete"),
+    ("find from / with -exec rm", "find / -name '*.json' -exec rm {{}} +"),
+    ("sudo rm -rf of home", "sudo rm -rf ~"),
+    ("sudo rm -rf of /", "sudo rm -rf /"),
+    ("sudo mv of home elsewhere", "sudo mv ~ /tmp/x"),
+    ("sudo cp -rT onto home", "sudo cp -rT x ~"),
+    # Accepted over-block: find's predicates aren't evaluated, as for a case root
+    (
+        "over-block: find from home with -exec grep",
+        "find ~ -name '*.py' -exec grep -l x {{}} +",
+    ),
+]
+ABOVE_ALLOW = [
+    ("rm -rf of a folder in home, outside the cases root", "rm -rf ~/scratch/x"),
+    ("ls of home", "ls ~"),
+    ("cd to home", "cd ~ && ls -la"),
+    ("rename a file in home", "mv ~/a ~/b"),
+    ("find from home without -delete or -exec", "find ~ -name x"),
+    ("find from / without -delete or -exec", "find / -name x -print"),
+    ("cp of a file into home", "cp {O}/x ~/"),
+    ("rm -rf of a folder whose name is a prefix of the cases folder", "rm -rf ~/case"),
+    ("grep -r over home", "grep -r foo ~"),
+    ("find -delete under a folder in home", "find ~/scratch -name '*.tmp' -delete"),
+    ("du of home", "du -sh ~"),
+    ("tar of home into a file outside", "tar czf {O}/home.tgz ~"),
+    ("cp -r of home to a folder outside", "cp -r ~ {O}/home-copy"),
+    ("stat of home", "stat ~"),
+    ("sudo ls of /", "sudo ls /"),
+]
+
+
+@pytest.mark.parametrize("label,template", ABOVE_BLOCK, ids=[r[0] for r in ABOVE_BLOCK])
+def test_blocks_slash_and_directories_above_the_cases_root(above, label, template):
+    p = _run_above(above, template)
+    assert p.returncode == 2, (template, p.stdout, p.stderr)
+    assert p.stdout == "" and "BLOCKED" in p.stderr and "couldn't" not in p.stderr
+
+
+@pytest.mark.parametrize("label,template", ABOVE_ALLOW, ids=[r[0] for r in ABOVE_ALLOW])
+def test_allows_other_work_in_home_and_reads_from_above(above, label, template):
+    p = _run_above(above, template)
+    assert p.returncode == 0 and p.stdout == "" and p.stderr == "", (template, p.stderr)
+
+
+@pytest.fixture
+def deeper(box):
+    """The box with a second cases root two folders down in home."""
+    root, cases, case, out = box
+    deep = root / "work" / "team" / "cases"
+    (deep / "INC-2" / "audit").mkdir(parents=True)
+    (deep / "INC-2" / "findings.json").write_text("[]\n")
+    (root / "work" / "other").mkdir()
+    return (root, deep, deep / "INC-2", out)
+
+
+@pytest.mark.parametrize(
+    "expect,template",
+    [
+        (2, "rm -rf ~/work"),
+        (2, "rm -rf ~/work/team"),
+        (2, "mv ~/work /tmp/w"),
+        (2, "find ~/work -name findings.json -delete"),
+        (0, "rm -rf ~/work/other"),
+        (0, "ls ~/work/team"),
+    ],
+    ids=[
+        "rm -rf two folders above the cases root",
+        "rm -rf of the cases root's parent",
+        "mv of a folder above the cases root",
+        "find -delete from a folder above the cases root",
+        "rm -rf of a sibling folder",
+        "ls of the cases root's parent",
+    ],
+)
+def test_a_deeper_cases_root_protects_each_folder_above_it(deeper, expect, template):
+    root, cases, case, out = deeper
+    p = run(deeper, out, template)
+    assert p.returncode == expect, (template, p.stdout, p.stderr)

@@ -1,0 +1,271 @@
+import { createStore } from 'vuex';
+
+import Utils from './components/utils/utils';
+import { parseRoles } from '@common/vueFilters.js';
+
+const store = createStore({
+  state: {
+    esHealth: undefined,
+    esHealthError: undefined,
+    user: undefined,
+    views: undefined,
+    remoteclusters: undefined,
+    esCluster: {
+      availableCluster: {
+        active: [],
+        inactive: []
+      },
+      selectedCluster: []
+    },
+    fieldsArr: [],
+    fieldsMap: {}, // NOTE: this has duplicate fields where dbField and dbField2 are different
+    fieldsAliasMap: {},
+    fieldhistory: [],
+    // eslint-disable-next-line no-undef
+    timeRange: DEFAULT_TIME_RANGE ?? 1,
+    expression: undefined,
+    time: {
+      startTime: undefined,
+      stopTime: undefined
+    },
+    hideViz: false,
+    stickyViz: false,
+    fetchGraphData: false,
+    disabledAggregations: false,
+    forcedAggregations: false,
+    showMaps: true,
+    showToolBars: true,
+    mapSrc: true,
+    mapDst: true,
+    xffGeo: false,
+    graphType: undefined,
+    seriesType: undefined,
+    focusSearch: undefined,
+    issueSearch: undefined,
+    focusTimeRange: undefined,
+    shiftKeyHold: false,
+    responseTime: undefined,
+    sessionsTableState: undefined,
+    loadingData: false,
+    sorts: [['firstPacket', 'desc']],
+    sortsParam: 'firstPacket:desc',
+    stickySessionsBtn: false,
+    showCapStartTimes: true,
+    capStartTimes: [{ nodeName: 'none', startTime: 1 }],
+    roles: [],
+    fieldActions: {},
+    notifiers: [],
+    sessionDetailDLWidth: 160,
+    sessionDetailCols: localStorage.getItem('sessionDetailCols') || 2,
+    userSettingDefaults: {}
+  },
+  getters: {
+    sessionsTableState (state) {
+      if (!state.sessionsTableState.order) {
+        state.sessionsTableState = Utils.getDefaultTableState();
+      }
+      return state.sessionsTableState;
+    },
+    getFieldActions (state) {
+      return state.fieldActions;
+    }
+  },
+  mutations: {
+    setTimeRange (state, value) {
+      state.timeRange = value.toString();
+    },
+    setTime (state, value) {
+      if (value.startTime !== undefined) {
+        state.time.startTime = value.startTime.toString();
+      }
+      if (value.stopTime !== undefined) {
+        state.time.stopTime = value.stopTime.toString();
+      }
+    },
+    setExpression (state, value) {
+      state.expression = value;
+    },
+    addToExpression (state, value) {
+      let newExpr = '';
+
+      if (!state.expression) { state.expression = ''; }
+
+      if (state.expression && state.expression !== '') {
+        if (state.expression[state.expression.length - 1] !== ' ') {
+          // if last char is not a space, add it
+          newExpr += ' ';
+        }
+        newExpr += (value.op || '&&') + ' ';
+      }
+
+      newExpr += value.expression;
+
+      state.expression += newExpr;
+    },
+    clearExpression (state) {
+      state.expression = undefined;
+    },
+    toggleStickyViz (state, value) {
+      state.stickyViz = value;
+    },
+    toggleHideViz (state, value) {
+      state.hideViz = value;
+    },
+    setFetchGraphData (state, value) {
+      state.fetchGraphData = value;
+    },
+    toggleMaps (state, value) {
+      state.showMaps = value;
+    },
+    toggleToolBars (state) {
+      state.showToolBars = !state.showToolBars;
+    },
+    toggleMapSrc (state, value) {
+      state.mapSrc = value;
+    },
+    toggleMapDst (state, value) {
+      state.mapDst = value;
+    },
+    toggleMapXffGeo (state, value) {
+      state.xffGeo = value;
+    },
+    updateGraphType (state, value) {
+      state.graphType = value;
+    },
+    updateSeriesType (state, value) {
+      state.seriesType = value;
+    },
+    setFocusSearch (state, value) {
+      state.focusSearch = value;
+      setTimeout(() => { state.focusSearch = false; });
+    },
+    setIssueSearch (state, value) {
+      state.issueSearch = value;
+      setTimeout(() => { state.issueSearch = false; });
+    },
+    setFocusTimeRange (state, value) {
+      state.focusTimeRange = value;
+      setTimeout(() => { state.focusTimeRange = false; });
+    },
+    setShiftKeyHold (state, value) {
+      state.shiftKeyHold = value;
+    },
+    setUser (state, value) {
+      state.user = value;
+    },
+    setUserSettings (state, value) {
+      state.user.settings = value;
+    },
+    setResponseTime (state, value) {
+      state.responseTime = value;
+    },
+    setSessionsTableState (state, value) {
+      state.sessionsTableState = value;
+    },
+    setViews (state, value) {
+      state.views = value;
+    },
+    addView (state, value) {
+      state.views.push(value);
+    },
+    setLoadingData (state, value) {
+      state.loadingData = value;
+    },
+    setSorts (state, value) {
+      state.sorts = value;
+
+      state.sortsParam = '';
+
+      if (!Array.isArray(value)) {
+        state.sortsParam = value;
+        return;
+      }
+
+      // combine sort field and sort order into one string
+      // because server takes one param
+      for (let i = 0, len = value.length; i < len; ++i) {
+        const item = value[i];
+        state.sortsParam += item[0] + ':' + item[1];
+        if (i < len - 1) { state.sortsParam += ','; }
+      }
+    },
+    setAvailableCluster (state, value) {
+      state.esCluster.availableCluster = value;
+    },
+    setSelectedCluster (state, value) {
+      state.esCluster.selectedCluster = value;
+    },
+    setStickySessionsBtn (state, value) {
+      state.stickySessionsBtn = value;
+    },
+    setShowCapStartTimes (state, value) {
+      state.showCapStartTimes = value;
+    },
+    setCapStartTimes (state, value) {
+      state.capStartTimes = value;
+    },
+    setESHealth (state, value) {
+      state.esHealth = value;
+    },
+    setESHealthError (state, value) {
+      state.esHealthError = value;
+    },
+    setAppInfo (state, value) {
+      state.esHealth = value.esHealth;
+      state.esHealthError = value.esHealthError;
+      state.user = value.user;
+      state.views = value.views;
+      state.fieldsArr = value.fieldsArr;
+      state.remoteclusters = value.remoteclusters;
+      state.fieldhistory = value.fieldhistory.fields || [];
+      state.esCluster.availableCluster = value.clusters;
+      state.userSettingDefaults = value.userSettingDefaults;
+      state.roles = parseRoles(value.roles);
+
+      // fieldsMap has keys for these fields: dbField, dbField2, fieldECS, and exp (id/key)
+      // fieldsAliasMap has keys for field aliases
+      // noFacet fields (search-only variants like payload8.src.utf8) must not
+      // claim the db field keys over the field that matches the stored data
+      const setDbKey = (key, field) => {
+        if (key === undefined) { return; }
+        if (!state.fieldsMap[key] || !field.noFacet) {
+          state.fieldsMap[key] = field;
+        }
+      };
+      for (const key in value.fieldsMap) {
+        const field = value.fieldsMap[key];
+        state.fieldsMap[field.exp] = field;
+        setDbKey(field.dbField, field);
+        setDbKey(field.dbField2, field);
+        setDbKey(field.fieldECS, field);
+        (field.aliases || []).forEach((alias) => {
+          state.fieldsAliasMap[alias] = field;
+        });
+      }
+    },
+    setRoles (state, value) {
+      state.roles = value;
+    },
+    setDisabledAggregations (state, value) {
+      state.disabledAggregations = value;
+    },
+    setForcedAggregations (state, value) {
+      state.forcedAggregations = value;
+    },
+    setFieldActions (state, value) {
+      state.fieldActions = value;
+    },
+    setNotifiers (state, value) {
+      state.notifiers = value;
+    },
+    setSessionDetailDLWidth (state, value) {
+      state.sessionDetailDLWidth = value;
+    },
+    setSessionDetailCols (state, value) {
+      state.sessionDetailCols = value;
+      localStorage.setItem('sessionDetailCols', value);
+    }
+  }
+});
+
+export default store;

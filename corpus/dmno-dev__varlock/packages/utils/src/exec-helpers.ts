@@ -1,0 +1,76 @@
+import { spawn, exec, type SpawnOptions } from 'node:child_process';
+import { promisify } from 'node:util';
+
+export class ExecError extends Error {
+  constructor(
+    readonly exitCode: number,
+    readonly signal: NodeJS.Signals | null,
+    readonly data: string = 'command gave no output',
+  ) {
+    super(data);
+  }
+}
+
+export function spawnAsyncHelper(
+  command: string,
+  args: Array<string>,
+  spawnOptions?: SpawnOptions,
+) {
+  const childProcess = spawn(command, args, spawnOptions || {});
+
+  const deferred = new Promise<string>((resolve, reject) => {
+    let stdoutData: string = '';
+    let stderrData: string = '';
+    childProcess.stdout?.on('data', (data) => {
+      stdoutData += data.toString();
+    });
+    childProcess.stderr?.on('data', (data) => {
+      stderrData += data.toString();
+    });
+    childProcess.stdout?.on('error', (err) => {
+      reject(err);
+    });
+    childProcess.stderr?.on('error', (err) => {
+      reject(err);
+    });
+    childProcess.on('error', (err) => {
+      reject(err);
+    });
+    childProcess.on('exit', (exitCode, signal) => {
+      // A child killed by a signal exits with a null code, so only an explicit 0 counts as
+      // success. Otherwise whatever partial stdout arrived before the kill would be returned.
+      if (exitCode === 0) {
+        resolve(stdoutData);
+      } else {
+        reject(new ExecError(
+          exitCode ?? 1,
+          signal,
+          stderrData || (signal ? `command terminated by ${signal}` : ''),
+        ));
+      }
+    });
+  });
+
+  return { childProcess, execResult: deferred };
+}
+
+export async function spawnAsync(
+  command: string,
+  args: Array<string>,
+  opts?: SpawnOptions & { input?: string },
+) {
+  const { input, ...spawnOpts } = opts ?? {};
+  const { childProcess, execResult } = spawnAsyncHelper(command, args, spawnOpts);
+  if (input !== undefined && childProcess.stdin) {
+    // A child that exits before reading its input (bad args, wrong cwd, ...) closes the pipe
+    // mid-write. Without a listener that EPIPE is an unhandled error event rather than a
+    // rejection, so it takes down the process. The exit code and stderr are the real signal
+    // here, and `execResult` already carries both.
+    childProcess.stdin.on('error', () => { /* swallowed on purpose - see above */ });
+    childProcess.stdin.write(input);
+    childProcess.stdin.end();
+  }
+  return execResult;
+}
+
+export const asyncExec = promisify(exec);

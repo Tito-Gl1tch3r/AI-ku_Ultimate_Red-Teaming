@@ -1,0 +1,435 @@
+import { spawn, type ChildProcess } from 'node:child_process';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import type { DevServerScenario, DevServerResult, DevServerRequestResult } from './types.js';
+
+const VERBOSE = !!process.env.FRAMEWORK_TEST_VERBOSE;
+const URL_PATTERN = /https?:\/\/(?:localhost|127\.0\.0\.1):\d+/;
+// Strips all ANSI escape sequences: SGR (colors), CSI (cursor/erase), OSC (titles), etc.
+// eslint-disable-next-line no-control-regex
+const ANSI_PATTERN = /[\x1b\x9b][[(]?[0-9;?]*(?:[0-9A-ORZcf-nqry=><~]|#[0-9])/g;
+
+/**
+ * Gracefully kill a child process: SIGTERM first, SIGKILL after 3s.
+ */
+function killProcess(child: ChildProcess): Promise<void> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.killed) {
+      resolve();
+      return;
+    }
+
+    const forceKillTimer = setTimeout(() => {
+      // SIGKILL the process group to ensure grandchildren (spawned via shell) are killed
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch { /* already dead */ }
+      }
+      child.kill('SIGKILL');
+    }, 3_000);
+
+    child.on('close', () => {
+      clearTimeout(forceKillTimer);
+      resolve();
+    });
+
+    // Kill the process group (negative pid) so shell-spawned children also get the signal
+    if (child.pid) {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch { /* already dead */ }
+    } else {
+      child.kill('SIGTERM');
+    }
+  });
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => {
+  setTimeout(r, ms);
+});
+
+/**
+ * A client-side abort (`AbortSignal.timeout`) means the server never answered - the
+ * request hung. Anything else is the connection itself failing, which is what a killed
+ * response looks like to the client.
+ */
+function classifyRequestFailure(err: unknown): 'network' | 'timeout' {
+  const name = (err as { name?: string } | undefined)?.name;
+  return name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'network';
+}
+
+/**
+ * Fetch a URL with retries (server may report ready before accepting connections).
+ *
+ * A 503 is also retried, since dev servers serve one while (re)building rather than
+ * holding the connection - Nuxt's restart, for example, logs its build steps before
+ * the app is renderable again, so a request fired on that banner lands on the
+ * "loading" response. Callers that actually expect a 503 opt out.
+ */
+async function fetchWithRetry(
+  url: string,
+  opts: {
+    retries?: number,
+    delayMs?: number,
+    timeoutMs?: number,
+    /** retry while the server answers 503 (default true) */
+    retryWhileUnavailable?: boolean,
+    /** how long to keep retrying a 503 before returning it */
+    unavailableTimeoutMs?: number,
+  } = {},
+): Promise<DevServerRequestResult> {
+  const {
+    // `retries: 0` means a single attempt with no retry sleeps, for requests whose
+    // expected outcome is a failure
+    retries = 3, delayMs = 500, timeoutMs = 15_000,
+    retryWhileUnavailable = true, unavailableTimeoutMs = 30_000,
+  } = opts;
+
+  const attempt = async () => {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const body = await resp.text();
+    return { status: resp.status, body, headers: Object.fromEntries(resp.headers.entries()) };
+  };
+
+  const unavailableDeadline = Date.now() + unavailableTimeoutMs;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const result = await attempt();
+      if (result.status !== 503 || !retryWhileUnavailable) return result;
+      // still building, keep polling (this does not consume a connection retry)
+      while (Date.now() < unavailableDeadline) {
+        await sleep(delayMs);
+        const retried = await attempt();
+        if (retried.status !== 503) return retried;
+      }
+      return result;
+    } catch {
+      if (i < retries - 1) await sleep(delayMs);
+    }
+  }
+  // final attempt — let it throw
+  return attempt();
+}
+
+/**
+ * Wait for a pattern in stdout/stderr that indicates the server is ready.
+ * Returns the extracted server URL, or undefined if timed out.
+ */
+function waitForReady(
+  child: ChildProcess,
+  stdoutChunks: Array<string>,
+  stderrChunks: Array<string>,
+  pattern: string | RegExp,
+  timeout: number,
+): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const regex = typeof pattern === 'string' ? new RegExp(pattern) : pattern;
+    let resolved = false;
+    function done(url: string | undefined) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer); // eslint-disable-line no-use-before-define
+      // clean up listeners to avoid accumulation across scenarios
+      child.stdout?.removeListener('data', onStdout); // eslint-disable-line no-use-before-define
+      child.stderr?.removeListener('data', onStderr); // eslint-disable-line no-use-before-define
+      child.removeListener('close', onClose); // eslint-disable-line no-use-before-define
+      resolve(url);
+    }
+
+    function checkReady() {
+      // strip ANSI codes so ready patterns aren't broken by color sequences
+      const combined = [...stdoutChunks, ...stderrChunks].join('').replace(ANSI_PATTERN, '');
+      if (regex.test(combined)) {
+        const urlMatch = combined.match(URL_PATTERN);
+        done(urlMatch ? urlMatch[0] : undefined);
+      }
+    }
+
+    const onStdout = () => checkReady();
+    const onStderr = () => checkReady();
+    const onClose = () => done(undefined);
+
+    child.stdout?.on('data', onStdout);
+    child.stderr?.on('data', onStderr);
+    child.on('close', onClose);
+
+    const timer = setTimeout(() => done(undefined), timeout);
+  });
+}
+
+/**
+ * Wait for the ready pattern to appear in NEW output (after a given chunk offset).
+ * Used after file edits to detect that the dev server has restarted.
+ *
+ * `matched` is reported separately from `url` because a restart banner does not
+ * always repeat the server URL - Nuxt, for example, prints the `Local:` line only
+ * on first boot and just re-logs its build steps on restart. Callers keep the URL
+ * they already have when a match carries none.
+ */
+function waitForNewReady(
+  child: ChildProcess,
+  stdoutChunks: Array<string>,
+  stderrChunks: Array<string>,
+  stdoutOffset: number,
+  stderrOffset: number,
+  pattern: string | RegExp,
+  timeout: number,
+): Promise<{ matched: boolean, url?: string }> {
+  return new Promise((resolve) => {
+    const regex = typeof pattern === 'string' ? new RegExp(pattern) : pattern;
+    let resolved = false;
+    function done(matched: boolean, url?: string) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer); // eslint-disable-line no-use-before-define
+      child.stdout?.removeListener('data', onData); // eslint-disable-line no-use-before-define
+      child.stderr?.removeListener('data', onData); // eslint-disable-line no-use-before-define
+      child.removeListener('close', onClose); // eslint-disable-line no-use-before-define
+      resolve({ matched, url });
+    }
+
+    function checkNewOutput() {
+      // only look at output produced after the edit, stripping ANSI codes
+      const newOut = (stdoutChunks.slice(stdoutOffset).join('')
+        + stderrChunks.slice(stderrOffset).join('')).replace(ANSI_PATTERN, '');
+      if (regex.test(newOut)) {
+        const urlMatch = newOut.match(URL_PATTERN);
+        done(true, urlMatch ? urlMatch[0] : undefined);
+      }
+    }
+
+    const onData = () => checkNewOutput();
+    const onClose = () => done(false);
+
+    child.stdout?.on('data', onData);
+    child.stderr?.on('data', onData);
+    child.on('close', onClose);
+
+    const timer = setTimeout(() => done(false), timeout);
+  });
+}
+
+/**
+ * Spawn a dev server, wait for it to be ready, run HTTP requests, then shut it down.
+ * Supports mid-run file edits: if a request has `fileEdits`, files are written and
+ * the runner waits for the server's readyPattern to reappear before making the request.
+ */
+export async function runDevServer(
+  cwd: string,
+  command: string,
+  scenario: DevServerScenario,
+): Promise<DevServerResult> {
+  const readyTimeout = scenario.readyTimeout ?? 30_000;
+  const log = (msg: string) => {
+    if (VERBOSE) console.error(`[dev-server] ${msg}`);
+  };
+  const logError = (msg: string) => console.error(`[dev-server] ${msg}`);
+
+  const stdoutChunks: Array<string> = [];
+  const stderrChunks: Array<string> = [];
+
+  const spawnEnv = {
+    ...process.env,
+    // Dev servers should run in development mode, not vitest's test mode
+    NODE_ENV: 'development',
+    COREPACK_ENABLE_STRICT: '0',
+    COREPACK_ENABLE_PROJECT_SPEC: '0',
+    WRANGLER_SEND_METRICS: 'false',
+    VARLOCK_DEBUG: '1',
+    // Astro v7 auto-backgrounds `astro dev` when it detects an agentic/CI
+    // environment, which detaches the server's output (and emits JSON logs) so
+    // the harness can't monitor stdout. Setting this env var (any value — astro
+    // only checks presence) disables that auto-detection; `0` is the form astro
+    // documents and reads correctly as "background off".
+    ASTRO_DEV_BACKGROUND: '0',
+    ...scenario.env,
+  };
+
+  // The harness runs under vitest, so process.env carries VITEST / VITEST_* vars
+  // plus a generic TEST=true. Both make dev servers behave differently:
+  //  - Astro v7's dev server plugin (vite-plugin-astro-server) bails out of mounting
+  //    its SSR request handler when it sees process.env.VITEST — an escape hatch for
+  //    Astro's own vitest suite — which makes every SSR route 404 ("Cannot GET").
+  //  - `TEST` is what std-env's `isTest` reads, and consola drops its log level to
+  //    `warn` when that is set. Nuxt's CLI logs everything through consola at info
+  //    level, so the server starts and serves requests but emits no output at all:
+  //    the ready pattern never matches and the scenario times out silently.
+  // Strip these so the spawned dev server doesn't think it's running under vitest.
+  for (const key of Object.keys(spawnEnv)) {
+    if (key === 'VITEST' || key.startsWith('VITEST_') || key === 'TEST') {
+      delete (spawnEnv as Record<string, string | undefined>)[key];
+    }
+  }
+  log(`Spawning: ${command}`);
+  let child: ChildProcess;
+  try {
+    child = spawn(command, {
+      cwd,
+      shell: true,
+      detached: true,
+      env: spawnEnv,
+    });
+  } catch (err) {
+    logError(`Failed to spawn: ${(err as Error).message}`);
+    return {
+      success: false,
+      stdout: '',
+      stderr: '',
+      responses: [],
+      error: `Failed to spawn: ${(err as Error).message}`,
+    };
+  }
+
+  log(`Spawned pid=${child.pid}`);
+
+  child.stdout?.on('data', (data) => stdoutChunks.push(data.toString()));
+  child.stderr?.on('data', (data) => stderrChunks.push(data.toString()));
+  child.on('close', (code, signal) => {
+    log(`Process closed: code=${code}, signal=${signal}`);
+  });
+
+  const getStdout = () => stdoutChunks.join('');
+  const getStderr = () => stderrChunks.join('');
+  const dumpOutput = () => {
+    const stdout = getStdout();
+    const stderr = getStderr();
+    logError(`Process status: exitCode=${child.exitCode}, killed=${child.killed}`);
+    if (stdout) logError(`STDOUT:\n${stdout.slice(-2000)}`);
+    if (stderr) logError(`STDERR:\n${stderr.slice(-2000)}`);
+    if (!stdout && !stderr) logError('No output received from process at all');
+  };
+
+  // safety net: kill child on process exit
+  const exitHandler = () => {
+    child.kill('SIGKILL');
+  };
+  process.on('exit', exitHandler);
+
+  try {
+    log(`Waiting for ready pattern (timeout=${readyTimeout}ms)...`);
+    let currentUrl = await waitForReady(child, stdoutChunks, stderrChunks, scenario.readyPattern, readyTimeout);
+    if (!currentUrl) {
+      logError(`Timeout waiting for ready pattern. Command: ${command}`);
+      dumpOutput();
+      return {
+        success: false,
+        stdout: getStdout(),
+        stderr: getStderr(),
+        responses: [],
+        error: `Server did not become ready within ${readyTimeout}ms`,
+      };
+    }
+
+    log(`Server ready at ${currentUrl}`);
+
+    const responses: Array<DevServerRequestResult> = [];
+    for (let i = 0; i < scenario.requests.length; i++) {
+      const req = scenario.requests[i];
+
+      // if this request has file edits, apply them and wait for the server to process them
+      if (req.fileEdits) {
+        const stdoutOffsetBefore = stdoutChunks.length;
+        const stderrOffsetBefore = stderrChunks.length;
+
+        for (const [filePath, content] of Object.entries(req.fileEdits)) {
+          const fullPath = join(cwd, filePath);
+          mkdirSync(dirname(fullPath), { recursive: true });
+          writeFileSync(fullPath, content);
+        }
+
+        if (req.fileEditDelay) {
+          // Fixed delay — used for in-place reloads / HMR where the server doesn't restart
+          log(`File edits applied, waiting ${req.fileEditDelay}ms for reload...`);
+          await new Promise<void>((r) => {
+            setTimeout(r, req.fileEditDelay);
+          });
+        } else {
+          log('File edits applied, waiting for server restart...');
+          const restarted = await waitForNewReady(
+            child,
+            stdoutChunks,
+            stderrChunks,
+            stdoutOffsetBefore,
+            stderrOffsetBefore,
+            scenario.readyPattern,
+            readyTimeout,
+          );
+          if (!restarted.matched) {
+            logError('Server did not restart after file edit');
+            dumpOutput();
+            return {
+              success: false,
+              stdout: getStdout(),
+              stderr: getStderr(),
+              responses,
+              error: 'Server did not become ready again after file edit',
+            };
+          }
+          // Update URL in case the port changed (e.g. when using --port 0). A
+          // restart banner that doesn't repeat the URL keeps the existing one.
+          if (restarted.url) currentUrl = restarted.url;
+          log(`Server restarted at ${currentUrl}`);
+        }
+      }
+
+      const url = `${currentUrl}${req.path}`;
+      log(`Request ${i + 1}/${scenario.requests.length}: GET ${url}`);
+      try {
+        const result = await fetchWithRetry(url, {
+          retryWhileUnavailable: req.expectedStatus !== 503,
+          // a request that is expected to fail gets one attempt: retrying it only buys
+          // `delayMs` of sleeping per retry on the path where the test passes, and a
+          // shorter timeout bounds the wait if a hang regression puts one back
+          ...req.expectedFailure ? { timeoutMs: 5_000, retries: 0 } : {},
+        });
+        log(`Response: status=${result.status}, body=${result.body.length} bytes`);
+        responses.push(result);
+      } catch (err) {
+        if (req.allowRequestFailure || req.expectedFailure) {
+          // e.g. runtime leak detection kills the response mid-stream — record a
+          // synthetic result so scenario/log assertions can still run, keeping the
+          // kind of failure so `expectedFailure` can tell a reset from a hang
+          const failure = classifyRequestFailure(err);
+          log(`Request failed (allowed, ${failure}): ${(err as Error).message}`);
+          responses.push({
+            status: 0, body: '', headers: {}, failure,
+          });
+          continue;
+        }
+        logError(`Request failed: ${(err as Error).message}`);
+        dumpOutput();
+        throw err;
+      }
+    }
+
+    // allow time for any async output (e.g. worker console.log piped through
+    // varlock-wrangler's rewriteOutput) to flush before we kill the process
+    await new Promise<void>((r) => {
+      setTimeout(r, 500);
+    });
+
+    log('All requests completed successfully');
+    return {
+      success: true,
+      stdout: getStdout(),
+      stderr: getStderr(),
+      responses,
+      serverUrl: currentUrl,
+    };
+  } catch (err) {
+    logError(`Error: ${(err as Error).message}`);
+    return {
+      success: false,
+      stdout: getStdout(),
+      stderr: getStderr(),
+      responses: [],
+      error: (err as Error).message,
+    };
+  } finally {
+    log('Killing dev server...');
+    process.removeListener('exit', exitHandler);
+    await killProcess(child);
+    log('Dev server killed');
+  }
+}

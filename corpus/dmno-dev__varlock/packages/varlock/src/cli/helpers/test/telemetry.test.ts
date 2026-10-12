@@ -1,0 +1,160 @@
+import {
+  describe, it, expect, vi, beforeEach,
+} from 'vitest';
+
+vi.mock('../js-package-manager-utils', () => ({
+  detectJsPackageManager: vi.fn(),
+}));
+
+import { detectJsPackageManager } from '../js-package-manager-utils';
+import {
+  getJsPackageManagerForTelemetry, normalizeGitRemoteUrl, getProjectSlugFromCi, bucketGitHost,
+  checkIsOptedOutViaEnv,
+} from '../telemetry';
+
+describe('getJsPackageManagerForTelemetry', () => {
+  beforeEach(() => {
+    vi.mocked(detectJsPackageManager).mockReset();
+  });
+
+  it('returns the detected package manager name', () => {
+    vi.mocked(detectJsPackageManager).mockReturnValue({
+      name: 'pnpm',
+      lockfiles: ['pnpm-lock.yaml'],
+      add: 'pnpm add',
+      exec: 'pnpm exec',
+      dlx: 'pnpm dlx',
+    });
+
+    expect(getJsPackageManagerForTelemetry()).toBe('pnpm');
+  });
+
+  it('returns null when no package manager is detected', () => {
+    vi.mocked(detectJsPackageManager).mockReturnValue(undefined);
+    expect(getJsPackageManagerForTelemetry()).toBeNull();
+  });
+});
+
+describe('normalizeGitRemoteUrl', () => {
+  it('collapses http/ssh/scp/git clone variants to the same canonical value', () => {
+    const variants = [
+      'git@github.com:owner/repo.git',
+      'git@github.com:owner/repo',
+      'ssh://git@github.com/owner/repo.git',
+      'ssh://git@github.com:22/owner/repo.git',
+      'https://github.com/owner/repo.git',
+      'https://github.com/owner/repo',
+      'http://github.com/owner/repo.git',
+      'https://user:token@github.com/owner/repo.git',
+      'git://github.com/owner/repo.git',
+      'https://github.com/owner/repo/',
+      'https://GitHub.com/Owner/Repo.git',
+    ];
+    for (const v of variants) {
+      expect(normalizeGitRemoteUrl(v), v).toBe('github.com/owner/repo');
+    }
+  });
+
+  it('keeps host distinct so same owner/repo on different hosts do not collide', () => {
+    expect(normalizeGitRemoteUrl('git@gitlab.com:owner/repo.git')).toBe('gitlab.com/owner/repo');
+    expect(normalizeGitRemoteUrl('https://bitbucket.org/owner/repo.git')).toBe('bitbucket.org/owner/repo');
+  });
+
+  it('preserves nested groups (e.g. gitlab subgroups)', () => {
+    expect(normalizeGitRemoteUrl('git@gitlab.com:group/subgroup/repo.git'))
+      .toBe('gitlab.com/group/subgroup/repo');
+    expect(normalizeGitRemoteUrl('https://gitlab.com/group/subgroup/repo.git'))
+      .toBe('gitlab.com/group/subgroup/repo');
+  });
+
+  it('returns undefined for unparseable or empty input', () => {
+    expect(normalizeGitRemoteUrl('')).toBeUndefined();
+    expect(normalizeGitRemoteUrl('   ')).toBeUndefined();
+    expect(normalizeGitRemoteUrl('not-a-url')).toBeUndefined();
+    expect(normalizeGitRemoteUrl('https://github.com')).toBeUndefined();
+  });
+});
+
+describe('bucketGitHost', () => {
+  it('emits well-known public hosts verbatim', () => {
+    expect(bucketGitHost('github.com')).toBe('github.com');
+    expect(bucketGitHost('gitlab.com')).toBe('gitlab.com');
+    expect(bucketGitHost('bitbucket.org')).toBe('bitbucket.org');
+  });
+
+  it('buckets self-hosted / internal hosts so a private hostname is never emitted', () => {
+    expect(bucketGitHost('github.acme-corp.com')).toBe('self-hosted'); // GitHub Enterprise
+    expect(bucketGitHost('gitlab.internal.example')).toBe('self-hosted');
+    expect(bucketGitHost('git.acme.io')).toBe('self-hosted');
+  });
+
+  it('returns null for empty input', () => {
+    expect(bucketGitHost(null)).toBeNull();
+    expect(bucketGitHost(undefined)).toBeNull();
+    expect(bucketGitHost('')).toBeNull();
+  });
+});
+
+describe('checkIsOptedOutViaEnv', () => {
+  it('opts out when DO_NOT_TRACK is set', () => {
+    // `1` is the canonical value from the DO_NOT_TRACK spec
+    expect(checkIsOptedOutViaEnv({ DO_NOT_TRACK: '1' })).toBe(true);
+    // and we accept the same true-ish values as our own env var
+    expect(checkIsOptedOutViaEnv({ DO_NOT_TRACK: 'true' })).toBe(true);
+    expect(checkIsOptedOutViaEnv({ DO_NOT_TRACK: 'TRUE' })).toBe(true);
+    expect(checkIsOptedOutViaEnv({ DO_NOT_TRACK: 't' })).toBe(true);
+  });
+
+  it('does not opt out when DO_NOT_TRACK is unset or not true-ish', () => {
+    expect(checkIsOptedOutViaEnv({})).toBe(false);
+    expect(checkIsOptedOutViaEnv({ DO_NOT_TRACK: '0' })).toBe(false);
+    expect(checkIsOptedOutViaEnv({ DO_NOT_TRACK: '' })).toBe(false);
+    expect(checkIsOptedOutViaEnv({ DO_NOT_TRACK: 'false' })).toBe(false);
+  });
+
+  it('still opts out via VARLOCK_TELEMETRY_DISABLED', () => {
+    expect(checkIsOptedOutViaEnv({ VARLOCK_TELEMETRY_DISABLED: '1' })).toBe(true);
+    expect(checkIsOptedOutViaEnv({ VARLOCK_TELEMETRY_DISABLED: 'true' })).toBe(true);
+    expect(checkIsOptedOutViaEnv({ VARLOCK_TELEMETRY_DISABLED: 't' })).toBe(true);
+    expect(checkIsOptedOutViaEnv({ VARLOCK_TELEMETRY_DISABLED: '0' })).toBe(false);
+  });
+
+  it('still opts out via the legacy PH_OPT_OUT var, which only matches "true"', () => {
+    expect(checkIsOptedOutViaEnv({ PH_OPT_OUT: 'true' })).toBe(true);
+    expect(checkIsOptedOutViaEnv({ PH_OPT_OUT: '1' })).toBe(false);
+  });
+});
+
+describe('getProjectSlugFromCi', () => {
+  it('resolves GitHub Actions repo slug', () => {
+    expect(getProjectSlugFromCi({ GITHUB_REPOSITORY: 'Owner/Repo' })).toBe('github.com/owner/repo');
+  });
+
+  it('honors GITHUB_SERVER_URL for GitHub Enterprise', () => {
+    expect(getProjectSlugFromCi({
+      GITHUB_REPOSITORY: 'owner/repo',
+      GITHUB_SERVER_URL: 'https://github.acme.com',
+    })).toBe('github.acme.com/owner/repo');
+  });
+
+  it('resolves GitLab CI slug incl. subgroups', () => {
+    expect(getProjectSlugFromCi({
+      CI_SERVER_HOST: 'gitlab.com',
+      CI_PROJECT_PATH: 'group/subgroup/repo',
+    })).toBe('gitlab.com/group/subgroup/repo');
+  });
+
+  it('resolves Bitbucket Pipelines slug', () => {
+    expect(getProjectSlugFromCi({ BITBUCKET_REPO_FULL_NAME: 'workspace/repo' }))
+      .toBe('bitbucket.org/workspace/repo');
+  });
+
+  it('matches normalizeGitRemoteUrl output for the same repo (CI vs local clone)', () => {
+    expect(getProjectSlugFromCi({ GITHUB_REPOSITORY: 'owner/repo' }))
+      .toBe(normalizeGitRemoteUrl('git@github.com:owner/repo.git'));
+  });
+
+  it('returns undefined when no CI repo vars are present', () => {
+    expect(getProjectSlugFromCi({})).toBeUndefined();
+  });
+});

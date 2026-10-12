@@ -1,0 +1,669 @@
+import fsSync from 'node:fs';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { isValid as semverIsValid, satisfies as semverSatisfies } from 'verkit';
+import {
+  parseEnvSpecDotEnvFile,
+  ParsedEnvSpecFile,
+  ParsedEnvSpecDecorator,
+  ParsedEnvSpecFunctionArgs,
+  ParsedEnvSpecStaticValue,
+  ParsedEnvSpecKeyValuePair,
+} from '@env-spec/parser';
+import { tryCatch } from '@env-spec/utils/try-catch';
+import { pathExists } from '@env-spec/utils/fs-utils';
+import { checkIsFileGitIgnored } from '@env-spec/utils/git-utils';
+import { downloadPluginToCache } from '../env-graph/lib/plugins';
+import { getWindowsPathHint } from '../env-graph/lib/path-hints';
+
+/**
+ * `varlock flatten` support - copies every env file reachable via @import into a
+ * self-contained output directory and rewrites the @import paths, so a single
+ * package can be deployed (e.g. into a Docker image) without the rest of the
+ * monorepo being present at runtime.
+ *
+ * Layout of the output dir:
+ * - files inside the package keep their package-relative position at the output root
+ * - files outside the package mirror their position under `.env-imports/`, relative to
+ *   the deepest directory containing the package and everything being copied
+ *
+ * That base directory is derived from the import graph itself, so any path that
+ * resolves on disk can be flattened - there is no workspace/repo boundary involved.
+ * Imported files must live in a subdirectory rather than at the output root, since the
+ * output root is auto-scanned by the loader and they would load twice.
+ *
+ * Because both mappings preserve directory structure, relative imports between
+ * two copied files stay valid, and rewrites are simple relative-path math.
+ *
+ * Values are never resolved and plugins are never executed - this is a purely
+ * structural transform. Files that need no rewrites are copied byte-for-byte.
+ */
+
+const IMPORTS_DIR_NAME = '.env-imports';
+const PLUGINS_DIR_NAME = '.env-plugins';
+
+export class FlattenError extends Error {}
+
+export type FlattenResult = {
+  outDir: string;
+  /** files written to the output dir (absolute src -> absolute dest) */
+  copiedFiles: Array<{ src: string, dest: string }>;
+  /** local (gitignored-style) env files that were skipped */
+  skippedLocalFiles: Array<string>;
+  /** npm plugins that had their version pinned in rewritten files (auto-installed at runtime) */
+  pinnedPlugins: Array<{ moduleName: string, version: string, filePath: string }>;
+  /** npm plugins that were downloaded and vendored into the output dir (--vendor-plugins) */
+  vendoredPlugins: Array<{ moduleName: string, version: string, dest: string }>;
+  warnings: Array<string>;
+};
+
+export type FlattenOptions = {
+  /** the package directory whose env files are being flattened (defaults to cwd) */
+  packageDir: string;
+  /** output directory, relative to packageDir unless absolute (default `.env-flat`) */
+  outDir?: string;
+  /** include .env.local / .env.*.local files (default false - they usually hold machine-local secrets) */
+  includeLocal?: boolean;
+  /**
+   * Copy npm `@plugin()` packages into the output dir, rewriting the declarations to local
+   * paths. Makes the artifact fully self-contained: no runtime npm fetch, and works in
+   * shell-less/offline/distroless runtimes. Prefers the copy already installed in node_modules
+   * (no network); only downloads from npm when a plugin is not installed locally. When false
+   * (default), npm plugins are only version-pinned for runtime auto-install.
+   */
+  vendorPlugins?: boolean;
+};
+
+/** stable, filesystem-safe directory name for a vendored plugin (e.g. `varlock-infisical-plugin_2.1.0`) */
+function vendoredPluginDirName(moduleName: string, version: string) {
+  const safeName = moduleName.replaceAll('/', '-').replaceAll('@', '');
+  return `${safeName}_${version}`;
+}
+
+function isEnvFileName(name: string) {
+  return name === '.env' || name.startsWith('.env.');
+}
+function isLocalEnvFileName(name: string) {
+  return name === '.env.local' || (name.startsWith('.env.') && name.endsWith('.local'));
+}
+
+/** relative path in posix form (import paths always use forward slashes) */
+function relativeImportPath(fromDir: string, toPath: string) {
+  const rel = path.relative(fromDir, toPath).split(path.sep).join('/');
+  return (rel.startsWith('./') || rel.startsWith('../')) ? rel : `./${rel}`;
+}
+
+function getFnArgs(dec: ParsedEnvSpecDecorator) {
+  if (dec.isBareFnCall && dec.data.value instanceof ParsedEnvSpecFunctionArgs) {
+    return dec.data.value;
+  }
+}
+
+function getStaticKwarg(args: ParsedEnvSpecFunctionArgs, key: string) {
+  for (const val of args.values) {
+    if (val instanceof ParsedEnvSpecKeyValuePair && val.key === key) {
+      if (val.value instanceof ParsedEnvSpecStaticValue) return val.value.value;
+      return undefined; // dynamic (fn call) - value unknown at flatten time
+    }
+  }
+  return undefined;
+}
+
+function makeStaticPathValue(newPath: string, quote?: '"' | "'" | '`') {
+  if (quote) {
+    return new ParsedEnvSpecStaticValue({ rawValue: `${quote}${newPath}${quote}`, quote });
+  }
+  return new ParsedEnvSpecStaticValue({ rawValue: newPath });
+}
+
+/** walk up from `fromDir` looking for node_modules/<moduleName>, the same way node resolves */
+async function findInstalledPlugin(
+  moduleName: string,
+  fromDir: string,
+): Promise<{ version: string, dir: string } | undefined> {
+  let currentDir = fromDir;
+  while (currentDir) {
+    const pluginDir = path.join(currentDir, 'node_modules', moduleName);
+    const candidatePath = path.join(pluginDir, 'package.json');
+    if (await pathExists(candidatePath)) {
+      const packageJson = await tryCatch(
+        async () => JSON.parse(await fs.readFile(candidatePath, 'utf8')),
+        () => undefined,
+      );
+      if (packageJson?.version) return { version: packageJson.version as string, dir: pluginDir };
+    }
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) break;
+    currentDir = parentDir;
+  }
+  return undefined;
+}
+
+/**
+ * Walk up from `fromDir` looking for a git repo (`.git` is a directory normally, a file in a
+ * worktree or submodule). Only used to warn about copied files from outside the repo - the
+ * repo has no bearing on which files can be flattened or where they land in the output.
+ */
+async function findGitRoot(fromDir: string): Promise<string | undefined> {
+  let currentDir = fromDir;
+  while (currentDir) {
+    if (await pathExists(path.join(currentDir, '.git'))) return currentDir;
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) return undefined;
+    currentDir = parentDir;
+  }
+  return undefined;
+}
+
+/** deepest directory containing all of the given absolute paths */
+function commonAncestorDir(absPaths: Array<string>): string {
+  const fsRoot = path.parse(absPaths[0]).root;
+  let commonParts = absPaths[0].split(path.sep);
+  for (const absPath of absPaths.slice(1)) {
+    const parts = absPath.split(path.sep);
+    let i = 0;
+    while (i < commonParts.length && i < parts.length && commonParts[i] === parts[i]) i++;
+    commonParts = commonParts.slice(0, i);
+  }
+  const common = commonParts.join(path.sep);
+  // guards against posix `''` and windows `C:` (a drive-relative path, not the drive root)
+  return common.length >= fsRoot.length ? common : fsRoot;
+}
+
+/** an `@import()` found during discovery, resolved to an absolute path but not yet rewritten */
+type DiscoveredImport = {
+  args: ParsedEnvSpecFunctionArgs;
+  pathArg: ParsedEnvSpecStaticValue;
+  importPathStr: string;
+  isDirImport: boolean;
+  targetAbs: string;
+};
+
+/** an env file reached from the package, held in memory until output paths are known */
+type DiscoveredFile = {
+  srcAbs: string;
+  rawContents: string;
+  /** undefined when the file could not be parsed - it gets copied as-is */
+  parsedFile?: ParsedEnvSpecFile;
+  imports: Array<DiscoveredImport>;
+  pluginDecorators: Array<ParsedEnvSpecDecorator>;
+};
+
+export async function flattenEnvFiles(opts: FlattenOptions): Promise<FlattenResult> {
+  const packageDir = path.resolve(opts.packageDir);
+  const outDir = path.resolve(packageDir, opts.outDir || '.env-flat');
+  const includeLocal = !!opts.includeLocal;
+  const vendorPlugins = !!opts.vendorPlugins;
+
+  if (outDir === packageDir || packageDir.startsWith(outDir + path.sep)) {
+    throw new FlattenError('flatten output directory cannot contain the package directory');
+  }
+
+  const result: FlattenResult = {
+    outDir,
+    copiedFiles: [],
+    skippedLocalFiles: [],
+    pinnedPlugins: [],
+    vendoredPlugins: [],
+    warnings: [],
+  };
+
+  // dedupe downloads: `${moduleName}@${version}` -> absolute dest plugin dir
+  const vendoredPluginDirs = new Map<string, string>();
+
+  // every env file reached from the package, in discovery order (also breaks import cycles)
+  const discoveredFiles = new Map<string, DiscoveredFile>();
+  const discoveredDirs = new Set<string>();
+  // absolute paths outside the package that will be copied - they decide the mirror base dir
+  const externalSrcPaths = new Set<string>();
+  // local-path plugin sources already copied into the output
+  const copiedPluginSources = new Set<string>();
+  // dest -> src, to detect the (unlikely) case of two sources mapping to the same output path
+  const claimedDests = new Map<string, string>();
+
+  function relLabel(absPath: string) {
+    const rel = path.relative(packageDir, absPath);
+    return rel.startsWith('..') ? absPath : rel;
+  }
+
+  function isInsidePackage(srcAbs: string) {
+    const rel = path.relative(packageDir, srcAbs);
+    return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+  }
+
+  /** register a path that lives outside the package, so it is accounted for in the mirror base */
+  function noteExternalPath(srcAbs: string) {
+    if (!isInsidePackage(srcAbs)) externalSrcPaths.add(srcAbs);
+  }
+
+  /**
+   * Deepest directory containing the package and everything being copied. External files
+   * mirror their position relative to it, which keeps the mapping injective (so no two
+   * sources can collide) and preserves the relative layout between copied files.
+   * Only meaningful once discovery has finished - assigned before any output path is computed.
+   */
+  let importsBaseDir = packageDir;
+
+  /** maps a source path to its output location */
+  function getDestPath(srcAbs: string): string {
+    const relFromPackage = path.relative(packageDir, srcAbs);
+    if (relFromPackage && !relFromPackage.startsWith('..') && !path.isAbsolute(relFromPackage)) {
+      return path.join(outDir, relFromPackage);
+    }
+    const relFromBase = path.relative(importsBaseDir, srcAbs);
+    if (relFromBase.startsWith('..') || path.isAbsolute(relFromBase)) {
+      // only reachable when paths share no root at all (e.g. two windows drives)
+      throw new FlattenError(`cannot flatten "${srcAbs}" - it shares no parent directory with ${packageDir}`);
+    }
+    return path.join(outDir, IMPORTS_DIR_NAME, relFromBase);
+  }
+
+  function claimDest(destAbs: string, srcAbs: string) {
+    const existingClaim = claimedDests.get(destAbs);
+    if (existingClaim && existingClaim !== srcAbs) {
+      throw new FlattenError(
+        `flatten output collision: both "${existingClaim}" and "${srcAbs}" map to "${destAbs}"`,
+      );
+    }
+    claimedDests.set(destAbs, srcAbs);
+  }
+
+  /**
+   * Warn if a copied/vendored plugin package declares runtime `dependencies`. Those live in
+   * `node_modules` and do not travel with the copied package, so the plugin would fail to load
+   * from the flattened output. Plugins are expected to be self-contained (a single built file,
+   * or a package that bundles its dependencies). No-op for single-file plugins (no package.json).
+   */
+  async function warnIfUnbundledDeps(pkgDir: string, label: string) {
+    const pkgJson = await tryCatch(
+      async () => JSON.parse(await fs.readFile(path.join(pkgDir, 'package.json'), 'utf8')),
+      () => undefined,
+    );
+    if (pkgJson?.dependencies && Object.keys(pkgJson.dependencies).length) {
+      result.warnings.push(
+        `${label} declares runtime dependencies that are not bundled into the package - they will `
+        + 'be missing from the flattened copy. Plugins must be self-contained (a single built file, '
+        + 'or a package that bundles its dependencies).',
+      );
+    }
+  }
+
+  /** copy a local-path plugin source (single file or self-contained package dir) into the output */
+  async function copyPluginSource(pluginAbs: string, destAbs: string, label: string) {
+    if (copiedPluginSources.has(pluginAbs)) return;
+    copiedPluginSources.add(pluginAbs);
+    claimDest(destAbs, pluginAbs);
+    await fs.mkdir(path.dirname(destAbs), { recursive: true });
+    await fs.cp(pluginAbs, destAbs, { recursive: true, dereference: true });
+    await warnIfUnbundledDeps(destAbs, label);
+    result.copiedFiles.push({ src: pluginAbs, dest: destAbs });
+  }
+
+  /**
+   * Copy an npm plugin at an exact version into the output's plugins dir. Prefers the copy
+   * already installed in `node_modules` (`localDir`, no network); only downloads from npm when
+   * the plugin is not installed locally. Copies each module@version only once per run.
+   */
+  async function vendorNpmPlugin(moduleName: string, version: string, localDir?: string): Promise<string> {
+    const cacheKey = `${moduleName}@${version}`;
+    const cached = vendoredPluginDirs.get(cacheKey);
+    if (cached) return cached;
+
+    const destPluginDir = path.join(outDir, PLUGINS_DIR_NAME, vendoredPluginDirName(moduleName, version));
+    // dereference: the installed entry may be a symlink (pnpm store, workspace link) - copy the
+    // real files so the output stays self-contained. Falls back to downloading (native extract,
+    // no shell) when the plugin is not present in node_modules.
+    const sourceDir = localDir ?? await downloadPluginToCache(moduleName, version);
+    await fs.rm(destPluginDir, { recursive: true, force: true });
+    await fs.mkdir(path.dirname(destPluginDir), { recursive: true });
+    await fs.cp(sourceDir, destPluginDir, { recursive: true, dereference: true });
+
+    await warnIfUnbundledDeps(destPluginDir, `@plugin(${cacheKey})`);
+
+    vendoredPluginDirs.set(cacheKey, destPluginDir);
+    result.vendoredPlugins.push({ moduleName, version, dest: destPluginDir });
+    return destPluginDir;
+  }
+
+  /**
+   * Resolve an `@import()` to an absolute path and follow it, recording the edge so it can be
+   * rewritten once every output path is known. Returns undefined for imports that are left
+   * alone (dynamic paths, unsupported protocols).
+   */
+  async function discoverImport(
+    dec: ParsedEnvSpecDecorator,
+    srcAbs: string,
+  ): Promise<DiscoveredImport | undefined> {
+    const args = getFnArgs(dec);
+    if (!args || !args.values.length) return;
+    const pathArg = args.values[0];
+    // dynamic import paths are a load-time error anyway - nothing to rewrite
+    if (!(pathArg instanceof ParsedEnvSpecStaticValue)) return;
+    const importPathStr = String(pathArg.value ?? '');
+    if (!importPathStr) return;
+
+    const isDirImport = importPathStr.endsWith('/');
+
+    let targetAbs: string | undefined;
+    if (importPathStr.startsWith('./') || importPathStr.startsWith('../')) {
+      targetAbs = path.resolve(path.dirname(srcAbs), importPathStr);
+    } else if (importPathStr === '~' || importPathStr.startsWith('~/')) {
+      targetAbs = path.join(os.homedir(), importPathStr.slice(1));
+    } else if (importPathStr.startsWith('/')) {
+      targetAbs = path.resolve(importPathStr);
+    } else {
+      // http(s):// and npm: imports are not supported by the loader yet, so there is nothing to
+      // copy. A windows-native path is a mistake rather than a future feature, so it gets said out
+      // loud here instead of only failing later at load time.
+      const windowsPathHint = getWindowsPathHint(importPathStr);
+      if (windowsPathHint) {
+        result.warnings.push(`@import(${importPathStr}) in ${relLabel(srcAbs)} was left untouched - ${windowsPathHint}`);
+      }
+      return;
+    }
+
+    const target = targetAbs;
+    noteExternalPath(target);
+
+    const allowMissing = getStaticKwarg(args, 'allowMissing') === true;
+    const fsStat = await tryCatch(async () => fs.stat(target), () => undefined);
+    if (!fsStat) {
+      if (!allowMissing) {
+        result.warnings.push(`@import(${importPathStr}) in ${relLabel(srcAbs)} does not exist - decorator was rewritten but nothing was copied`);
+      }
+    } else if (isDirImport) {
+      // eslint-disable-next-line no-use-before-define
+      if (fsStat.isDirectory()) await discoverDirectory(target);
+    } else if (fsStat.isFile()) {
+      const fileName = path.basename(target);
+      if (isLocalEnvFileName(fileName) && !includeLocal) {
+        result.skippedLocalFiles.push(target);
+        result.warnings.push(
+          `@import(${importPathStr}) in ${relLabel(srcAbs)} targets a local env file, which is excluded by default (rerun with --include-local to include it)`,
+        );
+      } else {
+        // eslint-disable-next-line no-use-before-define
+        await discoverEnvFile(target);
+      }
+    }
+
+    return {
+      args, pathArg, importPathStr, isDirImport, targetAbs: target,
+    };
+  }
+
+  /** note a local-path `@plugin()` source so it is accounted for when picking the mirror base */
+  function noteLocalPluginPath(dec: ParsedEnvSpecDecorator, srcAbs: string) {
+    const args = getFnArgs(dec);
+    if (!args || !args.values.length) return;
+    const sourceArg = args.values[0];
+    if (!(sourceArg instanceof ParsedEnvSpecStaticValue)) return;
+    const sourceDescriptor = String(sourceArg.value ?? '');
+    if (!sourceDescriptor.startsWith('./') && !sourceDescriptor.startsWith('../') && !sourceDescriptor.startsWith('/')) return;
+    noteExternalPath(path.resolve(path.dirname(srcAbs), sourceDescriptor));
+  }
+
+  /** read + parse an env file and follow its imports, without writing anything yet */
+  async function discoverEnvFile(srcAbs: string): Promise<void> {
+    if (discoveredFiles.has(srcAbs)) return;
+    const file: DiscoveredFile = {
+      srcAbs, rawContents: '', imports: [], pluginDecorators: [],
+    };
+    discoveredFiles.set(srcAbs, file); // set before recursing - breaks import cycles
+    noteExternalPath(srcAbs);
+
+    file.rawContents = await fs.readFile(srcAbs, 'utf8');
+    try {
+      file.parsedFile = parseEnvSpecDotEnvFile(file.rawContents);
+    } catch {
+      result.warnings.push(`${relLabel(srcAbs)} could not be parsed - copied as-is without processing imports`);
+      return;
+    }
+
+    // note: root decorators only - @import/@plugin are only valid in the file header
+    for (const dec of file.parsedFile.decoratorsArray) {
+      if (dec.name === 'import') {
+        const discoveredImport = await discoverImport(dec, srcAbs);
+        if (discoveredImport) file.imports.push(discoveredImport);
+      } else if (dec.name === 'plugin') {
+        file.pluginDecorators.push(dec);
+        noteLocalPluginPath(dec, srcAbs);
+      }
+    }
+  }
+
+  /** follow all env files in an imported directory (directory imports load top-level .env.* files only) */
+  async function discoverDirectory(dirAbs: string): Promise<void> {
+    if (discoveredDirs.has(dirAbs)) return;
+    discoveredDirs.add(dirAbs);
+    const entries = await fs.readdir(dirAbs, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !isEnvFileName(entry.name)) continue;
+      if (isLocalEnvFileName(entry.name) && !includeLocal) {
+        result.skippedLocalFiles.push(path.join(dirAbs, entry.name));
+        continue;
+      }
+      await discoverEnvFile(path.join(dirAbs, entry.name));
+    }
+  }
+
+  async function rewritePluginDecorator(
+    dec: ParsedEnvSpecDecorator,
+    srcAbs: string,
+    destAbs: string,
+  ): Promise<boolean> {
+    const args = getFnArgs(dec);
+    if (!args || !args.values.length) return false;
+    const sourceArg = args.values[0];
+    if (!(sourceArg instanceof ParsedEnvSpecStaticValue)) return false;
+    const sourceDescriptor = String(sourceArg.value ?? '');
+    if (!sourceDescriptor) return false;
+
+    // local path plugin - copy the source (plugins are self-contained) and rewrite the path
+    if (sourceDescriptor.startsWith('./') || sourceDescriptor.startsWith('../') || sourceDescriptor.startsWith('/')) {
+      const pluginAbs = path.resolve(path.dirname(srcAbs), sourceDescriptor);
+      const destPlugin = getDestPath(pluginAbs);
+      if (!(await pathExists(pluginAbs))) {
+        result.warnings.push(`@plugin(${sourceDescriptor}) in ${relLabel(srcAbs)} does not exist - left untouched`);
+        return false;
+      }
+      await copyPluginSource(pluginAbs, destPlugin, `@plugin(${sourceDescriptor}) in ${relLabel(srcAbs)}`);
+      const newPluginPath = relativeImportPath(path.dirname(destAbs), destPlugin);
+      if (newPluginPath === sourceDescriptor) return false;
+      args.data.values[0] = makeStaticPathValue(newPluginPath, sourceArg.data.quote);
+      return true;
+    }
+
+    // other protocols are not supported by the plugin loader yet
+    if (/^(https?|npm|jsr|git):/.test(sourceDescriptor)) return false;
+
+    // a windows-native path would fall through to the npm module handling below
+    const windowsPathHint = getWindowsPathHint(sourceDescriptor);
+    if (windowsPathHint) {
+      result.warnings.push(`@plugin(${sourceDescriptor}) in ${relLabel(srcAbs)} was left untouched - ${windowsPathHint}`);
+      return false;
+    }
+
+    const atLocation = sourceDescriptor.indexOf('@', 1);
+    const moduleName = atLocation === -1 ? sourceDescriptor : sourceDescriptor.slice(0, atLocation);
+    const versionDescriptor = atLocation === -1 ? undefined : sourceDescriptor.slice(atLocation + 1);
+    const relFromPackage = path.relative(packageDir, srcAbs);
+    const isPackageInternal = !relFromPackage.startsWith('..') && !path.isAbsolute(relFromPackage);
+
+    // resolve the concrete version to use: an already-pinned exact version, otherwise the
+    // version installed in node_modules (works for bare names and semver ranges alike)
+    const pinnedExact = versionDescriptor && semverIsValid(versionDescriptor) ? versionDescriptor : undefined;
+
+    if (vendorPlugins) {
+      // vendor every npm plugin (package-internal included) so the artifact needs no node_modules
+      // and no runtime npm fetch - rewrite the declaration to point at the copied local package
+      const installed = await findInstalledPlugin(moduleName, path.dirname(srcAbs));
+
+      // prefer copying the installed package (no network); only fall back to downloading when the
+      // resolved version is not what is installed locally (or nothing is installed at all)
+      let version: string | undefined;
+      let localDir: string | undefined;
+      if (pinnedExact) {
+        version = pinnedExact;
+        if (installed?.version === pinnedExact) localDir = installed.dir;
+      } else if (installed) {
+        if (versionDescriptor && !semverSatisfies(installed.version, versionDescriptor)) {
+          result.warnings.push(
+            `@plugin(${sourceDescriptor}) in ${relLabel(srcAbs)} - installed version ${installed.version} does not satisfy the declared range, left untouched`,
+          );
+          return false;
+        }
+        version = installed.version;
+        localDir = installed.dir;
+      }
+      if (!version) {
+        result.warnings.push(
+          `@plugin(${sourceDescriptor}) in ${relLabel(srcAbs)} could not be resolved to a concrete version to vendor - install the plugin or pin an exact version`,
+        );
+        return false;
+      }
+
+      let destPluginDir: string;
+      try {
+        destPluginDir = await vendorNpmPlugin(moduleName, version, localDir);
+      } catch (err) {
+        result.warnings.push(
+          `@plugin(${sourceDescriptor}) in ${relLabel(srcAbs)} could not be vendored: ${(err as Error).message}`,
+        );
+        return false;
+      }
+      args.data.values[0] = makeStaticPathValue(
+        relativeImportPath(path.dirname(destAbs), destPluginDir),
+        sourceArg.data.quote,
+      );
+      return true;
+    }
+
+    // npm plugin declared in a file that lives inside the package - it resolves from the
+    // package's own node_modules at runtime, so leave it alone
+    if (isPackageInternal) return false;
+
+    // npm plugin declared in an imported external file - after flattening it can no longer
+    // resolve from the original package's node_modules, so pin the version that is installed
+    // there now; at runtime varlock can then auto-download it if it is not installed locally
+    if (pinnedExact) return false; // already pinned
+
+    const installed = await findInstalledPlugin(moduleName, path.dirname(srcAbs));
+    if (!installed) {
+      result.warnings.push(
+        `@plugin(${sourceDescriptor}) in ${relLabel(srcAbs)} could not be resolved to pin a version - install the plugin in this package or pin an exact version manually`,
+      );
+      return false;
+    }
+    if (versionDescriptor && !semverSatisfies(installed.version, versionDescriptor)) {
+      result.warnings.push(
+        `@plugin(${sourceDescriptor}) in ${relLabel(srcAbs)} - installed version ${installed.version} does not satisfy the declared range, left untouched`,
+      );
+      return false;
+    }
+    args.data.values[0] = makeStaticPathValue(`${moduleName}@${installed.version}`, sourceArg.data.quote);
+    result.pinnedPlugins.push({ moduleName, version: installed.version, filePath: srcAbs });
+    return true;
+  }
+
+  /** rewrite a discovered file's decorators against the now-known output paths, and write it */
+  async function emitEnvFile(file: DiscoveredFile, destAbs: string): Promise<void> {
+    let modified = false;
+
+    for (const discoveredImport of file.imports) {
+      const {
+        args, pathArg, importPathStr, isDirImport, targetAbs,
+      } = discoveredImport;
+      let newImportPath = relativeImportPath(path.dirname(destAbs), getDestPath(targetAbs));
+      if (isDirImport) newImportPath += '/';
+      if (newImportPath === importPathStr) continue;
+      args.data.values[0] = makeStaticPathValue(newImportPath, pathArg.data.quote);
+      modified = true;
+    }
+
+    for (const dec of file.pluginDecorators) {
+      modified = (await rewritePluginDecorator(dec, file.srcAbs, destAbs)) || modified;
+    }
+
+    await fs.mkdir(path.dirname(destAbs), { recursive: true });
+    if (modified && file.parsedFile) {
+      let serialized = file.parsedFile.toString();
+      if (file.rawContents.endsWith('\n') && !serialized.endsWith('\n')) serialized += '\n';
+      await fs.writeFile(destAbs, serialized, 'utf8');
+    } else {
+      // untouched files are copied byte-for-byte
+      await fs.copyFile(file.srcAbs, destAbs);
+    }
+    result.copiedFiles.push({ src: file.srcAbs, dest: destAbs });
+  }
+
+  // start fresh on every run
+  if (fsSync.existsSync(outDir)) {
+    await fs.rm(outDir, { recursive: true, force: true });
+  }
+
+  // ---- discovery: the package's own env files, then everything they reach via @import ----
+  const packageEntries = await fs.readdir(packageDir, { withFileTypes: true });
+  let foundAnyEnvFile = false;
+  for (const entry of packageEntries) {
+    if (!entry.isFile() || !isEnvFileName(entry.name)) continue;
+    foundAnyEnvFile = true;
+    if (isLocalEnvFileName(entry.name) && !includeLocal) {
+      result.skippedLocalFiles.push(path.join(packageDir, entry.name));
+      continue;
+    }
+    await discoverEnvFile(path.join(packageDir, entry.name));
+  }
+  if (!foundAnyEnvFile) {
+    throw new FlattenError(`no .env files found in ${packageDir}`);
+  }
+
+  // ---- everything reachable is known, so the mirror base (and every output path) can be fixed ----
+  importsBaseDir = commonAncestorDir([packageDir, ...externalSrcPaths]);
+
+  const destPaths = new Map<string, string>();
+  for (const srcAbs of discoveredFiles.keys()) {
+    const destAbs = getDestPath(srcAbs);
+    claimDest(destAbs, srcAbs);
+    destPaths.set(srcAbs, destAbs);
+  }
+
+  // ---- emit ----
+  for (const [srcAbs, file] of discoveredFiles) {
+    await emitEnvFile(file, destPaths.get(srcAbs)!);
+  }
+
+  // Flag copied files that are not part of the project: from outside the repo, or gitignored.
+  // They are copied like anything else, but they are the cases where the output quietly picks
+  // up something that will not be there for anyone else running the same build.
+  const gitRoot = await findGitRoot(packageDir);
+  if (gitRoot) {
+    const inRepoPaths: Array<string> = [];
+    for (const { src } of result.copiedFiles) {
+      const relFromGitRoot = path.relative(gitRoot, src);
+      if (!relFromGitRoot.startsWith('..') && !path.isAbsolute(relFromGitRoot)) {
+        inRepoPaths.push(src);
+        continue;
+      }
+      result.warnings.push(
+        `${src} was copied into the output from outside the git repo (${gitRoot}) - check that you meant to include it`,
+      );
+    }
+    // git skips paths that are in the index, so files it tracks are never reported as ignored.
+    // That keeps the common "ignore .env*, then `git add -f .env.schema`" setup quiet.
+    // Returns undefined when git cannot answer (not installed, not a repo) - this only drives a
+    // warning, so anything short of a definite yes is left alone.
+    const gitIgnored = await Promise.all(inRepoPaths.map(
+      (src) => tryCatch(() => checkIsFileGitIgnored(src), () => undefined),
+    ));
+    for (const [i, src] of inRepoPaths.entries()) {
+      if (gitIgnored[i] !== true) continue;
+      result.warnings.push(
+        `${relLabel(src)} is gitignored but was copied into the output - check that you meant to include it`,
+      );
+    }
+  }
+
+  return result;
+}

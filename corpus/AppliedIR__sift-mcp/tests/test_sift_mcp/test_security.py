@@ -1,0 +1,550 @@
+"""Tests for sift-mcp security utilities — path validation, denylist, rm protection."""
+
+import os
+
+import pytest
+from sift_mcp.security import (
+    get_output_flags,
+    is_denied,
+    sanitize_extra_args,
+    validate_input_path,
+    validate_output_path,
+    validate_rm_targets,
+)
+
+# --- Denylist ---
+
+
+class TestDenylist:
+    """is_denied() checks against the hard denylist."""
+
+    def test_mkfs_denied(self):
+        assert is_denied("mkfs") is True
+
+    def test_mkfs_ext4_denied(self):
+        assert is_denied("mkfs.ext4") is True
+
+    def test_dd_not_denied(self):
+        assert is_denied("dd") is False
+
+    def test_shutdown_denied(self):
+        assert is_denied("shutdown") is True
+
+    def test_fdisk_not_denied(self):
+        assert is_denied("fdisk") is False
+
+    def test_mount_allowed(self):
+        """mount is allowed — examiners need it for evidence images."""
+        assert is_denied("mount") is False
+
+    def test_kill_denied(self):
+        assert is_denied("kill") is True
+
+    def test_rm_not_denied(self):
+        assert is_denied("rm") is False
+
+    def test_fls_not_denied(self):
+        assert is_denied("fls") is False
+
+    def test_strings_not_denied(self):
+        assert is_denied("strings") is False
+
+    def test_bash_not_denied(self):
+        assert is_denied("bash") is False
+
+    def test_case_insensitive(self):
+        assert is_denied("MKFS") is True
+        assert is_denied("SHUTDOWN") is True
+
+
+# --- rm Protection ---
+
+
+class TestRmProtection:
+    """validate_rm_targets() blocks rm in protected directories."""
+
+    def test_rm_blocks_cases_dir(self):
+        with pytest.raises(ValueError):
+            validate_rm_targets(["-rf", "/cases"])
+
+    def test_rm_blocks_cases_subdir(self):
+        with pytest.raises(ValueError):
+            validate_rm_targets(["/cases/INC-001/file.txt"])
+
+    def test_rm_blocks_evidence_dir(self):
+        with pytest.raises(ValueError):
+            validate_rm_targets(["/evidence/disk.dd"])
+
+    def test_rm_blocks_case_evidence(self, tmp_path, monkeypatch):
+        case_dir = tmp_path / "INC-2026-001"
+        case_dir.mkdir()
+        (case_dir / "CASE.yaml").write_text("case_id: test\n")
+        evidence_dir = case_dir / "evidence"
+        evidence_dir.mkdir()
+        monkeypatch.setenv("VHIR_CASE_DIR", str(case_dir))
+        with pytest.raises(ValueError):
+            validate_rm_targets([str(evidence_dir / "file.img")])
+
+    def test_rm_allows_tmp(self):
+        # Should not raise
+        validate_rm_targets(["/tmp/output.csv"])
+
+    def test_rm_allows_regular_file(self):
+        validate_rm_targets(["-f", "/opt/work/temp.txt"])
+
+    def test_rm_blocks_root(self):
+        with pytest.raises(ValueError, match="filesystem root"):
+            validate_rm_targets(["-rf", "/"])
+
+    def test_rm_ignores_flags(self):
+        """Flags (starting with -) are not treated as paths."""
+        validate_rm_targets(["-rf"])  # should not raise
+
+
+# --- Path validation ---
+
+
+class TestValidateInputPath:
+    """validate_input_path must block access to sensitive system directories."""
+
+    def test_blocks_etc_shadow(self):
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path("/etc/shadow")
+
+    def test_blocks_proc_cmdline(self):
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path("/proc/1/cmdline")
+
+    def test_blocks_sys_class(self):
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path("/sys/class")
+
+    def test_blocks_dev_sda(self):
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path("/dev/sda")
+
+    def test_blocks_etc_passwd(self):
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path("/etc/passwd")
+
+    def test_a_protected_file_is_not_called_a_directory(self):
+        path = os.path.expanduser("~/.claude.json")
+        with pytest.raises(ValueError) as e:
+            validate_input_path(path)
+        assert str(e.value).startswith("Access denied: ")
+        assert f"under protected path '{path}'" in str(e.value)
+        assert "directory" not in str(e.value)
+
+    def test_blocks_boot(self):
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path("/boot/vmlinuz")
+
+    def test_blocks_the_codex_profile(self):
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path(os.path.expanduser("~/.codex/valhuntir.config.toml"))
+
+    def test_blocks_the_deployed_skills_codex_reads(self):
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path(
+                os.path.expanduser("~/.agents/skills/vhir-playbooks/SKILL.md")
+            )
+
+    def test_allows_home_directory(self):
+        """Paths in /home are now allowed for forensic analysis."""
+        result = validate_input_path("/home/user/evidence/disk.dd")
+        assert result.endswith("disk.dd")
+
+    def test_allows_tmp(self):
+        """Paths in /tmp are now allowed."""
+        result = validate_input_path("/tmp/evidence.img")
+        assert result.endswith("evidence.img")
+
+    def test_allows_var_log(self):
+        """Paths in /var/log are now allowed for forensic analysis."""
+        result = validate_input_path("/var/log/syslog")
+        assert result.endswith("syslog")
+
+    def test_allows_usr(self):
+        """Paths in /usr are now allowed."""
+        result = validate_input_path("/usr/bin/ls")
+        assert result.endswith("ls")
+
+    def test_allows_cases_evidence(self):
+        """Paths in /cases should pass validation."""
+        result = validate_input_path("/cases/test/image.E01")
+        assert result.endswith("image.E01")
+
+    def test_allows_opt_directory(self):
+        """Paths in /opt should pass validation."""
+        result = validate_input_path("/opt/tools/evidence/disk.dd")
+        assert result.endswith("disk.dd")
+
+    def test_symlink_to_blocked_dir(self, tmp_path):
+        """Symlink pointing to a blocked directory should be blocked."""
+        link = tmp_path / "sneaky_link"
+        os.symlink("/etc/passwd", str(link))
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path(str(link))
+
+    def test_flag_value_path_validation(self):
+        """flag=value arguments should have the value portion validated as a path."""
+        with pytest.raises(ValueError, match="under protected path"):
+            validate_input_path("--input=/etc/shadow")
+
+    def test_flag_value_safe_path(self):
+        """flag=value with safe path should pass."""
+        result = validate_input_path("--input=/cases/evidence.img")
+        assert result.endswith("evidence.img")
+
+
+# --- Output path validation ---
+
+
+class TestValidateOutputPath:
+    """validate_output_path must restrict where tools can write."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_case_dir(self, monkeypatch):
+        monkeypatch.delenv("VHIR_CASE_DIR", raising=False)
+        monkeypatch.setattr("sift_mcp.security.resolve_case_dir", lambda: "")
+
+    def test_blocks_etc(self):
+        with pytest.raises(ValueError, match="Output denied"):
+            validate_output_path("/etc/cron.d/")
+
+    def test_blocks_usr(self):
+        with pytest.raises(ValueError, match="Output denied"):
+            validate_output_path("/usr/local/bin/backdoor")
+
+    def test_blocks_var(self):
+        with pytest.raises(ValueError, match="Output denied"):
+            validate_output_path("/var/spool/cron/evil")
+
+    def test_blocks_home(self):
+        with pytest.raises(ValueError, match="Output denied"):
+            validate_output_path("/home/user/.bashrc")
+
+    def test_blocks_bin(self):
+        with pytest.raises(ValueError, match="Output denied"):
+            validate_output_path("/bin/sh")
+
+    def test_blocks_sbin(self):
+        with pytest.raises(ValueError, match="Output denied"):
+            validate_output_path("/sbin/init")
+
+    def test_blocks_lib(self):
+        with pytest.raises(ValueError, match="Output denied"):
+            validate_output_path("/lib/x86_64-linux-gnu/libc.so")
+
+    def test_allows_tmp(self):
+        result = validate_output_path("/tmp/output.csv")
+        assert result.endswith("output.csv")
+
+    def test_allows_cwd(self):
+        cwd = os.getcwd()
+        result = validate_output_path(cwd + "/output.csv")
+        assert result.endswith("output.csv")
+
+    def test_case_dir_allows_inside(self, tmp_path, monkeypatch):
+        case_dir = tmp_path / "case-001"
+        case_dir.mkdir()
+        monkeypatch.setattr("sift_mcp.security.resolve_case_dir", lambda: str(case_dir))
+        result = validate_output_path(str(case_dir / "output.csv"))
+        assert result.endswith("output.csv")
+
+    def test_case_dir_blocks_outside(self, tmp_path, monkeypatch):
+        case_dir = tmp_path / "case-001"
+        case_dir.mkdir()
+        monkeypatch.setattr("sift_mcp.security.resolve_case_dir", lambda: str(case_dir))
+        with pytest.raises(ValueError, match="outside the case directory"):
+            validate_output_path("/tmp/output.csv")
+
+    def test_case_dir_under_home_allowed(self, tmp_path, monkeypatch):
+        """Case dirs under /home must be allowed (containment check before /home block)."""
+        case_dir = tmp_path / "home" / "user" / "cases" / "case-001"
+        case_dir.mkdir(parents=True)
+        monkeypatch.setattr("sift_mcp.security.resolve_case_dir", lambda: str(case_dir))
+        result = validate_output_path(str(case_dir / "results" / "output.csv"))
+        assert result.endswith("output.csv")
+
+    def test_blocks_arbitrary_path(self):
+        with pytest.raises(ValueError, match="Without an active case"):
+            validate_output_path("/opt/sneaky/output.csv")
+
+    def test_symlink_to_blocked_dir(self, tmp_path):
+        link = tmp_path / "sneaky_link"
+        os.symlink("/etc/cron.d", str(link))
+        with pytest.raises(ValueError, match="Output denied"):
+            validate_output_path(str(link))
+
+
+class TestGetOutputFlags:
+    """get_output_flags() returns the configured output flag set."""
+
+    def test_returns_frozenset(self):
+        flags = get_output_flags()
+        assert isinstance(flags, frozenset)
+
+    def test_contains_csv_flag(self):
+        flags = get_output_flags()
+        assert "--csv" in flags
+
+    def test_contains_output_flag(self):
+        flags = get_output_flags()
+        assert "-o" in flags
+        assert "--output" in flags
+
+    def test_contains_json_flags(self):
+        flags = get_output_flags()
+        assert "--json" in flags
+        assert "--jsonl" in flags
+
+
+# --- Zeek script blocking ---
+
+
+class TestZeekScriptBlocking:
+    """Extra args containing Zeek scripts must be rejected."""
+
+    def _check_zeek_args(self, extra_args: list[str]) -> None:
+        sanitized = sanitize_extra_args(extra_args, "zeek")
+        for arg in sanitized:
+            if "/" in arg or "\\" in arg:
+                raise ValueError(
+                    "Zeek script arguments not allowed in extra_args: "
+                    "use explicit parameters instead"
+                )
+            if arg.endswith(".zeek") or arg.endswith(".bro"):
+                raise ValueError(
+                    "Zeek script arguments not allowed in extra_args: "
+                    "use explicit parameters instead"
+                )
+
+    def test_blocks_path_with_slash(self):
+        with pytest.raises(ValueError, match="Zeek script arguments not allowed"):
+            self._check_zeek_args(["/tmp/evil.zeek"])
+
+    def test_blocks_zeek_extension(self):
+        with pytest.raises(ValueError, match="Zeek script arguments not allowed"):
+            self._check_zeek_args(["script.zeek"])
+
+    def test_blocks_bro_extension(self):
+        with pytest.raises(ValueError, match="Zeek script arguments not allowed"):
+            self._check_zeek_args(["old.bro"])
+
+    def test_blocks_backslash_path(self):
+        with pytest.raises(ValueError, match="Zeek script arguments not allowed"):
+            self._check_zeek_args(["C:\\scripts\\evil.zeek"])
+
+    def test_allows_normal_flags(self):
+        self._check_zeek_args(["-C"])
+        self._check_zeek_args(["--no-checksums"])
+        self._check_zeek_args([])
+
+
+# --- sanitize_extra_args ---
+
+
+class TestSanitizeExtraArgs:
+    """Verify dangerous flag and shell metacharacter blocking."""
+
+    def test_blocks_exec_flag(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag"):
+            sanitize_extra_args(["-e", "malicious"], "some_tool")
+
+    def test_blocks_shell_metacharacter(self):
+        with pytest.raises(ValueError, match="Blocked shell metacharacter"):
+            sanitize_extra_args(["--flag; rm -rf /"], "some_tool")
+
+    def test_blocks_command_substitution(self):
+        with pytest.raises(ValueError, match="Blocked shell metacharacter"):
+            sanitize_extra_args(["$(whoami)"], "some_tool")
+
+    def test_allows_safe_flags(self):
+        result = sanitize_extra_args(
+            ["-r", "--verbose", "-o", "output.txt"], "some_tool"
+        )
+        assert result == ["-r", "--verbose", "-o", "output.txt"]
+
+    def test_bulk_extractor_e_flag_allowed(self):
+        result = sanitize_extra_args(
+            ["-e", "email"], "bulk_extractor"
+        )  # the binary run_command passes
+        assert result == ["-e", "email"]
+
+    # --- Per-tool blocked flags ---
+
+    def test_find_exec_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*find"):
+            sanitize_extra_args(
+                ["/cases", "-name", "*.log", "-exec", "rm", "{}", "+"], "find"
+            )
+
+    def test_find_execdir_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*find"):
+            sanitize_extra_args(["/cases", "-execdir", "cat", "{}", ";"], "find")
+
+    def test_find_delete_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*find"):
+            sanitize_extra_args(["/cases", "-name", "*.tmp", "-delete"], "find")
+
+    def test_find_name_allowed(self):
+        result = sanitize_extra_args(
+            ["/cases", "-name", "*.evtx", "-type", "f"], "find"
+        )
+        assert "-name" in result
+
+    def test_sed_inplace_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*sed"):
+            sanitize_extra_args(["-i", "s/foo/bar/", "/cases/file.txt"], "sed")
+
+    def test_sed_inplace_long_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*sed"):
+            sanitize_extra_args(["--in-place", "s/foo/bar/", "/cases/file.txt"], "sed")
+
+    def test_sed_read_only_allowed(self):
+        result = sanitize_extra_args(["s/foo/bar/", "/cases/file.txt"], "sed")
+        assert "s/foo/bar/" in result
+
+    def test_find_fls_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*find"):
+            sanitize_extra_args(["/cases", "-fls", "/tmp/output"], "find")
+
+    def test_find_fprint_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*find"):
+            sanitize_extra_args(["/cases", "-fprint", "/tmp/output"], "find")
+
+    def test_find_fprint0_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*find"):
+            sanitize_extra_args(["/cases", "-fprint0", "/tmp/output"], "find")
+
+    def test_find_fprintf_blocked(self):
+        with pytest.raises(ValueError, match="Blocked dangerous flag.*find"):
+            sanitize_extra_args(["/cases", "-fprintf", "/tmp/output", "%p"], "find")
+
+
+# --- Security policy YAML ---
+
+
+class TestSecurityPolicyYAML:
+    """Verify security policy loads from YAML and matches expected contents."""
+
+    def test_security_policy_loads_from_yaml(self):
+        from sift_mcp.catalog import clear_catalog_cache, load_security_policy
+
+        clear_catalog_cache()
+        policy = load_security_policy()
+
+        assert isinstance(policy["dangerous_flags"], set)
+        assert "-e" in policy["dangerous_flags"]
+        assert "--exec" in policy["dangerous_flags"]
+
+        assert isinstance(policy["denied_binaries"], frozenset)
+        assert "mkfs" in policy["denied_binaries"]
+        assert "dd" not in policy["denied_binaries"]
+        assert "kill" in policy["denied_binaries"]
+
+        assert "bulk_extractor" in policy["tool_allowed_flags"]
+        assert "-e" in policy["tool_allowed_flags"]["bulk_extractor"]
+
+        assert "find" in policy["tool_blocked_flags"]
+        assert "-exec" in policy["tool_blocked_flags"]["find"]
+        assert "sed" in policy["tool_blocked_flags"]
+        assert "-i" in policy["tool_blocked_flags"]["sed"]
+
+        assert isinstance(policy["output_flags"], frozenset)
+        assert "--csv" in policy["output_flags"]
+        assert "-o" in policy["output_flags"]
+
+        clear_catalog_cache()
+
+
+# Credentials and the HMAC store are refused as path arguments, including bare
+# names in the working folder. ~ is the home the blocklist was built from (the
+# root conftest's temporary one).
+
+_HOME0 = os.path.expanduser("~")
+
+
+def _guarded(argv, cwd=None):
+    from unittest.mock import patch
+
+    from sift_mcp.tools.generic import run_command
+
+    ran = []
+
+    def fake(cmd, **kw):
+        ran.append(cmd)
+        return {"exit_code": 0, "stdout": "", "stderr": "", "stdout_total_bytes": 0}
+
+    old = os.getcwd()
+    if cwd:
+        os.chdir(cwd)
+    try:
+        with (
+            patch(
+                "sift_mcp.tools.generic.find_binary",
+                side_effect=lambda b: "/usr/bin/" + b,
+            ),
+            patch("sift_mcp.tools.generic.execute", side_effect=fake),
+        ):
+            try:
+                run_command([a.replace("~", _HOME0) for a in argv])
+            except ValueError as e:
+                assert not ran
+                return str(e)
+    finally:
+        os.chdir(old)
+    assert ran
+    return "allowed"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cat", "~/.ssh/id_ed25519"],
+        ["cp", "-r", "~/.ssh", "/tmp/s"],
+        ["cat", "~/.claude.json"],
+        ["cat", "~/.claude.json.vhir-backup-20261006T000000Z"],
+        ["cat", "~/.claude/.credentials.json"],
+        ["cp", "/tmp/x", "~/.claude/settings.json"],
+        ["cat", "~/.config/opencti-mcp/token"],
+        ["grep", "--file=~/.config/opencti-mcp/token", "x"],
+        ["cat", "/var/lib/vhir/verification/INC-1.jsonl"],
+        ["cat", "/var/lib/vhir/passwords/examiner.json"],
+        ["cp", "/tmp/x", "/var/lib/vhir/verification/INC-1.jsonl"],
+    ],
+)
+def test_credentials_and_the_hmac_store_are_refused(argv):
+    assert _guarded(argv).startswith("Access denied")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cat", ".claude.json"],
+        ["cp", "-r", ".ssh", "x"],
+        ["grep", "--file=.claude.json", "x"],
+        ["tar", "-cf", "/tmp/c.tar", ".claude"],
+    ],
+)
+def test_a_bare_name_in_the_working_folder_is_refused_too(argv):
+    assert _guarded(argv, cwd=_HOME0).startswith("Access denied")
+
+
+@pytest.mark.parametrize(
+    "argv, cwd",
+    [
+        (["ls", "-la"], _HOME0),
+        (["grep", "foo", "file.txt"], _HOME0),
+        (["cat", "~/.sshfoo/x"], None),
+        (["cat", "~/.claude.jsonl"], None),
+        (["cat", "/var/log/syslog"], None),
+    ],
+)
+def test_ordinary_reads_are_still_allowed(argv, cwd):
+    assert _guarded(argv, cwd=cwd) == "allowed"
+
+
+def test_the_gateway_config_is_still_refused():
+    assert _guarded(["cat", "~/.vhir/gateway.yaml"]).startswith("Access denied")

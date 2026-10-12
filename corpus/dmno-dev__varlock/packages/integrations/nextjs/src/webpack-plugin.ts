@@ -1,0 +1,306 @@
+import fs from 'node:fs';
+
+import {
+  scanForLeaks, varlockSettings,
+} from 'varlock/env';
+import { patchGlobalServerResponse } from 'varlock/patch-server-response';
+import { scrubLeakedSecrets } from './leak-scrub';
+
+import type { SerializedEnvGraph } from 'varlock';
+import { encryptEnvBlobSync } from 'varlock/encrypt-env';
+import type { NextConfig } from 'next';
+
+const WEBPACK_PLUGIN_NAME = 'VarlockNextWebpackPlugin';
+
+// one-time guard for the Vercel unencrypted resolved-env warning
+let vercelUnencryptedWarningLogged = false;
+
+// We use a proxy object for the static replacements that we pass to webpack.DefinePlugin
+// because this plugin/webpack code is not invoked again when env files change
+// instead next is direcly messing with the existing plugins for their own changes
+// so instead we use a proxy object, and grab the values off of process.env.__VARLOCK_ENV
+// which will have been updated by our next-env-compat code
+let latestLoadedVarlockEnv: SerializedEnvGraph | undefined;
+function createStaticReplacementsProxy(debug: (...args: Array<any>) => void) {
+  return new Proxy({} as Record<string, string>, {
+    ownKeys(_target) {
+      latestLoadedVarlockEnv = JSON.parse(process.env.__VARLOCK_ENV || '{}') as SerializedEnvGraph;
+      const replaceKeys = [] as Array<string>;
+      for (const itemKey in latestLoadedVarlockEnv.config) {
+        const item = latestLoadedVarlockEnv.config[itemKey];
+        const isDynamic = item.isDynamic ?? item.isSensitive;
+        if (!isDynamic) replaceKeys.push(`ENV.${itemKey}`);
+      }
+      debug('reloaded static replacements keys', replaceKeys);
+      return replaceKeys;
+    },
+    getOwnPropertyDescriptor(_target, prop) {
+      const itemKey = prop.toString().split('.')[1];
+      const item = latestLoadedVarlockEnv?.config[itemKey];
+      if (!item) return;
+      const isDynamic = item.isDynamic ?? item.isSensitive;
+      if (isDynamic) return;
+      return {
+        value: '', // this value is not used, the get handler will return the value
+        writable: false,
+        enumerable: true,
+        configurable: true,
+      };
+    },
+    get(_target, prop) {
+      const itemKey = prop.toString().split('.')[1];
+      const item = latestLoadedVarlockEnv?.config[itemKey];
+      if (!item) return;
+      const isDynamic = item.isDynamic ?? item.isSensitive;
+      if (!isDynamic) return JSON.stringify(item.value);
+    },
+  });
+}
+
+export function createWebpackConfigFn(
+  resolvedNextConfig: NextConfig,
+  patchGlobalFsMethods: () => void,
+  debug: (...args: Array<any>) => void,
+  isBuild: boolean,
+) {
+  const staticReplacementsProxy = createStaticReplacementsProxy(debug);
+
+  return function webpackConfigFn(webpackConfig: any, options: any) {
+    debug('varlockNextConfigPlugin webpack config patching');
+
+    const { dev } = options; // also available - isServer, nextRuntime
+
+    // only patch fs methods during builds — they create "hooks" for post-build
+    // scanning/scrubbing and are unnecessary during dev
+    if (isBuild) patchGlobalFsMethods();
+
+    if (varlockSettings.preventLeaks) {
+      // have to wait to run this until here when we know if this is dev mode or not
+      patchGlobalServerResponse({
+        ignoreUrlPatterns: [
+          /^\/__nextjs_source-map\?.*/, // sourcemaps
+          /[?&]_rsc=/, // RSC payloads are server-side and expected to contain sensitive data
+        ],
+        // in dev mode, we redact the secrets rather than throwing, because otherwise the dev server crashes
+        redactInsteadOfThrow: dev,
+      });
+    }
+
+    // webpack itself is passed in so we dont have to import it (or make it a dependency)
+    const webpack = options.webpack;
+
+    // apply existing user customizations if there are any
+    if (resolvedNextConfig.webpack) {
+      webpackConfig = resolvedNextConfig.webpack(webpackConfig, options);
+    }
+
+    if (!process.env.__VARLOCK_ENV) throw new Error('VarlockNextWebpackPlugin: __VARLOCK_ENV is not set');
+
+    // Add per-file init guard for server (non-edge) compilations.
+    // Pre-rendering workers may receive compiled code via IPC rather than loading
+    // runtime files from disk, so runtime injection alone isn't sufficient.
+    // The loader ensures initVarlockEnv() and patchGlobalConsole() run in every worker.
+    // alwaysRepatchConsole: in webpack, React wraps console for RSC dev replay AFTER
+    // our initial patch in the runtime file, so we re-patch in each file to ensure
+    // our redaction wraps React's wrapper. (Turbopack doesn't need this.)
+    if (options.isServer && options.nextRuntime !== 'edge') {
+      webpackConfig.module.rules.push({
+        test: /\.(js|jsx|ts|tsx|mjs|mts)$/,
+        exclude: /node_modules/,
+        use: [
+          {
+            // explicit .cjs: this resolves against the built sibling in dist/, and node's
+            // cjs resolver only probes .js/.json/.node for an extensionless specifier
+            loader: require.resolve('./loader.cjs'),
+            options: { bundler: 'webpack' },
+          },
+        ],
+      });
+    }
+    // Edge compilation: also re-patch console to wrap React's RSC dev replay wrapper.
+    // Edge can't use require(), so we call globalThis.__varlockPatchConsole which the
+    // init-edge bundle exposes after running.
+    if (options.isServer && options.nextRuntime === 'edge') {
+      webpackConfig.module.rules.push({
+        test: /\.(js|jsx|ts|tsx|mjs|mts)$/,
+        exclude: /node_modules/,
+        use: [
+          {
+            loader: require.resolve('./loader.cjs'),
+            options: { bundler: 'webpack', isEdge: true },
+          },
+        ],
+      });
+    }
+
+    // Set up build-time replacements / rewrites - using webpack.DefinePlugin and a proxy
+    // TODO: use shared helpers from core library?
+    debug('adding ENV.xxx static replacements proxy object');
+    webpackConfig.plugins.push(new webpack.DefinePlugin(staticReplacementsProxy));
+
+    if (varlockSettings.preventLeaks) {
+      webpackConfig.plugins.push({
+        apply(compiler: any) {
+          compiler.hooks.assetEmitted.tap(WEBPACK_PLUGIN_NAME, (_file: any, assetDetails: any) => {
+            const { content, targetPath } = assetDetails;
+
+            if (
+              targetPath.includes('/.next/static/chunks/')
+              || targetPath.endsWith('.html')
+              // .rsc and .body are server-side (RSC payloads), not client-facing
+            ) {
+              // NOTE - in dev mode the request hangs on the error, but the console error should help
+              // and during a build, it will actually fail the build
+              try {
+                scanForLeaks(content, {
+                  method: '@varlock/nextjs-integration/plugin - assetEmitted hook',
+                  file: targetPath,
+                });
+              } catch (err) {
+                if (dev) {
+                  // overwrite file with redacted version
+                  fs.writeFileSync(targetPath, scrubLeakedSecrets(content.toString()));
+                } else {
+                  throw err;
+                }
+              }
+            }
+          });
+        },
+      });
+    }
+
+    // Inject varlock init into webpack runtime files.
+    // We prepend the self-contained init bundle as raw JS so it runs before any module code.
+    // Server runtimes get the full init (with server-response patching),
+    // edge runtimes get the edge-safe init (no node:zlib/node:http).
+    function injectVarlockInitIntoWebpackRuntime(edgeRuntime = false) {
+      return function assetUpdateFn(origSource: any) {
+        const origSourceStr = origSource.source();
+
+        const initBundleName = edgeRuntime ? 'init-edge' : 'init-server';
+        const injectorPath = require.resolve(`varlock/${initBundleName}`);
+        const injectorSrc = fs.readFileSync(injectorPath, 'utf8');
+
+        // inline the resolved env so it's baked into the build
+        // this removes the need for a .env.production.local file on platforms like Vercel
+        const rawEnv = process.env.__VARLOCK_ENV;
+        const encryptionRequired = latestLoadedVarlockEnv?.settings?.encryptInjectedEnv;
+        const encryptionKey = process.env._VARLOCK_ENV_KEY;
+        if (encryptionRequired && !encryptionKey) {
+          throw new Error(
+            '[varlock] @encryptInjectedEnv is enabled but _VARLOCK_ENV_KEY is not set.\n'
+            + 'Generate a key with `varlock generate-key` and set it on your platform.\n'
+            + 'See https://varlock.dev/guides/encrypted-deployments/ for details.',
+          );
+        }
+        // Vercel has no native runtime-binding mechanism, so baking the resolved
+        // env into the build is the correct approach there — but plaintext means
+        // secrets sit as JSON in the build artifact. Nudge (don't block) users
+        // who haven't opted into `@encryptInjectedEnv`.
+        if (process.env.VERCEL === '1' && !encryptionRequired && !dev && !vercelUnencryptedWarningLogged) {
+          vercelUnencryptedWarningLogged = true;
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[varlock] ⚠️ Deploying to Vercel ships your resolved env as plaintext JSON in the build artifact. '
+            + 'Consider enabling `@encryptInjectedEnv` — see https://varlock.dev/guides/encrypted-deployments/',
+          );
+        }
+        // The baked env is a build-time fallback: a blob already present in the actual
+        // runtime env (a fresh boot-time resolution, e.g. `varlock run`) always wins.
+        // Flag the payload as build-resolved so `initVarlockEnv` skips its stale-echo
+        // cleanup and never deletes runtime-provided vars. The flag lives INSIDE the
+        // payload so it travels with the blob (child processes, encryption round-trips)
+        // and can never outlive it.
+        let envPayload = rawEnv;
+        if (envPayload) {
+          try {
+            envPayload = JSON.stringify({ ...JSON.parse(envPayload), injectedAtBuild: true });
+          } catch {
+            // not plaintext JSON (e.g. an already-encrypted ambient blob) - bake as-is,
+            // without provenance, so the boot behaves like a plain injected blob
+          }
+          if (encryptionKey) envPayload = encryptEnvBlobSync(envPayload, encryptionKey);
+        }
+        const envInline = envPayload
+          ? `process.env.__VARLOCK_ENV = process.env.__VARLOCK_ENV || ${JSON.stringify(envPayload)};`
+          : '';
+
+        const updatedSourceStr = [
+          envInline,
+          // Wrap in IIFE to avoid symbol collisions when bundlers concatenate files.
+          // Provide dummy exports/module since the CJS bundle uses `exports.X = ...`
+          `(function(exports,module){${injectorSrc}})({},{exports:{}});`,
+          origSourceStr,
+        ].join('\n');
+
+        return new webpack.sources.RawSource(updatedSourceStr);
+      };
+    }
+
+    const isEdgeRuntime = options.nextRuntime === 'edge';
+    webpackConfig.plugins.push({
+      apply(compiler: any) {
+        compiler.hooks.thisCompilation.tap(WEBPACK_PLUGIN_NAME, (compilation: any) => {
+          compilation.hooks.processAssets.tap(
+            {
+              name: WEBPACK_PLUGIN_NAME,
+              stage: webpack.Compilation.PROCESS_ASSETS_STAGE_ADDITIONS,
+            },
+            () => {
+              if (isEdgeRuntime) {
+                // Edge compilation — only inject the edge-safe init bundle (no node builtins)
+                if (compilation.getAsset('edge-runtime-webpack.js')) {
+                  compilation.updateAsset('edge-runtime-webpack.js', injectVarlockInitIntoWebpackRuntime(true));
+                }
+                // Edge compilation also has webpack-runtime.js — inject init-edge there too
+                for (const name of ['webpack-runtime.js', '../webpack-runtime.js']) {
+                  if (compilation.getAsset(name)) {
+                    compilation.updateAsset(name, injectVarlockInitIntoWebpackRuntime(true));
+                  }
+                }
+              } else if (options.isServer) {
+                // Server (node.js) compilation — inject full init with server-response patching
+                for (const name of ['webpack-runtime.js', '../webpack-runtime.js', 'webpack-api-runtime.js', '../webpack-api-runtime.js']) {
+                  if (compilation.getAsset(name)) {
+                    compilation.updateAsset(name, injectVarlockInitIntoWebpackRuntime());
+                  }
+                }
+              } else {
+                // Client (browser) compilation — inject the declared public+dynamic key
+                // list into the client webpack runtime chunk (loaded before any app
+                // chunk), so the runtime hydration helpers (loadPublicDynamicEnv,
+                // payload filtering, hydration-state checks) work in the browser.
+                // Key NAMES only - never values. Client compilations have no loader,
+                // so this is the webpack analog of the loader's client-component
+                // injection used by turbopack.
+                let publicDynamicKeys: Array<string> = [];
+                try {
+                  const graph = JSON.parse(process.env.__VARLOCK_ENV || '{}') as SerializedEnvGraph;
+                  publicDynamicKeys = Object.entries(graph.config || {})
+                    .filter(([, item]) => (item.isDynamic ?? item.isSensitive) && !item.isSensitive)
+                    .map(([key]) => key);
+                } catch {
+                  // bad/missing blob - skip injection rather than break the build
+                }
+                if (publicDynamicKeys.length) {
+                  const snippet = `globalThis.__varlockPublicDynamicKeys ??= ${JSON.stringify(publicDynamicKeys)};`;
+                  for (const assetName of Object.keys(compilation.assets)) {
+                    // prod: static/chunks/webpack-<hash>.js, dev: static/chunks/webpack.js
+                    if (/(^|\/)webpack(-[^/]*)?\.js$/.test(assetName)) {
+                      compilation.updateAsset(assetName, (origSource: any) => (
+                        new webpack.sources.RawSource(`${snippet}\n${origSource.source()}`)
+                      ));
+                    }
+                  }
+                }
+              }
+            },
+          );
+        });
+      },
+    });
+
+    return webpackConfig; // must return the modified config
+  };
+}

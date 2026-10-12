@@ -1,0 +1,349 @@
+/******************************************************************************/
+/* reader-scheme-file.c
+ *
+ * Copyright 2023 All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <fcntl.h>
+#include "arkime.h"
+#include "arkimeconfig.h"
+
+extern ArkimeConfig_t        config;
+
+#ifdef HAVE_SYS_INOTIFY_H
+#include <sys/inotify.h>
+LOCAL int         monitorFd;
+LOCAL GHashTable *wdHashTable;
+
+typedef struct {
+    char                 *dirname;
+    ArkimeSchemeFlags     flags;
+    ArkimeSchemeAction_t *actions;
+} SchemeWatch_t;
+
+LOCAL void scheme_file_monitor_dir(const char *dirname, ArkimeSchemeFlags flags, ArkimeSchemeAction_t *actions);
+
+LOCAL void scheme_watch_free(gpointer data)
+{
+    SchemeWatch_t *sw = (SchemeWatch_t *)data;
+    g_free(sw->dirname);
+    arkime_reader_scheme_actions_deref(sw->actions);
+    ARKIME_TYPE_FREE(SchemeWatch_t, sw);
+}
+
+LOCAL void scheme_file_monitor_do(struct inotify_event *event)
+{
+    SchemeWatch_t *sw = g_hash_table_lookup(wdHashTable, (void *)(long)event->wd);
+    if (!sw)
+        return;
+
+    // The watch is gone (directory deleted/unmounted, or explicitly removed).
+    // Drop our tracking entry now instead of waiting for the kernel to maybe
+    // reuse this wd number for an unrelated watch later.
+    if (event->mask & IN_IGNORED) {
+        g_hash_table_remove(wdHashTable, (void *)(long)event->wd);
+        return;
+    }
+
+    gchar *fullfilename = g_build_filename(sw->dirname, event->name, NULL);
+
+    if ((sw->flags & ARKIME_SCHEME_FLAG_RECURSIVE) &&
+        (event->mask & IN_CREATE) &&
+        g_file_test(fullfilename, G_FILE_TEST_IS_DIR)) {
+
+        scheme_file_monitor_dir(fullfilename, sw->flags, sw->actions);
+        g_free(fullfilename);
+        return;
+    }
+
+    if ((event->mask & IN_CLOSE_WRITE) == 0) {
+        g_free(fullfilename);
+        return;
+    }
+
+    if (!g_regex_match(config.offlineRegex, fullfilename, 0, NULL)) {
+        g_free(fullfilename);
+        return;
+    }
+
+    if (config.debug)
+        LOG("Monitor enqueuing %s", fullfilename);
+    arkime_reader_scheme_load(fullfilename, sw->flags & (ArkimeSchemeFlags)(~ARKIME_SCHEME_FLAG_DIRHINT), sw->actions);
+    g_free(fullfilename);
+}
+/******************************************************************************/
+LOCAL gboolean scheme_file_monitor_read()
+{
+    char buf[20 * (sizeof(struct inotify_event) + NAME_MAX + 1)] __attribute__((aligned(8)));
+
+    int rc = read(monitorFd, buf, sizeof(buf));
+    if (rc == 0)
+        return TRUE;
+    if (rc == -1)
+        LOGEXIT("ERROR - Monitor read failed - %s", strerror(errno));
+    if (rc < (int)sizeof(buf))
+        buf[rc] = 0;
+
+    for (char *p = buf; p < buf + rc;) {
+        struct inotify_event *event = (struct inotify_event *) p;
+        scheme_file_monitor_do(event);
+        p += sizeof(struct inotify_event) + event->len;
+    }
+    return TRUE;
+}
+/******************************************************************************/
+LOCAL void scheme_file_init_monitor()
+{
+    monitorFd = inotify_init1(IN_NONBLOCK);
+
+    if (monitorFd < 0)
+        LOGEXIT("ERROR - Couldn't init inotify %s", strerror(errno));
+
+    wdHashTable = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, scheme_watch_free);
+    arkime_watch_fd(monitorFd, ARKIME_GIO_READ_COND, scheme_file_monitor_read, NULL);
+}
+/******************************************************************************/
+LOCAL void scheme_file_monitor_dir(const char *dirname, ArkimeSchemeFlags flags, ArkimeSchemeAction_t *actions)
+{
+    static char inited = 0;
+    if (!inited) {
+        inited = 1;
+        scheme_file_init_monitor();
+    }
+
+    if (config.debug)
+        LOG("Monitoring %s", dirname);
+
+    int rc = inotify_add_watch(monitorFd, dirname, IN_CLOSE_WRITE | IN_CREATE);
+    if (rc == -1) {
+        LOG("WARNING - Couldn't watch %s %s", dirname, strerror(errno));
+        return;
+    } else {
+        SchemeWatch_t *sw = ARKIME_TYPE_ALLOC(SchemeWatch_t);
+        sw->dirname = g_strdup(dirname);
+        sw->flags = flags;
+        sw->actions = actions;
+        arkime_reader_scheme_actions_ref(actions);
+        g_hash_table_insert(wdHashTable, (void *)(long)rc, sw);
+    }
+
+    if ((flags & ARKIME_SCHEME_FLAG_RECURSIVE) == 0)
+        return;
+
+    GError   *error = NULL;
+    GDir     *dir = g_dir_open(dirname, 0, &error);
+
+    if (error)
+        LOGEXIT("ERROR - Couldn't open pcap directory %s: %s", dirname, error->message);
+
+    while (1) {
+        const gchar *filename = g_dir_read_name(dir);
+
+        // No more files, stop processing this directory
+        if (!filename) {
+            break;
+        }
+
+        // Skip hidden files/directories
+        if (filename[0] == '.')
+            continue;
+
+        gchar *fullfilename = g_build_filename(dirname, filename, NULL);
+
+        if (g_file_test(fullfilename, G_FILE_TEST_IS_DIR)) {
+            scheme_file_monitor_dir(fullfilename, flags | ARKIME_SCHEME_FLAG_DIRHINT, actions);
+        }
+        g_free(fullfilename);
+    }
+    g_dir_close(dir);
+}
+#else
+LOCAL void scheme_file_monitor_dir(const char UNUSED(*dirname), ArkimeSchemeFlags UNUSED(flags), ArkimeSchemeAction_t UNUSED(*actions))
+{
+    if (config.commandSocket || config.commandList)
+        LOG_RATE(30, "ERROR - Monitoring not supported on this OS - %s", dirname);
+    else
+        LOGEXIT("ERROR - Monitoring not supported on this OS - %s", dirname);
+}
+#endif
+/******************************************************************************/
+// g_ptr_array_sort passes pointers to the array elements (gchar **)
+LOCAL int scheme_file_name_cmp(gconstpointer a, gconstpointer b)
+{
+    return g_strcmp0(*(const gchar * const *)a, *(const gchar * const *)b);
+}
+/******************************************************************************/
+LOCAL int scheme_file_dir(const char *dirname, ArkimeSchemeFlags flags, ArkimeSchemeAction_t *actions)
+{
+    GDir   *pcapGDir;
+    GError *error = 0;
+
+    if (flags & ARKIME_SCHEME_FLAG_MONITOR) {
+        scheme_file_monitor_dir(dirname, flags, actions);
+    }
+
+    pcapGDir = g_dir_open(dirname, 0, &error);
+    if (error) {
+        LOG("ERROR - Couldn't open pcap directory %s: %s", dirname, error->message);
+        return 1;
+    }
+
+    GPtrArray *files = (flags & ARKIME_SCHEME_FLAG_SORTED) ? g_ptr_array_new_with_free_func(g_free) : NULL;
+    while (1) {
+        const gchar *filename = g_dir_read_name(pcapGDir);
+
+        // No more files, stop processing this directory
+        if (!filename) {
+            break;
+        }
+
+        // Skip hidden files/directories
+        if (filename[0] == '.')
+            continue;
+
+        if (flags & ARKIME_SCHEME_FLAG_SORTED) {
+            g_ptr_array_add(files, g_strdup(filename));
+            continue;
+        }
+
+        gchar *fullfilename = g_build_filename(dirname, filename, NULL);
+
+        // If recursive option and a directory then process all the files in that dir
+        if ((flags & ARKIME_SCHEME_FLAG_RECURSIVE)  && g_file_test(fullfilename, G_FILE_TEST_IS_DIR)) {
+            scheme_file_dir(fullfilename, flags, actions);
+            g_free(fullfilename);
+            continue;
+        }
+
+        if (!g_regex_match(config.offlineRegex, filename, 0, NULL)) {
+            g_free(fullfilename);
+            continue;
+        }
+
+        arkime_reader_scheme_load(fullfilename, flags & (ArkimeSchemeFlags)(~ARKIME_SCHEME_FLAG_DIRHINT), actions);
+        g_free(fullfilename);
+    }
+    g_dir_close(pcapGDir);
+
+    // Not sorted mode, everything was already processed above
+    if ((flags & ARKIME_SCHEME_FLAG_SORTED) == 0)
+        return 1;
+
+    g_ptr_array_sort(files, scheme_file_name_cmp);
+    for (guint i = 0; i < files->len; i++) {
+        const gchar *filename = files->pdata[i];
+        gchar *fullfilename = g_build_filename(dirname, filename, NULL);
+
+        // If recursive option and a directory then process all the files in that dir
+        if ((flags & ARKIME_SCHEME_FLAG_RECURSIVE)  && g_file_test(fullfilename, G_FILE_TEST_IS_DIR)) {
+            scheme_file_dir(fullfilename, flags, actions);
+            g_free(fullfilename);
+            continue;
+        }
+
+        if (!g_regex_match(config.offlineRegex, filename, 0, NULL)) {
+            g_free(fullfilename);
+            continue;
+        }
+
+        arkime_reader_scheme_load(fullfilename, flags & (ArkimeSchemeFlags)(~ARKIME_SCHEME_FLAG_DIRHINT), actions);
+        g_free(fullfilename);
+    }
+    g_ptr_array_free(files, TRUE);
+    return 1;
+}
+/******************************************************************************/
+LOCAL uint8_t buffer[0xfffff];
+LOCAL int scheme_file_load(const char *uri, ArkimeSchemeFlags flags, ArkimeSchemeAction_t *actions)
+{
+    if (strncmp("file://", uri, 7) == 0) {
+        uri += 7;
+    }
+
+    if (g_file_test(uri, G_FILE_TEST_IS_DIR)) {
+        return scheme_file_dir(uri, flags | ARKIME_SCHEME_FLAG_DIRHINT, actions);
+    }
+
+    int fd;
+    const int isStdin = strcmp(uri, "-") == 0;
+    if (isStdin) {
+        fd = fileno(stdin);
+    } else {
+        LOCAL  char  filename[PATH_MAX + 1];
+        if (!realpath(uri, filename)) {
+            LOG("ERROR - pcap open failed - Couldn't realpath file: '%s' with %s (%d)", uri, strerror(errno), errno);
+            return 1;
+        }
+
+        if ((flags & ARKIME_SCHEME_FLAG_SKIP) && arkime_db_file_exists(filename, NULL)) {
+            if (config.debug)
+                LOG("Skipping %s", filename);
+            return 1;
+        }
+
+        if (config.pcapReprocess && !arkime_db_file_exists(filename, NULL)) {
+            LOG("Can't reprocess %s", filename);
+            return 1;
+        }
+
+
+        fd = open(filename, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            LOG("ERROR - pcap open failed - Couldn't open file: '%s' with %s (%d)", filename, strerror(errno), errno);
+            return 1;
+        }
+
+        // check to see if viewer might have access issues to non-copied pcap file
+        if (config.copyPcap == 0) {
+            arkime_check_file_permissions(filename);
+        }
+        uri = filename;
+    }
+
+    do {
+        ssize_t bytesRead = read(fd, buffer, sizeof(buffer));
+        if (bytesRead > 0) {
+            if (arkime_reader_scheme_process(uri, buffer, bytesRead, NULL, actions)) {
+                if (!isStdin)
+                    close(fd);
+                if (config.ignoreErrors && (flags & ARKIME_SCHEME_FLAG_DELETE)) { // ALW - Maybe this should always delete?
+                    if (config.debug)
+                        LOG("Deleting %s", uri);
+                    int rc = unlink(uri);
+                    if (rc != 0)
+                        LOG("Failed to delete file %s %s (%d)", uri, strerror(errno), errno);
+                }
+                return 1;
+            }
+        } else if (bytesRead < 0) {
+            if (errno == EINTR)
+                continue;
+            LOG("ERROR - pcap read failed - Couldn't read file: '%s' with %s (%d)", uri, strerror(errno), errno);
+            break;
+        } else {
+            break;
+        }
+    } while (1);
+
+    if (!isStdin)
+        close(fd);
+    if (flags & ARKIME_SCHEME_FLAG_DELETE) {
+        if (config.debug)
+            LOG("Deleting %s", uri);
+        int rc = unlink(uri);
+        if (rc != 0)
+            LOG("Failed to delete file %s %s (%d)", uri, strerror(errno), errno);
+    }
+    return 0;
+}
+/******************************************************************************/
+LOCAL void scheme_file_exit()
+{
+}
+/******************************************************************************/
+void arkime_reader_scheme_file_init()
+{
+    arkime_reader_scheme_register("file", scheme_file_load, scheme_file_exit);
+}

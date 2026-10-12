@@ -1,0 +1,524 @@
+package rpc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	implantpb "github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	"github.com/chainreactors/IoM-go/proto/services/listenerrpc"
+	"github.com/chainreactors/IoM-go/types"
+	"github.com/chainreactors/logs"
+	"github.com/chainreactors/malice-network/server/internal/core"
+	"github.com/chainreactors/malice-network/server/internal/db"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"io"
+	"sort"
+	"sync"
+	"time"
+)
+
+var listenerRegistrationMu sync.Mutex
+
+func (rpc *Server) GetListeners(ctx context.Context, req *clientpb.Empty) (*clientpb.Listeners, error) {
+	return core.Listeners.ToProtobuf(), nil
+}
+
+func (rpc *Server) RegisterListener(ctx context.Context, req *clientpb.RegisterListener) (*clientpb.Empty, error) {
+	if req == nil || req.Name == "" {
+		return nil, types.ErrMissingRequestField
+	}
+	if err := validateScopedResourceName("listener", req.Name); err != nil {
+		return nil, err
+	}
+	runtimeSnapshot, err := validateListenerRuntimeSnapshot(req.Name, req.Pipelines)
+	if err != nil {
+		return nil, err
+	}
+	listenerRegistrationMu.Lock()
+	defer listenerRegistrationMu.Unlock()
+
+	// Idempotent: if a listener with this name already exists (e.g. reconnect after crash),
+	// fully clean up the old state before creating the fresh instance.
+	if old, err := core.Listeners.Get(req.Name); err == nil {
+		if old.Active() {
+			return nil, status.Errorf(codes.AlreadyExists,
+				"listener %q is already active, use a different name or stop the existing one first", req.Name)
+		}
+		for _, pipe := range old.AllPipelines() {
+			deletePipelineStream(pipe.ListenerId, pipe.Name)
+		}
+		// Use Stop + Map.Delete instead of Remove to avoid event publishing
+		// which could block or panic during concurrent cleanup.
+		_ = core.Listeners.Stop(req.Name)
+		core.Listeners.Map.Delete(req.Name)
+		logs.Log.Warnf("server - listener_reregister name=%s state=old_cleaned", req.Name)
+	}
+
+	lns := core.NewPendingListener(req.Name, req.Host)
+	core.Listeners.Add(lns)
+	if req.Pipelines != nil {
+		for _, pipeline := range runtimeSnapshot {
+			core.Jobs.AddPipeline(pipeline)
+		}
+		lns.MarkRuntimeSnapshotReceived()
+	}
+	core.EventBroker.Notify(core.Event{
+		EventType: consts.EventListener,
+		Op:        consts.CtrlListenerStart,
+		Message:   fmt.Sprintf("Listener %s started at %s", req.Name, req.Host),
+	})
+	logs.Log.Importantf("server - register_listener host=%s name=%s", req.Host, req.Name)
+	return &clientpb.Empty{}, nil
+}
+
+func validateListenerRuntimeSnapshot(listenerID string, snapshot *clientpb.Pipelines) ([]*clientpb.Pipeline, error) {
+	if snapshot == nil {
+		return nil, nil
+	}
+	result := make([]*clientpb.Pipeline, 0, len(snapshot.GetPipelines()))
+	for _, pipeline := range snapshot.GetPipelines() {
+		if pipeline == nil || !pipeline.GetEnable() {
+			continue
+		}
+		if pipeline.GetListenerId() != "" && pipeline.GetListenerId() != listenerID {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"listener %q runtime snapshot contains pipeline for %q", listenerID, pipeline.GetListenerId())
+		}
+		cloned := proto.Clone(pipeline).(*clientpb.Pipeline)
+		cloned.ListenerId = listenerID
+		if err := validatePipelineIdentity(cloned); err != nil {
+			return nil, err
+		}
+		result = append(result, cloned)
+	}
+	return result, nil
+}
+
+func deletePipelineStream(listenerID, pipelineID string) {
+	pipelinesCh.Delete(core.PipelineRuntimeKey(listenerID, pipelineID))
+	if listenerID != "" {
+		pipelinesCh.Delete(pipelineID)
+	}
+}
+
+func deletePipelineStreamIfSame(key string, stream interface{}) bool {
+	if key == "" || stream == nil {
+		return false
+	}
+	return pipelinesCh.CompareAndDelete(key, stream)
+}
+
+func sessionSnapshotsForListener(listenerID string) []*clientpb.Session {
+	if core.Sessions == nil {
+		return nil
+	}
+	snapshots := make([]*clientpb.Session, 0)
+	for _, session := range core.Sessions.All() {
+		if session == nil {
+			continue
+		}
+		snapshot := session.ToProtobufLite()
+		if snapshot.ListenerId == listenerID {
+			snapshots = append(snapshots, snapshot)
+		}
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].SessionId < snapshots[j].SessionId
+	})
+	return snapshots
+}
+
+func syncRecoveredSessions(stream listenerrpc.ListenerRPC_JobStreamServer, listenerID string) error {
+	if err := stream.Send(&clientpb.JobCtrl{
+		Ctrl: core.CtrlListenerSessionSnapshotBegin,
+	}); err != nil {
+		return fmt.Errorf("begin session snapshot for listener %s: %w", listenerID, err)
+	}
+	for _, snapshot := range sessionSnapshotsForListener(listenerID) {
+		if err := stream.Send(&clientpb.JobCtrl{
+			Ctrl:    consts.CtrlListenerSyncSession,
+			Session: snapshot,
+		}); err != nil {
+			return fmt.Errorf("sync session %s to listener %s: %w", snapshot.SessionId, listenerID, err)
+		}
+	}
+	if err := stream.Send(&clientpb.JobCtrl{
+		Ctrl: core.CtrlListenerSessionSnapshotEnd,
+	}); err != nil {
+		return fmt.Errorf("complete session snapshot for listener %s: %w", listenerID, err)
+	}
+	return nil
+}
+
+func (rpc *Server) SpiteStream(stream listenerrpc.ListenerRPC_SpiteStreamServer) error {
+	pipelineID, err := getPipelineID(stream.Context())
+	if err != nil {
+		logs.Log.Error(err.Error())
+		return err
+	}
+	listenerID, _ := getListenerID(stream.Context())
+	pipelineKey := core.PipelineRuntimeKey(listenerID, pipelineID)
+	pipelinesCh.Store(pipelineKey, stream)
+	defer func() {
+		if deletePipelineStreamIfSame(pipelineKey, stream) {
+			logs.Log.Warnf("pipeline %s SpiteStream disconnected, cleaned from pipelinesCh", pipelineKey)
+		} else {
+			logs.Log.Warnf("pipeline %s SpiteStream disconnected, replacement stream kept", pipelineKey)
+		}
+	}()
+
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			logs.Log.Errorf("pipeline %s stream exit: %v", pipelineID, err)
+			return err
+		}
+
+		sess, err := core.Sessions.Get(msg.SessionId)
+		if err != nil {
+			// Session not in memory — try to recover from DB since the implant
+			// is actively sending data, meaning it's still alive.
+			dbSess, dbErr := db.FindSession(msg.SessionId)
+			if dbErr != nil || dbSess == nil {
+				logs.Log.Warnf("session %s not found in memory or DB", msg.SessionId)
+				continue
+			}
+			sess, err = core.RecoverSession(dbSess)
+			if err != nil {
+				logs.Log.Warnf("session %s recovery failed: %v", msg.SessionId, err)
+				continue
+			}
+			activateRecoveredSession(sess)
+			logs.Log.Importantf("session %s recovered from DB via SpiteStream", msg.SessionId)
+		}
+		sess.SetLastCheckin(time.Now().Unix())
+		if sess.MarkAlive() {
+			if err := sess.Save(); err != nil {
+				logs.Log.Errorf("save session %s reborn state failed: %s", sess.ID, err.Error())
+			}
+			target, _, pipelineID := sess.ConnectionSnapshot()
+			sess.Publish(consts.CtrlSessionReborn, fmt.Sprintf("session %s from %s reborn at %s", sess.Abstract(), target, pipelineID), true, true)
+		}
+
+		if size := proto.Size(msg.Spite); size <= 1000 {
+			logs.Log.Debugf("server.%s - receive_spite session=%s name=%s listener=%s spite=%v", sess.ID, sess.ID, msg.Spite.Name, msg.ListenerId, msg.Spite)
+		} else {
+			logs.Log.Debugf("server.%s - receive_spite session=%s name=%s listener=%s bytes=%d", sess.ID, sess.ID, msg.Spite.Name, msg.ListenerId, size)
+		}
+
+		ch, ok := sess.GetResp(msg.TaskId)
+		if !ok {
+			logs.Log.Warnf("response channel missing for session %s task %d", msg.SessionId, msg.TaskId)
+			continue
+		}
+		if err := deliverSpiteResponse(ch, msg.Spite); err != nil {
+			logs.Log.Warnf("deliver spite response failed for session %s task %d: %v", msg.SessionId, msg.TaskId, err)
+		}
+	}
+}
+
+//func (s *Server) ListenerCtrl(req *clientpb.CtrlStatus, stream listenerrpc.ListenerRPC_ListenerCtrlServer) error {
+//	var resp clientpb.CtrlPipeline
+//	for {
+//		if req.CtrlType == consts.CtrlPipelineStart {
+//
+//		} else if req.CtrlType == consts.CtrlPipelineStop {
+//			err := core.Listeners.Stop(req.ListenerID)
+//			if err != nil {
+//				logs.Log.Error(err.Error())
+//			}
+//			resp = clientpb.CtrlPipeline{
+//				ListenerID: req.ListenerID,
+//				CtrlType:     consts.CtrlPipelineStop,
+//			}
+//		}
+//		if err := stream.Send(&resp); err != nil {
+//			return err
+//		}
+//	}
+//}
+
+func (rpc *Server) JobStream(stream listenerrpc.ListenerRPC_JobStreamServer) error {
+	listenerID, err := getListenerID(stream.Context())
+	if err != nil {
+		return err
+	}
+	lns, err := core.Listeners.Get(listenerID)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	defer func() {
+		// Listener disconnected — full cleanup.
+		// Clean up associated SpiteStream entries from pipelinesCh.
+		for _, pipe := range lns.AllPipelines() {
+			deletePipelineStream(pipe.ListenerId, pipe.Name)
+		}
+		// Remove only this stream's listener instance. Remove is identity-safe and
+		// publishes the runtime stop after the listener has left authoritative state.
+		if core.Listeners.Remove(lns) {
+			logs.Log.Warnf("listener %s JobStream disconnected, fully cleaned", listenerID)
+		} else {
+			logs.Log.Debugf("listener %s JobStream cleanup skipped replacement instance", listenerID)
+		}
+	}()
+
+	if err := syncRecoveredSessions(stream, listenerID); err != nil {
+		return err
+	}
+	lns.MarkReady()
+
+	recvMsgCh := make(chan *clientpb.JobStatus)
+	sendErrCh := core.GoGuarded("listener-job-stream-send:"+listenerID, func() error {
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case msg, ok := <-lns.Ctrl:
+				if !ok {
+					return nil
+				}
+				lns.CtrlJob.Store(msg.Id, nil)
+				if err := stream.Send(msg); err != nil {
+					lns.CtrlJob.Delete(msg.Id)
+					lns.DiscardDeferredEvent(msg.Id)
+					return fmt.Errorf("send job ctrl failed: %w", err)
+				}
+			}
+		}
+	}, core.LogGuardedError("listener-job-stream-send:"+listenerID))
+	recvErrCh := core.GoGuarded("listener-job-stream-recv:"+listenerID, func() error {
+		defer close(recvMsgCh)
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				if err == io.EOF {
+					return nil
+				}
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case recvMsgCh <- msg:
+			}
+		}
+	}, core.LogGuardedError("listener-job-stream-recv:"+listenerID))
+	if lns.RuntimeSnapshotReceived() {
+		core.GoGuarded(
+			"listener-runtime-reconcile:"+listenerID,
+			func() error { return rpc.reconcileListenerRuntime(ctx, lns) },
+			core.LogGuardedError("listener-runtime-reconcile:"+listenerID),
+		)
+	}
+
+	var pendingRecvCh <-chan *clientpb.JobStatus = recvMsgCh
+	var pendingSendErrCh <-chan error = sendErrCh
+	var pendingRecvErrCh <-chan error = recvErrCh
+
+	for pendingRecvCh != nil || pendingSendErrCh != nil || pendingRecvErrCh != nil {
+		select {
+		case msg, ok := <-pendingRecvCh:
+			if !ok {
+				cancel()
+				pendingRecvCh = nil
+				continue
+			}
+			handleJobStatus(lns, msg)
+		case err, ok := <-pendingSendErrCh:
+			pendingSendErrCh = nil
+			cancel()
+			if ok && err != nil {
+				return err
+			}
+		case err, ok := <-pendingRecvErrCh:
+			pendingRecvErrCh = nil
+			cancel()
+			if ok && err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (rpc *Server) reconcileListenerRuntime(ctx context.Context, lns *core.Listener) error {
+	if lns == nil {
+		return errors.New("listener is nil")
+	}
+	pipelines, err := db.NewPipelineQuery().
+		WhereListenerID(lns.Name).
+		OrderBy("name ASC").
+		Find()
+	if err != nil {
+		return err
+	}
+
+	desiredEnabled := make(map[string]bool, len(pipelines))
+	for _, pipeline := range pipelines {
+		desiredEnabled[pipeline.Name] = pipeline.Enable
+	}
+
+	var errs []error
+	for _, runtime := range lns.AllPipelines() {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if runtime == nil || desiredEnabled[runtime.GetName()] {
+			continue
+		}
+		ctrl := consts.CtrlPipelineStop
+		switch runtime.GetType() {
+		case consts.WebsitePipeline:
+			ctrl = consts.CtrlWebsiteStop
+		case consts.RemPipeline:
+			ctrl = consts.CtrlRemStop
+		}
+		job := (&core.Job{
+			ID:       core.NextJobID(),
+			Name:     runtime.GetName(),
+			Pipeline: runtime,
+		}).ToProtobuf()
+
+		unlock := lockPipelineLifecycle(lns.Name, runtime.GetName())
+		ctrlID := lns.PushCtrlContext(ctx, &clientpb.JobCtrl{Ctrl: ctrl, Job: job})
+		status := lns.WaitCtrlContext(ctx, ctrlID)
+		unlock()
+		if err := waitForCtrlStatus("reconcile stopped pipeline", runtime.GetName(), status); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		lns.RemovePipeline(runtime)
+		logs.Log.Infof("server - pipeline_reconciled_stopped listener=%s name=%s", lns.Name, runtime.GetName())
+	}
+
+	for _, pipeline := range pipelines {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if !pipeline.Enable {
+			continue
+		}
+		if runtime := lns.GetPipeline(pipeline.Name); runtime != nil && runtime.GetEnable() {
+			continue
+		}
+
+		pipelinePB := pipeline.ToProtobuf()
+		if pipelinePB == nil {
+			errs = append(errs, fmt.Errorf("recover pipeline %s: protobuf is nil", pipeline.Name))
+			continue
+		}
+		pipelinePB.Enable = true
+		if pipeline.Type == consts.WebsitePipeline {
+			if err := MapContents(pipelinePB); err != nil {
+				errs = append(errs, fmt.Errorf("recover website %s: %w", pipeline.Name, err))
+				continue
+			}
+		}
+
+		ctrl := consts.CtrlPipelineStart
+		switch pipeline.Type {
+		case consts.WebsitePipeline:
+			ctrl = consts.CtrlWebsiteStart
+		case consts.RemPipeline:
+			ctrl = consts.CtrlRemStart
+		}
+		job := (&core.Job{
+			ID:       core.NextJobID(),
+			Name:     pipeline.Name,
+			Pipeline: pipelinePB,
+		}).ToProtobuf()
+
+		unlock := lockPipelineLifecycle(lns.Name, pipeline.Name)
+		ctrlID := lns.PushCtrlContext(ctx, &clientpb.JobCtrl{Ctrl: ctrl, Job: job})
+		status := lns.WaitCtrlContext(ctx, ctrlID)
+		unlock()
+		if err := waitForCtrlStatus("recover pipeline", pipeline.Name, status); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		logs.Log.Infof("server - pipeline_recovered listener=%s name=%s", lns.Name, pipeline.Name)
+	}
+	return errors.Join(errs...)
+}
+
+func handleJobStatus(lns *core.Listener, msg *clientpb.JobStatus) {
+	deferredEvent := lns.ConsumeDeferredEvent(msg.CtrlId)
+	if _, ok := lns.CtrlJob.Load(msg.CtrlId); ok {
+		lns.CtrlJob.Store(msg.CtrlId, msg)
+		core.GoGuarded("listener-job-status-cleanup", func() error {
+			time.Sleep(1 * time.Second)
+			lns.CtrlJob.Delete(msg.CtrlId)
+			return nil
+		}, core.LogGuardedError("listener-job-status-cleanup"))
+	}
+	if msg.Ctrl == consts.CtrlPipelineSync {
+		return
+	}
+	if msg.Status == consts.CtrlStatusSuccess {
+		if deferredEvent && publishesAfterPersistence(msg.Ctrl) {
+			return
+		}
+		core.EventBroker.Publish(core.Event{
+			EventType: consts.EventJob,
+			Op:        msg.Ctrl,
+			IsNotify:  true,
+			Job:       msg.Job,
+			Important: true,
+		})
+		return
+	}
+	core.EventBroker.Publish(core.Event{
+		EventType: consts.EventJob,
+		Op:        msg.Ctrl,
+		Err:       fmt.Sprintf("%s faild,status %d,  %s", msg.Job.Name, msg.Status, msg.Error),
+		IsNotify:  true,
+		Important: true,
+	})
+}
+
+func publishesAfterPersistence(operation string) bool {
+	switch operation {
+	case consts.CtrlPipelineStart,
+		consts.CtrlPipelineStop,
+		consts.CtrlRemStart,
+		consts.CtrlRemStop,
+		consts.CtrlWebsiteStart,
+		consts.CtrlWebsiteStop,
+		consts.CtrlWebContentAdd,
+		consts.CtrlWebContentUpdate,
+		consts.CtrlWebContentRemove:
+		return true
+	default:
+		return false
+	}
+}
+
+func deliverSpiteResponse(ch chan *implantpb.Spite, spite *implantpb.Spite) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = core.RecoverError("listener-spite-response", recovered)
+		}
+	}()
+
+	select {
+	case ch <- spite:
+		return nil
+	default:
+		return fmt.Errorf("response channel full")
+	}
+}
+
+func (rpc *Server) ListJobs(ctx context.Context, req *clientpb.Empty) (*clientpb.Pipelines, error) {
+	var pipelines []*clientpb.Pipeline
+	for _, job := range core.Jobs.All() {
+		pipelines = append(pipelines, job.Pipeline)
+	}
+	return &clientpb.Pipelines{Pipelines: pipelines}, nil
+}

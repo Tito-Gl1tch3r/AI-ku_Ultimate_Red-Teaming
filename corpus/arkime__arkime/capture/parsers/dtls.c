@@ -1,0 +1,477 @@
+/* Copyright 2019 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#define OPENSSL_SUPPRESS_DEPRECATED
+#include <openssl/sha.h>
+#include "arkime.h"
+
+//#define DTLSDEBUG 1
+
+extern ArkimeConfig_t        config;
+extern uint8_t               arkime_char_to_hexstr[256][3];
+
+LOCAL uint32_t tls_process_server_certificate_func;
+LOCAL uint32_t dtls_process_server_hello_func;
+LOCAL uint32_t dtls_process_client_hello_func;
+
+LOCAL  int                   ja4Field;
+LOCAL  int                   ja4RawField;
+
+LOCAL  gboolean              ja4Raw;
+
+/******************************************************************************/
+// https://tools.ietf.org/html/draft-davidben-tls-grease-00
+LOCAL int dtls_is_grease_value(uint32_t val)
+{
+    if ((val & 0x0f) != 0x0a)
+        return 0;
+
+    if ((val & 0xff) != ((val >> 8) & 0xff))
+        return 0;
+
+    return 1;
+}
+/******************************************************************************/
+// JA4 encodes the first/last ALPN bytes, hex-escaping non-alphanumeric values
+LOCAL void dtls_alpn_to_ja4alpn(const uint8_t *alpn, int len, uint8_t *ja4alpn)
+{
+    if (len == 0)
+        return;
+
+    len--;  // len now the offset of last byte, which could be 0
+    if (isalnum(alpn[0]) && isalnum(alpn[len])) {
+        ja4alpn[0] = alpn[0];
+        ja4alpn[1] = alpn[len];
+    } else {
+        ja4alpn[0] = arkime_char_to_hexstr[alpn[0]][0];
+        ja4alpn[1] = arkime_char_to_hexstr[alpn[len]][1];
+    }
+}
+/******************************************************************************/
+LOCAL void dtls_ja4_version(uint16_t ver, char vstr[3])
+{
+    switch (ver) {
+    case 0x0002:
+        memcpy(vstr, "s2", 3);
+        break;
+    case 0x0300:
+        memcpy(vstr, "s3", 3);
+        break;
+    case 0x0301:
+        memcpy(vstr, "10", 3);
+        break;
+    case 0x0302:
+        memcpy(vstr, "11", 3);
+        break;
+    case 0x0303:
+        memcpy(vstr, "12", 3);
+        break;
+    case 0x0304:
+        memcpy(vstr, "13", 3);
+        break;
+    case 0xfeff:
+        memcpy(vstr, "d1", 3);
+        break;
+    case 0xfefd:
+        memcpy(vstr, "d2", 3);
+        break;
+    case 0xfefc:
+        memcpy(vstr, "d3", 3);
+        break;
+    default:
+        memcpy(vstr, "00", 3);
+        break;
+    }
+}
+/******************************************************************************/
+LOCAL void dtls_2digit_to_string(int val, char *str)
+{
+    if (val >= 99) {
+        str[0] = '9';
+        str[1] = '9';
+        return;
+    }
+    str[0] = (val / 10) + '0';
+    str[1] = (val % 10) + '0';
+}
+/******************************************************************************/
+// Comparison function for qsort
+LOCAL int compare_uint16_t(const void *a, const void *b)
+{
+    return (*(const uint16_t *)a < * (const uint16_t *)b ? -1 : * (const uint16_t *)a > *(const uint16_t *)b);
+}
+/******************************************************************************/
+LOCAL uint32_t dtls_process_client_hello(ArkimeSession_t *session, const uint8_t *data, int len, void UNUSED(*uw))
+{
+    char     ja4HasSNI = 'i';
+    uint16_t ja4Ciphers[256];
+    uint16_t ja4NumCiphers = 0;
+    uint16_t ja4NumExtensions = 0;
+    uint16_t ja4Extensions[256];
+    uint16_t ja4NumExtensionsSome = 0;
+    uint16_t ja4NumAlgos = 0;
+    uint16_t ja4Algos[256];
+    uint8_t  ja4ALPN[2] = {'0', '0'};
+
+    BSB cbsb;
+    BSB_INIT(cbsb, data, len);
+
+    uint16_t ver = 0;
+    BSB_IMPORT_u16(cbsb, ver);
+
+
+    if (BSB_IS_ERROR(cbsb) || BSB_REMAINING(cbsb) <= 32) {
+        return -1;
+    }
+
+    BSB_IMPORT_skip(cbsb, 32);     // Random
+
+    int skiplen = 0;
+    BSB_IMPORT_u08(cbsb, skiplen);   // Session Id Length
+    BSB_IMPORT_skip(cbsb, skiplen);  // Session Id
+
+    BSB_IMPORT_u08(cbsb, skiplen);   // Cookie Length
+    BSB_IMPORT_skip(cbsb, skiplen);  // Cookie
+
+    BSB_IMPORT_u16(cbsb, skiplen);   // Cipher Suites Length
+    while (BSB_NOT_ERROR(cbsb) && skiplen >= 2) {
+        uint16_t c = 0;
+        BSB_IMPORT_u16(cbsb, c);
+        if (!dtls_is_grease_value(c)) {
+            if (ja4NumCiphers < ARRAY_LEN(ja4Ciphers)) {
+                ja4Ciphers[ja4NumCiphers] = c;
+                ja4NumCiphers++;
+            }
+        }
+        skiplen -= 2;
+    }
+    BSB_IMPORT_skip(cbsb, skiplen);  // Odd declared length leaves a trailing byte
+    BSB_IMPORT_u08(cbsb, skiplen);   // Compression Length
+    BSB_IMPORT_skip(cbsb, skiplen);  // Compressions
+
+    if (BSB_REMAINING(cbsb) >= 6) {
+        int etotlen = 0;
+        BSB_IMPORT_u16(cbsb, etotlen);  // Extensions Length
+
+        etotlen = MIN(etotlen, BSB_REMAINING(cbsb));
+
+        BSB ebsb;
+        BSB_IMPORT_bsb(cbsb, ebsb, etotlen);
+
+        while (BSB_REMAINING(ebsb) >= 4) {
+            uint16_t etype = 0, elen = 0;
+
+            BSB_IMPORT_u16(ebsb, etype);
+            BSB_IMPORT_u16(ebsb, elen);
+
+            if (dtls_is_grease_value(etype)) {
+                BSB_IMPORT_skip(ebsb, elen);
+                continue;
+            }
+
+            ja4NumExtensions++;
+            if (ja4NumExtensionsSome < ARRAY_LEN(ja4Extensions)) {
+                ja4Extensions[ja4NumExtensionsSome] = etype;
+                ja4NumExtensionsSome++;
+            }
+
+            if (elen > BSB_REMAINING(ebsb))
+                break;
+
+            if (etype == 0) { // SNI
+                if (ja4NumExtensionsSome > 0)
+                    ja4NumExtensionsSome--;
+                BSB bsb;
+                BSB_IMPORT_bsb(ebsb, bsb, elen);
+
+                int sni = 0;
+                BSB_IMPORT_u16(bsb, sni); // list len
+                if (sni != BSB_REMAINING(bsb))
+                    continue;
+
+                BSB_IMPORT_u08(bsb, sni); // type
+                if (sni != 0)
+                    continue;
+
+                BSB_IMPORT_u16(bsb, sni); // len
+                if (sni != BSB_REMAINING(bsb))
+                    continue;
+
+                //arkime_field_string_add(hostField, session, (char *)BSB_WORK_PTR(bsb), sni, TRUE);
+                ja4HasSNI = 'd';
+            } else if (etype == 0x000d) { // Signature Algorithms
+                BSB bsb;
+                BSB_IMPORT_bsb(ebsb, bsb, elen);
+
+                uint16_t llen = 0;
+                BSB_IMPORT_u16(bsb, llen); // list len
+                BSB_SHRINK_REMAINING(bsb, llen);
+                while (BSB_REMAINING(bsb) >= 2) {
+                    uint16_t a = 0;
+                    BSB_IMPORT_u16(bsb, a);
+                    if (!dtls_is_grease_value(a) && ja4NumAlgos < ARRAY_LEN(ja4Algos))
+                        ja4Algos[ja4NumAlgos++] = a;
+                }
+            } else if (etype == 0x10) { // ALPN
+                if (ja4NumExtensionsSome > 0)
+                    ja4NumExtensionsSome--;
+                BSB bsb;
+                BSB_IMPORT_bsb(ebsb, bsb, elen);
+
+                BSB_IMPORT_skip(bsb, 2);  // len
+                uint8_t alen = 0;
+                BSB_IMPORT_u08(bsb, alen);  // len
+                const uint8_t *astr = NULL;
+                BSB_IMPORT_ptr(bsb, astr, alen);
+                if (alen > 0 && astr && !BSB_IS_ERROR(bsb)) {
+                    dtls_alpn_to_ja4alpn(astr, alen, ja4ALPN);
+                }
+            } else if (etype == 0x2b) { // etype 0x2b is supported version
+                BSB bsb;
+                BSB_IMPORT_bsb(ebsb, bsb, elen);
+
+                uint16_t llen = 0;
+                BSB_IMPORT_u08(bsb, llen); // list len
+                BSB_SHRINK_REMAINING(bsb, llen);
+                while (BSB_REMAINING(bsb) >= 2) {
+                    uint16_t supported_version = 0;
+                    BSB_IMPORT_u16(bsb, supported_version);
+                    if (!dtls_is_grease_value(supported_version)) {
+                        // DTLS version numbers are inverted (DTLS 1.3 = 0xfefc <
+                        // DTLS 1.2 = 0xfefd < DTLS 1.0 = 0xfeff), so the newest
+                        // offered version is the numerically smallest one.
+                        if (ver == 0)
+                            ver = supported_version;
+                        else
+                            ver = MIN(supported_version, ver);
+                    }
+                }
+            } else {
+                BSB_IMPORT_skip(ebsb, elen);
+            }
+        }
+    }
+
+    char vstr[3];
+    dtls_ja4_version(ver, vstr);
+
+    char ja4_r[4096];
+    BSB ja4_rbsb;
+    BSB_INIT(ja4_rbsb, ja4_r, sizeof(ja4_r));
+
+    char ja4[37];
+    ja4[36] = 0;
+    ja4[0] = 'd';
+    ja4[1] = vstr[0];
+    ja4[2] = vstr[1];
+    ja4[3] = ja4HasSNI;
+    dtls_2digit_to_string(ja4NumCiphers, ja4 + 4);
+    dtls_2digit_to_string(ja4NumExtensions, ja4 + 6);
+    ja4[8] = ja4ALPN[0];
+    ja4[9] = ja4ALPN[1];
+    ja4[10] = '_';
+
+    BSB_EXPORT_ptr(ja4_rbsb, ja4, 11);
+
+    // Sized for the larger of the cipher leg and the extensions+algos leg
+    char tmpBuf[5 * ARRAY_LEN(ja4Extensions) + 1 + 5 * ARRAY_LEN(ja4Algos) + 5 * ARRAY_LEN(ja4Ciphers)];
+    BSB tmpBSB;
+
+    // Sort ciphers, convert to hex, first 12 bytes of sha256
+    qsort(ja4Ciphers, ja4NumCiphers, 2, compare_uint16_t);
+    BSB_INIT(tmpBSB, tmpBuf, sizeof(tmpBuf));
+    for (int i = 0; i < ja4NumCiphers; i++) {
+        BSB_EXPORT_sprintf(tmpBSB, "%04x,", ja4Ciphers[i]);
+    }
+    if (ja4NumCiphers > 0) {
+        BSB_EXPORT_rewind(tmpBSB, 1); // Remove last ,
+        BSB_EXPORT_ptr(ja4_rbsb, tmpBuf, BSB_LENGTH(tmpBSB));
+    }
+
+    BSB_EXPORT_u08(ja4_rbsb, '_');
+
+    uint8_t digest[SHA256_DIGEST_LENGTH];
+    char    hex[SHA256_DIGEST_LENGTH * 2 + 1];
+
+    if (BSB_LENGTH(tmpBSB) > 0) {
+        SHA256((uint8_t *)tmpBuf, BSB_LENGTH(tmpBSB), digest);
+        arkime_sprint_hex_string(hex, digest, 6);
+        memcpy(ja4 + 11, hex, 12);
+    } else {
+        memcpy(ja4 + 11, "000000000000", 12);
+    }
+
+    ja4[23] = '_';
+
+    // Sort the extensions, convert to hex, add unsorted Algos, first 12 bytes of sha256
+    qsort(ja4Extensions, ja4NumExtensionsSome, 2, compare_uint16_t);
+    BSB_INIT(tmpBSB, tmpBuf, sizeof(tmpBuf));
+    for (int i = 0; i < ja4NumExtensionsSome; i++) {
+        BSB_EXPORT_sprintf(tmpBSB, "%04x,", ja4Extensions[i]);
+    }
+    if (ja4NumExtensionsSome > 0) {
+        BSB_EXPORT_rewind(tmpBSB, 1); // Remove last ,
+    }
+    if (ja4NumAlgos > 0) {
+        BSB_EXPORT_u08(tmpBSB, '_');
+        for (int i = 0; i < ja4NumAlgos; i++) {
+            BSB_EXPORT_sprintf(tmpBSB, "%04x,", ja4Algos[i]);
+        }
+        BSB_EXPORT_rewind(tmpBSB, 1); // Remove last ,
+    }
+
+    BSB_EXPORT_ptr(ja4_rbsb, tmpBuf, BSB_LENGTH(tmpBSB));
+    BSB_EXPORT_u08(ja4_rbsb, 0);
+
+    if (BSB_LENGTH(tmpBSB) > 0) {
+        SHA256((uint8_t *)tmpBuf, BSB_LENGTH(tmpBSB), digest);
+        arkime_sprint_hex_string(hex, digest, 6);
+        memcpy(ja4 + 24, hex, 12);
+    } else {
+        memcpy(ja4 + 24, "000000000000", 12);
+    }
+
+    // Add the field
+    arkime_field_string_add(ja4Field, session, ja4, 36, TRUE);
+    if (ja4Raw && BSB_NOT_ERROR(ja4_rbsb)) {
+        arkime_field_string_add(ja4RawField, session, ja4_r, BSB_LENGTH(ja4_rbsb) - 1, TRUE);
+    }
+    return 0;
+}
+
+/******************************************************************************/
+LOCAL void dtls_handshake(ArkimeSession_t *session, uint8_t handshakeType, const uint8_t *data, int len)
+{
+    switch (handshakeType) {
+    case 1: // client hello
+        arkime_parsers_call_named_func(dtls_process_client_hello_func, session, data, len, NULL);
+        break;
+    case 2: // server hello
+        arkime_parsers_call_named_func(dtls_process_server_hello_func, session, data, len, NULL);
+        break;
+    case 11: // Certificate
+        arkime_parsers_call_named_func(tls_process_server_certificate_func, session, data, len, NULL);
+        break;
+    }
+}
+/******************************************************************************/
+// Append a handshake fragment in order, returns TRUE once the whole message is buffered.
+// state is the message being reassembled, (msgSeq << 8 | type) + 1
+LOCAL gboolean dtls_fragment(ArkimeParserBuf_t *pb, int which, uint8_t handshakeType, uint16_t msgSeq, uint32_t handshakeLen,
+                             uint32_t frameOffset, const uint8_t *data, uint32_t fragmentLength)
+{
+    if (handshakeLen > pb->bufMax || frameOffset + fragmentLength > handshakeLen)
+        return FALSE;
+
+    const int key = ((msgSeq << 8) | handshakeType) + 1;
+    if (pb->state[which] != key) {
+        arkime_parser_buf_del(pb, which, pb->len[which]);
+        pb->state[which] = key;
+    }
+
+    // Fragment past a gap, drop it
+    if ((int)frameOffset > pb->len[which])
+        return FALSE;
+
+    const int end = frameOffset + fragmentLength;
+    if (end > pb->len[which])
+        arkime_parser_buf_add(pb, which, data + (pb->len[which] - frameOffset), end - pb->len[which]);
+
+    return pb->len[which] >= (int)handshakeLen;
+}
+/******************************************************************************/
+LOCAL int dtls_udp_parser(ArkimeSession_t *session, void *uw, const uint8_t *data, int len, int which)
+{
+    ArkimeParserBuf_t *pb = uw;
+    BSB bbuf;
+
+    if (len < 13)
+        return 0;
+
+    // 22 is handshake
+    if (data[0] != 22) {
+        arkime_parsers_unregister(session, uw);
+        return 0;
+    }
+
+    BSB_INIT(bbuf, data, len);
+
+    while (BSB_NOT_ERROR(bbuf) && BSB_REMAINING(bbuf) >= 13) {
+        BSB_IMPORT_skip(bbuf, 11);
+        uint16_t tlen = 0;
+        BSB_IMPORT_u16(bbuf, tlen);
+
+        if (tlen > BSB_REMAINING(bbuf))
+            return 0;
+
+        BSB msgBuf;
+        BSB_IMPORT_bsb(bbuf, msgBuf, tlen);
+
+        while (BSB_NOT_ERROR(bbuf) && BSB_NOT_ERROR(msgBuf) && BSB_REMAINING(msgBuf) > 12) {
+            uint8_t handshakeType = 0;
+            BSB_IMPORT_u08(msgBuf, handshakeType);
+            uint32_t handshakeLen = 0;
+            BSB_IMPORT_u24(msgBuf, handshakeLen);
+            uint16_t msgSeq = 0;
+            BSB_IMPORT_u16(msgBuf, msgSeq);
+            uint32_t frameOffset = 0;
+            BSB_IMPORT_u24(msgBuf, frameOffset);
+            uint32_t fragmentLength = 0;
+            BSB_IMPORT_u24(msgBuf, fragmentLength);
+
+            // Not enough data left
+            if (BSB_IS_ERROR(msgBuf) || fragmentLength > BSB_REMAINING(msgBuf))
+                break;
+
+            if (frameOffset == 0 && fragmentLength >= handshakeLen) {
+                dtls_handshake(session, handshakeType, BSB_WORK_PTR(msgBuf), fragmentLength);
+            } else if (dtls_fragment(pb, which, handshakeType, msgSeq, handshakeLen, frameOffset, BSB_WORK_PTR(msgBuf), fragmentLength)) {
+                dtls_handshake(session, handshakeType, pb->buf[which], handshakeLen);
+                arkime_parser_buf_del(pb, which, pb->len[which]);
+                pb->state[which] = 0;
+            }
+            BSB_IMPORT_skip(msgBuf, fragmentLength);
+        }
+    }
+
+    return 0;
+}
+/******************************************************************************/
+LOCAL void dtls_udp_classify(ArkimeSession_t *session, const uint8_t *data, int len, int UNUSED(which), void *UNUSED(uw))
+{
+    if (len < 100 || data[13] != 1)
+        return;
+    if (arkime_parsers_has_registered(session, dtls_udp_parser))
+        return;
+    arkime_session_add_protocol(session, "dtls");
+    ArkimeParserBuf_t *pb = arkime_parser_buf_create2(1024, 0xffff);
+    arkime_parsers_register(session, dtls_udp_parser, pb, arkime_parser_buf_session_free);
+}
+/******************************************************************************/
+void arkime_parser_init()
+{
+    arkime_parsers_classifier_register_udp("dtls", NULL, 0, (const uint8_t *)"\x16\x01\x00", 3, dtls_udp_classify);
+    arkime_parsers_classifier_register_udp("dtls", NULL, 0, (const uint8_t *)"\x16\xfe\xff", 3, dtls_udp_classify);
+    arkime_parsers_classifier_register_udp("dtls", NULL, 0, (const uint8_t *)"\x16\xfe\xfe", 3, dtls_udp_classify);
+    arkime_parsers_classifier_register_udp("dtls", NULL, 0, (const uint8_t *)"\x16\xfe\xfd", 3, dtls_udp_classify);
+
+    tls_process_server_certificate_func = arkime_parsers_get_named_func("tls_process_server_certificate");
+
+    ja4Raw = arkime_config_boolean(NULL, "ja4Raw", FALSE);
+
+    ja4Field = arkime_field_define("tls", "lotermfield",
+                                   "tls.ja4", "JA4", "tls.ja4",
+                                   "SSL/TLS JA4 field",
+                                   ARKIME_FIELD_TYPE_STR_GHASH,  ARKIME_FIELD_FLAG_CNT,
+                                   (char *)NULL);
+
+    ja4RawField = arkime_field_define("tls", "lotermfield",
+                                      "tls.ja4_r", "JA4_r", "tls.ja4_r",
+                                      "SSL/TLS JA4_r field",
+                                      ARKIME_FIELD_TYPE_STR_GHASH,  ARKIME_FIELD_FLAG_CNT,
+                                      (char *)NULL);
+
+    dtls_process_server_hello_func = arkime_parsers_get_named_func("dtls_process_server_hello");
+    dtls_process_client_hello_func = arkime_parsers_add_named_func("dtls_process_client_hello", dtls_process_client_hello);
+}

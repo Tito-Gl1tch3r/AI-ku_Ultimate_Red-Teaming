@@ -1,0 +1,100 @@
+package com.six2dez.burp.aiagent.ui
+
+import java.awt.Color
+import java.awt.Font
+import javax.swing.UIManager
+
+/**
+ * Legacy theme object retained as a call-site shim.
+ *
+ * Canonical design tokens are now defined in
+ * `com.six2dez.burp.aiagent.ui.design.DesignTokens` (added in Phase 9).
+ * This object is preserved so that existing callers in `SettingsPanel`, `BackendConfigPanel`,
+ * `AccordionPanel`, `SubtleNotice`, `ToggleSwitch`, `ActionCard`, and `ChatPanel` continue to
+ * compile and behave identically without any migration in this phase. Phase 11 will align
+ * the two name-spaces and remove this shim once all call sites are migrated.
+ *
+ * Do NOT add new color/typography roles here — add them to `DesignTokens` instead.
+ */
+object UiTheme {
+    val isDarkTheme: Boolean
+        get() {
+            val bg = Colors.surface
+            // Simple luminance calculation
+            val luminance = (0.299 * bg.red + 0.587 * bg.green + 0.114 * bg.blue) / 255
+            return luminance < 0.5
+        }
+
+    /**
+     * Legacy color tokens. Canonical equivalents are in `DesignTokens.Colors`.
+     *
+     * Naming differences (legacy → canonical):
+     * - `outline` → `border`
+     * - `outlineVariant` → `borderSubtle`
+     * - `statusRunning` → `statusSuccess`
+     * - `statusCrashed` → `statusError`
+     * - `statusTerminal` → `statusWarning`
+     *
+     * Chat-specific and banner colors below have no canonical equivalent in `DesignTokens`
+     * (FLAG-01); they are preserved here for `ChatPanel` and banner components.
+     */
+    object Colors {
+        val primary: Color get() = UIManager.getColor("Burp.primaryButtonBackground") ?: Color(0xD86633)
+        val onPrimary: Color get() = UIManager.getColor("Burp.primaryButtonForeground") ?: Color.WHITE
+        val surface: Color get() = UIManager.getColor("Panel.background") ?: Color(0xFFFBFF)
+        val onSurface: Color get() = UIManager.getColor("Label.foreground") ?: Color(0x1A1A1A)
+        val onSurfaceVariant: Color get() = UIManager.getColor("Label.disabledForeground") ?: Color(0x666666)
+        val outline: Color get() = UIManager.getColor("Component.borderColor") ?: Color(0xCCCCCC)
+        val outlineVariant: Color get() = UIManager.getColor("Separator.foreground") ?: Color(0xE0E0E0)
+        val statusRunning: Color get() = UIManager.getColor("Burp.successColor") ?: Color(0x1B9E5A)
+        val statusCrashed: Color get() = UIManager.getColor("Burp.errorColor") ?: Color(0xB3261E)
+        val statusTerminal: Color get() = UIManager.getColor("Burp.warningColor") ?: Color(0xF57C00)
+        val inputBackground: Color get() = UIManager.getColor("TextField.background") ?: Color.WHITE
+        val inputForeground: Color get() = UIManager.getColor("TextField.foreground") ?: Color(0x1A1A1A)
+        val comboBackground: Color get() = UIManager.getColor("ComboBox.background") ?: Color.WHITE
+        val comboForeground: Color get() = UIManager.getColor("ComboBox.foreground") ?: Color(0x1A1A1A)
+
+        // Chat bubble colors
+        val userBubble: Color get() = if (isDarkTheme) Color(0x264653) else Color(0xDCF8C6)
+        val aiBubble: Color get() = if (isDarkTheme) Color(0x3D3D3D) else Color(0xFFFFFF)
+        val userRole: Color get() = if (isDarkTheme) Color(0x81C784) else Color(0x2E7D32)
+        val aiRole: Color get() = if (isDarkTheme) Color(0xFFB74D) else primary
+
+        // Banner
+        val warningBannerBg: Color get() = if (isDarkTheme) Color(0x3E2723) else Color(0xFFF3CD)
+        val warningBannerFg: Color get() = if (isDarkTheme) Color(0xFFCC80) else onSurface
+
+        // Subtle notice palette — softer than `warningBannerBg` for in-panel advisories. The accent
+        // colors below are reused as the left-border accent strip on `SubtleNotice`.
+        val subtleWarning: Color get() = if (isDarkTheme) Color(0x3E2723) else Color(0xFFF8E1)
+        val subtleDanger: Color get() = if (isDarkTheme) Color(0x3D1F1F) else Color(0xFDECEA)
+        val accentWarn: Color get() = statusTerminal
+        val accentDanger: Color get() = statusCrashed
+
+        // Code blocks
+        val codeBlockBg: Color get() = if (isDarkTheme) Color(0x2D2D2D) else Color(0xF0F0F0)
+        val inlineCodeBg: Color get() = if (isDarkTheme) Color(0x3C3C3C) else Color(0xE0E0E0)
+    }
+
+    /**
+     * Legacy typography roles. Canonical equivalents are in `DesignTokens.Typography`.
+     *
+     * Naming differences (legacy → canonical):
+     * - `title` → `sectionTitle` (in DesignTokens)
+     *
+     * Chat-specific roles (`chatBody`) and `headline` have no canonical equivalent in
+     * `DesignTokens`; they are preserved here for `ChatPanel` and other consumers.
+     */
+    object Typography {
+        private val baseFont: Font get() = UIManager.getFont("Label.font") ?: Font("SansSerif", Font.PLAIN, 14)
+        private val baseSize: Int get() = baseFont.size
+        private val textAreaFont: Font get() = UIManager.getFont("TextArea.font") ?: baseFont
+
+        val headline: Font get() = baseFont.deriveFont(Font.BOLD, (baseSize * 1.8f))
+        val title: Font get() = baseFont.deriveFont(Font.BOLD, (baseSize * 1.2f))
+        val body: Font get() = baseFont.deriveFont(Font.PLAIN, baseSize.toFloat())
+        val label: Font get() = baseFont.deriveFont(Font.BOLD, baseSize.toFloat())
+        val mono: Font get() = UIManager.getFont("TextArea.font") ?: Font("Monospaced", Font.PLAIN, baseSize)
+        val chatBody: Font get() = textAreaFont.deriveFont(Font.PLAIN, textAreaFont.size.toFloat())
+    }
+}

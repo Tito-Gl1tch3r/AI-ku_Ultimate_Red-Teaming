@@ -1,0 +1,239 @@
+use super::*;
+
+#[test]
+fn test_all_non_empty() {
+    assert!(!all().is_empty());
+}
+
+#[test]
+fn test_every_gadget_has_template_and_label() {
+    for g in all() {
+        assert!(
+            !g.template.is_empty(),
+            "gadget {} has empty template",
+            g.label
+        );
+        assert!(!g.label.is_empty(), "a gadget has an empty label");
+        // A gadget must be reachable somehow: either via a host allowlist or
+        // under strict-dynamic. An entry with neither would be dead.
+        assert!(
+            !g.host_patterns.is_empty() || g.strict_dynamic,
+            "gadget {} is unreachable (no host patterns and not strict-dynamic)",
+            g.label
+        );
+    }
+}
+
+#[test]
+fn test_host_patterns_are_lowercase() {
+    for g in all() {
+        for p in g.host_patterns {
+            assert_eq!(
+                *p,
+                p.to_ascii_lowercase(),
+                "host pattern {p:?} for {} must be lowercase (matching lowercases the origin)",
+                g.label
+            );
+        }
+    }
+}
+
+#[test]
+fn test_host_component_extracts_host() {
+    let cases = [
+        (
+            "https://ajax.googleapis.com/ajax/libs/jquery.js",
+            "ajax.googleapis.com",
+        ),
+        ("http://localhost:8080/x", "localhost"),
+        ("//cdn.example.com/lib.js", "cdn.example.com"),
+        ("example.com", "example.com"),
+        ("https://a.com/p?x=1#frag", "a.com"),
+    ];
+
+    for (origin, expected) in cases {
+        assert_eq!(host_component(origin), expected, "origin: {origin}");
+    }
+}
+
+#[test]
+fn test_host_matches_dotted_pattern_exact_match() {
+    assert!(host_matches("googleapis.com", "googleapis.com"));
+}
+
+#[test]
+fn test_host_matches_dotted_pattern_subdomain_match() {
+    assert!(host_matches("ajax.googleapis.com", "googleapis.com"));
+}
+
+#[test]
+fn test_host_matches_dotted_pattern_requires_label_boundary() {
+    assert!(!host_matches("notgoogleapis.com", "googleapis.com"));
+}
+
+#[test]
+fn test_host_matches_dotted_pattern_must_be_terminal_suffix() {
+    assert!(!host_matches("googleapis.com.spoof.test", "googleapis.com"));
+}
+
+#[test]
+fn test_host_matches_bare_fragment_substring_match() {
+    assert!(host_matches("code.jquery.com", "jquery"));
+}
+
+#[test]
+fn test_host_matches_bare_fragment_intentionally_matches_untrusted_substring() {
+    // Bare library fragments intentionally use loose substring matching, even
+    // when the matching host is not a trusted library domain.
+    assert!(host_matches("evil-jquery-cdn.attacker.com", "jquery"));
+}
+
+#[test]
+fn test_host_matches_bare_fragment_non_match() {
+    assert!(!host_matches("example.com", "jquery"));
+}
+
+#[test]
+fn test_gadgets_for_host_matches_cdnjs() {
+    let hits: Vec<_> = gadgets_for_host("https://cdnjs.cloudflare.com").collect();
+    assert!(hits.iter().any(|g| g.template.contains("angular")));
+}
+
+#[test]
+fn test_gadgets_for_host_matches_google_jsonp() {
+    let hits: Vec<_> = gadgets_for_host("https://ajax.googleapis.com").collect();
+    assert!(
+        hits.iter()
+            .any(|g| g.template.contains("google.com/complete/search"))
+    );
+}
+
+#[test]
+fn test_gadgets_for_host_matches_jquery_globaleval() {
+    let hits: Vec<_> = gadgets_for_host("https://code.jquery.com").collect();
+    assert!(hits.iter().any(|g| g.template.contains("globalEval")));
+}
+
+#[test]
+fn test_gadgets_for_host_matches_jsdelivr() {
+    let hits: Vec<_> = gadgets_for_host("https://cdn.jsdelivr.net").collect();
+    assert!(hits.iter().any(|g| g.template.contains("jsdelivr.net")));
+}
+
+#[test]
+fn test_gadgets_for_host_unknown_returns_empty() {
+    let hits: Vec<_> = gadgets_for_host("https://example.com").collect();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn test_gadgets_for_host_does_not_overmatch_lookalike_domain() {
+    // `notgoogle.com` merely *contains* `google.com` as a substring — a dotted
+    // domain pattern must match on a domain boundary, not loosely.
+    assert!(gadgets_for_host("https://notgoogle.com").next().is_none());
+    assert!(
+        gadgets_for_host("https://jsdelivr.net.evil.com")
+            .next()
+            .is_none()
+    );
+    assert!(
+        gadgets_for_host("https://cdnjs.cloudflare.com.attacker.test")
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn test_gadgets_for_host_matches_subdomain_of_domain_pattern() {
+    // A genuine subdomain of a dotted pattern still matches.
+    assert!(
+        gadgets_for_host("https://ajax.googleapis.com")
+            .next()
+            .is_some()
+    );
+    assert!(
+        gadgets_for_host("https://sub.cdn.jsdelivr.net")
+            .next()
+            .is_some()
+    );
+}
+
+#[test]
+fn test_gadgets_for_host_strips_port_and_path() {
+    assert!(
+        gadgets_for_host("https://code.jquery.com:443/jquery.js")
+            .next()
+            .is_some()
+    );
+}
+
+#[test]
+fn test_gadgets_for_host_handles_wildcard_and_schemeless() {
+    assert!(gadgets_for_host("*.googleapis.com").next().is_some());
+    assert!(gadgets_for_host("//cdn.jsdelivr.net").next().is_some());
+}
+
+/// A `*.D` wildcard allows any subdomain of `D`, so a gadget whose ONLY
+/// matching pattern is a deeper subdomain (`cdnjs.cloudflare.com`, with no bare
+/// `cloudflare.com` parent pattern) must still be found — the base collapsing
+/// to `cloudflare.com` previously missed it.
+#[test]
+fn test_gadgets_for_host_wildcard_matches_deeper_subdomain_gadget() {
+    let hits: Vec<_> = gadgets_for_host("https://*.cloudflare.com").collect();
+    assert!(
+        hits.iter().any(|g| g.template.contains("angular")),
+        "*.cloudflare.com allows cdnjs.cloudflare.com, so the AngularJS gadget must match"
+    );
+    // But a wildcard over an unrelated domain must not pull in those gadgets.
+    assert!(
+        gadgets_for_host("https://*.attacker.test").next().is_none(),
+        "a wildcard over an unrelated domain must not over-match gadget hosts"
+    );
+}
+
+#[test]
+fn test_gadgets_for_host_is_case_insensitive() {
+    let hits: Vec<_> = gadgets_for_host("HTTPS://CODE.JQUERY.COM").collect();
+    assert!(!hits.is_empty());
+}
+
+#[test]
+fn test_strict_dynamic_gadgets_non_empty() {
+    let g: Vec<_> = strict_dynamic_gadgets().collect();
+    assert!(!g.is_empty());
+    assert!(g.iter().all(|x| x.strict_dynamic));
+}
+
+#[test]
+fn test_strict_dynamic_includes_requirejs_and_document_write() {
+    let g: Vec<_> = strict_dynamic_gadgets().collect();
+    assert!(g.iter().any(|x| x.template.contains("data-main")));
+    assert!(g.iter().any(|x| x.template.contains("document.write")));
+}
+
+#[test]
+fn test_pure_dom_gadget_has_no_host_patterns() {
+    // The document.write gadget must work regardless of host allowlist.
+    let dw = all()
+        .iter()
+        .find(|g| g.template.contains("document.write"))
+        .expect("document.write gadget present");
+    assert!(dw.host_patterns.is_empty());
+    assert!(dw.strict_dynamic);
+}
+
+#[test]
+fn test_no_template_leaves_unrendered_marker_after_render() {
+    // Sanity: every embedded template, once rendered, has no leftover
+    // reflection-marker placeholders (guards against a typo like `{CLAS}`).
+    // Note: framework gadgets legitimately contain `{{ }}` interpolation, so we
+    // check specifically for the `{CLASS}` / `{ID}` tokens, not bare braces.
+    for g in all() {
+        let rendered = crate::scanning::markers::fill_markers(g.template);
+        assert!(
+            !rendered.contains("{CLASS}") && !rendered.contains("{ID}"),
+            "gadget {} left an unrendered marker: {rendered}",
+            g.label
+        );
+    }
+}

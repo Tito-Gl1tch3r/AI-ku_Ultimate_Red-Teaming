@@ -1,0 +1,1791 @@
+//! # Parameter Analysis (Stages 1–3)
+//!
+//! Orchestrates Discovery → Mining → Active Probing to produce a finalized
+//! list of reflected parameters with confirmed injection characteristics.
+//!
+//! ## Stage 3: Active Probing (`active_probe_param`)
+//!
+//! **Input:** `DiscoveredParams` — parameters from Stages 1-2 with naive
+//! special character classification and injection context.
+//!
+//! **Output:** `ProbedParams` — parameters with:
+//! - `valid_specials` / `invalid_specials` actively confirmed via per-char probes
+//! - `injection_context` refined from actual response analysis
+//! - `pre_encoding` auto-detected (base64, 2base64, 2url, 3url) when `<` is
+//!   invalid in naive check but valid after encoding
+//!
+//! **Side effects:** One batched probe request per parameter that carries
+//! every `SPECIAL_PROBE_CHARS` entry between the open/close markers; the
+//! reflected segment is scanned to classify each char. Falls back to a
+//! per-char fan-out (one request per char) only when the batched probe
+//! reflects the markers but strips every special char — a likely WAF
+//! tripwire on the dense payload that per-char probes can sidestep. All
+//! work runs under `target.workers` semaphore gating.
+
+pub mod discovery;
+pub mod mining;
+pub(crate) mod xml_inject;
+
+pub(crate) use mining::detect_injection_context;
+
+use crate::cmd::scan::ScanArgs;
+use crate::target_parser::Target;
+pub use discovery::*;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+pub use mining::*;
+use serde::{Deserialize, Serialize};
+use serde_json::{self, Value};
+use std::sync::Arc;
+use tokio::sync::{Mutex, Semaphore};
+
+/// Parameters after Stage 1 (Discovery) and Stage 2 (Mining).
+/// Each `Param` has naive `valid_specials`/`invalid_specials` and a tentative
+/// `injection_context`, but `pre_encoding` is still `None`.
+// Named for the stage contract documented in `lib.rs`'s pipeline table; both
+// are plain `Vec<Param>`, so nothing needs to construct them by name.
+#[allow(dead_code)]
+pub(crate) type DiscoveredParams = Vec<Param>;
+
+/// Parameters after Stage 3 (Active Probing).
+/// Each `Param` now carries actively confirmed `valid_specials`/`invalid_specials`,
+/// a refined `injection_context`, and auto-detected `pre_encoding`.
+#[allow(dead_code)]
+pub(crate) type ProbedParams = Vec<Param>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Location {
+    Query,
+    Body,
+    JsonBody,
+    MultipartBody,
+    /// A GraphQL request whose payload is injected into one string value inside
+    /// the `variables` object. The whole request body (query + all variables)
+    /// is rebuilt from the param's `pre_encoding_pipeline` (`JsonField` at the
+    /// variable's JSON pointer) and sent as `application/json`. Distinct from
+    /// `JsonBody`, whose builder substitutes at a *top-level* key.
+    GraphqlBody,
+    /// An XML / SOAP request whose payload is injected into one element text
+    /// node or attribute value. The whole body is rebuilt from the param's
+    /// `pre_encoding_pipeline` (a `Splice` of the original document around the
+    /// injection point) and sent with the request's XML content-type. The
+    /// non-target bytes of the document survive verbatim.
+    XmlBody,
+    Header,
+    Path,
+    Fragment,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DelimiterType {
+    SingleQuote,
+    DoubleQuote,
+    /// JavaScript template literal (backtick-quoted string). Distinct from
+    /// `'` / `"` because the breakout payload is different — inside a
+    /// template literal, `${expr}` evaluates the expression with no need
+    /// to escape the surrounding quote.
+    Backtick,
+    Comment,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InjectionContext {
+    Html(Option<DelimiterType>),
+    Javascript(Option<DelimiterType>),
+    Attribute(Option<DelimiterType>),
+    AttributeUrl(Option<DelimiterType>),
+    Css(Option<DelimiterType>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Param {
+    pub name: String,
+    pub value: String,
+    pub location: Location,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injection_context: Option<InjectionContext>,
+    // Special characters that were confirmed reflected unchanged for this parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_specials: Option<Vec<char>>,
+    // Special characters that appear to be filtered, encoded, or not reflected
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_specials: Option<Vec<char>>,
+    /// Pre-encoding required before injection (e.g. "base64", "2base64").
+    /// When set, payloads are pre-encoded before sending and reflection is
+    /// checked against the original (decoded) payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_encoding: Option<String>,
+    /// Composable pre-encoding pipeline. Takes precedence over `pre_encoding`
+    /// when present. Used for nested encodings that the legacy single-step
+    /// field cannot express, e.g. `JsonField{pointer:"/move_url"} → Base64`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_encoding_pipeline: Option<crate::encoding::pipeline::EncodingPipeline>,
+    /// HTTP-layer parameter name used when the payload must be inserted at a
+    /// different name than this `Param.name`. Set when `name` is a synthetic
+    /// nested-field display label (e.g. `qs[move_url]`) but the wire-level
+    /// substitution targets the parent parameter (`qs`). When `None`, callers
+    /// fall back to `name`.
+    ///
+    /// Currently honored in the `Location::Query` substitution paths
+    /// (`build_injected_url`, `active_probe_param`). `Location::Body`,
+    /// `Header`, `JsonBody`, `MultipartBody` still substitute by `name`
+    /// because nested-field discovery (`infer_nested_pipelines`) only
+    /// emits Query params today. Extend those branches before enabling
+    /// nested discovery on other locations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_name: Option<String>,
+    /// POST target URL resolved from form action attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_action_url: Option<String>,
+    /// Page URL where the form was discovered (for stored XSS verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_origin_url: Option<String>,
+    /// Framework-specific innerHTML-style sink the marker landed inside
+    /// during discovery: `"v-html"`, `"data-bind"`, `"ng-bind-html"`,
+    /// `"dangerouslySetInnerHTML"`. When set, the reflection is rendered
+    /// as raw HTML by the framework at runtime — entity-encoded
+    /// payloads also execute because the browser decodes them at
+    /// attribute-value parse time before innerHTML assignment. Used to
+    /// upgrade the finding's `inject_type` label so users can tell
+    /// framework-sink reflections apart from generic attribute echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_sink: Option<String>,
+    /// Special characters that reflect back only in *escaped* form — the server
+    /// inserts a backslash before them (e.g. `"` → `\"`, the classic
+    /// JS-string-escaping filter). Distinct from `valid_specials` (reflected
+    /// raw) and `invalid_specials` (stripped/encoded): an escaped quote *is*
+    /// present in the response but cannot break out raw, so payload synthesis
+    /// uses a backslash-prefixed breakout (`\";…`) instead. Populated by the
+    /// quote-escape probe in `active_probe_param` (issue #1072).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escaped_specials: Option<Vec<char>>,
+    /// Exact JS breakout closer computed from the *observed* inline-`<script>`
+    /// source between the enclosing script's content start and this parameter's
+    /// reflection point (issue #1073 follow-up). For a reflection nested inside
+    /// e.g. `foo({ bar: [ "…" ] })` this carries `"]})` — the minimal sequence
+    /// that closes the open string and every unbalanced `([{` to reach an
+    /// executable statement position. Computed once at detection time (where the
+    /// response body is available) via
+    /// [`crate::payload::js_breakout::compute_js_breakout`] and consumed by
+    /// payload synthesis, which emits the matching breakout *first* (highest
+    /// confidence) ahead of the fixed depth-0–3 catalog. `None` when the
+    /// reflection is not inside an inline `<script>` body, or when the observed
+    /// prefix already sits at statement position (nothing to close) — in which
+    /// case synthesis falls back to the fixed catalog exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_breakout: Option<String>,
+    /// A pre-scan probe already saw this parameter's markers come back.
+    ///
+    /// Set by [`active_probe_param`], the last stage before scanning, which
+    /// sends `OPEN + specials + CLOSE` and reads the echo. The scan worker's
+    /// Stage-0 probe asks the *same* question with the *same* markers, so when
+    /// this is set it skips its request and takes the answer (one request per
+    /// parameter, ~25% of the per-parameter cost on a reflecting target).
+    ///
+    /// One-directional on purpose: `false` never means "does not reflect", only
+    /// "no probe has proved it does". The batched probe is dense with special
+    /// characters, so a WAF can block it while the plain marker gets through —
+    /// which is exactly why Stage 0 still runs in that case.
+    ///
+    /// Scan-internal despite being `pub` (the struct's other fields are too,
+    /// and integration tests build `Param` literals): `#[serde(skip)]` keeps it
+    /// off every output and API surface, and a param deserialized from one
+    /// starts out `false`, i.e. gets the pre-existing behaviour.
+    #[serde(default, skip)]
+    pub marker_echoed: bool,
+    /// Page slots (element attributes / text, CSS custom properties) that
+    /// held the pre-scan probe's marker, when that probe echoed on a page with
+    /// script. The AST phase reads it as proof that the page's JS reading
+    /// those slots reads this parameter: Stage 0 is skipped when the probe
+    /// echoed, and the attack response it analyses instead has usually broken
+    /// out of the very slot it would need to prove. Scan-internal, like
+    /// `marker_echoed`.
+    #[serde(default, skip)]
+    pub reflected_markup: Option<std::sync::Arc<crate::scanning::ast_dom_analysis::PageMarkup>>,
+    /// XML response MIME for which the active probe reflected its marker but
+    /// the body has no active namespace yet. The scan uses a small, namespaced
+    /// XML payload set for this case rather than spending the full HTML catalog
+    /// on a document that currently parses as inert XML.
+    #[serde(default, skip)]
+    pub xml_namespace_candidate: Option<String>,
+    /// Explicitly distinguishes a cookie parameter from an HTTP header when
+    /// both locations carry the same name. `None` preserves the legacy
+    /// target-based inference for params created by older callers.
+    #[serde(skip)]
+    pub is_cookie: Option<bool>,
+    /// Operator-facing filter verdict from the active probe, surfaced on
+    /// findings (issue #1515). Separate from `valid_specials` /
+    /// `invalid_specials`, which are tuned for recall (an entity-encoded echo
+    /// counts as valid, a failed probe as all-invalid) and so misread as a
+    /// verdict. `None` when the probe produced no trustworthy reading.
+    #[serde(skip)]
+    pub filter: Option<FilterFingerprint>,
+}
+
+/// How a parameter treated each probed special character, read from the
+/// batched probe's reflected segment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FilterFingerprint {
+    /// Reflected raw.
+    pub allowed: Vec<char>,
+    /// Reflected only as an HTML entity or `%HH`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encoded: Vec<char>,
+    /// Stripped, or forbidden by the transport.
+    pub blocked: Vec<char>,
+    /// Reflected only with a backslash in front.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escaped: Vec<char>,
+}
+
+impl FilterFingerprint {
+    /// Classify every `probe_chars` entry against the reflected `segment`.
+    pub(crate) fn from_segment(segment: &str, probe_chars: &[char]) -> Self {
+        static ENCODED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"&#?[0-9A-Za-z]+;|%[0-9A-Fa-f]{2}").expect("static regex")
+        });
+        // Without the encoded sequences, so the `;` of `&lt;` is not a raw `;`.
+        let raw = ENCODED.replace_all(segment, "");
+        // Decode each sequence rather than match known spellings: servers emit
+        // `&#039;`, `&#x27;`, `%3c`, ... for the same char.
+        let encoded: Vec<char> = ENCODED
+            .find_iter(segment)
+            .filter_map(|m| match m.as_str().strip_prefix('%') {
+                Some(hex) => u8::from_str_radix(hex, 16).ok().map(char::from),
+                None => {
+                    let decoded =
+                        crate::scanning::check_reflection::decode_html_entities(m.as_str());
+                    let mut chars = decoded.chars();
+                    chars.next().filter(|_| chars.next().is_none())
+                }
+            })
+            .collect();
+        let mut out = Self {
+            allowed: Vec::new(),
+            encoded: Vec::new(),
+            blocked: Vec::new(),
+            escaped: Vec::new(),
+        };
+        for &c in probe_chars {
+            let bucket = if raw.contains(c) {
+                &mut out.allowed
+            } else if encoded.contains(&c) {
+                &mut out.encoded
+            } else {
+                &mut out.blocked
+            };
+            if !bucket.contains(&c) {
+                bucket.push(c);
+            }
+        }
+        out.allowed.sort_unstable();
+        out.encoded.sort_unstable();
+        out.blocked.sort_unstable();
+        out
+    }
+
+    /// Move `chars` out of `allowed` into `bucket` (escaped or blocked).
+    fn demote(&mut self, chars: &[char], to_escaped: bool) {
+        for &c in chars {
+            self.allowed.retain(|a| *a != c);
+            self.encoded.retain(|a| *a != c);
+            let bucket = if to_escaped {
+                &mut self.escaped
+            } else {
+                &mut self.blocked
+            };
+            if !bucket.contains(&c) {
+                bucket.push(c);
+                bucket.sort_unstable();
+            }
+        }
+    }
+
+    /// One-line form for human-readable reports:
+    /// `allowed <>  encoded "'  blocked ()  escaped \`.
+    pub fn summary(&self) -> String {
+        let field = |v: &[char]| {
+            if v.is_empty() {
+                "none".to_string()
+            } else {
+                v.iter().collect()
+            }
+        };
+        let mut out = format!("allowed {}", field(&self.allowed));
+        if !self.encoded.is_empty() {
+            out.push_str(&format!("  encoded {}", field(&self.encoded)));
+        }
+        out.push_str(&format!("  blocked {}", field(&self.blocked)));
+        if !self.escaped.is_empty() {
+            out.push_str(&format!("  escaped {}", field(&self.escaped)));
+        }
+        out
+    }
+}
+
+impl Param {
+    /// A parameter with the three identifying fields set and every optional
+    /// analysis field unset.
+    ///
+    /// The optional fields are filled in progressively by discovery, mining,
+    /// and the probe stages; almost no call site knows more than one or two of
+    /// them. Spelling out the other ten `None`s at each of the ~140
+    /// construction sites made every new field an N-site edit (and dragged
+    /// patch coverage down for a mechanical change). Set what you know and let
+    /// struct update syntax supply the rest:
+    ///
+    /// ```ignore
+    /// Param {
+    ///     injection_context: Some(ctx),
+    ///     ..Param::new(name, value, Location::Query)
+    /// }
+    /// ```
+    pub fn new(name: impl Into<String>, value: impl Into<String>, location: Location) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            location,
+            injection_context: None,
+            valid_specials: None,
+            invalid_specials: None,
+            pre_encoding: None,
+            pre_encoding_pipeline: None,
+            wire_name: None,
+            form_action_url: None,
+            form_origin_url: None,
+            framework_sink: None,
+            escaped_specials: None,
+            js_breakout: None,
+            marker_echoed: false,
+            reflected_markup: None,
+            xml_namespace_candidate: None,
+            is_cookie: None,
+            filter: None,
+        }
+    }
+
+    /// Set the wire location for a `Header` param when discovery already knows
+    /// whether it came from the Cookie header or a named request header.
+    pub(crate) fn with_cookie_identity(mut self, is_cookie: bool) -> Self {
+        self.is_cookie = Some(is_cookie);
+        self
+    }
+
+    /// Fill in the analysis fields every reflection probe derives from the
+    /// response body its marker came back in: the injection context, the naive
+    /// special-character split, and the observed JS breakout closer.
+    ///
+    /// Discovery and mining probe more than a dozen injection points — query,
+    /// header, cookie, path, form (GET / POST / multipart / JSON) and the four
+    /// mining wordlist fan-outs — and every one of them reached those four
+    /// assignments by hand, which made each new analysis field a ~19-site
+    /// mechanical edit. Chain this onto the literal instead, so a site spells
+    /// out only the fields that are specific to it:
+    ///
+    /// ```ignore
+    /// Param {
+    ///     form_action_url: Some(form_url.to_string()),
+    ///     ..Param::new(name, value, Location::Body)
+    /// }
+    /// .with_reflection_analysis(&text)
+    /// ```
+    ///
+    /// This scans `body` once per call. When one body feeds several params,
+    /// compute a [`ReflectionAnalysis`] up front and apply it with
+    /// [`Param::with_analysis`] instead.
+    pub(crate) fn with_reflection_analysis(self, body: &str) -> Self {
+        self.with_analysis(&ReflectionAnalysis::of(body))
+    }
+
+    /// [`Param::with_reflection_analysis`] against an analysis already computed
+    /// for the body in hand.
+    pub(crate) fn with_analysis(mut self, analysis: &ReflectionAnalysis) -> Self {
+        self.injection_context = Some(analysis.injection_context.clone());
+        self.valid_specials = Some(analysis.valid_specials.clone());
+        self.invalid_specials = Some(analysis.invalid_specials.clone());
+        self.js_breakout = analysis.js_breakout.clone();
+        self
+    }
+
+    /// The context half of [`Param::with_reflection_analysis`], leaving
+    /// `valid_specials`/`invalid_specials` unset.
+    ///
+    /// The pre-encoded query probes (base64 / nested pipeline) skip the
+    /// special-character split on purpose: the encoding already carries the
+    /// payload past HTTP-level filtering, and leaving the split `None` tells
+    /// synthesis to try every payload type rather than adaptively dropping the
+    /// ones a raw-reflection probe would have ruled out.
+    pub(crate) fn with_reflection_context(mut self, body: &str) -> Self {
+        self.injection_context = Some(detect_injection_context(body));
+        self.js_breakout = detect_js_breakout(body);
+        self
+    }
+
+    /// Record the framework innerHTML-style sink the marker landed inside, if
+    /// any (see [`Param::framework_sink`]).
+    ///
+    /// Only the query and header discovery stages probe for this today; the
+    /// remaining stages leave `framework_sink` unset.
+    pub(crate) fn with_framework_sink(mut self, body: &str) -> Self {
+        self.framework_sink =
+            detect_framework_html_sink(body, crate::scanning::markers::bracketed_marker())
+                .map(ToString::to_string);
+        self
+    }
+
+    /// HTTP-level parameter name (parent param when this is a nested-field
+    /// virtual param, otherwise `name`).
+    pub(crate) fn effective_wire_name(&self) -> &str {
+        self.wire_name.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// What a reflecting response body says about the injection point it reflected
+/// in, computed once for that body and applied to one or more `Param`s.
+///
+/// See [`Param::with_reflection_analysis`] for the one-shot form; reach for
+/// this type only when a single response yields several params (the JSON-form
+/// probe posts every field at once and attributes the same body to each).
+pub(crate) struct ReflectionAnalysis {
+    injection_context: InjectionContext,
+    valid_specials: Vec<char>,
+    invalid_specials: Vec<char>,
+    js_breakout: Option<String>,
+}
+
+impl ReflectionAnalysis {
+    /// Analyze a response body that already contains the reflection marker.
+    pub(crate) fn of(body: &str) -> Self {
+        let inner = crate::scanning::markers::inner_marker();
+        let marker = if body.contains(inner) {
+            inner
+        } else {
+            crate::scanning::markers::open_marker()
+        };
+        Self::of_with_marker(body, marker)
+    }
+
+    /// Analyze a response body relative to a specific marker occurrence.
+    ///
+    /// Batched query mining can receive several reflected canaries in one
+    /// response. The shared analysis shape is still useful for the special
+    /// character split, but the injection context and JS breakout must follow
+    /// the canary being turned into a `Param`; otherwise a script reflection
+    /// can incorrectly lend its context to a text or attribute reflection in
+    /// the same response.
+    pub(crate) fn of_with_marker(body: &str, marker: &str) -> Self {
+        let (valid_specials, invalid_specials) = classify_special_chars(body);
+        Self {
+            injection_context: detect_injection_context_with_marker(body, marker),
+            valid_specials,
+            invalid_specials,
+            js_breakout: detect_js_breakout_with_marker(body, marker),
+        }
+    }
+}
+
+/// Set of special characters to probe with patterns like: dalfox'<char>dalfox"
+/// Order preserved for deterministic output.
+pub(crate) const SPECIAL_PROBE_CHARS: &[char] = &[
+    '/', '\\', '\'', '{', '`', '<', '>', '"', '(', ')', ';', '=', '|', '}', '[', '.', ':', ']',
+    '+', ',', '$', '-',
+];
+
+/// Skeleton classification helper.
+/// Given a response body that already contains the reflection marker (dynamic nonce),
+/// return (valid, invalid) special chars based on naive presence detection.
+/// TODO:
+/// 1. Actively send mutated payloads per character (e.g. dalfox'<c>dalfox")
+/// 2. Parse the reflected segment boundaries to avoid false positives
+/// 3. Detect normalization (HTML entity encoding, URL encoding) and still treat as "valid"
+pub(crate) fn classify_special_chars(body: &str) -> (Vec<char>, Vec<char>) {
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for c in SPECIAL_PROBE_CHARS {
+        if body.contains(*c) {
+            valid.push(*c);
+        } else {
+            invalid.push(*c);
+        }
+    }
+    (valid, invalid)
+}
+
+/// Return common encoded variants (HTML entities / numeric) for a character.
+/// Used to treat encoded reflection as still valid.
+pub(crate) fn encoded_variants(c: char) -> Vec<&'static str> {
+    match c {
+        '<' => vec!["&lt;", "&#60;"],
+        '>' => vec!["&gt;", "&#62;"],
+        '"' => vec!["&quot;", "&#34;"],
+        '\'' => vec!["&#39;", "&apos;"],
+        '(' => vec!["&#40;"],
+        ')' => vec!["&#41;"],
+        '{' => vec!["&#123;"],
+        '}' => vec!["&#125;"],
+        '[' => vec!["&#91;"],
+        ']' => vec!["&#93;"],
+        '`' => vec!["&#96;"],
+        '/' => vec!["&#47;"],
+        '\\' => vec!["&#92;"],
+        ';' => vec!["&#59;"],
+        '=' => vec!["&#61;"],
+        '|' => vec!["&#124;"],
+        '+' => vec!["&#43;"],
+        ',' => vec!["&#44;"],
+        '$' => vec!["&#36;"],
+        '-' => vec!["&#45;"],
+        '.' => vec!["&#46;"],
+        ':' => vec!["&#58;"],
+        _ => vec![],
+    }
+}
+
+/// Byte offset of the first ASCII-case-insensitive occurrence of `needle` in
+/// `haystack`, or `None`.
+///
+/// Markers are `dlx`/`xld` plus 8 hex digits, so case-folding them cannot
+/// collide with anything else in a response — while a server that
+/// case-normalizes reflected input (title-case, `upcase`, `downcase`) breaks an
+/// exact-case `find` and makes the marker look filtered.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return Some(0);
+    }
+    if h.len() < n.len() {
+        return None;
+    }
+    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// Whether `body` carries either probe marker, matched case-insensitively.
+fn body_has_probe_marker(body: &str) -> bool {
+    contains_ascii_ci(body, crate::scanning::markers::open_marker())
+        || contains_ascii_ci(body, crate::scanning::markers::close_marker())
+}
+
+/// Extract segment between first open marker and subsequent close marker.
+///
+/// Marker matching is ASCII-case-insensitive: a server that case-normalizes the
+/// reflection (`"Dlx1234abcd'\"<>…"` from a title-casing template filter) still
+/// reflects every special character raw, and an exact-case `find` would miss the
+/// segment and hand the caller the "all specials filtered" verdict — muting the
+/// entire angle/quote-bearing payload set for a completely unfiltered sink.
+fn extract_reflected_segment(body: &str) -> Option<&str> {
+    let open = crate::scanning::markers::open_marker();
+    let close = crate::scanning::markers::close_marker();
+    let start = find_ascii_ci(body, open)?;
+    let after = start + open.len();
+    let rest = &body[after..];
+    let end_rel = find_ascii_ci(rest, close)?;
+    Some(&rest[..end_rel])
+}
+
+/// Send one probe request that injects `payload` into `param`'s location and
+/// return the response text combined with any redirect Location header. The
+/// payload is sent verbatim — pre-encoding must already be applied by the
+/// caller. Returns `None` when the request fails, the server returns a status
+/// in `target.ignore_return`, or the body cannot be read.
+async fn send_probe_request_for_param(
+    client: &reqwest::Client,
+    target: &Target,
+    param: &Param,
+    payload: &str,
+) -> Option<String> {
+    send_probe_request_detailed(client, target, param, payload)
+        .await
+        .text
+}
+
+/// One probe response, plus whether the scan phases would act on a reflection
+/// found in it.
+pub(crate) struct ProbeResponse {
+    /// `Location:` header and body concatenated, exactly what
+    /// [`send_probe_request_for_param`] returns; `None` on a transport error or
+    /// an `--ignore-return` status.
+    text: Option<String>,
+    /// The response is one an injection would be judged on: not an inert-data
+    /// or `text/plain` content-type. Mirrors the non-Path half of
+    /// `check_reflection::injection_response_suppressed`, which is what the
+    /// scan worker's Stage-0 probe applies to its own response — so a marker
+    /// echoed in a JSON API body is *not* evidence Stage 0 can be skipped on.
+    actionable: bool,
+    /// True when an XML response reflected the probe markers but its document
+    /// did not yet have an active XHTML/SVG namespace. Such a response needs
+    /// the small XML namespace-activation payload family.
+    xml_candidate_response: bool,
+    content_type: String,
+    markup_document: bool,
+}
+
+/// Send one active-probe request (counted + rate-limited), then sleep
+/// `--delay` as every discovery and mining probe does.
+async fn send_paced_probe(
+    target: &Target,
+    request_builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    crate::record_outbound_request().await;
+    let sent = crate::utils::http::send_counted(request_builder).await;
+    if target.delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(target.delay)).await;
+    }
+    sent
+}
+
+async fn send_probe_request_detailed(
+    client: &reqwest::Client,
+    target: &Target,
+    param: &Param,
+    payload: &str,
+) -> ProbeResponse {
+    // Build the probe request through the canonical injection builder — the
+    // same request the reflection / light-verify / DOM-verify paths send — so a
+    // special-char probe carries the user's headers, User-Agent, cookies, and
+    // Content-Type exactly as the real injection will, at the same
+    // form-action-resolved URL and method.
+    //
+    // This replaces a hand-rolled copy of the Body/JsonBody/MultipartBody/
+    // GraphqlBody/XmlBody/Query/Header/Path/Fragment matrix that (1) dropped
+    // `target.headers` on every location except Header injection — so
+    // `-H "Authorization: ..."` never reached a Body/Query probe, a silent
+    // false negative against authed endpoints — (2) appended headers instead of
+    // replacing them (duplicate values on imported targets), and (3) emitted
+    // only `{name:value}` for JSON bodies with no non-object fallback.
+    let ignore_return = target.ignore_return.clone();
+    let request_builder =
+        crate::scanning::url_inject::build_inject_request(client, target, param, payload);
+
+    let unusable = ProbeResponse {
+        text: None,
+        actionable: false,
+        xml_candidate_response: false,
+        content_type: String::new(),
+        markup_document: false,
+    };
+    let Ok(resp) = send_paced_probe(target, request_builder).await else {
+        return unusable;
+    };
+    if !ignore_return.is_empty() && ignore_return.contains(&resp.status().as_u16()) {
+        return unusable;
+    }
+    let status_code = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let redirect_text = if resp.status().is_redirection() {
+        resp.headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string)
+    } else {
+        None
+    };
+    let body_text = match crate::utils::http::read_body_counted(resp).await {
+        Ok(body) => Some(body),
+        Err(e) => {
+            crate::dbg_log!("discovery response body read failed: {}", e);
+            None
+        }
+    };
+    let markup_document = crate::utils::is_javascript_content_type(&content_type)
+        || body_text
+            .as_deref()
+            .is_some_and(|body| crate::utils::response_has_markup_document(&content_type, body));
+    // Path has extra body-dependent suppressions (error pages echo the URL, a
+    // marker outside markup) that this check cannot replicate, so a path param
+    // is never counted as actionable — Stage 0 keeps judging those. The body
+    // check also distinguishes inactive XML documents from XML that already
+    // carries an executable XHTML/SVG namespace.
+    let actionable = !matches!(param.location, Location::Path)
+        && !(300..400).contains(&status_code)
+        && !crate::utils::http::content_type_is_never_markup(&content_type)
+        && markup_document;
+    let xml_candidate_response = !matches!(param.location, Location::Path)
+        && !(300..400).contains(&status_code)
+        && crate::utils::is_xml_content_type(&content_type);
+    ProbeResponse {
+        text: Some(match (redirect_text, body_text) {
+            (Some(loc), Some(body)) => format!("{}{}", loc, body),
+            (Some(loc), None) => loc,
+            (None, Some(body)) => body,
+            (None, None) => String::new(),
+        }),
+        actionable,
+        xml_candidate_response,
+        content_type,
+        markup_document,
+    }
+}
+
+/// Check whether a single char `c` is observable in the reflected segment,
+/// either as the literal char, one of its HTML/numeric entity variants, or
+/// its `%HH` URL-encoded form. Matches the legacy per-char classification.
+fn char_reflected_in_segment(segment: &str, c: char) -> bool {
+    if segment.contains(c) {
+        return true;
+    }
+    for e in encoded_variants(c) {
+        if segment.contains(e) {
+            return true;
+        }
+    }
+    // Match the `%HH` URL-encoded form case-insensitively (a server may echo
+    // `%hh`). The previous `segment.to_ascii_uppercase()` allocated a full copy
+    // of the segment *per character* inside the SPECIAL_PROBE_CHARS loop; scan
+    // the bytes case-insensitively instead so the hot probe path allocates only
+    // the tiny needle.
+    let pct = format!("%{:02X}", c as u32);
+    if contains_ascii_ci(segment, &pct) {
+        return true;
+    }
+    false
+}
+
+/// ASCII-case-insensitive substring search without allocating either operand.
+/// Used on the active-probe hot path where the alternative
+/// (`haystack.to_ascii_uppercase().contains(needle)`) copied the whole haystack
+/// once per probed character.
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// Active probe for one parameter. Sends a single **batched** probe carrying
+/// all `SPECIAL_PROBE_CHARS` between the open/close markers, then classifies
+/// each char by inspecting the reflected segment of the response. This
+/// replaces the previous per-char fan-out (one request per character) with
+/// one request per parameter — the dominant request-count reducer at scan
+/// time.
+///
+/// Sentinels that bracket each quote in the quote-escape probe (issue #1072).
+/// Alphanumeric so a character filter won't strip them, and distinct so the
+/// reflected slice belonging to each quote is unambiguous. Probe value shape:
+/// `OPEN + A + " + B + ' + C + CLOSE`.
+const ESC_SENT_A: &str = "eqaq7z";
+const ESC_SENT_B: &str = "eqbq7z";
+const ESC_SENT_C: &str = "eqcq7z";
+const ESC_SENT_D: &str = "eqdq7z";
+
+/// Return the substring of `hay` strictly between the first occurrence of `a`
+/// and the next occurrence of `b` after it.
+fn slice_between<'a>(hay: &'a str, a: &str, b: &str) -> Option<&'a str> {
+    let start = hay.find(a)? + a.len();
+    let rest = &hay[start..];
+    let end = rest.find(b)?;
+    Some(&rest[..end])
+}
+
+/// True when `slice` ends with `quote` preceded by an ODD number of
+/// backslashes — i.e. the quote is backslash-*escaped* (`\"`), not a real
+/// closing quote. An even run (`\\"`, a literal backslash then a real quote)
+/// is NOT escaped, so this rejects the doubled-backslash false positive.
+fn quote_is_backslash_escaped(slice: &str, quote: char) -> bool {
+    match slice.rfind(quote) {
+        Some(pos) => {
+            slice[..pos]
+                .chars()
+                .rev()
+                .take_while(|c| *c == '\\')
+                .count()
+                % 2
+                == 1
+        }
+        None => false,
+    }
+}
+
+/// Pure classifier for the quote-escape probe. The probe reflects as
+/// `A <dq> B <sq> C <bs> D`, where each `<…>` is the (possibly transformed)
+/// region for `"`, `'` and a lone `\`. A quote is reported escaped only when
+/// (1) the server leaves a backslash RAW (`<bs>` == `\`) — the `\";…` bypass
+/// needs our injected `\` to survive; a server that doubles backslashes
+/// (`\` → `\\`) would re-escape it and neutralise the breakout — AND (2) the
+/// quote came back with an odd-length backslash prefix (genuinely escaped).
+fn classify_escaped_quotes(segment: &str) -> Vec<char> {
+    // Precondition: backslash must pass through unchanged.
+    let backslash_raw = slice_between(segment, ESC_SENT_C, ESC_SENT_D).is_some_and(|bs| bs == "\\");
+    if !backslash_raw {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if slice_between(segment, ESC_SENT_A, ESC_SENT_B)
+        .is_some_and(|dq| quote_is_backslash_escaped(dq, '"'))
+    {
+        out.push('"');
+    }
+    if slice_between(segment, ESC_SENT_B, ESC_SENT_C)
+        .is_some_and(|sq| quote_is_backslash_escaped(sq, '\''))
+    {
+        out.push('\'');
+    }
+    out
+}
+
+/// The quote-escape probe value: `OPEN + A "B 'C \D + CLOSE`. Sentinels bracket
+/// the two quotes and a lone backslash so each reflected region is unambiguous.
+fn escape_probe_value() -> String {
+    format!(
+        "{}{}\"{}'{}\\{}{}",
+        crate::scanning::markers::open_marker(),
+        ESC_SENT_A,
+        ESC_SENT_B,
+        ESC_SENT_C,
+        ESC_SENT_D,
+        crate::scanning::markers::close_marker()
+    )
+}
+
+/// Pure: from a probe response `body`, extract the reflected segment and report
+/// which of the `valid` quotes came back backslash-escaped. Returns `None` when
+/// the probe didn't reflect (no segment), distinct from an empty vec (reflected
+/// but nothing escaped).
+fn escaped_quotes_from_response(body: &str, valid: &[char]) -> Option<Vec<char>> {
+    let seg = extract_reflected_segment(body)?;
+    let mut escaped = classify_escaped_quotes(seg);
+    // Only report quotes that were confirmed reflected at all.
+    escaped.retain(|q| valid.contains(q));
+    Some(escaped)
+}
+
+/// Send one quote-escape probe for `param` and classify which valid quotes
+/// reflect back backslash-escaped. Returns `None` if the probe didn't reflect.
+async fn detect_escaped_quotes_via_probe(
+    client: &reqwest::Client,
+    target: &Target,
+    param: &Param,
+    valid: &[char],
+    semaphore: &Arc<Semaphore>,
+) -> Option<Vec<char>> {
+    let payload = crate::encoding::pre_encoding::apply_param_encoding(&escape_probe_value(), param);
+    let permit = semaphore.acquire().await.expect("acquire semaphore permit");
+    let resp = send_probe_request_for_param(client, target, param, &payload).await;
+    drop(permit);
+    escaped_quotes_from_response(resp.as_deref()?, valid)
+}
+
+/// One-shot WAF inspection-window-overflow probe. Re-sends the batched
+/// special-char probe behind a benign filler prefix (`waf_window_pad`) so the
+/// markers + special chars land past a size-limited inspection window (the
+/// AWS WAF-style "only the first N bytes are scanned" class). Returns the
+/// `(valid, invalid)` special-char split when the padded probe reflects at
+/// least one special char raw — the signature of a window-limited WAF — and
+/// `None` otherwise (genuine filtering, or no reflection at all).
+///
+/// Skips params that already carry a pre-encoding transform: the pad rides the
+/// `pre_encoding` rail, so applying it would clobber an existing encoding. Such
+/// a param keeps the legacy "all invalid" classification.
+async fn window_overflow_probe(
+    client: &reqwest::Client,
+    target: &Target,
+    param: &Param,
+    semaphore: &Arc<Semaphore>,
+) -> Option<(Vec<char>, Vec<char>)> {
+    if param.pre_encoding.is_some() || param.pre_encoding_pipeline.is_some() {
+        return None;
+    }
+
+    // Use the transport-aware probe set, not raw `SPECIAL_PROBE_CHARS`: for a
+    // cookie param the latter still contains `;`, which ends the cookie value
+    // on the wire and truncates the probe before the CLOSE marker — so
+    // `extract_reflected_segment` finds nothing and this window probe returns
+    // `None` even when the special chars *would* reflect past the window. That
+    // silently disabled window-limited-WAF detection for every cookie param,
+    // the exact inconsistency `probe_chars_for` exists to prevent on the normal
+    // path. `;` is folded back into `invalid` centrally via
+    // `transport_invalid_chars`, so dropping it here loses no classification.
+    let probe_chars = probe_chars_for(target, param);
+    let batched_chars: String = probe_chars.iter().collect();
+    let probe = format!(
+        "{}{}{}{}",
+        crate::encoding::pre_encoding::waf_window_pad(),
+        crate::scanning::markers::open_marker(),
+        batched_chars,
+        crate::scanning::markers::close_marker(),
+    );
+
+    let permit = semaphore.acquire().await.expect("acquire semaphore permit");
+    let resp = send_probe_request_for_param(client, target, param, &probe).await;
+    drop(permit);
+
+    let segment = resp.as_deref().and_then(extract_reflected_segment)?;
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for &c in &probe_chars {
+        if char_reflected_in_segment(segment, c) {
+            valid.push(c);
+        } else {
+            invalid.push(c);
+        }
+    }
+    // Only a window-limited WAF if padding actually recovered special chars;
+    // if everything is still stripped, it's genuine filtering, not a window.
+    if valid.is_empty() {
+        return None;
+    }
+    Some((valid, invalid))
+}
+
+/// Coverage safety net: if the batched probe is reflected but **no** char
+/// survives in the reflected segment (likely the server's WAF tripped on the
+/// dense special-char payload, while individual chars would pass), the
+/// function falls back to the legacy per-char loop so payload generators
+/// still see an accurate valid/invalid split.
+/// The special characters worth probing for `param`.
+///
+/// A cookie value is delimited by `;`, so a `;` inside the batched probe is not
+/// "filtered by the application" — it *ends the cookie*. The server then sees a
+/// truncated value, the probe's CLOSE marker never comes back,
+/// `extract_reflected_segment` finds nothing, and the whole parameter is
+/// classified as "no special character survives". That muted the payload
+/// generators for **every cookie parameter against every real server**, leaving
+/// cookies to fall back to a generic catalog that omits the context-appropriate
+/// breakout (measured: 21 targeted requests on a query param vs 4355 generic
+/// ones, missing the winning payload, on the identical sink reached via a
+/// cookie).
+///
+/// `;` is therefore dropped from the probe and recorded as invalid up front,
+/// which is also simply true: no payload can carry a raw `;` through a cookie.
+fn probe_chars_for(target: &Target, param: &Param) -> Vec<char> {
+    if crate::scanning::url_inject::param_is_cookie(target, param) {
+        SPECIAL_PROBE_CHARS
+            .iter()
+            .copied()
+            .filter(|c| *c != ';')
+            .collect()
+    } else {
+        SPECIAL_PROBE_CHARS.to_vec()
+    }
+}
+
+/// Characters that cannot survive `param`'s transport regardless of what the
+/// application does, so they are known-invalid without spending a probe.
+fn transport_invalid_chars(target: &Target, param: &Param) -> Vec<char> {
+    if crate::scanning::url_inject::param_is_cookie(target, param) {
+        vec![';']
+    } else {
+        Vec::new()
+    }
+}
+
+pub async fn active_probe_param(
+    target: &Target,
+    mut param: Param,
+    semaphore: Arc<Semaphore>,
+) -> Param {
+    // A fragment never reaches the wire, so a probe could not reflect and would
+    // only burn ~2 requests per fragment key. The scan phase skips these too.
+    if !crate::scanning::param_is_http_scannable(&param) {
+        return param;
+    }
+    let client = target.build_client_or_default();
+
+    // Single batched probe — `OPEN + all special chars concatenated + CLOSE`.
+    // `extract_reflected_segment` recovers the substring between markers, and
+    // `classify_special_chars`-style per-char checks then split it into
+    // valid/invalid. One request replaces SPECIAL_PROBE_CHARS.len()
+    // requests.
+    let probe_chars = probe_chars_for(target, &param);
+    let batched_chars: String = probe_chars.iter().collect();
+    let batched_probe = format!(
+        "{}{}{}",
+        crate::scanning::markers::open_marker(),
+        batched_chars,
+        crate::scanning::markers::close_marker()
+    );
+    let batched_payload =
+        crate::encoding::pre_encoding::apply_param_encoding(&batched_probe, &param);
+
+    let permit = semaphore.acquire().await.expect("acquire semaphore permit");
+    let batched = send_probe_request_detailed(&client, target, &param, &batched_payload).await;
+    drop(permit);
+
+    // Record the echo for the scan worker's Stage-0 probe (see
+    // `Param::marker_echoed`): this request already asked, with the same
+    // markers, whether the parameter comes back in a response the scan would
+    // act on.
+    param.marker_echoed =
+        batched.actionable && batched.text.as_deref().is_some_and(body_has_probe_marker);
+    if param.marker_echoed {
+        param.reflected_markup = batched
+            .text
+            .as_deref()
+            .and_then(crate::scanning::ast_integration::reflected_markup_from_html)
+            .map(std::sync::Arc::new);
+    }
+    let xml_text_context = matches!(
+        param.injection_context.as_ref(),
+        None | Some(InjectionContext::Html(None))
+    );
+    param.xml_namespace_candidate = (xml_text_context
+        && batched.xml_candidate_response
+        && !batched.markup_document
+        && batched.text.as_deref().is_some_and(body_has_probe_marker))
+    .then_some(batched.content_type);
+    let batched_response = batched.text;
+
+    let mut valid: Vec<char> = Vec::new();
+    let mut invalid: Vec<char> = Vec::new();
+    let mut need_per_char_fallback = false;
+
+    match batched_response
+        .as_deref()
+        .and_then(extract_reflected_segment)
+    {
+        Some(segment) => {
+            param.filter = Some(FilterFingerprint::from_segment(segment, &probe_chars));
+            for &c in &probe_chars {
+                if char_reflected_in_segment(segment, c) {
+                    valid.push(c);
+                } else {
+                    invalid.push(c);
+                }
+            }
+            // Coverage safety net: if the server echoed the bracketed marker
+            // but stripped every special char from the segment, the dense
+            // batched payload likely tripped a WAF rule that wouldn't fire
+            // on per-char probes. Re-probe individually to avoid blanket
+            // false-positive "all invalid" classifications that would mute
+            // the entire payload set during scanning.
+            if valid.is_empty() {
+                need_per_char_fallback = true;
+            }
+        }
+        None if matches!(param.location, Location::Path) => {
+            // Path location: the dense batched probe (every special char
+            // concatenated) routinely fails to reflect even on a permissive
+            // server, because characters like `/`, `\`, `[`, `]`, `{`, `}`
+            // reshape the URL path — extra `/` segments make the request miss
+            // its route, encoded slashes get rejected, etc. — so the markers
+            // land nowhere. That is a *probe artifact*, NOT a filtering signal.
+            // Falling back to the legacy "all invalid" classification here
+            // would wrongly mute every angle/paren/quote-bearing payload and
+            // miss genuine path XSS (e.g. a path segment reflected inside an
+            // HTML comment, which needs `-->…<svg onload=alert(1)>` — `(` `)`
+            // `<` `>` all required). Single-character path injections
+            // round-trip cleanly through percent-encoding, so re-probe each
+            // character individually instead.
+            need_per_char_fallback = true;
+        }
+        None => {
+            // No reflected segment — the markers never came back. That can be
+            // genuine heavy filtering, a WAF that blocked the whole request
+            // because it inspects only the first N bytes of the value and
+            // tripped on the leading special chars, or a server that strips a
+            // fixed prefix/suffix (partial reflection) so only part of a marker
+            // survives.
+            //
+            // Only the *block* case is a window-overflow candidate. Gate on a
+            // genuine block: the batched probe reflected NOTHING, i.e. neither
+            // marker survived. A prefix/suffix-stripping server leaves one
+            // marker intact (discovery already handles those as partial
+            // reflection), and a block page that echoes the payload (e.g. a
+            // reflected-block-page WAF) carries the markers too — neither is a
+            // size-limited inspection window, so skip the probe for them.
+            let genuine_block = batched_response
+                .as_deref()
+                .is_none_or(|body| !body_has_probe_marker(body));
+            let window = if genuine_block {
+                // One window-overflow probe: re-send the batched probe behind a
+                // benign filler prefix. If the markers + specials now reflect,
+                // the param sits behind a size-limited inspection window.
+                window_overflow_probe(&client, target, &param, &semaphore).await
+            } else {
+                None
+            };
+            match window {
+                Some((win_valid, win_invalid)) => {
+                    valid = win_valid;
+                    invalid = win_invalid;
+                    // `marker_echoed` is deliberately NOT set here. This branch
+                    // is reached when the batched probe came back with nothing
+                    // — including when it simply failed or timed out under load
+                    // — and `window_overflow_probe` reports only the
+                    // valid/invalid split, not the content-type of the response
+                    // it saw. Setting the flag on that made a JSON API case
+                    // skip the Stage-0 probe, and with it the inert-data
+                    // suppression, whenever the first probe lost the race: an
+                    // intermittent `[V]` on a `application/json` body. Stage 0
+                    // runs for these (one request, rare path) and judges its
+                    // own response.
+                    param.pre_encoding = Some(
+                        crate::encoding::pre_encoding::PreEncodingType::WafWindowPad
+                            .as_str()
+                            .to_string(),
+                    );
+                }
+                // Genuine filtering / partial strip — keep the legacy
+                // "all invalid" classification.
+                None => invalid.extend_from_slice(&probe_chars),
+            }
+        }
+    }
+
+    if need_per_char_fallback {
+        // The dense probe tripped something; its reading is not the filter.
+        param.filter = None;
+        valid.clear();
+        invalid.clear();
+        let mut handles = Vec::new();
+        let valid_specials = Arc::new(Mutex::new(Vec::<char>::new()));
+        let invalid_specials = Arc::new(Mutex::new(Vec::<char>::new()));
+        for &c in &probe_chars {
+            let sem = semaphore.clone();
+            let client_clone = client.clone();
+            let target_clone = target.clone();
+            let param_clone = param.clone();
+            let valid_ref = valid_specials.clone();
+            let invalid_ref = invalid_specials.clone();
+            handles.push(tokio::spawn(crate::with_job_scopes(
+                crate::JobScopes::capture(),
+                async move {
+                    let probe = format!(
+                        "{}{}{}",
+                        crate::scanning::markers::open_marker(),
+                        c,
+                        crate::scanning::markers::close_marker()
+                    );
+                    let pp =
+                        crate::encoding::pre_encoding::apply_param_encoding(&probe, &param_clone);
+                    let _permit = sem.acquire().await.expect("acquire semaphore permit");
+                    let resp = send_probe_request_for_param(
+                        &client_clone,
+                        &target_clone,
+                        &param_clone,
+                        &pp,
+                    )
+                    .await;
+                    let ok = resp
+                        .as_deref()
+                        .and_then(extract_reflected_segment)
+                        .map(|seg| char_reflected_in_segment(seg, c))
+                        .unwrap_or(false);
+                    if ok {
+                        valid_ref.lock().await.push(c);
+                    } else {
+                        invalid_ref.lock().await.push(c);
+                    }
+                },
+            )));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        valid = valid_specials.lock().await.clone();
+        invalid = invalid_specials.lock().await.clone();
+    }
+
+    let iv = invalid.clone();
+    // Fold in the characters the transport itself forbids, so payload
+    // generation avoids them rather than learning it the hard way.
+    let transport_invalid = transport_invalid_chars(target, &param);
+    for &c in &transport_invalid {
+        if !invalid.contains(&c) {
+            invalid.push(c);
+        }
+        valid.retain(|v| *v != c);
+    }
+    if let Some(filter) = param.filter.as_mut() {
+        filter.demote(&transport_invalid, false);
+    }
+    param.valid_specials = Some(valid.clone());
+    param.invalid_specials = Some(invalid);
+
+    // Issue #1072: quote-escape detection. A quote that reflects back only in
+    // *escaped* form (`"` → `\"`, the classic JS-string-escaping filter) is
+    // "valid" by raw presence but cannot break out of a JS string raw — synthesis
+    // needs a backslash-prefixed breakout (`\";…`) instead. We only probe in JS
+    // string contexts: in an HTML attribute a stray backslash before the quote is
+    // inert, so the naive breakout already works there and the extra request would
+    // be pure waste.
+    if matches!(
+        param.injection_context,
+        Some(InjectionContext::Javascript(Some(
+            DelimiterType::SingleQuote | DelimiterType::DoubleQuote
+        )))
+    ) && (valid.contains(&'"') || valid.contains(&'\''))
+        && let Some(escaped) =
+            detect_escaped_quotes_via_probe(&client, target, &param, &valid, &semaphore).await
+        && !escaped.is_empty()
+    {
+        if let Some(filter) = param.filter.as_mut() {
+            filter.demote(&escaped, true);
+        }
+        param.escaped_specials = Some(escaped);
+    }
+
+    // If '<' is invalid and no pre_encoding is set, try double/triple URL encoding
+    // to detect servers that multi-decode input (e.g. double URL decode).
+    // Skip when a pipeline is already set — the nested encoding is fixed by
+    // structure inference and would clash with extra URL-decode rounds.
+    if param.pre_encoding.is_none()
+        && param.pre_encoding_pipeline.is_none()
+        && iv.contains(&'<')
+        && matches!(param.location, Location::Query | Location::Path)
+    {
+        let open = crate::scanning::markers::open_marker();
+        let close = crate::scanning::markers::close_marker();
+        let raw_marker = format!("{}<{}", open, close);
+
+        for (enc_type, rounds) in crate::encoding::pre_encoding::multi_url_decode_probes() {
+            let enc_name = enc_type.as_str();
+            // For Query: append_pair adds one URL-encoding layer automatically,
+            // so we encode (N-1) times for N-decode detection.
+            // For Path: selective_path_segment_encode encodes '%' to '%25' (one layer),
+            // so we also encode (N-1) extra times.
+            let encoded = crate::encoding::repeat_url_encode(&raw_marker, usize::from(*rounds));
+
+            let _permit = semaphore.acquire().await.expect("acquire semaphore permit");
+            let url = match param.location {
+                // Same base as the real injection: a GET-form field is probed at
+                // the form's action, not the page that hosts the `<form>`.
+                Location::Query => with_query_param(
+                    &crate::scanning::url_inject::effective_query_base(&target.url, &param),
+                    &param.name,
+                    &encoded,
+                ),
+                Location::Path => {
+                    let mut url = target.url.clone();
+                    if let Some(idx_str) = param.name.strip_prefix("path_segment_")
+                        && let Ok(idx) = idx_str.parse::<usize>()
+                    {
+                        let original_path = url.path().to_string();
+                        let segments: Vec<&str> = if original_path == "/" {
+                            Vec::new()
+                        } else {
+                            original_path
+                                .trim_matches('/')
+                                .split('/')
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        };
+                        if idx < segments.len() {
+                            // Encode '%' for the path so the server receives the multi-encoded payload
+                            let path_encoded = encoded.replace('%', "%25");
+                            let mut new_path = String::new();
+                            for (i, segment) in segments.iter().enumerate() {
+                                new_path.push('/');
+                                if i == idx {
+                                    new_path.push_str(&path_encoded);
+                                } else {
+                                    new_path.push_str(segment);
+                                }
+                            }
+                            url.set_path(&new_path);
+                        }
+                    }
+                    url
+                }
+                _ => unreachable!(),
+            };
+            // Route the pre-encoding detection probe through the canonical builder
+            // so it carries the user's headers / UA / cookies too — otherwise an
+            // authed endpoint 401s this probe and pre-encoding is silently never
+            // detected, the same header-drop class fixed in the probe path.
+            let request_builder = crate::utils::build_request(
+                &client,
+                target,
+                target.parse_method(),
+                url,
+                target.data.clone(),
+            );
+            if let Ok(resp) = send_paced_probe(target, request_builder).await
+                && let Ok(text) = crate::utils::http::read_body_counted(resp).await
+                && text.contains(&raw_marker)
+            {
+                param.pre_encoding = Some(enc_name.to_string());
+                // With multi-URL-decode, skip special char filtering — the encoding
+                // bypasses HTTP-level filters. Set specials to None so all payloads
+                // are tried.
+                param.valid_specials = None;
+                param.invalid_specials = None;
+                param.filter = None;
+                break;
+            }
+        }
+    }
+
+    param
+}
+
+pub async fn analyze_parameters(
+    target: &mut Target,
+    args: &ScanArgs,
+    multi_pb: Option<Arc<MultiProgress>>,
+) {
+    // CLI `-d` bodies are present on both `ScanArgs` and `Target`, but imported
+    // raw-HTTP/HAR requests carry their body only on `Target`. The body mining
+    // strategies consume `ScanArgs.data`, so give them the captured body when
+    // there was no explicit CLI body override.
+    let mut effective_args = args.clone();
+    if effective_args.data.is_none() {
+        effective_args.data.clone_from(&target.data);
+    }
+    let args = &effective_args;
+
+    let pb = if let Some(ref mp) = multi_pb {
+        let bar = mp.add(ProgressBar::new_spinner());
+        // The message changes as mining moves between sources, and indicatif
+        // can't feed the live `{msg}` to a custom key, so the text lives in a
+        // shared cell that `{wave}` shimmers and `ShimmerSpinner::set_message`
+        // updates. Reserve 2 cols (glyph + space) so a long URL truncates
+        // instead of wrapping. The steady tick advances the shimmer.
+        let label = std::sync::Arc::new(std::sync::Mutex::new(format!(
+            "Analyzing parameters for {}",
+            target.url
+        )));
+        bar.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {wave}")
+                .expect("valid progress style template")
+                .tick_chars(crate::utils::shimmer::TICK_CHARS)
+                .with_key(
+                    "wave",
+                    crate::utils::shimmer::wave_tracker_shared(label.clone(), 2),
+                ),
+        );
+        bar.enable_steady_tick(std::time::Duration::from_millis(
+            crate::utils::shimmer::FRAME_MS as u64,
+        ));
+        Some(crate::utils::shimmer::ShimmerSpinner::new(bar, label))
+    } else {
+        None
+    };
+
+    // === Stage 1: Discovery — identify reflecting parameters ===
+    let reflection_params = Arc::new(Mutex::new(Vec::new()));
+    let semaphore = Arc::new(Semaphore::new(crate::utils::semaphore_permits(
+        target.workers,
+    )));
+    check_discovery(target, args, reflection_params.clone(), semaphore.clone()).await;
+
+    // === Stage 2: Mining — discover additional parameters from HTML/JS/dict ===
+    mine_parameters(
+        target,
+        args,
+        reflection_params.clone(),
+        semaphore.clone(),
+        pb.clone(),
+    )
+    .await;
+    // Mining can push the same `(name, location)` slot again — most
+    // commonly when DOM mining surfaces a param name that the query /
+    // form / header discovery already registered. Run the collapse
+    // pass here too so by the time payload generation reads
+    // `target.reflection_params` every wire slot is unique. (The
+    // earlier collapse inside `check_discovery` keeps internal
+    // bookkeeping clean before mining starts; this one catches new
+    // duplicates introduced by mining.)
+    {
+        let mut guard = reflection_params.lock().await;
+        crate::parameter_analysis::discovery::dedupe_reflection_params(&mut guard, &target.url);
+    }
+    let mut params = reflection_params.lock().await.clone();
+    if !args.ignore_param.is_empty() {
+        params.retain(|p| !args.ignore_param.iter().any(|ignored| ignored == &p.name));
+    }
+    if !args.param.is_empty() {
+        params = filter_params(params, &args.param, target);
+        // Discovery/mining may have been skipped for the location an explicit
+        // `-p name:type` targets; synthesize those so a named injection point
+        // is always tested regardless of `--skip-*` flags.
+        ensure_explicit_params(&mut params, &args.param, target);
+    } else if args.sxss {
+        // Stored-XSS candidate seeding.
+        //
+        // Every discovery/mining probe keeps a param only when the marker
+        // comes back in the *immediate* response. For a stored sink that is
+        // precisely the wrong test: the defining property of `--sxss` is that
+        // the write endpoint does not echo — the payload surfaces later, on
+        // the retrieval URL. So the documented flow (inject at A, verify at
+        // `--sxss-url` B) discovered zero params and reported a clean scan
+        // without ever requesting B, even though the SXSS-aware reflection and
+        // DOM stages downstream do fetch B correctly.
+        //
+        // Seed the inputs the request actually carries so those stages get a
+        // chance to run. Anything discovery already found keeps its richer
+        // probe metadata; these fills are the same shape `-p name:type`
+        // synthesizes, which is the path that already worked.
+        ensure_sxss_candidate_params(&mut params, target, args);
+    }
+    target.reflection_params = params;
+
+    // === Stage 3: Active Probing — confirm specials, detect pre_encoding ===
+    let probe_semaphore = Arc::new(Semaphore::new(crate::utils::semaphore_permits(
+        target.workers,
+    )));
+    let probe_target = Arc::new(target.clone());
+    let mut param_handles = Vec::new();
+    for p in std::mem::take(&mut target.reflection_params) {
+        let target_ref = probe_target.clone();
+        let sem = probe_semaphore.clone();
+        param_handles.push(tokio::spawn(crate::with_job_scopes(
+            crate::JobScopes::capture(),
+            async move { active_probe_param(target_ref.as_ref(), p, sem).await },
+        )));
+    }
+    let mut probed = Vec::with_capacity(param_handles.len());
+    for h in param_handles {
+        if let Ok(res) = h.await {
+            probed.push(res);
+        }
+    }
+    if args.sxss {
+        // The active probe judges special characters from the *write*
+        // response. A stored sink that does not render the value there (the
+        // common "saved" / redirect / JSON-ack shape) comes back with no marker
+        // at all, which the probe records as "every special is filtered" — and
+        // the adaptive prune then drops every `<`/`>`/quote payload before the
+        // retrieval URL is ever checked. That verdict describes a page that
+        // never showed the value, not the one that renders it, so discard it
+        // and let the full payload set run (the same `None` the multi-URL-decode
+        // detection above uses for "the filter verdict does not apply").
+        for p in probed.iter_mut().filter(|p| !p.marker_echoed) {
+            p.valid_specials = None;
+            p.invalid_specials = None;
+        }
+        // The probe read the write response; findings come from the render
+        // page, so its verdict describes a different page.
+        for p in probed.iter_mut() {
+            p.filter = None;
+        }
+    }
+    target.reflection_params = probed;
+
+    // Logging parameter analysis (stderr). When an indicatif spinner is active,
+    // route through `pb.println` so the redraw doesn't shred each log line.
+    if !args.silence {
+        for p in &target.reflection_params {
+            let valid = p
+                .valid_specials
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |v| v.iter().collect::<String>());
+            let invalid = p
+                .invalid_specials
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |v| v.iter().collect::<String>());
+            let escaped = p
+                .escaped_specials
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |v| v.iter().collect::<String>());
+            let line = format!(
+                "[param-analysis] name={} type={:?} reflected=true context={:?} valid_specials=\"{}\" invalid_specials=\"{}\" escaped_specials=\"{}\"",
+                p.name, p.location, p.injection_context, valid, invalid, escaped
+            );
+            if let Some(ref pb) = pb {
+                pb.println(line);
+            } else {
+                eprintln!("{}", line);
+            }
+        }
+    }
+
+    if let Some(pb) = pb {
+        crate::scanning::finish_scan_bar(
+            pb.bar(),
+            console::style("✓").green().to_string(),
+            format!("Completed analyzing parameters for {}", target.url),
+        );
+    }
+}
+
+/// The `-p name:<type>` label for a param's location, matching the `-p`
+/// spec grammar. `Location::Header` uses explicit discovery identity when
+/// available and falls back to target-cookie membership for synthesized
+/// legacy params. Single source of truth shared by `filter_params` and
+/// `ensure_explicit_params`.
+fn param_type_label(p: &Param, target: &Target) -> &'static str {
+    match p.location {
+        Location::Query => "query",
+        Location::Body => "body",
+        Location::JsonBody => "json",
+        Location::MultipartBody => "multipart",
+        Location::GraphqlBody => "graphql",
+        Location::XmlBody => "xml",
+        Location::Path => "path",
+        Location::Fragment => "fragment",
+        Location::Header => {
+            if p.is_cookie
+                .unwrap_or_else(|| target.cookies.iter().any(|(n, _)| n == &p.name))
+            {
+                "cookie"
+            } else {
+                "header"
+            }
+        }
+    }
+}
+
+fn filter_params(params: Vec<Param>, param_specs: &[String], target: &Target) -> Vec<Param> {
+    if param_specs.is_empty() {
+        return params;
+    }
+
+    params
+        .into_iter()
+        .filter(|p| {
+            for spec in param_specs {
+                // "name:type" → match name + location; extra colons are ignored
+                // (parts[0]/parts[1]). A bare "name" matches any location.
+                let parts: Vec<&str> = spec.split(':').collect();
+                if parts.len() >= 2 {
+                    if p.name == parts[0] && param_type_label(p, target) == parts[1] {
+                        return true;
+                    }
+                } else if p.name == *spec {
+                    return true;
+                }
+            }
+            false
+        })
+        .collect()
+}
+
+/// Guarantee that every explicit `-p` injection point is present in `params`,
+/// synthesizing any that discovery/mining did not seed.
+///
+/// `-p` is otherwise just a *filter* over discovered params, so a `--skip-*`
+/// flag that suppresses the phase which would have seeded a location silently
+/// drops the operator's explicit target (the #1044 / #1045 bug class). This is
+/// the general guard: a named target is always tested, whatever was skipped.
+///
+/// Spec forms:
+/// - `name:type` — synthesize that exact location (`query`, `body`, `json`,
+///   `multipart`, `header`, `cookie`).
+/// - bare `name` — if no param with that name is already present, infer a
+///   location from the target (URL query → body → cookies → headers) and
+///   fall back to `query`. Bare names that already matched via filtering are
+///   left alone (any location).
+///
+/// Synthesized params carry no `injection_context` (scanning then uses the
+/// context-agnostic fallback payloads) and no special-char profile (the active
+/// probing stage fills that in). `path` and `fragment` are excluded: path
+/// segments are positional (`path_segment_N`, not name-addressable) and
+/// fragments are never sent to the server, so neither can be seeded by name.
+fn ensure_explicit_params(params: &mut Vec<Param>, param_specs: &[String], target: &Target) {
+    for spec in param_specs {
+        // Parse "name:type" as parts[0]/parts[1] to match `filter_params`.
+        let parts: Vec<&str> = spec.split(':').collect();
+        let (name, type_str) = match parts.as_slice() {
+            [name, ty, ..] if !name.is_empty() && !ty.is_empty() => (*name, Some(*ty)),
+            [name] if !name.is_empty() => (*name, None),
+            [name, ..] if !name.is_empty() => (*name, None),
+            _ => continue,
+        };
+
+        if let Some(type_str) = type_str {
+            let location = match type_str {
+                "query" => Location::Query,
+                "body" => Location::Body,
+                "json" => Location::JsonBody,
+                "multipart" => Location::MultipartBody,
+                "header" | "cookie" => Location::Header,
+                // path / fragment / unknown: not name-addressable for synthesis
+                _ => continue,
+            };
+            let already = params
+                .iter()
+                .any(|p| p.name == name && param_type_label(p, target) == type_str);
+            if already {
+                continue;
+            }
+            let is_cookie = matches!(type_str, "cookie")
+                .then_some(true)
+                .or_else(|| (type_str == "header").then_some(false));
+            push_synthesized_param(params, name, location, is_cookie);
+        } else {
+            // Bare name: keep any filtered matches; only synthesize when none.
+            if params.iter().any(|p| p.name == name) {
+                continue;
+            }
+            let location = infer_location_for_bare_param(name, target);
+            let is_cookie = (location == Location::Header)
+                .then(|| target.cookies.iter().any(|(n, _)| n == name));
+            push_synthesized_param(params, name, location, is_cookie);
+        }
+    }
+}
+
+/// Seed stored-XSS candidates from the inputs the request actually carries.
+///
+/// Only called under `--sxss` with no explicit `-p`. Discovery gates on
+/// immediate-response reflection, which a stored sink by definition fails, so
+/// without this the scan has nothing to test and silently reports clean. See
+/// the call site for the full rationale.
+///
+/// Deliberately limited to inputs already present on the wire (URL query pairs
+/// and `--data` body fields) rather than the mining wordlists: those are the
+/// operator's own declared inputs, so seeding them cannot invent traffic the
+/// user did not ask for. `--ignore-param` is still honoured.
+fn ensure_sxss_candidate_params(params: &mut Vec<Param>, target: &Target, args: &ScanArgs) {
+    let mut candidates: Vec<(String, Location)> = Vec::new();
+
+    for (name, _) in target.url.query_pairs() {
+        candidates.push((name.to_string(), Location::Query));
+    }
+
+    if let Some(data) = args.data.as_deref() {
+        let trimmed = data.trim_start();
+        if trimmed.starts_with('{') {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
+                for key in map.keys() {
+                    candidates.push((key.clone(), Location::JsonBody));
+                }
+            }
+        } else {
+            for (name, _) in url::form_urlencoded::parse(data.as_bytes()) {
+                candidates.push((name.to_string(), Location::Body));
+            }
+        }
+    }
+
+    // Keep whatever discovery produced for a slot — it carries probed
+    // specials / injection context that a bare synthesis does not. A set, not
+    // a scan of `params` per candidate: both grow with the URL/body size.
+    let mut present: std::collections::HashSet<(String, Location)> = params
+        .iter()
+        .map(|p| (p.name.clone(), p.location.clone()))
+        .collect();
+    for (name, location) in candidates {
+        if name.is_empty() || args.ignore_param.iter().any(|ignored| ignored == &name) {
+            continue;
+        }
+        if !present.insert((name.clone(), location.clone())) {
+            continue;
+        }
+        push_synthesized_param(params, &name, location, None);
+    }
+}
+
+fn push_synthesized_param(
+    params: &mut Vec<Param>,
+    name: &str,
+    location: Location,
+    is_cookie: Option<bool>,
+) {
+    let mut param = Param::new(name.to_string(), String::new(), location);
+    param.is_cookie = is_cookie;
+    params.push(param);
+}
+
+/// Infer a wire location for a bare `-p name` when discovery did not seed it.
+///
+/// Order mirrors how operators usually mean an untyped name: query string
+/// first (most common XSS surface), then request body, cookies, headers.
+/// Default is `query` so `--skip-discovery -p q` still tests something.
+fn infer_location_for_bare_param(name: &str, target: &Target) -> Location {
+    // URL query
+    if target.url.query_pairs().any(|(k, _)| k.as_ref() == name) {
+        return Location::Query;
+    }
+
+    // Form / JSON body
+    if let Some(data) = target.data.as_deref() {
+        let trimmed = data.trim_start();
+        if trimmed.starts_with('{') {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed)
+                && map.contains_key(name)
+            {
+                return Location::JsonBody;
+            }
+        } else if url::form_urlencoded::parse(data.as_bytes()).any(|(k, _)| k.as_ref() == name) {
+            return Location::Body;
+        }
+    }
+
+    // Cookies (Header location; `param_type_label` reports "cookie")
+    if target.cookies.iter().any(|(n, _)| n == name) {
+        return Location::Header;
+    }
+
+    // Headers (case-insensitive name match on header names)
+    if target
+        .headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(name))
+    {
+        return Location::Header;
+    }
+
+    Location::Query
+}
+
+/// Return `-p` specs that are still absent from `params` after filtering +
+/// synthesis. Used by dry-run to surface agent-visible warnings (e.g. only
+/// `path`/`fragment` specs, which cannot be synthesized by name).
+pub(crate) fn unresolved_explicit_param_specs(
+    params: &[Param],
+    param_specs: &[String],
+    target: &Target,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for spec in param_specs {
+        let parts: Vec<&str> = spec.split(':').collect();
+        match parts.as_slice() {
+            [name, ty, ..] if !name.is_empty() && !ty.is_empty() => {
+                let present = params
+                    .iter()
+                    .any(|p| p.name == *name && param_type_label(p, target) == *ty);
+                if !present {
+                    missing.push(spec.clone());
+                }
+            }
+            [name, ..] if !name.is_empty() && !params.iter().any(|p| p.name == *name) => {
+                missing.push(spec.clone());
+            }
+            _ => {}
+        }
+    }
+    missing
+}
+
+/// `base` with every `name` query pair's value set to `value`, or the pair
+/// appended when `name` is absent. Other pairs keep their order.
+pub(crate) fn with_query_param(base: &url::Url, name: &str, value: &str) -> url::Url {
+    let mut url = base.clone();
+    let mut replaced = false;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.clear();
+        for (k, v) in base.query_pairs() {
+            if k == name {
+                pairs.append_pair(&k, value);
+                replaced = true;
+            } else {
+                pairs.append_pair(&k, &v);
+            }
+        }
+        if !replaced {
+            pairs.append_pair(name, value);
+        }
+    }
+    url
+}
+
+/// Await every discovery/mining probe task and append the params they found
+/// to `reflection_params` in one lock acquisition, in spawn order.
+pub(crate) async fn extend_with_joined(
+    reflection_params: &Mutex<Vec<Param>>,
+    handles: Vec<tokio::task::JoinHandle<Option<Param>>>,
+) {
+    let mut batch: Vec<Param> = Vec::new();
+    for handle in handles {
+        if let Ok(Some(p)) = handle.await {
+            batch.push(p);
+        }
+    }
+    if !batch.is_empty() {
+        reflection_params.lock().await.extend(batch);
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,2105 @@
+use super::*;
+
+#[test]
+fn test_normalize_proxy_empty_is_absent_unroutable_is_error() {
+    // REST/MCP treat empty as "no proxy" (templated `?proxy=`). The CLI's
+    // `validate_proxy_url` rejects empty instead — that split is deliberate.
+    assert_eq!(normalize_proxy("").unwrap(), None);
+    assert_eq!(normalize_proxy("   ").unwrap(), None);
+
+    assert_eq!(
+        normalize_proxy("  http://127.0.0.1:8080  ")
+            .unwrap()
+            .as_deref(),
+        Some("http://127.0.0.1:8080")
+    );
+    assert_eq!(
+        normalize_proxy("\u{a0}socks5://127.0.0.1:1080")
+            .unwrap()
+            .as_deref(),
+        Some("socks5://127.0.0.1:1080")
+    );
+
+    // `ftp://` parses and passes `Proxy::all` but is not routed — must not
+    // survive as a stored proxy, or the scan goes DIRECT.
+    let err = normalize_proxy("ftp://127.0.0.1:8080").unwrap_err();
+    assert!(
+        err.contains("not routable"),
+        "unroutable scheme must be named, got: {err}"
+    );
+    assert!(
+        !err.contains("S3cr3t"),
+        "must not echo a proxy that could carry credentials"
+    );
+    let secret_err = normalize_proxy("ftp://user:S3cr3t@host:8080").unwrap_err();
+    assert!(
+        !secret_err.contains("S3cr3t"),
+        "error leaked credentials: {secret_err}"
+    );
+}
+
+#[test]
+fn test_has_http_scheme() {
+    // Accepts http/https, case-insensitively, after trimming.
+    for ok in [
+        "http://example.com",
+        "https://example.com/p?q=1",
+        "HTTP://EXAMPLE.COM",
+        "HtTpS://x",
+        "  http://x  ",
+    ] {
+        assert!(has_http_scheme(ok), "should accept {:?}", ok);
+    }
+    // Rejects other schemes, bare hosts, and empties.
+    for bad in [
+        "ftp://x",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "example.com",
+        "",
+        "   ",
+        "httpx://x",
+    ] {
+        assert!(!has_http_scheme(bad), "should reject {:?}", bad);
+    }
+}
+
+#[test]
+fn test_parse_job_status_round_trip() {
+    for status in [
+        JobStatus::Queued,
+        JobStatus::Running,
+        JobStatus::Done,
+        JobStatus::Error,
+        JobStatus::Cancelled,
+    ] {
+        let s = status.to_string();
+        assert_eq!(parse_job_status(&s), Some(status));
+    }
+    assert_eq!(parse_job_status("unknown"), None);
+}
+
+#[test]
+fn test_new_queued_initializes_timestamps() {
+    let before = now_ms();
+    let job = Job::new_queued("https://example.com".to_string());
+    let after = now_ms();
+    assert_eq!(job.status, JobStatus::Queued);
+    assert!(job.queued_at_ms >= before && job.queued_at_ms <= after);
+    assert!(job.started_at_ms.is_none());
+    assert!(job.finished_at_ms.is_none());
+    assert!(!job.is_terminal());
+}
+
+#[test]
+fn test_duration_ms_computed_from_timestamps() {
+    let mut job = Job::new_queued("https://example.com".to_string());
+    assert_eq!(job.duration_ms(), None);
+    job.started_at_ms = Some(1000);
+    job.finished_at_ms = Some(1250);
+    assert_eq!(job.duration_ms(), Some(250));
+}
+
+#[test]
+fn test_duration_ms_clamps_clock_stepback_to_zero() {
+    // A wall-clock step-back (NTP/VM) between started_at and finished_at must
+    // not surface a negative duration in the serialized API output.
+    let mut job = Job::new_queued("https://example.com".to_string());
+    job.started_at_ms = Some(5_000);
+    job.finished_at_ms = Some(4_000);
+    assert_eq!(job.duration_ms(), Some(0));
+}
+
+#[test]
+fn test_purge_expired_jobs_removes_old_terminal_jobs() {
+    let mut jobs = HashMap::new();
+    let mut old = Job::new_queued("old".to_string());
+    old.status = JobStatus::Done;
+    old.finished_at_ms = Some(now_ms() - (JOB_RETENTION_SECS + 10) * 1000);
+    jobs.insert("old".to_string(), old);
+
+    let mut fresh = Job::new_queued("fresh".to_string());
+    fresh.status = JobStatus::Done;
+    fresh.finished_at_ms = Some(now_ms());
+    jobs.insert("fresh".to_string(), fresh);
+
+    jobs.insert("active".to_string(), Job::new_queued("active".to_string()));
+
+    purge_expired_jobs(&mut jobs, JOB_RETENTION_SECS);
+
+    assert!(
+        !jobs.contains_key("old"),
+        "old terminal job should be purged"
+    );
+    assert!(jobs.contains_key("fresh"), "fresh terminal job must remain");
+    assert!(
+        jobs.contains_key("active"),
+        "active job must never be purged"
+    );
+}
+
+#[test]
+fn job_status_display_matches_lowercase_variant_name() {
+    assert_eq!(JobStatus::Queued.to_string(), "queued");
+    assert_eq!(JobStatus::Running.to_string(), "running");
+    assert_eq!(JobStatus::Done.to_string(), "done");
+    assert_eq!(JobStatus::Error.to_string(), "error");
+    assert_eq!(JobStatus::Cancelled.to_string(), "cancelled");
+}
+
+/// The Display impl and the `#[serde(rename_all = "lowercase")]`
+/// representation must agree — REST and MCP clients parse the JSON
+/// form, and CLI logs print the Display form. Drift between them
+/// would silently break consumers that compare the two strings.
+#[test]
+fn job_status_serde_matches_display() {
+    let variants = [
+        JobStatus::Queued,
+        JobStatus::Running,
+        JobStatus::Done,
+        JobStatus::Error,
+        JobStatus::Cancelled,
+    ];
+    for v in variants {
+        let json = serde_json::to_string(&v).unwrap();
+        // serde_json wraps the variant name in quotes.
+        assert_eq!(json, format!("\"{}\"", v));
+        let round: JobStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, v);
+    }
+}
+
+#[test]
+fn job_status_deserializes_from_lowercase_string() {
+    let s: JobStatus = serde_json::from_str("\"queued\"").unwrap();
+    assert_eq!(s, JobStatus::Queued);
+    let s: JobStatus = serde_json::from_str("\"cancelled\"").unwrap();
+    assert_eq!(s, JobStatus::Cancelled);
+}
+
+#[test]
+fn effective_rate_limit_resolves_request_and_cap() {
+    // No request, no cap → unlimited.
+    assert_eq!(effective_rate_limit(None, None), 0);
+    // No request, cap set → the cap applies to everyone.
+    assert_eq!(effective_rate_limit(None, Some(20)), 20);
+    // Cap explicitly 0 → still unlimited.
+    assert_eq!(effective_rate_limit(None, Some(0)), 0);
+    // Request only → used as-is (including an explicit unlimited).
+    assert_eq!(effective_rate_limit(Some(50), None), 50);
+    assert_eq!(effective_rate_limit(Some(0), None), 0);
+    // Request below the cap → request wins (a client may ask for less).
+    assert_eq!(effective_rate_limit(Some(5), Some(20)), 5);
+    // Request above the cap → clamped down to the cap.
+    assert_eq!(effective_rate_limit(Some(100), Some(20)), 20);
+    // Request tries to go unlimited while a cap is set → clamped to the cap.
+    assert_eq!(effective_rate_limit(Some(0), Some(20)), 20);
+}
+
+#[test]
+fn split_cookie_pairs_splits_and_trims_multi_cookie_value() {
+    // The bug F4 fixes: a bare split_once('=') would fold "; lang=en" into the
+    // first value and keep the surrounding whitespace.
+    let pairs = split_cookie_pairs("session = abc ; lang=en");
+    assert_eq!(
+        pairs,
+        vec![
+            ("session".to_string(), "abc".to_string()),
+            ("lang".to_string(), "en".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn lift_cookie_headers_moves_pairs_and_keeps_unparseable_headers() {
+    let mut headers = vec![
+        ("X-A".to_string(), "1".to_string()),
+        ("COOKIE".to_string(), "a=1; sid=x".to_string()),
+        ("Cookie".to_string(), "junk".to_string()),
+    ];
+    let mut cookies = vec![("sid".to_string(), "dropped".to_string())];
+    lift_cookie_headers(&mut headers, &mut cookies);
+    // The header replaces `--cookies`, as it always did on the wire; the
+    // header with no pair is left alone.
+    assert_eq!(
+        cookies,
+        vec![
+            ("a".to_string(), "1".to_string()),
+            ("sid".to_string(), "x".to_string())
+        ]
+    );
+    assert_eq!(
+        headers,
+        vec![
+            ("X-A".to_string(), "1".to_string()),
+            ("Cookie".to_string(), "junk".to_string())
+        ]
+    );
+}
+
+#[test]
+fn hydrate_target_lifts_cookie_header_for_server_and_mcp() {
+    let args = crate::cmd::scan::ScanArgs {
+        headers: vec!["Cookie: other=1; sid=abc".to_string()],
+        ..Default::default()
+    };
+    let t = runner::hydrate_target("http://127.0.0.1:1/", &args).expect("hydrate");
+    assert_eq!(
+        t.cookies,
+        vec![
+            ("other".to_string(), "1".to_string()),
+            ("sid".to_string(), "abc".to_string())
+        ]
+    );
+    assert!(t.headers.is_empty());
+}
+
+#[test]
+fn hydrate_target_marks_a_raw_multipart_body_like_the_cli() {
+    let args = crate::cmd::scan::ScanArgs {
+        data: Some(
+            "--X\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nv\r\n--X--\r\n".to_string(),
+        ),
+        ..Default::default()
+    };
+    let t = runner::hydrate_target("http://127.0.0.1:1/", &args).expect("hydrate");
+    assert!(t.multipart);
+    let args = crate::cmd::scan::ScanArgs {
+        data: Some("q=v".to_string()),
+        ..Default::default()
+    };
+    let t = runner::hydrate_target("http://127.0.0.1:1/", &args).expect("hydrate");
+    assert!(!t.multipart);
+}
+
+#[test]
+fn job_status_rejects_unknown_variant() {
+    assert!(serde_json::from_str::<JobStatus>("\"finished\"").is_err());
+}
+
+#[test]
+fn effective_scan_timeout_resolves_request_and_cap() {
+    // No request, no cap → unbounded.
+    assert_eq!(effective_scan_timeout(None, None), 0);
+    // No request, cap set → the cap applies to everyone.
+    assert_eq!(effective_scan_timeout(None, Some(30)), 30);
+    // No request, cap explicitly 0 → still unbounded (a 0 cap is "no cap").
+    assert_eq!(effective_scan_timeout(None, Some(0)), 0);
+    // Request only → used as-is, including an explicit disable.
+    assert_eq!(effective_scan_timeout(Some(45), None), 45);
+    assert_eq!(effective_scan_timeout(Some(0), None), 0);
+    // Request under the cap → request wins (a client may ask for less).
+    assert_eq!(effective_scan_timeout(Some(10), Some(30)), 10);
+    // Request over the cap → clamped down to the cap (can't exceed it).
+    assert_eq!(effective_scan_timeout(Some(120), Some(30)), 30);
+    // Request tries to disable while a cap is set → clamped up to the cap
+    // (a client cannot opt out of a server-enforced budget).
+    assert_eq!(effective_scan_timeout(Some(0), Some(30)), 30);
+    // Equal values → that value.
+    assert_eq!(effective_scan_timeout(Some(30), Some(30)), 30);
+}
+
+#[tokio::test]
+async fn run_within_scan_budget_trips_and_sets_cancel_on_expiry() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Budget of 1s against a future that would take 3s → must abort at the
+    // budget (~1s), set the cancel flag, and report that it timed out.
+    let timed_out = run_within_scan_budget(1, &cancel, async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    })
+    .await;
+    assert!(timed_out, "an over-budget scan must report timed_out");
+    assert!(
+        cancel.load(std::sync::atomic::Ordering::Relaxed),
+        "expiry must trip the shared cancel flag so workers wind down"
+    );
+}
+
+#[tokio::test]
+async fn run_within_scan_budget_passes_through_when_under_budget() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Completes well inside the budget → no timeout, cancel flag untouched.
+    let timed_out = run_within_scan_budget(5, &cancel, async {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    })
+    .await;
+    assert!(!timed_out, "a scan that finishes in time must not time out");
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn run_within_scan_budget_zero_disables_the_cap() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    // budget_secs == 0 takes the no-cap branch: it just awaits the future and
+    // returns false without ever arming a timer or touching the cancel flag.
+    let timed_out = run_within_scan_budget(0, &cancel, async {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    })
+    .await;
+    assert!(!timed_out, "a 0 budget must never report a timeout");
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn enforce_retention_cap_evicts_oldest_finished_first() {
+    let mut jobs: HashMap<String, Job> = HashMap::new();
+    for i in 0..5i64 {
+        let mut job = Job::new_queued(format!("http://example.com/{}", i));
+        job.status = JobStatus::Done;
+        job.finished_at_ms = Some(1_000 + i);
+        jobs.insert(format!("job{}", i), job);
+    }
+
+    enforce_retention_cap(&mut jobs, 3);
+
+    assert_eq!(jobs.len(), 3);
+    assert!(!jobs.contains_key("job0"), "oldest evicted first");
+    assert!(!jobs.contains_key("job1"));
+    assert!(jobs.contains_key("job4"), "newest retained");
+}
+
+#[test]
+fn enforce_retention_cap_never_evicts_active_jobs() {
+    let mut jobs: HashMap<String, Job> = HashMap::new();
+    // Two active jobs with no finished_at, plus one finished job.
+    jobs.insert(
+        "queued".to_string(),
+        Job::new_queued("http://a".to_string()),
+    );
+    let mut running = Job::new_queued("http://b".to_string());
+    running.status = JobStatus::Running;
+    jobs.insert("running".to_string(), running);
+    let mut done = Job::new_queued("http://c".to_string());
+    done.status = JobStatus::Done;
+    done.finished_at_ms = Some(now_ms());
+    jobs.insert("done".to_string(), done);
+
+    enforce_retention_cap(&mut jobs, 1);
+
+    // Only the finished one can go; the map stays over cap rather than
+    // stranding a worker that is still writing to its entry.
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.contains_key("queued"));
+    assert!(jobs.contains_key("running"));
+    assert!(!jobs.contains_key("done"));
+}
+
+// ---------------------------------------------------------------------------
+// Worker leases: a cancelled job is stamped terminal while its worker drains
+// ---------------------------------------------------------------------------
+//
+// `cancel_scan_handler` sets `status = Cancelled` and `finished_at_ms` the
+// moment the user asks, so `is_terminal()` is true while the worker is still
+// running — it has partial results to store, a status to reconcile and (REST) a
+// terminal webhook to fire. Retention used to evict on `is_terminal()` alone,
+// so a burst of new submissions could collect that entry out from under the
+// worker: `jobs.get_mut(&id)` then returns None, the results are dropped, the
+// webhook never fires, and a GET on the caller's scan_id 404s.
+
+#[test]
+fn cancelled_job_with_a_live_worker_is_not_evictable() {
+    let mut job = Job::new_queued("http://a".to_string());
+    let lease = job.issue_worker_lease();
+
+    // What DELETE /scan/{id} does to a running job.
+    job.status = JobStatus::Cancelled;
+    job.finished_at_ms = Some(now_ms());
+
+    assert!(
+        job.is_terminal(),
+        "cancel stamps the terminal state at once"
+    );
+    assert!(job.worker_alive(), "but the worker is still draining");
+    assert!(
+        !job.is_evictable(),
+        "retention must not collect a job a worker is still writing to"
+    );
+    assert!(
+        !job.is_settled(),
+        "explicit deletion must wait for the lease"
+    );
+
+    // Worker finishes (or panics): the lease drops and the entry is collectable.
+    drop(lease);
+    assert!(!job.worker_alive());
+    assert!(job.is_settled());
+    assert!(job.is_evictable());
+}
+
+#[test]
+fn enforce_retention_cap_never_evicts_a_draining_job() {
+    let mut jobs: HashMap<String, Job> = HashMap::new();
+
+    let mut draining = Job::new_queued("http://draining".to_string());
+    let _lease = draining.issue_worker_lease();
+    draining.status = JobStatus::Cancelled;
+    // Oldest by finished_at, so it is the *first* candidate the cap would take.
+    // Still inside the drain grace, so the worker genuinely owns it.
+    draining.finished_at_ms = Some(now_ms() - 2_000);
+    jobs.insert("draining".to_string(), draining);
+
+    let mut settled = Job::new_queued("http://settled".to_string());
+    settled.status = JobStatus::Done;
+    settled.finished_at_ms = Some(now_ms() - 1_000);
+    jobs.insert("settled".to_string(), settled);
+
+    enforce_retention_cap(&mut jobs, 1);
+
+    assert!(
+        jobs.contains_key("draining"),
+        "a cancelled-but-draining job must survive the retention cap"
+    );
+    assert!(
+        !jobs.contains_key("settled"),
+        "the settled job is the one that should have been evicted"
+    );
+}
+
+#[test]
+fn purge_expired_jobs_keeps_a_draining_job_past_its_ttl() {
+    // A short TTL so the entry is past retention while the worker is still
+    // inside its drain grace — the window the lease guard exists for.
+    const SHORT_TTL: i64 = 1;
+    let mut jobs: HashMap<String, Job> = HashMap::new();
+    let mut draining = Job::new_queued("http://draining".to_string());
+    let _lease = draining.issue_worker_lease();
+    draining.status = JobStatus::Cancelled;
+    draining.finished_at_ms = Some(now_ms() - (SHORT_TTL + 10) * 1000);
+    jobs.insert("draining".to_string(), draining);
+
+    purge_expired_jobs(&mut jobs, SHORT_TTL);
+
+    assert!(
+        jobs.contains_key("draining"),
+        "the retention TTL must not collect an entry a worker still owns"
+    );
+
+    // Same job once the worker is gone: now it is past its TTL and collectable.
+    jobs.get_mut("draining")
+        .expect("still present")
+        .worker_lease = None;
+    purge_expired_jobs(&mut jobs, SHORT_TTL);
+    assert!(jobs.is_empty(), "an expired settled job is still purged");
+}
+
+// A live lease is what keeps a terminal job's slot and entry alive, but "until
+// the lease drops" is not a bound: `effective_scan_timeout` is 0 (unbounded)
+// unless the request or `--scan-timeout` sets one, so a worker wedged past its
+// cancellation checkpoints would otherwise pin one of `--max-concurrent-scans`
+// and one map entry forever — repeat that and /scan returns 503 for good.
+// `WORKER_DRAIN_GRACE_SECS` is the outer bound on that window.
+
+#[test]
+fn a_wedged_worker_stops_holding_its_slot_after_the_drain_grace() {
+    let mut job = Job::new_queued("http://wedged".to_string());
+    let _lease = job.issue_worker_lease();
+    job.status = JobStatus::Cancelled;
+    job.finished_at_ms = Some(now_ms() - 1_000);
+
+    assert!(
+        job.occupies_capacity(),
+        "a freshly cancelled job still holds its slot while the worker drains"
+    );
+    assert!(!job.is_evictable());
+    assert!(!job.drain_window_expired());
+
+    // Same job, same live lease, long past any healthy drain.
+    job.finished_at_ms = Some(now_ms() - (WORKER_DRAIN_GRACE_SECS + 10) * 1000);
+    assert!(job.worker_alive(), "the worker never let go");
+    assert!(job.drain_window_expired());
+    assert!(
+        !job.occupies_capacity(),
+        "a wedged worker must not pin a concurrency slot forever"
+    );
+    assert!(
+        job.is_evictable(),
+        "and its map entry must become collectable"
+    );
+    assert!(
+        !job.is_settled(),
+        "retention grace must not make explicit deletion unsafe"
+    );
+}
+
+#[test]
+fn a_running_job_never_expires_its_drain_window() {
+    // The grace only bounds the *terminal* drain. A job that is legitimately
+    // still running holds its slot for as long as it runs, however long that is.
+    let mut job = Job::new_queued("http://running".to_string());
+    let _lease = job.issue_worker_lease();
+    job.status = JobStatus::Running;
+    job.started_at_ms = Some(now_ms() - (WORKER_DRAIN_GRACE_SECS + 600) * 1000);
+
+    assert!(!job.drain_window_expired());
+    assert!(job.occupies_capacity());
+    assert!(!job.is_evictable());
+}
+
+#[test]
+fn purge_expired_jobs_collects_a_wedged_worker_past_the_grace() {
+    let mut jobs: HashMap<String, Job> = HashMap::new();
+    let mut wedged = Job::new_queued("http://wedged".to_string());
+    let _lease = wedged.issue_worker_lease();
+    wedged.status = JobStatus::Cancelled;
+    wedged.finished_at_ms = Some(now_ms() - (JOB_RETENTION_SECS + 10) * 1000);
+    jobs.insert("wedged".to_string(), wedged);
+
+    purge_expired_jobs(&mut jobs, JOB_RETENTION_SECS);
+
+    assert!(
+        jobs.is_empty(),
+        "an entry whose worker wedged an hour ago is not still draining"
+    );
+}
+
+#[test]
+fn a_job_with_no_worker_is_evictable_as_soon_as_it_is_terminal() {
+    // Jobs staged by hand (tests, and any future path that records a terminal
+    // job without spawning a worker) carry no lease, so the lease check must
+    // not turn into "never evict anything".
+    let mut job = Job::new_queued("http://a".to_string());
+    job.status = JobStatus::Done;
+    job.finished_at_ms = Some(now_ms());
+    assert!(!job.worker_alive());
+    assert!(job.is_evictable());
+}
+
+#[test]
+fn enforce_retention_cap_zero_disables_the_cap() {
+    let mut jobs: HashMap<String, Job> = HashMap::new();
+    for i in 0..4 {
+        let mut job = Job::new_queued(format!("http://example.com/{}", i));
+        job.status = JobStatus::Done;
+        job.finished_at_ms = Some(now_ms());
+        jobs.insert(format!("job{}", i), job);
+    }
+
+    enforce_retention_cap(&mut jobs, 0);
+
+    assert_eq!(jobs.len(), 4);
+}
+
+// ---------------------------------------------------------------------------
+// job::spec — the shared REST/MCP request → ScanArgs mapping
+// ---------------------------------------------------------------------------
+
+use crate::job::spec::ScanRequestSpec;
+
+/// The surface policy every agent-facing scan gets regardless of what the
+/// caller asked for. Previously written out twice (once in `job_runner`, once
+/// in the MCP tool) and drifted; pin it once.
+#[test]
+fn into_scan_args_applies_the_fixed_surface_policy() {
+    let args = ScanRequestSpec {
+        target: "http://example.com/?q=1".to_string(),
+        skip_mining: true,
+        ..Default::default()
+    }
+    .into_scan_args();
+
+    assert_eq!(args.input_type, "url");
+    assert_eq!(args.targets, vec!["http://example.com/?q=1".to_string()]);
+    assert_eq!(args.format, "json");
+    assert!(args.silence, "job output is serialized, never printed");
+    assert!(args.no_color, "diagnostics must not carry ANSI into JSON");
+    // One request-level switch drives all three mining stages.
+    assert!(args.skip_mining && args.skip_mining_dict && args.skip_mining_dom);
+    assert!(
+        args.oob.blind_oob.is_none(),
+        "OOB/OAST blind XSS stays CLI-only on these surfaces"
+    );
+}
+
+/// A REST request that names nothing must land on the CLI's own defaults. The
+/// REST path used to spell them as literals (`50`, `"GET"`, `["url", "html"]`),
+/// so changing a `DEFAULT_*` moved the CLI and MCP but silently left the server
+/// behind.
+#[test]
+fn rest_defaults_track_the_cli_constants() {
+    let opts = crate::server::types::ScanOptions::default();
+    let spec = ScanRequestSpec::from_rest_options(
+        "http://example.com".to_string(),
+        &opts,
+        false,
+        false,
+        0,
+        0,
+        None,
+    );
+
+    assert_eq!(spec.workers, crate::cmd::scan::DEFAULT_WORKERS);
+    assert_eq!(spec.method, crate::cmd::scan::DEFAULT_METHOD);
+    assert_eq!(spec.timeout, crate::cmd::scan::DEFAULT_TIMEOUT_SECS);
+    assert_eq!(spec.waf_bypass, crate::cmd::scan::DEFAULT_WAF_BYPASS);
+    assert_eq!(
+        spec.waf_min_confidence,
+        crate::cmd::scan::DEFAULT_WAF_MIN_CONFIDENCE
+    );
+    assert_eq!(spec.encoders, crate::cmd::scan::DEFAULT_ENCODERS);
+    assert_eq!(
+        spec.insecure, None,
+        "an unspecified `insecure` stays unspecified; the Target decides"
+    );
+}
+
+/// The two front-ends describe the same scan in two request shapes. Given
+/// equivalent input they must produce byte-identical `ScanArgs` — that equality
+/// is the whole reason the mapping was pulled into one place.
+#[test]
+fn rest_and_mcp_requests_agree_on_scan_args() {
+    let mcp_params: crate::mcp::ScanWithDalfoxParams =
+        serde_json::from_str(r#"{"target":"http://example.com/?q=1"}"#)
+            .expect("minimal MCP scan request deserializes");
+
+    // The MCP tool schema fills its own defaults via serde; the REST body
+    // leaves everything `None` and resolves defaults on the way into the spec.
+    let rest = ScanRequestSpec::from_rest_options(
+        "http://example.com/?q=1".to_string(),
+        &crate::server::types::ScanOptions::default(),
+        false,
+        false,
+        0,
+        0,
+        None,
+    )
+    .into_scan_args();
+
+    let mcp = ScanRequestSpec {
+        target: "http://example.com/?q=1".to_string(),
+        param: mcp_params.param,
+        data: mcp_params.data,
+        headers: mcp_params.headers,
+        cookies: mcp_params.cookies,
+        method: mcp_params.method,
+        user_agent: mcp_params.user_agent,
+        encoders: mcp_params.encoders,
+        timeout: mcp_params.timeout,
+        scan_timeout: mcp_params.scan_timeout,
+        delay: mcp_params.delay,
+        follow_redirects: mcp_params.follow_redirects,
+        // The only deliberate divergence: MCP's schema always yields a concrete
+        // bool, and its default (`true`) is the same posture the REST path
+        // reaches by leaving the choice to the Target. Normalize it here so the
+        // rest of the comparison is meaningful.
+        insecure: None,
+        proxy: mcp_params.proxy,
+        include_request: mcp_params.include_request,
+        include_response: mcp_params.include_response,
+        skip_mining: mcp_params.skip_mining,
+        skip_discovery: mcp_params.skip_discovery,
+        deep_scan: mcp_params.deep_scan,
+        skip_ast_analysis: mcp_params.skip_ast_analysis,
+        analyze_external_js: mcp_params.analyze_external_js,
+        detect_outdated_libs: mcp_params.detect_outdated_libs,
+        blind_callback_url: mcp_params.blind_callback_url,
+        workers: mcp_params.workers,
+        rate_limit: mcp_params.rate_limit,
+        waf_bypass: mcp_params.waf_bypass,
+        skip_waf_probe: mcp_params.skip_waf_probe,
+        force_waf: mcp_params.force_waf,
+        waf_evasion: mcp_params.waf_evasion,
+        waf_min_confidence: mcp_params.waf_min_confidence as f32,
+        remote_payloads: mcp_params.remote_payloads,
+        remote_wordlists: mcp_params.remote_wordlists,
+        max_payloads_per_param: mcp_params.max_payloads_per_param,
+        blind_oob: mcp_params.blind_oob.as_ref().and_then(|b| b.servers()),
+        blind_oob_wait: mcp_params.blind_oob_wait,
+        session_check: mcp_params.session_check,
+        session_check_url: mcp_params.session_check_url,
+        min_confidence: mcp_params.min_confidence,
+    }
+    .into_scan_args();
+
+    assert_eq!(
+        rest, mcp,
+        "a default REST scan and a default MCP scan must run identically"
+    );
+}
+
+/// The value-plumbing seam. `into_scan_args` fills `ScanArgs` with
+/// `..Default::default()`, so a field accepted by `ScanOptions` but not wired
+/// through `from_rest_options` + `into_scan_args` is silently dropped: it still
+/// passes `surface_parity` (which only checks a field *name* maps to a flag)
+/// and `rest_and_mcp_requests_agree_on_scan_args` (which only exercises
+/// defaults). This asserts a *non-default* value on every mapped REST option
+/// actually reaches `ScanArgs` — the #1388 drop class, one layer in.
+#[test]
+fn rest_non_default_options_reach_scan_args() {
+    use crate::server::types::ScanOptions;
+    let opts = ScanOptions {
+        param: Some(vec!["myparam:query".to_string()]),
+        data: Some("a=b".to_string()),
+        header: Some(vec!["X-Test: 1".to_string()]),
+        cookie: Some("sid=abc".to_string()),
+        method: Some("PUT".to_string()),
+        user_agent: Some("UA/1".to_string()),
+        encoders: Some(vec!["base64".to_string()]),
+        timeout: Some(7),
+        delay: Some(50),
+        follow_redirects: Some(true),
+        insecure: Some(false),
+        proxy: Some("http://127.0.0.1:9".to_string()),
+        skip_mining: Some(true),
+        skip_discovery: Some(true),
+        deep_scan: Some(true),
+        skip_ast_analysis: Some(true),
+        analyze_external_js: Some(true),
+        detect_outdated_libs: Some(true),
+        blind: Some("http://cb".to_string()),
+        worker: Some(9),
+        waf_bypass: Some("off".to_string()),
+        skip_waf_probe: Some(true),
+        waf_evasion: Some(true),
+        waf_min_confidence: Some(0.7),
+        remote_payloads: Some(vec!["portswigger".to_string()]),
+        remote_wordlists: Some(vec!["burp".to_string()]),
+        max_payloads_per_param: Some(11),
+        blind_oob: Some(crate::job::spec::BlindOobRequest::Servers(vec![
+            "oast.fun".to_string(),
+        ])),
+        blind_oob_wait: Some(12),
+        session_check: Some("Sign out".to_string()),
+        session_check_url: Some("https://app/me".to_string()),
+        min_confidence: Some("high".to_string()),
+        ..Default::default()
+    };
+
+    let args = ScanRequestSpec::from_rest_options(
+        "http://example.com/?q=1".to_string(),
+        &opts,
+        true,                           // include_request
+        true,                           // include_response
+        1234,                           // scan_timeout (already capped by the handler)
+        42,                             // rate_limit (already capped)
+        Some("cloudflare".to_string()), // force_waf (already normalized)
+    )
+    .into_scan_args();
+
+    assert_eq!(args.param, vec!["myparam:query".to_string()]);
+    assert_eq!(args.data.as_deref(), Some("a=b"));
+    assert_eq!(args.headers, vec!["X-Test: 1".to_string()]);
+    assert_eq!(args.cookies, vec!["sid=abc".to_string()]);
+    assert_eq!(args.method, "PUT");
+    assert_eq!(args.user_agent.as_deref(), Some("UA/1"));
+    assert_eq!(args.encoders, vec!["base64".to_string()]);
+    assert_eq!(args.timeout, 7);
+    assert_eq!(args.scan_timeout, 1234);
+    assert_eq!(args.delay, 50);
+    assert!(args.follow_redirects);
+    assert_eq!(args.insecure, Some(false));
+    assert_eq!(args.proxy.as_deref(), Some("http://127.0.0.1:9"));
+    // One request switch drives all three mining stages.
+    assert!(args.skip_mining);
+    assert!(args.skip_mining_dict);
+    assert!(args.skip_mining_dom);
+    assert!(args.skip_discovery);
+    assert!(args.deep_scan);
+    assert!(args.skip_ast_analysis);
+    assert!(args.analyze_external_js);
+    assert!(args.detect_outdated_libs);
+    assert_eq!(args.blind_callback_url.as_deref(), Some("http://cb"));
+    assert_eq!(args.workers, 9);
+    assert_eq!(args.rate_limit, 42);
+    assert_eq!(args.waf_bypass, "off");
+    assert!(args.skip_waf_probe);
+    assert_eq!(args.force_waf.as_deref(), Some("cloudflare"));
+    assert!(args.waf_evasion);
+    assert_eq!(args.waf_min_confidence, 0.7_f32);
+    assert_eq!(args.remote_payloads, vec!["portswigger".to_string()]);
+    assert_eq!(args.remote_wordlists, vec!["burp".to_string()]);
+    assert_eq!(args.max_payloads_per_param, 11);
+    assert_eq!(args.min_confidence.as_deref(), Some("high"));
+    assert!(args.include_request);
+    assert!(args.include_response);
+    assert_eq!(args.oob.blind_oob, Some(vec!["oast.fun".to_string()]));
+    assert!(args.blind_oob_enabled());
+    assert_eq!(args.oob.blind_oob_wait, Some(12));
+    assert_eq!(args.session_check.as_deref(), Some("Sign out"));
+    assert_eq!(args.session_check_url.as_deref(), Some("https://app/me"));
+}
+
+#[test]
+fn normalize_blind_oob_validates_and_cleans_servers() {
+    use crate::job::spec::BlindOobRequest;
+    // A bare bool is passed through untouched.
+    let mut enabled = Some(BlindOobRequest::Enabled(true));
+    normalize_blind_oob(&mut enabled).unwrap();
+    assert_eq!(enabled, Some(BlindOobRequest::Enabled(true)));
+
+    // Blanks are dropped, good hosts kept (bare + scheme forms both valid).
+    let mut servers = Some(BlindOobRequest::Servers(vec![
+        "  oast.fun ".to_string(),
+        "".to_string(),
+        "https://oob.example.com".to_string(),
+    ]));
+    normalize_blind_oob(&mut servers).unwrap();
+    assert_eq!(
+        servers,
+        Some(BlindOobRequest::Servers(vec![
+            "oast.fun".to_string(),
+            "https://oob.example.com".to_string(),
+        ]))
+    );
+
+    // A comma-separated string (parity with the GET query form) canonicalizes
+    // to a validated server list.
+    let mut csv = Some(BlindOobRequest::Csv(" oast.fun , oast.me ".to_string()));
+    normalize_blind_oob(&mut csv).unwrap();
+    assert_eq!(
+        csv,
+        Some(BlindOobRequest::Servers(vec![
+            "oast.fun".to_string(),
+            "oast.me".to_string(),
+        ]))
+    );
+    // A blank CSV string is "off", not the mesh.
+    let mut blank = Some(BlindOobRequest::Csv("  , ".to_string()));
+    normalize_blind_oob(&mut blank).unwrap();
+    assert_eq!(blank, Some(BlindOobRequest::Enabled(false)));
+
+    // A host-allowlist bypass (parsed, not pattern-matched), a junk value, and
+    // a single-label boolean typo (`ture`) are all refused, naming the field.
+    for bad in [
+        "oast.pro:0443:x",
+        "ht!tp://x",
+        "http://",
+        "not a host",
+        "ture",
+        "localhost",
+    ] {
+        let mut r = Some(BlindOobRequest::Servers(vec![bad.to_string()]));
+        let err = normalize_blind_oob(&mut r).expect_err(&format!("{bad} must be rejected"));
+        assert!(err.contains("blind_oob"), "field must be named: {err}");
+    }
+    // An IP literal and host:port are valid even without a dotted-name FQDN.
+    for ok in ["127.0.0.1:8080", "https://[::1]:9000"] {
+        let mut r = Some(BlindOobRequest::Servers(vec![ok.to_string()]));
+        normalize_blind_oob(&mut r).unwrap_or_else(|e| panic!("{ok} must pass: {e}"));
+    }
+
+    // Too many servers is a typo guard, not a feature.
+    let mut many = Some(BlindOobRequest::Servers(
+        (0..MAX_BLIND_OOB_SERVERS + 1)
+            .map(|i| format!("oob{i}.example.com"))
+            .collect(),
+    ));
+    assert!(normalize_blind_oob(&mut many).is_err());
+}
+
+#[test]
+fn normalize_session_check_blanks_are_unset_and_bad_inputs_rejected() {
+    // A templated `?session_check=` (empty string) is "unset".
+    let (mut p, mut u) = (Some("".to_string()), Some("".to_string()));
+    normalize_session_check(&mut p, &mut u).unwrap();
+    assert_eq!(p, None);
+    assert_eq!(u, None);
+    // Whitespace-only is a real regex, compiled like the CLI — kept, not dropped.
+    let (mut p, mut u) = (Some("  ".to_string()), None);
+    normalize_session_check(&mut p, &mut u).unwrap();
+    assert_eq!(p.as_deref(), Some("  "));
+
+    // A good pair survives, trimmed.
+    let (mut p, mut u) = (
+        Some("Sign out".to_string()),
+        Some(" https://app/me ".to_string()),
+    );
+    normalize_session_check(&mut p, &mut u).unwrap();
+    assert_eq!(p.as_deref(), Some("Sign out"));
+    assert_eq!(u.as_deref(), Some("https://app/me"));
+
+    // A bad regex fails up front (and its CRLF cannot forge a log line).
+    let (mut p, mut u) = (Some("(".to_string()), None);
+    let err = normalize_session_check(&mut p, &mut u).unwrap_err();
+    assert!(err.contains("session_check") && !err.contains('\n'));
+
+    // A non-http probe URL is refused.
+    let (mut p, mut u) = (None, Some("ftp://app/me".to_string()));
+    assert!(normalize_session_check(&mut p, &mut u).is_err());
+}
+
+/// The real MCP mapping of the new OOB/session fields, exercised from a
+/// deserialized `ScanWithDalfoxParams` with non-default values (not the
+/// all-`None` defaults the parity test uses): `blind_oob` as a JSON list,
+/// `session_check*` set, validated then mapped into `ScanArgs` exactly as the
+/// `scan_with_dalfox` handler does.
+#[test]
+fn mcp_oob_and_session_fields_reach_scan_args() {
+    use crate::job::spec::BlindOobRequest;
+    let mut p: crate::mcp::ScanWithDalfoxParams = serde_json::from_value(serde_json::json!({
+        "target": "http://example.com/?q=1",
+        "blind_oob": ["oast.fun", "oast.me"],
+        "blind_oob_wait": 12,
+        "session_check": "Sign out",
+        "session_check_url": "https://app/me",
+    }))
+    .expect("MCP params with OOB/session fields deserialize");
+
+    // The shared validation canonicalizes/validates in place, as the handler runs it.
+    normalize_blind_oob(&mut p.blind_oob).expect("servers valid");
+    normalize_session_check(&mut p.session_check, &mut p.session_check_url).expect("session valid");
+
+    let args = ScanRequestSpec {
+        target: p.target.clone(),
+        blind_oob: p.blind_oob.as_ref().and_then(BlindOobRequest::servers),
+        blind_oob_wait: p.blind_oob_wait,
+        session_check: p.session_check.clone(),
+        session_check_url: p.session_check_url.clone(),
+        ..Default::default()
+    }
+    .into_scan_args();
+
+    assert!(args.blind_oob_enabled());
+    assert_eq!(
+        args.oob.blind_oob,
+        Some(vec!["oast.fun".to_string(), "oast.me".to_string()])
+    );
+    assert_eq!(args.oob.blind_oob_wait, Some(12));
+    assert_eq!(args.session_check.as_deref(), Some("Sign out"));
+    assert_eq!(args.session_check_url.as_deref(), Some("https://app/me"));
+
+    // A JSON boolean `true` maps to the public mesh (empty server list).
+    let b: crate::mcp::ScanWithDalfoxParams = serde_json::from_value(serde_json::json!({
+        "target": "http://example.com/?q=1",
+        "blind_oob": true,
+    }))
+    .expect("bool blind_oob deserializes");
+    assert_eq!(
+        b.blind_oob.as_ref().and_then(BlindOobRequest::servers),
+        Some(Vec::new())
+    );
+}
+
+#[test]
+fn validate_header_value_matches_reqwest_builder_semantics() {
+    // What reqwest's `.header()` accepts for a &str value, this must accept —
+    // and reject the control bytes that fail the builder. Obs-text (a UTF-8
+    // User-Agent) is legal; CR/LF/NUL are not.
+    assert!(validate_header_value("user_agent", "Mozilla/5.0 (caf\u{e9})").is_ok());
+    assert!(validate_header_value("cookie", "sid=abc; theme=dark").is_ok());
+    assert!(validate_header_value("user_agent", "Mozilla\r\nX: 1").is_err());
+    assert!(validate_header_value("user_agent", "Mozilla\nX: 1").is_err());
+    assert!(validate_header_value("cookie", "sid=a\0b").is_err());
+}
+
+#[test]
+fn a_cancelled_job_keeps_its_capacity_slot_until_the_worker_stops() {
+    // `!is_terminal()` is not the same question as "is a worker running".
+    // Cancel stamps the terminal status immediately, but the worker keeps a
+    // blocking-pool thread and keeps sending requests until it notices. If the
+    // slot is released at that moment, a submit-then-cancel loop keeps an
+    // unbounded number of workers alive against a cap of 1.
+    let mut job = Job::new_queued("http://a".to_string());
+    let lease = job.issue_worker_lease();
+    assert!(job.occupies_capacity(), "a queued job holds a slot");
+
+    job.status = JobStatus::Cancelled;
+    job.finished_at_ms = Some(now_ms());
+    assert!(
+        job.is_terminal(),
+        "cancel stamps the terminal state at once"
+    );
+    assert!(
+        job.occupies_capacity(),
+        "the worker is still running — the slot is not free yet"
+    );
+
+    drop(lease);
+    assert!(
+        !job.occupies_capacity(),
+        "once the worker's lease drops the slot is free"
+    );
+}
+
+#[test]
+fn a_finished_job_without_a_worker_holds_no_slot() {
+    // The control: ordinary completion must still free the slot, or the cap
+    // would never let anything through after the first N scans.
+    let mut job = Job::new_queued("http://a".to_string());
+    let lease = job.issue_worker_lease();
+    job.status = JobStatus::Done;
+    job.finished_at_ms = Some(now_ms());
+    drop(lease);
+    assert!(!job.occupies_capacity());
+    assert!(job.is_evictable());
+}
+
+#[test]
+fn a_job_that_never_got_a_worker_holds_no_slot_once_terminal() {
+    // A job rejected or errored before any task was spawned has no lease at
+    // all; `occupies_capacity` must not treat the absent lease as "alive".
+    let mut job = Job::new_queued("http://a".to_string());
+    assert!(job.occupies_capacity(), "queued and not yet terminal");
+    job.status = JobStatus::Error;
+    job.finished_at_ms = Some(now_ms());
+    assert!(!job.occupies_capacity());
+}
+
+#[test]
+fn test_normalize_blind_callback_empty_is_absent_scheme_is_required() {
+    // Empty already meant "no blind XSS" on REST/MCP (templated `?blind=`),
+    // and refusing it would break that shape without closing any hole.
+    assert_eq!(normalize_blind_callback("", "blind").unwrap(), None);
+    assert_eq!(normalize_blind_callback("   ", "blind").unwrap(), None);
+
+    // Trimmed, because the stored string is interpolated straight into
+    // `<script src={}>` — storing the raw form would emit `src= https://cb/ `.
+    assert_eq!(
+        normalize_blind_callback("  https://cb.example/x  ", "blind")
+            .unwrap()
+            .as_deref(),
+        Some("https://cb.example/x")
+    );
+    // URI schemes are case-insensitive, same as `has_http_scheme` accepts.
+    assert_eq!(
+        normalize_blind_callback("HTTP://cb.example/x", "blind")
+            .unwrap()
+            .as_deref(),
+        Some("HTTP://cb.example/x")
+    );
+
+    // A value that renders as `<script src=...>` but can never call back: the
+    // stored payloads permanently modify the target and buy nothing. A prefix
+    // test on `http://` would let the hostless forms through, which is why this
+    // parses the URL instead.
+    for bad in [
+        "cb.example/x",
+        "//cb.example/x",
+        "ftp://cb.example/x",
+        "http://",
+        "https://",
+        "https://a b",
+        "javascript:alert(1)",
+    ] {
+        let err =
+            normalize_blind_callback(bad, "blind").expect_err(&format!("{bad} must be rejected"));
+        assert!(
+            err.contains("blind") && err.contains("http"),
+            "error must name the field and the accepted shape, got: {err}"
+        );
+    }
+
+    // Shapes that *can* receive a callback stay accepted — including
+    // `http:///x`, which the URL parser reads as host `x`, not as a hostless
+    // URL.
+    for ok in [
+        "http:///x",
+        "http://[::1]:8080/x",
+        "https://user:p@cb.example/x",
+        "http://127.0.0.1:9000/cb?id=1",
+    ] {
+        assert_eq!(
+            normalize_blind_callback(ok, "blind").unwrap().as_deref(),
+            Some(ok),
+            "{ok} must survive verbatim"
+        );
+    }
+
+    // The field name is the caller's, because REST spells it `blind` and MCP
+    // spells it `blind_callback_url`.
+    let err = normalize_blind_callback("nope", "blind_callback_url").unwrap_err();
+    assert!(err.contains("blind_callback_url"), "got: {err}");
+}
+
+#[test]
+fn test_normalize_blind_callback_error_cannot_forge_a_log_line() {
+    // The rejected value is echoed back and lands in server/MCP logs, so a
+    // CR/LF in it must not be able to forge a `[ts] [LVL] ...` line.
+    let err = normalize_blind_callback("cb\r\n[2020-01-01] [ERR] forged", "blind").unwrap_err();
+    assert!(
+        !err.contains('\n') && !err.contains('\r'),
+        "raw CRLF in: {err}"
+    );
+}
+
+#[test]
+fn test_validate_remote_providers_accepts_known_and_rejects_unknown() {
+    // Known names pass, case-insensitively (the registry lowercases on insert,
+    // which is the same normalization `collect_*_provider_urls` applies).
+    validate_remote_providers(&["portswigger".to_string()], &["burp".to_string()])
+        .expect("built-in providers must be accepted");
+    validate_remote_providers(&["PortSwigger".to_string()], &["BURP".to_string()])
+        .expect("provider names are case-insensitive");
+    // Empty lists are the common case and must not error.
+    validate_remote_providers(&[], &[]).expect("no providers requested");
+
+    // A typo used to cache an empty list and let the scan settle `done` with
+    // silently reduced payload coverage.
+    let err = validate_remote_providers(&["payloadboxx".to_string()], &[])
+        .expect_err("unknown payload provider must be rejected");
+    assert!(
+        err.contains("remote_payloads"),
+        "field must be named: {err}"
+    );
+    assert!(err.contains("payloadboxx"), "offender must be named: {err}");
+    assert!(
+        err.contains("payloadbox"),
+        "the known set must be listed so the caller can fix the typo: {err}"
+    );
+
+    let err = validate_remote_providers(&[], &["assetnotes".to_string()])
+        .expect_err("unknown wordlist provider must be rejected");
+    assert!(
+        err.contains("remote_wordlists"),
+        "field must be named: {err}"
+    );
+}
+
+#[test]
+fn test_validate_remote_providers_error_cannot_forge_a_log_line() {
+    let err = validate_remote_providers(&["a\r\n[2020-01-01] [ERR] forged".to_string()], &[])
+        .expect_err("unknown provider must be rejected");
+    assert!(
+        !err.contains('\n') && !err.contains('\r'),
+        "raw CRLF in: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REST ↔ MCP accepted-option parity
+// ---------------------------------------------------------------------------
+
+/// Every spelling a `deny_unknown_fields` struct accepts, recovered from the
+/// error serde raises for an unknown key ("unknown field `x`, expected one of
+/// `a`, `b`, …"). Reading it back out of serde is what makes this a real drift
+/// guard: it sees the `#[serde(alias)]`es too, which no hand-written list or
+/// JSON-schema dump would, and it cannot go stale when a field is added.
+fn accepted_field_names<T: serde::de::DeserializeOwned>() -> std::collections::BTreeSet<String> {
+    // A key no surface will ever define, so the error is always the unknown-field one.
+    let probe = serde_json::json!({ "zzz_not_a_real_field_zzz": null });
+    let err = serde_json::from_value::<T>(probe)
+        .err()
+        .expect("the struct must carry #[serde(deny_unknown_fields)]")
+        .to_string();
+    let list = err
+        .split_once("expected one of ")
+        .unwrap_or_else(|| panic!("unexpected serde unknown-field error shape: {err}"))
+        .1;
+    list.split(", ")
+        .map(|f| f.trim().trim_matches('`').to_string())
+        .filter(|f| !f.is_empty())
+        .collect()
+}
+
+/// The silent-false-clean guard, at the surface level. An agent that read one
+/// front-end's docs and called the other used to have the mismatched options
+/// dropped on the floor — a scan with no cookies and no headers, reported as a
+/// clean `done`. Both surfaces now refuse unknown keys, which only stays usable
+/// because each accepts the other's spellings; this pins that neither half can
+/// drift away on its own.
+///
+/// A new option on one side must either be added to the other or listed here
+/// with the reason it is deliberately one-sided.
+#[test]
+fn rest_and_mcp_accept_the_same_scan_option_names() {
+    use std::collections::BTreeSet;
+
+    // The REST surface is split across the envelope (`target`/`url`) and the
+    // nested option dict; the MCP surface is one flat object.
+    let mut rest = accepted_field_names::<crate::server::types::ScanRequest>();
+    rest.extend(accepted_field_names::<crate::server::types::ScanOptions>());
+    // Structural, not an option: REST nests options, MCP does not.
+    rest.remove("options");
+
+    let mcp = accepted_field_names::<crate::mcp::ScanWithDalfoxParams>();
+
+    /// Result-delivery webhook. Kept off the agent-facing surface on purpose:
+    /// it would hand a model a channel to ship scan output (target URLs,
+    /// reflected payloads, response excerpts) to a host of its choosing.
+    const REST_ONLY: &[&str] = &["callback_url"];
+    /// Call-transport knobs for a single tool invocation. REST has no
+    /// equivalent because a REST client polls `GET /scan/{id}` instead.
+    const MCP_ONLY: &[&str] = &["wait", "wait_timeout_sec"];
+
+    let rest_only: BTreeSet<_> = REST_ONLY.iter().map(ToString::to_string).collect();
+    let mcp_only: BTreeSet<_> = MCP_ONLY.iter().map(ToString::to_string).collect();
+
+    let missing_on_mcp: Vec<_> = rest
+        .difference(&mcp)
+        .filter(|f| !rest_only.contains(*f))
+        .collect();
+    assert!(
+        missing_on_mcp.is_empty(),
+        "REST accepts these scan options but MCP refuses them, so an agent \
+         reusing its REST arguments gets a hard error (or, worse, a scan \
+         missing them): {missing_on_mcp:?}. Add them to ScanWithDalfoxParams, \
+         or document them in REST_ONLY."
+    );
+
+    let missing_on_rest: Vec<_> = mcp
+        .difference(&rest)
+        .filter(|f| !mcp_only.contains(*f))
+        .collect();
+    assert!(
+        missing_on_rest.is_empty(),
+        "MCP accepts these scan options but REST refuses them: \
+         {missing_on_rest:?}. Add them to ScanOptions, or document them in MCP_ONLY."
+    );
+
+    // The exclusion lists must stay honest: an entry that is actually accepted
+    // on both sides is a stale exemption hiding a real divergence later.
+    for f in &rest_only {
+        assert!(
+            rest.contains(f),
+            "REST_ONLY names `{f}`, which REST does not accept"
+        );
+        assert!(
+            !mcp.contains(f),
+            "REST_ONLY names `{f}`, but MCP accepts it"
+        );
+    }
+    for f in &mcp_only {
+        assert!(
+            mcp.contains(f),
+            "MCP_ONLY names `{f}`, which MCP does not accept"
+        );
+        assert!(
+            !rest.contains(f),
+            "MCP_ONLY names `{f}`, but REST accepts it"
+        );
+    }
+}
+
+/// Parity of *names* is only half of it: the REST-spelled values have to reach
+/// `ScanArgs`. The whole point is that an agent using `cookie`/`header`/
+/// `worker`/`blind` on the MCP tool gets an authenticated scan, not a
+/// zero-finding one.
+#[test]
+fn mcp_rest_spellings_reach_scan_args() {
+    let p: crate::mcp::ScanWithDalfoxParams = serde_json::from_value(serde_json::json!({
+        "url": "http://example.com/?q=1",
+        "cookie": "sid=abc; lang=en",
+        "header": ["Authorization: Bearer t"],
+        "worker": 9,
+        "blind": "http://cb.example/x",
+    }))
+    .expect("REST-spelled MCP arguments deserialize");
+
+    let args = ScanRequestSpec {
+        target: p.target.clone(),
+        headers: p.headers.clone(),
+        cookies: p.cookies.clone(),
+        blind_callback_url: p.blind_callback_url.clone(),
+        workers: p.workers,
+        ..Default::default()
+    }
+    .into_scan_args();
+
+    assert_eq!(args.targets, vec!["http://example.com/?q=1".to_string()]);
+    assert_eq!(args.cookies, vec!["sid=abc; lang=en".to_string()]);
+    assert_eq!(args.headers, vec!["Authorization: Bearer t".to_string()]);
+    assert_eq!(args.workers, 9);
+    assert_eq!(
+        args.blind_callback_url.as_deref(),
+        Some("http://cb.example/x")
+    );
+
+    // Same request in REST's own shape lands on exactly the same values — the
+    // two spellings are one option, not two behaviours.
+    let rest = ScanRequestSpec::from_rest_options(
+        "http://example.com/?q=1".to_string(),
+        &serde_json::from_value::<crate::server::types::ScanOptions>(serde_json::json!({
+            "cookie": "sid=abc; lang=en",
+            "header": ["Authorization: Bearer t"],
+            "worker": 9,
+            "blind": "http://cb.example/x",
+        }))
+        .expect("REST options deserialize"),
+        false,
+        false,
+        0,
+        0,
+        None,
+    )
+    .into_scan_args();
+    assert_eq!(rest.cookies, args.cookies);
+    assert_eq!(rest.headers, args.headers);
+    assert_eq!(rest.workers, args.workers);
+    assert_eq!(rest.blind_callback_url, args.blind_callback_url);
+}
+
+/// A REST/MCP `deep_scan` carries the findings ceiling — against an
+/// echo-everything target it otherwise held gigabytes of results — and a job
+/// that hit it says so instead of reading as a complete `done`. Normal scans
+/// stay uncapped.
+#[test]
+fn async_jobs_cap_findings_and_say_so() {
+    let deep = ScanRequestSpec {
+        deep_scan: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        deep.into_scan_args().limit,
+        Some(super::MAX_FINDINGS_PER_JOB)
+    );
+    assert_eq!(ScanRequestSpec::default().into_scan_args().limit, None);
+
+    let run = runner::ScanRun {
+        results: Default::default(),
+        reachability_failed: false,
+        timed_out: false,
+        was_cancelled: false,
+        panicked: false,
+        worker_panics: 0,
+        session_lost: None,
+        findings_capped: true,
+        warnings: Vec::new(),
+        min_confidence: None,
+    };
+    let mut job = Job::new_queued("http://t/".into());
+    assert_eq!(
+        run.settle(&mut job, Arc::new(Vec::new()), 0, false),
+        JobStatus::Done
+    );
+    assert!(
+        job.error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("per-scan cap")),
+        "{:?}",
+        job.error_message
+    );
+}
+
+/// `preflight_dalfox` deliberately accepts a *subset* of the scan options: it
+/// sends no payloads, so most of them describe nothing it does. REST has no
+/// such tool — `POST /preflight` deserializes the same `ScanRequest` as
+/// `POST /scan` and ignores what it cannot use — so `deny_unknown_fields` on
+/// the MCP side makes this the one place the two surfaces genuinely diverge.
+///
+/// That divergence is a deliberate trade, not an oversight. An option refused
+/// here costs one retry against an error that names it, and preflight returns
+/// an *estimate*: a wrong one is visibly wrong. The scan tool's silent drop
+/// cost an unauthenticated scan reported as clean, which is not recoverable at
+/// all — which is why that surface takes the aliases and this one does not
+/// grow fields it would only ignore.
+///
+/// The list below is the whole of it. A field added to the scan tool lands
+/// here until it is either mirrored onto preflight or written down as
+/// something preflight has no use for.
+#[test]
+fn preflight_accepts_a_documented_subset_of_the_scan_options() {
+    use std::collections::BTreeSet;
+
+    let scan = accepted_field_names::<crate::mcp::ScanWithDalfoxParams>();
+    let preflight = accepted_field_names::<crate::mcp::PreflightDalfoxParams>();
+
+    /// Scan options preflight does not accept, each because it describes
+    /// behaviour preflight has not got: it sends no payloads, spawns no
+    /// workers, runs no WAF probe, and always returns inline.
+    const NOT_ON_PREFLIGHT: &[&str] = &[
+        // No payloads are sent, so nothing to pace, bound, or parallelize.
+        "delay",
+        "scan_timeout",
+        "rate_limit",
+        "worker",
+        "workers",
+        // No payloads means no blind injection and no WAF interaction.
+        "blind",
+        "blind_callback_url",
+        // Blind OOB arms a payload channel and polls for callbacks — there is
+        // nothing to call back when preflight sends no payloads.
+        "blind_oob",
+        "blind_oob_wait",
+        // Session-loss detection watches a running scan's auth; preflight sends
+        // no scan traffic a session could expire during.
+        "session_check",
+        "session_check_url",
+        "waf_bypass",
+        "skip_waf_probe",
+        "force_waf",
+        "waf_evasion",
+        "waf_min_confidence",
+        // No findings to grade.
+        "min_confidence",
+        // Nothing is fetched to fuel an attack the caller has not run yet.
+        "remote_payloads",
+        "remote_wordlists",
+        // There are no findings to attach raw traffic to.
+        "include_request",
+        "include_response",
+        // Analysis switches for a scan, not for discovery.
+        "skip_ast_analysis",
+        "analyze_external_js",
+        "detect_outdated_libs",
+        // Preflight is already blocking; it has nothing to wait on.
+        "wait",
+        "wait_timeout_sec",
+    ];
+
+    let exempt: BTreeSet<_> = NOT_ON_PREFLIGHT.iter().map(ToString::to_string).collect();
+
+    let unexplained: Vec<_> = scan
+        .difference(&preflight)
+        .filter(|f| !exempt.contains(*f))
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "these scan options are refused by preflight with no reason recorded: \
+         {unexplained:?}. Either mirror them onto PreflightDalfoxParams, or add \
+         them to NOT_ON_PREFLIGHT with why preflight cannot use them."
+    );
+
+    // Preflight must not accept something the scan tool refuses: its whole job
+    // is to describe the scan that follows.
+    let preflight_only: Vec<_> = preflight.difference(&scan).collect();
+    assert!(
+        preflight_only.is_empty(),
+        "preflight accepts options the scan tool does not: {preflight_only:?}"
+    );
+
+    // Keep the exemption list honest — a stale entry would silently widen it.
+    for f in &exempt {
+        assert!(
+            scan.contains(f),
+            "NOT_ON_PREFLIGHT names `{f}`, which the scan tool does not accept either"
+        );
+        assert!(
+            !preflight.contains(f),
+            "NOT_ON_PREFLIGHT names `{f}`, but preflight accepts it"
+        );
+    }
+
+    // The cross-surface spellings that carry credentials or name the target do
+    // reach preflight: sending it without cookies would under-report the
+    // parameters an authenticated scan would find.
+    for aliased in ["url", "cookie", "cookies", "header", "headers"] {
+        assert!(
+            preflight.contains(aliased),
+            "preflight must accept `{aliased}` — it shapes what discovery sees"
+        );
+    }
+}
+
+/// The server / MCP runner derives the same target state from its preflight
+/// GET that the CLI preflight does. It used to use that response for the
+/// initial AST pass only, so a REST/MCP job never fingerprinted a WAF (and
+/// `force_waf` / `waf_bypass` were silent no-ops), never analysed the page's
+/// CSP (no CSP-bypass payloads, no Trusted Types posture for the scan-phase
+/// AST), never fingerprinted the stack, and ignored `detect_outdated_libs`.
+#[tokio::test]
+async fn execute_scan_derives_waf_csp_tech_and_outdated_libs_like_the_cli() {
+    use axum::{Router, http::HeaderMap, response::IntoResponse, routing::get};
+
+    async fn page() -> impl IntoResponse {
+        let mut h = HeaderMap::new();
+        h.insert("cf-ray", "8a1b2c3d4e5f-ICN".parse().unwrap());
+        h.insert("server", "cloudflare".parse().unwrap());
+        h.insert(
+            "content-security-policy",
+            "script-src 'self'".parse().unwrap(),
+        );
+        h.insert("content-type", "text/html".parse().unwrap());
+        (
+            h,
+            r#"<html><head><script src="/static/jquery-1.7.2.min.js"></script></head><body>ok</body></html>"#,
+        )
+    }
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", get(page))).await;
+    });
+
+    let mut target =
+        crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+    let args = Arc::new(crate::cmd::scan::ScanArgs {
+        skip_discovery: true,
+        skip_mining: true,
+        skip_waf_probe: true,
+        detect_outdated_libs: true,
+        silence: true,
+        ..Default::default()
+    });
+    let progress = JobProgress::default();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let run =
+        crate::job::runner::execute_scan(&mut target, &args, &progress, &cancel, &|_| {}).await;
+
+    let waf = target.waf_info.as_ref().expect("passive WAF fingerprint");
+    assert!(
+        waf.waf_types()
+            .iter()
+            .any(|t| matches!(t, crate::waf::WafType::Cloudflare)),
+        "cf-ray/server headers must fingerprint Cloudflare: {waf:?}"
+    );
+    assert!(
+        target.mutation_stats.is_some(),
+        "bypass is on by default, so mutation stats are tracked"
+    );
+    let csp = target.csp_analysis.as_ref().expect("CSP analysed");
+    assert!(!csp.report_only && !csp.missing_script_src);
+    let results = run.results.lock().await;
+    assert!(
+        results.iter().any(|r| r.cwe == "CWE-1104"),
+        "detect_outdated_libs must report jQuery 1.7.2"
+    );
+}
+
+/// Session-loss parity with the CLI (#1273): a server/MCP job whose
+/// `--session-check` marker vanishes mid-scan must surface `SESSION_LOST`, not
+/// settle `done` with zero findings. The marker is present on the preflight
+/// baseline GET and absent on the post-scan probe, so `execute_scan` must
+/// report the loss and `settle` must stamp `Error` with a `SESSION_LOST:`
+/// error_message.
+#[tokio::test]
+async fn execute_scan_surfaces_session_loss_like_the_cli() {
+    use axum::{Router, routing::get};
+    use std::sync::atomic::AtomicUsize;
+
+    // First GET (preflight baseline) shows the logged-in marker; every GET
+    // after it (the post-scan session probe) shows a login page instead. HEAD
+    // (the reachability probe) never touches the GET counter.
+    let gets = Arc::new(AtomicUsize::new(0));
+    let gets_h = gets.clone();
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            let gets = gets_h.clone();
+            async move {
+                if gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    "<html><body>Welcome LOGGED_IN</body></html>"
+                } else {
+                    "<html><body>Please sign in</body></html>"
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut target =
+        crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+    let args = Arc::new(crate::cmd::scan::ScanArgs {
+        skip_discovery: true,
+        skip_mining: true,
+        skip_waf_probe: true,
+        skip_ast_analysis: true,
+        session_check: Some("LOGGED_IN".to_string()),
+        silence: true,
+        ..Default::default()
+    });
+    let progress = JobProgress::default();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let run =
+        crate::job::runner::execute_scan(&mut target, &args, &progress, &cancel, &|_| {}).await;
+    assert!(
+        run.lost_session(),
+        "a disappearing session marker must be detected as a lost session"
+    );
+
+    let mut job = Job::new_queued(format!("http://{addr}/"));
+    job.status = JobStatus::Running;
+    let status = run.settle(&mut job, Arc::new(Vec::new()), 0, false);
+    assert_eq!(
+        status,
+        JobStatus::Error,
+        "a lost session is not a clean done"
+    );
+    assert!(
+        job.error_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with(crate::cmd::error_codes::SESSION_LOST)),
+        "the error_message must carry the SESSION_LOST code: {:?}",
+        job.error_message
+    );
+}
+
+/// The silent-clean guard for the two new soft failures: an OOB server that
+/// refuses registration and a `session_check_url` whose baseline cannot be
+/// captured must each leave a warning on the job record (not only in the
+/// operator log), and the REST result payload must expose them — while a job
+/// with no warnings carries no `warnings` key at all.
+#[tokio::test]
+async fn soft_failures_surface_as_job_warnings() {
+    use axum::{Router, routing::get};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", get(|| async { "ok" }))).await;
+    });
+
+    let mut target =
+        crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+    let args = Arc::new(crate::cmd::scan::ScanArgs {
+        skip_discovery: true,
+        skip_mining: true,
+        skip_waf_probe: true,
+        silence: true,
+        timeout: 2,
+        // Nothing listens on port 1: registration and the baseline probe fail.
+        session_check_url: Some("http://127.0.0.1:1/me".to_string()),
+        oob: crate::cmd::scan::BlindOobArgs {
+            blind_oob: Some(vec!["http://127.0.0.1:1".to_string()]),
+            blind_oob_secret: None,
+            blind_oob_wait: Some(0),
+        },
+        ..Default::default()
+    });
+    let progress = JobProgress::default();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run =
+        crate::job::runner::execute_scan(&mut target, &args, &progress, &cancel, &|_| {}).await;
+
+    let mut job = Job::new_queued(format!("http://{addr}/"));
+    job.status = JobStatus::Running;
+    run.settle(&mut job, Arc::new(Vec::new()), 0, false);
+    assert!(
+        job.warnings
+            .iter()
+            .any(|w| w.contains("blind_oob disabled")),
+        "OOB registration failure must be on the job: {:?}",
+        job.warnings
+    );
+    assert!(
+        job.warnings
+            .iter()
+            .any(|w| w.contains("session-loss monitoring is INACTIVE")),
+        "an unusable session baseline must be on the job: {:?}",
+        job.warnings
+    );
+
+    let payload = |j: &Job| {
+        serde_json::to_value(crate::server::types::ResultPayload {
+            target: j.target_url.clone(),
+            status: j.status.clone(),
+            results: None,
+            error_message: None,
+            warnings: &j.warnings,
+            progress: None,
+            queued_at_ms: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
+            duration_ms: None,
+        })
+        .expect("serialize")
+    };
+    assert!(
+        payload(&job)["warnings"]
+            .as_array()
+            .is_some_and(|a| a.len() >= 2)
+    );
+    let clean = Job::new_queued("http://t/".into());
+    assert!(payload(&clean).get("warnings").is_none());
+}
+
+#[test]
+fn push_job_warning_dedups_caps_and_sanitizes() {
+    let mut w = Vec::new();
+    push_job_warning(&mut w, "same");
+    push_job_warning(&mut w, "same");
+    assert_eq!(w.len(), 1, "identical messages are deduplicated");
+    push_job_warning(&mut w, "x\r\n[ERR] forged");
+    assert!(
+        !w[1].contains('\n') && !w[1].contains('\r'),
+        "sanitized: {:?}",
+        w[1]
+    );
+    for i in 0..100 {
+        push_job_warning(&mut w, &format!("w{i}"));
+    }
+    assert_eq!(w.len(), MAX_JOB_WARNINGS, "bounded");
+}
+
+/// `force_waf` needs no fingerprint at all; `waf_bypass=off` keeps detection
+/// but must not arm the bypass state.
+#[tokio::test]
+async fn execute_scan_honours_force_waf_and_waf_bypass_off() {
+    use axum::{Router, routing::get};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            Router::new().route("/", get(|| async { "plain" })),
+        )
+        .await;
+    });
+
+    for (bypass, armed) in [("auto", true), ("off", false)] {
+        let mut target =
+            crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+        let args = Arc::new(crate::cmd::scan::ScanArgs {
+            skip_discovery: true,
+            skip_mining: true,
+            skip_waf_probe: true,
+            force_waf: Some("akamai".to_string()),
+            waf_bypass: bypass.to_string(),
+            silence: true,
+            ..Default::default()
+        });
+        let progress = JobProgress::default();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::job::runner::execute_scan(&mut target, &args, &progress, &cancel, &|_| {}).await;
+
+        let waf = target.waf_info.as_ref().expect("forced WAF recorded");
+        assert!(
+            waf.waf_types()
+                .iter()
+                .any(|t| matches!(t, crate::waf::WafType::Akamai)),
+            "force_waf must be honoured (waf_bypass={bypass})"
+        );
+        assert_eq!(
+            target.mutation_stats.is_some(),
+            armed,
+            "bypass state armed only when waf_bypass != off (waf_bypass={bypass})"
+        );
+        assert_eq!(
+            crate::scanning::compute_waf_strategy(&target, &args).is_some(),
+            armed
+        );
+    }
+}
+
+/// The reachability probe goes out like any other scan request: one
+/// `User-Agent` (a job's UA is in both `target.headers` and
+/// `target.user_agent`) and one `Cookie` (a caller's `Cookie` header wins over
+/// the composed jar, as everywhere else).
+#[tokio::test]
+async fn reachability_probe_sends_each_header_once() {
+    use axum::{Router, http::HeaderMap, routing::get};
+    use std::sync::Mutex as StdMutex;
+
+    let seen: Arc<StdMutex<Vec<(usize, usize)>>> = Arc::new(StdMutex::new(Vec::new()));
+    let seen_handler = seen.clone();
+    let app = Router::new().route(
+        "/",
+        get(move |headers: HeaderMap| {
+            let seen = seen_handler.clone();
+            async move {
+                seen.lock().unwrap().push((
+                    headers.get_all("user-agent").iter().count(),
+                    headers.get_all("cookie").iter().count(),
+                ));
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut target =
+        crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+    target.headers = vec![
+        ("User-Agent".to_string(), "job-agent".to_string()),
+        ("Cookie".to_string(), "sid=hdr".to_string()),
+    ];
+    target.user_agent = Some("job-agent".to_string());
+    target.cookies = vec![("theme".to_string(), "dark".to_string())];
+
+    assert!(send_reachability_probe(&target).await);
+    server.abort();
+    assert_eq!(*seen.lock().unwrap(), vec![(1, 1)]);
+}
+
+/// REST only fills an empty `error_message`; MCP appends to an earlier reason.
+#[test]
+fn settle_note_fills_empty_message_and_appends_only_when_asked() {
+    let run = runner::ScanRun {
+        results: Default::default(),
+        reachability_failed: false,
+        timed_out: true,
+        was_cancelled: true,
+        panicked: false,
+        worker_panics: 0,
+        session_lost: None,
+        findings_capped: false,
+        warnings: Vec::new(),
+        min_confidence: None,
+    };
+    let note = "scan exceeded scan_timeout (5s); returning partial results";
+    for (prior, append, want) in [
+        (None, false, note.to_string()),
+        (Some("client gone"), false, "client gone".to_string()),
+        (Some("client gone"), true, format!("client gone; {note}")),
+    ] {
+        let mut job = Job::new_queued("http://t/".into());
+        job.error_message = prior.map(String::from);
+        let status = run.settle(&mut job, Arc::new(Vec::new()), 5, append);
+        assert_eq!(status, JobStatus::Cancelled);
+        assert_eq!(job.error_message.as_deref(), Some(want.as_str()));
+        assert!(job.finished_at_ms.is_some() && job.results.is_some());
+    }
+}
+
+/// One DOM sink is found by the preflight pass and again per parameter. The
+/// CLI folds those (`dedupe_ast_results`); the stored job results and the
+/// `findings_so_far` tally must match, not list the sink once per stage.
+#[tokio::test]
+async fn sanitized_results_folds_duplicate_ast_findings() {
+    use crate::scanning::result::{FindingType, Result as ScanResult};
+    let ast = |param: &str| {
+        ScanResult::builder(FindingType::AstDetected)
+            .inject_type("DOM-XSS")
+            .method("GET")
+            .data("http://t/")
+            .param(param)
+            .payload("")
+            .evidence("http://t/:1:1 - (Source: location.hash, Sink: innerHTML)")
+            .severity("Medium")
+            .message_id(0)
+            .build()
+    };
+    let reflected = ScanResult::builder(FindingType::Reflected)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("http://t/?a=1")
+        .param("a")
+        .payload("x")
+        .evidence("e")
+        .severity("Low")
+        .message_id(7)
+        .build();
+    let run = runner::ScanRun {
+        results: Arc::new(tokio::sync::Mutex::new(vec![
+            ast("-"),
+            ast("a"),
+            reflected,
+            ast("b"),
+        ])),
+        reachability_failed: false,
+        timed_out: false,
+        was_cancelled: false,
+        panicked: false,
+        worker_panics: 0,
+        session_lost: None,
+        findings_capped: false,
+        warnings: Vec::new(),
+        min_confidence: None,
+    };
+    let progress = JobProgress::default();
+    let out = run.sanitized_results(&progress, false, false).await;
+    assert_eq!(out.len(), 2, "three AST copies fold into one, R kept");
+    assert_eq!(
+        progress
+            .findings_so_far
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+/// `min_confidence = "high"` on a REST/MCP job drops low-graded findings from
+/// the stored results and the settled tally — the same predicate the CLI
+/// applies at render — while ungraded informational findings stay. Without
+/// the flag every finding is kept.
+#[tokio::test]
+async fn sanitized_results_honor_min_confidence() {
+    use crate::scanning::result::{Confidence, FindingType, Result as ScanResult};
+    let graded = |t: FindingType, c: Option<Confidence>, param: &str| {
+        // Non-zero `message_id`: 0 marks an AST finding, which the result
+        // fold collapses by evidence.
+        let mut r = ScanResult::builder(t).param(param).message_id(1).build();
+        r.confidence = c;
+        r
+    };
+    let results = vec![
+        graded(FindingType::Verified, Some(Confidence::High), "high"),
+        graded(FindingType::Reflected, Some(Confidence::Low), "low"),
+        graded(FindingType::Informational, None, "info"),
+    ];
+    for (min, want) in [
+        (None, vec!["high", "low", "info"]),
+        (Some("low"), vec!["high", "low", "info"]),
+        (Some("high"), vec!["high", "info"]),
+    ] {
+        let run = runner::ScanRun {
+            results: Arc::new(tokio::sync::Mutex::new(results.clone())),
+            reachability_failed: false,
+            timed_out: false,
+            was_cancelled: false,
+            panicked: false,
+            worker_panics: 0,
+            session_lost: None,
+            findings_capped: false,
+            warnings: Vec::new(),
+            min_confidence: min.map(String::from),
+        };
+        let progress = JobProgress::default();
+        let kept = run.sanitized_results(&progress, false, false).await;
+        let params: Vec<&str> = kept.iter().map(|r| r.param.as_str()).collect();
+        assert_eq!(params, want, "min_confidence = {min:?}");
+        assert_eq!(
+            progress
+                .findings_so_far
+                .load(std::sync::atomic::Ordering::Relaxed),
+            want.len() as u64
+        );
+    }
+}
+
+/// The job filters before it folds AST duplicates, as the CLI render does
+/// (`min_confidence_filters_before_ast_dedup`): a `V`/low duplicate must not
+/// win the fold and then take the `A`/high flow down with it.
+#[tokio::test]
+async fn sanitized_results_filter_min_confidence_before_ast_dedup() {
+    use crate::scanning::result::{Confidence, FindingType, Result as ScanResult};
+    let mut a_high = ScanResult::builder(FindingType::AstDetected)
+        .inject_type("DOM-XSS")
+        .data("http://t/")
+        .param("q")
+        .evidence("http://t/:1:1 - d (Source: location.hash, Sink: innerHTML)")
+        .severity("Medium")
+        .build();
+    a_high.confidence = Some(Confidence::High);
+    let mut v_low = a_high.clone();
+    v_low.result_type = FindingType::Verified;
+    v_low.severity = "High".to_string();
+    v_low.confidence = Some(Confidence::Low);
+    let run = runner::ScanRun {
+        results: Arc::new(tokio::sync::Mutex::new(vec![a_high, v_low])),
+        reachability_failed: false,
+        timed_out: false,
+        was_cancelled: false,
+        panicked: false,
+        worker_panics: 0,
+        session_lost: None,
+        findings_capped: false,
+        warnings: Vec::new(),
+        min_confidence: Some("high".to_string()),
+    };
+    let progress = JobProgress::default();
+    let kept = run.sanitized_results(&progress, false, false).await;
+    assert_eq!(kept.len(), 1, "the high-graded A flow survives");
+    assert_eq!(kept[0].result_type, FindingType::AstDetected);
+    assert_eq!(kept[0].confidence, Some(Confidence::High));
+}
+
+#[test]
+fn scan_option_checks_reject_an_unknown_min_confidence() {
+    for ok in ["low", "high"] {
+        assert!(
+            ScanOptionChecks::<f32> {
+                min_confidence: Some(ok),
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+    let err = ScanOptionChecks::<f32> {
+        min_confidence: Some("medium"),
+        ..Default::default()
+    }
+    .validate()
+    .unwrap_err();
+    assert!(err.contains("min_confidence"), "{err}");
+}
+
+/// The CLI's `SESSION?` advisory (a baseline that redirects to an auth-shaped
+/// URL — maybe an expired SSO session, maybe not) must reach a silenced job's
+/// warnings too, or the caller reads `done` as "session was fine".
+#[tokio::test]
+async fn ambiguous_session_baseline_surfaces_as_job_warning() {
+    use axum::{Router, http::StatusCode, http::header::LOCATION, routing::get};
+
+    let app = Router::new().route(
+        "/",
+        get(|| async { (StatusCode::FOUND, [(LOCATION, "/oauth2/authorize")], "") }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut target =
+        crate::target_parser::parse_target(&format!("http://{addr}/")).expect("valid target");
+    target.cookies = vec![("sid".to_string(), "x".to_string())];
+    let args = Arc::new(crate::cmd::scan::ScanArgs {
+        skip_discovery: true,
+        skip_mining: true,
+        skip_waf_probe: true,
+        skip_ast_analysis: true,
+        silence: true,
+        ..Default::default()
+    });
+    let progress = JobProgress::default();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run =
+        crate::job::runner::execute_scan(&mut target, &args, &progress, &cancel, &|_| {}).await;
+    assert!(!run.lost_session(), "ambiguous is not a verdict");
+    assert!(
+        run.warnings.iter().any(|w| w.contains("auth-shaped URL")),
+        "the session advisory must reach the job: {:?}",
+        run.warnings
+    );
+}
+
+/// Blind injection writes stored payloads into the target (params × templates
+/// × channels, each paced by `delay`); a cancel landing mid-pass must stop it
+/// rather than keep firing at a target nobody is waiting on.
+#[tokio::test]
+async fn cancel_stops_blind_injection_mid_pass() {
+    use axum::{Router, routing::any};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_h = hits.clone();
+    let app = Router::new().fallback(any(move || {
+        let hits = hits_h.clone();
+        async move {
+            hits.fetch_add(1, Ordering::Relaxed);
+            "ok"
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // 8 query params × 3 blind templates = 24 requests, 200ms apart (~5s).
+    let mut target = crate::target_parser::parse_target(&format!(
+        "http://{addr}/?a=1&b=1&c=1&d=1&e=1&f=1&g=1&h=1"
+    ))
+    .expect("valid target");
+    target.delay = 200;
+    let args = Arc::new(crate::cmd::scan::ScanArgs {
+        skip_discovery: true,
+        skip_mining: true,
+        skip_waf_probe: true,
+        silence: true,
+        blind_callback_url: Some("https://cb.example/x".to_string()),
+        ..Default::default()
+    });
+    let progress = JobProgress::default();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trip = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        trip.store(true, Ordering::Relaxed);
+    });
+    let start = std::time::Instant::now();
+    let run =
+        crate::job::runner::execute_scan(&mut target, &args, &progress, &cancel, &|_| {}).await;
+    assert!(run.was_cancelled);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "cancel must stop blind injection (took {:?}, {} requests)",
+        start.elapsed(),
+        hits.load(Ordering::Relaxed)
+    );
+}

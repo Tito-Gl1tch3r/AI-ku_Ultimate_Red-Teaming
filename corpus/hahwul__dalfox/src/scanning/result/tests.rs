@@ -1,0 +1,1265 @@
+use super::*;
+use serde_json;
+
+#[test]
+fn informational_finding_type_labels_and_serde() {
+    assert_eq!(FindingType::Informational.short(), "I");
+    assert_eq!(FindingType::Informational.description(), "Informational");
+    assert!(
+        FindingType::Informational
+            .long_description()
+            .contains("Informational")
+    );
+    // Serializes to the compact "I" tag and round-trips.
+    let r = Result::builder(FindingType::Informational)
+        .inject_type("OutdatedComponent")
+        .cwe("CWE-1104")
+        .build();
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(json.contains("\"type\":\"I\""), "json: {json}");
+    let back: Result = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.result_type, FindingType::Informational);
+}
+
+#[test]
+fn test_result_creation() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com?q=test")
+        .param("q")
+        .payload("<script>alert(1)</script>")
+        .evidence("Found script tag")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+
+    assert_eq!(result.result_type, FindingType::Verified);
+    assert_eq!(result.inject_type, "inHTML");
+    assert_eq!(result.method, "GET");
+    assert_eq!(result.data, "https://example.com?q=test");
+    assert_eq!(result.param, "q");
+    assert_eq!(result.payload, "<script>alert(1)</script>");
+    assert_eq!(result.evidence, "Found script tag");
+    assert_eq!(result.cwe, "CWE-79");
+    assert_eq!(result.severity, "High");
+    assert_eq!(result.message_id, 606);
+    assert_eq!(result.message_str, "XSS detected");
+    assert!(result.request.is_none());
+    assert!(result.response.is_none());
+}
+
+#[test]
+fn test_result_creation_with_request_response() {
+    let mut result = Result::builder(FindingType::Verified)
+        .inject_type("inJS")
+        .method("POST")
+        .data("https://example.com")
+        .param("data")
+        .payload("alert(1)")
+        .evidence("JavaScript execution")
+        .cwe("CWE-79")
+        .severity("Medium")
+        .message_id(200)
+        .message_str("Potential XSS")
+        .build();
+
+    result.request = Some("POST / HTTP/1.1\nHost: example.com\n\nkey=value".to_string());
+    result.response = Some("HTTP/1.1 200 OK\n\n<html>alert(1)</html>".to_string());
+
+    assert_eq!(result.result_type, FindingType::Verified);
+    assert_eq!(result.severity, "Medium");
+    assert!(result.request.is_some());
+    assert!(result.response.is_some());
+    assert!(result.request.as_ref().unwrap().contains("POST"));
+    assert!(result.response.as_ref().unwrap().contains("200 OK"));
+}
+
+#[test]
+fn test_result_serialization() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("query")
+        .payload("payload")
+        .evidence("evidence")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("message")
+        .build();
+
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(json.contains("\"type\":\"V\""));
+    assert!(json.contains("\"inject_type\":\"inHTML\""));
+    assert!(json.contains("\"method\":\"GET\""));
+    assert!(json.contains("\"data\":\"https://example.com\""));
+    assert!(json.contains("\"param\":\"query\""));
+    assert!(json.contains("\"payload\":\"payload\""));
+    assert!(json.contains("\"evidence\":\"evidence\""));
+    assert!(json.contains("\"cwe\":\"CWE-79\""));
+    assert!(json.contains("\"severity\":\"High\""));
+    assert!(json.contains("\"message_id\":606"));
+    assert!(json.contains("\"message_str\":\"message\""));
+    assert!(!json.contains("\"request\":null"));
+    assert!(!json.contains("\"response\":null"));
+}
+
+#[test]
+fn test_result_deserialization() {
+    let json = r#"{
+        "type": "V",
+        "inject_type": "inHTML",
+        "method": "GET",
+        "data": "https://example.com",
+        "param": "q",
+        "payload": "<script>alert(1)</script>",
+        "evidence": "Found script",
+        "cwe": "CWE-79",
+        "severity": "High",
+        "message_id": 200,
+        "message_str": "XSS found",
+        "request": null,
+        "response": null
+    }"#;
+
+    let result: Result = serde_json::from_str(json).unwrap();
+    assert_eq!(result.result_type, FindingType::Verified);
+    assert_eq!(result.param, "q");
+    assert_eq!(result.severity, "High");
+    assert_eq!(result.message_id, 200);
+}
+
+#[test]
+fn test_result_deserialization_reflected() {
+    let json = r#"{
+        "type": "R",
+        "inject_type": "inHTML",
+        "method": "GET",
+        "data": "https://example.com",
+        "param": "q",
+        "payload": "test",
+        "evidence": "Reflected",
+        "cwe": "CWE-79",
+        "severity": "Info",
+        "message_id": 100,
+        "message_str": "Reflection found"
+    }"#;
+
+    let result: Result = serde_json::from_str(json).unwrap();
+    assert_eq!(result.result_type, FindingType::Reflected);
+}
+
+#[test]
+fn test_result_deserialization_ast_detected() {
+    let json = r#"{
+        "type": "A",
+        "inject_type": "DOM-XSS",
+        "method": "GET",
+        "data": "https://example.com",
+        "param": "-",
+        "payload": "alert(1)",
+        "evidence": "AST finding",
+        "cwe": "CWE-79",
+        "severity": "Medium",
+        "message_id": 0,
+        "message_str": "AST DOM XSS"
+    }"#;
+
+    let result: Result = serde_json::from_str(json).unwrap();
+    assert_eq!(result.result_type, FindingType::AstDetected);
+}
+
+#[test]
+fn test_result_different_types() {
+    let reflected = Result::builder(FindingType::Reflected)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("param")
+        .payload("test")
+        .evidence("Reflected")
+        .cwe("CWE-79")
+        .severity("Info")
+        .message_id(200)
+        .message_str("Parameter reflected")
+        .build();
+
+    let vulnerable = Result::builder(FindingType::Verified)
+        .inject_type("inJS")
+        .method("POST")
+        .data("https://example.com")
+        .param("data")
+        .payload("alert(1)")
+        .evidence("Executed")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(200)
+        .message_str("XSS confirmed")
+        .build();
+
+    assert_eq!(reflected.result_type, FindingType::Reflected);
+    assert_eq!(reflected.severity, "Info");
+    assert_eq!(vulnerable.result_type, FindingType::Verified);
+    assert_eq!(vulnerable.severity, "High");
+    assert_ne!(reflected.result_type, vulnerable.result_type);
+}
+
+#[test]
+fn test_result_edge_cases() {
+    // Empty strings (except result_type which is now an enum)
+    let result = Result::builder(FindingType::Reflected)
+        .inject_type("")
+        .method("")
+        .data("")
+        .param("")
+        .payload("")
+        .evidence("")
+        .cwe("")
+        .severity("")
+        .message_id(0)
+        .message_str("")
+        .build();
+
+    assert_eq!(result.result_type, FindingType::Reflected);
+    assert_eq!(result.message_id, 0);
+
+    // Special characters
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("param")
+        .payload("<>\"'&")
+        .evidence("Special chars")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(200)
+        .message_str("Test")
+        .build();
+
+    assert_eq!(result.payload, "<>\"'&");
+    let json = serde_json::to_string(&result).unwrap();
+    // Ensure special chars are properly handled in JSON
+    assert!(json.contains("\"payload\":\"<>\\\""));
+}
+
+#[test]
+fn test_results_to_markdown() {
+    let result1 = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com?q=test")
+        .param("q")
+        .payload("<script>alert(1)</script>")
+        .evidence("Found script tag")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+
+    let result2 = Result::builder(FindingType::Reflected)
+        .inject_type("inJS")
+        .method("POST")
+        .data("https://example.com/api")
+        .param("data")
+        .payload("alert(2)")
+        .evidence("Reflected in JS")
+        .cwe("CWE-79")
+        .severity("Medium")
+        .message_id(200)
+        .message_str("Reflection found")
+        .build();
+
+    let results = vec![result1, result2];
+    let markdown = Result::results_to_markdown(&results, false, false);
+
+    // Check header
+    assert!(markdown.contains("# Dalfox Scan Results"));
+
+    // Check summary
+    assert!(markdown.contains("## Summary"));
+    assert!(markdown.contains("**Total Findings**: 2"));
+    assert!(markdown.contains("**Vulnerabilities (V)**: 1"));
+    assert!(markdown.contains("**Reflections (R)**: 1"));
+
+    // Check findings section
+    assert!(markdown.contains("## Findings"));
+    assert!(markdown.contains("### 1. Vulnerability - `q` (inHTML)"));
+    assert!(markdown.contains("### 2. Reflection - `data` (inJS)"));
+
+    // Check table content
+    assert!(markdown.contains("| **Type** | V |"));
+    assert!(markdown.contains("| **Type** | R |"));
+    assert!(markdown.contains("| **Parameter** | `q` |"));
+    assert!(markdown.contains("| **Parameter** | `data` |"));
+    assert!(markdown.contains("| **Severity** | High |"));
+    assert!(markdown.contains("| **Severity** | Medium |"));
+    assert!(markdown.contains("| **CWE** | CWE-79 |"));
+    assert!(markdown.contains("| **Payload** | `<script>alert(1)</script>` |"));
+}
+
+#[test]
+fn test_results_to_markdown_with_request_response() {
+    let mut result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("test")
+        .payload("<x>")
+        .evidence("test evidence")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS")
+        .build();
+
+    result.request = Some("GET /?test=%3Cx%3E HTTP/1.1\nHost: example.com".to_string());
+    result.response =
+        Some("HTTP/1.1 200 OK\nContent-Type: text/html\n\n<html><x></html>".to_string());
+
+    let results = vec![result];
+    let markdown = Result::results_to_markdown(&results, true, true);
+
+    // Check request and response sections
+    assert!(markdown.contains("**Request:**"));
+    assert!(markdown.contains("```http"));
+    assert!(markdown.contains("GET /?test=%3Cx%3E HTTP/1.1"));
+    assert!(markdown.contains("**Response:**"));
+    assert!(markdown.contains("<html><x></html>"));
+}
+
+#[test]
+fn test_results_to_markdown_escapes_terminal_controls_in_request_response() {
+    // Markdown also renders to stdout, so a hostile response must not reach
+    // the terminal with a live OSC 52 (clipboard write) or title escape.
+    let mut result = Result::builder(FindingType::Verified)
+        .param("q")
+        .payload("<x>")
+        .build();
+    result.request = Some("GET /?q=\x1b]0;T\x07 HTTP/1.1\r\nHost: h\r\n".to_string());
+    result.response = Some("HTTP/1.1 200 OK\r\n\r\n\x1b]52;c;SEFDSw==\x07\u{9d}x".to_string());
+
+    let markdown = Result::results_to_markdown(&[result], true, true);
+
+    assert!(!markdown.contains('\x1b') && !markdown.contains('\x07'));
+    assert!(!markdown.contains('\u{9d}'));
+    assert!(markdown.contains("\\x1b]52;c;SEFDSw==\\x07\\u{9d}x"));
+    // Raw HTTP stays pasteable: CRLF line structure survives.
+    assert!(markdown.contains("HTTP/1.1\r\nHost: h\r\n"));
+}
+
+#[test]
+fn test_results_to_markdown_empty() {
+    let results: Vec<Result> = vec![];
+    let markdown = Result::results_to_markdown(&results, false, false);
+
+    assert!(markdown.contains("# Dalfox Scan Results"));
+    assert!(markdown.contains("**Total Findings**: 0"));
+    assert!(markdown.contains("**Vulnerabilities (V)**: 0"));
+    assert!(markdown.contains("**Reflections (R)**: 0"));
+}
+
+#[test]
+fn test_results_to_sarif_basic() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com?q=test")
+        .param("q")
+        .payload("<script>alert(1)</script>")
+        .evidence("Found script tag")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+
+    let results = vec![result];
+    let sarif = Result::results_to_sarif(&results, false, false);
+
+    // Verify SARIF structure
+    assert!(sarif.contains("\"version\": \"2.1.0\""));
+    assert!(sarif.contains("\"$schema\""));
+    assert!(sarif.contains("sarif-schema-2.1.0.json"));
+    assert!(sarif.contains("\"runs\""));
+    assert!(sarif.contains("\"tool\""));
+    assert!(sarif.contains("\"driver\""));
+    assert!(sarif.contains("\"name\": \"Dalfox\""));
+    assert!(sarif.contains("\"results\""));
+
+    // Verify result content
+    assert!(sarif.contains("\"ruleId\": \"dalfox/cwe-79\""));
+    assert!(sarif.contains("\"level\": \"error\""));
+    assert!(sarif.contains("XSS detected"));
+    assert!(sarif.contains("https://example.com?q=test"));
+    assert!(sarif.contains("<script>alert(1)</script>"));
+
+    // Verify properties
+    assert!(sarif.contains("\"type\": \"V\""));
+    assert!(sarif.contains("\"inject_type\": \"inHTML\""));
+    assert!(sarif.contains("\"method\": \"GET\""));
+    assert!(sarif.contains("\"param\": \"q\""));
+    assert!(sarif.contains("\"severity\": \"High\""));
+    // Stable fingerprint key present and a 16-char hex value, not the
+    // catalog message_id.
+    assert!(sarif.contains("\"vulnIdentity/v1\""));
+    assert!(!sarif.contains("\"messageId\": \"606\""));
+}
+
+/// SARIF consumers (e.g. GitHub code scanning) dedupe re-runs by matching
+/// `partialFingerprints`. Two findings produced by different payload
+/// variants for the same vulnerability identity (target + param +
+/// inject_type + cwe) must therefore share a fingerprint.
+#[test]
+fn test_results_to_sarif_fingerprint_stable_across_payload_variants() {
+    let mk = |payload: &str, data: &str| {
+        Result::builder(FindingType::Reflected)
+            .inject_type("inHTML")
+            .method("GET")
+            .data(data.to_string())
+            .param("q")
+            .payload(payload.to_string())
+            .evidence("")
+            .cwe("CWE-79")
+            .severity("Info")
+            .message_id(606)
+            .message_str("X")
+            .build()
+    };
+    let a = mk("<svg/onload=alert(1)>", "https://h/s?q=%3Csvg%3E");
+    let b = mk("<img src=x onerror=alert(1)>", "https://h/s?q=%3Cimg%3E");
+    let sarif_a = Result::results_to_sarif(&[a], false, false);
+    let sarif_b = Result::results_to_sarif(&[b], false, false);
+    let extract_fp = |s: &str| -> String {
+        let key = "\"vulnIdentity/v1\": \"";
+        let i = s.find(key).expect("fingerprint key present");
+        let rest = &s[i + key.len()..];
+        let end = rest.find('"').expect("closing quote");
+        rest[..end].to_string()
+    };
+    assert_eq!(extract_fp(&sarif_a), extract_fp(&sarif_b));
+}
+
+/// Distinct vulnerabilities must have distinct fingerprints — otherwise
+/// SARIF consumers would collapse independent findings.
+#[test]
+fn test_results_to_sarif_fingerprint_distinct_for_different_targets() {
+    let mk = |data: &str, param: &str| {
+        Result::builder(FindingType::Verified)
+            .inject_type("inHTML")
+            .method("GET")
+            .data(data.to_string())
+            .param(param.to_string())
+            .payload("p")
+            .evidence("")
+            .cwe("CWE-79")
+            .severity("High")
+            .message_id(606)
+            .message_str("X")
+            .build()
+    };
+    let a = Result::results_to_sarif(&[mk("https://h/a?q=x", "q")], false, false);
+    let b = Result::results_to_sarif(&[mk("https://h/b?q=x", "q")], false, false);
+    let extract_fp = |s: &str| -> String {
+        let key = "\"vulnIdentity/v1\": \"";
+        let i = s.find(key).expect("fingerprint key present");
+        let rest = &s[i + key.len()..];
+        let end = rest.find('"').expect("closing quote");
+        rest[..end].to_string()
+    };
+    assert_ne!(extract_fp(&a), extract_fp(&b));
+}
+
+#[test]
+fn test_results_to_sarif_with_request_response() {
+    let mut result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("test")
+        .payload("<x>")
+        .evidence("test evidence")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS")
+        .build();
+
+    result.request = Some("GET /?test=%3Cx%3E HTTP/1.1\nHost: example.com".to_string());
+    result.response =
+        Some("HTTP/1.1 200 OK\nContent-Type: text/html\n\n<html><x></html>".to_string());
+
+    let results = vec![result];
+    let sarif = Result::results_to_sarif(&results, true, true);
+
+    // Verify request and response are included in properties
+    assert!(sarif.contains("\"request\""));
+    assert!(sarif.contains("GET /?test=%3Cx%3E HTTP/1.1"));
+    assert!(sarif.contains("\"response\""));
+    assert!(sarif.contains("<html><x></html>"));
+}
+
+#[test]
+fn test_results_to_sarif_severity_levels() {
+    let high = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("p1")
+        .payload("payload")
+        .evidence("")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(1)
+        .message_str("High severity")
+        .build();
+
+    let medium = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("p2")
+        .payload("payload")
+        .evidence("")
+        .cwe("CWE-79")
+        .severity("Medium")
+        .message_id(2)
+        .message_str("Medium severity")
+        .build();
+
+    let low = Result::builder(FindingType::Reflected)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("p3")
+        .payload("payload")
+        .evidence("")
+        .cwe("CWE-79")
+        .severity("Low")
+        .message_id(3)
+        .message_str("Low severity")
+        .build();
+
+    // Test each severity level mapping
+    let sarif_high = Result::results_to_sarif(&[high], false, false);
+    assert!(sarif_high.contains("\"level\": \"error\""));
+
+    let sarif_medium = Result::results_to_sarif(&[medium], false, false);
+    assert!(sarif_medium.contains("\"level\": \"warning\""));
+
+    let sarif_low = Result::results_to_sarif(&[low], false, false);
+    assert!(sarif_low.contains("\"level\": \"note\""));
+}
+
+#[test]
+fn test_results_to_sarif_empty() {
+    let results: Vec<Result> = vec![];
+    let sarif = Result::results_to_sarif(&results, false, false);
+
+    // Should still be valid SARIF with empty results array
+    assert!(sarif.contains("\"version\": \"2.1.0\""));
+    assert!(sarif.contains("\"results\": []"));
+}
+
+#[test]
+fn test_results_to_toml() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com?q=test")
+        .param("q")
+        .payload("<script>alert(1)</script>")
+        .evidence("Found script tag")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+
+    let results = vec![result];
+    let toml_output = Result::results_to_toml_with_meta(&results, false, false, None);
+
+    assert!(toml_output.contains("type = \"V\""));
+    assert!(toml_output.contains("inject_type = \"inHTML\""));
+    assert!(toml_output.contains("method = \"GET\""));
+    assert!(toml_output.contains("param = \"q\""));
+    assert!(toml_output.contains("payload = \"<script>alert(1)</script>\""));
+    assert!(toml_output.contains("severity = \"High\""));
+    assert!(toml_output.contains("message_id = 606"));
+}
+
+#[test]
+fn test_results_to_sarif_valid_json() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("q")
+        .payload("payload")
+        .evidence("evidence")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("message")
+        .build();
+
+    let results = vec![result];
+    let sarif = Result::results_to_sarif(&results, false, false);
+
+    // Should be valid JSON
+    let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&sarif);
+    assert!(parsed.is_ok(), "SARIF output should be valid JSON");
+
+    if let Ok(json) = parsed {
+        // Verify required SARIF fields
+        assert_eq!(json["version"], "2.1.0");
+        assert!(json["runs"].is_array());
+        assert_eq!(json["runs"].as_array().unwrap().len(), 1);
+
+        let run = &json["runs"][0];
+        assert!(run["tool"].is_object());
+        assert!(run["results"].is_array());
+    }
+}
+
+/// SARIF requires every result's `ruleId` to resolve to a rule in
+/// `driver.rules`, and a present `ruleIndex` to point at that same rule.
+/// Findings with different CWEs (XSS = CWE-79, outdated libs = CWE-1104) must
+/// therefore each get their own rule and a correct index — not a hardcoded
+/// `ruleIndex: 0` against a single XSS rule.
+#[test]
+fn test_results_to_sarif_multiple_cwes_have_consistent_rule_index() {
+    let xss = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .data("https://example.com/?q=x")
+        .param("q")
+        .payload("<script>alert(1)</script>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_str("xss")
+        .build();
+    let lib = Result::builder(FindingType::Informational)
+        .inject_type("OutdatedComponent")
+        .data("https://example.com/app.js")
+        .cwe("CWE-1104")
+        .severity("Medium")
+        .message_str("outdated jquery")
+        .build();
+
+    let sarif = Result::results_to_sarif(&[xss, lib], false, false);
+    let json: serde_json::Value = serde_json::from_str(&sarif).expect("valid SARIF JSON");
+    let run = &json["runs"][0];
+
+    // The rule table must define both CWE rules.
+    let rules = run["tool"]["driver"]["rules"]
+        .as_array()
+        .expect("rules array");
+    let rule_ids: Vec<&str> = rules.iter().filter_map(|r| r["id"].as_str()).collect();
+    assert!(rule_ids.contains(&"dalfox/cwe-79"), "rules: {rule_ids:?}");
+    assert!(rule_ids.contains(&"dalfox/cwe-1104"), "rules: {rule_ids:?}");
+
+    // Every result's ruleIndex must point at the rule whose id equals its ruleId.
+    for res in run["results"].as_array().expect("results array") {
+        let rule_id = res["ruleId"].as_str().expect("ruleId");
+        let idx = res["ruleIndex"].as_u64().expect("ruleIndex") as usize;
+        assert_eq!(
+            rules[idx]["id"].as_str(),
+            Some(rule_id),
+            "ruleIndex {idx} must point at the rule whose id is {rule_id}"
+        );
+    }
+}
+
+#[test]
+fn test_to_json_value_respects_include_flags() {
+    let mut result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("q")
+        .payload("payload")
+        .evidence("evidence")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(1)
+        .message_str("message")
+        .build();
+    result.request = Some("GET / HTTP/1.1".to_string());
+    result.response = Some("HTTP/1.1 200 OK".to_string());
+
+    let with_all = result.to_json_value(true, true);
+    assert_eq!(with_all["request"], "GET / HTTP/1.1");
+    assert_eq!(with_all["response"], "HTTP/1.1 200 OK");
+    assert_eq!(
+        with_all["type_description"],
+        "Vulnerable - dalfox asserts this input is exploitable; act on it"
+    );
+
+    let without_optional = result.to_json_value(false, false);
+    assert!(without_optional.get("request").is_none());
+    assert!(without_optional.get("response").is_none());
+    // type_description always present
+    assert!(without_optional.get("type_description").is_some());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tests for scan metadata envelope in non-JSON formats (issue #1093)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn mk_meta() -> ScanMetadata {
+    ScanMetadata {
+        dalfox_version: "1.2.3-test".to_string(),
+        targets: vec![
+            "https://example.com".to_string(),
+            "https://ex2.com".to_string(),
+        ],
+        scan_duration_ms: 1234,
+        total_requests: 42,
+        findings_count: 1,
+        incomplete: false,
+        min_confidence: None,
+        target_summary: vec![
+            serde_json::json!({
+                "target": "https://example.com",
+                "status": "findings",
+                "findings_count": 1,
+                "waf": {
+                    "detected": [
+                        {"type": "Cloudflare", "confidence": 95, "evidence": "cf-ray header"}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "target": "https://ex2.com",
+                "method": "POST",
+                "status": "skipped",
+                "findings_count": 0,
+                "error_code": "CONNECTION_FAILED"
+            }),
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_results_to_markdown_with_meta() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com?q=test")
+        .param("q")
+        .payload("<script>alert(1)</script>")
+        .evidence("")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS")
+        .build();
+    let results = vec![result];
+    let md = Result::results_to_markdown_with_meta(&results, false, false, Some(&mk_meta()));
+
+    assert!(md.contains("## Scan Metadata"));
+    assert!(md.contains("| **Dalfox Version** | 1.2.3-test |"));
+    assert!(md.contains("| **Scan Duration** | 1234 ms |"));
+    assert!(md.contains("| **Total Requests** | 42 |"));
+    assert!(md.contains("### Target Summary"));
+    assert!(md.contains("| https://example.com | findings | 1 | Cloudflare |"));
+    // Method-prefixed when the row carries one (#1527).
+    assert!(md.contains("| POST https://ex2.com | skipped (CONNECTION\\_FAILED) | 0 | none |"));
+    // still has the findings summary
+    assert!(md.contains("## Summary"));
+    assert!(md.contains("**Total Findings**: 1"));
+}
+
+/// `--min-confidence` must show in the markdown metadata table as it does in
+/// the JSON envelope: a report whose findings were all filtered out otherwise
+/// reads `0` findings / `clean` with nothing saying why.
+#[test]
+fn test_results_to_markdown_with_meta_shows_min_confidence() {
+    let mut meta = mk_meta();
+    let md = Result::results_to_markdown_with_meta(&[], false, false, Some(&meta));
+    assert!(
+        !md.contains("Min Confidence"),
+        "absent when the flag is unset"
+    );
+    meta.min_confidence = Some(serde_json::json!({"level": "high", "dropped": 2}));
+    let md = Result::results_to_markdown_with_meta(&[], false, false, Some(&meta));
+    assert!(
+        md.contains("| **Min Confidence** | high (2 finding(s) dropped) |"),
+        "{md}"
+    );
+}
+
+#[test]
+fn test_results_to_toml_with_meta() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("q")
+        .payload("x")
+        .evidence("")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(1)
+        .message_str("x")
+        .build();
+    let results = vec![result];
+    let toml = Result::results_to_toml_with_meta(&results, false, false, Some(&mk_meta()));
+
+    // meta table present, mirroring json envelope
+    assert!(toml.contains("[meta]"));
+    assert!(toml.contains("dalfox_version = \"1.2.3-test\""));
+    assert!(toml.contains("scan_duration_ms = 1234"));
+    assert!(toml.contains("total_requests = 42"));
+    assert!(toml.contains("[[results]]"));
+    // target_summary carried
+    assert!(toml.contains("target_summary"));
+    assert!(toml.contains("Cloudflare"));
+}
+
+#[test]
+fn test_results_to_sarif_with_meta() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com")
+        .param("q")
+        .payload("p")
+        .evidence("")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(1)
+        .message_str("x")
+        .build();
+    let results = vec![result];
+    let sarif = Result::results_to_sarif_with_meta(&results, false, false, Some(&mk_meta()));
+
+    let v: serde_json::Value = serde_json::from_str(&sarif).expect("valid");
+
+    // run.properties has the envelope
+    let run_props = &v["runs"][0]["properties"];
+    assert_eq!(run_props["dalfox_version"], "1.2.3-test");
+    assert_eq!(run_props["total_requests"], 42);
+    assert!(run_props["target_summary"].is_array());
+
+    // driver.properties also has it (for GitHub code scanning etc)
+    let driver_props = &v["runs"][0]["tool"]["driver"]["properties"];
+    assert_eq!(driver_props["scan_duration_ms"], 1234);
+    assert_eq!(driver_props["findings_count"], 1);
+    assert!(driver_props.get("waf").is_none()); // waf is inside target_summary entries
+}
+
+/// Records written before the confidence/method fields existed must still
+/// deserialize — `SanitizedResult` is a public shape and consumers may have
+/// stored it. `detection_method` falls back rather than failing the parse.
+#[test]
+fn test_sanitized_result_deserializes_records_without_new_fields() {
+    let old = r#"{
+        "type": "R",
+        "type_description": "Reflected",
+        "inject_type": "inHTML",
+        "method": "GET",
+        "data": "https://example.com/?q=x",
+        "param": "q",
+        "payload": "<x>",
+        "evidence": "evidence",
+        "cwe": "CWE-79",
+        "severity": "Info",
+        "message_id": 606,
+        "message_str": "msg"
+    }"#;
+    let parsed: SanitizedResult = serde_json::from_str(old).expect("old shape must still parse");
+    assert_eq!(parsed.detection_method, FindingMethod::Reflection);
+    assert_eq!(parsed.confidence, None);
+    assert!(parsed.confidence_reason.is_empty());
+}
+
+/// The confidence fields are omitted rather than emitted as null when a finding
+/// has no grade, so `[I]` records stay clean for consumers keying on presence.
+#[test]
+fn test_informational_finding_omits_confidence_in_json() {
+    let r = Result::builder(FindingType::Informational)
+        .inject_type("OutdatedComponent")
+        .method("GET")
+        .data("https://example.com/")
+        .cwe("CWE-1104")
+        .severity("Info")
+        .message_id(1104)
+        .message_str("outdated jquery")
+        .build();
+    let v = r.to_json_value(false, false);
+    assert_eq!(v["detection_method"], "library");
+    assert!(v.get("confidence").is_none(), "got: {}", v);
+    assert!(v.get("confidence_reason").is_none(), "got: {}", v);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Markdown report — the target must not be able to write the report's shape
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn markdown_param_cannot_forge_rows_or_headings() {
+    // A page naming its input `q| forged |\n\n## FORGED HEADING\n\nx` used to
+    // end up with a real heading and an extra table row inside the report.
+    let hostile = "q| forged |\n\n## FORGED HEADING\n\nx";
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param(hostile)
+        .payload("<svg onload=alert(1)>")
+        .evidence("a | b")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+
+    assert!(
+        !md.lines().any(|l| l.trim_start().starts_with("## FORGED")),
+        "param forged a heading:\n{md}"
+    );
+    // The pipe is escaped, so the row still has exactly the two cells.
+    assert!(md.contains("| **Parameter** | `q\\| forged \\|"), "{md}");
+    assert!(md.contains("| **Evidence** | a \\| b |"), "{md}");
+    // …and the newlines are escaped rather than ending the table.
+    assert!(md.contains("\\n\\n## FORGED HEADING\\n\\nx"), "{md}");
+}
+
+#[test]
+fn markdown_target_text_cannot_create_a_link_inside_parameter_cells() {
+    // Parameter names can come directly from a page's form or query string.
+    // A backtick closes the fixed inline-code span used by the table, leaving
+    // the rest of this value active Markdown in both the heading and cell.
+    let hostile = "q` [click](https://attacker.example)";
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param(hostile)
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+
+    assert!(
+        md.contains("### 1. Vulnerability - ``q` [click](https://attacker.example)`` (inHTML)"),
+        "target text must stay inside a code span in the finding heading:\n{md}"
+    );
+    assert!(
+        md.contains("| **Parameter** | ``q` [click](https://attacker.example)`` |"),
+        "the parameter value must remain inside one code span:\n{md}"
+    );
+}
+
+#[test]
+fn markdown_finding_includes_type_description() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+
+    assert!(
+        md.contains("| **Type Description** | Vulnerable - dalfox asserts this input is exploitable; act on it |"),
+        "Markdown must pair the type code with its description:\n{md}"
+    );
+}
+
+#[test]
+fn markdown_labels_ast_and_informational_findings_and_counts_them() {
+    let make = |tier: FindingType, param: &str| {
+        Result::builder(tier)
+            .inject_type("DOM-XSS")
+            .method("GET")
+            .data("https://example.com/")
+            .param(param)
+            .payload("")
+            .cwe("CWE-79")
+            .severity("Low")
+            .message_id(0)
+            .message_str("m")
+            .build()
+    };
+    let md = Result::results_to_markdown(
+        &[
+            make(FindingType::AstDetected, "location.hash"),
+            make(FindingType::Informational, ""),
+        ],
+        false,
+        false,
+    );
+    assert!(md.contains("### 1. AST-detected - `location.hash`"), "{md}");
+    assert!(md.contains("### 2. Informational - -"), "{md}");
+    assert!(
+        !md.contains("Reflection -"),
+        "A/I must not read as R:\n{md}"
+    );
+    assert!(md.contains("**AST-detected (A)**: 1"), "{md}");
+    assert!(md.contains("**Informational (I)**: 1"), "{md}");
+    assert!(!md.contains("``"), "no empty code span:\n{md}");
+}
+
+#[test]
+fn sarif_finding_includes_type_description() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let sarif = Result::results_to_sarif(&[result], false, false);
+    let value: serde_json::Value = serde_json::from_str(&sarif).expect("valid SARIF JSON");
+
+    assert_eq!(
+        value["runs"][0]["results"][0]["properties"]["type_description"],
+        "Vulnerable - dalfox asserts this input is exploitable; act on it"
+    );
+}
+
+#[test]
+fn markdown_control_bytes_in_cells_are_escaped() {
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/\u{1b}]8;;http://evil/\u{7}")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+    assert!(!md.contains('\u{1b}') && !md.contains('\u{7}'), "{md:?}");
+    assert!(md.contains("\\\\x1b\\]8;;http://evil/\\\\x07"), "{md}");
+    // Payload punctuation is untouched.
+    assert!(md.contains("<svg onload=alert(1)>"), "{md}");
+}
+
+#[test]
+fn markdown_code_fence_outgrows_backticks_in_the_body() {
+    // A response echoed under --include-response can contain ``` and used to
+    // close the fence early, spilling the rest into the document as Markdown.
+    let mut result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    result.response = Some("HTTP/1.1 200 OK\r\n\r\n```\n## NOT A HEADING\n```".to_string());
+    let md = Result::results_to_markdown(&[result], false, true);
+    let (_, fenced) = md
+        .split_once("**Response:**\n\n")
+        .expect("response section");
+    assert!(
+        fenced.starts_with("````http\n"),
+        "fence must outgrow the body:\n{md}"
+    );
+    // The body's own ``` lines sit between the opening and closing 4-backtick
+    // fences, so nothing after them is read as Markdown.
+    let (block, _) = fenced
+        .split_once("\n````\n")
+        .expect("closing fence of the same length");
+    assert!(block.contains("```\n## NOT A HEADING\n```"), "{md}");
+}
+
+#[test]
+fn markdown_payload_cell_keeps_waf_bypass_whitespace() {
+    // `payload::xss_html` ships `<img\x0csrc=x\x0conerror=…>`; the Payload
+    // cell is what a reader copies to reproduce, so those bytes must survive.
+    let result = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("GET")
+        .data("https://example.com/")
+        .param("q")
+        .payload("<img\u{c}src=x\u{c}onerror=alert(1)>")
+        .cwe("CWE-79")
+        .severity("High")
+        .message_id(606)
+        .message_str("XSS detected")
+        .build();
+    let md = Result::results_to_markdown(&[result], false, false);
+    assert!(
+        md.contains("<img\u{c}src=x\u{c}onerror=alert(1)>"),
+        "{md:?}"
+    );
+}
+
+#[test]
+fn unparsable_target_lines_surface_in_every_envelope() {
+    // A run that discarded part of its input list must never read as full
+    // coverage of that list — the same contract `targets_deduplicated` has.
+    let meta = ScanMetadata {
+        targets_unparsable: 7,
+        ..mk_meta()
+    };
+
+    let json = Result::make_scan_meta_value(&meta);
+    assert_eq!(json["targets_unparsable"], serde_json::json!(7));
+
+    let md = Result::results_to_markdown_with_meta(&[], false, false, Some(&meta));
+    assert!(
+        md.contains("| **Targets Unparsable** | 7 list line(s) skipped |"),
+        "markdown meta table missing the row:\n{md}"
+    );
+
+    // Serde carries it into the formats that serialize the struct directly.
+    let serialized = serde_json::to_value(&meta).expect("meta serializes");
+    assert_eq!(serialized["targets_unparsable"], serde_json::json!(7));
+}
+
+#[test]
+fn a_clean_run_carries_no_unparsable_field_at_all() {
+    // Zero is the normal case: it must not add a field to every envelope, and
+    // it must not add a row to the Markdown table.
+    let meta = mk_meta();
+    assert_eq!(meta.targets_unparsable, 0);
+
+    let json = Result::make_scan_meta_value(&meta);
+    assert!(
+        json.get("targets_unparsable").is_none(),
+        "zero must be omitted from the JSON envelope: {json}"
+    );
+
+    let md = Result::results_to_markdown_with_meta(&[], false, false, Some(&meta));
+    assert!(!md.contains("Targets Unparsable"), "{md}");
+
+    let serialized = serde_json::to_value(&meta).expect("meta serializes");
+    assert!(serialized.get("targets_unparsable").is_none());
+}
+
+#[test]
+fn filter_fingerprint_separates_raw_encoded_and_stripped() {
+    let probe = ['<', '>', '"', '\'', ';', '(', ')', '-', '`'];
+    // htmlspecialchars + strip parens: `<>"'` come back as entities, whose
+    // own `;` must not read as a raw `;`.
+    let f = FilterFingerprint::from_segment("&lt;&gt;&quot;&#039;-`", &probe);
+    assert_eq!(f.allowed, vec!['-', '`']);
+    assert_eq!(f.encoded, vec!['"', '\'', '<', '>']);
+    assert_eq!(f.blocked, vec!['(', ')', ';']);
+    assert_eq!(f.summary(), "allowed -`  encoded \"'<>  blocked ();");
+
+    let f = FilterFingerprint::from_segment("%3C%3e;", &probe);
+    assert_eq!(f.allowed, vec![';']);
+    assert_eq!(f.encoded, vec!['<', '>']);
+
+    let f = FilterFingerprint::from_segment("", &['<']);
+    assert_eq!(f.summary(), "allowed none  blocked <");
+}
+
+#[test]
+fn markdown_code_cell_closes_around_edge_backticks() {
+    let mut r = Result::builder(FindingType::Reflected)
+        .param("q")
+        .payload("x")
+        .build();
+    r.filter = Some(FilterFingerprint {
+        allowed: vec!['<'],
+        encoded: vec![],
+        blocked: vec!['`'],
+        escaped: vec![],
+    });
+    let md = Result::results_to_markdown_with_meta(std::slice::from_ref(&r), false, false, None);
+    assert!(
+        md.contains("| **Filter** | `` allowed <  blocked ` `` |"),
+        "md: {md}"
+    );
+    r.result_type = FindingType::Verified;
+    let md = Result::results_to_markdown_with_meta(std::slice::from_ref(&r), false, false, None);
+    assert!(!md.contains("**Filter**"), "V rows skip the filter: {md}");
+}
+
+#[test]
+fn filter_fingerprint_reaches_every_machine_format() {
+    let mut r = Result::builder(FindingType::Reflected)
+        .param("q")
+        .payload("<x>")
+        .cwe("CWE-79")
+        .severity("Info")
+        .build();
+    r.filter = Some(FilterFingerprint {
+        allowed: vec!['<'],
+        encoded: vec![],
+        blocked: vec!['('],
+        escaped: vec![],
+    });
+
+    let json = r.to_json_value(false, false);
+    assert_eq!(json["filter"]["allowed"], serde_json::json!(["<"]));
+    assert_eq!(json["filter"]["blocked"], serde_json::json!(["("]));
+    assert!(
+        json["filter"].get("escaped").is_none(),
+        "empty escaped omitted"
+    );
+    assert!(
+        json["filter"].get("encoded").is_none(),
+        "empty encoded omitted"
+    );
+
+    let sanitized = serde_json::to_value(r.to_sanitized(false, false)).unwrap();
+    assert_eq!(sanitized["filter"], json["filter"]);
+
+    let toml = Result::results_to_toml_with_meta(std::slice::from_ref(&r), false, false, None);
+    assert!(toml.contains("[results.filter]"), "toml: {toml}");
+
+    r.filter = None;
+    assert!(r.to_json_value(false, false).get("filter").is_none());
+}
+
+/// SARIF `level` follows severity only. The confidence grade rides in
+/// `properties`, and neither `level` nor `partialFingerprints` move with it, so
+/// existing code-scanning gates and finding identities are unaffected.
+#[test]
+fn test_results_to_sarif_level_and_fingerprint_ignore_confidence() {
+    let mk = |grade: Option<Confidence>| {
+        let mut r = Result::builder(FindingType::Verified)
+            .inject_type("DOM-XSS")
+            .data("https://h/s?q=1")
+            .param("q")
+            .cwe("CWE-79")
+            .severity("High")
+            .build();
+        r.confidence = grade;
+        r
+    };
+    let sarif = |r: Result| -> serde_json::Value {
+        serde_json::from_str(&Result::results_to_sarif(&[r], false, false)).unwrap()
+    };
+    let first = |v: &serde_json::Value| v["runs"][0]["results"][0].clone();
+    let high = first(&sarif(mk(Some(Confidence::High))));
+    let low = first(&sarif(mk(Some(Confidence::Low))));
+    let none = first(&sarif(mk(None)));
+    for r in [&high, &low, &none] {
+        assert_eq!(r["level"], "error");
+    }
+    assert_eq!(high["partialFingerprints"], low["partialFingerprints"]);
+    assert_eq!(low["properties"]["confidence"], "low");
+}

@@ -1,0 +1,181 @@
+/******************************************************************************/
+/* schemes.js -- schemes for file loading
+ *
+ * Copyright Yahoo Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+'use strict';
+
+const http = require('http');
+const https = require('https');
+const axios = require('axios');
+const { LRUCache } = require('lru-cache');
+// const fs = require('fs');
+const Config = require('./config.js');
+const { GetObjectCommand, S3 } = require('@aws-sdk/client-s3');
+
+const blocklru = new LRUCache({ max: 100 });
+const S3s = new Map();
+
+const httpAgent = new http.Agent({ family: 4 });
+const httpsAgent = new https.Agent({ family: 4 });
+
+// --------------------------------------------------------------------------
+async function getBlockHTTP (info, pos) {
+  async function getBlockHttpInternal () {
+    const result = await axios.get(info.name, { responseType: 'arraybuffer', httpAgent, httpsAgent, headers: { range: `bytes=${blockStart}-${blockStart + blockSize - 1}` } });
+    return result.data;
+  }
+
+  const blockSize = 0x10000;
+  const blockStart = Math.floor(pos / blockSize) * blockSize;
+  const key = `${info.name}:${blockStart}`;
+
+  let block = blocklru.get(key);
+  if (!block) {
+    block = getBlockHttpInternal();
+    blocklru.set(key, block);
+    block.catch(() => { blocklru.delete(key); });
+  }
+  block = await block;
+  return block.slice(pos - blockStart);
+}
+
+// --------------------------------------------------------------------------
+function makeS3 (info) {
+  const key = Config.getFull(info.node, 's3AccessKeyId') ?? Config.get('s3AccessKeyId');
+
+  const cacheKey = `${info.extra.endpoint}:${info.extra.bucket}:${key}`;
+
+  let s3 = S3s.get(cacheKey);
+  if (s3) {
+    return s3;
+  }
+
+  const s3Params = { region: info.extra.region, endpoint: info.extra.endpoint };
+
+  if (s3Params.endpoint.endsWith('amazonaws.com')) {
+    delete s3Params.endpoint;
+  }
+
+  if (key) {
+    const secret = Config.getFull(info.node, 's3SecretAccessKey') ?? Config.get('s3SecretAccessKey');
+    if (!secret) {
+      console.log('ERROR - No s3SecretAccessKey set for ', info.node);
+    }
+
+    s3Params.credentials = { accessKeyId: key, secretAccessKey: secret };
+  }
+
+  s3Params.forcePathStyle = info.extra.pathStyle;
+  s3Params.sslEnabled = info.extra.endpoint.startsWith('https://');
+
+  // Let's hope that we can find a credential provider elsewhere
+
+  s3 = new S3(s3Params);
+  S3s.set(cacheKey, s3);
+  return s3;
+}
+
+// --------------------------------------------------------------------------
+// https://coderwall.com/p/pq0usg/javascript-string-split-that-ll-return-the-remainder
+function splitRemain (str, separator, limit) {
+  str = str.split(separator);
+  if (str.length <= limit) { return str; }
+
+  const ret = str.splice(0, limit);
+  ret.push(str.join(separator));
+
+  return ret;
+}
+
+// --------------------------------------------------------------------------
+async function getBlockS3Internal (info, params) {
+  const s3 = makeS3(info);
+  const command = new GetObjectCommand(params);
+  const response = await s3.send(command);
+  return Buffer.from(await response.Body.transformToByteArray());
+}
+
+// --------------------------------------------------------------------------
+// s3://bucket/path
+async function getBlockS3 (info, pos) {
+  const blockSize = 0x10000;
+  const blockStart = Math.floor(pos / blockSize) * blockSize;
+  const key = `${info.name}:${blockStart}`;
+  let block = blocklru.get(key);
+  if (!block) {
+    const parts = splitRemain(info.name, '/', 3);
+
+    const params = {
+      Bucket: parts[2],
+      Key: parts[3],
+      Range: `bytes=${blockStart}-${blockStart + blockSize - 1}`
+    };
+
+    block = getBlockS3Internal(info, params);
+    blocklru.set(key, block);
+    block.catch(() => { blocklru.delete(key); });
+  }
+
+  block = await block;
+  // Return a new buffer starting at pos
+  return block.slice(pos - blockStart);
+}
+
+// --------------------------------------------------------------------------
+// s3http://host:port/bucket/path
+// s3https://host:port/bucket/path
+async function getBlockS3HTTP (info, pos) {
+  const blockSize = 0x10000;
+  const blockStart = Math.floor(pos / blockSize) * blockSize;
+  const key = `${info.name}:${blockStart}`;
+  let block = blocklru.get(key);
+  if (!block) {
+    const params = {
+      Bucket: info.extra.bucket,
+      Key: info.extra.path.replace(/^\//, ''),
+      Range: `bytes=${blockStart}-${blockStart + blockSize - 1}`
+    };
+
+    block = getBlockS3Internal(info, params);
+    blocklru.set(key, block);
+    block.catch(() => { blocklru.delete(key); });
+  }
+
+  // Return a new buffer starting at pos
+  block = await block;
+  return block.slice(pos - blockStart);
+}
+
+// --------------------------------------------------------------------------
+/*
+async function getBlockDisk (info, pos) {
+  const blockSize = 0x10000;
+  const blockStart = Math.floor(pos / blockSize) * blockSize;
+  const key = `${info.name}:${blockStart}`;
+  let block = blocklru.get(key);
+  if (!block) {
+    const fd = await fs.promises.open(info.name, 'r');
+    const result = await fd.promises.read(Buffer.alloc(blockSize), 0, blockSize, blockStart);
+    block = result.buffer.slice(0, result.bytesRead);
+    blocklru.set(key, block);
+    fs.close(fd);
+  }
+
+  // Return a new buffer starting at pos
+  return block.slice(pos - blockStart);
+}
+schemes.set('file', { getBlock: getBlockDisk });
+*/
+
+const schemes = new Map();
+
+schemes.set('http', { getBlock: getBlockHTTP });
+schemes.set('https', { getBlock: getBlockHTTP });
+schemes.set('s3', { getBlock: getBlockS3 });
+schemes.set('s3http', { getBlock: getBlockS3HTTP });
+schemes.set('s3https', { getBlock: getBlockS3HTTP });
+
+module.exports = schemes;

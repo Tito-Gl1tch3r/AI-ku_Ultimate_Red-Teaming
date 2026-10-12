@@ -1,0 +1,128 @@
+/******************************************************************************/
+/* internals.js -- global vars shared between parts of viewer
+ *
+ * Copyright Yahoo Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+'use strict';
+
+const Config = require('./config.js');
+const EventEmitter = require('events').EventEmitter;
+const http = require('http');
+const https = require('https');
+const RE2 = require('re2');
+const ArkimeConfig = require('../common/arkimeConfig');
+
+// build internals
+const internals = {
+  isProduction: false,
+  multiES: false,
+  CYBERCHEFVERSION: '11.5.0',
+  httpAgent: new http.Agent({ keepAlive: true, keepAliveMsecs: 20000, maxSockets: 50, maxFreeSockets: 25 }),
+  rightClicks: {},
+  fieldActions: {},
+  customViewFields: {},
+  pluginEmitter: new EventEmitter(),
+  writers: new Map(),
+  uploadLimits: {},
+
+  // http://garethrees.org/2007/11/14/pngcrush/
+  emptyPNG: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==', 'base64'),
+  PNG_LINE_WIDTH: 256,
+  shortcutTypeMap: {
+    ip: 'ip',
+    integer: 'number',
+    termfield: 'string',
+    uptermfield: 'string',
+    lotermfield: 'string'
+  },
+  anonymousUser: {
+    userId: 'anonymous',
+    enabled: true,
+    webEnabled: true,
+    headerAuthEnabled: false,
+    emailSearch: true,
+    removeEnabled: true,
+    packetSearch: true,
+    settings: {},
+    welcomeMsgNum: 1,
+    found: true,
+    roles: ['arkimeUser']
+  },
+  // default settings for users with no settings
+  settingDefaults: {
+    timezone: 'local',
+    detailFormat: 'last',
+    showTimestamps: 'last',
+    sortColumn: 'firstPacket',
+    sortDirection: 'desc',
+    spiGraph: 'node',
+    connSrcField: 'source.ip',
+    connDstField: 'ip.dst:port',
+    numPackets: 'last',
+    theme: 'default-theme',
+    manualQuery: false,
+    timelineDataFilters: ['network.packets', 'network.bytes', 'totDataBytes'], // dbField2 values from fields
+    hideTags: ''
+  },
+  usersMissing: {
+    userId: '',
+    userName: '',
+    expression: '',
+    enabled: 0,
+    webEnabled: 0,
+    headerAuthEnabled: 0,
+    emailSearch: 0,
+    removeEnabled: 0,
+    lastUsed: 0
+  }
+};
+
+internals.initialize = (app) => {
+  internals.isProduction = app.get('env') === 'production';
+};
+
+ArkimeConfig.loaded(() => {
+  // build internals
+  internals.elasticBase = Config.getArray('elasticsearch', 'http://localhost:9200');
+  internals.remoteClusters = Config.configMap('remote-clusters', 'moloch-clusters');
+  internals.esQueryTimeout = Config.get('elasticsearchTimeout', 5 * 60) + 's';
+  internals.esScrollTimeout = Config.get('elasticsearchScrollTimeout', 5 * 60) + 's';
+  internals.userNameHeader = Config.get('userNameHeader');
+  internals.esAdminUsersSet = Config.get('esAdminUsers', false) !== false;
+  internals.esAdminUsers = Config.getArray('esAdminUsers', '');
+  if (internals.esAdminUsersSet) {
+    console.log('WARNING - the esAdminUsers setting is deprecated and will be removed in Arkime 7, assign the dbAdmin role to those users instead');
+  }
+  internals.httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 20000, maxSockets: 50, maxFreeSockets: 25, rejectUnauthorized: !ArkimeConfig.insecure });
+  internals.isLocalViewRegExp = Config.get('isLocalViewRegExp') ? new RE2(Config.get('isLocalViewRegExp')) : undefined;
+  internals.allowUploads = !!Config.get('uploadCommand');
+  internals.uploadRoles = Config.getArray('uploadRoles', 'arkimeUser');
+  internals.cronTimeout = +Config.get('dbFlushTimeout', 5) + // How long capture holds items
+                           60 + // How long before ES reindexes
+                           20; // Transmit and extra time
+  internals.prefix = Config.get('prefix', 'arkime_');
+  internals.multiES = Config.getBool('multiES', false);
+
+  // make sure there's an _ after the prefix
+  if (internals.prefix && !internals.prefix.endsWith('_')) {
+    internals.prefix = `${internals.prefix}_`;
+  }
+
+  internals.uploadLimits.fileSize = Config.getInt('uploadFileSizeLimit', 2147483648);
+
+  if (!internals.elasticBase[0].startsWith('http')) {
+    internals.elasticBase[0] = 'http://' + internals.elasticBase[0];
+  }
+
+  // update user settingDefaults with user-setting-defaults config option if set
+  for (const key in internals.settingDefaults) {
+    const userSettingDefault = ArkimeConfig.getFull('user-setting-defaults', key);
+    if (userSettingDefault !== undefined && userSettingDefault !== null) {
+      internals.settingDefaults[key] = key === 'timelineDataFilters' ? userSettingDefault.split(';') : userSettingDefault;
+    }
+  }
+});
+
+module.exports = internals;

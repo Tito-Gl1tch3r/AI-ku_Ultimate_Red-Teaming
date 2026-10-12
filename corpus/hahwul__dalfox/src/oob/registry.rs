@@ -1,0 +1,91 @@
+//! Correlation registry: maps a per-payload nonce (the 13 chars after the
+//! 20-char correlation-id) back to the exact request that embedded it, so a
+//! later out-of-band callback can be reported against its origin.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+
+/// What was injected for a given correlation nonce.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InjectionRecord {
+    /// Where the payload was sent: the target URL, or a form's action URL.
+    pub target_url: String,
+    /// The scanned target the payload was injected for, stamped on the
+    /// callback's finding as its `origin_target`. Empty when unknown.
+    pub origin_target: String,
+    pub param: String,
+    /// Wire location understood by `generate_poc`: `"Query"`, `"Body"`,
+    /// `"Header"` (cookies fold here too). Empty when unknown.
+    pub location: String,
+    pub payload: String,
+    pub method: String,
+}
+
+/// Thread-safe `nonce -> InjectionRecord` map shared between the injection
+/// passes (writers) and the OOB poller (reader).
+#[derive(Default)]
+pub struct CorrelationRegistry {
+    inner: Mutex<HashMap<String, InjectionRecord>>,
+}
+
+impl CorrelationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn record(&self, nonce: String, rec: InjectionRecord) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(nonce, rec);
+    }
+
+    pub(crate) fn lookup(&self, nonce: &str) -> Option<InjectionRecord> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(nonce)
+            .cloned()
+    }
+
+    /// Live entry count. The OOB drain reads this to skip its wait window when
+    /// nothing was injected over OOB; the registry tests assert the map is
+    /// pruned as interactions are matched.
+    pub(crate) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_and_lookup() {
+        let reg = CorrelationRegistry::new();
+        assert!(reg.is_empty());
+        reg.record(
+            "abc1234567890".to_string(),
+            InjectionRecord {
+                target_url: "https://t/?q=1".to_string(),
+                origin_target: String::new(),
+                param: "q".to_string(),
+                location: "Query".to_string(),
+                payload: "\"'><script src=//x></script>".to_string(),
+                method: "GET".to_string(),
+            },
+        );
+        assert_eq!(reg.len(), 1);
+        let got = reg.lookup("abc1234567890").expect("present");
+        assert_eq!(got.param, "q");
+        assert_eq!(got.location, "Query");
+        assert!(reg.lookup("missing").is_none());
+    }
+}

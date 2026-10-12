@@ -1,0 +1,62 @@
+package listener
+
+import (
+	"errors"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/tui"
+	"github.com/evertras/bubble-table/table"
+	"github.com/spf13/cobra"
+	"strconv"
+)
+
+func ListenerCmd(cmd *cobra.Command, con *core.Console) error {
+	listeners, err := con.Rpc.GetListeners(con.Context(), &clientpb.Empty{})
+	if err != nil {
+		return err
+	}
+	printListeners(con, listeners)
+	return nil
+}
+
+func InspectListenerCmd(cmd *cobra.Command, con *core.Console) error {
+	listenerID := cmd.Flags().Arg(0)
+	listeners, err := con.Rpc.GetListeners(con.Context(), &clientpb.Empty{})
+	if err != nil {
+		return err
+	}
+	for _, listener := range listeners.GetListeners() {
+		if listener.GetId() == listenerID {
+			tui.RenderKVWithOptions(map[string]interface{}{
+				"ID":     listener.GetId(),
+				"IP":     listener.GetIp(),
+				"Active": listener.GetActive(),
+			}, []string{"ID", "IP", "Active"}, tui.KVOptions{ShowHeader: true})
+			return nil
+		}
+	}
+	return errors.New("listener not found")
+}
+
+func printListeners(con *core.Console, listeners *clientpb.Listeners) {
+	var rowEntries []table.Row
+	var row table.Row
+	tableModel := tui.NewTable([]table.Column{
+		table.NewColumn("ID", "ID", 10),
+		table.NewFlexColumn("Addr", "Addr", 1),
+		table.NewColumn("Active", "Active", 7),
+	}, true)
+	for _, listener := range listeners.GetListeners() {
+		row = table.NewRow(
+			table.RowData{
+				"ID":     listener.Id,
+				"Addr":   listener.Ip,
+				"Active": strconv.FormatBool(listener.Active),
+			})
+		rowEntries = append(rowEntries, row)
+	}
+	tableModel.SetMultiline()
+	tableModel.SetRows(rowEntries)
+	tableModel.Title = "listeners"
+	con.Log.Console(tableModel.View())
+}

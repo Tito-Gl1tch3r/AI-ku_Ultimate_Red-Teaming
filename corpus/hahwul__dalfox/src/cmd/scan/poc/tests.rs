@@ -1,0 +1,643 @@
+use super::*;
+use crate::scanning::result::{FindingType, Result};
+
+fn informational(inject_type: &str) -> Result {
+    Result::builder(FindingType::Informational)
+        .inject_type(inject_type)
+        .data("https://example.com")
+        .message_str("Outdated JavaScript library: jQuery 1.7.2")
+        .evidence("jQuery 1.7.2 is known-vulnerable (CVE-2020-11023); upgrade to >= 3.5.0")
+        .cwe("CWE-1104")
+        .build()
+}
+
+#[test]
+fn informational_block_plain_is_compact_and_colored() {
+    let r = informational("OutdatedComponent");
+    let out = render_finding_block(&r, "plain", false, false);
+    // Tagged, payload-free summary line + evidence sub-line.
+    assert!(out.contains("[INF][OutdatedComponent]"), "{out}");
+    assert!(out.contains("https://example.com"));
+    assert!(out.contains("jQuery 1.7.2"));
+    assert!(out.contains("CVE-2020-11023"));
+    // plain output is colorized (cyan).
+    assert!(out.contains("\x1b[36m"));
+    // No payload-oriented "[POC]" / "Payload:" tree for informational findings.
+    assert!(!out.contains("[POC]"));
+    assert!(!out.contains("Payload:"));
+}
+
+#[test]
+fn informational_block_non_plain_summary_not_cyan() {
+    let r = informational("OutdatedComponent");
+    let out = render_finding_block(&r, "curl", false, false);
+    assert!(out.contains("[INF][OutdatedComponent]"));
+    // The summary line must not be cyan-wrapped for non-plain output (the tree
+    // sub-lines follow the existing always-colored convention).
+    assert!(
+        !out.contains("\x1b[36m"),
+        "non-plain summary must not be cyan-colored: {out:?}"
+    );
+}
+
+#[test]
+fn informational_block_defaults_tag_when_inject_type_empty() {
+    let r = informational("");
+    let out = render_finding_block(&r, "plain", false, false);
+    assert!(out.contains("[INF][Informational]"), "{out}");
+}
+
+#[test]
+fn poc_location_tag_header_cookie_is_case_insensitive() {
+    assert_eq!(poc_location_tag("Header", "Cookie", false), Some("cookie"));
+    assert_eq!(poc_location_tag("Header", "cookie", false), Some("cookie"));
+    assert_eq!(poc_location_tag("Header", "COOKIE", false), Some("cookie"));
+}
+
+#[test]
+fn poc_location_tag_header_non_cookie() {
+    assert_eq!(poc_location_tag("Header", "X-Foo", false), Some("hdr"));
+    assert_eq!(
+        poc_location_tag("Header", "Authorization", false),
+        Some("hdr")
+    );
+}
+
+#[test]
+fn poc_location_tag_body_variants() {
+    assert_eq!(poc_location_tag("Body", "q", false), Some("body"));
+    assert_eq!(poc_location_tag("JsonBody", "q", false), Some("body"));
+    assert_eq!(poc_location_tag("MultipartBody", "q", false), Some("body"));
+}
+
+#[test]
+fn poc_location_tag_path_and_fragment() {
+    assert_eq!(poc_location_tag("Path", "seg", false), Some("path"));
+    assert_eq!(poc_location_tag("Fragment", "f", false), Some("frag"));
+}
+
+#[test]
+fn poc_location_tag_query_and_empty_return_none() {
+    assert_eq!(poc_location_tag("", "q", false), None);
+    assert_eq!(poc_location_tag("Query", "q", false), None);
+}
+
+#[test]
+fn poc_location_tag_unknown_returns_none() {
+    assert_eq!(poc_location_tag("UnknownLocation", "q", false), None);
+}
+
+#[test]
+fn poc_location_in_url_true_for_query_path_fragment() {
+    assert!(poc_location_in_url(""));
+    assert!(poc_location_in_url("Query"));
+    assert!(poc_location_in_url("Path"));
+    assert!(poc_location_in_url("Fragment"));
+}
+
+#[test]
+fn poc_location_in_url_false_for_side_channel_locations() {
+    assert!(!poc_location_in_url("Header"));
+    assert!(!poc_location_in_url("Cookie"));
+    assert!(!poc_location_in_url("Body"));
+    assert!(!poc_location_in_url("JsonBody"));
+    assert!(!poc_location_in_url("MultipartBody"));
+}
+
+#[test]
+fn poc_location_tag_graphql_and_xml() {
+    assert_eq!(
+        poc_location_tag("GraphqlBody", "variables.n", false),
+        Some("graphql")
+    );
+    assert_eq!(poc_location_tag("XmlBody", "msg", false), Some("xml"));
+}
+
+#[test]
+fn poc_location_in_url_false_for_graphql_and_xml() {
+    // Structured bodies are side-channel deliveries — never synthesize a
+    // `?param=payload` query for them.
+    assert!(!poc_location_in_url("GraphqlBody"));
+    assert!(!poc_location_in_url("XmlBody"));
+}
+
+#[test]
+fn request_ct_and_body_splits_headers_from_body() {
+    let req = "POST /graphql HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 9\r\n\r\n{\"a\":\"b\"}";
+    let (ct, body) = request_content_type_and_body(Some(req)).expect("has body");
+    assert_eq!(ct, "application/json");
+    assert_eq!(body, "{\"a\":\"b\"}");
+}
+
+#[test]
+fn request_ct_and_body_none_when_no_body_section() {
+    // A request with no blank-line separator yields no body.
+    assert!(request_content_type_and_body(Some("GET / HTTP/1.1\r\nHost: x")).is_none());
+    assert!(request_content_type_and_body(None).is_none());
+}
+
+#[test]
+fn graphql_curl_poc_reproduces_full_recorded_body() {
+    let req = "POST /graphql HTTP/1.1\r\nHost: h:8899\r\nContent-Type: application/json\r\nContent-Length: 5\r\n\r\n{\"query\":\"mutation($n:String){a(n:$n)}\",\"variables\":{\"n\":\"<svg onload=alert(1)>\"}}";
+    let r = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("POST")
+        .data("http://h:8899/graphql")
+        .param("variables.n")
+        .payload("<svg onload=alert(1)>")
+        .message_str("x")
+        .build();
+    let mut r = r;
+    r.location = "GraphqlBody".to_string();
+    r.request = Some(req.to_string());
+    let out = render_curl_poc(&r, "http://h:8899/graphql");
+    assert!(out.contains("-H 'Content-Type: application/json'"), "{out}");
+    // The full structured body (query + the injected variable) is present,
+    // not a lossy `{"variables.n":"payload"}` fragment.
+    assert!(out.contains("mutation($n:String)"), "{out}");
+    assert!(
+        out.contains("\"variables\":{\"n\":\"<svg onload=alert(1)>\"}"),
+        "{out}"
+    );
+}
+
+#[test]
+fn multipart_curl_poc_uses_form_string_not_urlencoded() {
+    // A multipart finding must reproduce as a multipart request. `--data`
+    // would send `application/x-www-form-urlencoded` — the wrong wire format —
+    // and `-F` would treat the leading `<` as "read from file". `--form-string`
+    // sends the literal value as a real multipart field.
+    let r = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("POST")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .message_str("x")
+        .build();
+    let mut r = r;
+    r.location = "MultipartBody".to_string();
+    let out = render_curl_poc(&r, "http://h:8899/m");
+    assert!(
+        out.contains("--form-string 'q=<svg onload=alert(1)>'"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("--data"),
+        "must not fall back to urlencoded: {out}"
+    );
+    assert!(
+        !out.contains("-F \""),
+        "must not use -F (leading `<` = read-from-file): {out}"
+    );
+}
+
+#[test]
+fn multipart_httpie_poc_forces_multipart() {
+    // httpie's `-f`/`--form` sends urlencoded unless a file field is present;
+    // `--multipart` forces the multipart/form-data request needed to reproduce.
+    let r = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("POST")
+        .param("q")
+        .payload("<svg onload=alert(1)>")
+        .message_str("x")
+        .build();
+    let mut r = r;
+    r.location = "MultipartBody".to_string();
+    let out = render_httpie_poc(&r, "http://h:8899/m");
+    assert!(out.contains("http --multipart 'post'"), "{out}");
+    assert!(
+        !out.contains("http -f "),
+        "must not use urlencoded form mode: {out}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Shell quoting — parameter names are target-derived and unfiltered
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameter names reach the POC renderers straight from the target page:
+/// `discovery::form` takes whatever `name=` attribute the HTML carries and
+/// `mining::probe_response_id` takes `id=` attributes, neither applying a
+/// character filter. These are the shapes that used to escape the old
+/// double-quoted commands.
+const HOSTILE_PARAMS: &[&str] = &[
+    "a\";echo INJECTED;\"b",
+    "c$(id -un)d",
+    "e`id`f",
+    "g'h",
+    "i\nj",
+    "k;l",
+    "m$IFS$9n",
+    "o\\p",
+    // fish reads `\'` as an escape inside single quotes.
+    "x\\'; echo INJECTED #",
+];
+
+fn hostile_result(location: &str, param: &str) -> Result {
+    let mut r = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method("POST")
+        .data("http://h:8899/x")
+        .param(param)
+        .payload("<svg onload=alert(1)>")
+        .message_str("x")
+        .build();
+    r.location = location.to_string();
+    r
+}
+
+#[test]
+fn shell_single_quote_wraps_and_escapes_quotes_and_backslashes() {
+    assert_eq!(shell_single_quote("abc"), "'abc'");
+    // `"`, `$` and backtick are literal inside single quotes — they must
+    // survive untouched or the POC stops reproducing the finding.
+    assert_eq!(shell_single_quote("a\"$`b"), "'a\"$`b'");
+    // `\` is escaped out-of-quote: fish treats `\'` / `\\` as escapes even
+    // inside single quotes.
+    assert_eq!(shell_single_quote("a\\b"), "'a'\\\\'b'");
+    // The one character that needs care: close, escape, reopen.
+    assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    assert_eq!(shell_single_quote(""), "''");
+}
+
+/// Split a rendered POC the way a shell would, by handing it to `sh` as the
+/// argument list of `printf`. This is the property that matters: whatever the
+/// target named its parameter, the command must tokenize into the argv we
+/// intended and must not run anything extra.
+#[cfg(unix)]
+fn shell_argv(command: &str) -> Vec<String> {
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        // NUL-separated: a parameter name containing a newline is still one
+        // shell word, and `%s\n` would report it as two.
+        .arg(format!("printf '%s\\0' {}", command.trim_end()))
+        .output()
+        .expect("spawn /bin/sh");
+    assert!(
+        out.status.success(),
+        "shell rejected the POC command: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut argv: Vec<String> = stdout.split('\0').map(str::to_string).collect();
+    argv.pop(); // trailing separator
+    argv
+}
+
+/// fish is not POSIX: `\'` and `\\` are escapes inside its single quotes. A
+/// quoted word must still come back byte-identical there. Skips when fish is
+/// not installed.
+#[cfg(unix)]
+#[test]
+fn shell_single_quote_round_trips_in_fish() {
+    for param in HOSTILE_PARAMS {
+        let Ok(out) = std::process::Command::new("fish")
+            .arg("-c")
+            .arg(format!("printf '%s' {}", shell_single_quote(param)))
+            .output()
+        else {
+            return;
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            *param,
+            "fish mis-tokenized {param:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn curl_poc_tokenizes_exactly_despite_hostile_param_names() {
+    for param in HOSTILE_PARAMS {
+        for (location, flag) in [
+            ("Body", "--data-urlencode"),
+            ("MultipartBody", "--form-string"),
+            ("Header", "-H"),
+        ] {
+            let r = hostile_result(location, param);
+            let rendered = render_curl_poc(&r, "http://h:8899/x");
+            let argv = shell_argv(&rendered);
+            let sep = if location == "Header" { ": " } else { "=" };
+            // `--data-urlencode` encodes only the content; the name part is
+            // passed through, so the POC pre-encodes it.
+            let name = if location == "Body" {
+                urlencoding::encode(param).into_owned()
+            } else {
+                param.to_string()
+            };
+            assert_eq!(
+                argv,
+                vec![
+                    "curl".to_string(),
+                    "-X".to_string(),
+                    "POST".to_string(),
+                    flag.to_string(),
+                    format!("{}{}{}", name, sep, r.payload),
+                    "http://h:8899/x".to_string(),
+                ],
+                "param {param:?} at {location} rendered as {rendered:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn httpie_poc_tokenizes_exactly_despite_hostile_param_names() {
+    for param in HOSTILE_PARAMS {
+        let r = hostile_result("Body", param);
+        let rendered = render_httpie_poc(&r, "http://h:8899/x");
+        assert_eq!(
+            shell_argv(&rendered),
+            vec![
+                "http".to_string(),
+                "-f".to_string(),
+                "post".to_string(),
+                "http://h:8899/x".to_string(),
+                // httpie's own item grammar needs its separators escaped
+                // inside the field name; the shell still delivers one word.
+                format!("{}={}", httpie_escape_name(param), r.payload),
+            ],
+            "param {param:?} rendered as {rendered:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn curl_poc_does_not_run_an_injected_command() {
+    // The concrete reproduction: `<input name='a";echo INJECTED;"b'>`. Under
+    // the old double-quoted renderer, pasting the POC ran `echo INJECTED`.
+    let r = hostile_result("Body", "a\";echo INJECTED;\"b");
+    let rendered = render_curl_poc(&r, "http://h:8899/x");
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        // Neutralize the program name so nothing leaves the machine; any
+        // *extra* command the quoting failed to contain still executes.
+        .arg(rendered.replacen("curl", ":", 1))
+        .output()
+        .expect("spawn /bin/sh");
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "POC executed injected shell: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_body_poc_is_valid_json_for_hostile_param_and_payload() {
+    let mut r = hostile_result("JsonBody", "a\"b\\c");
+    r.payload = "\"</script><svg onload=alert(1)>".to_string();
+    let rendered = render_curl_poc(&r, "http://h:8899/x");
+    // Let the shell unquote the body, then parse it.
+    let argv = shell_argv(&rendered);
+    let body = argv
+        .iter()
+        .position(|a| a == "--data")
+        .and_then(|i| argv.get(i + 1))
+        .expect("json body present");
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("body must be valid JSON");
+    assert_eq!(parsed[&r.param], serde_json::Value::String(r.payload));
+}
+
+#[test]
+fn synthesized_query_percent_encodes_the_param_name() {
+    // A mined name carrying `&` or `#` used to splice extra query structure
+    // (or a fragment) into the POC URL.
+    let mut r = hostile_result("Query", "a&b=c#d");
+    r.location = String::new();
+    r.data = "http://h:8899/x".to_string();
+    let poc = generate_poc(&r, "plain");
+    assert!(poc.contains("?a%26b%3Dc%23d="), "{poc}");
+    assert!(!poc.contains("?a&b=c#d"), "{poc}");
+}
+
+#[test]
+fn httpie_escape_name_escapes_request_item_separators() {
+    // httpie splits each item on the first unescaped separator, so a mined
+    // name carrying one has to be escaped or httpie rejects the whole item
+    // ("Invalid item") and the POC reproduces nothing.
+    assert_eq!(httpie_escape_name("x=y:z@w;v"), "x\\=y\\:z\\@w\\;v");
+    assert_eq!(httpie_escape_name("a\\b"), "a\\\\b");
+    // Ordinary names are untouched.
+    assert_eq!(httpie_escape_name("q"), "q");
+    assert_eq!(httpie_escape_name("user_id"), "user_id");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Terminal control bytes — findings quote target-controlled bytes
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Every ANSI-colored marker the renderer itself emits, so a test can ask
+/// "is there any escape byte here that we didn't put there?".
+fn strip_own_colors(block: &str) -> String {
+    block
+        .replace("\x1b[90m", "")
+        .replace("\x1b[38;5;247m", "")
+        .replace("\x1b[36m", "")
+        .replace("\x1b[31m", "")
+        .replace("\x1b[33m", "")
+        .replace("\x1b[35m", "")
+        .replace("\x1b[0m", "")
+}
+
+#[test]
+fn finding_block_escapes_control_bytes_from_the_response() {
+    // OSC 8 (hyperlink), OSC 0 (window title) and OSC 52 (clipboard write)
+    // all survived `strip_ansi`, and on a colour terminal nothing stripped
+    // them at all.
+    let mut r = hostile_result("Query", "q");
+    r.location = String::new();
+    r.data = "http://h:8899/x".to_string();
+    r.payload = "<svg onload=alert(1)>".to_string();
+    r.response = Some(
+        "<html>\x1b]0;PWNED\x07\x1b]8;;http://evil/\x07<svg onload=alert(1)>\x1b]52;c;cm0=\x07</html>"
+            .to_string(),
+    );
+    let block = render_finding_block(&r, "plain", false, true);
+    let residue = strip_own_colors(&block);
+    assert!(
+        !residue.contains('\x1b') && !residue.contains('\x07'),
+        "raw control bytes reached the rendered block: {residue:?}"
+    );
+    assert!(residue.contains("\\x1b]0;PWNED\\x07"), "{residue:?}");
+    // Printable payload characters must survive verbatim.
+    assert!(residue.contains("<svg onload=alert(1)>"), "{residue:?}");
+}
+
+#[test]
+fn finding_block_escapes_control_bytes_from_the_param_name() {
+    let r = hostile_result("Header", "X\x1b]0;PWNED\x07H");
+    let block = render_finding_block(&r, "curl", false, false);
+    let residue = strip_own_colors(&block);
+    assert!(
+        !residue.contains('\x1b') && !residue.contains('\x07'),
+        "raw control bytes reached the rendered block: {residue:?}"
+    );
+}
+
+#[test]
+fn informational_block_escapes_control_bytes() {
+    let mut r = informational("OutdatedComponent");
+    r.data = "https://h/\x1b]8;;http://evil/\x07".to_string();
+    r.message_str = "lib\x1b]0;PWNED\x07".to_string();
+    r.evidence = "CVE-\x1b[2J0000".to_string();
+    let block = render_finding_block(&r, "plain", false, false);
+    let residue = strip_own_colors(&block);
+    assert!(
+        !residue.contains('\x1b') && !residue.contains('\x07'),
+        "raw control bytes reached the informational block: {residue:?}"
+    );
+}
+
+#[test]
+fn http_request_poc_keeps_crlf_while_escaping_controls() {
+    // The `http-request` POC is a raw HTTP artifact — it has to stay
+    // pasteable into `nc` / Repeater, so CRLF line structure survives.
+    let mut r = hostile_result("Query", "q");
+    r.request = Some("GET /x HTTP/1.1\r\nHost: h\r\nX-E: \x1b]0;P\x07\r\n\r\n".to_string());
+    let block = render_finding_block(&r, "http-request", false, false);
+    assert!(
+        block.contains("GET /x HTTP/1.1\r\nHost: h\r\n"),
+        "{block:?}"
+    );
+    assert!(block.contains("X-E: \\x1b]0;P\\x07"), "{block:?}");
+}
+
+#[test]
+fn finding_block_keeps_waf_bypass_whitespace_in_the_poc() {
+    // `payload::xss_html` ships `<img\x0csrc=x\x0conerror=…>` and
+    // `<svg\x0bonload=…>` as WAF bypasses. Escaping those bytes on the way to
+    // the terminal would print — and paste — a POC that no longer reproduces.
+    let mut r = hostile_result("Body", "q");
+    r.payload = "<img\u{c}src=x\u{c}onerror=alert(1)>".to_string();
+    let block = render_finding_block(&r, "curl", false, false);
+    assert!(
+        block.contains("--data-urlencode 'q=<img\u{c}src=x\u{c}onerror=alert(1)>'"),
+        "{block:?}"
+    );
+    // The `Payload:` tree line keeps them too.
+    assert!(
+        block.contains("Payload:\u{1b}[0m \u{1b}[38;5;247m<img\u{c}src=x\u{c}onerror=alert(1)>"),
+        "{block:?}"
+    );
+}
+
+// ---- POCs must reproduce the request the scan actually sent ---------------
+
+/// A finding shaped exactly as the scan records it: `data` is the as-sent URL
+/// and `location` the param's wire location.
+fn wire_finding(location: &str, data: &str, param: &str, payload: &str) -> Result {
+    let mut r = Result::builder(FindingType::Verified)
+        .inject_type("inHTML")
+        .method(if matches!(location, "Query" | "Path" | "Header") {
+            "GET"
+        } else {
+            "POST"
+        })
+        .data(data)
+        .param(param)
+        .payload(payload)
+        .build();
+    r.location = location.to_string();
+    r
+}
+
+#[test]
+fn path_poc_is_the_as_sent_url_without_a_duplicated_segment() {
+    use crate::parameter_analysis::{Location, Param};
+    // `build_injected_url` percent-encodes `<`, `>`, `"` and spaces in the
+    // segment, so the raw payload never appears in `data`. The old rewrite
+    // took that as "payload not visible" and appended it as an extra segment.
+    let base = url::Url::parse("https://ex.com/a/b/c").unwrap();
+    let param = Param::new(
+        "path_segment_1".to_string(),
+        "b".to_string(),
+        Location::Path,
+    );
+    for payload in ["<svg onload=alert(1)>", "\"><img src=x onerror=alert(1)>"] {
+        let sent = crate::scanning::url_inject::build_injected_url(&base, &param, payload);
+        let r = wire_finding("Path", &sent, "path_segment_1", payload);
+        for poc_type in ["plain", "curl", "httpie"] {
+            let out = generate_poc(&r, poc_type);
+            assert!(out.contains(&sent), "{poc_type}: {out}");
+            assert!(
+                !out.contains(&format!("{sent}/")),
+                "{poc_type} POC appended a second payload segment: {out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn side_channel_pocs_send_the_pre_encoded_wire_value() {
+    // A header / cookie / body param behind a size-limited WAF window is sent
+    // with the `wafpad` prefix; the raw payload alone is what the WAF blocks.
+    let pad = crate::encoding::pre_encoding::waf_window_pad();
+    let payload = "<svg onload=alert(1)>";
+    let wire = format!("{pad}{payload}");
+    for (location, param, needle) in [
+        ("Header", "X-Q", format!("X-Q: {wire}")),
+        ("Header", "sid", format!("sid={wire}")),
+        ("Body", "q", format!("q={wire}")),
+        ("MultipartBody", "q", format!("q={wire}")),
+        ("JsonBody", "q", format!("{{\"q\":\"{wire}\"}}")),
+    ] {
+        let mut r = wire_finding(location, "https://ex.com/p", param, payload);
+        r.wire_payload = Some(wire.clone());
+        r.cookie_param = param == "sid";
+        let curl = generate_poc(&r, "curl");
+        assert!(curl.contains(&needle), "curl {location}: {curl}");
+        let httpie = generate_poc(&r, "httpie");
+        assert!(httpie.contains(&wire), "httpie {location}: {httpie}");
+    }
+}
+
+#[test]
+fn curl_body_poc_urlencodes_the_field_value() {
+    // `--data` is sent verbatim: `&` split the field, `+` became a space and
+    // `%XX` was decoded by the server. The scan sends the value through a form
+    // serializer, so the POC has to encode it too.
+    let r = wire_finding("Body", "https://ex.com/p", "a b", "&#x3c;x+y%41");
+    let out = generate_poc(&r, "curl");
+    assert!(
+        out.contains("--data-urlencode 'a%20b=&#x3c;x+y%41'"),
+        "got: {out}"
+    );
+    assert!(!out.contains("--data '"), "got: {out}");
+}
+
+#[test]
+fn body_pocs_replay_the_recorded_body_with_sibling_fields() {
+    // Rebuilding a body POC from (param, payload) dropped every other field —
+    // a CSRF token or a required `action` — so the pasted POC was rejected.
+    for (location, ct, body) in [
+        (
+            "Body",
+            "application/x-www-form-urlencoded",
+            "q=%3Csvg%3E&tok=x%26y",
+        ),
+        ("JsonBody", "application/json", r#"{"n":1,"q":"<svg>"}"#),
+    ] {
+        let mut r = wire_finding(location, "http://h/p", "q", "<svg>");
+        r.request = Some(format!(
+            "POST /p HTTP/1.1\r\nHost: h\r\nContent-Type: {ct}\r\n\r\n{body}"
+        ));
+        let curl = generate_poc(&r, "curl");
+        assert!(
+            curl.contains(&format!("--data '{body}'")),
+            "curl {location}: {curl}"
+        );
+        assert!(curl.contains(&format!("Content-Type: {ct}")), "{curl}");
+        let httpie = generate_poc(&r, "httpie");
+        assert!(
+            httpie.starts_with(&format!("printf '%s' '{body}' | http ")),
+            "httpie {location}: {httpie}"
+        );
+    }
+}

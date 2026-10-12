@@ -1,0 +1,474 @@
+use super::*;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+fn make_headers(pairs: &[(&str, &str)]) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (k, v) in pairs {
+        map.insert(
+            HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    map
+}
+
+#[test]
+fn test_detect_angular_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<html><div ng-app ng-controller='MainCtrl'>{{name}}</div></html>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Angular));
+}
+
+#[test]
+fn test_detect_react_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<div id='root' data-reactroot></div>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::React));
+}
+
+#[test]
+fn test_detect_vue_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<div data-v-abc123 class='container'></div>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Vue));
+}
+
+#[test]
+fn test_detect_modern_frameworks_from_body() {
+    let headers = make_headers(&[]);
+    for (body, tech, name) in [
+        ("<div x-data></div>", TechType::Alpine, "Alpine.js"),
+        ("<script src=preact.min.js>", TechType::Preact, "Preact"),
+        ("<lit-element>", TechType::Lit, "Lit"),
+        ("<script>_$HY</script>", TechType::Solid, "SolidJS"),
+    ] {
+        let result = detect_technologies(&headers, Some(body));
+        assert!(result.has(&tech));
+        assert_eq!(tech.to_string(), name);
+    }
+}
+
+#[test]
+fn test_detect_jquery_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<script src='https://code.jquery.com/jquery.min.js'></script>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::JQuery));
+}
+
+#[test]
+fn test_detect_wordpress_from_header() {
+    let headers = make_headers(&[("x-generator", "WordPress 6.0")]);
+    let result = detect_technologies(&headers, None);
+    assert!(result.has(&TechType::WordPress));
+}
+
+#[test]
+fn test_detect_express_from_header() {
+    let headers = make_headers(&[("x-powered-by", "Express")]);
+    let result = detect_technologies(&headers, None);
+    assert!(result.has(&TechType::Express));
+}
+
+#[test]
+fn test_detect_php_from_header() {
+    let headers = make_headers(&[("x-powered-by", "PHP/8.1")]);
+    let result = detect_technologies(&headers, None);
+    assert!(result.has(&TechType::PHP));
+}
+
+#[test]
+fn test_no_tech_detected() {
+    let headers = make_headers(&[("server", "nginx")]);
+    let result = detect_technologies(&headers, Some("<html><body>ok</body></html>"));
+    assert!(result.is_empty());
+}
+
+// --- CSTI interpolation-bracket fallback heuristic ---
+
+#[test]
+fn test_interpolation_brackets_promote_to_angular_when_no_framework_marker() {
+    // SPA bundle that lost its `ng-app` / `angular.js` banner via
+    // minification still leaks `{{ name }}` interpolation literals
+    // into the rendered HTML. Treat that as evidence of an unidentified
+    // client-side template engine so AngularJS template-escape payloads
+    // get a shot at the parameter.
+    let headers = make_headers(&[]);
+    let body = "<html><body><h1>Hello {{ user.name }}!</h1></body></html>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Angular));
+    let evidence = result
+        .detected
+        .iter()
+        .find(|d| d.tech == TechType::Angular)
+        .map(|d| d.evidence.clone())
+        .unwrap();
+    assert!(
+        evidence.contains("interpolation"),
+        "fallback evidence should mention interpolation; got {:?}",
+        evidence
+    );
+}
+
+#[test]
+fn test_interpolation_brackets_skipped_when_angular_already_detected() {
+    // Don't double-add Angular when the strong marker is already present.
+    let headers = make_headers(&[]);
+    let body = "<html ng-app><h1>Hello {{ name }}!</h1></html>";
+    let result = detect_technologies(&headers, Some(body));
+    let angular_hits = result
+        .detected
+        .iter()
+        .filter(|d| d.tech == TechType::Angular)
+        .count();
+    assert_eq!(angular_hits, 1);
+}
+
+#[test]
+fn test_interpolation_brackets_dont_promote_for_empty_braces() {
+    // Empty / whitespace-only braces don't carry an identifier and
+    // shouldn't promote the page to Angular. A bare `{{ TODO }}` token
+    // intentionally still triggers the heuristic — that's the shape a
+    // real interpolation takes, and burning a few template payloads on
+    // a doc page is cheap insurance against missing the live framework.
+    let headers = make_headers(&[]);
+    let body = "<p>Placeholder: {{ }} or {{   }}</p>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(!result.has(&TechType::Angular));
+}
+
+#[test]
+fn test_interpolation_brackets_promote_even_when_identifier_is_a_word() {
+    // `{{ TODO }}` looks like a placeholder in prose but is shaped
+    // exactly like a real identifier — the framework (if any) would
+    // attempt to evaluate it. Better to send the AngularJS payload set
+    // and let scan-time reflection check validate than to miss a CSTI
+    // sink on a minified SPA.
+    let headers = make_headers(&[]);
+    let body = "<p>{{ TODO }}</p>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Angular));
+}
+
+#[test]
+fn test_interpolation_brackets_match_identifier_with_dots_and_indices() {
+    let headers = make_headers(&[]);
+    let body = "<p>{{users[0].name}} {{cfg.theme}}</p>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Angular));
+}
+
+#[test]
+fn test_interpolation_brackets_skipped_when_vue_detected() {
+    // Vue already drives template-escape payloads via the existing
+    // tech-specific path; the fallback must not duplicate the entry.
+    let headers = make_headers(&[]);
+    let body = "<div data-v-abc><span>{{message}}</span></div>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Vue));
+    assert!(
+        !result.has(&TechType::Angular),
+        "fallback must yield to a more specific framework match (Vue here)"
+    );
+}
+
+#[test]
+fn test_has_interpolation_brackets_matches_identifier_shaped_expressions() {
+    for body in [
+        "{{ user.name }}",
+        "{{count}}",
+        "{{ items[0] }}",
+        "{{ $scope.value }}",
+        "{{ TODO }}",
+        "<p>prefix {{x}} suffix</p>",
+    ] {
+        assert!(has_interpolation_brackets(body), "should match {:?}", body);
+    }
+}
+
+#[test]
+fn test_has_interpolation_brackets_rejects_non_identifier_contents() {
+    for body in [
+        "{{ }}",
+        "{{}}",
+        "{{ 1 + 2 }}",
+        "{{ user name }}",
+        "{ single brace }",
+        "{{ user.name",
+        "plain text with no braces",
+    ] {
+        assert!(
+            !has_interpolation_brackets(body),
+            "should not match {:?}",
+            body
+        );
+    }
+}
+
+#[test]
+fn test_multiple_techs_detected() {
+    let headers = make_headers(&[]);
+    let body = "<div ng-app></div><script src='jquery.min.js'></script>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Angular));
+    assert!(result.has(&TechType::JQuery));
+}
+
+#[test]
+fn test_angular_payloads_generated() {
+    let mut result = TechDetectionResult::default();
+    result.detected.push(TechDetection {
+        tech: TechType::Angular,
+        evidence: "test".to_string(),
+    });
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(!payloads.is_empty());
+    assert!(payloads.iter().any(|p| p.contains("constructor")));
+}
+
+#[test]
+fn test_react_payloads_cover_javascript_url_and_innerhtml_sinks() {
+    // React tech used to map to an empty payload set. Real React XSS
+    // vectors are concentrated in `<a href={input}>` (still accepts
+    // `javascript:` schemes — only warned, never blocked) and
+    // `dangerouslySetInnerHTML={{__html: input}}` (maps to innerHTML
+    // so `<svg onload>` / `<img onerror>` execute). The payload set
+    // must cover both.
+    let mut result = TechDetectionResult::default();
+    result.detected.push(TechDetection {
+        tech: TechType::React,
+        evidence: "test".to_string(),
+    });
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(
+        payloads.iter().any(|p| p.starts_with("javascript:")),
+        "expected a javascript: URL payload for href injection, got {:?}",
+        payloads
+    );
+    assert!(
+        payloads
+            .iter()
+            .any(|p| p.contains("svg") && p.contains("onload")),
+        "expected an SVG onload payload for innerHTML sinks, got {:?}",
+        payloads
+    );
+}
+
+#[test]
+fn test_jquery_payloads_generated() {
+    let mut result = TechDetectionResult::default();
+    result.detected.push(TechDetection {
+        tech: TechType::JQuery,
+        evidence: "test".to_string(),
+    });
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(payloads.iter().any(|p| p.contains("globalEval")));
+}
+
+#[test]
+fn test_display_tech_types() {
+    assert_eq!(format!("{}", TechType::Angular), "Angular");
+    assert_eq!(format!("{}", TechType::JQuery), "jQuery");
+    assert_eq!(format!("{}", TechType::WordPress), "WordPress");
+}
+
+// --- Additional header-based detection ---
+
+#[test]
+fn test_detect_aspnet_from_header() {
+    let headers = make_headers(&[("x-powered-by", "ASP.NET")]);
+    let result = detect_technologies(&headers, None);
+    assert!(result.has(&TechType::ASPNet));
+}
+
+#[test]
+fn test_detect_nextjs_from_header() {
+    let headers = make_headers(&[("x-powered-by", "Next.js")]);
+    let result = detect_technologies(&headers, None);
+    assert!(result.has(&TechType::NextJs));
+}
+
+#[test]
+fn test_detect_wordpress_from_link_header() {
+    let headers = make_headers(&[(
+        "link",
+        "<https://site/wp-json/>; rel=\"https://api.w.org/\"",
+    )]);
+    let result = detect_technologies(&headers, None);
+    assert!(result.has(&TechType::WordPress));
+}
+
+// --- Additional body-based detection ---
+
+#[test]
+fn test_detect_handlebars_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<script src='/js/handlebars.min.js'></script>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Handlebars));
+}
+
+#[test]
+fn test_detect_svelte_from_body() {
+    let headers = make_headers(&[]);
+    // Real Svelte/SvelteKit output carries an anchored marker (here the
+    // `__svelte`/`data-svelte` runtime markers), not just the bare word.
+    let body = "<div data-svelte-h='svelte-1a2b3c'></div><script>__sveltekit_1={}</script>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Svelte));
+}
+
+#[test]
+fn test_svelte_not_detected_from_prose() {
+    // A bare "svelte" substring in prose / unrelated paths must not be flagged
+    // as the Svelte framework (the old `pattern: "svelte"` rule false-fired here).
+    let headers = make_headers(&[]);
+    let body = "<p>We made a svelte, sveltekit-free design decision.</p>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(!result.has(&TechType::Svelte));
+}
+
+#[test]
+fn test_detect_ember_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<script src='/assets/ember.min.js'></script>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Ember));
+}
+
+#[test]
+fn test_detect_backbone_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<script src='/js/backbone.min.js'></script>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Backbone));
+}
+
+#[test]
+fn test_detect_knockout_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<div data-bind=\"text: name\"></div>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Knockout));
+}
+
+#[test]
+fn test_detect_nuxt_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<script>window.__NUXT__={}</script>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::Nuxt));
+}
+
+#[test]
+fn test_detect_nextjs_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<script src='/_next/static/chunks/main.js'></script>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::NextJs));
+}
+
+#[test]
+fn test_detect_wordpress_from_body() {
+    let headers = make_headers(&[]);
+    let body = "<link href='/wp-content/themes/x/style.css'>";
+    let result = detect_technologies(&headers, Some(body));
+    assert!(result.has(&TechType::WordPress));
+}
+
+// --- Additional tech-specific payload generation ---
+
+#[test]
+fn test_vue_payloads_generated() {
+    let mut result = TechDetectionResult::default();
+    result.detected.push(TechDetection {
+        tech: TechType::Vue,
+        evidence: "test".to_string(),
+    });
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(payloads.iter().any(|p| p.contains("constructor")));
+    assert!(payloads.iter().any(|p| p.contains("v-html")));
+}
+
+#[test]
+fn test_handlebars_payloads_generated() {
+    let mut result = TechDetectionResult::default();
+    result.detected.push(TechDetection {
+        tech: TechType::Handlebars,
+        evidence: "test".to_string(),
+    });
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(payloads.iter().any(|p| p.contains("#with")));
+}
+
+#[test]
+fn test_knockout_payloads_generated() {
+    let mut result = TechDetectionResult::default();
+    result.detected.push(TechDetection {
+        tech: TechType::Knockout,
+        evidence: "test".to_string(),
+    });
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(payloads.iter().any(|p| p.contains("data-bind")));
+}
+
+#[test]
+fn test_ember_payloads_generated() {
+    let mut result = TechDetectionResult::default();
+    result.detected.push(TechDetection {
+        tech: TechType::Ember,
+        evidence: "test".to_string(),
+    });
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(payloads.iter().any(|p| p.contains("constructor")));
+}
+
+#[test]
+fn test_wordpress_payloads_generated() {
+    let mut result = TechDetectionResult::default();
+    result.detected.push(TechDetection {
+        tech: TechType::WordPress,
+        evidence: "test".to_string(),
+    });
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(payloads.iter().any(|p| p.contains("onerror=alert(1)")));
+}
+
+#[test]
+fn test_server_side_techs_generate_no_payloads() {
+    let mut result = TechDetectionResult::default();
+    for tech in [
+        TechType::PHP,
+        TechType::Express,
+        TechType::ASPNet,
+        TechType::Nuxt,
+        TechType::Svelte,
+        TechType::Backbone,
+    ] {
+        result.detected.push(TechDetection {
+            tech,
+            evidence: "t".to_string(),
+        });
+    }
+    let payloads = get_tech_specific_payloads(&result);
+    assert!(payloads.is_empty());
+}
+
+#[test]
+fn test_display_all_tech_types() {
+    assert_eq!(format!("{}", TechType::React), "React");
+    assert_eq!(format!("{}", TechType::Vue), "Vue.js");
+    assert_eq!(format!("{}", TechType::Handlebars), "Handlebars");
+    assert_eq!(format!("{}", TechType::Svelte), "Svelte");
+    assert_eq!(format!("{}", TechType::Ember), "Ember");
+    assert_eq!(format!("{}", TechType::Backbone), "Backbone");
+    assert_eq!(format!("{}", TechType::Knockout), "Knockout");
+    assert_eq!(format!("{}", TechType::ASPNet), "ASP.NET");
+    assert_eq!(format!("{}", TechType::PHP), "PHP");
+    assert_eq!(format!("{}", TechType::Express), "Express");
+    assert_eq!(format!("{}", TechType::NextJs), "Next.js");
+    assert_eq!(format!("{}", TechType::Nuxt), "Nuxt");
+}

@@ -1,0 +1,895 @@
+//! Shared helpers for constructing injected URLs for reflection / DOM XSS testing.
+//!
+//! This consolidates logic that previously appeared in multiple modules (reflection checks,
+//! scanning orchestration, etc.). Centralizing the transformation avoids subtle divergence
+//! (e.g., inconsistent path segment encoding or query param insertion).
+//!
+//! Notes:
+//! - Query parameter injection: replaces existing parameter value or appends when absent.
+//! - Path segment injection: parameter name pattern "path_segment_{idx}" where idx is the
+//!   zero-based index of the segment in the URL path. Only simple visible encoding is
+//!   applied (space, '#', '?', '%') to keep the payload recognizable in PoCs without
+//!   breaking path semantics. Additional encoding strategies (full percent-encoding,
+//!   unicode escaping) can be layered in higher-level modules if needed.
+
+use crate::parameter_analysis::{Location, Param};
+use crate::target_parser::Target;
+use reqwest::Client;
+use std::borrow::Cow;
+
+/// Encode a decoded query component: RFC 3986 unreserved bytes pass through,
+/// everything else becomes uppercase `%XX`. Existing URL components come from
+/// `Url::query_pairs()`, which has already decoded `%25`; their literal percent
+/// signs must be escaped again rather than treated as preserved wire encoding.
+fn encode_decoded_query_component_into(raw: &str, out: &mut String) {
+    urlencoding::Encoded(raw).append_to(out);
+}
+
+/// Encode an injected query component while preserving valid `%XX` sequences.
+/// Payload encoders can intentionally hand this function pre-escaped bytes.
+fn encode_query_component_preserving_pct_into(raw: &str, out: &mut String) {
+    let bytes = raw.as_bytes();
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%'
+            && idx + 2 < bytes.len()
+            && bytes[idx + 1].is_ascii_hexdigit()
+            && bytes[idx + 2].is_ascii_hexdigit()
+        {
+            out.push_str(&raw[idx..idx + 3]);
+            idx += 3;
+            continue;
+        }
+
+        let len = raw[idx..]
+            .chars()
+            .next()
+            .expect("valid utf-8 char")
+            .len_utf8();
+        encode_decoded_query_component_into(&raw[idx..idx + len], out);
+        idx += len;
+    }
+}
+
+/// Replace the zero-based `idx`th non-empty path segment without changing any
+/// empty segments, leading slash, or trailing slash in `path`.
+pub(crate) fn replace_nonempty_path_segment(
+    path: &str,
+    idx: usize,
+    replacement: &str,
+) -> Option<String> {
+    let mut segment_idx = 0;
+    let mut result = String::with_capacity(path.len() + replacement.len());
+    for (part_idx, part) in path.split('/').enumerate() {
+        if part_idx > 0 {
+            result.push('/');
+        }
+        if part.is_empty() {
+            continue;
+        }
+        if segment_idx == idx {
+            result.push_str(replacement);
+        } else {
+            result.push_str(part);
+        }
+        segment_idx += 1;
+    }
+    (idx < segment_idx).then_some(result)
+}
+
+/// Selectively encode a path segment for readability while preserving most characters
+/// for exploit clarity. This mirrors prior inline logic (space, '#', '?', '%').
+/// If more rigorous encoding is desired, enhance or replace this function centrally.
+fn selective_path_segment_encode(raw: &str) -> Cow<'_, str> {
+    // Fast path: if no special chars, return borrowed (no allocation)
+    if !raw
+        .bytes()
+        .any(|b| matches!(b, b' ' | b'#' | b'?' | b'%' | b'\n' | b'\t' | b'\r'))
+    {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len() + 16);
+    for ch in raw.chars() {
+        match ch {
+            ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            '%' => out.push_str("%25"),
+            '\n' => out.push_str("%0A"),
+            '\t' => out.push_str("%09"),
+            '\r' => out.push_str("%0D"),
+            _ => out.push(ch),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Resolve the URL where a Query-location param should be probed.
+///
+/// When `param` was discovered through a `<form action=...>`, its
+/// `form_action_url` points at the form's action endpoint — that's the URL
+/// hosting the sink, not the page where the `<form>` tag was found. Without
+/// this redirection, GET-form scans probe the form-host page (no sink) and
+/// produce a false negative even though discovery flagged the field as
+/// reflecting at the action URL.
+///
+/// For non-Query locations and for params without a `form_action_url`, the
+/// caller's `target_url` is returned unchanged. An action the scan may not send
+/// credentials to is likewise ignored -- see [`resolve_form_action_url`] for why
+/// every site that turns a stored action back into a request URL repeats that
+/// check.
+pub(crate) fn effective_query_base(target_url: &url::Url, param: &Param) -> url::Url {
+    let uses_form_action = matches!(
+        param.location,
+        Location::Query | Location::Body | Location::JsonBody | Location::MultipartBody
+    );
+    if uses_form_action
+        && let Some(ref action) = param.form_action_url
+        && let Ok(parsed) = url::Url::parse(action)
+        && crate::utils::http::same_origin_or_tls_upgrade(target_url, &parsed)
+    {
+        return parsed;
+    }
+    target_url.clone()
+}
+
+/// Method used when mining/injecting against the target's own request body
+/// (`-d` / imported body) without a form-discovery context.
+///
+/// Body-less verbs (GET/HEAD/OPTIONS/TRACE) force POST. Body-capable verbs
+/// (POST/PUT/PATCH/DELETE/QUERY/…) are preserved so scans like
+/// `-X QUERY -d '…'` actually send QUERY (RFC 10008).
+pub(crate) fn body_location_method(target_method: &str) -> reqwest::Method {
+    match target_method.trim().to_ascii_uppercase().as_str() {
+        "" | "GET" | "HEAD" | "OPTIONS" | "TRACE" => reqwest::Method::POST,
+        other => other.parse().unwrap_or(reqwest::Method::POST),
+    }
+}
+
+/// Method used for Body / JsonBody / MultipartBody injection for a concrete
+/// param. HTML form-discovered sinks (`form_action_url` set) always submit as
+/// POST — forms never use QUERY/PUT/etc. Own-body params fall through to
+/// [`body_location_method`].
+pub(crate) fn body_location_method_for_param(
+    target_method: &str,
+    param: &Param,
+) -> reqwest::Method {
+    if param.form_action_url.is_some() {
+        return reqwest::Method::POST;
+    }
+    body_location_method(target_method)
+}
+
+/// HTTP method that will actually be used to send a payload-bearing
+/// request for `param`. Body-bearing locations use
+/// [`body_location_method_for_param`]; other locations keep the target's own
+/// method. Finding metadata must match the verb that is actually sent.
+pub(crate) fn effective_method(target_method: &str, param: &Param) -> String {
+    match param.location {
+        Location::Body
+        | Location::JsonBody
+        | Location::MultipartBody
+        | Location::GraphqlBody
+        | Location::XmlBody => body_location_method_for_param(target_method, param)
+            .as_str()
+            .to_string(),
+        _ => target_method.to_string(),
+    }
+}
+
+/// Build a URL string with the given parameter injected/replaced by `injected`.
+/// For Location::Query it rewrites or appends the query pair.
+/// For Location::Path it replaces the indexed segment derived from param name pattern
+/// "path_segment_{idx}". Other locations return the original URL unchanged.
+///
+/// Returns the new URL as a String. (We return String instead of Url to avoid
+/// repeated parse/serialize overhead in hot loops; caller already holds original Url.)
+pub(crate) fn build_injected_url(base: &url::Url, param: &Param, injected: &str) -> String {
+    match param.location {
+        Location::Query => {
+            // Build the URL string directly without cloning Url or allocating Vec
+            let base_str = base.as_str();
+            // Prefix = scheme + authority + path, i.e. everything before the
+            // query ('?') or fragment ('#'), whichever comes first. A real
+            // query separator always precedes the fragment, so this lands on
+            // the query when there is one and on the fragment otherwise. A bare
+            // `find('?')` instead splits on the first '?' *anywhere*, which for
+            // a fragmented URL with no query (`…#section`, or a hash-router
+            // `…#/route?tab=1`) is either absent or sits inside the fragment —
+            // both leave the fragment in the prefix, so the injected pair is
+            // appended into the re-emitted fragment and the server, which never
+            // receives the fragment, sees no query at all.
+            let prefix = match base_str.find(['?', '#']) {
+                Some(cut) => &base_str[..cut],
+                None => base_str,
+            };
+            // Preserve fragment
+            let fragment = base.fragment();
+
+            let mut result = String::with_capacity(base_str.len() + injected.len() + 16);
+            result.push_str(prefix);
+            result.push('?');
+
+            // Special handling for parameter key injection: payload becomes the key
+            if param.name == "__dalfox_key_inject__" {
+                let mut first = true;
+                for (k, v) in base.query_pairs() {
+                    if !first {
+                        result.push('&');
+                    }
+                    first = false;
+                    encode_decoded_query_component_into(&k, &mut result);
+                    result.push('=');
+                    encode_decoded_query_component_into(&v, &mut result);
+                }
+                if !first {
+                    result.push('&');
+                }
+                encode_query_component_preserving_pct_into(injected, &mut result);
+                result.push_str("=1");
+            } else {
+                let mut found = false;
+                let mut first = true;
+                for (k, v) in base.query_pairs() {
+                    if !first {
+                        result.push('&');
+                    }
+                    first = false;
+                    encode_decoded_query_component_into(&k, &mut result);
+                    result.push('=');
+                    if k == param.effective_wire_name() {
+                        encode_query_component_preserving_pct_into(injected, &mut result);
+                        found = true;
+                    } else {
+                        encode_decoded_query_component_into(&v, &mut result);
+                    }
+                }
+                if !found {
+                    if !first {
+                        result.push('&');
+                    }
+                    encode_decoded_query_component_into(param.effective_wire_name(), &mut result);
+                    result.push('=');
+                    encode_query_component_preserving_pct_into(injected, &mut result);
+                }
+            }
+            if let Some(frag) = fragment {
+                result.push('#');
+                result.push_str(frag);
+            }
+            result
+        }
+        Location::Path => {
+            let mut url = base.clone();
+            if let Some(idx_str) = param.name.strip_prefix("path_segment_")
+                && let Ok(idx) = idx_str.parse::<usize>()
+            {
+                let original_path = url.path().to_string();
+                if original_path != "/" {
+                    let encoded = selective_path_segment_encode(injected);
+                    if let Some(new_path) =
+                        replace_nonempty_path_segment(&original_path, idx, &encoded)
+                    {
+                        url.set_path(&new_path);
+                    }
+                }
+            }
+            url.to_string()
+        }
+        Location::Body
+        | Location::JsonBody
+        | Location::MultipartBody
+        | Location::GraphqlBody
+        | Location::XmlBody => {
+            // For body params, the URL itself does not change.
+            // Return the base URL as-is; actual payload injection happens in the
+            // request body (handled by the caller when building the request).
+            base.to_string()
+        }
+        Location::Header => {
+            // Header injection does not alter the URL.
+            base.to_string()
+        }
+        Location::Fragment => {
+            // Fragment injection: replace the target param value inside the URL fragment.
+            // Supports SPA-style routing fragments like `#/redir?url=value` and simple
+            // `#key=value` fragments.
+            let base_str = base.as_str();
+            let frag = base.fragment().unwrap_or("");
+
+            // Split fragment into route prefix and query part
+            let (route_prefix, query_part) = if let Some(q_pos) = frag.find('?') {
+                (&frag[..q_pos], &frag[q_pos + 1..])
+            } else {
+                // No '?' — treat the whole fragment as key=value pairs
+                ("", frag)
+            };
+
+            // Parse key=value pairs from the query part
+            let pairs: Vec<(&str, &str)> = query_part
+                .split('&')
+                .filter(|s| !s.is_empty())
+                .map(|pair| {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        (k, v)
+                    } else {
+                        (pair, "")
+                    }
+                })
+                .collect();
+
+            // Rebuild the fragment with injected value
+            let mut new_frag = String::with_capacity(frag.len() + injected.len() + 16);
+            new_frag.push_str(route_prefix);
+            if !route_prefix.is_empty() {
+                new_frag.push('?');
+            }
+
+            let mut found = false;
+            let mut first = true;
+            for (k, v) in &pairs {
+                if !first {
+                    new_frag.push('&');
+                }
+                first = false;
+                new_frag.push_str(k);
+                new_frag.push('=');
+                if *k == param.name && !found {
+                    new_frag.push_str(injected);
+                    found = true;
+                } else {
+                    new_frag.push_str(v);
+                }
+            }
+            if !found {
+                if !first {
+                    new_frag.push('&');
+                }
+                new_frag.push_str(&param.name);
+                new_frag.push('=');
+                new_frag.push_str(injected);
+            }
+
+            // Build result: everything before '#' + new fragment
+            let prefix = if let Some(hash_pos) = base_str.find('#') {
+                &base_str[..hash_pos]
+            } else {
+                base_str
+            };
+            let mut result = String::with_capacity(prefix.len() + 1 + new_frag.len());
+            result.push_str(prefix);
+            result.push('#');
+            result.push_str(&new_frag);
+            result
+        }
+    }
+}
+
+/// HPP (HTTP Parameter Pollution) strategy variants.
+/// Different server stacks handle duplicate query parameters differently,
+/// so we generate multiple HPP variants to increase bypass probability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HppPosition {
+    /// Payload appears as the last duplicate: `?p=safe&p=<payload>`
+    /// Effective against: PHP/Apache (uses last), Ruby/Rack (uses last)
+    Last,
+    /// Payload appears as the first duplicate: `?p=<payload>&p=safe`
+    /// Effective against: JSP/Tomcat (uses first), Python/Flask (uses first)
+    First,
+    /// Payload only, no safe decoy: `?p=<payload>&p=<payload>`
+    /// Useful when server concatenates (ASP.NET/IIS joins with comma)
+    Both,
+}
+
+/// Build an HPP URL variant for a query parameter.
+/// Returns the URL with the parameter duplicated according to the given `position`.
+/// For non-Query locations, returns `None` (HPP only applies to query params).
+pub(crate) fn build_hpp_url(
+    base: &url::Url,
+    param: &Param,
+    injected: &str,
+    position: HppPosition,
+) -> Option<String> {
+    if param.location != Location::Query {
+        return None;
+    }
+
+    let base_str = base.as_str();
+    // Cut before the query or fragment, whichever comes first — the fragment is
+    // re-appended below, so a bare `find('?')` (which can match a '?' inside a
+    // fragment, or miss entirely on `…#section`) would strand the HPP pairs in
+    // the fragment. See the matching note in `build_injected_url`'s Query arm.
+    let prefix = match base_str.find(['?', '#']) {
+        Some(cut) => &base_str[..cut],
+        None => base_str,
+    };
+    let fragment = base.fragment();
+
+    // The key the server reads. A nested-field param (`qs[a]`, JSON/base64 in
+    // `qs`) is addressed by its wire key, like `build_injected_url` does.
+    let key = param.effective_wire_name();
+
+    let mut result = String::with_capacity(base_str.len() + injected.len() + key.len() + 32);
+    result.push_str(prefix);
+    result.push('?');
+
+    // `true` = the payload, `false` = the safe decoy, in wire order.
+    let order = match position {
+        HppPosition::Last => [false, true],
+        HppPosition::First => [true, false],
+        HppPosition::Both => [true, true],
+    };
+    let push_hpp_pairs = |result: &mut String, safe_value: &str| {
+        for (i, is_payload) in order.into_iter().enumerate() {
+            if i > 0 {
+                result.push('&');
+            }
+            encode_decoded_query_component_into(key, result);
+            result.push('=');
+            if is_payload {
+                encode_query_component_preserving_pct_into(injected, result);
+            } else {
+                encode_decoded_query_component_into(safe_value, result);
+            }
+        }
+    };
+
+    let mut first = true;
+    let mut replaced = false;
+
+    // Rebuild existing query pairs, replacing the target param's value
+    for (k, v) in base.query_pairs() {
+        if !first {
+            result.push('&');
+        }
+        first = false;
+        if k == key && !replaced {
+            replaced = true;
+            // A nested param's `param.value` is the leaf, not a value the server
+            // can decode from `key`; decoy with the pair's own original value.
+            let decoy: &str = if param.wire_name.is_some() {
+                &v
+            } else {
+                &param.value
+            };
+            push_hpp_pairs(&mut result, decoy);
+        } else {
+            encode_decoded_query_component_into(&k, &mut result);
+            result.push('=');
+            encode_decoded_query_component_into(&v, &mut result);
+        }
+    }
+
+    // If param wasn't in the original query, append the HPP pair
+    if !replaced {
+        if !first {
+            result.push('&');
+        }
+        push_hpp_pairs(&mut result, &param.value);
+    }
+
+    if let Some(frag) = fragment {
+        result.push('#');
+        result.push_str(frag);
+    }
+
+    Some(result)
+}
+
+/// Generate all HPP URL variants for a given payload.
+/// Returns up to 3 variants (Last, First, Both) for query params, empty vec for others.
+#[cfg(test)]
+pub(crate) fn build_hpp_urls(
+    base: &url::Url,
+    param: &Param,
+    injected: &str,
+) -> Vec<(String, HppPosition)> {
+    [HppPosition::Last, HppPosition::First, HppPosition::Both]
+        .iter()
+        .filter_map(|&pos| build_hpp_url(base, param, injected, pos).map(|url| (url, pos)))
+        .collect()
+}
+
+/// Build an `application/x-www-form-urlencoded` body that carries `value` for
+/// `name`, replacing every matching occurrence when the param is already
+/// present and appending it otherwise. Updating all duplicates ensures both
+/// first-value and last-value servers receive the payload.
+///
+/// This is the single source of truth for form-body injection. It was
+/// previously copy-pasted (byte-identical) across the reflection check, light
+/// verify, DOM verify, and PoC builders; keeping one implementation prevents
+/// the drift those parallel copies were prone to.
+/// True when `param` is one of the target's cookies rather than a plain
+/// request header.
+///
+/// Cookies have no `Location` of their own — per-cookie discovery
+/// (`parameter_analysis::discovery`) files them as [`Location::Header`] with the
+/// *cookie's* name — so every injection site has to re-derive this. Matching
+/// `param_type_label`, which reports exactly these params as `"cookie"` to the
+/// user.
+pub(crate) fn param_is_cookie(target: &Target, param: &Param) -> bool {
+    matches!(param.location, Location::Header)
+        && param
+            .is_cookie
+            .unwrap_or_else(|| target.cookies.iter().any(|(name, _)| name == &param.name))
+}
+
+/// Build a request injecting `value` into a [`Location::Header`] parameter,
+/// routing cookie params into the `Cookie` header instead of a header of the
+/// same name.
+///
+/// This distinction is load-bearing and was previously implemented in only one
+/// of the three injection paths. Per-cookie discovery yields a param named
+/// after the cookie (`session`, `theme`, …); injecting that as
+/// `session: <payload>` sets an HTTP header the application never reads, so
+/// the payload never reaches the sink, no reflection is observed, and the whole
+/// parameter is dropped. Measured: a page reflecting the *first* of three
+/// cookies was found when it was the only cookie and missed entirely when two
+/// others followed it.
+///
+/// The injected cookie is written first and the target's other cookies are
+/// preserved after it, so neighbouring cookies keep whatever session state the
+/// application needs to render the sink at all.
+pub(crate) fn build_header_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    value: &str,
+    method: reqwest::Method,
+) -> reqwest::RequestBuilder {
+    let parsed_url = target.url.clone();
+    if param_is_cookie(target, param) {
+        let others =
+            crate::utils::compose_cookie_header_excluding(&target.cookies, Some(&param.name));
+        let cookie_header = match others {
+            Some(rest) if !rest.is_empty() => format!("{}={}; {}", param.name, value, rest),
+            _ => format!("{}={}", param.name, value),
+        };
+        crate::utils::build_request_with_cookie(
+            client,
+            target,
+            method,
+            parsed_url,
+            target.data.clone(),
+            Some(cookie_header),
+        )
+    } else {
+        let base =
+            crate::utils::build_request(client, target, method, parsed_url, target.data.clone());
+        crate::utils::apply_header_overrides(base, &[(param.name.clone(), value.to_string())])
+    }
+}
+
+pub(crate) fn urlencoded_body(data: Option<&str>, name: &str, value: &str) -> String {
+    match data {
+        Some(data) => {
+            let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(data.as_bytes())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let mut found = false;
+            for pair in &mut pairs {
+                if pair.0 == name {
+                    pair.1 = value.to_string();
+                    found = true;
+                }
+            }
+            if !found {
+                pairs.push((name.to_string(), value.to_string()));
+            }
+            url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(&pairs)
+                .finish()
+        }
+        None => format!(
+            "{}={}",
+            urlencoding::encode(name),
+            urlencoding::encode(value)
+        ),
+    }
+}
+
+/// Build a JSON body that carries `value` for `name`.
+///
+/// - Valid JSON object body → insert/overwrite the `name` key.
+/// - Non-JSON body with an empty `param_value` → re-serialize as `{name: value}`
+///   (an empty `str::replace` pattern would splice the payload between every
+///   byte of the body).
+/// - Non-JSON body with a non-empty `param_value` → textual replace of the
+///   original value, preserving the surrounding (non-JSON) structure.
+/// - No captured body → `{name: value}`.
+///
+/// Single source of truth for the reflection / light-verify / DOM-verify / PoC
+/// JSON builders, which were byte-identical copies.
+pub(crate) fn json_body(data: Option<&str>, name: &str, param_value: &str, value: &str) -> String {
+    match data {
+        Some(data) => {
+            if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(obj) = json_val.as_object_mut() {
+                    obj.insert(
+                        name.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    );
+                }
+                serde_json::to_string(&json_val).unwrap_or_else(|_| data.to_string())
+            } else if param_value.is_empty() {
+                serde_json::json!({ name: value }).to_string()
+            } else {
+                data.replace(param_value, value)
+            }
+        }
+        None => serde_json::json!({ name: value }).to_string(),
+    }
+}
+
+/// The ordered form fields a multipart injection puts on the wire: the target's
+/// captured `data` parsed as `key=value` pairs (percent-decoded), with `name`'s
+/// value replaced by `value`, or a fresh `name=value` field appended when the
+/// param isn't already present. Single source of field selection for both the
+/// wire form ([`multipart_form`]) and the rendered PoC ([`multipart_poc_body`]),
+/// so the request that is sent and the request that is displayed cannot disagree
+/// on which fields exist.
+fn multipart_fields(data: Option<&str>, name: &str, value: &str) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    let mut found = false;
+    // A captured multipart body (raw HTTP / HAR / `-d`) keeps its own framing.
+    if let Some(raw) = data.and_then(crate::target_parser::raw_multipart_fields) {
+        for (k, v) in raw {
+            if k == name {
+                fields.push((k, value.to_string()));
+                found = true;
+            } else {
+                fields.push((k, v));
+            }
+        }
+    } else if let Some(data) = data {
+        for pair in data.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                let k = urlencoding::decode(k)
+                    .unwrap_or(Cow::Borrowed(k))
+                    .to_string();
+                let v = urlencoding::decode(v)
+                    .unwrap_or(Cow::Borrowed(v))
+                    .to_string();
+                if k == name {
+                    fields.push((k, value.to_string()));
+                    found = true;
+                } else {
+                    fields.push((k, v));
+                }
+            }
+        }
+    }
+    if !found {
+        fields.push((name.to_string(), value.to_string()));
+    }
+    fields
+}
+
+/// Build a `multipart/form-data` form that carries `value` for `name`,
+/// replacing the matching field from the captured `data` and appending it when
+/// absent so an explicit `--param` not present in an imported body still ships
+/// its payload.
+///
+/// Single source of truth for the reflection / light-verify / DOM-verify /
+/// probe multipart builders.
+pub(crate) fn multipart_form(
+    data: Option<&str>,
+    name: &str,
+    value: &str,
+) -> reqwest::multipart::Form {
+    let mut form = reqwest::multipart::Form::new();
+    for (k, v) in multipart_fields(data, name, value) {
+        form = form.text(k, v);
+    }
+    form
+}
+
+/// Fixed, representative boundary for a rendered multipart PoC. reqwest picks a
+/// random boundary at send time; the PoC needs a stable, self-consistent one so
+/// the displayed body and its `Content-Type` agree and the request is
+/// copy-pasteable.
+const MULTIPART_POC_BOUNDARY: &str = "----DalfoxBoundary7MA4YWxkTrZu0gW";
+
+/// Render a faithful `multipart/form-data` body (and matching `Content-Type`)
+/// for the PoC. Serializes the exact fields [`multipart_form`] sends — both draw
+/// from [`multipart_fields`], so they cannot disagree on which fields exist —
+/// framed here with a fixed boundary the displayed `Content-Type` declares.
+pub(crate) fn multipart_poc_body(data: Option<&str>, name: &str, value: &str) -> (String, String) {
+    let mut body = String::new();
+    for (k, v) in multipart_fields(data, name, value) {
+        body.push_str("--");
+        body.push_str(MULTIPART_POC_BOUNDARY);
+        body.push_str("\r\nContent-Disposition: form-data; name=\"");
+        body.push_str(&k);
+        body.push_str("\"\r\n\r\n");
+        body.push_str(&v);
+        body.push_str("\r\n");
+    }
+    body.push_str("--");
+    body.push_str(MULTIPART_POC_BOUNDARY);
+    body.push_str("--\r\n");
+
+    let content_type = format!("multipart/form-data; boundary={MULTIPART_POC_BOUNDARY}");
+    (body, content_type)
+}
+
+/// Resolve the URL a body-bearing injection must be sent to: the discovered
+/// `<form action=...>` endpoint when the param came from a form, else the
+/// target's own URL. A form-discovered body param reflects at the action
+/// endpoint, not at the page that contained the form.
+///
+/// Belt and braces on the destination: `check_form_discovery` already refuses
+/// to record an action the scan may not send credentials to (anything but the
+/// target's own origin, or a same-host TLS upgrade of it -- see
+/// [`crate::utils::http::same_origin_or_tls_upgrade`]), so this should never
+/// fire. It stays because every site that turns a stored action string back
+/// into an outbound request sends the operator's credentials with it, and a
+/// future producer of `form_action_url` must not be able to reintroduce the leak
+/// by skipping the discovery-time gate. The three such sites are this one,
+/// [`effective_query_base`] (the Query/GET-form path) and
+/// `check_reflection::resolve_sxss_check_urls`; all three repeat the check.
+/// Falling back to the target's own URL keeps the injection on a permitted
+/// destination rather than dropping the param.
+pub(crate) fn resolve_form_action_url(param: &Param, target: &Target) -> url::Url {
+    param
+        .form_action_url
+        .as_ref()
+        .and_then(|u| url::Url::parse(u).ok())
+        .filter(|u| crate::utils::http::same_origin_or_tls_upgrade(&target.url, u))
+        .unwrap_or_else(|| target.url.clone())
+}
+
+/// The XML content-type to frame an [`Location::XmlBody`] injection with:
+/// the request's own declared `Content-Type` when it is an XML family type,
+/// else `application/xml`. Preserving `application/soap+xml` matters — a SOAP
+/// endpoint routes on it — while a stray non-XML captured type (or none) must
+/// not override the XML body we are actually sending.
+pub(crate) fn xml_request_content_type(target: &Target) -> String {
+    target
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.trim())
+        .filter(|v| crate::utils::is_xml_content_type(v))
+        .map(str::to_string)
+        .unwrap_or_else(|| "application/xml".to_string())
+}
+
+/// Shared tail of the typed body builders: send `body` to the form-action (or
+/// target) URL with the body-location method and `content_type`.
+fn typed_body_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    body: String,
+    content_type: String,
+) -> reqwest::RequestBuilder {
+    let parsed_url = resolve_form_action_url(param, target);
+    let method = body_location_method_for_param(&target.method, param);
+    let base =
+        crate::utils::build_body_request_base(client, target, method, parsed_url, Some(body));
+    crate::utils::apply_header_overrides(base, &[("Content-Type".to_string(), content_type)])
+}
+
+/// GraphQL body injection. The param's `pre_encoding_pipeline` has already
+/// rebuilt the full request body (query + all variables, the target variable
+/// carrying `value`), so it ships verbatim as `application/json`.
+pub(crate) fn build_graphql_body_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    typed_body_request(
+        client,
+        target,
+        param,
+        value.to_string(),
+        "application/json".to_string(),
+    )
+}
+
+/// XML / SOAP body injection. The param's `pre_encoding_pipeline` (a `Splice`)
+/// has already re-glued the original document around the injection point, so
+/// `value` is the complete XML body; it ships with the request's declared XML
+/// content-type (see [`xml_request_content_type`]).
+pub(crate) fn build_xml_body_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    let content_type = xml_request_content_type(target);
+    typed_body_request(client, target, param, value.to_string(), content_type)
+}
+
+/// `application/x-www-form-urlencoded` body injection.
+pub(crate) fn build_body_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    let body = urlencoded_body(target.data.as_deref(), &param.name, value);
+    let content_type = "application/x-www-form-urlencoded".to_string();
+    typed_body_request(client, target, param, body, content_type)
+}
+
+/// `application/json` body injection.
+pub(crate) fn build_json_body_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    let body = json_body(target.data.as_deref(), &param.name, &param.value, value);
+    typed_body_request(client, target, param, body, "application/json".to_string())
+}
+
+/// `multipart/form-data` body injection. No explicit `Content-Type` override:
+/// reqwest derives it from the form, and it must carry the generated boundary.
+/// `build_body_request_base` drops any `Content-Type` inherited from an imported
+/// target so reqwest's boundary-carrying one is the only value on the wire — a
+/// leftover captured `multipart/...; boundary=OLD` would be the first header the
+/// server frames the body with, seeing zero parts.
+pub(crate) fn build_multipart_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    let parsed_url = resolve_form_action_url(param, target);
+    let form = multipart_form(target.data.as_deref(), &param.name, value);
+    let method = body_location_method_for_param(&target.method, param);
+    crate::utils::build_body_request_base(client, target, method, parsed_url, None).multipart(form)
+}
+
+/// Query / Path injection: the payload goes into the URL and the target's own
+/// body (if any) rides along unchanged.
+pub(crate) fn build_url_inject_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    value: &str,
+    method: reqwest::Method,
+) -> reqwest::RequestBuilder {
+    // Query params discovered through a `<form action=...>` must be injected at
+    // the action URL — that's where the sink lives. Path params keep
+    // `target.url` because path-segment injection depends on the original path
+    // layout.
+    let base_url = effective_query_base(&target.url, param);
+    let inject_url_str = build_injected_url(&base_url, param, value);
+    let inject_url = url::Url::parse(&inject_url_str).unwrap_or_else(|_| base_url.clone());
+    crate::utils::build_request(client, target, method, inject_url, target.data.clone())
+}
+
+/// Build the injection request for `value` at `param`'s location.
+///
+/// Single source of truth for the reflection / light-verify / DOM-verify
+/// request builders, which were three near-identical copies of this `match`.
+/// They had already drifted: the light-verify copy sent an urlencoded body
+/// with **no `Content-Type`**, so form-parsing servers never bound the param
+/// and the verification silently came back negative.
+pub(crate) fn build_inject_request(
+    client: &Client,
+    target: &Target,
+    param: &Param,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    let default_method = target.parse_method();
+    match param.location {
+        // A cookie param must go into the `Cookie` header, not a header named
+        // after the cookie — see `build_header_request`.
+        Location::Header => build_header_request(client, target, param, value, default_method),
+        Location::Body => build_body_request(client, target, param, value),
+        Location::JsonBody => build_json_body_request(client, target, param, value),
+        Location::MultipartBody => build_multipart_request(client, target, param, value),
+        Location::GraphqlBody => build_graphql_body_request(client, target, param, value),
+        Location::XmlBody => build_xml_body_request(client, target, param, value),
+        _ => build_url_inject_request(client, target, param, value, default_method),
+    }
+}
+
+#[cfg(test)]
+mod tests;

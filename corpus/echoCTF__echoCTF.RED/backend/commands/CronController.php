@@ -1,0 +1,675 @@
+<?php
+
+namespace app\commands;
+
+use yii\console\Controller;
+use yii\helpers\ArrayHelper;
+use Docker\DockerClientFactory;
+use app\modules\activity\models\SpinQueue;
+use app\modules\activity\models\SpinHistory;
+use app\modules\gameplay\models\Target;
+use app\components\Pf;
+use Docker\Docker;
+use app\modules\infrastructure\models\DockerContainer;
+use app\modules\infrastructure\models\TargetInstance;
+use app\modules\infrastructure\models\TargetInstanceAudit;
+use app\modules\infrastructure\models\NetworkTargetSchedule as NTS;
+use app\modules\gameplay\models\NetworkTarget;
+use app\components\helpers\ArrayHelperExtended;
+
+/**
+ * @method docker_connect()
+ * @method containers_list()
+ */
+class CronController extends Controller
+{
+  const ACTION_START = 0;
+  const ACTION_RESTART = 1;
+  const ACTION_DESTROY = 2;
+  const ACTION_EXPIRED = 3;
+
+  /*
+   * Perofrm all needed cron operations for the VPN
+   */
+  public function actionIndex()
+  {
+    if (file_exists("/tmp/cron-index.lock")) {
+      echo date("Y-m-d H:i:s ") . "CronIndex: /tmp/cron-index.lock exists, skipping execution\n";
+      return;
+    }
+    touch("/tmp/cron-index.lock");
+    try {
+      $this->actionTargetNetMigration();
+      $this->actionSpinQueue();
+      $this->actionOndemand();
+      $this->actionPf(true);
+    } catch (\Exception $e) {
+      echo "cron/index: " . $e->getMessage(), "\n";
+    }
+    @unlink("/tmp/cron-index.lock");
+  }
+
+  public function actionTargetNetMigration()
+  {
+    if (file_exists("/tmp/cron-targetnetmigration.lock")) {
+      echo date("Y-m-d H:i:s ") . "TargetNetMigrations: /tmp/cron-targetnetmigration.lock exists, skipping execution\n";
+      return;
+    }
+    touch("/tmp/cron-targetnetmigration.lock");
+    try {
+      // Get schedules that need to be processed
+      $q = NTS::find()->queue();
+      foreach ($q->all() as $entry) {
+        printf("Processing target: %s\n", $entry->target->name);
+
+        // target scheduled to be removed from a network
+        if ($entry->network_id === null && $entry->target->network !== null) {
+          printf("Removing from network %s\n", $entry->target->network->name);
+          // remove target from old pf table
+          // the rules and other pf entries will be synced
+          Pf::del_table_ip($entry->target->network->codename, $entry->target->ipoctet);
+          // short lived transactions
+          $transaction = \Yii::$app->db->beginTransaction();
+          try {
+            $entry->trigger($entry::EVENT_TARGET_MIGRATE);
+            $entry->target->networkTarget->delete();
+            if ($entry->delete() === false)
+              throw new \Exception('Failed to delete migration for ' . $entry->target->name);
+            $transaction->commit();
+          } catch (\Exception $e) {
+            echo "Error: ", $e->getMessage();
+            $transaction->rollBack();
+          }
+        } elseif ($entry->network_id !== null) {
+          printf("Moving to network %s\n", $entry->network->name);
+          $transaction = \Yii::$app->db->beginTransaction();
+          try {
+            if ($entry->target->network === null) {
+              $NT = new NetworkTarget;
+            } else {
+              Pf::del_table_ip($entry->target->network->codename, $entry->target->ipoctet);
+              $NT = $entry->target->networkTarget;
+            }
+            $NT->target_id = $entry->target_id;
+            $NT->network_id = $entry->network_id;
+            $entry->trigger($entry::EVENT_TARGET_MIGRATE);
+            if ($NT->save() === false || $entry->delete() === false)
+              throw new \Exception('Failed migrate target [' . $entry->target->name . '] to network ', $entry->network->name);
+            $transaction->commit();
+          } catch (\Exception $e) {
+            $transaction->rollBack();
+          }
+        }
+      }
+    } catch (\Exception $e) {
+      echo "cron/target-net-migration: ", $e->getMessage(), "\n";
+    }
+    @unlink("/tmp/cron-targetnetmigration.lock");
+  }
+
+  public function actionPowerOperations()
+  {
+    if (file_exists("/tmp/cron-poweroperations.lock")) {
+      echo date("Y-m-d H:i:s ") . "PowerOperations: /tmp/cron-poweroperations.lock exists, skipping execution\n";
+      return;
+    }
+    touch("/tmp/cron-poweroperations.lock");
+    $this->actionPowerups();
+    $this->actionPowerdowns();
+    $this->actionOfflines();
+    @unlink("/tmp/cron-poweroperations.lock");
+  }
+
+  public function actionInstancePf($before = 60)
+  {
+    $action = SELF::ACTION_START;
+
+    $LASTID = intval(@file_get_contents('/tmp/instance-pf.last_id'));
+    $t = TargetInstanceAudit::find()->latestPerPlayerInstance();
+
+    if ($LASTID === 0) {
+      $t->since($before);
+    } else {
+      $t->andWhere(['>', 'id', $LASTID]);
+    }
+
+    $ACTIONS = [];
+    foreach ($t->all() as $val) {
+      $ACTION_ID = $val->player_id . '_' . $val->target_id;
+      $ACTIONS[$ACTION_ID] = ['op' => $val->op, 'object' => $val];
+      $LASTID = $val->id;
+    }
+
+    @file_put_contents('/tmp/instance-pf.last_id', $LASTID);
+
+    foreach ($ACTIONS as $obj) {
+      $val = $obj['object'];
+      $ips = [];
+      if ($val->op === 'i') {
+        echo date("Y-m-d H:i:s ") . "Starting ", $val->id, " ", $val->target->name, '_', $val->player_id, "\n";
+        $action = SELF::ACTION_START;
+      } else if ($val->op === 'd') {
+        echo date("Y-m-d H:i:s ") . "Destroying ", $val->id, " ", $val->target->name, '_', $val->player_id, " and its clients.\n";
+        $action = SELF::ACTION_DESTROY;
+      } else if ($val->op === 'u') {
+        echo date("Y-m-d H:i:s ") . "Updating ", $val->id, " ", $val->target->name, '_', $val->player_id, "\n";
+        $action = SELF::ACTION_RESTART;
+      }
+
+      switch ($action) {
+        case SELF::ACTION_START:
+        case SELF::ACTION_RESTART:
+          if (($val->team_allowed === true || \Yii::$app->sys->team_visible_instances === true) && $val->player->teamPlayer !== null && $val->player->teamPlayer->approved === 1) {
+            $ips = $val->player->teamPlayer->team->approvedMemberIPs;
+          } else if ((int)$val->player->last->vpn_local_address !== 0) {
+            $ips[] = long2ip($val->player->last->vpn_local_address);
+          }
+          if ($ips) {
+            echo 'Adding ', $val->target->name . '_' . $val->player_id . '_clients', ' IP: ', implode(' ', $ips);
+            Pf::add_table_ip($val->target->name . '_' . $val->player_id . '_clients', implode(' ', $ips), true);
+          }
+          if ($val->ip !== null)
+            Pf::add_table_ip($val->target->name . '_' . $val->player_id, long2ip($val->ip), true);
+          else echo 'target not booted yet skipping table creation: ', $val->target->name . '_' . $val->player_id, "\n";
+          break;
+        case SELF::ACTION_EXPIRED:
+        case SELF::ACTION_DESTROY:
+          Pf::kill_table($val->target->name . '_' . $val->player_id, true);
+          Pf::kill_table($val->target->name . '_' . $val->player_id . '_clients', true);
+          break;
+        default:
+          printf("Error: Unknown action\n");
+      }
+    }
+    $this->actionInstancePfTables(true);
+  }
+
+  public function actionInstancePfTables($dopf = false, int $server_id = 0)
+  {
+    $t = TargetInstance::find()->server_assigned($server_id)->active()->orderBy('target_instance.created_at ASC, target_instance.updated_at ASC');
+
+    foreach ($t->all() as $val) {
+      $IPs = [];
+      // get target name
+      $table = sprintf("%s_%d_clients", $val->target->name, $val->player_id);
+      if (($pIP = $val->player->last->vpn_local_address) !== null) {
+        $IPs[] = long2ip($pIP);
+      }
+      $team_visible_instances = \Yii::$app->sys->team_visible_instances;
+      if ($val->team_allowed == true ||  $team_visible_instances === true) {
+        if ($val->player->teamPlayer) {
+          $team = $val->player->teamPlayer->team;
+          $IPs = ArrayHelperExtended::mergeUnique($IPs, $team->approvedMemberIPs);
+        }
+      }
+
+      if ($dopf !== false) {
+        if ($IPs === []) {
+          Pf::kill_table($table);
+        } else {
+          Pf::add_table_ip($table, implode(' ', $IPs), true);
+        }
+      }
+    }
+  }
+
+  /**
+   * Process player private instances
+   *
+   * This command updates the last updated_at field for active instances
+   * and processes instances that are pending action (eg. reboot, destroy, powerup)
+   * and updates the PF according to currently online players.
+   *
+   * @param bool $pfonly Perform PF operations and skip instance docker actions (default: false)
+   * @param int $expired_ago Filter instances based that haven't been updated X seconds ago (default: 2400 seconds = 40 minutes)
+   * @param int $atOnce Process X instances at once
+   * @param int $server_id Filter operations to $server_id
+   * @return int Exit code
+   */
+  public function actionInstances(bool $pfonly = false, int $expired_ago = 2400, int $atOnce = 0, int $server_id = 0)
+  {
+    if (file_exists("/tmp/cron-instances.lock")) {
+      echo date("Y-m-d H:i:s ") . "Instances: /tmp/cron-instances.lock exists, skipping execution\n";
+      return;
+    }
+    touch("/tmp/cron-instances.lock");
+    $action = SELF::ACTION_EXPIRED;
+    $t = TargetInstance::find()->pending_action($expired_ago)->server_assigned($server_id)->orderBy('target_instance.created_at ASC, target_instance.updated_at ASC');
+    if ($atOnce > 0) $t->limit($atOnce);
+    foreach ($t->all() as $val) {
+      try {
+        $ips = [];
+        $dc = new DockerContainer($val->target);
+        $dc->timeout = ($val->server->timeout ? $val->server->timeout : 10000);
+
+        if ($val->target->targetVolumes !== null)
+          $dc->targetVolumes = $val->target->targetVolumes;
+
+        if ($val->target->targetVariables !== null) {
+          $dc->targetVariables = $val->target->targetVariables;
+        }
+
+        // Check If target supports dynamic_treasures
+        if ($val->target->dynamic_treasures) {
+          // Fetch the encrypted env flag
+          $encryptedTreasures = $val->encryptedTreasures;
+
+          // Check existing environment variables for ETSCTF_FLAG keys
+          foreach ($dc->targetVariables as $key => $tv) {
+            // Replace the old key with the encrypted treasure
+            if ($tv->key == 'ETSCTF_FLAG' && array_key_exists('env', $encryptedTreasures['fs'])) {
+              $tv->val = str_replace($encryptedTreasures['fs']['env'][0]['src'], $encryptedTreasures['fs']['env'][0]['dest'], $tv->val);
+              break;
+            }
+          }
+          $dc->labels['dynamic_treasures'] = "1";
+          $dc->labels['player_id'] = (string)$val->player_id;
+          $dc->labels['target_id'] = (string)$val->target_id;
+          foreach (str_split(base64_encode(json_encode($encryptedTreasures)), 1024) as $key => $part)
+            $dc->labels['treasures_' . $key] = $part;
+        }
+
+        $dc->name = $val->name;
+        $dc->server = $val->server->connstr;
+        $dc->net = $val->server->network;
+
+        if ($val->reboot === 2) {
+          echo date("Y-m-d H:i:s ") . "Destroying";
+          $action = SELF::ACTION_DESTROY;
+        } else if ($val->reboot === 1) {
+          echo date("Y-m-d H:i:s ") . "Restarting";
+          $action = SELF::ACTION_RESTART;
+        } else if ($val->ip == null && $val->reboot == 0) {
+          echo date("Y-m-d H:i:s ") . "Starting";
+          $action = SELF::ACTION_START;
+        } else {
+          echo date("Y-m-d H:i:s ") . "Expiring";
+          $action = SELF::ACTION_EXPIRED;
+        }
+        printf(" %s for %s (%s) at %s\n", $val->target->name, $val->player->username, $dc->name, $val->server->name);
+        switch ($action) {
+          case SELF::ACTION_START:
+          case SELF::ACTION_RESTART:
+            if ($pfonly === false) {
+              try {
+                $dc->destroy();
+              } catch (\Throwable $e) {
+              }
+              $dc->pull();
+              usleep(100);
+              $dc->spin();
+            }
+            if (($val->team_allowed === true || \Yii::$app->sys->team_visible_instances === true) && $val->player->teamPlayer && $val->player->teamPlayer->approved === 1) {
+              $ips = $val->player->teamPlayer->team->approvedMemberIPs;
+            } else if ((int)$val->player->last->vpn_local_address !== 0) {
+              $ips[] = long2ip($val->player->last->vpn_local_address);
+            }
+            if ($ips != [])
+              Pf::add_table_ip($dc->name . '_clients', implode(' ', $ips), true);
+            $val->ipoctet = $dc->container->getNetworkSettings()->getNetworks()->{$val->server->network}->getIPAddress();
+            Pf::add_table_ip($dc->name, $val->ipoctet, true);
+            $val->reboot = 0;
+            if ($pfonly === false) {
+              $val->updated_at = new \yii\db\Expression('NOW()');
+              $val->save();
+            }
+
+            break;
+          case SELF::ACTION_EXPIRED:
+          case SELF::ACTION_DESTROY:
+            if ($pfonly === false) {
+              try {
+                $dc->destroy();
+              } catch (\Exception $e) {
+              }
+            }
+            Pf::kill_table($dc->name, true);
+            Pf::kill_table($dc->name . '_clients', true);
+            if ($pfonly === false)
+              $val->delete();
+            break;
+          default:
+            printf("Error: Unknown action\n");
+        }
+      } catch (\Throwable $e) {
+        if (method_exists($e, 'getErrorResponse'))
+          echo "Instances: ", $e->getErrorResponse()->getMessage(), "\n";
+        else
+          echo "Instances: ", $e->getMessage(), "\n";
+        if (getenv('DEBUG', true) !== false)
+          \Yii::error($e);
+      }
+      unset($dc);
+      usleep(200);
+      $publisher = new \app\services\ServerPublisher(\Yii::$app->params['serverPublisher']);
+      $publisher->publish($val->player_id, 'target', ['id' => $val->target_id]);
+    } // end foreach
+    $this->actionInstancePfTables(true);
+
+    if ($pfonly === false) {
+      try {
+        $t = TargetInstance::find()->active()->withApprovedMemberHeartbeat()->last_updated(round($expired_ago / 2))->server_assigned($server_id);
+        foreach ($t->all() as $instance) {
+          printf("Updating heartbeat [%d: %s for %d: %s]\n", $instance->target_id, $instance->target->name, $instance->player_id, $instance->player->username);
+          $instance->touch('updated_at');
+        }
+      } catch (\Throwable $e) {
+        echo "Instrances: Error while touching updated_at. ", $e->getMessage();
+      }
+    }
+    @unlink("/tmp/cron-instances.lock");
+  }
+
+  /**
+   * Check container health status and merge with spin queue
+   */
+  public function actionHealthcheck($spin = false)
+  {
+    if (file_exists("/tmp/cron-healthcheck.lock")) {
+      echo date("Y-m-d H:i:s ") . "Healthcheck: /tmp/cron-healthcheck.lock exists, skipping execution\n";
+      return;
+    }
+    touch("/tmp/cron-healthcheck.lock");
+    try {
+      $unhealthy = $this->unhealthy_dockers();
+
+      foreach ($unhealthy as $target) {
+        printf("Processing unhealthy [%s] on docker [%s]", $target->name, $target->server);
+        if ($target->healthcheck == 0) {
+          printf("... skipping by healthcheck flag\n");
+        }
+        echo "\n";
+        if ($spin !== false) {
+          $target->spin();
+          $sh = new SpinHistory;
+          $sh->target_id = $target->id;
+          $sh->created_at = new \yii\db\Expression('NOW()');
+          $sh->updated_at = new \yii\db\Expression('NOW()');
+          $sh->player_id = 1;
+          $sh->save();
+        }
+      }
+    } catch (\Exception $e) {
+      echo "Healthcheck:", $e->getMessage(), "\n";
+    }
+    @unlink("/tmp/cron-healthcheck.lock");
+  }
+
+  /**
+   *  Process Pending Spin Queue entries
+   */
+  public function actionSpinQueue()
+  {
+
+    try {
+      $transaction = \Yii::$app->db->beginTransaction();
+      $query = SpinQueue::find();
+      foreach ($query->all() as $t) {
+        printf("Processing queue [%s] on docker [%s]", $t->target->name, $t->target->server);
+        printf(" by [%s] on %s", $t->player->username, $t->created_at);
+
+        try {
+          $t->target->spin();
+          if ($t->target->ondemand && $t->target->ondemand->state < 0) {
+            $t->target->ondemand->state = 1;
+            $t->target->ondemand->heartbeat = new \yii\db\Expression('NOW()');
+            $t->target->ondemand->player_id = $t->player_id;
+            $t->target->ondemand->save();
+            Pf::add_table_ip('heartbeat', $t->target->ipoctet);
+            $notifTitle = sprintf("Target [%s] powered up", $t->target->name);
+          } else {
+            $notifTitle = sprintf("Target [%s] restart request completed", $t->target->name);
+          }
+          $t->player->notify("info", $notifTitle, sprintf("<p>Target [<b><code>%s</code></b>] got rebooted.<br/>Have fun</p>", $t->target->name));
+          $t->delete();
+          echo " OK\n";
+        } catch (\Exception $ce) {
+          printf(" NOT OK (%s)\n", $ce->getMessage());
+        }
+      }
+      $transaction->commit();
+    } catch (\Exception $e) {
+      echo "Failed to process SpinQueue: [{$e->getMessage()}]\n";
+      $transaction->rollBack();
+      throw $e;
+    } catch (\Throwable $e) {
+      $transaction->rollBack();
+      throw $e;
+    }
+  }
+
+  public function actionPowerups()
+  {
+    try {
+      $targets = Target::find()->powerup();
+      foreach ($targets->all() as $target) {
+        printf("Target %s ", $target->fqdn);
+        try {
+          if (!$target->ondemand) {
+            printf("scheduled for [%s] at %s, spin: %s\n", $target->status, $target->scheduled_at, $target->spin() ? "success" : "fail");
+          } else {
+            printf("scheduled for [%s] at %s, pull: %s\n", $target->status, $target->scheduled_at, $target->pull() ? "success" : "fail");
+          }
+          $target->status = 'online';
+          $target->scheduled_at = null;
+          $target->active = 1;
+          $target->save();
+        } catch (\Exception $e) {
+          echo "fail. ", $e->getMessage(), "\n";
+        }
+      }
+    } catch (\Exception $e) {
+      echo "Powerups:", $e->getMessage(), "\n";
+    }
+  }
+
+  public function actionOndemand($host = "/var/run/memcached/memcached.sock", $port = 0)
+  {
+    try {
+      $demands = \app\modules\gameplay\models\TargetOndemand::find()->andWhere(['state' => 1]);
+      $memcache = new \Memcached();
+      $memcache->addServer($host, $port);
+      foreach ($demands->all() as $ondemand) {
+        $val = $memcache->get('target_heartbeat:' . $ondemand->target->ipoctet);
+        if ($val !== false)
+          $ondemand->touch('heartbeat');
+      }
+    } catch (\Exception $e) {
+    }
+    try {
+      $demands = \app\modules\gameplay\models\TargetOndemand::find()
+        ->andWhere(
+          [
+            'and',
+            ['state' => 1],
+            [
+              'OR',
+              ['IS', 'heartbeat', new \yii\db\Expression('NULL')],
+              ['<=', 'heartbeat', new \yii\db\Expression('NOW() - INTERVAL 1 HOUR')],
+            ]
+          ]
+        );
+
+      foreach ($demands->all() as $ondemand) {
+        printf("Destroying ondemand target %s\n", $ondemand->target->fqdn);
+        $ondemand->target->destroy();
+        $ondemand->state = -1;
+        $ondemand->heartbeat = null;
+        Pf::del_table_ip('heartbeat', $ondemand->target->ipoctet);
+        $ondemand->save();
+      }
+    } catch (\Exception $e) {
+      echo "OnDemand:", $e->getMessage(), "\n";
+    }
+  }
+
+  public function actionOfflines()
+  {
+    try {
+      $targets = Target::find()->offline();
+      foreach ($targets->all() as $target) {
+        printf("Target %s ", $target->fqdn);
+        printf("scheduled for [%s] at [%s]", $target->status, $target->scheduled_at);
+        $requirePF = $target->powerdown();
+        printf(", destroyed: %s\n", $requirePF ? "success" : "fail");
+      }
+    } catch (\Exception $e) {
+      echo "Offlines:", $e->getMessage(), "\n";
+    }
+  }
+
+  public function actionPowerdowns()
+  {
+    try {
+      $targets = Target::find()->powerdown();
+      foreach ($targets->all() as $target) {
+        printf("Target %s ", $target->fqdn);
+        printf("scheduled for [%s] at [%s]", $target->status, $target->scheduled_at);
+        $requirePF = $target->powerdown();
+        printf(", destroyed: %s\n", $requirePF ? "success" : "fail");
+      }
+    } catch (\Exception $e) {
+      echo "Powerdowns:", $e->getMessage(), "\n";
+    }
+  }
+
+  /**
+   * Populate pf related tables and rules for targets
+   */
+  public function actionPf($load = false, $base = "/etc")
+  {
+    try {
+      $this->active_targets_pf($base);
+      $this->match_findings($load, $base);
+    } catch (\Exception $e) {
+      echo "PF:", $e->getMessage(), "\n";
+    }
+  }
+
+  /*
+   * Generate match rules for target findings and load them
+   */
+  private function match_findings($load, $base = "/etc")
+  {
+    $pflogmin = intval(\Yii::$app->sys->pflog_min);
+    $pflogmax = intval(\Yii::$app->sys->pflog_max);
+    if ($pflogmin === 0)
+      $pflogmin = $pflogmax = 1;
+    $networks = $rules = $frules = [];
+    $targets = Target::find()->active()->online()->poweredup()->all();
+    foreach ($targets as $target) {
+      foreach ($target->findings as $finding) {
+        if ($target->network) {
+          $networks[$target->network->codename] = $target->network;
+        }
+        $frules[] = $finding->matchRule;
+      }
+    }
+    $instances = TargetInstance::find()->active();
+    foreach ($instances->all() as $ti)
+      foreach ($ti->target->findings as $f) {
+        $rules[] = $f->getMatchRule('<' . $ti->name . '_clients>', '<' . $ti->name . '>', $pflogmin, $pflogmax, $ti->player_id);
+      }
+
+
+    Pf::store($base . '/match-findings-pf.conf', ArrayHelper::merge($frules, $rules));
+
+    if ($load)
+      Pf::load_anchor_file("offense/findings", "$base/match-findings-pf.conf");
+  }
+
+  /*
+   * Find and store active targets IP addresses on their PF table
+   */
+  private function active_targets_pf($base = "/etc")
+  {
+    $ips = $networks = $rules = $rulestoNet = $rulestoClient = [];
+    $targets = Target::find()->active()->online()->poweredup()->orderBy(['ip' => SORT_ASC])->all();
+    foreach ($targets as $target) {
+      if ($target->networkTarget === NULL) {
+        $ips[] = $target->ipoctet;
+      } else {
+        $networks[$target->network->codename][] = $target->ipoctet;
+        $rulestoNet[] = Pf::allowToNetwork($target);
+        $rulestoClient[] = Pf::allowToClient($target);
+      }
+    }
+    foreach (TargetInstance::find()->active()->all() as $ti) {
+      $_nname = $ti->name;
+      $networks[$_nname][] = $ti->ipoctet;
+      $rulestoNet[] = Pf::allowToNetwork($ti->target, $_nname . '_clients', $_nname);
+      $rulestoClient[] = Pf::allowToClient($ti->target, $_nname . '_clients', $_nname);
+    }
+    Pf::store($base . '/targets.conf', $ips);
+    Pf::load_table_file('targets', $base . '/targets.conf');
+    $rulestoNet = array_unique($rulestoNet, SORT_STRING);
+    $rulestoClient = array_unique($rulestoClient, SORT_STRING);
+    $rules = array_merge($rulestoNet, $rulestoClient);
+    foreach ($networks as $key => $val) {
+      Pf::store($base . '/' . $key . '.conf', $val);
+      Pf::load_table_file($key, $base . '/' . $key . '.conf');
+      $rules[] = sprintf("pass inet proto udp from <%s> to (targets:0) port 53", $key);
+    }
+
+    if (Pf::store("$base/targets_networks.conf", $rules))
+      Pf::load_anchor_file("networks", "$base/targets_networks.conf");
+  }
+
+  /*
+   * Return an array of unhealthy containers or null
+   */
+  private function unhealthy_dockers()
+  {
+    $unhealthy = [];
+    foreach (Target::find()->select(['server'])->distinct()->all() as $target) {
+      $docker = $this->docker_connect($target->server);
+
+      $containers = $this->containers_list($docker);
+      foreach ($containers as $container) {
+        if (strstr($container->getStatus(), 'unhealthy')) {
+          $name = str_replace('/', '', $container->getNames()[0]);
+          if (($unhealthyTarget = Target::findOne(['name' => $name])) !== NULL) {
+            $unhealthy[$name] = $unhealthyTarget;
+          } else {
+            echo date("Y-m-d H:i:s ") . "Unhealthy container  [$name => {$target->server}] not on our list!!!\n";
+          }
+        }
+      }
+    }
+    return $unhealthy;
+  }
+
+  /**
+   * Connect to a docker server API and return docker client object
+   */
+  private function docker_connect($remote_socket)
+  {
+    $client = DockerClientFactory::create([
+      'remote_socket' => $remote_socket,
+      'ssl' => false,
+      'timeout' => 5000,
+    ]);
+    try {
+      $docker = Docker::create($client);
+    } catch (\Exception $e) {
+      echo "Failed to connect to docker server {$remote_socket}: [{$e->getMessage()}]\n";
+      return false;
+    }
+    return $docker;
+  }
+
+  /**
+   * Get a list of containers from a connected docker
+   */
+  private function containers_list($docker)
+  {
+    if ($docker === false) return [];
+    try {
+      $containerList = $docker->containerList();
+    } catch (\Exception $e) {
+      echo "Failed to get container list: [{$e->getMessage()}]\n";
+      return [];
+    }
+    return $containerList;
+  }
+}

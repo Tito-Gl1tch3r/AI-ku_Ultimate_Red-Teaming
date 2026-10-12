@@ -1,0 +1,357 @@
+package com.six2dez.burp.aiagent.scanner
+
+import burp.api.montoya.http.message.HttpHeader
+import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.http.message.responses.HttpResponse
+import com.six2dez.burp.aiagent.cache.CachedEntry
+import com.six2dez.burp.aiagent.cache.CachedIssue
+import com.six2dez.burp.aiagent.cache.PersistentPromptCache
+import com.six2dez.burp.aiagent.config.AgentSettings
+import com.six2dez.burp.aiagent.redact.Redaction
+import com.six2dez.burp.aiagent.util.IssueUtils
+import java.io.File
+import java.net.URI
+import java.util.LinkedHashMap
+import java.util.Locale
+
+// AWT-free contract: MUST NOT import java.awt.* or javax.swing.*
+
+private const val RESPONSE_FINGERPRINT_BODY_PREFIX_CHARS = 2_000
+private const val HEADER_VALUE_MAX_CHARS = 120
+private const val MIN_RESPONSE_BODY_CHARS = 50
+
+// Redeclared from PassiveAiScanner companion (private there, copied here for extension functions)
+private const val LOCAL_FINDING_SKIP_CONFIDENCE = 90
+private const val MIN_BODY_SIZE_FOR_AI = 80
+
+// ---- time-window helpers ----
+
+internal fun PassiveAiScanner.endpointDedupWindowMs(): Long = endpointDedupMinutes.toLong().coerceAtLeast(1L) * 60_000L
+
+internal fun PassiveAiScanner.responseFingerprintDedupWindowMs(): Long = responseFingerprintDedupMinutes.toLong().coerceAtLeast(1L) * 60_000L
+
+internal fun PassiveAiScanner.promptCacheTtlMs(): Long = promptCacheTtlMinutes.toLong().coerceAtLeast(1L) * 60_000L
+
+// ---- LRU trim helper ----
+
+internal fun <K, V> PassiveAiScanner.trimLruCache(
+    cache: LinkedHashMap<K, V>,
+    maxEntries: Int,
+) {
+    while (cache.size > maxEntries) {
+        val iterator = cache.entries.iterator()
+        if (!iterator.hasNext()) return
+        iterator.next()
+        iterator.remove()
+    }
+}
+
+// ---- skip-decision helpers ----
+
+internal fun PassiveAiScanner.shouldSkipAiAfterLocalFindings(
+    localFindings: List<LocalFinding>,
+    request: HttpRequest,
+    requestBody: String,
+): Boolean {
+    if (localFindings.isEmpty()) return false
+    val hasHighConfidenceLocal = localFindings.any { it.confidence >= LOCAL_FINDING_SKIP_CONFIDENCE }
+    if (!hasHighConfidenceLocal) return false
+    val hasInterestingInput =
+        request.parameters().isNotEmpty() ||
+            requestBody.length > MIN_BODY_SIZE_FOR_AI ||
+            request.method().uppercase() in setOf("POST", "PUT", "PATCH", "DELETE")
+    return !hasInterestingInput
+}
+
+internal fun PassiveAiScanner.shouldSkipUninterestingTraffic(
+    request: HttpRequest,
+    response: HttpResponse?,
+    responseBody: String,
+): Boolean {
+    val status = response?.statusCode() ?: return false
+    if (status == 204.toShort() || status == 304.toShort()) return true
+    val path = runCatching { URI(request.url()).path.orEmpty().lowercase() }.getOrDefault("")
+    if (path.isNotBlank() && staticAssetPathRegex.containsMatchIn(path)) return true
+    if (responseBody.length < MIN_RESPONSE_BODY_CHARS && !hasInterestingResponseHeaders(response)) return true
+    return false
+}
+
+internal fun PassiveAiScanner.hasInterestingResponseHeaders(response: HttpResponse): Boolean =
+    response.headers().any { header ->
+        val name = header.name().lowercase()
+        responseHeaderAllowlist.contains(name) || name.startsWith("x-")
+    }
+
+internal fun PassiveAiScanner.shouldSkipRecentlyAnalyzedEndpoint(request: HttpRequest): Boolean {
+    val key = buildEndpointCacheKey(request)
+    val now = System.currentTimeMillis()
+    synchronized(endpointRecentCache) {
+        val previous = endpointRecentCache[key]
+        if (previous != null && now - previous < endpointDedupWindowMs()) {
+            return true
+        }
+        endpointRecentCache[key] = now
+    }
+    return false
+}
+
+internal fun PassiveAiScanner.buildEndpointCacheKey(request: HttpRequest): String {
+    val method = request.method().uppercase()
+    val uri = runCatching { URI(request.url()) }.getOrNull()
+    val normalizedPath =
+        runCatching {
+            IssueUtils.normalizePathSegments(uri?.path.orEmpty())
+        }.getOrElse { IssueUtils.normalizePathSegments(request.url()) }
+    val host = uri?.host.orEmpty().lowercase()
+    val sortedParamNames =
+        uri
+            ?.query
+            .orEmpty()
+            .split('&')
+            .mapNotNull {
+                it
+                    .split('=')
+                    .firstOrNull()
+                    ?.lowercase()
+                    ?.ifBlank { null }
+            }.filter { !cacheBustingParamRegex.matches(it) }
+            .sorted()
+            .joinToString(",")
+    return "$method:$host:$normalizedPath:$sortedParamNames"
+}
+
+internal fun PassiveAiScanner.shouldSkipKnownResponseFingerprint(
+    request: HttpRequest,
+    response: HttpResponse?,
+    responseBody: String,
+): Boolean {
+    val fingerprint = buildResponseFingerprint(request, response, responseBody) ?: return false
+    val now = System.currentTimeMillis()
+    synchronized(responseFingerprintCache) {
+        val previous = responseFingerprintCache[fingerprint]
+        if (previous != null && now - previous < responseFingerprintDedupWindowMs()) {
+            return true
+        }
+        responseFingerprintCache[fingerprint] = now
+    }
+    return false
+}
+
+internal fun PassiveAiScanner.buildResponseFingerprint(
+    request: HttpRequest,
+    response: HttpResponse?,
+    responseBody: String,
+): String? {
+    if (response == null) return null
+    val headers =
+        sanitizeHeadersForPrompt(response.headers(), isRequest = false)
+            .take(10)
+            .joinToString("\n")
+    val bodyPrefix = stripDynamicValues(responseBody.take(RESPONSE_FINGERPRINT_BODY_PREFIX_CHARS))
+    val raw =
+        buildString {
+            append(request.method()).append('\n')
+            append(IssueUtils.normalizeUrl(request.url())).append('\n')
+            append(response.statusCode()).append('\n')
+            append(headers).append('\n')
+            append(bodyPrefix)
+        }
+    return sha256Hex(raw)
+}
+
+internal fun PassiveAiScanner.stripDynamicValues(text: String): String = dynamicValueStripRegex.replace(text, "{DYN}")
+
+internal fun PassiveAiScanner.sanitizeHeadersForPrompt(
+    headers: List<HttpHeader>,
+    isRequest: Boolean,
+): List<String> =
+    headers
+        .asSequence()
+        .filter { header ->
+            // (PRIV-05) D-27-04: Locale.ROOT covers every comparison that reads this one lowered
+            // value — the denylist lookup, the "x-" prefix test and both allowlist lookups. Measured:
+            // Kotlin's no-argument lowercase() is already locale-agnostic, so this is stated to make a
+            // future switch to a locale-SENSITIVE spelling read as the security change it would be.
+            val name = header.name().lowercase(Locale.ROOT)
+            if (name in headerNoiseDenylist) return@filter false
+            if (name.startsWith("x-")) return@filter true
+            // (PRIV-05) D-27-01: Redaction.isCookieHeaderName is the single cookie-header-name rule
+            // across the two redaction paths and this admitter — measured at those three sites, not a
+            // claim about every cookie matcher in the tree (CookieHeaderRuleOwnershipTest classifies
+            // the others as non-redacting). All three share it because the v0.10.0 milestone audit
+            // found the rule widened on the prompt path and forgotten on the tool-result one. The
+            // `auth`/`token` conjuncts stay hand-written on purpose: they are the open-ended vendor
+            // class CONCERNS.md records as deliberately deferred, and folding them in here would
+            // quietly extend this phase into a class the maintainer decided not to close.
+            //
+            // (PRIV-05) 27-10 — POLARITY, stated where the predicate is actually consumed. This is
+            // the ADMITTING site: returning true PUTS the header into the outbound prompt, which
+            // Redaction.apply then has to strip. At the other two sites the same predicate is a
+            // REDACTOR, where being wide is fail-safe. HERE being wide is fail-OPEN, because a name
+            // this branch claims and Redaction's two cookie regexes cannot match is emitted and never
+            // removed. So any name admitted here MUST also be a name Redaction.apply can strip:
+            // Redaction.COOKIE_NAME_PART is the constant that has to move with this predicate, and
+            // widening one without the other reopens the leak. That is not hypothetical — before plan
+            // 27-10, COOKIE_NAME_PART excluded '_' while this branch admitted my_cookie, X_Cookie and
+            // session_cookie, and all three were measured reaching an AI backend under STRICT.
+            if (name.contains("auth") || name.contains("token") || Redaction.isCookieHeaderName(header.name())) {
+                return@filter true
+            }
+            if (isRequest) {
+                name in requestHeaderAllowlist
+            } else {
+                name in responseHeaderAllowlist
+            }
+        }.take(headerMaxCount)
+        .map { header ->
+            val value = truncateWithEllipsis(header.value(), HEADER_VALUE_MAX_CHARS)
+            "${header.name()}: $value"
+        }.toList()
+
+// ---- in-memory + persistent prompt-result cache ----
+
+internal fun PassiveAiScanner.promptResultCacheValue(promptHash: String): List<AiIssueItem>? {
+    val now = System.currentTimeMillis()
+    // Check in-memory cache first
+    synchronized(promptResultCache) {
+        val cached = promptResultCache[promptHash]
+        if (cached != null) {
+            if (now - cached.createdAtMs > promptCacheTtlMs()) {
+                promptResultCache.remove(promptHash)
+            } else {
+                return cached.issues
+            }
+        }
+    }
+    // Fall back to persistent cache
+    val diskEntry = persistentCache?.get(promptHash) ?: return null
+    val issues =
+        diskEntry.issues.map { ci ->
+            AiIssueItem(
+                reasoning = ci.reasoning,
+                title = ci.title,
+                severity = ci.severity,
+                detail = ci.detail,
+                confidence = ci.confidence,
+                requestIndex = ci.requestIndex,
+            )
+        }
+    // Promote to in-memory cache
+    synchronized(promptResultCache) {
+        promptResultCache[promptHash] =
+            CachedAiIssues(
+                createdAtMs = diskEntry.createdAtMs,
+                issues = issues,
+            )
+    }
+    return issues
+}
+
+internal fun PassiveAiScanner.putPromptResultCacheValue(
+    promptHash: String,
+    issues: List<AiIssueItem>,
+) {
+    val now = System.currentTimeMillis()
+    synchronized(promptResultCache) {
+        promptResultCache[promptHash] =
+            CachedAiIssues(
+                createdAtMs = now,
+                issues = issues,
+            )
+    }
+    // Write to persistent cache
+    persistentCache?.put(
+        promptHash,
+        CachedEntry(
+            createdAtMs = now,
+            issues =
+                issues.map { ai ->
+                    CachedIssue(
+                        reasoning = ai.reasoning,
+                        title = ai.title,
+                        severity = ai.severity,
+                        detail = ai.detail,
+                        confidence = ai.confidence,
+                        requestIndex = ai.requestIndex,
+                    )
+                },
+        ),
+    )
+}
+
+// ---- optimization settings ----
+
+/**
+ * Synchronizes scanner operational parameters from [AgentSettings].
+ * Called from the scanner itself before each analysis, and from the UI / settings-apply paths.
+ * Stays AWT-free.
+ */
+fun PassiveAiScanner.applyOptimizationSettings(settings: AgentSettings) {
+    if (endpointDedupMinutes != settings.passiveAiEndpointDedupMinutes) {
+        endpointDedupMinutes = settings.passiveAiEndpointDedupMinutes
+    }
+    if (responseFingerprintDedupMinutes != settings.passiveAiResponseFingerprintDedupMinutes) {
+        responseFingerprintDedupMinutes = settings.passiveAiResponseFingerprintDedupMinutes
+    }
+    if (promptCacheTtlMinutes != settings.passiveAiPromptCacheTtlMinutes) {
+        promptCacheTtlMinutes = settings.passiveAiPromptCacheTtlMinutes
+    }
+    if (endpointCacheEntries != settings.passiveAiEndpointCacheEntries) {
+        endpointCacheEntries = settings.passiveAiEndpointCacheEntries
+    }
+    if (responseFingerprintCacheEntries != settings.passiveAiResponseFingerprintCacheEntries) {
+        responseFingerprintCacheEntries = settings.passiveAiResponseFingerprintCacheEntries
+    }
+    if (promptCacheEntries != settings.passiveAiPromptCacheEntries) {
+        promptCacheEntries = settings.passiveAiPromptCacheEntries
+    }
+    if (requestBodyPromptMaxChars != settings.passiveAiRequestBodyMaxChars) {
+        requestBodyPromptMaxChars = settings.passiveAiRequestBodyMaxChars
+    }
+    if (responseBodyPromptMaxChars != settings.passiveAiResponseBodyMaxChars) {
+        responseBodyPromptMaxChars = settings.passiveAiResponseBodyMaxChars
+    }
+    if (headerMaxCount != settings.passiveAiHeaderMaxCount) {
+        headerMaxCount = settings.passiveAiHeaderMaxCount
+    }
+    if (paramMaxCount != settings.passiveAiParamMaxCount) {
+        paramMaxCount = settings.passiveAiParamMaxCount
+    }
+    val newExcluded =
+        settings.passiveAiExcludedExtensions
+            .split(",")
+            .map { it.trim().lowercase().removePrefix(".") }
+            .filter { it.isNotEmpty() }
+            .toSet()
+    if (excludedExtensions != newExcluded) {
+        excludedExtensions = newExcluded
+    }
+    // Apply batch size
+    val newBatchSize = settings.passiveAiBatchSize.coerceIn(1, 5)
+    if (batchQueue.maxBatchSize != newBatchSize) {
+        batchQueue.maxBatchSize = newBatchSize
+    }
+    // Initialize or update persistent cache (project-namespaced)
+    if (settings.passiveAiPersistentCacheEnabled) {
+        val wantMaxBytes = settings.passiveAiPersistentCacheMaxMb.toLong() * 1024 * 1024
+        val wantTtlMs = settings.passiveAiPersistentCacheTtlHours.toLong() * 60 * 60 * 1000
+        val current = persistentCache
+        if (current == null || current.maxDiskBytes != wantMaxBytes || current.ttlMs != wantTtlMs) {
+            val projectSlug =
+                try {
+                    api.project().id().take(8)
+                } catch (_: Exception) {
+                    "default"
+                }
+            val cacheDir = File(System.getProperty("user.home"), ".burp-ai-agent/cache/$projectSlug")
+            persistentCache =
+                PersistentPromptCache(
+                    cacheDir = cacheDir,
+                    maxDiskBytes = wantMaxBytes,
+                    ttlMs = wantTtlMs,
+                )
+        }
+    } else {
+        persistentCache = null
+    }
+}

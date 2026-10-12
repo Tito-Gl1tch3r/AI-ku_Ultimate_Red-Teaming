@@ -1,0 +1,230 @@
+/******************************************************************************/
+/*
+ *
+ * Copyright 2012-2016 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+'use strict';
+
+const WISESource = require('./wiseSource.js');
+const util = require('util');
+const splunkjs = require('splunk-sdk');
+const iptrie = require('arkime-iptrie');
+const ArkimeUtil = require('../common/arkimeUtil');
+
+class SplunkSource extends WISESource {
+  // ----------------------------------------------------------------------------
+  async init() {
+    try {
+      this.service = new splunkjs.Service({ username: this.username, password: this.password, host: this.host, port: this.port, version: this.version });
+      const success = await this.service.login();
+
+      if (this.periodic) {
+        this.periodicRefresh(true);
+      }
+
+      console.log(this.section, 'Login was successful:', success);
+      this.api.addSource(this.section, this, [this.type]);
+    } catch (err) {
+      console.log(this.section, "ERROR - Couldn't login to splunk - ", util.inspect(err, false, 50));
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  constructor (api, section) {
+    super(api, section, { typeSetting: true, tagsSetting: true });
+
+    this.host = api.getConfig(section, 'host');
+    this.username = api.getConfig(section, 'username');
+    this.password = api.getConfig(section, 'password');
+    this.version = api.getConfig(section, 'version', 5);
+    this.port = api.getConfig(section, 'port', 8089);
+    this.periodic = api.getConfig(section, 'periodic');
+    this.query = api.getConfig(section, 'query');
+    this.mergeQuery = api.getConfig(section, 'mergeQuery');
+    // this.arrayPath = api.getConfig(section, 'arrayPath');
+    // no default so the required-check below can actually fire
+    this.keyPath = api.getConfig(section, 'keyPath', api.getConfig(section, 'keyColumn'));
+
+    let missing = false;
+    ['host', 'username', 'password', 'query', 'keyPath'].forEach((item) => {
+      if (this[item] === undefined) {
+        console.log(this.section, `- ERROR not loading since no ${item} specified in config file`);
+        missing = true;
+      }
+    });
+    if (missing) { return; }
+
+    if (this.periodic) {
+      this.cacheTimeout = -1; // Don't cache
+      this[this.api.funcName(this.type)] = this.sendResultPeriodic;
+      setInterval(this.periodicRefresh.bind(this), 1000 * this.periodic);
+    } else {
+      this[this.api.funcName(this.type)] = this.sendResult;
+    }
+
+    process.nextTick(() => {
+      this.init();
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  async periodicRefresh (firstTime) {
+    let query = this.query;
+    let merging = false;
+    if (this.mergeQuery && !firstTime) {
+      query = this.mergeQuery;
+      merging = true;
+    }
+    try {
+      const results = await this.service.oneshotSearch(query, { output_mode: 'json', count: 0 });
+
+      if (results === undefined || results.results === undefined) {
+        console.log(this.section, '- No results - ', results);
+        return;
+      }
+
+      let cache;
+      if (merging && this.cache !== undefined) {
+        cache = this.cache;
+      } else {
+        if (this.type === 'ip') {
+          cache = { items: new Map(), trie: new iptrie.IPTrie() };
+        } else {
+          cache = new Map();
+        }
+      }
+
+      for (const item of results.results) {
+        const key = item[this.keyPath];
+        if (!key) { continue; }
+
+        const args = this.parseJSONElement(item);
+
+        const newitem = WISESource.encodeResult.apply(null, args);
+
+        if (this.type === 'ip') {
+          if (!ArkimeUtil.addCidrToTrie(cache.trie, key, newitem, { mapV4: false })) {
+            console.log('ERROR adding', this.section, ArkimeUtil.sanitizeStr(key), '- not a usable CIDR');
+            continue;
+          }
+          cache.items.set(key, newitem);
+        } else {
+          cache.set(key, newitem);
+        }
+      }
+      this.cache = cache;
+    } catch (err) {
+      console.log(this.section, '- ERROR', err);
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  itemCount () {
+    if (this.cache) {
+      return this.type === 'ip' ? this.cache.items.size : this.cache.size;
+    } else {
+      return 0;
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  dump (res) {
+    if (this.cache === undefined) {
+      return res.end();
+    }
+
+    const cache = this.type === 'ip' ? this.cache.items : this.cache;
+    cache.forEach((value, key) => {
+      const str = `{"key": ${JSON.stringify(key)}, "ops":\n` +
+        WISESource.result2JSON(WISESource.combineResults([this.tagsResult, value])) + '},\n';
+      res.write(str);
+    });
+    res.end();
+  }
+
+  // ----------------------------------------------------------------------------
+  sendResultPeriodic (key, cb) {
+    if (!this.cache) {
+      return cb(null, undefined);
+    }
+
+    const result = this.type === 'ip' ? this.cache.trie.find(key) : this.cache.get(key);
+
+    // Not found, or found but no extra values to add
+    if (!result) {
+      return cb(null, undefined);
+    }
+    if (result[0] === 0) {
+      return cb(null, this.tagsResult);
+    }
+
+    // Found, so combine the two results (per item, and per source)
+    const newresult = WISESource.combineResults([result, this.tagsResult]);
+    return cb(null, newresult);
+  }
+
+  // ----------------------------------------------------------------------------
+  async sendResult (key, cb) {
+    // Keys are ips/domains/hashes/emails/urls, whitespace or control characters
+    // can only be an attempt to add search terms when the query doesn't quote
+    // %%SEARCHTERM%%, so never search for them
+    if (key === '' || /[\s\u0000-\u001f\u007f]/.test(key)) {
+      return cb(null, undefined);
+    }
+
+    // Backticks expand macros in SPL
+    const sanitizedKey = key.replace(/[\\"|[\]()`]/g, '\\$&');
+    // Replace with a function, otherwise a $' or $& in the key is treated as a
+    // replacement pattern and copies unescaped parts of the query into itself
+    const query = this.query.replace('%%SEARCHTERM%%', () => sanitizedKey);
+
+    try {
+      const results = await this.service.oneshotSearch(query, { output_mode: 'json', count: 0 });
+
+      if (!results.results || results.results.length === 0) {
+        return cb(null, undefined);
+      }
+
+      const item = results.results[0];
+
+      const args = this.parseJSONElement(item);
+      const newresult = WISESource.combineResults([WISESource.encodeResult.apply(null, args), this.tagsResult]);
+      return cb(null, newresult);
+    } catch (err) {
+      console.log(this.section, '- ERROR', err);
+      return cb(null, undefined);
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------
+exports.initSource = function (api) {
+  api.addSourceConfigDef('splunk', {
+    singleton: false,
+    name: 'splunk',
+    description: 'Fetch data from a Splunk server',
+    link: 'https://arkime.com/wise#splunk',
+    displayable: true,
+    fields: [
+      { name: 'type', required: true, help: 'The wise query type this source supports' },
+      { name: 'tags', required: false, help: 'Comma separated list of tags to set for matches', regex: '^[-a-z0-9,]+' },
+      { name: 'username', required: true, help: 'The Splunk username' },
+      { name: 'password', required: true, password: true, help: 'The Splunk password' },
+      { name: 'host', required: true, help: 'The Splunk hostname' },
+      // { name: 'arrayPath', required: false, help: "The path of where to find the array, if the json result isn't an array", ifField: 'format', ifValue: 'json' },
+      { name: 'keyPath', required: true, help: 'The path to use from the returned data to use as the key' },
+      { name: 'periodic', required: false, help: 'If set, the number of seconds between periodic full queries. If not set, an individual query is done per key.' },
+      { name: 'port', required: true, help: 'The Splunk port' },
+      { name: 'query', required: true, help: 'The query to run against Splunk. For non periodic queries the string %%SEARCHTERM%% will be replaced with the key' },
+      { name: 'mergeQuery', help: 'When in periodic mode, use this query after startup and merge the keyPath value into previous table' },
+      { name: 'version', required: false, help: 'The Splunk api version to use (defaults to 5)' }
+    ]
+  });
+
+  const sections = api.getConfigSections().filter((e) => { return e.match(/^splunk:/); });
+  sections.forEach((section) => {
+    return new SplunkSource(api, section);
+  });
+};

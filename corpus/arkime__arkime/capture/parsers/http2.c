@@ -1,0 +1,625 @@
+/* Copyright 2012-2017 AOL Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * https://http2.github.io/http2-spec/
+ */
+#include "arkime.h"
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include "nghttp2/nghttp2.h"
+
+#define OPENSSL_SUPPRESS_DEPRECATED
+#include <openssl/md5.h>
+
+//#define HTTPDEBUG 1
+
+#define MAX_URL_LENGTH 4096
+#define MAX_HTTP2_SIZE 20000
+#define MAX_STREAMS 16
+
+typedef struct {
+    uint32_t                 id;
+    uint8_t                  ended;
+    uint8_t                  md5Started;    // bit per which, streams are memset when reused
+    const char              *magicString[2];
+    MD5_CTX                  md5Ctx[2];
+    GChecksum               *sha256[2];
+    uint8_t                  authorityLen;  // lowercased :authority, used to build http.uri
+    char                     authority[255];
+} HTTP2Stream_t;
+
+typedef enum {
+    HTTP2_STATE_NORMAL,
+    HTTP2_STATE_IN_DATA
+} HTTP2InfoState_t;
+
+typedef struct {
+    nghttp2_hd_inflater     *hd_inflater[2];
+    uint8_t                  data[2][MAX_HTTP2_SIZE];
+    int                      used[2];
+    uint8_t                  lastType[2];
+    uint8_t                  dataPadding[2];
+    uint8_t                  isEnd[2];
+    int                      dataNeeded[2];
+    uint32_t                 dataStreamId[2];
+    int                      which;
+
+    int                      numStreams;
+    HTTP2Stream_t            streams[MAX_STREAMS];
+} HTTP2Info_t;
+
+#ifdef HTTPDEBUG
+LOCAL const char *http2_frameNames[] = {"DATA", "HEADERS", "PRIORITY", "RST_STREAM", "SETTINGS", "PUSH_PROMISE", "PING", "GOAWAY", "WINDOW_UPDATE", "CONTINUATION", "ALTSVC", "ORIGIN"};
+#endif
+
+
+extern ArkimeConfig_t        config;
+
+LOCAL  int statuscodeField;
+LOCAL  int methodField;
+LOCAL  int hostField;
+LOCAL  int magicField;
+LOCAL  int md5Field;
+LOCAL  int sha256Field;
+LOCAL  int urlsField;
+
+
+void http_common_parse_cookie(ArkimeSession_t *session, char *cookie, int len);
+void http_common_add_header(ArkimeSession_t *session, int pos, int isReq, const char *name, int namelen, const char *value, int valuelen);
+void http_common_parse_url(ArkimeSession_t *session, char *url, int len);
+
+/******************************************************************************/
+LOCAL int http2_spos_get(HTTP2Info_t *http2, uint32_t streamId, int create)
+{
+    streamId &= 0x7fffffff;
+    streamId++;
+
+    for (int i = 0; i < http2->numStreams; i++) {
+        if (streamId == http2->streams[i].id)
+            return i;
+    }
+
+    // Not found, if we aren't creating then return error
+    if (!create)
+        return -1;
+
+    // See if any slots are free and use that
+    for (int i = 0; i < http2->numStreams; i++) {
+        if (http2->streams[i].id == 0) {
+            http2->streams[i].id = streamId;
+            return i;
+        }
+    }
+
+    // See if we can add to the end
+    if (http2->numStreams == MAX_STREAMS)
+        return -1;
+    http2->streams[http2->numStreams].id = streamId;
+    http2->numStreams++;
+    return http2->numStreams - 1;
+}
+/******************************************************************************/
+LOCAL void http2_spos_free(HTTP2Info_t *http2, uint32_t streamId)
+{
+    streamId &= 0x7fffffff;
+    streamId++;
+
+    for (int i = 0; i < http2->numStreams; i++) {
+        if (streamId == http2->streams[i].id) {
+            if (http2->streams[i].sha256[0])
+                g_checksum_free(http2->streams[i].sha256[0]);
+            if (http2->streams[i].sha256[1])
+                g_checksum_free(http2->streams[i].sha256[1]);
+            memset(&http2->streams[i], 0, sizeof(http2->streams[i]));
+            return;
+        }
+    }
+}
+/******************************************************************************/
+LOCAL void http2_stream_end(HTTP2Info_t *http2, uint32_t streamId, int which)
+{
+    int spos = http2_spos_get(http2, streamId, FALSE);
+    if (spos == -1)
+        return;
+
+    http2->streams[spos].ended |= (1 << which);
+    if (http2->streams[spos].ended == 0x3)
+        http2_spos_free(http2, streamId);
+}
+/******************************************************************************/
+LOCAL void http2_parse_header_block(ArkimeSession_t *session, HTTP2Info_t *http2, int which, uint8_t flags, uint32_t streamId, uint8_t *in, int inlen)
+{
+    int spos = http2_spos_get(http2, streamId, TRUE);
+    if (spos == -1)
+        arkime_session_add_tag(session, "http2:too-many-streams");
+
+    if (!http2->hd_inflater[which])
+        nghttp2_hd_inflate_new(&http2->hd_inflater[which]);
+
+    int final = flags & NGHTTP2_FLAG_END_HEADERS;
+    int headerCount = 0;
+    size_t headerBytes = 0;
+
+    // :authority and :path can arrive in either order, buffer the path and
+    // combine once the fragment is done
+    char     path[MAX_URL_LENGTH];
+    int      pathLen = 0;
+    gboolean truncated = FALSE;
+    gboolean overBudget = FALSE;
+
+#ifdef HTTPDEBUG
+    LOG("%u,%d: which:%d inlen:%d final:%d %.*s", streamId, spos, which, inlen, final, inlen, in);
+    //arkime_print_hex_string(in, inlen);
+#endif
+
+    // https://nghttp2.org/documentation/nghttp2_hd_inflate_hd2.html
+    for (;;) {
+        nghttp2_nv nv;
+        int inflate_flags = 0;
+
+        ssize_t rv = nghttp2_hd_inflate_hd2(http2->hd_inflater[which], &nv, &inflate_flags,
+                                            in, inlen, final);
+
+        if (rv < 0) {
+            LOG_RATE(5, "inflate failed with error code %zd", rv);
+            return;
+        }
+
+        in += rv;
+        inlen -= rv;
+
+        if ((inflate_flags & NGHTTP2_HD_INFLATE_EMIT) && !overBudget) {
+            headerCount++;
+            headerBytes += nv.namelen + nv.valuelen;
+            if (headerCount > 256 || headerBytes > 65536) {
+                // Stop recording, but keep inflating
+                arkime_session_add_tag(session, "http2:hpack-budget-exceeded");
+                overBudget = TRUE;
+            } else if (nv.name[0] == ':') {
+                if (nv.namelen == 7 && memcmp(nv.name, ":method", 7) == 0) {
+                    arkime_field_string_add(methodField, session, (char *)nv.value, nv.valuelen, TRUE);
+                } else if (nv.namelen == 10 && memcmp(nv.name, ":authority", 10) == 0) {
+                    const uint8_t *colon = memchr(nv.value, ':', nv.valuelen);
+                    if (colon) {
+                        arkime_field_string_add(hostField, session, (char *)nv.value, colon - nv.value, TRUE);
+                    } else {
+                        arkime_field_string_add(hostField, session, (char *)nv.value, nv.valuelen, TRUE);
+                    }
+
+                    // http.uri keeps any port, like http/1 does
+                    if (spos != -1) {
+                        HTTP2Stream_t *stream = &http2->streams[spos];
+                        stream->authorityLen = MIN(nv.valuelen, sizeof(stream->authority));
+                        for (int i = 0; i < stream->authorityLen; i++)
+                            stream->authority[i] = g_ascii_tolower(nv.value[i]);
+                    }
+                } else if (nv.namelen == 5 && memcmp(nv.name, ":path", 5) == 0) {
+                    http_common_parse_url(session, (char *)nv.value, nv.valuelen);
+
+                    pathLen = MIN(nv.valuelen, sizeof(path));
+                    if ((size_t)pathLen != nv.valuelen)
+                        truncated = TRUE;
+                    memcpy(path, nv.value, pathLen);
+                } else if (nv.namelen == 7 && memcmp(nv.name, ":status", 7) == 0) {
+                    arkime_field_int_add(statuscodeField, session, arkime_atoin((const char *)nv.value, nv.valuelen));
+                }
+            } else {
+                http_common_add_header(session, 0, which == http2->which, (const char *)nv.name, nv.namelen, (const char *)nv.value, nv.valuelen);
+
+                if (nv.namelen == 6 && memcmp(nv.name, "cookie", 6) == 0) {
+                    http_common_parse_cookie(session, (char *)nv.value, nv.valuelen);
+                }
+            }
+#ifdef HTTPDEBUG
+            fwrite(nv.name, nv.namelen, 1, stderr);
+            fprintf(stderr, ": ");
+            fwrite(nv.value, nv.valuelen, 1, stderr);
+            fprintf(stderr, "\n");
+#endif
+        }
+        if (inflate_flags & NGHTTP2_HD_INFLATE_FINAL) {
+            nghttp2_hd_inflate_end_headers(http2->hd_inflater[which]);
+            break;
+        }
+        if ((inflate_flags & NGHTTP2_HD_INFLATE_EMIT) == 0 &&
+            inlen == 0) {
+            break;
+        }
+    }
+
+    if (pathLen == 0 || spos == -1)
+        return;
+
+    // http.uri is authority + path, matching what http/1 builds from Host + url
+    const HTTP2Stream_t *stream = &http2->streams[spos];
+    char                 uri[MAX_URL_LENGTH];
+    int                  uriLen = stream->authorityLen;
+
+    memcpy(uri, stream->authority, uriLen);
+
+    const int copyLen = MIN(pathLen, (int)sizeof(uri) - uriLen);
+    if (copyLen != pathLen)
+        truncated = TRUE;
+    memcpy(uri + uriLen, path, copyLen);
+    uriLen += copyLen;
+
+    arkime_field_string_add(urlsField, session, uri, uriLen, TRUE);
+
+    if (truncated)
+        arkime_session_add_tag(session, "http:url-truncated");
+}
+/******************************************************************************/
+/*
+ * https://http2.github.io/http2-spec/#HEADERS
+ * +---------------+
+ * |Pad Length? (8)|
+ * +-+-------------+-----------------------------------------------+
+ * |E|                 Stream Dependency? (31)                     |
+ * +-+-------------+-----------------------------------------------+
+ * |  Weight? (8)  |
+ * +-+-------------+-----------------------------------------------+
+ * |                   Header Block Fragment (*)                 ...
+ * +---------------------------------------------------------------+
+ * |                           Padding (*)                       ...
+ * +---------------------------------------------------------------+
+ */
+LOCAL void http2_parse_frame_headers(ArkimeSession_t *session, HTTP2Info_t *http2, int which, uint8_t flags, uint32_t streamId, uint8_t *in, int inlen)
+{
+    if (flags & NGHTTP2_FLAG_PADDED) {
+        if (inlen < 1)
+            return;
+        uint8_t padding = in[0];
+        if (padding >= inlen)
+            return;
+        in++;
+        inlen -= (1 + padding);
+    }
+
+    if (flags & NGHTTP2_FLAG_PRIORITY) {
+        if (inlen < 5)
+            return;
+        in += 5;
+        inlen -= 5;
+    }
+
+    http2_parse_header_block(session, http2, which, flags, streamId, in, inlen);
+}
+/******************************************************************************/
+/* https://http2.github.io/http2-spec/#PUSH_PROMISE
+ * +---------------+
+ * |Pad Length? (8)|
+ * +-+-------------+-----------------------------------------------+
+ * |R|                  Promised Stream ID (31)                    |
+ * +-+-----------------------------+-------------------------------+
+ * |                   Header Block Fragment (*)                 ...
+ * +---------------------------------------------------------------+
+ * |                           Padding (*)                       ...
+ * +---------------------------------------------------------------+
+ */
+LOCAL void http2_parse_frame_push_promise(ArkimeSession_t *session, HTTP2Info_t *http2, int which, uint8_t flags, uint32_t streamId, uint8_t *in, int inlen)
+{
+    if (flags & NGHTTP2_FLAG_PADDED) {
+        if (inlen < 1)
+            return;
+        uint8_t padding = in[0];
+        if (padding >= inlen)
+            return;
+        in++;
+        inlen -= (1 + padding);
+    }
+
+    // Promised Stream ID
+    if (inlen < 4)
+        return;
+    in += 4;
+    inlen -= 4;
+
+    http2_parse_header_block(session, http2, which, flags, streamId, in, inlen);
+}
+/******************************************************************************/
+/* https://http2.github.io/http2-spec/#DATA
+ * +---------------+
+ * |Pad Length? (8)|
+ * +---------------+-----------------------------------------------+
+ * |                            Data (*)                         ...
+ * +---------------------------------------------------------------+
+ * |                           Padding (*)                       ...
+ * +---------------------------------------------------------------+
+ */
+LOCAL void http2_parse_frame_data(ArkimeSession_t *session, HTTP2Info_t *http2, int which, uint8_t flags, uint32_t streamId, const uint8_t *in, int inlen, int initial)
+{
+    // If first packet check for padding/end and save it for when dataNeeded is 0
+    if (initial) {
+        if (flags & NGHTTP2_FLAG_PADDED) {
+            if (inlen < 1)
+                return;
+            http2->dataPadding[which] = in[0];
+            in++;
+            inlen--;
+        } else {
+            http2->dataPadding[which] = 0;
+        }
+        http2->isEnd[which] = (flags & NGHTTP2_FLAG_END_STREAM) != 0;
+    }
+
+    // If last packet in frame subtract saved padding
+    if (http2->dataNeeded[which] == 0) {
+        if (http2->dataPadding[which] > inlen)
+            return;
+        inlen -= http2->dataPadding[which];
+    }
+
+    int spos = http2_spos_get(http2, streamId, FALSE);
+    if (spos == -1) {
+        arkime_session_add_tag(session, "http2:data-frame-after-close");
+        return;
+    }
+
+    // Only get magic string on first frame
+    if (initial) {
+        http2->streams[spos].magicString[which] = arkime_parsers_magic(session, magicField, (char *)in, inlen);
+    }
+
+    // Start the hashes on the first data for this stream/direction
+    if (!(http2->streams[spos].md5Started & (1 << which))) {
+        MD5_Init(&http2->streams[spos].md5Ctx[which]);
+        http2->streams[spos].md5Started |= (1 << which);
+        if (config.supportSha256 && !http2->streams[spos].sha256[which]) {
+            http2->streams[spos].sha256[which] = g_checksum_new(G_CHECKSUM_SHA256);
+        }
+    }
+
+    MD5_Update(&http2->streams[spos].md5Ctx[which], in, inlen);
+    if (config.supportSha256) {
+        g_checksum_update(http2->streams[spos].sha256[which], (guchar *)in, inlen);
+    }
+
+    // If the first packet in the frame said this is end and we've read them all, set the md5/sha fields
+    if (http2->isEnd[which] && http2->dataNeeded[which] == 0) {
+        uint8_t digest[MD5_DIGEST_LENGTH];
+        char    md5[MD5_DIGEST_LENGTH * 2 + 1];
+        MD5_Final(digest, &http2->streams[spos].md5Ctx[which]);
+        arkime_sprint_hex_string(md5, digest, MD5_DIGEST_LENGTH);
+        arkime_field_string_uw_add(md5Field, session, md5, 32, (gpointer)http2->streams[spos].magicString[which], TRUE);
+        http2->streams[spos].md5Started &= ~(1 << which);   // re-init on the next body
+        if (config.supportSha256) {
+            const char *sha256 = g_checksum_get_string(http2->streams[spos].sha256[which]);
+            arkime_field_string_uw_add(sha256Field, session, (char *)sha256, 64, (gpointer)http2->streams[spos].magicString[which], TRUE);
+            g_checksum_reset(http2->streams[spos].sha256[which]);
+        }
+    }
+}
+/******************************************************************************/
+LOCAL int http2_parse_frame(ArkimeSession_t *session, HTTP2Info_t *http2, int which)
+{
+    BSB bsb;
+    BSB_INIT(bsb, http2->data[which], http2->used[which]);
+
+    uint32_t            len = 0;
+    nghttp2_frame_type  type = 0;
+    uint8_t             flags = 0;
+    uint32_t            streamId = 0;
+
+    BSB_IMPORT_u24(bsb, len);
+    BSB_IMPORT_u08(bsb, type);
+    BSB_IMPORT_u08(bsb, flags);
+    BSB_IMPORT_u32(bsb, streamId);
+
+    if (BSB_IS_ERROR(bsb))
+        goto cleanup;
+
+    // type will only be DATA if this is the first part of a data frame, anything else will be shortcutted in http_parse
+    if (type == NGHTTP2_DATA) {
+        if (len > (1 << 20)) {
+            arkime_session_add_tag(session, "http2:data-frame-too-large");
+            return 1;
+        }
+        int dataLen = MIN((int)len, BSB_REMAINING(bsb));
+        http2->dataStreamId[which] = streamId;
+        if (len > BSB_REMAINING(bsb)) {
+            http2->used[which] = 0;
+            http2->dataNeeded[which] = len - BSB_REMAINING(bsb);
+        } else {
+            http2->dataNeeded[which] = 0;
+        }
+        http2_parse_frame_data(session, http2, which, flags, streamId, BSB_WORK_PTR(bsb), dataLen, TRUE);
+
+        // Don't need to memmove below
+        if (http2->dataNeeded[which] != 0)
+            return 0;
+    }
+
+    if (len > BSB_REMAINING(bsb) && type != NGHTTP2_DATA) {
+        return 1;
+    }
+
+    if (type == NGHTTP2_CONTINUATION) {
+        type = http2->lastType[which];
+    }
+
+#ifdef HTTPDEBUG
+    LOG("which: %d len: %u, type: %u (%s), flags: 0x%x, streamId: %u", which, len, type, http2_frameNames[type], flags, streamId);
+#endif
+    switch (type) {
+    case NGHTTP2_HEADERS:
+        http2_parse_frame_headers(session, http2, which, flags, streamId, BSB_WORK_PTR(bsb), len);
+        break;
+    case NGHTTP2_PUSH_PROMISE:
+        http2_parse_frame_push_promise(session, http2, which, flags, streamId, BSB_WORK_PTR(bsb), len);
+        break;
+    case NGHTTP2_RST_STREAM:
+        http2_spos_free(http2, streamId);
+        break;
+    default:
+        break;
+    }
+    http2->lastType[which] = type;
+
+    if (flags & NGHTTP2_FLAG_END_STREAM) {
+        http2_stream_end(http2, streamId, which);
+    }
+
+cleanup:
+    http2->used[which] -= (9 + len);
+    memmove(http2->data[which], http2->data[which] + 9 + len, http2->used[which]);
+
+    return 0;
+}
+/******************************************************************************/
+LOCAL int http2_parse(ArkimeSession_t *session, void *uw, const uint8_t *data, int len, int which)
+{
+    HTTP2Info_t            *http2          = uw;
+
+#ifdef HTTPDEBUG
+    LOG("HTTPDEBUG which: %d used: %d len: %d", which, http2->used[which], len);
+#endif
+
+
+    if (http2->dataNeeded[which] > 0) {
+        int used = MIN(http2->dataNeeded[which], len);
+        http2->dataNeeded[which] -= used;
+        http2_parse_frame_data(session, http2, which, 0, http2->dataStreamId[which], data, used, FALSE);
+        if (http2->dataNeeded[which] == 0 && http2->isEnd[which])
+            http2_stream_end(http2, http2->dataStreamId[which], which);
+        if (used == len)
+            return 0;
+
+        data += used;
+        len -= used;
+    }
+
+    if (len > MAX_HTTP2_SIZE - http2->used[which]) {
+#ifdef HTTPDEBUG
+        arkime_print_hex_string(http2->data[which], http2->used[which]);
+        LOG("TOO MUCH DATA");
+#endif
+        return ARKIME_PARSER_UNREGISTER;
+    }
+    memcpy(http2->data[which] + http2->used[which], data, len);
+    http2->used[which] += len;
+
+    if (http2->used[which] > 24 && http2->data[which][0] == 'P' && memcmp(http2->data[which], "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0) {
+        http2->which = which; // only the client sends the preface
+        http2->used[which] -= 24;
+        memmove(http2->data[which], http2->data[which] + 24, http2->used[which]);
+    }
+
+    while (http2->used[which] >= 9) {
+        if (http2_parse_frame(session, http2, which))
+            break;
+    }
+
+    return 0;
+}
+/******************************************************************************/
+LOCAL void http2_save(ArkimeSession_t UNUSED(*session), void *UNUSED(uw), int final)
+{
+    if (!final)
+        return;
+
+//    HTTP2Info_t            *http2          = uw;
+
+#ifdef HTTPDEBUG
+    LOG("Save callback %d", final);
+#endif
+}
+/******************************************************************************/
+LOCAL void http2_free(ArkimeSession_t UNUSED(*session), void *uw)
+{
+    HTTP2Info_t            *http2          = uw;
+
+    if (http2->hd_inflater[0]) {
+        nghttp2_hd_inflate_del(http2->hd_inflater[0]);
+    }
+    if (http2->hd_inflater[1]) {
+        nghttp2_hd_inflate_del(http2->hd_inflater[1]);
+    }
+    for (int i = 0; i < http2->numStreams; i++) {
+        if (http2->streams[i].sha256[0])
+            g_checksum_free(http2->streams[i].sha256[0]);
+        if (http2->streams[i].sha256[1])
+            g_checksum_free(http2->streams[i].sha256[1]);
+    }
+    ARKIME_TYPE_FREE(HTTP2Info_t, http2);
+}
+/******************************************************************************/
+LOCAL void http2_classify(ArkimeSession_t *session, const uint8_t *UNUSED(data), int UNUSED(len), int which, void *UNUSED(uw))
+{
+    if (arkime_session_has_protocol(session, "http2"))
+        return;
+    arkime_session_add_protocol(session, "http2");
+
+    HTTP2Info_t            *http2          = ARKIME_TYPE_ALLOC0(HTTP2Info_t);
+    http2->which = which;
+
+    arkime_parsers_register2(session, http2_parse, http2, http2_free, http2_save);
+}
+/******************************************************************************/
+// Called by the http parser on a 101 h2c upgrade, uw is the http parser's state which this
+// takes over from. The data may be the server's first frames, the client's preface sets which
+LOCAL int http2_upgrade_sub(ArkimeSession_t *session, void *uw, const uint8_t *data, int remaining, int which)
+{
+    HTTP2Info_t            *http2          = ARKIME_TYPE_ALLOC0(HTTP2Info_t);
+    http2->which = -1;
+
+    if (!arkime_parsers_replace(session, uw, http2_parse, http2, http2_free, http2_save))
+        return 0;
+
+    arkime_session_add_protocol(session, "http2");
+
+    if (remaining > 0 && http2_parse(session, http2, data, remaining, which) == ARKIME_PARSER_UNREGISTER)
+        arkime_parsers_unregister(session, http2);
+    return 0;
+}
+/******************************************************************************/
+void arkime_parser_init()
+{
+    arkime_parsers_classifier_register_tcp("http2", NULL, 0, (uint8_t *)"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24, http2_classify);
+    arkime_parsers_register_sub("http", "http2", http2_upgrade_sub, NULL);
+
+    methodField = arkime_field_define("http", "termfield",
+                                      "http.method", "HTTP Request Method", "http.method",
+                                      "HTTP Request Method",
+                                      ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                      (char *)NULL);
+    statuscodeField = arkime_field_define("http", "integer",
+                                          "http.statuscode", "HTTP Status Code", "http.statuscode",
+                                          "Response HTTP numeric status code",
+                                          ARKIME_FIELD_TYPE_INT_GHASH,  ARKIME_FIELD_FLAG_CNT,
+                                          (char *)NULL);
+    hostField = arkime_field_define("http", "lotermfield",
+                                    "host.http", "HTTP Host", "http.host",
+                                    "HTTP host header field",
+                                    ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                    "aliases", "[\"http.host\"]",
+                                    "category", "host",
+                                    (char *)NULL);
+    magicField = arkime_field_define("http", "termfield",
+                                     "http.bodymagic", "HTTP Body Magic", "http.bodyMagic",
+                                     "The content type of body determined by libfile/magic",
+                                     ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                     (char *)NULL);
+    md5Field = arkime_field_define("http", "lotermfield",
+                                   "http.md5", "HTTP Body MD5", "http.md5",
+                                   "MD5 of http body response",
+                                   ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                   "category", "md5",
+                                   (char *)NULL);
+
+    urlsField = arkime_field_define("http", "termfield",
+                                    "http.uri", "HTTP URI", "http.uri",
+                                    "URIs for request",
+                                    ARKIME_FIELD_TYPE_STR_HASH, ARKIME_FIELD_FLAG_CNT,
+                                    "category", "[\"url\",\"host\"]",
+                                    (char *)NULL);
+
+    if (config.supportSha256) {
+        sha256Field = arkime_field_define("http", "lotermfield",
+                                          "http.sha256", "HTTP Body SHA256", "http.sha256",
+                                          "SHA256 of http body response",
+                                          ARKIME_FIELD_TYPE_STR_HASH,  ARKIME_FIELD_FLAG_CNT,
+                                          "category", "sha256",
+                                          (char *)NULL);
+    }
+}

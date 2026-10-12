@@ -1,0 +1,353 @@
+"""Shared helper functions for angr-based analysis tools."""
+import threading
+from typing import Dict, Any
+
+from arkana.config import state, logger, ANGR_AVAILABLE
+
+if ANGR_AVAILABLE:
+    import angr
+
+# Serialize project/CFG initialization to prevent duplicate expensive builds
+_init_lock = threading.Lock()
+
+
+def _make_return_hook(rv, bits):
+    """H1: Factory function to create a SimProcedure with correct closure binding."""
+    class _ReturnHook(angr.SimProcedure):
+        def run(self):
+            return self.state.solver.BVV(rv, bits)
+    return _ReturnHook()
+
+
+def _rebuild_project_with_hooks():
+    """Rebuild the angr project from scratch and re-apply user hooks.
+
+    Hooking modifies the project's internal ``_sim_procedures`` mapping, which
+    can leave stale ``BlockNode`` references in the knowledge base after the
+    CFG is invalidated.  Recreating the project and re-applying hooks gives
+    ``CFGFast`` a clean slate so every block in the resulting graph is
+    consistent.
+    """
+    proj = angr.Project(state.filepath, auto_load_libs=False)
+
+    with state._angr_lock:
+        hooks_snapshot = dict(state.angr_hooks)
+    for key, info in hooks_snapshot.items():
+        ret_raw = info.get("return_value", "void")
+        nop = info.get("nop", False)
+
+        ret_val = None
+        if ret_raw != "void":
+            ret_val = int(ret_raw, 16)
+        elif nop:
+            ret_val = 0
+
+        # Build the same SimProcedure that hook_function creates
+        if ret_val is not None:
+            hook_proc = _make_return_hook(ret_val, proj.arch.bits)
+        else:
+            class _VoidHook(angr.SimProcedure):
+                IS_FUNCTION = True
+                def run(self):
+                    return
+
+            hook_proc = _VoidHook()
+
+        # Install: hex address → proj.hook, symbol name → proj.hook_symbol
+        try:
+            addr = int(key, 16)
+            proj.hook(addr, hook_proc)
+        except ValueError:
+            try:
+                proj.hook_symbol(key, hook_proc)
+            except Exception as e:
+                logger.warning("Failed to re-apply hook for '%s' during CFG rebuild: %s", key, e)
+
+    state.set_angr_results(proj, None, state.angr_loop_cache, state.angr_loop_cache_config)
+
+
+def _ensure_project_and_cfg():
+    """Ensure angr project and CFG are initialized.
+
+    Uses a module-level lock to prevent concurrent callers from both
+    creating separate ``angr.Project`` instances (expensive) when the
+    first caller has not yet stored its result.
+
+    CFG construction is performed outside the lock to avoid blocking ALL
+    angr-based tools across ALL sessions when a pathological binary causes
+    the CFGFast analysis to hang.
+
+    Lock ordering: _init_lock -> state._angr_lock. Never acquire _angr_lock then _init_lock.
+    """
+    with _init_lock:
+        project, cfg = state.get_angr_snapshot()
+        if project is None:
+            project = angr.Project(state.filepath, auto_load_libs=False)
+            state.set_angr_results(project, None, state.angr_loop_cache, state.angr_loop_cache_config)
+        need_cfg = cfg is None
+
+    if need_cfg:
+        with _init_lock:
+            # Re-check under lock — another thread may have built the CFG
+            project, cfg = state.get_angr_snapshot()
+            if cfg is not None:
+                return
+            with state._angr_lock:
+                has_hooks = bool(state.angr_hooks)
+            if has_hooks:
+                _rebuild_project_with_hooks()
+                project, cfg = state.get_angr_snapshot()
+        if cfg is None:
+            # Refresh project reference after potential hooks rebuild
+            project, _ = state.get_angr_snapshot()
+            # Snapshot hook count before CFG build to detect concurrent additions
+            with state._angr_lock:
+                hooks_before = len(state.angr_hooks)
+            # Build CFG outside the lock to avoid blocking other tools
+            new_cfg = project.analyses.CFGFast(normalize=True)
+            # Check if hooks were added during the (potentially long) CFG build.
+            # If so, the CFG may not reflect the hooked functions correctly.
+            # We don't rebuild (too expensive) but log the inconsistency.
+            with state._angr_lock:
+                hooks_after = len(state.angr_hooks)
+            if hooks_after > hooks_before:
+                logger.warning(
+                    "Hooks added during CFG build (%d -> %d). "
+                    "The CFG may not reflect hooked functions. "
+                    "Consider calling hook_function() before triggering CFG construction, "
+                    "or invalidate the CFG to force a rebuild.",
+                    hooks_before, hooks_after,
+                )
+            with _init_lock:
+                # Only store if no other thread beat us to it
+                _, existing_cfg = state.get_angr_snapshot()
+                if existing_cfg is None:
+                    # Read loop cache fields inside _init_lock to ensure consistency
+                    loop_cache = state.angr_loop_cache
+                    loop_cache_config = state.angr_loop_cache_config
+                    state.set_angr_results(project, new_cfg, loop_cache, loop_cache_config)
+
+
+def _build_region_cfg(project, target_addr: int, region_size: int = 0x10000):
+    """Build a small CFG around *target_addr* without a full-binary scan.
+
+    Uses ``CFGFast(regions=..., function_starts=...)`` to restrict analysis
+    to a region around the target.  Much faster than full-binary CFG and
+    sufficient for single-function decompilation.
+
+    Note: 64KB region may clip very large functions. Consider expanding if func.size is known.
+    """
+    obj = project.loader.find_object_containing(target_addr)
+    if obj is None:
+        raise RuntimeError(f"Address {hex(target_addr)} not in any loaded object.")
+    region_start = max(target_addr - region_size // 2, obj.min_addr)
+    region_end = min(target_addr + region_size // 2, obj.max_addr)
+    return project.analyses.CFGFast(
+        normalize=True,
+        regions=[(region_start, region_end)],
+        function_starts=[target_addr],
+    )
+
+
+def _parse_addr(hex_string: str, name: str = "address") -> int:
+    """Parse an address string (hex or decimal) to int."""
+    try:
+        # int(x, 0) auto-detects base: 0x prefix → hex, plain digits → decimal
+        return int(hex_string, 0)
+    except ValueError:
+        raise ValueError(f"Invalid {name} format. Provide a hex string like '0x401000' or a decimal integer.")
+
+
+def _resolve_function_address(target_addr: int):
+    """Resolve a function address, trying RVA-to-VA correction if needed.
+    Returns (function_object, address_used).
+
+    Uses a local snapshot of the CFG to avoid races with background workers
+    that may replace ``state.angr_cfg`` between the lock release inside
+    ``_ensure_project_and_cfg()`` and the attribute access here.
+    """
+    _ensure_project_and_cfg()
+    # Take a local snapshot so a concurrent reset cannot set cfg to None
+    _project, cfg = state.get_angr_snapshot()
+    if cfg is None:
+        raise RuntimeError(
+            "CFG is not available. The background analysis may still be running "
+            "or was reset. Use check_task_status('startup-angr') to monitor progress."
+        )
+    addr_to_use = target_addr
+
+    if addr_to_use not in cfg.functions:
+        pe_obj = state.pe_object
+        if (pe_obj
+                and hasattr(pe_obj, 'OPTIONAL_HEADER')
+                and pe_obj.OPTIONAL_HEADER):
+            image_base = pe_obj.OPTIONAL_HEADER.ImageBase
+            potential_va = target_addr + image_base
+            if potential_va in cfg.functions:
+                addr_to_use = potential_va
+
+    try:
+        func = cfg.functions[addr_to_use]
+    except KeyError:
+        raise KeyError(
+            f"No function found at address {hex(addr_to_use)}. "
+            f"Use get_function_map() to list known functions."
+        )
+    return func, addr_to_use
+
+
+def _raise_on_error_dict(result):
+    """Convert an ``{"error": "..."}`` dict return into a RuntimeError.
+
+    Many inner synchronous helpers return error dicts instead of raising.
+    Calling this after ``asyncio.to_thread`` standardises the pattern so
+    every tool failure surfaces as an exception that the MCP framework
+    converts to an ``isError=True`` response.
+    """
+    if isinstance(result, dict) and "error" in result:
+        # Only treat as error dict if it looks like one — not a legitimate
+        # result that happens to have an "error" key alongside many others.
+        other_keys = set(result) - {"error", "hint", "note"}
+        if not other_keys:
+            hint = result.get("hint", "")
+            msg = result["error"]
+            if hint:
+                msg = f"{msg} ({hint})"
+            raise RuntimeError(msg)
+    return result
+
+
+DECOMPILE_FALLBACK_NOTE = (
+    "Decompiled without full CFG context due to an angr internal error "
+    "(cffi pickle incompatibility). Pseudocode quality may be reduced — "
+    "cross-references, callee resolution, and type propagation are limited."
+)
+
+
+def _safe_decompile(project, func, cfg_model):
+    """Run angr's Decompiler with a fallback for cffi pickle errors.
+
+    angr's Clinic pass uses ``copy.copy()`` on AIL blocks.  Python's copy
+    module falls back to pickle (``__reduce__``) for objects that don't
+    implement ``__copy__``.  When a block contains cffi-backed VEX/capstone
+    data (``_cffi_backend._CDataBase``), the copy fails with
+    "cannot pickle '_cffi_backend._CDataBase' object".
+
+    This is more likely on local/region-scoped CFGs where the CFG model
+    retains more raw, unprocessed cffi objects.
+
+    Strategy: on pickle-related errors, retry with ``cfg=None`` which forces
+    angr to use a minimal internal CFG path that avoids the problematic
+    copy operations.
+
+    Returns ``(decompiler_result, used_fallback)`` tuple.
+    ``used_fallback`` is True when the cfg=None retry path was taken.
+    """
+    try:
+        return project.analyses.Decompiler(func, cfg=cfg_model), False
+    except Exception as e:
+        err_str = str(e)
+        if "pickle" in err_str or "CDataBase" in err_str or "CData" in err_str:
+            logger.warning(
+                "Decompiler pickle error for %s — retrying with cfg=None: %s",
+                func.name, err_str,
+            )
+            try:
+                return project.analyses.Decompiler(func, cfg=None), True
+            except Exception as fallback_err:
+                fallback_str = str(fallback_err)
+                if "pickle" in fallback_str or "CData" in fallback_str:
+                    logger.warning(
+                        "Decompiler cfg=None fallback also hit pickle error for %s: %s",
+                        func.name, fallback_str,
+                    )
+                    raise RuntimeError(
+                        f"Decompiler cffi pickle error on both attempts for {func.name}. "
+                        "This function contains VEX IR data that angr cannot copy internally. "
+                        "Use get_annotated_disassembly() instead for this function."
+                    ) from e
+                raise RuntimeError(
+                    f"Decompiler failed (original: pickle error, "
+                    f"fallback: {fallback_err})"
+                ) from e
+        raise
+
+
+def _cleanup_kb_decompile_artifacts(project, func_addr):
+    """Remove decompiler-internal KB artifacts for a function after caching.
+
+    After decompiled text is cached in _decompile_meta, the angr KB retains
+    StructuredCodeGenerator and Clinic objects that are never reused. Clearing
+    them per-function reclaims ~200KB-1MB each.
+
+    Does NOT clear kb.variables — used by get_function_variables and dashboard.
+    """
+    try:
+        kb = project.kb
+        if hasattr(kb, 'structured_code'):
+            sc = kb.structured_code
+            if hasattr(sc, '_results'):
+                keys_to_remove = [k for k in sc._results if isinstance(k, tuple) and k[0] == func_addr]
+                for k in keys_to_remove:
+                    del sc._results[k]
+        if hasattr(kb, 'clinic'):
+            clinic = kb.clinic
+            if hasattr(clinic, '_results') and func_addr in clinic._results:
+                del clinic._results[func_addr]
+    except Exception:
+        pass  # Best-effort cleanup
+
+
+def _format_cc_info(func) -> Dict[str, Any]:
+    """Format calling convention info for a single angr Function object."""
+    info: Dict[str, Any] = {
+        "function_name": func.name,
+        "address": hex(func.addr),
+    }
+    cc = func.calling_convention
+    if cc:
+        info["calling_convention"] = cc.__class__.__name__
+        try:
+            info["arg_locations"] = [str(a) for a in cc.ARG_REGS[:8]] if hasattr(cc, "ARG_REGS") else []
+        except Exception:
+            info["arg_locations"] = []
+        try:
+            info["return_location"] = str(cc.RETURN_VAL) if hasattr(cc, "RETURN_VAL") else None
+        except Exception:
+            info["return_location"] = None
+        # Try to extract argument objects from cc.args
+        try:
+            if hasattr(cc, 'args') and cc.args:
+                info["num_args"] = len(cc.args)
+                info["arg_details"] = [str(a) for a in cc.args[:8]]
+        except Exception:
+            logger.debug("_format_cc_info: failed to extract cc.args details", exc_info=True)
+    proto = func.prototype
+    if proto:
+        try:
+            info["prototype"] = str(proto)
+        except Exception:
+            info["prototype"] = repr(proto)
+        try:
+            info["num_args"] = len(proto.args) if hasattr(proto, "args") else None
+        except Exception:
+            info["num_args"] = None
+
+    # Even without a formal CC, provide useful heuristic data
+    if not cc and not proto:
+        try:
+            info["block_count"] = func.graph.number_of_nodes() if func.graph else len(list(func.blocks))  # L6-v10: O(1)
+            info["has_return"] = func.has_return
+            info["is_plt"] = getattr(func, 'is_plt', False)
+            info["is_simprocedure"] = func.is_simprocedure
+            info["binary_name"] = getattr(func, 'binary_name', None)
+        except Exception:
+            logger.debug("_format_cc_info: failed to get heuristic func data", exc_info=True)
+        info["note"] = (
+            "Calling convention analysis did not produce results for this function. "
+            "This typically happens with small/leaf functions, thunks, or functions "
+            "without clear parameter passing patterns. Try decompile_function_with_angr() "
+            "for pseudocode that infers parameters from usage context."
+        )
+
+    return info

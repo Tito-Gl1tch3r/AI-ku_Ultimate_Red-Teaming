@@ -1,0 +1,141 @@
+import { expect, vi } from 'vitest';
+import path from 'node:path';
+import { EnvGraph, DotEnvFileDataSource } from '../env-graph/index';
+import type { Constructor } from '@env-spec/utils/type-utils';
+
+type ErrorClass = Constructor<Error>;
+
+export type PluginTestSpec = {
+  /** inline .env.schema contents */
+  schema: string;
+  /**
+   * Values to inject (simulates process.env / override values).
+   * These override any values in the schema for the matching keys.
+   */
+  injectValues?: Record<string, string>;
+  /**
+   * directory to resolve relative paths from (plugin path, fixture paths, etc.)
+   * defaults to the directory of the calling test file
+   */
+  resolveDir?: string;
+  /** expected resolved values */
+  expectValues?: Record<string, string | number | boolean | undefined | ErrorClass>;
+  /** expect specific items to be sensitive */
+  expectSensitive?: Record<string, boolean>;
+  /** expect an error during schema loading / plugin init (before resolution) */
+  expectSchemaError?: boolean;
+  /** print debug info on failure */
+  debug?: boolean;
+};
+
+/**
+ * Create a test function that loads an env schema with a plugin and verifies resolved values.
+ *
+ * The schema string should include the `@plugin(...)` and `@init*()` decorators.
+ * Relative paths in the schema (plugin path, file paths) resolve relative to
+ * `resolveDir` (defaults to the test file's directory).
+ *
+ * @example
+ * ```ts
+ * test('reads password from kdbx', pluginTest({
+ *   schema: outdent`
+ *     # @plugin(../../)
+ *     # @initKeePass(dbPath="./fixtures/test.kdbx", password=$KP_PW)
+ *     # ---
+ *     KP_PW=test
+ *     SECRET=kp("myEntry")
+ *   `,
+ *   expectValues: { SECRET: 'expected-password-value' },
+ * }));
+ * ```
+ */
+export function pluginTest(spec: PluginTestSpec) {
+  return async () => {
+    const resolveDir = spec.resolveDir || path.dirname(expect.getState().testPath!);
+    vi.spyOn(process, 'cwd').mockReturnValue(resolveDir);
+
+    const g = new EnvGraph();
+
+    // inject override values (e.g., passwords needed by the plugin)
+    if (spec.injectValues) {
+      g.overrideValues = { ...g.overrideValues, ...spec.injectValues };
+    }
+
+    // create a data source with the schema contents
+    // use a full path so plugin relative paths resolve correctly
+    const schemaPath = path.join(resolveDir, '.env.schema');
+    const source = new DotEnvFileDataSource(schemaPath, {
+      overrideContents: spec.schema,
+    });
+    await g.setRootDataSource(source);
+    await g.finishLoad();
+
+    if (spec.debug) {
+      /* eslint-disable no-console */
+      for (const p of g.plugins) {
+        if (p.loadingError) console.log('Plugin loading error:', p.loadingError);
+      }
+      for (const ds of g.sortedDataSources) {
+        if (ds.loadingError) console.log('Data source loading error:', ds.loadingError);
+        for (const err of ds.schemaErrors) {
+          console.log('Schema error:', err);
+        }
+      }
+      /* eslint-enable no-console */
+    }
+
+    if (spec.expectSchemaError) {
+      const allErrors = [
+        ...g.sortedDataSources.flatMap((s) => s.errors.filter((e) => !e.isWarning)),
+        ...g.plugins.filter((p) => p.loadingError).map((p) => p.loadingError!),
+      ];
+      expect(allErrors.length, 'Expected an error, but none found').toBeGreaterThan(0);
+      return; // don't resolve if we expected errors
+    }
+
+    // verify no unexpected errors
+    const firstError = [
+      ...g.sortedDataSources.flatMap((s) => s.errors),
+      ...g.plugins.filter((p) => p.loadingError).map((p) => p.loadingError!),
+    ].find((e) => !e.isWarning);
+    expect(firstError, `Unexpected error: ${firstError?.message}`).toBeFalsy();
+
+    await g.resolveEnvValues();
+
+    if (spec.expectValues) {
+      for (const [key, expected] of Object.entries(spec.expectValues)) {
+        const item = g.configSchema[key];
+        expect(item, `Expected item "${key}" to exist in schema`).toBeDefined();
+
+        // warnings are advisory by design (e.g. the short-sensitive-value rule), and the
+        // source-level check above already ignores them. Both branches have to agree: a
+        // fixture must not be failed by an advisory warning, and an advisory warning must
+        // not be able to satisfy an expected error - a resolver that wrongly returns a
+        // short value would otherwise pass `expectValues: { KEY: Error }` unnoticed.
+        const realErrors = item.errors.filter((e) => !e.isWarning);
+
+        if (typeof expected === 'function' && (expected === Error || expected.prototype instanceof Error)) {
+          expect(realErrors.length, `Expected errors on "${key}"`).toBeGreaterThan(0);
+          if (expected !== Error) {
+            expect(realErrors[0]).toBeInstanceOf(expected);
+          }
+        } else {
+          if (realErrors.length > 0) {
+            expect.fail(`Unexpected errors on "${key}": ${realErrors.map((e: Error) => e.message).join(', ')}`);
+          }
+          expect(item.resolvedValue, `Value of "${key}"`).toEqual(expected);
+        }
+      }
+    }
+
+    if (spec.expectSensitive) {
+      for (const [key, expected] of Object.entries(spec.expectSensitive)) {
+        const item = g.configSchema[key];
+        expect(item, `Expected item "${key}" to exist in schema`).toBeDefined();
+        expect(item.isSensitive, `Expected "${key}" sensitive=${expected}`).toBe(expected);
+      }
+    }
+
+    return g;
+  };
+}

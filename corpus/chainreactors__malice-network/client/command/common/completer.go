@@ -1,0 +1,691 @@
+package common
+
+import (
+	"encoding/json"
+	"fmt"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/certs"
+	"github.com/chainreactors/malice-network/helper/implanttypes"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/carapace-sh/carapace"
+	"github.com/chainreactors/malice-network/client/assets"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"github.com/spf13/cobra"
+)
+
+//func LocalPathCompleter(prefix string, args []string, con *repl.Console) []string {
+//	var parent string
+//	var partial string
+//	//var sep string
+//	//
+//	//if runtime.GOOS == "windows" {
+//	//	sep = "\\"
+//	//} else {
+//	//	sep = "/"
+//	//}
+//	fi, err := os.Stat(prefix)
+//	if os.IsNotExist(err) {
+//		parent = filepath.Dir(prefix)
+//		partial = filepath.Base(prefix)
+//	} else {
+//		if fi.IsDir() {
+//			parent = prefix
+//			partial = ""
+//		} else {
+//			parent = filepath.Dir(prefix)
+//			partial = filepath.Base(prefix)
+//		}
+//	}
+//	results := []string{}
+//	ls, err := ioutil.ReadDir(parent)
+//	if err != nil {
+//		return results
+//	}
+//	for _, fi = range ls {
+//		if 0 < len(partial) {
+//			if strings.HasPrefix(fi.Name(), partial) {
+//				results = append(results, filepath.Join(parent, fi.Name()))
+//			}
+//		} else {
+//			results = append(results, filepath.Join(parent, fi.Name()))
+//		}
+//	}
+//	return results
+//}
+
+func SessionIDCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for _, s := range con.AlivedSessions() {
+			if s.Note != "" {
+				results = append(results, s.SessionId, fmt.Sprintf("SessionAlias, %s，%s", s.Note, s.Target))
+			} else {
+				results = append(results, s.SessionId, fmt.Sprintf("SessionID, %s", s.Target))
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("session id")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func AllSessionIDCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		con.UpdateSessions(true)
+		results := make([]string, 0)
+		for _, s := range con.SnapshotSessions() {
+			if s.Note != "" {
+				results = append(results, s.SessionId, fmt.Sprintf("SessionAlias, %s，%s", s.Note, s.Target))
+			} else {
+				results = append(results, s.SessionId, fmt.Sprintf("SessionID, %s", s.Target))
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("session id")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ListenerIDCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+
+		for _, listener := range con.SnapshotListeners() {
+			results = append(results, listener.Id, fmt.Sprintf("ListenerID, %s", listener.Id))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("listener id")
+	}
+	return carapace.ActionCallback(callback)
+
+}
+
+func ForwardListenerIDCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		statuses, err := con.Rpc.ListForwardListeners(con.Context(), &clientpb.Empty{})
+		if err != nil {
+			return carapace.ActionValuesDescribed(results...).Tag("forward listener id")
+		}
+		for _, status := range statuses.GetListeners() {
+			listenerID := status.GetListenerId()
+			if listenerID == "" || !status.GetActive() {
+				continue
+			}
+			results = append(results, listenerID, fmt.Sprintf("ForwardListener, %s", listenerID))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("forward listener id")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ListenerPipelineNameCompleter(con *core.Console, cmd *cobra.Command) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		listenerID := cmd.Flags().Arg(0)
+		if listenerID == "" {
+			return carapace.ActionValuesDescribed(results...).Tag("pipeline name")
+		}
+		var lis *clientpb.Listener
+		for _, listener := range con.SnapshotListeners() {
+			if listener.Id == listenerID {
+				lis = listener
+				break
+			}
+		}
+		for _, pipeline := range lis.GetPipelines().GetPipelines() {
+			switch pipeline.Body.(type) {
+			case *clientpb.Pipeline_Tcp:
+				results = append(results, pipeline.Name, fmt.Sprintf("type tcp %s:%v",
+					pipeline.GetTcp().Host, pipeline.GetTcp().Port))
+			case *clientpb.Pipeline_Web:
+				results = append(results, pipeline.Name, "type web")
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("pipeline name")
+	}
+	return carapace.ActionCallback(callback)
+
+}
+
+func SessionAddonCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		sess := con.GetInteractive()
+		if sess == nil {
+			return carapace.ActionValuesDescribed(results...).Tag("session addons")
+		}
+		for _, s := range sess.Addons {
+			results = append(results, s.Name, "")
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("session addons")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func SessionTaskCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		sess := con.GetInteractive()
+		if sess == nil || sess.Tasks == nil {
+			return carapace.ActionValuesDescribed(results...).Tag("session tasks")
+		}
+		for _, s := range sess.Tasks.Tasks {
+			if s == nil {
+				continue
+			}
+			results = append(results, fmt.Sprintf("%d", s.TaskId), fmt.Sprintf("%s %s", s.Type, taskStatusLabel(s)))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("session tasks")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func taskStatusLabel(task *clientpb.Task) string {
+	if task.GetStatus() != 0 {
+		return "error"
+	}
+	if task.GetCur() != task.GetTotal() {
+		return fmt.Sprintf("running %d/%d", task.GetCur(), task.GetTotal())
+	}
+	return "complete"
+}
+
+func ResourceCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+
+		// 添加文件系统中的资源
+		err := filepath.WalkDir(assets.GetConfigDir(), func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if !d.IsDir() && strings.HasSuffix(d.Name(), ".auth") {
+				fileName := d.Name()
+				prefix := strings.TrimSuffix(fileName, ".auth")
+				results = append(results, prefix, "client auth file")
+			}
+			return nil
+		})
+		if err != nil {
+			fmt.Printf("Error walking the directory: %v\n", err)
+			return carapace.Action{}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("session resources")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func PipelineCompleter(con *core.Console, use string) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for name, pipe := range SnapshotCachedPipelines(con) {
+			if use == "" || pipe.Type == use {
+				results = append(results, name, fmt.Sprintf("pipeline %s, type %s, listener %s", name, pipe.Type, pipe.ListenerId))
+			}
+		}
+
+		return carapace.ActionValuesDescribed(results...).Tag("pipeline")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func BuildTargetCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for s, _ := range consts.BuildTargetMap {
+			results = append(results, s, "")
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("build")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func BuildTypeCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for _, s := range consts.BuildType {
+			results = append(results, s, fmt.Sprintf("build type"))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("build")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func BuildResourceCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for _, s := range consts.BuildSource {
+			results = append(results, s, fmt.Sprintf("build source"))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("build")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ProfileCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		profiles, err := con.Rpc.GetProfiles(con.Context(), &clientpb.Empty{})
+		if err != nil {
+			con.Log.Errorf("Error get profiles: %v\n", err)
+			return carapace.Action{}
+		}
+		for _, s := range profiles.Profiles {
+			results = append(results, s.Name, fmt.Sprintf("profile %s, target %s", s.Name, s.Target))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("profile")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ArtifactCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		artifacts, err := con.Rpc.ListArtifact(con.Context(), &clientpb.Empty{})
+		if err != nil {
+			con.Log.Errorf("Error get builder: %v\n", err)
+			return carapace.Action{}
+		}
+		for _, s := range artifacts.Artifacts {
+			results = append(results, s.Name, fmt.Sprintf("id: %d, type %s, target %s", s.Id, s.Type, s.Target))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("artifact")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ModuleArtifactsCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		artifacts, err := con.Rpc.ListArtifact(con.Context(), &clientpb.Empty{})
+		if err != nil {
+			con.Log.Errorf("Error get builder: %v\n", err)
+			return carapace.Action{}
+		}
+		for _, a := range artifacts.Artifacts {
+			if a.Type == consts.CommandBuildModules {
+				var params implanttypes.ProfileParams
+				err = json.Unmarshal(a.ParamsBytes, &params)
+				if err != nil {
+					return carapace.Action{}
+				}
+				results = append(results, a.Name, fmt.Sprintf("target %s, module %s", a.Target, params.Modules))
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("artifact")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ArtifactFormatCompleter() carapace.Action {
+	// Get supported formats from formatter
+	formatsWithDesc := output.GetFormatsWithDescriptions()
+
+	// Convert to slice for carapace
+	descriptions := make([]string, 0, len(formatsWithDesc)*2)
+	for formatName, desc := range formatsWithDesc {
+		descriptions = append(descriptions, formatName, desc)
+	}
+
+	return carapace.ActionValuesDescribed(descriptions...).Tag("artifact format")
+}
+
+func ArtifactNameCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		artifacts, err := con.Rpc.ListArtifact(con.Context(), &clientpb.Empty{})
+		if err != nil {
+			con.Log.Errorf("Error get builder: %v\n", err)
+			return carapace.Action{}
+		}
+		for _, s := range artifacts.Artifacts {
+			results = append(results, s.Name, fmt.Sprintf("artifact %s, type %s, target %s", s.Name, s.Type, s.Target))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("artifact")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func SyncCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		ctxs, err := con.Rpc.GetContexts(con.Context(), &clientpb.Context{})
+		if err != nil {
+			con.Log.Errorf("Error get ctxs: %v\n", err)
+			return carapace.Action{}
+		}
+		for _, f := range ctxs.Contexts {
+			results = append(results, f.Id, f.Type)
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("sync")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func AllPipelineCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for key, pipeline := range SnapshotCachedPipelines(con) {
+			if pipeline == nil {
+				continue
+			}
+			value := pipeline.Name
+			if key != "" && key != pipeline.Name {
+				value = key
+			}
+			results = append(results, value, fmt.Sprintf("%s: %s", pipeline.ListenerId, pipeline.Name))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("pipeline name")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func PipelineNameFlagCompleter(con *core.Console, cmd *cobra.Command, allowedTypes ...string) carapace.Action {
+	allowed := make(map[string]struct{}, len(allowedTypes))
+	for _, pipelineType := range allowedTypes {
+		allowed[pipelineType] = struct{}{}
+	}
+	return carapace.ActionCallback(func(c carapace.Context) carapace.Action {
+		listenerID := ""
+		if cmd.Flags().Lookup("listener") != nil {
+			listenerID, _ = cmd.Flags().GetString("listener")
+		}
+		descriptions := make(map[string][]string)
+		seen := make(map[string]struct{})
+		for _, pipeline := range SnapshotCachedPipelines(con) {
+			if pipeline == nil || listenerID != "" && pipeline.GetListenerId() != listenerID {
+				continue
+			}
+			if len(allowed) != 0 {
+				if _, ok := allowed[pipeline.GetType()]; !ok {
+					continue
+				}
+			}
+			identity := pipeline.GetListenerId() + "\x00" + pipeline.GetName()
+			if _, ok := seen[identity]; ok {
+				continue
+			}
+			seen[identity] = struct{}{}
+			descriptions[pipeline.GetName()] = append(descriptions[pipeline.GetName()], fmt.Sprintf("%s: %s", pipeline.GetListenerId(), pipeline.GetType()))
+		}
+
+		names := make([]string, 0, len(descriptions))
+		for name := range descriptions {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		results := make([]string, 0, len(names)*2)
+		for _, name := range names {
+			results = append(results, name, strings.Join(descriptions[name], ", "))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("pipeline name")
+	})
+}
+
+func SessionModuleCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		sess := con.GetInteractive()
+		if sess == nil {
+			return carapace.ActionValuesDescribed(results...).Tag("session modules")
+		}
+		for _, s := range sess.Modules {
+			results = append(results, s, "")
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("session modules")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func SessionBundleCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		sess := con.GetInteractive()
+		if sess == nil || sess.Data == nil || sess.Data.BundleMap == nil {
+			return carapace.ActionValuesDescribed(results...).Tag("session bundles")
+		}
+		seen := make(map[string]bool)
+		for _, bundle := range sess.Data.BundleMap {
+			if bundle != "" && !seen[bundle] {
+				seen[bundle] = true
+				results = append(results, bundle, "")
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("session bundles")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ModulesCompleter() carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for _, s := range consts.Modules {
+			results = append(results, s, fmt.Sprintf("modules"))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("modules")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func WebsiteCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for _, pipeline := range SnapshotCachedPipelines(con) {
+			if web := pipeline.GetWeb(); web != nil {
+				results = append(results, pipeline.Name,
+					fmt.Sprintf("port: %d, root: %s", web.Port, web.Root))
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("website name")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func WebContentCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		// List all contents from all websites since content ID is globally unique
+		for _, pipeline := range SnapshotCachedPipelines(con) {
+			if web := pipeline.GetWeb(); web != nil {
+				for path, content := range web.Contents {
+					results = append(results, content.Id,
+						fmt.Sprintf("website: %s, path: %s, type: %s",
+							pipeline.Name, path, content.Type))
+				}
+			}
+		}
+
+		return carapace.ActionValuesDescribed(results...).Tag("content id")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func RemPipelineCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for key, pipeline := range SnapshotCachedPipelines(con) {
+			if pipeline == nil {
+				continue
+			}
+			if rem := pipeline.GetRem(); rem != nil {
+				value := pipeline.Name
+				if key != "" && key != pipeline.Name {
+					value = key
+				}
+				results = append(results, value,
+					fmt.Sprintf("console: %s", rem.Console))
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("rem pipeline name")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func HttpPipelineCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for _, pipeline := range SnapshotCachedPipelines(con) {
+			if http := pipeline.GetHttp(); http != nil {
+				results = append(results, pipeline.Name,
+					fmt.Sprintf(" host: %s:%d", http.Host, http.Port))
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("http pipeline name")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func RemAgentCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for _, pipeline := range SnapshotCachedPipelines(con) {
+			if rem := pipeline.GetRem(); rem != nil {
+				ctxs, err := con.Rpc.GetContexts(con.Context(), &clientpb.Context{
+					Type: consts.ContextPivoting,
+				})
+				if err != nil {
+					return carapace.ActionValuesDescribed(results...).Tag("rem agent name")
+				}
+				contexts, err := output.ToContexts[*output.PivotingContext](ctxs.Contexts)
+				if err != nil {
+					return carapace.ActionValuesDescribed(results...).Tag("rem agent name")
+				}
+				for _, ctx := range contexts {
+					results = append(results, ctx.RemAgentID, ctx.String())
+				}
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("rem agent")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func TaskTriggerTypeCompleter() carapace.Action {
+	return carapace.ActionValuesDescribed(
+		"Daily", "Triggers every day",
+		"Monthly", "Triggers every month",
+		"Weekly", "Triggers every week",
+		"AtLogon", "Triggers at user logon",
+		"StartUp", "Triggers at system startup",
+	).Tag("task trigger type")
+}
+
+func ServiceStartTypeCompleter() carapace.Action {
+	return carapace.ActionValuesDescribed(
+		"BootStart", "Starts when the system starts",
+		"SystemStart", "Starts when the system starts",
+		"AutoStart", "Starts automatically",
+		"DemandStart", "Starts on demand",
+		"Disabled", "Starts disabled",
+	).Tag("service start type")
+}
+
+func ServiceErrorControlCompleter() carapace.Action {
+	return carapace.ActionValuesDescribed(
+		"Ignore", "Ignore errors",
+		"Normal", "Normal error control",
+		"Severe", "Severe error control",
+		"Critical", "Critical error control",
+	).Tag("service error control")
+}
+
+func MalCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+
+		if con.MalManager == nil {
+			return carapace.ActionValuesDescribed(results...).Tag("mal plugins")
+		}
+
+		// 添加外部插件
+		for name, plugin := range con.MalManager.GetAllExternalPlugins() {
+			manifest := plugin.Manifest()
+			results = append(results, name, fmt.Sprintf("external mal: %s v%s", manifest.Name, manifest.Version))
+		}
+
+		// 添加嵌入式插件（只读）
+		for name, plugin := range con.MalManager.GetAllEmbeddedPlugins() {
+			manifest := plugin.Manifest()
+			results = append(results, name, fmt.Sprintf("embedded mal: %s v%s (read-only)", manifest.Name, manifest.Version))
+		}
+
+		return carapace.ActionValuesDescribed(results...).Tag("mal plugins")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ExternalMalCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+
+		if con.MalManager == nil {
+			return carapace.ActionValuesDescribed(results...).Tag("external mal plugins")
+		}
+
+		// 只添加外部插件
+		for name, plugin := range con.MalManager.GetAllExternalPlugins() {
+			manifest := plugin.Manifest()
+			results = append(results, name, fmt.Sprintf("external mal: %s v%s", manifest.Name, manifest.Version))
+		}
+
+		return carapace.ActionValuesDescribed(results...).Tag("external mal plugins")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func ExternalMalFileCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+
+		entries, err := os.ReadDir(assets.GetMalsDir())
+		if err != nil {
+			con.Log.Errorf("Error reading dir: %v\n", err)
+			return carapace.Action{}
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				malYamlPath := filepath.Join(assets.GetMalsDir(), entry.Name(), "mal.yaml")
+				if _, err := os.Stat(malYamlPath); err == nil {
+					results = append(results, entry.Name(), "external mal plugin")
+				}
+			}
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("external mal plugins")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func CertNameCompleter(con *core.Console) carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		certificates, err := con.Rpc.GetAllCertificates(con.Context(), &clientpb.Empty{})
+		if err != nil {
+			con.Log.Errorf("Error get certs: %v\n", err)
+			return carapace.Action{}
+		}
+		if len(certificates.Certs) < 0 {
+			return carapace.Action{}
+		}
+		for _, c := range certificates.Certs {
+			results = append(results, c.Cert.Name, fmt.Sprintf("cert %s, type %s", c.Cert.Name, c.Cert.Type))
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("certs")
+	}
+	return carapace.ActionCallback(callback)
+}
+
+func CertTypeCompleter() carapace.Action {
+	callback := func(c carapace.Context) carapace.Action {
+		results := make([]string, 0)
+		for _, c := range certs.CertTypes {
+			results = append(results, c)
+		}
+		return carapace.ActionValuesDescribed(results...).Tag("cert type")
+	}
+	return carapace.ActionCallback(callback)
+}

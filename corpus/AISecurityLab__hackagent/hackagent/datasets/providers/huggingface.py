@@ -1,0 +1,171 @@
+# Copyright 2026 - AI4I. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""HuggingFace dataset provider for loading goals from HuggingFace Hub."""
+
+from hackagent.logger import get_logger
+from typing import Any, Dict, List, Optional
+
+from hackagent.datasets.base import DatasetProvider
+
+logger = get_logger(__name__)
+
+
+class HuggingFaceDatasetProvider(DatasetProvider):
+    """
+    Dataset provider for HuggingFace Hub datasets.
+
+    This provider loads datasets from HuggingFace Hub and extracts goal strings
+    from specified fields. It supports filtering, splitting, and limiting samples.
+
+    Example:
+        provider = HuggingFaceDatasetProvider({
+            "path": "ai-safety-institute/AgentHarm",
+            "name": "harmful",
+            "goal_field": "prompt",
+            "split": "test_public",
+        })
+        goals = provider.load_goals(limit=100)
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the HuggingFace dataset provider.
+
+        Args:
+            config: Configuration dictionary with keys:
+                - path (str): HuggingFace dataset path (e.g., "ai-safety-institute/AgentHarm")
+                - goal_field (str): Field name containing the goal/prompt text
+                - split (str, optional): Dataset split to use (default: "test")
+                - name (str, optional): Dataset configuration name
+                - fallback_fields (list, optional): Alternative fields if goal_field not found
+                - trust_remote_code (bool, optional): Whether to trust remote code (default: False)
+        """
+        super().__init__(config)
+
+        self.path = config.get("path")
+        if not self.path:
+            raise ValueError("HuggingFace dataset 'path' is required in config")
+
+        self.goal_field = config.get("goal_field", "input")
+        self.split = config.get("split", "test")
+        self.name = config.get("name")  # Dataset configuration name
+        self.fallback_fields = config.get(
+            "fallback_fields", ["input", "prompt", "question", "text"]
+        )
+        self.trust_remote_code = config.get("trust_remote_code", False)
+
+        self.extra_fields = config.get("extra_fields", [])
+        self.last_extracted_extras: List[Dict[str, Any]] = []
+
+        self._dataset = None
+        self._metadata = {
+            "provider": "huggingface",
+            "path": self.path,
+            "split": self.split,
+            "goal_field": self.goal_field,
+        }
+
+    def _load_dataset(self):
+        """Lazily load the dataset from HuggingFace."""
+        if self._dataset is not None:
+            return self._dataset
+
+        from datasets import load_dataset
+
+        self.logger.info(
+            f"Loading HuggingFace dataset: {self.path} (split: {self.split})"
+        )
+
+        load_kwargs = {
+            "path": self.path,
+            "split": self.split,
+            "trust_remote_code": self.trust_remote_code,
+        }
+
+        if self.name:
+            load_kwargs["name"] = self.name
+
+        try:
+            self._dataset = load_dataset(**load_kwargs)
+            self._metadata["total_samples"] = len(self._dataset)
+            self.logger.info(f"Loaded {len(self._dataset)} samples from {self.path}")
+        except Exception as e:
+            self.logger.error(f"Failed to load dataset {self.path}: {e}")
+            raise
+
+        return self._dataset
+
+    def load_goals(
+        self,
+        limit: Optional[int] = None,
+        shuffle: bool = False,
+        seed: Optional[int] = None,
+        **kwargs,
+    ) -> List[Any]:
+        """
+        Load goals from the HuggingFace dataset.
+
+        Args:
+            limit: Maximum number of goals to return.
+            shuffle: Whether to shuffle the dataset before selecting.
+            seed: Random seed for shuffling.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            List of goal strings.
+        """
+        dataset = self._load_dataset()
+
+        # Optionally shuffle
+        if shuffle:
+            dataset = dataset.shuffle(seed=seed)
+
+        goals = []
+        count = 0
+
+        self.last_extracted_extras = []
+        return_dicts = kwargs.get("return_dicts", False)
+
+        for record in dataset:
+            if limit and count >= limit:
+                break
+
+            goal = self._extract_goal_from_record(
+                record,
+                self.goal_field,
+                self.fallback_fields,
+            )
+
+            if goal:
+                extra_data = (
+                    {f: record.get(f) for f in self.extra_fields}
+                    if self.extra_fields
+                    else {}
+                )
+                self.last_extracted_extras.append(extra_data)
+
+                if return_dicts and self.extra_fields:
+                    goals.append({"goal": goal, **extra_data})
+                else:
+                    goals.append(goal)
+
+                count += 1
+            else:
+                self.logger.warning(
+                    f"Could not extract goal from record. "
+                    f"Tried fields: {[self.goal_field] + self.fallback_fields}"
+                )
+
+        self._metadata["goals_loaded"] = len(goals)
+        self.logger.info(f"Extracted {len(goals)} goals from dataset")
+
+        return goals
+
+    def get_extra_data(self) -> List[Dict[str, Any]]:
+        """Return extra fields extracted during the last load_goals call."""
+        return self.last_extracted_extras
+
+    def get_metadata(self) -> Dict[str, Any]:
+        """Return metadata about the loaded dataset."""
+        return self._metadata.copy()

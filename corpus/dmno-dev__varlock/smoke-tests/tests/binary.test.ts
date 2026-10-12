@@ -1,0 +1,199 @@
+import { spawnSync } from 'node:child_process';
+import {
+  chmodSync, existsSync, mkdtempSync, rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { describe, test, expect } from 'vitest';
+import {
+  runBinary, binaryRun, BINARY_PATH,
+} from '../helpers/run-varlock-binary.js';
+
+const SMOKE_TESTS_DIR = join(import.meta.dirname, '..');
+
+describe('Compiled binary tests', () => {
+  test('--version prints version', () => {
+    const result = runBinary(['--version']);
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toMatch(/\d+\.\d+\.\d+/);
+  });
+
+  test('--help shows usage', () => {
+    const result = runBinary(['--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toContain('varlock');
+  });
+
+  test('run injects env vars into child process', () => {
+    const result = binaryRun(
+      ['node', '-e', 'console.log("PUBLIC_VAR=" + process.env.PUBLIC_VAR)'],
+      { cwd: 'smoke-test-basic' },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toContain('PUBLIC_VAR=public-value');
+  });
+
+  test('run propagates exit code from child', () => {
+    const result = binaryRun(
+      ['node', '-e', 'process.exit(42)'],
+      { cwd: 'smoke-test-basic' },
+    );
+
+    expect(result.exitCode).toBe(42);
+  });
+
+  test('.env.local function calls are resolved, not treated as literal strings', () => {
+    // If Bun's auto-dotenv-loading is not disabled for the compiled binary,
+    // it pre-loads .env.local into process.env before varlock starts.
+    // env-graph.ts captures process.env as overrideValues, and config-item.ts
+    // would then return the literal function call string instead of resolving it.
+    const result = binaryRun(
+      ['node', '-e', 'console.log("PUBLIC_VAR=" + process.env.PUBLIC_VAR)'],
+      { cwd: 'smoke-test-dotenv-isolation' },
+    );
+
+    expect(result.exitCode).toBe(0);
+    // without --no-compile-autoload-dotenv this would be the literal: 'if(true, a, b)'
+    expect(result.output).toContain('PUBLIC_VAR=a');
+  });
+
+  // Runs as a service user often start in a directory that user cannot enter
+  // (e.g. `runuser` keeps the caller's cwd). The native helper must still start.
+  // Needs the helper next to the binary (a build without --skip-native), or
+  // `cache clear` never spawns it. Skipped as root, which can enter any directory.
+  const hasNativeHelper = existsSync(join(dirname(BINARY_PATH), 'varlock-local-encrypt'));
+  test.skipIf(process.platform === 'win32' || process.getuid?.() === 0 || !hasNativeHelper)(
+    'native helper starts when the cwd cannot be entered',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'varlock-locked-cwd-'));
+      // A scratch config dir, so `cache clear` never touches the real user cache.
+      const configDir = mkdtempSync(join(tmpdir(), 'varlock-config-'));
+      try {
+        // Enter the directory first, then remove access, so varlock starts with a
+        // cwd it cannot enter. `cache clear` asks the native helper for the key;
+        // VARLOCK_DEBUG shows that it really did.
+        const result = spawnSync('/bin/sh', ['-c', 'chmod 000 . && exec "$0" cache clear --yes', BINARY_PATH], {
+          cwd: dir,
+          env: { ...process.env, XDG_CONFIG_HOME: configDir, VARLOCK_DEBUG: '1' },
+          encoding: 'utf-8',
+        });
+        const output = (result.stdout ?? '') + (result.stderr ?? '');
+        expect(output).toContain('runNativeBinary:');
+        expect(output).not.toContain('EACCES');
+        expect(result.status).toBe(0);
+      } finally {
+        chmodSync(dir, 0o700);
+        rmSync(dir, { recursive: true, force: true });
+        rmSync(configDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // Bun 1.3.x failed every child_process spawn from such a cwd with EACCES, so
+  // `varlock run` could never start its command. Fixed by building with Bun 1.4.2.
+  // Skipped as root and on macOS, where getcwd() itself fails from a directory
+  // without search permission, so no runtime can start there at all.
+  test.skipIf(process.platform === 'win32' || process.platform === 'darwin' || process.getuid?.() === 0)(
+    'run starts its command when the cwd cannot be entered',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'varlock-locked-cwd-'));
+      try {
+        // The schema is loaded from an absolute --path since the locked cwd itself
+        // cannot be scanned.
+        const result = spawnSync(
+          '/bin/sh',
+          ['-c', 'chmod 000 . && exec "$0" run --path "$1" -- /bin/sh -c \'echo PUBLIC_VAR=$PUBLIC_VAR\'', BINARY_PATH, join(SMOKE_TESTS_DIR, 'smoke-test-basic')],
+          { cwd: dir, encoding: 'utf-8' },
+        );
+        const output = (result.stdout ?? '') + (result.stderr ?? '');
+        expect(output).not.toContain('EACCES');
+        expect(output).toContain('PUBLIC_VAR=public-value');
+        expect(result.status).toBe(0);
+      } finally {
+        chmodSync(dir, 0o700);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  describe('nested varlock run (issue #312)', () => {
+    test('inner binary can run and inject env vars', () => {
+      // Outer varlock run spawns inner varlock run, which spawns node
+      const result = binaryRun(
+        [
+          BINARY_PATH,
+          'run',
+          '--',
+          'node',
+          '-e',
+          'console.log("PUBLIC_VAR=" + process.env.PUBLIC_VAR)',
+        ],
+        { cwd: 'smoke-test-basic' },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.output).toContain('PUBLIC_VAR=public-value');
+    });
+
+    test('inner binary sees correct env values', () => {
+      // Use --no-redact-stdout on the outer run so the inner output is not redacted
+      const result = runBinary(
+        [
+          'run',
+          '--no-redact-stdout',
+          '--',
+          BINARY_PATH,
+          'run',
+          '--no-redact-stdout',
+          '--',
+          'node',
+          '-e',
+          `
+            const vars = {
+              NODE_ENV: process.env.NODE_ENV,
+              PUBLIC_VAR: process.env.PUBLIC_VAR,
+              SECRET_TOKEN: process.env.SECRET_TOKEN,
+            };
+            console.log(JSON.stringify(vars));
+          `,
+        ],
+        { cwd: 'smoke-test-basic' },
+      );
+
+      expect(result.exitCode).toBe(0);
+      const vars = JSON.parse(result.stdout.trim().split('\n').pop()!);
+      expect(vars.NODE_ENV).toBe('test');
+      expect(vars.PUBLIC_VAR).toBe('public-value');
+      expect(vars.SECRET_TOKEN).toBe('super-secret-token-12345');
+    });
+
+    test('inner binary propagates exit code', () => {
+      const result = binaryRun(
+        [
+          BINARY_PATH,
+          'run',
+          '--',
+          'node',
+          '-e',
+          'process.exit(7)',
+        ],
+        { cwd: 'smoke-test-basic' },
+      );
+
+      expect(result.exitCode).toBe(7);
+    });
+
+    test('inner binary --version works (argv not corrupted)', () => {
+      // This specifically guards against the original PKG_EXECPATH issue
+      // where the inner binary misinterpreted its own argv
+      const result = binaryRun(
+        [BINARY_PATH, '--version'],
+        { cwd: 'smoke-test-basic' },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.output).toMatch(/\d+\.\d+\.\d+/);
+    });
+  });
+});

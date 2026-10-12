@@ -1,0 +1,586 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/chainreactors/IoM-go/proto/implant/implantpb"
+	types "github.com/chainreactors/IoM-go/types"
+	"github.com/chainreactors/malice-network/helper/implanttypes"
+
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/logs"
+	"github.com/chainreactors/malice-network/helper/encoders"
+	"github.com/chainreactors/malice-network/helper/encoders/hash"
+	"github.com/chainreactors/malice-network/server/internal/parser"
+	cryptostream "github.com/chainreactors/malice-network/server/internal/stream"
+)
+
+var (
+	Connections = &connections{
+		connections: &sync.Map{},
+	}
+	ListenerSessions = &listenerSessions{
+		sessions: &sync.Map{},
+	}
+	ErrConnectionRemoved = fmt.Errorf("connection removed")
+)
+
+const (
+	payloadReadBaseTimeout       = 30 * time.Second
+	payloadReadMinBytesPerSecond = 512 << 10
+
+	CtrlListenerSessionSnapshotBegin = "sync_sessions_begin"
+	CtrlListenerSessionSnapshotEnd   = "sync_sessions_end"
+)
+
+// listenerSessions 管理 listener 端的 session 信息
+type listenerSessions struct {
+	mu       sync.RWMutex
+	sessions *sync.Map // map[uint32]*clientpb.Session
+	staged   *sync.Map
+}
+
+// Add 添加或更新 session
+func (ls *listenerSessions) Add(session *clientpb.Session) {
+	if ls == nil || session == nil {
+		return
+	}
+	ls.mu.RLock()
+	sessions := ls.sessions
+	if sessions != nil {
+		sessions.Store(session.RawId, session)
+	}
+	ls.mu.RUnlock()
+	logs.Log.Debugf("listener - session_upsert raw=%d keypair=%v",
+		session.RawId, session.KeyPair != nil)
+}
+
+func (ls *listenerSessions) BeginSnapshot() {
+	if ls == nil {
+		return
+	}
+	ls.mu.Lock()
+	ls.staged = &sync.Map{}
+	ls.mu.Unlock()
+}
+
+func (ls *listenerSessions) AddSnapshot(session *clientpb.Session) {
+	if ls == nil || session == nil {
+		return
+	}
+	ls.mu.RLock()
+	target := ls.staged
+	if target == nil {
+		target = ls.sessions
+	}
+	if target != nil {
+		target.Store(session.RawId, session)
+	}
+	ls.mu.RUnlock()
+}
+
+func (ls *listenerSessions) CommitSnapshot() {
+	if ls == nil {
+		return
+	}
+	ls.mu.Lock()
+	if ls.staged != nil {
+		ls.sessions = ls.staged
+		ls.staged = nil
+	}
+	ls.mu.Unlock()
+}
+
+func (ls *listenerSessions) AbortSnapshot() {
+	if ls == nil {
+		return
+	}
+	ls.mu.Lock()
+	ls.staged = nil
+	ls.mu.Unlock()
+}
+
+// Get 获取 session
+func (ls *listenerSessions) Get(rawID uint32) *clientpb.Session {
+	if ls == nil {
+		return nil
+	}
+	ls.mu.RLock()
+	sessions := ls.sessions
+	if sessions == nil {
+		ls.mu.RUnlock()
+		return nil
+	}
+	val, ok := sessions.Load(rawID)
+	ls.mu.RUnlock()
+	if ok {
+		return val.(*clientpb.Session)
+	}
+	return nil
+}
+
+// GetConnection 统一的连接获取/创建函数 (适用于 TCP pipeline)
+// 每个 TCP 连接创建独立 Connection，避免一个 EOF 杀死共享 Connection。
+func GetConnection(conn *cryptostream.Conn, pipelineID string, secureConfig *implanttypes.SecureConfig) (*Connection, error) {
+	sid, err := cryptostream.PeekSid(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	sessionID := hash.Md5Hash(encoders.Uint32ToBytes(sid))
+
+	if existing := Connections.Get(sessionID); existing != nil {
+		logs.Log.Debugf("connection - replace_existing session=%s raw=%d alive=%v pipeline=%s mode=tcp", sessionID, sid, existing.IsAlive(), pipelineID)
+	}
+	keyPair := GetKeyPairForSession(sid, secureConfig)
+	newConn := NewConnection(conn.Parser, sid, pipelineID, keyPair)
+	Connections.Add(newConn)
+	return newConn, nil
+}
+
+// GetOrReuseConnection 复用已有连接 (适用于 HTTP simplex pipeline)
+// HTTP 每个请求是短生命周期调用，不存在 EOF 互杀问题，
+// 复用已有 Connection 让 cache 能跨请求积累命令。
+func GetOrReuseConnection(conn *cryptostream.Conn, pipelineID string, secureConfig *implanttypes.SecureConfig) (*Connection, error) {
+	sid, err := cryptostream.PeekSid(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	sessionID := hash.Md5Hash(encoders.Uint32ToBytes(sid))
+
+	if existing := Connections.Get(sessionID); existing != nil && existing.IsAlive() {
+		if existing.PipelineID != pipelineID {
+			existing.closeWithError(fmt.Errorf("connection pipeline changed from %s to %s", existing.PipelineID, pipelineID))
+		} else {
+			existing.LastMessage = time.Now()
+			return existing, nil
+		}
+	}
+
+	keyPair := GetKeyPairForSession(sid, secureConfig)
+	newConn := NewConnection(conn.Parser, sid, pipelineID, keyPair)
+	Connections.Add(newConn)
+	return newConn, nil
+}
+
+// GetKeyPairForSession 获取会话的密钥对
+// 优先从 ListenerSessions 获取，如果没有则从 secureConfig 获取交换密钥对
+func GetKeyPairForSession(sid uint32, secureConfig *implanttypes.SecureConfig) *clientpb.KeyPair {
+	// 优先从 session 中获取 KeyPair
+	if secureConfig == nil || !secureConfig.Enable {
+		return nil
+	}
+
+	var sessionKeyPair *clientpb.KeyPair
+	if session := ListenerSessions.Get(sid); session != nil {
+		sessionKeyPair = session.KeyPair
+	}
+
+	// 组装解密私钥候选：优先当前会话私钥，回退 pipeline server 私钥。
+	privateCandidates := make([]string, 0, 2)
+	appendPrivate := func(key string) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+		for _, existing := range privateCandidates {
+			if existing == key {
+				return
+			}
+		}
+		privateCandidates = append(privateCandidates, key)
+	}
+
+	if sessionKeyPair != nil {
+		appendPrivate(sessionKeyPair.PrivateKey)
+	}
+	appendPrivate(secureConfig.ServerPrivateKey)
+
+	publicKey := secureConfig.ImplantPublicKey
+	if sessionKeyPair != nil && strings.TrimSpace(sessionKeyPair.PublicKey) != "" {
+		publicKey = strings.TrimSpace(sessionKeyPair.PublicKey)
+	}
+
+	if publicKey == "" && len(privateCandidates) == 0 {
+		// secure is enabled but no keys established yet (cold start scenario).
+		// Return an empty KeyPair so the parser enters "secure but plaintext" mode;
+		// once key exchange completes and PushCtrl syncs the new keys, the parser
+		// will pick them up on the next GetConnection / WithSecure call.
+		return &clientpb.KeyPair{}
+	}
+
+	return &clientpb.KeyPair{
+		PublicKey:  publicKey,
+		PrivateKey: strings.Join(privateCandidates, "\n"),
+	}
+}
+
+// Remove 移除 session
+func (ls *listenerSessions) Remove(rawID uint32) {
+	if ls == nil {
+		return
+	}
+	ls.mu.RLock()
+	sessions := ls.sessions
+	if sessions != nil {
+		sessions.Delete(rawID)
+	}
+	ls.mu.RUnlock()
+	logs.Log.Debugf("listener - session_remove raw=%d", rawID)
+}
+
+func NewConnection(p *parser.MessageParser, sid uint32, pipelineID string, keyPair *clientpb.KeyPair) *Connection {
+	logs.Log.Debugf("connection - create raw=%d pipeline=%s keypair=%v", sid, pipelineID, keyPair != nil)
+
+	// 如果有密钥对，创建安全的 parser
+	if keyPair != nil {
+		logs.Log.Debugf("connection - secure_enabled raw=%d pipeline=%s", sid, pipelineID)
+		p.WithSecure(keyPair)
+	}
+
+	conn := &Connection{
+		PipelineID:  pipelineID,
+		RawID:       sid,
+		SessionID:   hash.Md5Hash(encoders.Uint32ToBytes(sid)),
+		LastMessage: time.Now(),
+		C:           make(chan *clientpb.SpiteRequest, 255),
+		Sender:      make(chan *implantpb.Spites, 1),
+		cache:       parser.NewSpitesBuf(),
+		Parser:      p,
+	}
+	conn.alive.Store(true)
+
+	GoGuarded("connection-recv:"+conn.SessionID, conn.runReceiveLoop, conn.runtimeErrorHandler("receive loop"))
+	GoGuarded("connection-send:"+conn.SessionID, conn.runSenderLoop, conn.runtimeErrorHandler("sender loop"))
+	return conn
+}
+
+type Connection struct {
+	RawID       uint32
+	SessionID   string
+	LastMessage time.Time
+	PipelineID  string
+	C           chan *clientpb.SpiteRequest // spite
+	Sender      chan *implantpb.Spites
+	Parser      *parser.MessageParser
+	cache       *parser.SpitesCache
+	alive       atomic.Bool
+	errMu       sync.Mutex
+	lastErr     error
+	sendMu      sync.Mutex
+	leasedBatch *implantpb.Spites
+}
+
+func (c *Connection) IsAlive() bool {
+	return c.alive.Load()
+}
+
+func (c *Connection) LastError() error {
+	c.errMu.Lock()
+	defer c.errMu.Unlock()
+	return c.lastErr
+}
+
+func (c *Connection) fail(err error) {
+	if err != nil {
+		c.errMu.Lock()
+		if c.lastErr == nil {
+			c.lastErr = err
+		}
+		c.errMu.Unlock()
+	}
+	c.alive.Store(false)
+}
+
+func (c *Connection) runtimeErrorHandler(scope string) GoErrorHandler {
+	label := fmt.Sprintf("connection %s %s", c.SessionID, scope)
+	return CombineErrorHandlers(
+		LogGuardedError(label),
+		func(err error) {
+			c.fail(err)
+			Connections.removeIfSame(c.SessionID, c)
+		},
+	)
+}
+
+func (c *Connection) closeWithError(err error) error {
+	logs.Log.Debugf("connection - close session=%s raw=%d reason=%q", c.SessionID, c.RawID, err)
+	c.fail(err)
+	Connections.removeIfSame(c.SessionID, c)
+	return err
+}
+
+func (c *Connection) runReceiveLoop() error {
+	for c.IsAlive() {
+		select {
+		case req, ok := <-c.C:
+			if !ok {
+				return nil
+			}
+			logs.Log.Debugf("pipeline - receive_spite_request session=%s raw=%d name=%s", c.SessionID, c.RawID, req.Spite.Name)
+			c.cache.Append(req.Spite)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
+func (c *Connection) runSenderLoop() error {
+	var pending *implantpb.Spites
+	for c.IsAlive() {
+		if pending == nil {
+			if c.cache.Len() == 0 {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			pending = c.cache.Build()
+		}
+		select {
+		case c.Sender <- pending:
+			pending = nil
+		case <-time.After(100 * time.Millisecond):
+			// Keep the batch and retry while Sender is full.
+		}
+	}
+	return nil
+}
+
+func (c *Connection) Send(ctx context.Context, conn *cryptostream.Conn) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	if c.leasedBatch == nil {
+		select {
+		case <-ctx.Done():
+			return nil
+		case msg, ok := <-c.Sender:
+			if !ok || msg == nil {
+				return nil
+			}
+			c.leasedBatch = msg
+		default:
+			// Beacon responses do not wait for tasks that may arrive later.
+			return nil
+		}
+	}
+
+	written, err := c.Parser.WritePacketCounted(conn, c.leasedBatch, c.RawID)
+	if err == nil {
+		c.leasedBatch = nil
+		return nil
+	}
+	if written == 0 {
+		// No encoded byte left the process, so the batch is safe to retry on the
+		// next HTTP poll.
+		return fmt.Errorf("write packet for connection %s: %w", c.SessionID, err)
+	}
+
+	// Once any byte was accepted, replay could execute a task twice. Drop this
+	// lease and report an explicit terminal delivery error instead.
+	ambiguous := c.leasedBatch
+	c.leasedBatch = nil
+	c.reportDeliveryFailure(ambiguous, written, err)
+	return fmt.Errorf("write packet for connection %s after %d bytes: %w", c.SessionID, written, err)
+}
+
+func (c *Connection) reportDeliveryFailure(batch *implantpb.Spites, written int, writeErr error) {
+	if batch == nil {
+		return
+	}
+	reason := fmt.Sprintf("task delivery became ambiguous after %d bytes: %v", written, writeErr)
+	failures := &implantpb.Spites{}
+	for _, spite := range batch.GetSpites() {
+		if spite == nil || spite.GetTaskId() == 0 {
+			continue
+		}
+		failures.Spites = append(failures.Spites, &implantpb.Spite{
+			Name:   spite.GetName(),
+			TaskId: spite.GetTaskId(),
+			Error:  types.MaleficErrorTaskError,
+			Status: &implantpb.Status{
+				TaskId: spite.GetTaskId(),
+				Status: int32(types.TaskError),
+				Error:  reason,
+			},
+		})
+	}
+	if len(failures.GetSpites()) == 0 {
+		return
+	}
+	Forwarders.Send(c.PipelineID, &Message{
+		Spites:    failures,
+		SessionID: c.SessionID,
+		RawID:     c.RawID,
+	})
+}
+
+func (c *Connection) buildResponse(conn *cryptostream.Conn, length uint32) error {
+	var msg *implantpb.Spites
+	if length >= 2 {
+		if err := conn.SetReadDeadline(time.Now().Add(payloadReadTimeout(length))); err != nil {
+			return fmt.Errorf("set payload read deadline for %s: %w", conn.RemoteAddr(), err)
+		}
+		readMsg, readErr := c.Parser.ReadMessage(conn, length)
+		clearErr := conn.SetReadDeadline(time.Time{})
+		if readErr != nil {
+			readErr = fmt.Errorf("error reading message:%s %w", conn.RemoteAddr(), readErr)
+			if clearErr != nil {
+				return errors.Join(readErr, fmt.Errorf("clear payload read deadline for %s: %w", conn.RemoteAddr(), clearErr))
+			}
+			return readErr
+		}
+		if clearErr != nil {
+			return fmt.Errorf("clear payload read deadline for %s: %w", conn.RemoteAddr(), clearErr)
+		}
+		msg = readMsg
+		if msg.Spites == nil {
+			msg = types.BuildPingSpites()
+		}
+	} else {
+		msg = types.BuildPingSpites()
+	}
+
+	Forwarders.Send(c.PipelineID, &Message{
+		Spites:     msg,
+		SessionID:  c.SessionID,
+		RawID:      c.RawID,
+		RemoteAddr: conn.RemoteAddr().String(),
+	})
+	return nil
+}
+
+func payloadReadTimeout(length uint32) time.Duration {
+	seconds := (uint64(length) + payloadReadMinBytesPerSecond - 1) / payloadReadMinBytesPerSecond
+	return payloadReadBaseTimeout + time.Duration(seconds)*time.Second
+}
+
+func (c *Connection) Handler(ctx context.Context, conn *cryptostream.Conn) error {
+	var err error
+	_, length, err := c.Parser.ReadHeader(conn)
+	if err != nil {
+		return c.closeWithError(fmt.Errorf("error reading header:%s %w", conn.RemoteAddr(), err))
+	}
+	GoGuarded("connection-send-call:"+c.SessionID, func() error {
+		return c.Send(ctx, conn)
+	}, c.runtimeErrorHandler("send call"))
+
+	if err := c.buildResponse(conn, length); err != nil {
+		return c.closeWithError(err)
+	}
+	return nil
+}
+
+func (c *Connection) HandlerSimplex(ctx context.Context, conn *cryptostream.Conn) error {
+	var err error
+	_, length, err := c.Parser.ReadHeader(conn)
+	if err != nil {
+		return fmt.Errorf("error reading HTTP request header for %s from %s: %w", c.SessionID, conn.RemoteAddr(), err)
+	}
+	// net/http may make an unread HTTP/1.x request body unavailable once the response starts.
+	if err := c.buildResponse(conn, length); err != nil {
+		return fmt.Errorf("read HTTP request body for %s: %w", c.SessionID, err)
+	}
+	if err := c.Send(ctx, conn); err != nil {
+		return fmt.Errorf("write HTTP response for %s: %w", c.SessionID, err)
+	}
+	return nil
+}
+
+type connections struct {
+	connections *sync.Map // map[session_id]*Session
+}
+
+func (c *connections) All() []*Connection {
+	all := []*Connection{}
+	c.connections.Range(func(key, value interface{}) bool {
+		all = append(all, value.(*Connection))
+		return true
+	})
+	return all
+}
+
+func (c *connections) Get(sessionID string) *Connection {
+	if val, ok := c.connections.Load(sessionID); ok {
+		return val.(*Connection)
+	}
+	return nil
+}
+
+func (c *connections) Push(sid string, msg *clientpb.SpiteRequest) error {
+	connect := Connections.Get(sid)
+	if connect == nil {
+		return fmt.Errorf("connection %s not found", sid)
+	}
+	if !connect.IsAlive() {
+		return fmt.Errorf("connection %s is not alive", sid)
+	}
+	select {
+	case connect.C <- msg:
+		return nil
+	default:
+		return fmt.Errorf("connection %s channel full", sid)
+	}
+}
+
+//func (c *connections) GetFromRawID(rawID string) *Connection {
+//	if val, ok := c.connections.Load(hash.Md5Hash([]byte(rawID))); ok {
+//		return val.(*Connection)
+//	}
+//	return nil
+//}
+
+func (c *connections) Add(connect *Connection) *Connection {
+	if connect == nil || connect.SessionID == "" {
+		return connect
+	}
+	for {
+		currentValue, loaded := c.connections.Load(connect.SessionID)
+		if !loaded {
+			actual, loaded := c.connections.LoadOrStore(connect.SessionID, connect)
+			if !loaded {
+				return connect
+			}
+			currentValue = actual
+		}
+
+		current, ok := currentValue.(*Connection)
+		if !ok || current == connect {
+			return connect
+		}
+		if current.IsAlive() && connect.LastMessage.Before(current.LastMessage) {
+			logs.Log.Debugf("connection - stale_add_skip session=%s raw=%d current_raw=%d", connect.SessionID, connect.RawID, current.RawID)
+			return current
+		}
+		if c.connections.CompareAndSwap(connect.SessionID, current, connect) {
+			return connect
+		}
+	}
+}
+
+func (c *connections) Remove(sessionID string) {
+	c.remove(sessionID, ErrConnectionRemoved)
+}
+
+func (c *connections) removeIfSame(sessionID string, conn *Connection) {
+	if current := c.Get(sessionID); current == conn {
+		c.connections.Delete(sessionID)
+		logs.Log.Debugf("connection - map_remove session=%s", sessionID)
+	} else {
+		logs.Log.Debugf("connection - map_remove_skip session=%s reason=already_replaced", sessionID)
+	}
+}
+
+func (c *connections) remove(sessionID string, err error) {
+	conn := c.Get(sessionID)
+	if conn != nil {
+		conn.fail(err)
+		c.connections.Delete(sessionID)
+	}
+}

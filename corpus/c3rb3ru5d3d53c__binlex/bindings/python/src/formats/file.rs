@@ -1,0 +1,110 @@
+// MIT License
+//
+// Copyright (c) [2025] [c3rb3ru5d3d53c]
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+use crate::hashing::{SSDeep, SHA256, TLSH};
+use crate::Configuration;
+use crate::Magic;
+use binlex::formats::file::File as InnerFile;
+use pyo3::prelude::*;
+use std::io::Error;
+
+/// Open a file through the native binlex format helpers.
+#[pyclass(unsendable)]
+pub struct File {
+    pub inner: InnerFile,
+    pub config: Py<Configuration>,
+}
+
+#[pymethods]
+impl File {
+    #[new]
+    #[pyo3(text_signature = "(path, config)")]
+    /// Open the file at `path` using the provided configuration.
+    pub fn new(py: Python, path: String, config: Py<Configuration>) -> PyResult<Self> {
+        let inner_config = config.borrow(py).inner.lock().unwrap().clone();
+        let inner = InnerFile::new(path, inner_config)?;
+        Ok(Self { inner, config })
+    }
+
+    #[pyo3(text_signature = "($self)")]
+    /// Return the TLSH helper for the file, if available.
+    pub fn tlsh(&self) -> Option<TLSH> {
+        self.inner.tlsh().map(|hash| TLSH {
+            bytes: hash.bytes.into_owned(),
+        })
+    }
+
+    #[pyo3(text_signature = "($self)")]
+    /// Return the SHA-256 helper for the file, if available.
+    pub fn sha256(&self) -> Option<SHA256> {
+        self.inner.sha256().map(|hash| SHA256 {
+            bytes: hash.bytes.into_owned(),
+        })
+    }
+
+    #[pyo3(text_signature = "($self)")]
+    /// Return the ssdeep helper for the file, if available.
+    pub fn ssdeep(&self) -> Option<SSDeep> {
+        self.inner.ssdeep().map(|hash| SSDeep {
+            bytes: hash.bytes.into_owned(),
+        })
+    }
+
+    #[pyo3(text_signature = "($self)")]
+    /// Return the file size in bytes.
+    pub fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    #[pyo3(text_signature = "($self)")]
+    /// Return the detected magic/file kind for the file.
+    pub fn magic(&self) -> Magic {
+        Magic {
+            inner: self.inner.magic(),
+        }
+    }
+
+    #[pyo3(text_signature = "($self)")]
+    /// Read the file contents into the native file object.
+    pub fn read(&mut self) -> Result<(), Error> {
+        self.inner.read()
+    }
+
+    #[pyo3(text_signature = "($self)")]
+    /// Return the JSON representation of the file metadata.
+    pub fn json(&self) -> PyResult<String> {
+        self.inner
+            .json()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+}
+
+#[pymodule]
+#[pyo3(name = "file")]
+pub fn file_init(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<File>()?;
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item("binlex_bindings.binlex.formats.file", m)?;
+    m.setattr("__name__", "binlex_bindings.binlex.formats.file")?;
+    Ok(())
+}

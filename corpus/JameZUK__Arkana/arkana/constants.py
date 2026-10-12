@@ -1,0 +1,399 @@
+"""
+Pure constants — no optional-library imports, no side effects.
+
+Safe to import from anywhere without triggering heavyweight library loads.
+"""
+import re
+from pathlib import Path
+
+__all__ = [
+    "MAX_MCP_RESPONSE_SIZE_KB", "MAX_MCP_RESPONSE_SIZE_BYTES",
+    "MCP_SOFT_RESPONSE_LIMIT_CHARS",
+    "ANGR_ANALYSIS_TIMEOUT", "ANGR_SHORT_TIMEOUT", "ANGR_CFG_TIMEOUT",
+    "BACKGROUND_TASK_TIMEOUT",
+    "ANGR_CFG_SOFT_TIMEOUT", "BACKGROUND_TASK_SOFT_TIMEOUT",
+    "OVERTIME_CHECK_INTERVAL", "OVERTIME_STALL_KILL", "OVERTIME_MAX_RUNTIME",
+    "PE_ANALYSIS_SOFT_TIMEOUT", "PE_ANALYSIS_MAX_RUNTIME",
+    "CAPA_ANALYSIS_TIMEOUT", "FLOSS_ANALYSIS_TIMEOUT",
+    "HTTP_DOWNLOAD_TIMEOUT", "HTTP_API_TIMEOUT", "HTTP_QUICK_TIMEOUT",
+    "VT_API_URL_FILE_REPORT",
+    "PEID_USERDB_URL",
+    "CAPA_RULES_ZIP_URL", "CAPA_RULES_DEFAULT_DIR_NAME", "CAPA_RULES_SUBDIR_NAME",
+    "YARA_RULES_STORE_DIR_NAME",
+    "YARA_REVERSINGLABS_ZIP_URL", "YARA_REVERSINGLABS_SUBDIR",
+    "YARA_COMMUNITY_ZIP_URL", "YARA_COMMUNITY_SUBDIR",
+    "BSIM_DB_DIR", "BSIM_DEFAULT_THRESHOLD", "BSIM_BACKGROUND_TIMEOUT",
+    "MAX_ARTIFACT_FILE_SIZE", "MAX_TOTAL_ARTIFACT_EXPORT_SIZE",
+    "MAX_ARTIFACT_DIR_MEMBERS", "MAX_ARTIFACT_DIR_SIZE", "ARTIFACT_DIR_DEPTH_LIMIT",
+    "PROJECTS_DIR", "MAX_PROJECT_NAME_LEN", "PROJECT_NAME_RE",
+    "MAX_PROJECTS", "MAX_BINARIES_PER_PROJECT", "PROJECT_ID_LEN",
+    "MAX_BATCH_RENAMES",
+    "MAX_STRUCT_FIELDS", "MAX_ENUM_VALUES",
+    "MAX_BATCH_DECOMPILE", "BATCH_DECOMPILE_PER_FUNCTION_TIMEOUT",
+    "MAX_HEX_PATTERN_TOKENS", "MAX_HEX_PATTERN_MATCHES",
+    "DEFAULT_SEARCH_CONTEXT_LINES", "MAX_SEARCH_CONTEXT_LINES", "MAX_SEARCH_MATCHES",
+    "CFG_ERROR_RATE_THRESHOLD", "CFG_PARTIAL_MIN_FUNCS",
+    "ENRICHMENT_MAX_DECOMPILE", "ENRICHMENT_TIMEOUT", "MAX_ENRICHMENT_BLOCKS",
+    "MIN_STR_LEN_FALLBACK_FLOSS", "MAX_FLOSS_ENRICHMENT_STRINGS",
+    "MAX_FLOSS_REFS_PER_STRING",
+    "VIVISECT_BYTES_PER_SECOND_ESTIMATE", "VIVISECT_POLL_INTERVAL",
+    "MAX_LIST_SAMPLES_LIMIT", "MAX_TOOL_LIMIT",
+    "INTEGRITY_NULL_RATIO_SUSPICIOUS", "INTEGRITY_NULL_RATIO_CORRUPT",
+    "INTEGRITY_MIN_FILE_SIZE", "INTEGRITY_PE_MIN_SIZE",
+    "INTEGRITY_ELF_MIN_SIZE", "INTEGRITY_MACHO_MIN_SIZE",
+    "INTEGRITY_ENTROPY_PACKED", "INTEGRITY_ENTROPY_NEAR_ZERO",
+    "INTEGRITY_MAX_SECTIONS_PE", "INTEGRITY_FLAGGED_TIMEOUT_FACTOR",
+    "INTEGRITY_SAMPLE_SIZE", "INTEGRITY_MAX_ISSUES",
+    "MAX_ANALYSIS_WARNINGS",
+    "DEFAULT_MAX_FILE_SIZE_MB",
+    # Context aggregation
+    "MAX_CONTEXT_DECOMPILE_LINES", "MAX_CONTEXT_STRINGS", "MAX_CONTEXT_XREFS",
+    # Frida generation
+    "MAX_FRIDA_HOOK_TARGETS", "MAX_FRIDA_TRACE_APIS",
+    # Vulnerability scanning
+    "MAX_VULN_SCAN_FUNCTIONS", "MAX_VULN_FINDINGS",
+    # Symbolic execution extensions
+    "MAX_SYMBOLIC_STEPS", "MAX_SYMBOLIC_ACTIVE_STATES", "MAX_SYMBOLIC_FIND_ADDRESSES",
+    # .NET deobfuscation
+    "DOTNET_DEOBFUSCATE_TIMEOUT", "DOTNET_DECOMPILE_TIMEOUT",
+    "DOTNET_DECOMPILE_MAX_OUTPUT_LINES",
+    # Data flow analysis
+    "MAX_DATA_FLOW_FUNCTIONS", "MAX_DATA_FLOW_FINDINGS",
+    "DATA_FLOW_PER_FUNC_TIMEOUT", "DATA_FLOW_AGGREGATE_TIMEOUT",
+    # Taint tracking
+    "MAX_TAINT_CHAIN_DEPTH", "MAX_TAINT_CHAINS",
+    "TAINT_RDA_PER_FUNC_TIMEOUT",
+    "TAINT_MAX_SOURCE_FUNCTIONS", "TAINT_MAX_SINK_FUNCTIONS",
+    # CFG null-artifact filtering
+    "CFG_NULL_REGION_MIN_SIZE",
+    # Obfuscation detection
+    "CFF_MIN_BLOCKS", "CFF_DISPATCHER_IN_DEGREE_THRESHOLD",
+    "CFF_BACK_EDGE_RATIO_THRESHOLD",
+    "OPAQUE_PREDICATE_SOLVER_TIMEOUT", "MAX_OPAQUE_PREDICATE_BLOCKS",
+    "OBFUSCATION_DETECTION_TIMEOUT",
+    "MAX_CFF_SCAN_FUNCTIONS", "MAX_OPAQUE_SCAN_FUNCTIONS",
+    # Debug session
+    "MAX_DEBUG_SESSIONS", "DEBUG_SESSION_TTL", "DEBUG_COMMAND_TIMEOUT",
+    "MAX_DEBUG_SNAPSHOTS", "MAX_DEBUG_INSTRUCTIONS", "MAX_DEBUG_MEMORY_READ",
+    "DEBUG_DISASM_PREVIEW", "MAX_DEBUG_WATCHPOINT_SIZE",
+    "MAX_DEBUG_BREAKPOINTS", "MAX_DEBUG_WATCHPOINTS",
+    "MAX_DEBUG_USER_STUBS", "MAX_DEBUG_STUB_WRITE_SIZE", "MAX_DEBUG_STUB_WRITES",
+    "MAX_DEBUG_CAPTURED_OUTPUT", "MAX_DEBUG_PENDING_INPUT",
+    "MAX_DEBUG_API_TRACE", "MAX_DEBUG_SEARCH_MATCHES", "DEBUG_SEARCH_CONTEXT_BYTES",
+    "DASHBOARD_THREAD_POOL_SIZE",
+    # Resource monitor
+    "RESOURCE_MONITOR_INTERVAL", "RESOURCE_MEMORY_HIGH_MB",
+    "RESOURCE_MEMORY_CRITICAL_MB", "RESOURCE_CPU_HIGH_PERCENT",
+    "RESOURCE_HISTORY_SIZE",
+    "DEPENDENCIES",
+]
+
+# --- MCP Response Size Limit ---
+MAX_MCP_RESPONSE_SIZE_KB = 64
+MAX_MCP_RESPONSE_SIZE_BYTES = MAX_MCP_RESPONSE_SIZE_KB * 1024
+
+# Soft character limit for Claude Code CLI compatibility.
+# Claude Code truncates MCP tool responses at character thresholds:
+#   <10K chars: no truncation, 10-30K: truncated to 8K, 30-50K: truncated to 4K.
+# Default 8000 gives safe margin under the 10K threshold.
+# Override with ARKANA_MCP_RESPONSE_LIMIT_CHARS env var (e.g. 65536 to restore
+# old 64KB-only behaviour for non-Claude-Code clients).
+MCP_SOFT_RESPONSE_LIMIT_CHARS = 8000
+
+# --- Timeout Constants (seconds) ---
+ANGR_ANALYSIS_TIMEOUT = 300    # angr symbolic execution / analysis operations
+ANGR_SHORT_TIMEOUT = 120       # shorter angr operations (e.g. anti-debug scan)
+ANGR_CFG_TIMEOUT = 1800        # background CFGFast timeout (env: ARKANA_ANGR_CFG_TIMEOUT)
+BACKGROUND_TASK_TIMEOUT = 1800 # background task timeout (env: ARKANA_BACKGROUND_TASK_TIMEOUT)
+
+# --- Progress-Adaptive Overtime ---
+# Soft timeouts: transition to TASK_OVERTIME (notification, no kill)
+ANGR_CFG_SOFT_TIMEOUT = 900          # 15 min — env: ARKANA_ANGR_CFG_SOFT_TIMEOUT
+BACKGROUND_TASK_SOFT_TIMEOUT = 300   # 5 min — env: ARKANA_BACKGROUND_TASK_SOFT_TIMEOUT
+# Overtime loop settings
+OVERTIME_CHECK_INTERVAL = 60         # Check progress every 60s during overtime
+OVERTIME_STALL_KILL = 300            # Kill after 300s (5 min) of zero progress
+OVERTIME_MAX_RUNTIME = 21600         # 6 hour absolute ceiling — env: ARKANA_OVERTIME_MAX_RUNTIME
+# CFG degradation detection — accept partial CFG when error rate is high
+CFG_ERROR_RATE_THRESHOLD = 50        # errors per check interval → degraded — env: ARKANA_CFG_ERROR_RATE_THRESHOLD
+CFG_PARTIAL_MIN_FUNCS = 100          # min functions before accepting partial CFG
+
+# PE analysis overtime (open_file)
+PE_ANALYSIS_SOFT_TIMEOUT = 300      # 5 min — env: ARKANA_PE_ANALYSIS_SOFT_TIMEOUT
+PE_ANALYSIS_MAX_RUNTIME = 3600      # 1 hour ceiling — env: ARKANA_PE_ANALYSIS_MAX_RUNTIME
+
+CAPA_ANALYSIS_TIMEOUT = 300    # capa analysis during open_file (env: ARKANA_CAPA_ANALYSIS_TIMEOUT)
+FLOSS_ANALYSIS_TIMEOUT = 300   # FLOSS analysis during open_file (env: ARKANA_FLOSS_ANALYSIS_TIMEOUT)
+STRING_TOOL_TIMEOUT = 30       # Per-call timeout for string search/summary tools (env: ARKANA_STRING_TOOL_TIMEOUT)
+HTTP_DOWNLOAD_TIMEOUT = 60     # downloading resources (YARA rules, capa rules)
+HTTP_API_TIMEOUT = 20          # external API calls (e.g. VirusTotal)
+HTTP_QUICK_TIMEOUT = 15        # quick HTTP requests (e.g. PEiD DB download)
+
+# --- VirusTotal ---
+VT_API_URL_FILE_REPORT = "https://www.virustotal.com/api/v3/files/"
+
+# --- PEiD ---
+PEID_USERDB_URL = "https://raw.githubusercontent.com/JameZUK/Arkana/refs/heads/main/userdb.txt"
+
+# --- Capa ---
+# When bumping this URL, ALSO bump the matching URL in Dockerfile (around
+# line 283 — the pre-bake step) so containerised installs pick up the new
+# rules on the next image build. The Dockerfile also writes the marker file
+# alongside the rules, so the runtime's ``ensure_capa_rules_exist`` sees a
+# matching marker and uses the fast-path on container boot.
+#
+# Runtime invalidation story:
+#  - Non-containerised installs (developer running Python directly): the
+#    marker file lives in a user-writable directory, so bumping this URL
+#    triggers automatic wipe + re-download on the next capa call.
+#  - Containerised installs: ``/app/capa_rules_store/`` is root-owned and
+#    read-only to the app user; the only way to get new rules is a
+#    ``docker build`` that re-runs the pre-bake step. Runtime will log a
+#    best-effort adoption message on first call but cannot rewrite the
+#    baked marker.
+#
+# See also the compatibility block in ``requirements.txt``.
+CAPA_RULES_ZIP_URL = "https://github.com/mandiant/capa-rules/archive/refs/tags/v9.4.0.zip"
+CAPA_RULES_DEFAULT_DIR_NAME = "capa_rules_store"
+CAPA_RULES_SUBDIR_NAME = "rules"
+
+# --- YARA Rules Store ---
+YARA_RULES_STORE_DIR_NAME = "yara_rules_store"
+YARA_REVERSINGLABS_ZIP_URL = "https://github.com/reversinglabs/reversinglabs-yara-rules/archive/refs/heads/develop.zip"
+YARA_REVERSINGLABS_SUBDIR = "reversinglabs"
+YARA_COMMUNITY_ZIP_URL = "https://github.com/Yara-Rules/rules/archive/refs/heads/master.zip"
+YARA_COMMUNITY_SUBDIR = "community"
+
+# --- BSim Function Similarity ---
+try:
+    BSIM_DB_DIR = Path.home() / ".arkana" / "bsim"
+except RuntimeError:
+    BSIM_DB_DIR = Path("/tmp") / ".arkana" / "bsim"
+BSIM_DEFAULT_THRESHOLD = 0.5
+BSIM_BACKGROUND_TIMEOUT = 1800  # seconds — 30 min (env: ARKANA_BSIM_BACKGROUND_TIMEOUT). Note: CLAUDE.md historically said 600s; actual value is 1800s.
+BSIM_MIN_BLOCKS_FOR_MATCH = 3   # Suppress trivial matches below this block count
+BSIM_DEFAULT_CONFIDENCE_THRESHOLD = 1.0  # Minimum confidence for meaningful matches
+BSIM_AUTO_INDEX = True  # Auto-index into signature DB during enrichment (env: ARKANA_BSIM_AUTO_INDEX)
+
+# --- Artifact Limits ---
+MAX_ARTIFACT_FILE_SIZE = 100 * 1024 * 1024        # 100 MB per artifact
+MAX_TOTAL_ARTIFACT_EXPORT_SIZE = 50 * 1024 * 1024  # 50 MB total in exports
+MAX_ARTIFACT_DIR_MEMBERS = 1000                    # max files inside a directory artifact
+MAX_ARTIFACT_DIR_SIZE = 256 * 1024 * 1024          # 256 MB total per directory artifact
+ARTIFACT_DIR_DEPTH_LIMIT = 10                      # max recursion depth when walking directory artifacts
+
+# --- Projects ---
+try:
+    PROJECTS_DIR = Path.home() / ".arkana" / "projects"
+except RuntimeError:
+    PROJECTS_DIR = Path("/tmp") / ".arkana" / "projects"
+PROJECT_ID_LEN = 16                                # uuid4().hex[:16]
+MAX_PROJECT_NAME_LEN = 100
+# ASCII-only character class — unicode ``\w`` allowed RTL-override and
+# confusables, enabling visual spoofing of project names across the
+# find_by_name deduplication path. Explicit charset keeps names printable
+# and round-trips cleanly through filesystem/HTML/cookie contexts.
+PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9_\-. ]{1,100}$")
+MAX_PROJECTS = 1000
+MAX_BINARIES_PER_PROJECT = 50
+
+# Background overlay flush daemon — wakes every N seconds to persist any
+# session state with `_overlay_dirty=True`. Without this loop, mutations
+# only persist on close_file/close_project, so a SIGKILL between mutations
+# and close loses work. The interval is intentionally generous so the
+# loop is essentially free under normal load.
+OVERLAY_FLUSH_INTERVAL_SECONDS = 30
+
+# --- Project archive (v2) import safety caps ---
+# Defends against decompression bombs / zip bombs in user-supplied
+# .arkana_project.tar.gz archives. All three are tunable via env vars
+# (ARKANA_MAX_PROJECT_ARCHIVE_*).
+MAX_PROJECT_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024     # 4 GB total
+MAX_PROJECT_ARCHIVE_MEMBERS = 50000                     # max member count
+MAX_PROJECT_ARCHIVE_MEMBER_BYTES = 1024 * 1024 * 1024   # 1 GB per file
+
+# --- Project comparison (BSim) bounds ---
+# The Similarity → PROJECTS sub-tab can pin a dashboard worker thread for
+# many minutes if the user picks two huge projects. The pair-count cap is
+# the hard ceiling (refused outright); the time budget is the soft cap
+# inside the loop.
+MAX_PROJECT_COMPARE_PAIRS = 500                        # M*N pair grid cap
+PROJECT_COMPARE_TIME_BUDGET_S = 120.0                  # overall wallclock cap
+
+# --- compare_indexed_binaries (per-pair) bounds ---
+# Per-pair caps inside the BSim function-vs-function comparison. Must be
+# tight enough that a single hostile pair can't pin the dashboard executor
+# for the entire PROJECT_COMPARE_TIME_BUDGET_S.
+BSIM_COMPARE_MAX_FUNCS_PER_SIDE = 50000   # refuse pair if either side > this
+BSIM_COMPARE_MAX_CANDIDATES = 200          # candidate cap per fa
+BSIM_COMPARE_BLOCK_TOLERANCE = 5           # absolute ±k blocks (floor)
+BSIM_COMPARE_BLOCK_TOLERANCE_PCT = 0.10    # +10% relative window for big fns
+BSIM_COMPARE_TIME_BUDGET_S = 30.0          # per-pair wallclock cap
+BSIM_COMPARE_INNER_DEADLINE_CHECK = 32     # check deadline every N candidates
+
+# --- Rename / Annotation Limits ---
+MAX_BATCH_RENAMES = 50
+
+# --- Custom Type Limits ---
+MAX_STRUCT_FIELDS = 100
+MAX_ENUM_VALUES = 500
+
+# --- Batch Decompile Limits ---
+MAX_BATCH_DECOMPILE = 20
+BATCH_DECOMPILE_PER_FUNCTION_TIMEOUT = 60  # seconds per function
+
+# --- Hex Pattern Search Limits ---
+MAX_HEX_PATTERN_TOKENS = 200
+MAX_HEX_PATTERN_MATCHES = 5000
+
+# --- Search/Grep Limits ---
+DEFAULT_SEARCH_CONTEXT_LINES = 2
+MAX_SEARCH_CONTEXT_LINES = 20
+MAX_SEARCH_MATCHES = 500
+
+# --- Auto-Enrichment ---
+ENRICHMENT_MAX_DECOMPILE = 100       # max functions to decompile in background sweep
+ENRICHMENT_TIMEOUT = 1800            # overall enrichment timeout (seconds)
+MAX_ENRICHMENT_BLOCKS = 300          # max basic blocks per function for background decompile
+
+# --- FLOSS Fallback Constants ---
+MIN_STR_LEN_FALLBACK_FLOSS = 4
+MAX_FLOSS_ENRICHMENT_STRINGS = 500  # cap xref enrichment of static strings
+MAX_FLOSS_REFS_PER_STRING = 20  # Cap cross-references per string to prevent OOM
+
+# --- FLOSS Vivisect Progress Estimation ---
+VIVISECT_BYTES_PER_SECOND_ESTIMATE = 50_000  # ~50 KB/s for time-based progress curve
+VIVISECT_POLL_INTERVAL = 3  # seconds between function count polls during analysis
+
+# --- File Integrity Check ---
+INTEGRITY_NULL_RATIO_SUSPICIOUS = 0.95   # ratio above this → medium issue
+INTEGRITY_NULL_RATIO_CORRUPT = 0.99      # ratio above this → high issue
+INTEGRITY_MIN_FILE_SIZE = 64             # below this → medium issue
+INTEGRITY_PE_MIN_SIZE = 97               # minimum valid PE (DOS+PE sig+COFF)
+INTEGRITY_ELF_MIN_SIZE = 52              # minimum valid ELF header (32-bit)
+INTEGRITY_MACHO_MIN_SIZE = 28            # minimum valid Mach-O header
+INTEGRITY_ENTROPY_PACKED = 7.0           # entropy above this → likely packed
+INTEGRITY_ENTROPY_NEAR_ZERO = 0.5        # entropy below this → suspicious
+INTEGRITY_MAX_SECTIONS_PE = 96           # PE with more sections → suspicious
+INTEGRITY_FLAGGED_TIMEOUT_FACTOR = 0.5   # multiply timeout for flagged files
+INTEGRITY_SAMPLE_SIZE = 65536            # bytes to sample for entropy/null ratio
+INTEGRITY_MAX_ISSUES = 50                # cap issues list
+
+# --- list_samples Pagination ---
+MAX_LIST_SAMPLES_LIMIT = 500  # maximum files per page in list_samples
+
+# Upper bound on generic 'limit' parameters to prevent excessive memory allocation
+MAX_TOOL_LIMIT = 100_000
+
+# --- Analysis Warning Capture ---
+MAX_ANALYSIS_WARNINGS = 500  # max unique warnings retained per session
+
+# --- File Size Limit ---
+DEFAULT_MAX_FILE_SIZE_MB = 256  # default max file size for open_file / import
+
+# --- Context Aggregation ---
+MAX_CONTEXT_DECOMPILE_LINES = 80  # max decompiled lines in context response
+MAX_CONTEXT_STRINGS = 50  # max strings returned per function context
+MAX_CONTEXT_XREFS = 30  # max callers/callees in context response
+
+# --- Frida Generation ---
+MAX_FRIDA_HOOK_TARGETS = 50  # max API targets per hook script
+MAX_FRIDA_TRACE_APIS = 100  # max APIs per trace script
+
+# --- Vulnerability Scanning ---
+MAX_VULN_SCAN_FUNCTIONS = 500  # max functions to scan at once
+MAX_VULN_FINDINGS = 200  # max findings per scan
+
+# --- Symbolic Execution Extensions ---
+MAX_SYMBOLIC_STEPS = 100_000  # upper bound for max_steps parameter
+MAX_SYMBOLIC_ACTIVE_STATES = 100  # upper bound for max_active parameter
+MAX_SYMBOLIC_FIND_ADDRESSES = 20  # max find addresses for explore
+
+# --- .NET Deobfuscation ---
+DOTNET_DEOBFUSCATE_TIMEOUT = 120   # seconds for de4dot / NETReactorSlayer subprocess
+DOTNET_DECOMPILE_TIMEOUT = 120     # seconds for ilspycmd subprocess
+DOTNET_DECOMPILE_MAX_OUTPUT_LINES = 5000  # cap decompiled C# output lines
+
+# --- Data Flow Analysis ---
+MAX_DATA_FLOW_FUNCTIONS = 50       # max functions to analyse for source→sink flows
+MAX_DATA_FLOW_FINDINGS = 100       # max flow findings to return
+DATA_FLOW_PER_FUNC_TIMEOUT = 30    # per-function RDA timeout (seconds)
+DATA_FLOW_AGGREGATE_TIMEOUT = 120  # overall tool timeout (seconds)
+
+# --- Taint Tracking ---
+MAX_TAINT_CHAIN_DEPTH = 20         # deepest call chain to explore
+MAX_TAINT_CHAINS = 200             # hard cap on returned chains
+TAINT_RDA_PER_FUNC_TIMEOUT = 30    # per-function RDA timeout (seconds)
+TAINT_MAX_SOURCE_FUNCTIONS = 200   # max source functions to start BFS from
+TAINT_MAX_SINK_FUNCTIONS = 500     # max sink functions to check against
+
+# --- CFG Null-Artifact Filtering ---
+CFG_NULL_REGION_MIN_SIZE = 512  # minimum null-byte run for detection (env: ARKANA_CFG_NULL_MIN_SIZE)
+
+# --- Obfuscation Detection ---
+CFF_MIN_BLOCKS = 6                              # skip functions with fewer blocks
+CFF_DISPATCHER_IN_DEGREE_THRESHOLD = 4           # min in-degree for dispatcher candidate
+CFF_BACK_EDGE_RATIO_THRESHOLD = 0.6              # ratio of blocks with edge to dispatcher
+OPAQUE_PREDICATE_SOLVER_TIMEOUT = 15             # Z3 solver timeout per block (seconds)
+MAX_OPAQUE_PREDICATE_BLOCKS = 500                # max blocks to analyse across all functions
+OBFUSCATION_DETECTION_TIMEOUT = 180              # overall tool timeout (seconds)
+MAX_CFF_SCAN_FUNCTIONS = 200                     # max functions to scan for CFF
+MAX_OPAQUE_SCAN_FUNCTIONS = 100                  # max functions to scan for opaque predicates
+
+# --- Debug Session Constants ---
+MAX_DEBUG_SESSIONS = 3               # Max concurrent debug sessions per state (env: ARKANA_MAX_DEBUG_SESSIONS)
+DEBUG_SESSION_TTL = 1800             # 30-minute idle timeout (env: ARKANA_DEBUG_SESSION_TTL)
+DEBUG_COMMAND_TIMEOUT = 300          # 5-minute timeout per debug command (env: ARKANA_DEBUG_COMMAND_TIMEOUT)
+DEBUG_RUNNER_TIMEOUT_BUFFER = 15     # Extra seconds for client-side timeout beyond runner timeout
+MAX_DEBUG_SNAPSHOTS = 10             # Max snapshots per session (env: ARKANA_MAX_DEBUG_SNAPSHOTS)
+MAX_DEBUG_INSTRUCTIONS = 10_000_000  # Max instructions per continue/run_until
+MAX_DEBUG_MEMORY_READ = 1_048_576    # 1MB max memory read per call
+DEBUG_DISASM_PREVIEW = 5             # Instructions to preview in read_state
+MAX_DEBUG_WATCHPOINT_SIZE = 1_048_576  # 1MB max watchpoint region
+MAX_DEBUG_BREAKPOINTS = 100          # Max breakpoints per session
+MAX_DEBUG_WATCHPOINTS = 50           # Max watchpoints per session
+MAX_DEBUG_CAPTURED_OUTPUT = 10_000   # Max captured I/O output entries
+MAX_DEBUG_PENDING_INPUT = 1_000      # Max pending input entries for stubbed stdin
+MAX_DEBUG_API_TRACE = 10_000         # Max API trace entries per session
+MAX_DEBUG_SEARCH_MATCHES = 100       # Max memory search matches returned
+DEBUG_SEARCH_CONTEXT_BYTES = 32      # Context bytes around memory search matches
+MAX_DEBUG_USER_STUBS = 200           # Max user-defined API stubs per session
+MAX_DEBUG_STUB_WRITE_SIZE = 1024     # Max bytes per stub write operation
+MAX_DEBUG_STUB_WRITES = 8            # Max write operations per stub
+
+# --- Emulation Inspect Session Constants ---
+MAX_EMULATION_SESSIONS = 3              # Max concurrent emulation inspect sessions
+EMULATION_SESSION_TTL = 1800            # 30-minute idle timeout
+EMULATION_COMMAND_TIMEOUT = 60          # Per-command timeout for memory ops
+EMULATION_RUN_TIMEOUT = 300             # Timeout for the emulation run itself
+EMULATION_MAX_TIMEOUT = 300             # Hard cap per call — use emulation_resume() for longer ops
+MAX_EMULATION_MEMORY_READ = 1_048_576   # 1MB max memory read per call
+MAX_EMULATION_SEARCH_MATCHES = 100      # Max memory search matches returned
+EMULATION_SEARCH_CONTEXT_BYTES = 32     # Context bytes around search matches
+
+# --- Dashboard Thread Pool ---
+DASHBOARD_THREAD_POOL_SIZE = 4  # Dedicated pool for dashboard (env: ARKANA_DASHBOARD_THREADS)
+
+# --- Resource Monitor ---
+RESOURCE_MONITOR_INTERVAL = 10          # Seconds between polls (env: ARKANA_RESOURCE_MONITOR_INTERVAL)
+RESOURCE_MEMORY_HIGH_MB = 4096          # RSS MB warning threshold (env: ARKANA_RESOURCE_MEMORY_HIGH_MB)
+RESOURCE_MEMORY_CRITICAL_MB = 8192      # RSS MB critical threshold (env: ARKANA_RESOURCE_MEMORY_CRITICAL_MB)
+RESOURCE_CPU_HIGH_PERCENT = 90          # CPU% warning threshold (env: ARKANA_RESOURCE_CPU_HIGH_PERCENT)
+RESOURCE_HISTORY_SIZE = 60              # Number of snapshots to retain for trend analysis
+
+# --- Dependencies manifest (for diagnostics / status reporting) ---
+DEPENDENCIES = [
+    ("cryptography", "cryptography", "Cryptography (for digital signatures)", False),
+    ("requests", "requests", "Requests (for PEiD DB download & capa/FLOSS support)", False),
+    ("signify.authenticode", "signify", "Signify (for Authenticode validation)", False),
+    ("yara", "yara-python", "Yara (for YARA scanning)", False),
+    ("capa.main", "flare-capa", "Capa (for capability detection)", False),
+    ("floss.main", "flare-floss", "FLOSS (for advanced string extraction)", False),
+    ("stringsifter", "stringsifter", "StringSifter (for ranking string relevance)", False),
+    ("rapidfuzz", "rapidfuzz", "RapidFuzz (for fuzzy string matching)", False),
+    ("viv_utils", "vivisect", "Vivisect & Viv-Utils (for FLOSS analysis backend)", False),
+    ("mcp.server", "mcp[cli]", "MCP SDK (for MCP server mode)", True),
+    ("angr", "angr", "Angr (for binary decompilation & solving)", False),
+    ("refinery", "binary-refinery", "Binary Refinery (for data transforms, crypto, deobfuscation)", False),
+    ("psutil", "psutil", "psutil (for process resource monitoring)", False),
+]

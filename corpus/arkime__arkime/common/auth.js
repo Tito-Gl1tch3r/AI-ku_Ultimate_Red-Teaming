@@ -1,0 +1,1688 @@
+/******************************************************************************/
+/* auth.js  -- common Auth APIs
+ *
+ * Copyright Yahoo Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+'use strict';
+
+// eslint-disable-next-line no-shadow
+const crypto = require('crypto');
+const passport = require('passport');
+const DigestStrategy = require('passport-http').DigestStrategy;
+const BasicStrategy = require('passport-http').BasicStrategy;
+const iptrie = require('arkime-iptrie');
+const CustomStrategy = require('passport-custom');
+const LocalStrategy = require('passport-local');
+const express = require('express');
+const expressSession = require('express-session');
+const OIDC = require('openid-client');
+const jose = require('jose');
+const { LRUCache } = require('lru-cache');
+const bodyParser = require('body-parser');
+
+class Auth {
+  static mode;
+  static regressionTests = false;
+  static passwordSecret;
+  static passwordSecret256;
+
+  static #userNameHeader;
+  static #appAdminRole;
+  static #serverSecret;
+  static #serverSecret256;
+  static #basePath;
+  static #requiredAuthHeader;
+  static #requiredAuthHeaderVal;
+  static #requiredAuthHeaderHmacs;
+  static #userAutoCreateTmpl;
+  static #userAutoCreateFuncs;
+  static #userAuthIps;
+  static #strategies;
+  static #s2sRegressionTests;
+  static #authRouter = express.Router();
+  static #authConfig;
+  static #passportAuthOptions = { session: false };
+  static #caTrustCerts;
+  static #passwordSecretSection;
+  static #app;
+  static #keyCache = new LRUCache({ max: 1000, ttl: 1000 * 60 * 5 });
+  static #logoutUrl;
+  static #logoutUrlMethod;
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Set up the app.use() calls for the express application. Call in chain where
+   * auth should be installed.
+   */
+  static app (app, options) {
+    Auth.#app = app;
+    app.use(Auth.#ppChecker);
+    app.use(Auth.#authRouter);
+
+    app.post('/api/login', bodyParser.urlencoded({ extended: true }));
+    app.use(Auth.doAuth);
+
+    if (Auth.#app && Auth.#authConfig?.trustProxy !== undefined) {
+      Auth.#doTrustProxy();
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Initialize the Auth subsystem
+   * @param {string} options.mode=digest What auth mode to run in
+   * @param {string} options.basePath=/ What the web base path is for the app
+   * @param {string} options.userNameHeader In header auth mode, which http header has the user id
+   * @param {string} options.passwordSecret=password For basic/digest mode, what password to use to encrypt the password hash
+   * @param {string} options.serverSecret=passwordSecret What password is used to encrypt S2S auth
+   * @param {string} options.requiredAuthHeader In header auth mode, another header can be required
+   * @param {string} options.requiredAuthHeaderVal In header auth mode, a comma separated list of values for requiredAuthHeader, if none are matched the user will not be authorized
+   * @param {string} options.userAutoCreateTmpl A JavaScript string function that is used to create users that don't exist
+   * @param {boolean} options.s2s Support s2s auth also
+   * @param {object} options.authConfig options specific to each auth mode
+   * @param {object} options.caTrustFile Optional path to CA certificate file to use for external authentication
+   * @param {string} options.hostVar The name of this service's *Host config variable (e.g. 'viewHost') -
+   *                                 used only to print a security warning when header auth is enabled and
+   *                                 the service isn't restricted to loopback
+   */
+  static async initialize (options) {
+    // Make sure all options we need below are set
+    options ??= {};
+    options.mode ??= ArkimeConfig.get('authMode');
+    options.userNameHeader ??= ArkimeConfig.get('userNameHeader');
+    options.passwordSecret ??= ArkimeConfig.getFull(options.passwordSecretSection ?? undefined, 'passwordSecret');
+    options.serverSecret ??= ArkimeConfig.get('serverSecret');
+    options.requiredAuthHeader ??= ArkimeConfig.get('requiredAuthHeader');
+    options.requiredAuthHeaderVal ??= ArkimeConfig.get('requiredAuthHeaderVal');
+    options.userAutoCreateTmpl ??= ArkimeConfig.get('userAutoCreateTmpl');
+    options.userAuthIps = ArkimeConfig.getArray('userAuthIps');
+    options.caTrustFile ??= ArkimeConfig.get('caTrustFile');
+
+    options.authConfig ??= {};
+    options.authConfig.httpRealm ??= ArkimeConfig.get('httpRealm', 'Moloch');
+    options.authConfig.userIdField ??= ArkimeConfig.get('authUserIdField');
+    options.authConfig.discoverURL ??= ArkimeConfig.get('authDiscoverURL');
+    options.authConfig.clientId ??= ArkimeConfig.get('authClientId');
+    options.authConfig.clientSecret ??= ArkimeConfig.get('authClientSecret');
+    options.authConfig.redirectURIs ??= ArkimeConfig.get('authRedirectURIs');
+    options.authConfig.trustProxy ??= ArkimeConfig.get('authTrustProxy');
+    options.authConfig.cookieSameSite ??= ArkimeConfig.get('authCookieSameSite');
+    options.authConfig.cookieSecure ??= ArkimeConfig.getBool('authCookieSecure', true);
+    options.authConfig.oidcScope ??= ArkimeConfig.get('authOIDCScope', 'openid');
+    options.authConfig.jwsAlgorithm ??= ArkimeConfig.get('authJwsAlgorithm', 'RS256');
+
+    // Bearer JWT verification, used by the MCP endpoint. Config driven so the
+    // same code covers any issuer (Okta, Athenz ZTS, ...)
+    options.authConfig.jwtIssuer ??= ArkimeConfig.get('authJwtIssuer');
+    options.authConfig.jwtJwksUrl ??= ArkimeConfig.get('authJwtJwksUrl');
+    options.authConfig.jwtAlgorithms ??= ArkimeConfig.get('authJwtAlgorithms', 'RS256');
+    options.authConfig.jwtAudience ??= ArkimeConfig.get('authJwtAudience');
+    options.authConfig.jwtUserIdPrefix ??= ArkimeConfig.get('authJwtUserIdPrefix');
+    options.authConfig.jwtRequiredScopes ??= ArkimeConfig.get('authJwtRequiredScopes');
+    options.authConfig.jwtClockSkew ??= ArkimeConfig.getInt('authJwtClockSkew', 60);
+
+    if (ArkimeConfig.debug > 1) {
+      console.log('Auth.initialize', options);
+    }
+
+    if (options.mode === undefined) {
+      if (options.userNameHeader) {
+        if (options.userNameHeader.match(/^(digest|basic|anonymous|oidc|basic\+oidc|form|basic\+form)$/)) {
+          console.log(`WARNING - Using authMode=${options.userNameHeader} setting since userNameHeader set, add to config file to silence this warning.`);
+          options.mode = options.userNameHeader;
+          delete options.userNameHeader;
+        } else {
+          console.log('WARNING - Using authMode=header since not set, add to config file to silence this warning.');
+          options.mode = 'header';
+        }
+      } else {
+        console.log('WARNING - Using authMode=digest since not set, add to config file to silence this warning.');
+        options.mode = 'digest';
+      }
+    }
+
+    Auth.mode = options.mode;
+    Auth.#userNameHeader = options.userNameHeader;
+    Auth.#appAdminRole = options.appAdminRole;
+    Auth.#basePath = options.basePath ?? '/';
+    Auth.#passwordSecretSection = options.passwordSecretSection ?? 'default';
+    Auth.passwordSecret = options.passwordSecret ?? 'password';
+    Auth.passwordSecret256 = crypto.createHash('sha256').update(Auth.passwordSecret).digest();
+    if (options.serverSecret) {
+      Auth.#serverSecret = options.serverSecret;
+      Auth.#serverSecret256 = crypto.createHash('sha256').update(options.serverSecret).digest();
+    } else {
+      Auth.#serverSecret = Auth.passwordSecret;
+      Auth.#serverSecret256 = Auth.passwordSecret256;
+    }
+    Auth.#requiredAuthHeader = options.requiredAuthHeader;
+    Auth.#requiredAuthHeaderVal = options.requiredAuthHeaderVal?.split(',').map(s => s.trim()).filter(s => s !== '');
+    Auth.#requiredAuthHeaderHmacs = Auth.#requiredAuthHeaderVal?.map(v => crypto.createHmac('sha256', 'compare').update(v).digest());
+    // Without values #headerAuth would skip the requiredAuthHeader check entirely
+    if (ArkimeUtil.isString(Auth.#requiredAuthHeader) && !Auth.#requiredAuthHeaderVal?.length) {
+      console.log(`ERROR - requiredAuthHeader=${ArkimeUtil.sanitizeStr(Auth.#requiredAuthHeader)} is set but requiredAuthHeaderVal is missing or empty`);
+      process.exit(1);
+    }
+    Auth.#userAutoCreateTmpl = options.userAutoCreateTmpl;
+    if (Auth.#userAutoCreateTmpl) {
+      console.log('WARNING - userAutoCreateTmpl is deprecated and INSECURE, use [user-auto-create] section instead. This functionality will be removed in Arkime 7.');
+    }
+
+    const userAutoCreate = ArkimeConfig.getSection('user-auto-create');
+    if (userAutoCreate) {
+      if (Auth.#userAutoCreateTmpl) {
+        console.log('ERROR - Cannot use both userAutoCreateTmpl and [user-auto-create] section');
+        process.exit(1);
+      }
+      const allowedUserFields = new Set([
+        'userId', 'userName', 'passStore', 'enabled', 'webEnabled', 'headerAuthEnabled',
+        'emailSearch', 'createEnabled', 'removeEnabled', 'packetSearch',
+        'hideStats', 'hideFiles', 'hidePcap', 'disablePcapDownload',
+        'expression', 'settings', 'views', 'columnConfigs', 'spiviewFieldConfigs',
+        'tableStates', 'timeLimit', 'roles', 'roleAssigners', 'cont3xt'
+      ]);
+      Auth.#userAutoCreateFuncs = new Map();
+      for (const [field, func] of Object.entries(userAutoCreate)) {
+        if (!allowedUserFields.has(field)) {
+          console.log(`ERROR - user-auto-create field '${field}' is not a valid user property`);
+          process.exit(1);
+        }
+        try {
+          Auth.#userAutoCreateFuncs.set(field, ArkimeUtil.safeExpression(func, 'vals'));
+        } catch (e) {
+          console.log(`ERROR - user-auto-create '${field}': ${e.message}`);
+          process.exit(1);
+        }
+      }
+    }
+
+    Auth.#userAuthIps = new iptrie.IPTrie();
+    Auth.#s2sRegressionTests = options.s2sRegressionTests;
+    // Accepts plaintext s2s tokens, so never from config alone
+    if (Auth.#s2sRegressionTests && !ArkimeConfig.regressionTests) {
+      console.log('ERROR - s2sRegressionTests requires --regressionTests');
+      process.exit(1);
+    }
+    Auth.#authConfig = options.authConfig;
+    Auth.#jwks = undefined; // rebuilt on next use, the jwks url may have changed
+    Auth.#caTrustCerts = ArkimeUtil.certificateFileToArray(options.caTrustFile);
+
+    if (Auth.#app && Auth.#authConfig?.trustProxy !== undefined) {
+      Auth.#doTrustProxy();
+    }
+
+    if (options.userAuthIps?.length) {
+      Auth.#userAuthIps = ArkimeUtil.buildIpTrie(options.userAuthIps).trie; // validated at config load
+    } else if (Auth.mode.startsWith('header')) {
+      Auth.#userAuthIps = ArkimeUtil.buildIpTrie(['127.0.0.0/8', '::1']).trie;
+
+      // No explicit userAuthIps set, so we're relying on the loopback-only default above.
+      // If this service is also listening on a non-loopback host, warn - a reverse proxy or
+      // trustProxy misconfiguration could let a remote client's header be trusted.
+      if (options.hostVar) {
+        const hostVal = ArkimeConfig.get(options.hostVar);
+        if (hostVal !== undefined && hostVal !== 'localhost' && hostVal !== '127.0.0.1' && hostVal !== '::1') {
+          console.log(`SECURITY WARNING - When using any form of header auth, ${options.hostVar} (currently '${hostVal}') should be localhost OR make sure you have set authIps correctly.`);
+        }
+      }
+    } else {
+      Auth.#userAuthIps.add('::', 0, 1);
+    }
+
+    function check (field, str) {
+      if (!ArkimeUtil.isString(Auth.#authConfig[field])) {
+        console.log(`ERROR - ${str ?? field} missing from config file`);
+        process.exit(1);
+      }
+    }
+
+    Auth.#logoutUrl = ArkimeConfig.get('logoutUrl');
+    Auth.#logoutUrlMethod = ArkimeConfig.get('logoutUrlMethod', 'POST');
+    const addBasic = Auth.mode.startsWith('basic+');
+    if (addBasic) {
+      Auth.mode = Auth.mode.slice(6);
+    }
+
+    let sessionAuth = false;
+    switch (Auth.mode) {
+    case 'anonymous':
+      Auth.#strategies = ['anonymousWithDB'];
+      break;
+    case 'basic':
+      check('httpRealm');
+      Auth.#strategies = ['basic'];
+      break;
+    case 'digest':
+      check('httpRealm');
+      Auth.#strategies = ['digest'];
+      break;
+    case 'oidc':
+      check('userIdField', 'authUserIdField');
+      check('discoverURL', 'authDiscoverURL');
+      check('clientId', 'authClientId');
+      check('clientSecret', 'authClientSecret');
+      Auth.#strategies = ['oidc'];
+      Auth.#passportAuthOptions = { session: true, failureRedirect: `${Auth.#basePath}api/login`, scope: Auth.#authConfig.oidcScope };
+      sessionAuth = true;
+      break;
+    case 'form':
+      Auth.#strategies = ['form'];
+      Auth.#passportAuthOptions = { session: true, failureRedirect: `${Auth.#basePath}auth` };
+      sessionAuth = true;
+      Auth.#logoutUrl ??= `${Auth.#basePath}logout`;
+      break;
+    case 'headerOnly':
+      Auth.#strategies = ['header'];
+      break;
+    case 'header':
+    case 'header+digest':
+      Auth.#strategies = ['header', 'digest'];
+      break;
+    case 'header+basic':
+      Auth.#strategies = ['header', 'basic'];
+      break;
+    case 'header-jwt':
+      check('userIdField', 'authUserIdField');
+      Auth.#strategies = ['header'];
+      break;
+    case 's2s':
+      Auth.#strategies = ['s2s'];
+      break;
+    case 'regressionTests':
+      // Lets any caller pick their user, so never from config alone
+      if (!ArkimeConfig.regressionTests) {
+        console.log('ERROR - authMode=regressionTests requires --regressionTests');
+        process.exit(1);
+      }
+      Auth.#strategies = ['regressionTests'];
+      Auth.regressionTests = true;
+      break;
+    default:
+      console.log('ERROR - unknown authMode', ArkimeUtil.sanitizeStr(Auth.mode));
+      process.exit(1);
+    }
+
+    // Every header mode reads the userId (or the JWT) out of this header
+    if (Auth.#strategies.includes('header') && !ArkimeUtil.isString(Auth.#userNameHeader)) {
+      console.log(`ERROR - userNameHeader missing from config file, required for authMode=${ArkimeUtil.sanitizeStr(options.mode)}`);
+      process.exit(1);
+    }
+
+    // mcpAuthMode defaults to header, independent of authMode
+    if (ArkimeConfig.getBool('mcpEnabled', false) && ArkimeConfig.getArray('mcpAuthMode', 'header').includes('header') &&
+        !ArkimeUtil.isString(Auth.#userNameHeader)) {
+      console.log('ERROR - userNameHeader missing from config file, required for mcpAuthMode=header (the default). Set userNameHeader or set mcpAuthMode to jwt');
+      process.exit(1);
+    }
+
+    // Add basic to beginning
+    if (addBasic) {
+      Auth.#strategies.unshift('basic');
+    }
+
+    // Add s2s to beginning
+    if (options.s2s && !Auth.#strategies.includes('s2s')) {
+      Auth.#strategies.unshift('s2s');
+    }
+
+    if (ArkimeConfig.debug > 0) {
+      console.log('AUTH strategies', Auth.#strategies);
+    }
+
+    await Auth.#registerStrategies();
+
+    // If sessionAuth is required enable the express and passport sessions
+    if (sessionAuth) {
+      Auth.#authRouter.use(expressSession({
+        name: 'ARKIME-SID',
+        secret: Auth.passwordSecret + Auth.#serverSecret,
+        resave: false,
+        saveUninitialized: false,
+        cookie: { path: Auth.#basePath, secure: Auth.#authConfig.cookieSecure, sameSite: Auth.#authConfig.cookieSameSite ?? 'Lax', maxAge: 24 * 60 * 60 * 1000, httpOnly: true },
+        store: new ESStore({ })
+      }));
+      Auth.#authRouter.use(passport.initialize());
+      Auth.#authRouter.use(passport.session());
+
+      if (Auth.mode === 'form') {
+        const fs = require('fs');
+        const path = require('path');
+
+        Auth.#authRouter.get('/logo.png', (req, res) => {
+          res.sendFile(path.join(__dirname, '../assets/Arkime_Logo_Mark_FullGradient.png'));
+        });
+
+        let formHtmlTemplate;
+        Auth.#authRouter.get('/auth', (req, res) => {
+          // User is not authenticated, show the login form
+          if (!formHtmlTemplate) {
+            formHtmlTemplate = fs.readFileSync(path.join(__dirname, '/vueapp/formAuth.html'), 'utf-8');
+          }
+          const html = formHtmlTemplate.replace(/@@BASEHREF@@/g, Auth.#basePath)
+            .replace(/@@MESSAGE@@/g, ArkimeConfig.get('loginMessage', ''))
+            .replace(/@@OGURL@@/g, req.session.ogurl ?? Auth.#basePath);
+          return res.send(html);
+        });
+
+        Auth.#authRouter.post('/logout', (req, res, next) => {
+          req.logout((err) => {
+            if (err) { return next(err); }
+            return res.redirect(`${Auth.#basePath}auth`);
+          });
+        });
+      }
+
+      // only save the userId to passport session
+      passport.serializeUser(function (user, done) {
+        done(null, user.userId);
+      });
+
+      // load the user using the userId in the passport session
+      passport.deserializeUser(function (userId, done) {
+        User.getUserCache(userId, async (err, user) => {
+          if (err) { return done('ERROR - passport-session getUser - user: ' + userId + ' err:' + err); }
+          if (!user) { return done(userId + " doesn't exist"); }
+          if (!user.enabled) { return done(userId + ' not enabled'); }
+
+          user.setLastUsed();
+          return done(null, user);
+        });
+      });
+    } else {
+      Auth.#authRouter.use(passport.initialize());
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  static #doTrustProxy () {
+    const trustProxy = Auth.#authConfig.trustProxy;
+
+    if (trustProxy === true || trustProxy === 'true') {
+      Auth.#app.set('trust proxy', true);
+    } else if (trustProxy === false || trustProxy === 'false') {
+      Auth.#app.set('trust proxy', false);
+    } else if (!isNaN(trustProxy)) {
+      Auth.#app.set('trust proxy', parseInt(trustProxy));
+    } else {
+      Auth.#app.set('trust proxy', trustProxy);
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  static isAnonymousMode () {
+    return Auth.mode === 'anonymous' || Auth.mode === 'anonymousWithDB';
+  }
+
+  // ----------------------------------------------------------------------------
+  static get appAdminRole () {
+    return Auth.#appAdminRole;
+  }
+
+  // ----------------------------------------------------------------------------
+  static logoutUrl (req) {
+    let logoutUrl = Auth.#logoutUrl;
+    if (logoutUrl && req.session?.id_token !== undefined) {
+      logoutUrl = logoutUrl.replace('ARKIME_ID_TOKEN', req.session.id_token);
+    }
+    if (ArkimeConfig.debug > 0) {
+      console.log('Set logoutUrl to', req.user.userId, '=>', logoutUrl);
+    }
+    return logoutUrl;
+  }
+
+  // ----------------------------------------------------------------------------
+  static get logoutUrlMethod () {
+    return Auth.#logoutUrlMethod;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Checks a user's permission to access a resource to update/delete
+   * only allow admins, editors, or creator can update/delete resources
+   * @param {function} dbFunc The function to call to get the resource
+   * @param {string} ownerProperty The property on the resource that contains the owner
+   */
+  static checkResourceAccess (dbFunc, ownerProperty) {
+    return async (req, res, next) => {
+      if (req.user.hasRole(Auth.appAdminRole)) { // an admin can do anything
+        return next();
+      } else {
+        try {
+          const id = req.params.id ?? req.params.key;
+          if (!id) {
+            return res.serverError(404, 'Missing resource id');
+          }
+
+          let resource = await dbFunc(id);
+          if (resource?.body?._source) {
+            resource = resource.body._source;
+          }
+
+          if (!resource) {
+            return res.serverError(404, 'Unknown resource');
+          }
+
+          const settingUser = req.settingUser || req.user;
+          if ( // and creator or editor can update resources
+            (resource[ownerProperty] && resource[ownerProperty] === settingUser.userId) ||
+            settingUser.hasRole(resource.editRoles)
+          ) {
+            return next();
+          }
+
+          return res.serverError(403, 'Permission denied');
+        } catch (err) {
+          if (ArkimeConfig.debug > 0) {
+            console.log('ERROR - checking resource access:', err);
+          }
+          return res.serverError(404, 'Unknown resource');
+        }
+      }
+    };
+  }
+
+  // ----------------------------------------------------------------------------
+  /* Turn a userId that an external system (proxy header, oidc, jwt) has already
+   * vouched for into an Arkime user: create it when auto create is configured,
+   * check it is enabled, and refresh its dynamic roles from the claims. */
+  static #resolveUser (userId, claims, done, authInfo) {
+    async function authCheck (err, user) {
+      if (err || !user) { return done('User not found'); }
+      if (!user.enabled) { return done('User not enabled'); }
+      if (!user.headerAuthEnabled) { return done('User header auth not enabled'); }
+
+      try {
+        await user.updateDynamicRoles(claims);
+      } catch (e) {
+        console.log('AUTH: updateDynamicRoles failed for', ArkimeUtil.sanitizeStr(user.userId), e);
+        return done('Failed to update dynamic roles');
+      }
+      user.setLastUsed();
+      return done(null, user, authInfo);
+    }
+
+    User.getUserCache(userId, (err, user) => {
+      if (Auth.#userAutoCreateTmpl === undefined && Auth.#userAutoCreateFuncs === undefined) {
+        return authCheck(err, user);
+      } else if ((err && err.toString().includes('Not Found')) || (!user)) { // Try dynamic creation
+        Auth.#dynamicCreate(userId, claims, authCheck);
+      } else {
+        return authCheck(err, user);
+      }
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  /* Authenticate using a username http header set by a trusted upstream proxy.
+   * Exposed via Auth.headerAuth() so the MCP endpoint can reuse it. */
+  static #headerAuth (req, done) {
+    // Unset for non header authModes, MCP can still get here with mcpAuthMode=header
+    if (!ArkimeUtil.isString(Auth.#userNameHeader)) {
+      return done(null, false);
+    }
+
+    if (req.headers[Auth.#userNameHeader] === undefined) {
+      if (ArkimeConfig.debug > 0) {
+        console.log(`AUTH: didn't find ${Auth.#userNameHeader} in the headers`, req.headers);
+      }
+      return done(null, false);
+    }
+
+    if (Auth.#requiredAuthHeader !== undefined && Auth.#requiredAuthHeaderHmacs !== undefined) {
+      const authHeader = req.headers[Auth.#requiredAuthHeader];
+      if (authHeader === undefined) {
+        return done('Missing authorization header');
+      }
+      const authorized = authHeader.split(',').some(headerVal => {
+        const h = crypto.createHmac('sha256', 'compare').update(headerVal.trim()).digest();
+        return Auth.#requiredAuthHeaderHmacs.some(expected => crypto.timingSafeEqual(expected, h));
+      });
+      if (!authorized) {
+        console.log(`The required auth header '${Auth.#requiredAuthHeader}' did not match an expected value, got `, ArkimeUtil.sanitizeStr(authHeader));
+        return done('Bad authorization header');
+      }
+    }
+
+    let userId;
+    let vals;
+
+    if (Auth.mode === 'header-jwt') {
+      // No signature verification — the upstream proxy (ALB, Cloudflare Access, etc.)
+      // has already verified the JWT before forwarding the request.
+      try {
+        const jwt = req.headers[Auth.#userNameHeader];
+        const parts = jwt.split('.');
+        if (parts.length !== 3) {
+          return done('Invalid JWT in header');
+        }
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+        userId = payload[Auth.#authConfig.userIdField]?.toString().trim();
+        vals = payload;
+      } catch (e) {
+        console.log('AUTH: Failed to decode JWT from header', Auth.#userNameHeader, e.message);
+        return done('Failed to decode JWT');
+      }
+    } else {
+      // Node decodes HTTP header values as ISO-8859-1 (RFC 7230). Reverse proxies
+      // (Caddy, nginx, oauth2-proxy, ALB OIDC, etc.) typically write UTF-8 bytes
+      // directly into headers, so non-ASCII characters arrive as mojibake. Re-decode
+      // each string header from latin-1 bytes back to UTF-8 so auto-create
+      // expressions, dynamic roles, and downstream consumers see the original UTF-8
+      // string. Pure-ASCII values are unchanged.
+      vals = Auth.#utf8Headers(req.headers);
+      userId = vals[Auth.#userNameHeader].trim();
+    }
+
+    if (!userId || userId === '') {
+      return done('User name header is empty');
+    }
+
+    if (userId.startsWith('role:')) {
+      return done('Cannot authenticate with role');
+    }
+
+    return Auth.#resolveUser(userId, vals, done);
+  }
+
+  // ----------------------------------------------------------------------------
+  static #jwks;
+
+  /* Lazily build the remote JWKS, jose handles fetching/caching/key rotation */
+  static #getJwks () {
+    if (Auth.#jwks !== undefined) { return Auth.#jwks; }
+
+    const url = Auth.#authConfig.jwtJwksUrl;
+    if (!url) { throw new Error('authJwtJwksUrl is not set'); }
+
+    const options = {};
+    if (Auth.#caTrustCerts !== undefined) {
+      options.agent = new (require('https').Agent)({ ca: Auth.#caTrustCerts });
+    }
+
+    Auth.#jwks = jose.createRemoteJWKSet(new URL(url), options);
+    return Auth.#jwks;
+  }
+
+  // ----------------------------------------------------------------------------
+  /**
+   * Verify a Bearer JWT against the configured remote JWKS and return its claims.
+   * Throws when the token is missing, malformed, or fails any check.
+   */
+  static async verifyJwt (token) {
+    // Refuse to run half configured. Without an expected issuer and audience a
+    // valid token minted for some *other* service would authenticate here.
+    // Checked on every call, not just when the JWKS is first built.
+    if (!Auth.#authConfig.jwtIssuer) { throw new Error('authJwtIssuer is not set'); }
+    if (!Auth.#authConfig.jwtAudience) { throw new Error('authJwtAudience is not set'); }
+
+    const { payload } = await jose.jwtVerify(token, Auth.#getJwks(), {
+      issuer: Auth.#authConfig.jwtIssuer,
+      audience: Auth.#authConfig.jwtAudience.split(',').map(s => s.trim()).filter(s => s !== ''),
+      // Pinning the algorithms is what stops an attacker downgrading to `none`
+      // or swapping an RS256 verify for an HS256 one keyed off the public key
+      algorithms: Auth.#authConfig.jwtAlgorithms.split(',').map(s => s.trim()).filter(s => s !== ''),
+      clockTolerance: Auth.#authConfig.jwtClockSkew
+    });
+
+    const required = Auth.#authConfig.jwtRequiredScopes?.split(',').map(s => s.trim()).filter(s => s !== '');
+    if (required?.length) {
+      const scopes = Array.isArray(payload.scp) ? payload.scp : (payload.scope ?? '').split(' ');
+      const missing = required.filter(s => !scopes.includes(s));
+      if (missing.length) { throw new Error(`Token missing required scope(s) ${missing.join(',')}`); }
+    }
+
+    return payload;
+  }
+
+  // ----------------------------------------------------------------------------
+  /* Pull the userId out of verified claims, honoring the optional principal
+   * prefix (Athenz sends sub=user.SHORT_ID).
+   *
+   * Uses authUserIdField, the same setting authMode=header-jwt already uses to
+   * name the claim holding the user id, rather than inventing a second one. */
+  static #jwtUserId (claims) {
+    const field = Auth.#authConfig.userIdField ?? 'sub';
+    let userId = claims[field];
+    if (typeof userId !== 'string' || userId.trim() === '') {
+      throw new Error(`Token has no ${field} claim`);
+    }
+    userId = userId.trim();
+
+    const prefix = Auth.#authConfig.jwtUserIdPrefix;
+    if (prefix) {
+      if (!userId.startsWith(prefix)) { throw new Error(`Token subject is not a ${prefix}* principal`); }
+      userId = userId.slice(prefix.length);
+    }
+
+    if (userId === '') { throw new Error('Token has an empty user id'); }
+    return userId;
+  }
+
+  // ----------------------------------------------------------------------------
+  /* Authenticate using a Bearer JWT we verify ourselves */
+  static #jwtAuth (req, done) {
+    const auth = req.headers.authorization;
+    if (auth === undefined || !auth.toLowerCase().startsWith('bearer ')) {
+      return done(null, false);
+    }
+
+    Auth.verifyJwt(auth.slice(7).trim()).then((claims) => {
+      let userId;
+      try {
+        userId = Auth.#jwtUserId(claims);
+      } catch (e) {
+        return done(e.message);
+      }
+
+      if (userId.startsWith('role:')) { return done('Cannot authenticate with role'); }
+
+      return Auth.#resolveUser(userId, claims, done);
+    }).catch((e) => {
+      if (ArkimeConfig.debug > 0) { console.log('AUTH: jwt verify failed', e.message); }
+      return done('Invalid token');
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  /* Run a single strategy and resolve to a user (or undefined). The MCP
+   * endpoint uses these instead of passport.authenticate because it needs full
+   * control of the failure response - it must answer 401 with a
+   * WWW-Authenticate header and must never redirect. */
+  static #runStrategy (fn, req) {
+    return new Promise((resolve, reject) => {
+      fn(req, (err, user) => {
+        if (err) { return reject(err instanceof Error ? err : new Error(err)); }
+        return resolve(user || undefined);
+      });
+    });
+  }
+
+  static headerAuth (req) { return Auth.#runStrategy(Auth.#headerAuth, req); }
+  static jwtAuth (req) { return Auth.#runStrategy(Auth.#jwtAuth, req); }
+  static regressionTestsAuth (req) { return Auth.#runStrategy(Auth.#regressionTestsAuth, req); }
+
+  // ----------------------------------------------------------------------------
+  /* Take the user straight from a query param. Only ever reachable when the
+   * process was started with --regressionTests. */
+  static #regressionTestsAuth (req, done) {
+    const userId = req?.query?.arkimeRegressionUser ?? 'anonymous';
+    if (userId.startsWith('role:')) {
+      return done('Cannot authenticate with role');
+    }
+
+    User.getUserCache(userId, (err, user) => {
+      if (user) {
+        user.setLastUsed();
+      }
+      return done(null, user);
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  /* Register all the strategies that are supported */
+  static async #registerStrategies () {
+    // ----------------------------------------------------------------------------
+    passport.use('anonymous', new CustomStrategy(async (req, done) => {
+      const user = Object.assign(new User(), {
+        userId: 'anonymous',
+        enabled: true,
+        webEnabled: true,
+        headerAuthEnabled: false,
+        emailSearch: true,
+        removeEnabled: true,
+        packetSearch: true,
+        settings: {},
+        welcomeMsgNum: 1,
+        roles: ['superAdmin']
+      });
+      await user.expandFromRoles();
+      return done(null, user);
+    }));
+
+    // ----------------------------------------------------------------------------
+    passport.use('anonymousWithDB', new CustomStrategy(async (req, done) => {
+      // Setup anonymous user
+      const user = Object.assign(new User(), {
+        userId: 'anonymous',
+        enabled: true,
+        webEnabled: true,
+        headerAuthEnabled: false,
+        emailSearch: true,
+        removeEnabled: true,
+        packetSearch: true,
+        settings: {},
+        welcomeMsgNum: 1,
+        roles: ['superAdmin']
+      });
+      await user.expandFromRoles();
+
+      User.getUserCache('anonymous', (err, dbUser) => {
+        // Replace certain fields if available from db
+        if (dbUser) {
+          user.setLastUsed();
+          user.settings = dbUser.settings;
+          user.views = dbUser.views;
+          user.columnConfigs = dbUser.columnConfigs;
+          user.spiviewFieldConfigs = dbUser.spiviewFieldConfigs;
+          user.tableStates = dbUser.tableStates;
+          user.cont3xt = dbUser.cont3xt;
+        } else {
+          user.save();
+        }
+        return done(null, user);
+      });
+    }));
+
+    // ----------------------------------------------------------------------------
+    passport.use('basic', new BasicStrategy((userId, password, done) => {
+      if (userId.startsWith('role:')) {
+        console.log(`AUTH: User ${userId} Cannot authenticate with role`);
+        return done('Cannot authenticate with role');
+      }
+      User.getUserCache(userId, async (err, user) => {
+        if (err) { return done(err); }
+        if (!user) { console.log('AUTH: User', userId, "doesn't exist"); return done(null, false); }
+        if (!user.enabled) { console.log('AUTH: User', userId, 'not enabled'); return done('Not enabled'); }
+
+        const storeHa1 = Auth.store2ha1(user.passStore, user.userId);
+        const ha1 = Auth.pass2ha1(userId, password);
+        if (storeHa1.length !== ha1.length || !crypto.timingSafeEqual(Buffer.from(storeHa1), Buffer.from(ha1))) return done(null, false);
+
+        user.setLastUsed();
+        return done(null, user);
+      });
+    }));
+
+    // ----------------------------------------------------------------------------
+    passport.use('digest', new DigestStrategy({ qop: 'auth', realm: Auth.#authConfig.httpRealm }, (userId, done) => {
+      if (userId.startsWith('role:')) {
+        console.log(`AUTH: User ${userId} Cannot authenticate with role`);
+        return done('Cannot authenticate with role');
+      }
+      User.getUserCache(userId, async (err, user) => {
+        if (err) { return done(err); }
+        if (!user) { console.log('AUTH: User', userId, "doesn't exist"); return done(null, false); }
+        if (!user.enabled) { console.log('AUTH: User', userId, 'not enabled'); return done('Not enabled'); }
+
+        const ha1 = Auth.store2ha1(user.passStore, user.userId);
+        if (!ha1) {
+          console.log('AUTH: User', userId, 'passStore could not be decrypted, denying digest auth (check passwordSecret or reset the password)');
+          return done(null, false);
+        }
+
+        user.setLastUsed();
+        return done(null, user, { ha1 });
+      });
+    }, (poptions, done) => {
+      return done(null, true);
+    }));
+
+    // ----------------------------------------------------------------------------
+    passport.use('header', new CustomStrategy(Auth.#headerAuth));
+
+    // ----------------------------------------------------------------------------
+    if (Auth.mode === 'oidc') {
+      if (Auth.#caTrustCerts !== undefined) {
+        OIDC.custom.setHttpOptionsDefaults({ ca: Auth.#caTrustCerts });
+      }
+      const issuer = await OIDC.Issuer.discover(Auth.#authConfig.discoverURL);
+
+      // User didn't set a logoutUrl, so we will use the end_session_endpoint from the issuer
+      if (Auth.#logoutUrl === undefined && issuer.end_session_endpoint !== undefined) {
+        if (Auth.#authConfig.redirectURIs) {
+          const logoutUrl = new URL(issuer.end_session_endpoint);
+          logoutUrl.searchParams ??= new URLSearchParams();
+          logoutUrl.searchParams.set('id_token_hint', 'ARKIME_ID_TOKEN');
+          logoutUrl.searchParams.set('post_logout_redirect_uri', Auth.#authConfig.redirectURIs.split(',')[0].replace(/\/auth\/login\/callback$/, '/auth/logout/callback'));
+          Auth.#logoutUrl = logoutUrl.toString();
+          Auth.#logoutUrlMethod = 'GET';
+        } else {
+          console.log('WARNING - No redirectURIs set in authConfig, logoutUrl will not work');
+        }
+      }
+
+      const client = new issuer.Client({
+        client_id: Auth.#authConfig.clientId,
+        client_secret: Auth.#authConfig.clientSecret,
+        redirect_uris: Auth.#authConfig.redirectURIs ? Auth.#authConfig.redirectURIs.split(',') : undefined,
+        token_endpoint_auth_method: 'client_secret_post',
+        id_token_signed_response_alg: Auth.#authConfig.jwsAlgorithm
+      });
+
+      passport.use('oidc', new OIDC.Strategy({
+        client
+      }, (tokenSet, userinfo, done) => {
+        const userId = userinfo[Auth.#authConfig.userIdField];
+
+        if (userId === undefined) {
+          if (ArkimeConfig.debug > 0) {
+            console.log(`AUTH: didn't find ${Auth.#authConfig.userIdField} in the userinfo`, userinfo);
+          }
+          return done(null, false);
+        }
+
+        if (userId.startsWith('role:')) {
+          console.log(`AUTH: User ${userId} Cannot authenticate with role`);
+          return done('Cannot authenticate with role');
+        }
+
+        return Auth.#resolveUser(userId, userinfo, done, { id_token: tokenSet.id_token });
+      }));
+    }
+
+    // ----------------------------------------------------------------------------
+    passport.use('form', new LocalStrategy({ passReqToCallback: true }, (req, userId, password, done) => {
+      // passport-local falls back to the query string, which ends up in access and proxy logs,
+      // and the strategy runs on every unauthenticated request, not just /api/login
+      if (req.query.username !== undefined || req.query.password !== undefined) {
+        return done('Credentials must be in the POST body');
+      }
+      if (userId.startsWith('role:')) {
+        console.log(`AUTH: User ${userId} Cannot authenticate with role`);
+        return done('Cannot authenticate with role');
+      }
+      User.getUserCache(userId, async (err, user) => {
+        if (err) { return done(err); }
+        if (!user) { console.log('AUTH: User', userId, "doesn't exist"); return done(null, false); }
+        if (!user.enabled) { console.log('AUTH: User', userId, 'not enabled'); return done('Not enabled'); }
+
+        const storeHa1 = Auth.store2ha1(user.passStore, user.userId);
+        const ha1 = Auth.pass2ha1(userId, password);
+        if (storeHa1.length !== ha1.length || !crypto.timingSafeEqual(Buffer.from(storeHa1), Buffer.from(ha1))) return done(null, false);
+
+        user.setLastUsed();
+        return done(null, user);
+      });
+    }));
+
+    // ----------------------------------------------------------------------------
+    passport.use('regressionTests', new CustomStrategy(Auth.#regressionTestsAuth));
+
+    // ----------------------------------------------------------------------------
+    passport.use('s2s', new CustomStrategy(async (req, done) => {
+      if (req.headers['x-arkime-auth'] === undefined) {
+        return done(null, false);
+      }
+
+      const { obj, error } = Auth.parseS2SRequest(req);
+      if (error) {
+        return done(error);
+      }
+
+      // Don't look up user for receiveSession
+      if (req.url.match(/^\/receiveSession/i) || req.url.match(/^\/api\/sessions\/receive/i)) {
+        return done(null, {});
+      }
+
+      // s2s && regressionTests for anonymous user we just fake
+      if (Auth.regressionTests && obj.user === 'anonymous') {
+        const user = Object.assign(new User(), {
+          userId: obj.user,
+          enabled: true,
+          webEnabled: true,
+          headerAuthEnabled: false,
+          emailSearch: true,
+          removeEnabled: true,
+          packetSearch: true,
+          settings: {},
+          welcomeMsgNum: 1,
+          roles: ['arkimeAdmin', 'cont3xtUser', 'parliamentUser', 'usersAdmin', 'wiseUser']
+        });
+        await user.expandFromRoles();
+        return done(null, user);
+      }
+
+      User.getUserCache(obj.user, async (err, user) => {
+        if (err) { return done('ERROR - x-arkime getUser - user: ' + obj.user + ' err:' + err); }
+        if (!user) { return done(obj.user + " doesn't exist"); }
+        if (!user.enabled) { return done(obj.user + ' not enabled'); }
+
+        user.setLastUsed();
+        return done(null, user);
+      });
+    }));
+  }
+
+  // ----------------------------------------------------------------------------
+  static #checkIps (req, res) {
+    // userAuthIps restricts which connecting peer (typically the trusted auth
+    // proxy) may send requests. It MUST be checked against the real socket peer
+    // address, not req.ip: when trust proxy is enabled req.ip is derived from the
+    // client-supplied X-Forwarded-For header and is therefore spoofable, which
+    // would let an attacker bypass userAuthIps (e.g. the header-auth loopback default).
+    // No peer address (destroyed socket, or a synthetic one that doesn't set it)
+    // means we can't check, so deny
+    const ip = req.socket?.remoteAddress;
+    if (ip === undefined) {
+      res.status(403);
+      res.json({ success: false, text: 'Not allowed by ip' });
+      // debug only, an unauthenticated peer can trigger this at will
+      if (ArkimeConfig.debug > 0) {
+        console.log('Blocked (userAuthIps setting), no peer address', ArkimeUtil.sanitizeStr(req.url));
+      }
+      return 1;
+    }
+
+    if (ip.includes(':')) {
+      if (!Auth.#userAuthIps.find(ip)) {
+        res.status(403);
+        res.json({ success: false, text: `Not allowed by ip (${ip})` });
+        console.log('Blocked (userAuthIps setting) by ip', ip, req.url);
+        return 1;
+      }
+    } else {
+      if (!Auth.#userAuthIps.find(`::ffff:${ip}`)) {
+        res.status(403);
+        res.json({ success: false, text: `Not allowed by ip (${ip})` });
+        console.log('Blocked (userAuthIps setting) by ip', ip, req.url);
+        return 1;
+      }
+    }
+
+    return 0;
+  }
+
+  // ----------------------------------------------------------------------------
+  // Re-decode header values from latin-1 (Node's default) back to UTF-8.
+  // Pure-ASCII values are unchanged; UTF-8 bytes that Node mis-decoded as latin-1
+  // (e.g. "AndrÃ©" -> "André") are restored to the original UTF-8 string.
+  static #utf8Headers (headers) {
+    const out = {};
+    for (const [k, v] of Object.entries(headers)) {
+      out[k] = typeof v === 'string' ? Buffer.from(v, 'latin1').toString('utf8') : v;
+    }
+    return out;
+  }
+
+  // ----------------------------------------------------------------------------
+  static #dynamicCreate (userId, vars, cb) {
+    if (ArkimeConfig.debug > 0) {
+      console.log('AUTH - #dynamicCreate', ArkimeUtil.sanitizeStr(userId));
+    }
+
+    let nuser;
+    if (Auth.#userAutoCreateTmpl) {
+      nuser = JSON.parse(new Function('return `' + Auth.#userAutoCreateTmpl + '`;').call(vars));
+    } else {
+      nuser = {};
+      // No user record exists yet, so `this` is undefined in these expressions,
+      // unlike [user-role-mappings] which binds the existing user
+      for (const [field, func] of Auth.#userAutoCreateFuncs) {
+        try {
+          nuser[field] = func(vars);
+        } catch (e) {
+          console.log(`ERROR - user-auto-create function for '${field}' failed:`, e.message);
+          return cb('User auto-create failed');
+        }
+      }
+    }
+
+    if (nuser.userId !== userId) {
+      if (nuser.userId === undefined) {
+        if (ArkimeConfig.debug > 0) {
+          console.log(`WARNING - the userAutoCreateTmpl didn't set a userId field, instead using header/oidc set '${userId}'`);
+        }
+      } else {
+        console.log(`WARNING - the userAutoCreateTmpl set userId to a different value than header/oidc '${userId}' while the userAutoCreateTmpl returned '${nuser.userId}', resetting to use '${userId}'`);
+      }
+      nuser.userId = userId;
+    }
+
+    if (nuser.passStore === undefined) {
+      nuser.passStore = Auth.pass2store(nuser.userId, crypto.randomBytes(48));
+    }
+
+    if (nuser.userName === undefined || nuser.userName === 'undefined') {
+      console.log(`WARNING - The userAutoCreateTmpl didn't set a userName, using userId ${nuser.userId} for userName`);
+      nuser.userName = nuser.userId;
+    }
+
+    User.setUser(userId, nuser, (err, info) => {
+      if (err) {
+        console.log('OpenSearch/Elasticsearch error adding user: (%s):(%s):', userId, JSON.stringify(User.forLog(nuser)), err);
+      } else {
+        console.log('Added user: %s:%s', userId, JSON.stringify(User.forLog(nuser)));
+      }
+      return User.getUserCache(userId, cb);
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  static #ppChecker (req, res, next) {
+    if (req.path.match(/\/(__proto__|constructor)/)) {
+      return ArkimeUtil.serverError.call(res, 403, 'Bad path ' + ArkimeUtil.safeStr(req.path));
+    }
+
+    if (req.query) {
+      for (const key in req.query) {
+        if (ArkimeUtil.isPP(req.query[key])) {
+          return ArkimeUtil.serverError.call(res, 403, 'Invalid value for ' + ArkimeUtil.safeStr(key));
+        }
+      }
+    }
+
+    if (req.body) {
+      for (const key in req.body) {
+        if (ArkimeUtil.isPP(req.body[key])) {
+          return ArkimeUtil.serverError.call(res, 403, 'Invalid value for ' + ArkimeUtil.safeStr(key));
+        }
+      }
+    }
+
+    return next();
+  }
+
+  // ----------------------------------------------------------------------------
+  static doAuth (req, res, next) {
+    if (Auth.#checkIps(req, res)) {
+      return;
+    }
+
+    if (req._parsedUrl.pathname === '/auth/logout/callback') {
+      if (req.session) {
+        req.session.destroy((err) => {});
+      }
+      res.cookie('ARKIME-SID', '', { maxAge: 0, path: Auth.#basePath });
+      res.redirect(Auth.#basePath);
+      return;
+    }
+
+    // A packet portal request comes from a remote peer but is served on a
+    // synthetic socket (see H2Socket) whose 127.0.0.1 source address is a
+    // stand-in, not a connection from anywhere. That address, any userNameHeader
+    // and any session cookie the peer sends are therefore all untrustworthy: the
+    // first two would let header auth take the peer's word for the user, since
+    // what gates it is the userAuthIps loopback default, and the last would skip
+    // authentication entirely at the isAuthenticated() check below. Authenticate
+    // with the s2s token only -- on top of PacketPortal's own gate, which
+    // required a valid s2s token before the request ever reached the app.
+    const portal = req.socket?.arkimePacketPortal === true;
+
+    if (!portal && typeof (req.isAuthenticated) === 'function' && req.isAuthenticated()) {
+      return next();
+    }
+
+    if (Auth.#basePath !== '/') {
+      req.url = req.url.replace('/', Auth.#basePath);
+    }
+
+    // A portal request is never a browser being sent to a login page, and must
+    // not write to whatever session a cookie it carries happens to name
+    if (!portal && req.url.toLowerCase() !== '/api/login' && req.originalUrl !== '/' && req.session && req._parsedUrl.pathname !== '/auth/login/callback') {
+      // Until login this session only carries the return url (and the oidc state), keep
+      // it short lived so unauthenticated requests can't fill the store. Login regenerates it.
+      req.session.cookie.maxAge = 15 * 60 * 1000;
+      // save the original url so we can redirect after successful login
+      // the ogurl is saved in the form login page and accessed using req.body.ogurl
+      // a very long one isn't kept, it only makes each unauthenticated session bigger
+      if (req.originalUrl.length <= 4096) {
+        req.session.ogurl = Buffer.from(Auth.obj2authNext(req.originalUrl)).toString('base64');
+      }
+    }
+
+    const savedOgurl = req.session?.ogurl;
+
+    const passportAuthOptionsExtra = {};
+    if (Auth.#strategies.includes('oidc') && (Auth.#authConfig.redirectURIs === undefined || Auth.#authConfig.redirectURIs.split(',').length > 1)) {
+      passportAuthOptionsExtra.redirect_uri = req.protocol + '://' + req.hostname + `${Auth.#basePath}auth/login/callback`;
+    }
+    // receiveSession's s2s placeholder user has no userId, so never try to session-serialize it
+    if (req.url.match(/^\/receiveSession/i) || req.url.match(/^\/api\/sessions\/receive/i)) {
+      passportAuthOptionsExtra.session = false;
+    }
+
+    // A portal request must never mint or attach a session either
+    if (portal) { passportAuthOptionsExtra.session = false; }
+
+    const strategies = portal ? ['s2s'] : Auth.#strategies;
+
+    passport.authenticate(strategies, { ...Auth.#passportAuthOptions, ...passportAuthOptionsExtra })(req, res, function (err) {
+      if (req.session !== undefined && req.authInfo?.id_token !== undefined) {
+        req.session.id_token ??= req.authInfo.id_token;
+      }
+
+      if (Auth.#basePath !== '/') {
+        req.url = req.url.replace(Auth.#basePath, '/');
+      }
+      if (err) {
+        if (ArkimeConfig.debug > 0) {
+          console.log('AUTH: passport.authenticate fail', err);
+        }
+        res.status(403);
+        return res.json({ success: false, text: err });
+      } else {
+        // Redirect to / if this is a login url
+        if (req.route?.path === '/api/login' || req._parsedUrl.pathname === '/auth/login/callback') {
+          const ogurlEncoded = req.body?.ogurl || req.session?.ogurl || savedOgurl;
+          if (ogurlEncoded) {
+            try {
+              const ogurl = Auth.auth2objNext(Buffer.from(ogurlEncoded, 'base64').toString());
+              // Only redirect to a local same-origin path; reject absolute, protocol-relative
+              // ('//') and backslash ('/\') targets to prevent an open redirect.
+              if (typeof ogurl === 'string' && ogurl[0] === '/' && ogurl[1] !== '/' && ogurl[1] !== '\\') {
+                return res.redirect(ogurl);
+              }
+            } catch (e) {
+              console.log('Error', e);
+              // Fall through to redirect below
+            }
+          }
+          return res.redirect(Auth.#basePath);
+        } else if (req._parsedUrl.pathname === '/auth/logout/callback') {
+          if (ArkimeConfig.debug > 0) {
+            console.log('AUTH - logout callback from', req.user?.userId, req.ip);
+          }
+        }
+        return next();
+      }
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  static md5 (str, encoding) {
+    return crypto
+      .createHash('md5')
+      .update(str)
+      .digest(encoding || 'hex');
+  }
+
+  // ----------------------------------------------------------------------------
+  // Encrypt the hashed password for storing
+  static ha12store (ha1) {
+    // IV.E
+    const iv = crypto.randomBytes(16);
+    const c = crypto.createCipheriv('aes-256-cbc', Auth.passwordSecret256, iv);
+    let e = c.update(ha1, 'binary', 'hex');
+    e += c.final('hex');
+    return iv.toString('hex') + '.' + e;
+  }
+
+  // ----------------------------------------------------------------------------
+  // Hash (MD5) the password into HTTP Digest HA1 format.
+  // NOTE: MD5 is required by the HTTP Digest authentication spec (RFC 2617).
+  // The HA1 is encrypted with AES-256 before storage (see ha12store).
+  // For stronger password hashing, use form or OIDC auth modes instead of digest.
+  // nosemgrep: javascript.lang.security.audit.node-crypto-md5
+  static pass2ha1 (userId, password) {
+    return Auth.md5(userId + ':' + Auth.#authConfig.httpRealm + ':' + password);
+  }
+
+  // ----------------------------------------------------------------------------
+  // Hash (MD5) and encrypt the password before storing.
+  // Encryption is used because OpenSearch/Elasticsearch is insecure by default and we don't want others adding accounts.
+  static pass2store (userId, password) {
+    // md5 is required because of http digest
+    return Auth.ha12store(Auth.pass2ha1(userId, password));
+  }
+
+  // ----------------------------------------------------------------------------
+  // Decrypt the encrypted hashed password, it is still hashed
+  // Support 2 styles of decryption
+  static store2ha1 (passstore, userId) {
+    try {
+      const parts = passstore.split('.');
+      if (parts.length === 2) {
+        // IV.E
+        const c = crypto.createDecipheriv('aes-256-cbc', Auth.passwordSecret256, Buffer.from(parts[0], 'hex'));
+        let d = c.update(parts[1], 'hex', 'binary');
+        d += c.final('binary');
+        return d;
+      } else {
+        console.log(`WARNING - user '${userId}' passStore is using old encryption style, please reset user's password to update`);
+        return '';
+      }
+    } catch (e) {
+      console.log(`passwordSecret set in the [${Auth.#passwordSecretSection}] section cannot decrypt '${userId}' information.  Make sure passwordSecret is the same for all nodes/applications. You may need to re-add users or reset passwords if you've changed the secret.`, e);
+      return '';
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  // TOTP (Time-based One-Time Password) Support
+  // ----------------------------------------------------------------------------
+
+  // Encrypt TOTP secret for storage (same pattern as ha12store)
+  static totp2store (secret) {
+    const iv = crypto.randomBytes(16);
+    const c = crypto.createCipheriv('aes-256-cbc', Auth.passwordSecret256, iv);
+    let e = c.update(secret, 'utf8', 'hex');
+    e += c.final('hex');
+    return iv.toString('hex') + '.' + e;
+  }
+
+  // Decrypt stored TOTP secret
+  static store2totp (stored, userId) {
+    try {
+      const parts = stored.split('.');
+      if (parts.length === 2) {
+        const c = crypto.createDecipheriv('aes-256-cbc', Auth.passwordSecret256, Buffer.from(parts[0], 'hex'));
+        let d = c.update(parts[1], 'hex', 'utf8');
+        d += c.final('utf8');
+        return d;
+      } else {
+        console.log(`WARNING - user '${userId}' totpSecret is using invalid format`);
+        return null;
+      }
+    } catch (e) {
+      console.log(`passwordSecret cannot decrypt TOTP secret for '${userId}'. Make sure passwordSecret is the same for all nodes/applications.`, e);
+      return null;
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  // Encrypt an object into an auth string
+  static obj2authNext (obj, secret) {
+    secret ??= Auth.#serverSecret;
+
+    let entry, key, salt;
+    if ((entry = Auth.#keyCache.get(secret))) {
+      salt = entry.salt;
+      key = entry.key;
+    } else {
+      salt = crypto.randomBytes(16);
+      key = crypto.pbkdf2Sync(secret, salt, 300000, 32, 'sha256');
+      Auth.#keyCache.set(secret, { key, salt });
+      Auth.#keyCache.set(`${secret}:${salt.toString('hex')}`, key);
+    }
+
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+
+    let data = cipher.update(JSON.stringify(obj), 'utf8', 'hex');
+    data += cipher.final('hex');
+
+    const tag = cipher.getAuthTag();
+
+    const auth = {
+      iv: iv.toString('hex'),
+      salt: salt.toString('hex'),
+      data, // already hex
+      tag: tag.toString('hex')
+    };
+
+    return JSON.stringify(auth);
+  }
+
+  // ----------------------------------------------------------------------------
+  // Encrypt an object into an auth string
+  // IV.E.H
+  static obj2auth (obj, secret) {
+    return Auth.obj2authNext(obj, secret);
+  }
+
+  // Max hex data length for auth strings stored server side, like cont3xt keys.
+  // Anything a peer sends us uses the much smaller default.
+  static STORED_AUTH_MAX = 1024 * 1024;
+
+  // ----------------------------------------------------------------------------
+  // Decrypt the auth string into an object
+  static auth2objNext (auth, secret, maxDataLen = 8192) {
+    secret ??= Auth.#serverSecret;
+    try {
+      const parsed = JSON.parse(auth);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) ||
+          ArkimeUtil.isPP(Object.keys(parsed))) {
+        throw new Error('Malformed auth token');
+      }
+      const { iv, salt, data, tag } = parsed;
+
+      // Validate strict shapes BEFORE expensive PBKDF2 (DoS protection)
+      const isHex = /^[0-9a-fA-F]+$/;
+      if (typeof iv !== 'string' || iv.length !== 24 || !isHex.test(iv) ||
+          typeof salt !== 'string' || salt.length !== 32 || !isHex.test(salt) ||
+          typeof tag !== 'string' || tag.length !== 32 || !isHex.test(tag) ||
+          typeof data !== 'string' || data.length === 0 || data.length > maxDataLen || !isHex.test(data)) {
+        throw new Error('Malformed auth token');
+      }
+
+      const cacheKey = `${secret}:${salt}`;
+      let key = Auth.#keyCache.get(cacheKey);
+      const cached = !!key;
+      if (!cached) {
+        key = crypto.pbkdf2Sync(secret, Buffer.from(salt, 'hex'), 300000, 32, 'sha256');
+      }
+
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'hex'));
+      decipher.setAuthTag(Buffer.from(tag, 'hex'));
+
+      let decrypted = decipher.update(data, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+
+      // Only cache keys that decrypted, so forged salts can't evict real ones
+      if (!cached) { Auth.#keyCache.set(cacheKey, key); }
+
+      return JSON.parse(decrypted);
+    } catch (error) {
+      // debug only, an unauthenticated peer can trigger this at will
+      if (ArkimeConfig.debug > 0) { console.log(error); }
+      throw new Error('Incorrect auth supplied');
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  // Decrypt the auth string into an object
+  static auth2obj (auth, secret, maxDataLen) {
+    // New json style
+    if (auth[0] === '{') { return Auth.auth2objNext(auth, secret, maxDataLen); }
+
+    // New json style, but still encoded, bad proxy probably
+    if (auth.startsWith('%7B%22')) { return Auth.auth2objNext(decodeURIComponent(auth), secret, maxDataLen); }
+
+    // IV.E.H
+    const parts = auth.split('.');
+
+    if (parts.length !== 3) {
+      throw new Error(`Unsupported auth2obj ${parts.length}`);
+    }
+
+    if (secret) {
+      secret = crypto.createHash('sha256').update(secret).digest();
+    } else {
+      secret = Auth.#serverSecret256;
+    }
+
+    const signature = Buffer.from(parts[2], 'hex');
+    const h = crypto.createHmac('sha256', secret).update(parts[0] + '.' + parts[1]).digest();
+
+    if (signature.length !== h.length || !crypto.timingSafeEqual(signature, h)) {
+      throw new Error('Incorrect signature');
+    }
+
+    try {
+      const c = crypto.createDecipheriv('aes-256-cbc', secret, Buffer.from(parts[0], 'hex'));
+      let d = c.update(parts[1], 'hex', 'utf8');
+      d += c.final('utf8');
+      return JSON.parse(d);
+    } catch (error) {
+      // debug only, an unauthenticated peer can trigger this at will
+      if (ArkimeConfig.debug > 0) { console.log(error); }
+      throw new Error('Incorrect auth supplied');
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  // Parse and fully validate a request's x-arkime-auth header. Returns
+  // { obj } when it is a genuine s2s token for this request, otherwise
+  // { error }. Anything that needs to make its own s2s decision (the s2s
+  // passport strategy, the packet portal) should use this rather than calling
+  // auth2obj on its own, which only proves the token decrypts.
+  static parseS2SRequest (req) {
+    const auth = req.headers['x-arkime-auth'];
+    if (auth === undefined) { return { error: 'Missing x-arkime-auth' }; }
+
+    // Anything present but unusable (empty, duplicated header, not a string) is
+    // a corrupt token rather than a missing one -- auth2obj throws on all of it
+    let obj;
+    try {
+      obj = Auth.#s2sRegressionTests ? JSON.parse(auth) : Auth.auth2obj(auth);
+    } catch (e) {
+      // debug only, an unauthenticated peer can trigger this at will
+      if (ArkimeConfig.debug > 0) { console.log('AUTH: x-arkime-auth corrupt', e); }
+      return { error: 'S2S auth header corrupt' };
+    }
+
+    const error = Auth.validateS2SObj(obj, req);
+    if (error) { return { error }; }
+
+    return { obj };
+  }
+
+  // ----------------------------------------------------------------------------
+  // Validate a decoded x-arkime-auth object as a genuine s2s token for this
+  // request: bound to this path/method, from a real (non-role) user, with a
+  // recent timestamp. auth2obj()/JSON.parse only proves the token decrypts/parses
+  // with the serverSecret, which on its own is not sufficient. Returns an error
+  // string when invalid, or undefined when the token is a valid s2s token.
+  static validateS2SObj (obj, req) {
+    if (obj === null || typeof obj !== 'object') {
+      return 'S2S auth header corrupt';
+    }
+
+    if (!ArkimeUtil.isString(obj.path)) {
+      return 'S2S bad path';
+    }
+
+    if (!ArkimeUtil.isString(obj.user)) {
+      return 'S2S bad user';
+    }
+
+    if (typeof (obj.date) !== 'number') {
+      return 'S2S bad date';
+    }
+
+    if (obj.user.startsWith('role:')) {
+      return 'Cannot authenticate with role';
+    }
+
+    let objPath = obj.path;
+    if (Auth.#basePath.length > 1 && obj.path.startsWith(Auth.#basePath)) {
+      objPath = obj.path.substring(Auth.#basePath.length);
+    }
+    if (obj.path !== req.url && objPath !== req.url) {
+      console.log('ERROR - mismatch url object:', obj.path, 'request:', ArkimeUtil.sanitizeStr(req.url));
+      return 'Unauthorized based on bad url';
+    }
+
+    // Backwards compatible: only enforce method when the signed token includes it
+    if (obj.method !== undefined && obj.method !== req.method.toUpperCase()) {
+      console.log('ERROR - mismatch method object:', obj.method, 'request:', ArkimeUtil.sanitizeStr(req.method));
+      return 'Unauthorized based on bad method';
+    }
+
+    if (Math.abs(Date.now() - obj.date) > 120000) { // Request has to be +- 2 minutes
+      console.log('ERROR - Denying server to server based on timestamp, are clocks out of sync?', Date.now(), obj.date);
+      return 'Unauthorized based on timestamp - check that all Arkime viewer machines have accurate clocks';
+    }
+
+    return undefined;
+  }
+
+  // ----------------------------------------------------------------------------
+  static addS2SAuth (options, user, node, path, secret) {
+    if (!options.headers) {
+      options.headers = {};
+    }
+    options.headers['x-arkime-auth'] = Auth.obj2auth({
+      date: Date.now(),
+      user: user.userId,
+      node,
+      path,
+      method: (options.method ?? 'GET').toUpperCase()
+    }, secret);
+  }
+
+  // ----------------------------------------------------------------------------
+  // express middleware to set req.settingUser to who to work on, depending if admin or not
+  // This returns fresh from db
+  static getSettingUserDb (req, res, next) {
+    let userId;
+
+    if (!req.query.userId || req.query.userId === req.user.userId) {
+      userId = req.user.userId;
+    } else if (!req.user.hasRole('usersAdmin') || (!req.url.toLowerCase().startsWith('/api/user/password') && Auth.#appAdminRole && !req.user.hasRole(Auth.#appAdminRole))) {
+      // user is trying to get another user's settings without admin privilege
+      return res.serverError(403, 'Need admin privileges');
+    } else {
+      userId = req.query.userId;
+    }
+
+    User.getUser(userId, function (err, user) {
+      if (err || !user) {
+        if (!Auth.passwordSecret) {
+          req.settingUser = JSON.parse(JSON.stringify(req.user));
+          delete req.settingUser.found;
+        } else {
+          return res.serverError(403, 'Unknown user');
+        }
+
+        return next();
+      }
+
+      req.settingUser = user;
+      return next();
+    });
+  }
+}
+
+// ----------------------------------------------------------------------------
+class ESStore extends expressSession.Store {
+  static #client;
+  static #index;
+  static #ttl = 24 * 60 * 60 * 1000; // 24 hrs
+  static #memoryStore = new expressSession.MemoryStore(); // fallback when there's no Elasticsearch client
+
+  constructor (options) {
+    super();
+    setTimeout(async () => {
+      ESStore.#client = User.getClient();
+      if (!ESStore.#client) {
+        console.log('WARNING - usersElasticsearch is not Elasticsearch/OpenSearch, using in-memory sessions (lost on restart, not shared across nodes)');
+        // MemoryStore only drops an expired session when it is read again, all() checks every one
+        setInterval(() => ESStore.#memoryStore.all(), 60 * 1000).unref();
+        return;
+      }
+      ESStore.start();
+      setInterval(() => ESStore.#prune(), 10 * 60 * 1000).unref();
+    }, 100);
+    const prefix = ArkimeUtil.formatPrefix(ArkimeConfig.get('usersPrefix', ArkimeConfig.get('prefix', 'arkime_')));
+    ESStore.#index = `${prefix}sids_v50`;
+  }
+
+  // ----------------------------------------------------------------------------
+  static async start () {
+    // Create Index if needed
+    try {
+      await ESStore.#client.indices.create({
+        index: ESStore.#index,
+        body: {
+          settings: {
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            auto_expand_replicas: '0-1'
+          }
+        }
+      });
+    } catch (err) {
+      // If already exists ignore error
+      if (err.meta?.body?.error?.type !== 'resource_already_exists_exception') {
+        console.log(err);
+        process.exit(1);
+      }
+    }
+
+    // Update mapping if needed
+    await ESStore.#client.indices.putMapping({
+      index: ESStore.#index,
+      body: {
+        dynamic_templates: [
+          {
+            string_template: {
+              match_mapping_type: 'string',
+              mapping: {
+                type: 'keyword'
+              }
+            }
+          }
+        ],
+        properties: {
+          _timestamp: { type: 'date' },
+          _expires: { type: 'date' }
+        }
+      }
+    });
+
+    await ESStore.#prune();
+  }
+
+  // ----------------------------------------------------------------------------
+  // Delete expired sids, ignore errors. Older docs only have _timestamp.
+  static async #prune () {
+    const now = new Date().getTime();
+    try {
+      await ESStore.#client.deleteByQuery({
+        index: ESStore.#index,
+        body: {
+          query: {
+            bool: {
+              should: [
+                { range: { _expires: { lte: now } } },
+                { range: { _timestamp: { lte: now - ESStore.#ttl } } }
+              ]
+            }
+          }
+        },
+        timeout: '5m'
+      });
+    } catch (err) { }
+  }
+
+  // ----------------------------------------------------------------------------
+  destroy (sid, callback) {
+    if (!ESStore.#client) {
+      return ESStore.#memoryStore.destroy(sid, callback);
+    }
+    ESStore.#client.delete({
+      index: ESStore.#index,
+      id: sid
+    }, (err, response) => {
+      callback();
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  get (sid, callback) {
+    if (!ESStore.#client) {
+      return ESStore.#memoryStore.get(sid, callback);
+    }
+    ESStore.#client.get({
+      index: ESStore.#index,
+      id: sid
+    }, (err, response) => {
+      if (err) {
+        if (response?.statusCode === 404) {
+          return callback();
+        }
+        return callback(err);
+      }
+
+      const _source = response.body._source;
+      const now = new Date().getTime();
+      if (now - _source._timestamp > ESStore.#ttl || now > (_source._expires ?? Infinity)) {
+        this.destroy(sid, () => {});
+        return callback();
+      }
+      return callback(err, _source);
+    });
+  }
+
+  // ----------------------------------------------------------------------------
+  set (sid, session, callback) {
+    if (!ESStore.#client) {
+      return ESStore.#memoryStore.set(sid, session, callback);
+    }
+    session._timestamp = new Date().getTime();
+    session._expires = session.cookie?.expires ? new Date(session.cookie.expires).getTime() : session._timestamp + ESStore.#ttl;
+    ESStore.#client.index({
+      index: ESStore.#index,
+      id: sid,
+      body: session
+    }, (err, response) => {
+      callback(err);
+    });
+  }
+}
+// ----------------------------------------------------------------------------
+module.exports = Auth;
+
+const User = require('../common/user');
+const ArkimeUtil = require('../common/arkimeUtil');
+const ArkimeConfig = require('../common/arkimeConfig');
+
+ArkimeConfig.registerValidated({
+  userAuthIps: { type: 'cidrs' },
+  // A non numeric skew becomes NaN, and jose compares exp against NaN, which is
+  // always false - so an expired token would verify forever
+  authJwtClockSkew: { type: 'int', min: 0 }
+});

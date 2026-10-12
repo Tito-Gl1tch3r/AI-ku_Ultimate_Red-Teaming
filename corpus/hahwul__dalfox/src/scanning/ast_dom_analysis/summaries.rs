@@ -1,0 +1,330 @@
+//! Function summaries.
+//!
+//! A sink reached inside a helper is only a finding when a tainted value can
+//! reach that helper's parameter, so declarations are collected ahead of the
+//! walk and recorded as which parameter flows to which sink.
+
+use super::*;
+
+impl<'a> DomXssVisitor<'a> {
+    /// Walk through statements
+    pub(super) fn walk_statements(&mut self, stmts: &[Statement<'a>]) {
+        self.collect_function_declarations(stmts);
+        for stmt in stmts {
+            self.walk_statement(stmt);
+        }
+    }
+    /// Collect function declarations before statement traversal so hoisted calls are recognized.
+    pub(super) fn collect_function_declarations(&mut self, stmts: &[Statement<'a>]) {
+        for stmt in stmts {
+            if let Statement::FunctionDeclaration(func_decl) = stmt {
+                self.register_function_declaration(func_decl.as_ref());
+            }
+        }
+    }
+    pub(super) fn extract_param_names(&self, params: &FormalParameters<'a>) -> Vec<String> {
+        params
+            .items
+            .iter()
+            .filter_map(|param| match &param.pattern {
+                BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    }
+    pub(super) fn register_function_summary(
+        &mut self,
+        function_name: String,
+        params: Vec<String>,
+        body_stmts: &[Statement<'a>],
+    ) {
+        if self.function_summaries.contains_key(&function_name) {
+            return;
+        }
+
+        // Insert placeholder summary first to avoid recursive self-analysis loops.
+        self.function_summaries.insert(
+            function_name.clone(),
+            FunctionSummary {
+                tainted_param_sinks: BTreeMap::new(),
+                tainted_param_returns: BTreeMap::new(),
+                tainted_param_writes: BTreeMap::new(),
+                return_without_tainted_params: None,
+            },
+        );
+
+        // The summary walk starts from empty taint/alias state (each pass
+        // clears it below), so the live maps are moved out and moved back
+        // rather than cloned; the state the walk only reads is journaled and
+        // rolled back. Cloning it all made every hoisted declaration cost
+        // O(live state) — O(N²) across a bundle of them.
+        let saved_tainted = std::mem::take(&mut self.tainted_vars);
+        let saved_aliases = std::mem::take(&mut self.var_aliases);
+        let instance_classes_checkpoint = self.instance_classes.checkpoint();
+        let bound_aliases_checkpoint = self.bound_function_aliases.checkpoint();
+        let response_vars_checkpoint = self.response_object_vars.checkpoint();
+        // The summary walk is *hypothetical* — it assumes each parameter in
+        // turn is tainted — so any state it records must not leak into the real
+        // walk. The CSS custom-property map is keyed by a global property name
+        // rather than by a variable, so a helper that writes a parameter into
+        // `--label` would otherwise leave every later `getPropertyValue('--label')`
+        // reading tainted no matter what the helper was actually called with.
+        let css_custom_properties_checkpoint = self.css_custom_property_sources.checkpoint();
+        let idb_requests_checkpoint = self.idb_request_vars.checkpoint();
+        let idb_stores_checkpoint = self.idb_object_store_vars.checkpoint();
+        let image_vars_checkpoint = self.image_element_vars.checkpoint();
+        let saved_vuln_len = self.vulnerabilities.len();
+        let saved_collecting_tainted_returns = self.collecting_tainted_returns;
+        let saved_tainted_return_sources = std::mem::take(&mut self.tainted_return_sources);
+
+        let mut summary = FunctionSummary {
+            tainted_param_sinks: BTreeMap::new(),
+            tainted_param_returns: BTreeMap::new(),
+            tainted_param_writes: BTreeMap::new(),
+            return_without_tainted_params: None,
+        };
+
+        // A per-parameter pass assumes its parameter is tainted, so the field
+        // and global writes it makes are rolled back with it and recorded as
+        // `tainted_param_writes` instead — applied only where a call actually
+        // passes a tainted argument. Writes rooted at a local or a parameter
+        // die with the call.
+        let mut locals: HashSet<String> = params.iter().cloned().collect();
+        Self::collect_declared_names(body_stmts, &mut locals);
+        let is_outer = |path: &String| {
+            let root = path.split(['.', '[']).next().unwrap_or(path);
+            root != "this" && !locals.contains(root)
+        };
+        for (idx, param_name) in params.iter().enumerate() {
+            let field_taints_checkpoint = self.field_taints.checkpoint();
+            let global_taints_checkpoint = self.global_taints.checkpoint();
+            self.tainted_vars.clear();
+            self.var_aliases.clear();
+            self.tainted_vars.insert(param_name.clone());
+            self.var_aliases
+                .insert(param_name.clone(), format!("fn_param_{}", idx));
+            self.collecting_tainted_returns = true;
+            self.tainted_return_sources.clear();
+
+            let before = self.vulnerabilities.len();
+            self.walk_statements(body_stmts);
+            for vuln in &self.vulnerabilities[before..] {
+                if vuln.sink != "__return__" {
+                    summary
+                        .tainted_param_sinks
+                        .entry(idx)
+                        .or_insert_with(|| vuln.sink.clone());
+                }
+            }
+            if let Some(source) = self.tainted_return_sources.first() {
+                summary.tainted_param_returns.insert(idx, source.clone());
+            }
+            self.vulnerabilities.truncate(before);
+            self.tainted_return_sources.clear();
+            let fields: Vec<String> = self
+                .field_taints
+                .keys_added_since(&field_taints_checkpoint)
+                .into_iter()
+                .filter(is_outer)
+                .collect();
+            let globals: Vec<String> = self
+                .global_taints
+                .keys_added_since(&global_taints_checkpoint)
+                .into_iter()
+                .filter(is_outer)
+                .collect();
+            self.global_taints.rollback(global_taints_checkpoint);
+            self.field_taints.rollback(field_taints_checkpoint);
+            if !fields.is_empty() || !globals.is_empty() {
+                summary.tainted_param_writes.insert(idx, (fields, globals));
+            }
+        }
+
+        // Also capture return taint that does not depend on tainted parameters
+        // (e.g., function directly returning location.hash)
+        self.tainted_vars.clear();
+        self.var_aliases.clear();
+        self.collecting_tainted_returns = true;
+        self.tainted_return_sources.clear();
+        let before = self.vulnerabilities.len();
+        self.walk_statements(body_stmts);
+        if let Some(source) = self.tainted_return_sources.first() {
+            summary.return_without_tainted_params = Some(source.clone());
+        }
+        self.vulnerabilities.truncate(before);
+
+        self.tainted_vars = saved_tainted;
+        self.var_aliases = saved_aliases;
+        self.instance_classes.rollback(instance_classes_checkpoint);
+        self.bound_function_aliases
+            .rollback(bound_aliases_checkpoint);
+        self.response_object_vars.rollback(response_vars_checkpoint);
+        self.css_custom_property_sources
+            .rollback(css_custom_properties_checkpoint);
+        self.idb_request_vars.rollback(idb_requests_checkpoint);
+        self.idb_object_store_vars.rollback(idb_stores_checkpoint);
+        self.image_element_vars.rollback(image_vars_checkpoint);
+        self.vulnerabilities.truncate(saved_vuln_len);
+        self.collecting_tainted_returns = saved_collecting_tainted_returns;
+        self.tainted_return_sources = saved_tainted_return_sources;
+
+        self.function_summaries.insert(function_name, summary);
+    }
+    pub(super) fn register_function_declaration(&mut self, func_decl: &Function<'a>) {
+        let Some(id) = &func_decl.id else {
+            return;
+        };
+        let Some(body) = &func_decl.body else {
+            return;
+        };
+        self.register_function_summary(
+            id.name.to_string(),
+            self.extract_param_names(&func_decl.params),
+            &body.statements,
+        );
+    }
+    pub(super) fn register_object_literal_method_summaries(
+        &mut self,
+        object_name: &str,
+        obj: &ObjectExpression<'a>,
+    ) {
+        for prop in &obj.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                continue;
+            };
+            let Some(method_name) = self.get_property_key_name(&p.key) else {
+                continue;
+            };
+            let summary_name = format!("{}.{}", object_name, method_name);
+
+            match &p.value {
+                Expression::FunctionExpression(func_expr) => {
+                    if let Some(body) = &func_expr.body {
+                        self.register_function_summary(
+                            summary_name,
+                            self.extract_param_names(&func_expr.params),
+                            &body.statements,
+                        );
+                    }
+                }
+                Expression::ArrowFunctionExpression(arrow_expr) => {
+                    self.register_function_summary(
+                        summary_name,
+                        self.extract_param_names(&arrow_expr.params),
+                        &arrow_expr.body.statements,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    pub(super) fn register_class_method_summaries_for_name(
+        &mut self,
+        class_name: &str,
+        class_decl: &Class<'a>,
+    ) {
+        self.register_class_accessor_fields(class_name, class_decl);
+        for elem in &class_decl.body.body {
+            let ClassElement::MethodDefinition(method_def) = elem else {
+                continue;
+            };
+            if !matches!(method_def.kind, MethodDefinitionKind::Method) {
+                continue;
+            }
+            let Some(method_name) = self.get_property_key_name(&method_def.key) else {
+                continue;
+            };
+            let Some(body) = &method_def.value.body else {
+                continue;
+            };
+            self.register_function_summary(
+                format!("{}.{}", class_name, method_name),
+                self.extract_param_names(&method_def.value.params),
+                &body.statements,
+            );
+        }
+    }
+
+    /// Record the two halves of the accessor indirection for `class_name`:
+    /// which fields the constructor stores straight from a parameter, and which
+    /// getters just hand a field back.
+    ///
+    /// Together they let `new C(tainted).accessor` resolve — a read the member
+    /// walk cannot follow on its own, because the accessor is a function call
+    /// whose body never mentions the constructor argument.
+    ///
+    /// Both halves are deliberately literal-minded. Only a bare
+    /// `this.field = param` is a stored parameter, so a constructor that
+    /// sanitizes (`this.field = escapeHtml(param)`) records nothing and the
+    /// accessor reads clean; and only a getter whose body is `return this.field`
+    /// is an alias, so a getter that formats or escapes its field records
+    /// nothing either.
+    pub(super) fn register_class_accessor_fields(
+        &mut self,
+        class_name: &str,
+        class_decl: &Class<'a>,
+    ) {
+        for elem in &class_decl.body.body {
+            let ClassElement::MethodDefinition(method_def) = elem else {
+                continue;
+            };
+            let Some(body) = &method_def.value.body else {
+                continue;
+            };
+            match method_def.kind {
+                MethodDefinitionKind::Constructor => {
+                    let params = self.extract_param_names(&method_def.value.params);
+                    for stmt in &body.statements {
+                        let Statement::ExpressionStatement(expr_stmt) = stmt else {
+                            continue;
+                        };
+                        let Expression::AssignmentExpression(assign) = &expr_stmt.expression else {
+                            continue;
+                        };
+                        if assign.operator != AssignmentOperator::Assign {
+                            continue;
+                        }
+                        let AssignmentTarget::StaticMemberExpression(target) = &assign.left else {
+                            continue;
+                        };
+                        if !matches!(target.object, Expression::ThisExpression(_)) {
+                            continue;
+                        }
+                        let Expression::Identifier(rhs) = &assign.right else {
+                            continue;
+                        };
+                        let Some(idx) = params.iter().position(|p| p == rhs.name.as_str()) else {
+                            continue;
+                        };
+                        self.class_ctor_param_fields.insert(
+                            format!("{class_name}.{}", target.property.name.as_str()),
+                            idx,
+                        );
+                    }
+                }
+                MethodDefinitionKind::Get => {
+                    let Some(getter_name) = self.get_property_key_name(&method_def.key) else {
+                        continue;
+                    };
+                    for stmt in &body.statements {
+                        let Statement::ReturnStatement(ret) = stmt else {
+                            continue;
+                        };
+                        let Some(Expression::StaticMemberExpression(member)) = &ret.argument else {
+                            continue;
+                        };
+                        if !matches!(member.object, Expression::ThisExpression(_)) {
+                            continue;
+                        }
+                        self.class_getter_fields.insert(
+                            format!("{class_name}.{getter_name}"),
+                            member.property.name.to_string(),
+                        );
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}

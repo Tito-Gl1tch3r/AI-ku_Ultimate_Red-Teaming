@@ -1,0 +1,657 @@
+//! interactsh OAST client: RSA-armed registration, per-payload callback URLs,
+//! polling with decrypt, and best-effort deregistration. One client == one
+//! session bound to a single server domain and correlation-id.
+
+mod crypto;
+mod wire;
+
+use std::time::Duration;
+
+use rand::Rng;
+use reqwest::Client;
+
+use crate::oob::{OobConfig, OobInteraction};
+use crypto::SessionKeys;
+
+type ClientResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// interactsh fixes the correlation-id length at 20; the per-payload nonce fills
+/// the rest of the 33-char subdomain label.
+const CORRELATION_ID_LEN: usize = 20;
+const NONCE_LEN: usize = 13;
+/// Cap on the OAST poll/register response body we buffer. This bounds memory if
+/// a hostile/compromised OAST node streams an oversized body, consistent with
+/// the project's capped-body policy for scanned targets. Sized generously (a
+/// single poll can carry a whole batch of base64+AES-wrapped interactions) so a
+/// busy session doesn't routinely truncate; truncation mid-JSON drops the whole
+/// batch (lost blind-XSS evidence), so [`OobSession::poll`] makes a cap hit loud
+/// rather than letting the parse error vanish at debug level.
+const OOB_MAX_BODY_BYTES: usize = 32 << 20; // 32 MiB
+/// Upper bound on the pre-allocation hint for the decrypted-interaction buffer,
+/// so a large advertised entry count can't drive an oversized reservation.
+const OOB_MAX_ENTRIES_HINT: usize = 4096;
+const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+pub(crate) struct InteractshClient {
+    /// Bare host[:port] embedded in payload callback hosts and matched against
+    /// interaction `full-id`s.
+    server: String,
+    /// Full base URL (`scheme://host[:port]`) for register/poll/deregister.
+    base: String,
+    /// Scheme to use for minted callback URLs (honors user-provided scheme for
+    /// self-hosted OAST so that e.g. `http://my-collab:8080` produces
+    /// `http://<corr><nonce>.my-collab:8080` in blind payloads rather than
+    /// hard-coded https).
+    callback_scheme: String,
+    correlation_id: String,
+    secret_key: String,
+    token: Option<String>,
+    keys: SessionKeys,
+    http: Client,
+}
+
+/// Generate one keypair, then try each configured server in order until one
+/// registers. Returns the first live client, or the last error if all fail
+/// (the caller turns that into a soft warning). The RSA-2048 keypair is
+/// generated once and reused across attempts rather than per server.
+pub async fn register_first(config: &OobConfig) -> ClientResult<InteractshClient> {
+    // RSA-2048 keygen is a 50-300ms CPU burst. Run it on the blocking pool so it
+    // does not stall an async runtime worker (and any other tasks scheduled on
+    // it) for the duration.
+    let keys = tokio::task::spawn_blocking(SessionKeys::generate)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("OOB keygen task panicked: {e}").into()
+        })??;
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    for server in &config.servers {
+        let client = match InteractshClient::new(server, config, keys.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(format!("init {server}: {e}").into());
+                continue;
+            }
+        };
+        match client.register().await {
+            Ok(()) => return Ok(client),
+            Err(e) => last_err = Some(format!("register {server}: {e}").into()),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "no OOB servers configured".into()))
+}
+
+impl InteractshClient {
+    /// Build a client for `server` from a pre-generated keypair (does no network
+    /// I/O — call [`register`] next).
+    ///
+    /// [`register`]: InteractshClient::register
+    fn new(server: &str, config: &OobConfig, keys: SessionKeys) -> ClientResult<Self> {
+        crate::ensure_crypto_provider();
+        let correlation_id = rand_label(CORRELATION_ID_LEN);
+        let secret_key = uuid::Uuid::new_v4().to_string();
+
+        let (base, host) = split_server(server);
+
+        // Resolved before the TLS decision, because whether a usable proxy is
+        // actually in front of this connection is part of that decision.
+        let proxy = config
+            .proxy
+            .as_ref()
+            .and_then(|pxy| reqwest::Proxy::all(pxy).ok());
+        let intercepting_proxy = config
+            .proxy
+            .as_deref()
+            .is_some_and(is_tls_intercepting_proxy)
+            && proxy.is_some();
+
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(config.timeout.max(1)))
+            .no_proxy()
+            .danger_accept_invalid_certs(accept_invalid_certs(
+                &host,
+                config.insecure,
+                intercepting_proxy,
+            ));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(proxy);
+        }
+        let http = builder.build()?;
+
+        let callback_scheme = if base.starts_with("http://") {
+            "http".to_string()
+        } else {
+            "https".to_string()
+        };
+        Ok(Self {
+            server: host,
+            base,
+            callback_scheme,
+            correlation_id,
+            secret_key,
+            token: config.secret.clone(),
+            keys,
+            http,
+        })
+    }
+
+    pub(crate) fn server_domain(&self) -> &str {
+        &self.server
+    }
+
+    /// The per-session correlation id. Read by the interaction-matching tests,
+    /// which build the full `<id><nonce>.oast.fun` host the server echoes back.
+    #[cfg(test)]
+    pub fn correlation_id(&self) -> &str {
+        &self.correlation_id
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    /// Register the public key + correlation-id with the server.
+    pub async fn register(&self) -> ClientResult<()> {
+        let body = wire::RegisterRequest {
+            public_key: self.keys.public_key_b64.clone(),
+            secret_key: self.secret_key.clone(),
+            correlation_id: self.correlation_id.clone(),
+        };
+        let mut req = self
+            .http
+            .post(format!("{}/register", self.base_url()))
+            .json(&body);
+        if let Some(t) = &self.token {
+            req = req.header(reqwest::header::AUTHORIZATION, t);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            return Err(format!("register returned HTTP {}", resp.status()).into());
+        }
+        Ok(())
+    }
+
+    /// Mint a fresh `<scheme>://<corr><nonce>.<server>` callback URL (scheme
+    /// matches the one used for the OAST API server) and return it alongside
+    /// the `nonce` used to correlate the eventual callback.
+    pub fn new_payload_url(&self) -> (String, String) {
+        let nonce = rand_label(NONCE_LEN);
+        let host = format!("{}{}.{}", self.correlation_id, nonce, self.server);
+        (format!("{}://{host}", self.callback_scheme), nonce)
+    }
+
+    /// Recover the 13-char nonce from an interaction's `full-id`
+    /// (`<corr><nonce>.<server>`), or `None` if it isn't one of ours.
+    ///
+    /// The leftmost label is lowercased before matching: a recursive resolver may
+    /// apply DNS-0x20 case randomization, so a DNS callback's `full-id` can arrive
+    /// as e.g. `AbC...XyZ.oast.fun` even though we minted a lowercase host. Both
+    /// the correlation-id and the nonce alphabet are lowercase, so folding case
+    /// only ever recovers a correlation that would otherwise be missed.
+    pub fn extract_nonce(&self, full_id: &str) -> Option<String> {
+        let label = full_id.split('.').next()?.to_ascii_lowercase();
+        let rest = label.strip_prefix(&self.correlation_id)?;
+        if rest.is_empty() {
+            return None;
+        }
+        Some(rest.chars().take(NONCE_LEN).collect())
+    }
+
+    /// Poll once, returning every decrypted interaction the server had queued.
+    pub async fn poll(&self) -> ClientResult<Vec<OobInteraction>> {
+        let url = format!(
+            "{}/poll?id={}&secret={}",
+            self.base_url(),
+            self.correlation_id,
+            self.secret_key
+        );
+        let mut req = self.http.get(url);
+        if let Some(t) = &self.token {
+            req = req.header(reqwest::header::AUTHORIZATION, t);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            return Err(format!("poll returned HTTP {}", resp.status()).into());
+        }
+        // Cap the buffered body instead of `resp.json()` (which reads without
+        // bound) so a hostile OAST node can't drive an OOM through the poller.
+        let body = crate::utils::http::read_body_capped(resp, OOB_MAX_BODY_BYTES).await?;
+        // A cap hit means the body was truncated mid-JSON: the parse below would
+        // fail and the entire batch — potentially confirmed blind-XSS callbacks —
+        // would silently vanish (the poller only logs poll errors at debug). Make
+        // it loud and return early with a clear cause instead. (read_body_capped
+        // fills to exactly the cap on truncation; lossy UTF-8 can nudge it over,
+        // hence `>=`.)
+        if body.len() >= OOB_MAX_BODY_BYTES {
+            crate::ceprintln!(
+                "[warn] OOB poll body reached the {} MiB cap and was truncated; some queued blind-XSS callbacks in this batch may be lost",
+                OOB_MAX_BODY_BYTES >> 20
+            );
+            return Err(format!(
+                "OOB poll body exceeded the {} MiB cap (truncated)",
+                OOB_MAX_BODY_BYTES >> 20
+            )
+            .into());
+        }
+        let parsed: wire::PollResponse = serde_json::from_str(&body)?;
+
+        let aes_key_b64 = parsed.aes_key.as_deref().filter(|s| !s.is_empty());
+        let Some(aes_key_b64) = aes_key_b64 else {
+            return Ok(Vec::new());
+        };
+        let mut entries: Vec<String> = parsed.data.unwrap_or_default();
+        entries.extend(parsed.extra.unwrap_or_default());
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let aes_key = self.keys.decrypt_aes_key(aes_key_b64)?;
+
+        let mut out = Vec::with_capacity(entries.len().min(OOB_MAX_ENTRIES_HINT));
+        for item in &entries {
+            let Ok(plain) = crypto::decrypt_interaction(&aes_key, item) else {
+                continue;
+            };
+            if let Ok(inter) = serde_json::from_slice::<OobInteraction>(&plain) {
+                out.push(inter);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Best-effort deregistration; failures are ignored (the session is ending).
+    pub async fn deregister(&self) {
+        let body = wire::DeregisterRequest {
+            correlation_id: self.correlation_id.clone(),
+            secret_key: self.secret_key.clone(),
+        };
+        let mut req = self
+            .http
+            .post(format!("{}/deregister", self.base_url()))
+            .json(&body);
+        if let Some(t) = &self.token {
+            req = req.header(reqwest::header::AUTHORIZATION, t);
+        }
+        let _ = req.send().await;
+    }
+}
+
+/// Split a user-supplied server value into `(base_url, host)`. The scheme
+/// defaults to `https` (public interactsh) but an explicit `http://` is honored
+/// for self-hosted servers behind a TLS-terminating proxy (and for tests). The
+/// returned host (no scheme/path, trailing dot stripped, lowercased) is what
+/// gets embedded in payload callback hosts.
+/// Whether the OAST client may skip certificate verification for `host`.
+///
+/// `--insecure` is a statement about the *scan target*, which dalfox does not
+/// trust and does not control. The OAST server is the opposite: it is our own
+/// infrastructure, chosen by us, and this channel carries secrets the target
+/// never sees — `--blind-oob-secret` rides in the `Authorization` header and
+/// the session `secret_key` rides in the poll URL's query string. An on-path
+/// attacker who can MITM the connection reads both, and can then inject forged
+/// interactions (our RSA public key is, by definition, public), so callbacks
+/// dalfox reports as blind XSS need not have happened at all.
+///
+/// So the scan's TLS posture is honoured for a server the operator named
+/// themselves with `--blind-oob`, which is what the original accept-everything
+/// default was actually for: a self-hosted interactsh behind a self-signed or
+/// hostname-mismatched certificate. The public mesh
+/// ([`crate::oob::DEFAULT_SERVERS`]) presents valid certificates and is
+/// otherwise always verified — `--insecure` cannot reach it, because nobody
+/// asked for the public mesh to be trusted less.
+///
+/// The one exception is `through_intercepting_proxy`: `--proxy` also routes the
+/// OAST channel, and an HTTP-proxy front end (Burp, mitmproxy, a corporate TLS
+/// appliance) re-signs with its own CA, so verification against the mesh's real
+/// certificate cannot succeed. Refusing there would not protect the operator
+/// from a man in the middle — they put him there — it would just disable
+/// blind-OOB with a warning line, which is the silent-degradation failure this
+/// whole check exists to avoid. `--insecure` is how that is declared, so it is
+/// honoured.
+///
+/// See [`is_tls_intercepting_proxy`] for why this is not simply "a proxy is
+/// configured".
+fn accept_invalid_certs(
+    host: &str,
+    config_insecure: bool,
+    through_intercepting_proxy: bool,
+) -> bool {
+    config_insecure && (through_intercepting_proxy || !crate::oob::is_default_server(host))
+}
+
+/// Can this proxy plausibly be terminating and re-signing TLS?
+///
+/// Only an HTTP(S) proxy can: it is the one that sees a `CONNECT` and may
+/// choose to answer it with its own certificate. A SOCKS proxy (`socks5://`,
+/// as in a Tor or ssh -D setup) forwards bytes at the transport layer and
+/// never touches the certificate, so the mesh's real one arrives intact and
+/// there is nothing for `--insecure` to rescue — treating every `--proxy` as
+/// an interception would hand back accept-anything against the public mesh
+/// with no man in the middle anywhere in the path.
+///
+/// A plain CONNECT-tunnelling HTTP proxy does not re-sign either, but it is
+/// indistinguishable from an intercepting one without trying the connection,
+/// so `http://`/`https://` is resolved in the operator's favour: they named
+/// the proxy and passed `--insecure`.
+fn is_tls_intercepting_proxy(proxy: &str) -> bool {
+    let p = proxy.trim().to_ascii_lowercase();
+    // reqwest defaults a scheme-less proxy to HTTP.
+    let scheme = p.split_once("://").map(|(s, _)| s).unwrap_or("http");
+    matches!(scheme, "http" | "https")
+}
+
+/// Split a `--blind-oob` server into its API base URL and the bare
+/// `host[:port]` used in callback hosts and in the public-mesh check.
+///
+/// Normalization goes through `url::Url` rather than string surgery, because
+/// the result feeds [`accept_invalid_certs`]: every spelling of the same
+/// endpoint has to reduce to the same host, or a mesh domain could be written
+/// so that it reads as an operator-named server and slips out of certificate
+/// verification. Hand-rolled parsing missed several — `oast.pro:0443` (leading
+/// zero in the port), `oast.pro.:443` (the trailing-dot strip ran before the
+/// port strip), and `x@oast.pro` / `oast.pro?x=1` / `oast.pro#f`, which also
+/// left userinfo, a query or a fragment glued into the base URL. `Url` folds
+/// all of them: it lowercases the host, parses the port numerically and drops
+/// the scheme's default, and keeps userinfo, path, query and fragment in
+/// fields we simply do not read.
+///
+/// An input `Url` cannot parse falls back to the old string split. That path
+/// only produces a host no mesh domain can spell, so it lands on the
+/// operator-named side, which is where an unparseable custom server belongs.
+/// Parse `server` into `(base_url, host)` via `url::Url`, returning `None` when
+/// it does not name a dialable host. The single definition of "what spelling of
+/// an interactsh server is valid" — shared with `job::normalize_blind_oob`, so
+/// REST/MCP validate a server against exactly what the client will dial. A bare
+/// host gets `https://`; an explicit http(s) scheme (any case) is kept.
+pub(crate) fn parse_server_host(server: &str) -> Option<(String, String)> {
+    let s = server.trim();
+    // Schemes are case-insensitive (RFC 3986), and a case-sensitive test here
+    // would treat `HTTPS://oast.pro` as a bare host and prepend a second
+    // scheme, producing a garbage host that reads as operator-named.
+    let lower = s.to_ascii_lowercase();
+    let with_scheme = if lower.starts_with("https://") || lower.starts_with("http://") {
+        s.to_string()
+    } else {
+        format!("https://{s}")
+    };
+
+    let url = url::Url::parse(&with_scheme).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let parsed_host = url.host_str()?;
+    // A fully-qualified trailing dot names the same host; `Url` keeps it.
+    let bare = parsed_host.trim_end_matches('.').to_ascii_lowercase();
+    if bare.is_empty() {
+        return None;
+    }
+    let scheme = url.scheme();
+    // `port()` is None when the port equals the scheme's default, so
+    // `:443` on https and `:80` on http normalize away here.
+    let host = match url.port() {
+        Some(p) => format!("{bare}:{p}"),
+        None => bare,
+    };
+    Some((format!("{scheme}://{host}"), host))
+}
+
+fn split_server(server: &str) -> (String, String) {
+    if let Some(parsed) = parse_server_host(server) {
+        return parsed;
+    }
+
+    let lower = server.trim().to_ascii_lowercase();
+    let (scheme, rest) = if let Some(r) = lower.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = lower.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        ("https", lower.as_str())
+    };
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or(rest)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    (format!("{scheme}://{host}"), host)
+}
+
+/// Random lowercase-alphanumeric DNS label component of length `n`.
+fn rand_label(n: usize) -> String {
+    let mut rng = rand::thread_rng();
+    (0..n)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> OobConfig {
+        OobConfig {
+            servers: vec!["oast.fun".to_string()],
+            secret: None,
+            wait_secs: 5,
+            timeout: 10,
+            proxy: None,
+            insecure: false,
+        }
+    }
+
+    #[test]
+    fn insecure_never_reaches_the_public_oast_mesh() {
+        // `--insecure` is about the scan target. The public mesh is dalfox's
+        // own pick, and the channel carries the session secret_key (poll query
+        // string) and `--blind-oob-secret` (Authorization header), so an
+        // on-path attacker who could MITM it would read both tokens and could
+        // inject forged interactions with our own public key.
+        for server in crate::oob::DEFAULT_SERVERS {
+            let (_, host) = split_server(server);
+            assert!(
+                !accept_invalid_certs(&host, true, false),
+                "{server}: the public mesh must be verified even under --insecure"
+            );
+            assert!(!accept_invalid_certs(&host, false, false));
+        }
+
+        // A mesh domain written as a URL or with a trailing dot is the same
+        // node, and must not slip past the check on spelling alone.
+        for spelling in [
+            "https://oast.pro",
+            "OAST.PRO",
+            "oast.pro.",
+            "https://oast.fun/",
+            // The mesh's own port written out is the same endpoint, however
+            // it is padded. Each of these reached the real public mesh with
+            // verification disabled before `split_server` normalized through
+            // `url::Url`.
+            "oast.pro:443",
+            "https://oast.fun:443/",
+            "oast.pro:0443",
+            "oast.pro:00443",
+            "oast.pro.:443",
+            // Userinfo, query and fragment used to be glued into the host.
+            "https://x@oast.pro",
+            "https://oast.pro?x=1",
+            "https://oast.pro#f",
+            "https://oast.pro/register",
+            "HTTPS://OAST.PRO.:443/",
+        ] {
+            let (_, host) = split_server(spelling);
+            assert!(
+                !accept_invalid_certs(&host, true, false),
+                "{spelling} is the public mesh however it is spelled"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_http_proxy_counts_as_tls_interception() {
+        // Burp / mitmproxy / a corporate appliance: terminates TLS, re-signs.
+        for p in [
+            "http://127.0.0.1:8080",
+            "https://proxy.corp.example:3128",
+            // reqwest defaults a scheme-less proxy to HTTP.
+            "127.0.0.1:8080",
+            "  HTTP://127.0.0.1:8080  ",
+        ] {
+            assert!(is_tls_intercepting_proxy(p), "{p} can re-sign");
+        }
+        // SOCKS forwards bytes; the mesh's real certificate arrives intact, so
+        // there is nothing for --insecure to rescue and no MITM to excuse.
+        for p in [
+            "socks5://127.0.0.1:9050",
+            "socks5h://127.0.0.1:9050",
+            "socks4://127.0.0.1:1080",
+        ] {
+            assert!(!is_tls_intercepting_proxy(p), "{p} never sees the cert");
+        }
+    }
+
+    #[test]
+    fn a_socks_proxy_does_not_reopen_the_mesh() {
+        // The Tor / ssh -D setup. `--proxy socks5://... --insecure` must not
+        // hand back accept-anything against the public mesh.
+        for server in crate::oob::DEFAULT_SERVERS {
+            let (_, host) = split_server(server);
+            assert!(
+                !accept_invalid_certs(&host, true, false),
+                "{server}: a SOCKS proxy is not a man in the middle"
+            );
+        }
+    }
+
+    #[test]
+    fn an_intercepting_proxy_still_gets_the_insecure_posture() {
+        // `--proxy` routes the OAST channel too, and an intercepting proxy
+        // re-signs with its own CA. Verifying against the mesh's real
+        // certificate cannot succeed there, and registration failure is only a
+        // soft warning (see cmd::scan::blind) — so refusing would silently
+        // disable blind-OOB for anyone running dalfox through Burp.
+        for server in crate::oob::DEFAULT_SERVERS {
+            let (_, host) = split_server(server);
+            assert!(
+                accept_invalid_certs(&host, true, true),
+                "{server}: --insecure behind an operator's own proxy must apply"
+            );
+            // Still not a blanket exemption: without --insecure, a proxied
+            // connection is verified like any other.
+            assert!(!accept_invalid_certs(&host, false, true));
+        }
+    }
+
+    #[test]
+    fn insecure_still_covers_an_operator_named_server() {
+        // The use case the accept-everything default was added for: a
+        // self-hosted interactsh behind a self-signed or hostname-mismatched
+        // certificate. `--blind-oob=my-collab.internal --insecure` keeps
+        // working.
+        for server in [
+            "my-collab.internal",
+            "https://oast.corp.example",
+            "http://127.0.0.1:8080",
+            // A mesh domain on a non-standard port is not the public endpoint.
+            "oast.pro:8443",
+        ] {
+            let (_, host) = split_server(server);
+            assert!(
+                accept_invalid_certs(&host, true, false),
+                "{server} was named by the operator; --insecure must apply"
+            );
+            // And without --insecure it is still verified, as before.
+            assert!(
+                !accept_invalid_certs(&host, false, false),
+                "{server} must be verified when --insecure was not passed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_server_falls_back_and_is_never_mesh() {
+        // `url::Url` rejects these outright. The fallback split must still
+        // produce something, and — the property that matters — it must land on
+        // the operator-named side: a host no mesh domain can spell, so a
+        // parse failure can never be the thing that relaxes TLS for `oast.*`.
+        // `"..."` is the other way in: it *parses*, but every character of the
+        // host is a trailing dot, so the normalized host is empty.
+        for server in ["[", "::::", "h ttp://x", "..."] {
+            let (base, host) = split_server(server);
+            assert!(!base.is_empty(), "{server}: still needs a base URL");
+            assert!(
+                !crate::oob::is_default_server(&host),
+                "{server}: an unparseable server is not the public mesh"
+            );
+        }
+    }
+
+    #[test]
+    fn split_server_handles_scheme_and_path() {
+        assert_eq!(
+            split_server("https://OAST.fun/"),
+            ("https://oast.fun".to_string(), "oast.fun".to_string())
+        );
+        assert_eq!(
+            split_server("oast.me."),
+            ("https://oast.me".to_string(), "oast.me".to_string())
+        );
+        assert_eq!(
+            split_server("  http://my.collab:1/x "),
+            ("http://my.collab:1".to_string(), "my.collab:1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_client_builds_with_a_proxy_configured() {
+        // Covers the proxy-resolution arm of `new()`: the `&&` short-circuits
+        // when no proxy is named, so the "is this proxy usable" half only runs
+        // with one present. An unusable proxy string must not count as an
+        // interception either -- it is never applied to the client.
+        let keys = SessionKeys::generate().expect("keygen");
+        for proxy in [
+            Some("http://127.0.0.1:8080".to_string()),
+            Some("socks5://127.0.0.1:9050".to_string()),
+            Some("not a proxy".to_string()),
+            None,
+        ] {
+            let config = OobConfig {
+                proxy,
+                ..test_config()
+            };
+            InteractshClient::new("oast.fun", &config, keys.clone())
+                .expect("a client builds whatever the proxy setting");
+        }
+    }
+
+    #[test]
+    fn payload_url_is_33_char_host_and_correlates() {
+        let keys = SessionKeys::generate().expect("keygen");
+        let client = InteractshClient::new("oast.fun", &test_config(), keys).expect("client");
+        let (url, nonce) = client.new_payload_url();
+        assert_eq!(nonce.len(), NONCE_LEN);
+        let host = url.strip_prefix("https://").unwrap();
+        let label = host.split('.').next().unwrap();
+        assert_eq!(label.len(), CORRELATION_ID_LEN + NONCE_LEN);
+        assert!(host.ends_with(".oast.fun"));
+        assert!(
+            label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        );
+
+        // Round-trip: the full-id from a callback recovers the same nonce.
+        let full_id = format!("{}{}.oast.fun", client.correlation_id(), nonce);
+        assert_eq!(
+            client.extract_nonce(&full_id).as_deref(),
+            Some(nonce.as_str())
+        );
+        assert!(client.extract_nonce("someoneelses.oast.fun").is_none());
+
+        // DNS-0x20: a resolver may upper/mixed-case the label; correlation must
+        // still recover the (lowercase) nonce.
+        let shouty = format!("{}{}.OAST.FUN", client.correlation_id(), nonce).to_ascii_uppercase();
+        assert_eq!(
+            client.extract_nonce(&shouty).as_deref(),
+            Some(nonce.as_str())
+        );
+    }
+}

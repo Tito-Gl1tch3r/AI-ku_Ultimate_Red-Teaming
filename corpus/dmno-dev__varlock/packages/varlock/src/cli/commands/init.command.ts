@@ -1,0 +1,384 @@
+/* eslint-disable @stylistic/quotes */
+import path from 'node:path';
+import fs from 'node:fs/promises';
+import ansis from 'ansis';
+import { isCancel, select } from '@clack/prompts';
+import { gracefulExit } from 'exit-hook';
+
+import { envSpecUpdater, parseEnvSpecDotEnvFile } from '@env-spec/parser';
+import { checkIsFileGitIgnored } from '@env-spec/utils/git-utils';
+import { pathExists } from '@env-spec/utils/fs-utils';
+import _ from '@env-spec/utils/my-dash';
+
+import prompts from '../helpers/prompts';
+import { fmt, logLines } from '../helpers/pretty-format';
+import {
+  detectRedundantValues, ensureAllItemsExist, inferSchemaUpdates, type DetectedEnvFile,
+  inferItemDecorators,
+} from '../helpers/infer-schema';
+import { detectJsPackageManager, installJsDependency } from '../helpers/js-package-manager-utils';
+import { type TypedGunshiCommandFn } from '../helpers/gunshi-type-utils';
+import { findEnvFiles } from '../helpers/find-env-files';
+import { tryCatch } from '@env-spec/utils/try-catch';
+import { scanCodeForEnvVars } from '../helpers/env-var-scanner';
+import { isWellKnownEnvKey } from '../helpers/well-known-env-keys';
+import { detectTypegenDecorator } from '../helpers/typegen-lang-detect';
+import { commandSpec } from './init.command-spec';
+
+export { commandSpec };
+
+export const commandFn: TypedGunshiCommandFn<typeof commandSpec> = async (ctx) => {
+  const agentMode = Boolean(ctx.values.agent);
+  const jsPackageManager = detectJsPackageManager();
+
+  console.log('🧙 Hello and welcome to Varlock 🔒🔥✨');
+  if (agentMode) {
+    logLines([ansis.dim('Agent mode enabled: running init non-interactively with deterministic defaults.')]);
+  }
+
+  // scan for all .env files within current directory
+  const envFilePaths = await findEnvFiles();
+  const parsedEnvFiles: Record<string, DetectedEnvFile> = {};
+  for (const filePath of envFilePaths) {
+    const fileContents = await fs.readFile(filePath, 'utf-8');
+    const fileName = path.basename(filePath);
+    const parsedFile = await tryCatch(async () => parseEnvSpecDotEnvFile(fileContents), () => {
+      logLines([
+        '',
+        `Unable to parse ${fmt.filePath(filePath)}`,
+        'This file will be skipped.',
+      ]);
+    });
+    if (!parsedFile) {
+      continue;
+    }
+    parsedEnvFiles[fileName] = {
+      fileName,
+      fullPath: filePath,
+      parsedFile,
+    };
+  }
+
+  const existingSchemaFile = parsedEnvFiles['.env.schema'];
+
+  // * SET UP SCHEMA  ---------------------------------------------
+  if (existingSchemaFile) {
+    // for now - we don't do anything if they already have a schema set up
+    // in the future, we may want to add more tools for projects that are already set up
+    logLines([
+      `It looks like you already have a ${fmt.fileName('.env.schema')} file 🎉`,
+      'This init helper is meant to help you get a new project set up.',
+      'If you need to make changes to your schema or values, you can update your files directly.',
+      'See more docs at https://varlock.dev/guides/schema',
+    ]);
+  } else {
+    const allExampleFileNames = Object.keys(parsedEnvFiles).filter((fileName) => {
+      return fileName.startsWith('.env.example') || fileName.startsWith('.env.sample');
+    });
+    let exampleFileToConvert: typeof parsedEnvFiles[keyof typeof parsedEnvFiles] | undefined;
+
+    if (allExampleFileNames.length === 1) {
+      exampleFileToConvert = parsedEnvFiles[allExampleFileNames[0]];
+    } else if (allExampleFileNames.length > 1) {
+      if (agentMode) {
+        const sortedFileNames = [...allExampleFileNames].sort((a, b) => a.localeCompare(b));
+        const preferredFileName = sortedFileNames.find((name) => name === '.env.example')
+          ?? sortedFileNames.find((name) => name.startsWith('.env.example.'))
+          ?? sortedFileNames.find((name) => name === '.env.sample')
+          ?? sortedFileNames.find((name) => name.startsWith('.env.sample.'))
+          ?? sortedFileNames[0];
+        exampleFileToConvert = parsedEnvFiles[preferredFileName];
+        logLines([
+          '',
+          ansis.dim(`Agent mode: auto-selected ${fmt.fileName(preferredFileName)} to generate ${fmt.fileName('.env.schema')}.`),
+        ]);
+      } else {
+        console.log('');
+        // not quite sure about this, but we'll just let them select one
+        const selectedExample = await select({
+          message: `We detected more than one example .env file. Which one should we use to create your new ${fmt.fileName('.env.schema')}?`,
+          options: allExampleFileNames.map((fileName) => ({
+            label: fileName,
+            value: parsedEnvFiles[fileName],
+          })),
+        });
+        if (isCancel(selectedExample)) return gracefulExit(0);
+        exampleFileToConvert = selectedExample;
+      }
+    }
+
+    let scannedCodeEnvKeys: Array<string> = [];
+    if (!exampleFileToConvert) {
+      const scanResult = await scanCodeForEnvVars();
+      scannedCodeEnvKeys = scanResult.keys;
+    }
+
+    // update the schema
+    const parsedEnvSchemaFile = exampleFileToConvert?.parsedFile || parseEnvSpecDotEnvFile('');
+    if (!parsedEnvSchemaFile) throw new Error('expected parsed .env example file');
+    envSpecUpdater.ensureHeader(parsedEnvSchemaFile, [
+      'This env file uses @env-spec - see https://varlock.dev/env-spec for more info',
+      '',
+      // TODO: add env spec version? real links?
+    ].join('\n'));
+    envSpecUpdater.setRootDecorator(parsedEnvSchemaFile, 'defaultRequired', 'infer', { explicitTrue: true });
+    envSpecUpdater.setRootDecorator(parsedEnvSchemaFile, 'defaultSensitive', 'false', { explicitTrue: true });
+    // pick a code-gen decorator matching the detected primary project language (ts/py/go/rs/php)
+    const typegen = await detectTypegenDecorator();
+    envSpecUpdater.setRootDecorator(parsedEnvSchemaFile, typegen.decorator, typegen.args, { bareFnArgs: true });
+    // envSpecUpdater.setRootDecorator(parsedEnvFile, 'envFlag', 'APP_ENV', { comment: 'controls automatic loading of env-specific files (e.g. .env.test, .env.prod, etc.)' });
+
+    // add example item
+    envSpecUpdater.injectFromStr(parsedEnvSchemaFile, [
+      '',
+      '# example env variable injected by `varlock init` ⚠️ DELETE THIS ITEM! ⚠️',
+      '# @required @sensitive @example="example value"',
+      'EXAMPLE_ITEM="delete me!"',
+      '',
+    ].join('\n'), { location: 'after_header' });
+    // update some decorators based on some simple heuristics
+    inferSchemaUpdates(parsedEnvSchemaFile);
+    // add items we find in other env files, but are missing in the schema/example
+    ensureAllItemsExist(parsedEnvSchemaFile, Object.values(parsedEnvFiles));
+
+    const scannedCodeKeysToAdd = !exampleFileToConvert
+      ? scannedCodeEnvKeys.filter((key) => {
+        // skip execution-environment plumbing (PATH, NODE_OPTIONS, npm_*, ...) - it's read
+        // from process.env but isn't app config the user should declare
+        if (isWellKnownEnvKey(key)) return false;
+        return !parsedEnvSchemaFile.configItems.find((i) => i.key === key);
+      })
+      : [];
+
+    // add items we detect in source code if no sample/example file was provided
+    if (scannedCodeKeysToAdd.length > 0) {
+      envSpecUpdater.injectFromStr(parsedEnvSchemaFile, [
+        '',
+        '# items added to schema by `varlock init`',
+        '# detected by scanning your source code for env var references',
+        '# PLEASE REVIEW THESE!',
+        '# ---',
+        '',
+      ].join('\n'), { location: 'end' });
+
+      for (const key of scannedCodeKeysToAdd) {
+        envSpecUpdater.injectFromStr(parsedEnvSchemaFile, `${key}=`);
+        inferItemDecorators(parsedEnvSchemaFile, key, '');
+      }
+    }
+
+    // write new updated schema file
+    const schemaFilePath = path.join(process.cwd(), '.env.schema');
+    await fs.writeFile(schemaFilePath, parsedEnvSchemaFile.toString());
+
+    // log new schema file path
+    if (exampleFileToConvert) {
+      logLines([
+        '',
+        `Your ${fmt.fileName(exampleFileToConvert.fileName)} has been used to generate your new ${fmt.fileName('.env.schema')}:`,
+        fmt.filePath(schemaFilePath),
+      ]);
+    } else if (scannedCodeKeysToAdd.length > 0) {
+      logLines([
+        '',
+        `Your new ${fmt.fileName('.env.schema')} file has been created from scanned source code references:`,
+        fmt.filePath(schemaFilePath),
+        ansis.dim(`Detected ${scannedCodeEnvKeys.length} env var key${scannedCodeEnvKeys.length === 1 ? '' : 's'} in your codebase.`),
+      ]);
+    } else {
+      logLines([
+        '',
+        `Your new ${fmt.fileName('.env.schema')} file has been created:`,
+        fmt.filePath(schemaFilePath),
+      ]);
+    }
+
+    // make sure .env.schema is not gitignored
+    if (await checkIsFileGitIgnored(schemaFilePath)) {
+      // maybe could do this silently? it's relatively harmless
+      logLines([ansis.dim(`(and updated ${fmt.fileName('.gitignore')} to ensure it will be tracked by git)`)]);
+      await fs.appendFile('.gitignore', '\n!.env.schema');
+    }
+
+    if (agentMode) {
+      logLines([
+        '',
+        ansis.bold('Agent setup instructions:'),
+        '- Initial schema generation uses heuristics, and must be reviewed and confirmed explicitly with the user',
+        '- Schema writing guide: https://varlock.dev/guides/schema',
+        '- Confirm/add `@type` on items, default is string, so no `@type=string` necessary',
+        '- Add `@required`/`@optional`, can adjust `@defaultRequired` root decorator to change default behavior',
+        '- Confirm with user which items are `@sensitive` (secrets, private keys, etc) - see https://varlock.dev/guides/secrets/',
+        '- Remove placeholder example values, move useful ones to `@example`',
+        '- Add description comments when key itself is not self-explanitory',
+        '- Add `@docs()` to attach docs links to items',
+        '',
+        'Help user review and update .env.schema file for them, validating that config is resolving correctly and valid.',
+        'Schema file is safe to read, do not look directly at values in .env / .env.local files - tell user to edit those files if necessary.',
+        `Validate the resolved config any time using ${fmt.command('varlock load --agent', { jsPackageManager: true })}. It prints JSON with sensitive values redacted so you can safely inspect output in logs or transcripts. Or drop the \`--agent\` flag to get human-readable output to show the user.`,
+        '',
+        'Advanced setup:',
+        '- Can use multiple .env files or functions to manage variation per environment, see https://varlock.dev/guides/environments/',
+        '- Complex/large files can be broken up and use `@import`, see https://varlock.dev/guides/import/',
+        '- If user wants to load secrets from external sources, help install and configure plugins - see https://varlock.dev/guides/plugins/',
+        '- If user has any sensitive values in plaintext, can use local encryption, see https://varlock.dev/guides/local-encryption/',
+        '',
+      ]);
+    } else {
+      // ask them to review and confirm
+      logLines([
+        '',
+        ansis.bold(`🚧 Please review and update your new ${fmt.fileName('.env.schema')} file! 🚧`),
+        `We've done our best to get you started, but you must review and make sure it is correct!`,
+        '',
+        `👉 Some helpful pointers to get you started:`,
+        `- add a description to each item when the name is not self explanatory - it will come through in generated types`,
+        `- use ${fmt.decorator('@required')} (or ${fmt.decorator('@optional')}) to tag items that should fail validation when empty`,
+        `- use ${fmt.decorator('@sensitive')} to tag items that contain sensitive secrets, and must be handled accordingly`,
+        `- use ${fmt.decorator('@type')} to set an item's data type (if not a basic string), which affects validation and coercion logic`,
+        `- if an item value is a ${ansis.italic('useful example')} rather than a default, use ${fmt.decorator('@example')}`,
+        `- if an item value is just a dummy placeholder, delete it`,
+      ]);
+      const confirmReviewed = await prompts.confirm({
+        message: `Have you reviewed and updated your new ${fmt.fileName('.env.schema')} file?`,
+      });
+      if (isCancel(confirmReviewed)) return gracefulExit(0);
+
+      // reload the graph
+      const reloadedSchemaFile = await parseEnvSpecDotEnvFile(await fs.readFile(schemaFilePath, 'utf-8'));
+      // check if they removed the EXAMPLE_ITEM and warn them
+      if (reloadedSchemaFile.configItems.find((i) => i.key === 'EXAMPLE_ITEM')) {
+        logLines(confirmReviewed
+          ? [
+            '',
+            ansis.bold(`🚨 Really? ${ansis.red("You didn't remove the EXAMPLE_ITEM!")}`),
+            `Please make sure your schema is all correct before using it...`,
+          ]
+          : [
+            '',
+            ansis.bold(`🙏 Thanks for your honesty!`),
+            `Make sure to review your schema and remove the ${ansis.bold('EXAMPLE_ITEM')} before using it...`,
+          ]);
+      }
+    }
+
+    // delete the example file if they want us to
+    if (exampleFileToConvert) {
+      if (agentMode) {
+        logLines([`- left ${exampleFileToConvert.fileName} in place (no destructive prompts) - confirm with user and remove for them`]);
+      } else {
+        const confirmDeleteExample = await prompts.confirm({
+          message: `Should we delete your ${fmt.fileName(exampleFileToConvert.fileName)} file? ${ansis.italic.gray('(you can always do this yourself later)')}`,
+        });
+        if (isCancel(confirmDeleteExample)) return gracefulExit(0);
+        if (confirmDeleteExample) {
+          await fs.unlink(exampleFileToConvert.fullPath);
+        }
+      }
+    }
+
+    // recommendation to delete defaults file
+    const defaultsFile = Object.values(parsedEnvFiles).find((f) => {
+      return f.fileName.startsWith('.env.default'); // also covers ".env.defaults"
+    });
+    if (defaultsFile) {
+      if (agentMode) {
+        logLines([`- found ${defaultsFile.fileName} in project - tell user to migrate defaults to .env.schema and delete it`]);
+      } else {
+        logLines([
+          '',
+          `🚧 We detected a ${fmt.fileName(defaultsFile.fileName)} file in your project`,
+          `You should migrate these default values into ${fmt.fileName('.env.schema')} and delete it.`,
+        ]);
+      }
+    }
+
+    // detect and remove redundant defaults that are now in the schema
+    const redundantInfo = await detectRedundantValues(parsedEnvSchemaFile, parsedEnvFiles);
+    if (Object.keys(redundantInfo).length > 0) {
+      if (agentMode) {
+        logLines([`- found redundant values in other .env files - tell user to review and delete them`]);
+      } else {
+        logLines([
+          '',
+          ansis.bold('‼️  Now that your schema contains defaults, some values in your other .env files are redundant:'),
+        ]);
+        for (const [sourcePath, itemKeys] of Object.entries(redundantInfo)) {
+          console.log(fmt.filePath(sourcePath));
+          console.log('  ', itemKeys.map((k) => ansis.italic(k)).join(', '));
+        }
+
+        const confirmDeleteRedundant = await prompts.confirm({
+          message: 'Should we delete these redundant values from your other .env files?',
+        });
+        if (isCancel(confirmDeleteRedundant)) return gracefulExit(0);
+        if (confirmDeleteRedundant) {
+          await detectRedundantValues(parsedEnvSchemaFile, parsedEnvFiles, { delete: true });
+        }
+      }
+    }
+
+    // final success!
+    if (!agentMode) {
+      logLines([
+        '',
+        ansis.bold('🎉 Great!'),
+        `You can run ${fmt.command('varlock load', { jsPackageManager })} to attempt loading your env vars validate against your new schema.`,
+        '',
+        'Check out our docs for more info about integrating into your application.',
+        '',
+        '📖 https://varlock.dev 👈',
+        '',
+      ]);
+    }
+  }
+
+  // * MAKE SURE VARLOCK IS INSTALLED ------------------------------------------
+  if (jsPackageManager && await pathExists(path.join(process.cwd(), 'package.json'))) {
+    const installResult = installJsDependency({
+      packageManager: jsPackageManager.name,
+      packageName: 'varlock',
+    });
+    if (installResult) {
+      logLines([
+        '',
+        `✅ Added ${fmt.packageName('varlock')} as a dependency in your package.json`,
+      ]);
+    }
+  }
+
+  // * CONFIGURE BUNFIG.TOML FOR BUN PROJECTS ----------------------------------
+  if (jsPackageManager?.name === 'bun') {
+    const bunfigPath = path.join(process.cwd(), 'bunfig.toml');
+    const bunfigExists = await pathExists(bunfigPath);
+
+    if (bunfigExists) {
+      const bunfigContents = await fs.readFile(bunfigPath, 'utf-8');
+      // check if `env = false` is already set (allowing for whitespace variations)
+      if (!/^\s*env\s*=\s*false\s*$/m.test(bunfigContents)) {
+        await fs.writeFile(bunfigPath, `env = false\n${bunfigContents}`);
+        logLines([
+          '',
+          `✅ Added ${ansis.bold('env = false')} to your existing ${fmt.fileName('bunfig.toml')}`,
+          ansis.dim('This disables Bun\'s automatic .env loading, which conflicts with Varlock.'),
+          ansis.dim(`See ${ansis.underline('https://varlock.dev/integrations/bun')} for more info.`),
+        ]);
+      }
+    } else {
+      await fs.writeFile(bunfigPath, 'env = false\n');
+      logLines([
+        '',
+        `✅ Created ${fmt.fileName('bunfig.toml')} with ${ansis.bold('env = false')}`,
+        ansis.dim('This disables Bun\'s automatic .env loading, which conflicts with Varlock.'),
+        ansis.dim(`See ${ansis.underline('https://varlock.dev/integrations/bun')} for more info.`),
+      ]);
+    }
+  }
+
+  if (!agentMode) {
+    logLines([
+      '',
+      `💡 Want tab completions for the varlock CLI? See ${ansis.underline('https://varlock.dev/guides/shell-completion')}`,
+    ]);
+  }
+};

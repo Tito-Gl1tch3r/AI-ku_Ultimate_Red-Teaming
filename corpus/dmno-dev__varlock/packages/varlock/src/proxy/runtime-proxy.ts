@@ -1,0 +1,2164 @@
+import { timingSafeEqual } from 'node:crypto';
+import {
+  mkdir, mkdtemp, readFile, rm, writeFile,
+} from 'node:fs/promises';
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
+import tls from 'node:tls';
+import { URL } from 'node:url';
+
+import {
+  createApprovalRequest, isApprovalValid, type ApprovalProvider,
+} from './approval';
+import type { ProxyActivity } from './audit';
+import {
+  createEphemeralCa, createHostCert, exportCaPrivateKeyPem, loadCa,
+} from './cert-authority';
+import {
+  describeRule, domainMatches, evaluateProxyPolicy, getRequestScopedManagedItems, normalizeHost, ruleMatchesFacts,
+  type RequestFacts, type RequestScopedManagedItem,
+} from './policy';
+import { canonicalizeRequestTarget, substitutedPathKeepsStructure } from './request-target';
+import { BUILT_IN_TRANSFORM_SCHEMES } from './request-transform';
+import {
+  PROXY_TOKEN_HEADER, SESSION_ENV_ENDPOINT_PATH, VARLOCK_INTERNAL_HOST,
+} from './session-env-payload';
+import { attachTunnelServer, type TunnelBootstrap } from './tunnel';
+import {
+  PROXY_TRANSFORM_COMMON_OPTION_SPECS,
+  isNeverAutoSubstituteHeader, proxySubstitutionTargetKey, proxyTransformItemRefName,
+  type ProxyApprovalEach, type ProxyEgressMode, type ProxyManagedItem, type ProxyRule,
+  type ProxyRuleTransform, type ProxySubstitutionLocation, type ProxySubstitutionTarget,
+  type ProxyTransformSchemeDef, type ProxyTransformResult,
+} from './types';
+
+const LOCALHOST = '127.0.0.1';
+
+
+/**
+ * Stand-in written over a reflected transform credential in a response.
+ *
+ * Deliberately NOT a `vlk_placeholder_*` string. Response scrubbing normally
+ * restores an item's own placeholder, which round-trips: the child sent that
+ * placeholder, so handing it back leaves it exactly where it started. A
+ * transform credential has no such placeholder - the proxy derived it (from two
+ * items, for http-basic), and the child never held one - so there is nothing to
+ * restore. Looking like a placeholder would imply it can be sent back and
+ * swapped for the real value, which it cannot; the bracketed form reads as a
+ * dead end instead. It is also plain ASCII with no quotes or backslashes, so it
+ * cannot corrupt a JSON or XML response it lands in.
+ */
+const REDACTED_TRANSFORM_VALUE = '[redacted by varlock]';
+
+export type ProxyReconfigureInput = {
+  managedItems: Array<ProxyManagedItem>;
+  rules: Array<ProxyRule>;
+  egressMode: ProxyEgressMode;
+  /** Omitted = keep the current scheme registry. */
+  transformSchemes?: Record<string, ProxyTransformSchemeDef>;
+};
+
+export type ProxyRuntimeContext = {
+  env: NodeJS.ProcessEnv;
+  /**
+   * Hot-swap the policy a running proxy enforces (rules, managed items, egress
+   * mode) without restarting — used by `proxy reload` to apply schema edits to
+   * a live daemon. Takes effect on the next request; in-flight requests keep the
+   * snapshot they already resolved. The proxy address and CA are unchanged.
+   */
+  reconfigure: (next: ProxyReconfigureInput) => void;
+  /**
+   * Set/replace the encoded session-env payload the `varlock.internal` endpoint
+   * serves (see `internalEndpoint`). Called once after startup and again on
+   * every reload so attach fetches are always current.
+   */
+  setSessionEnvPayloadJson: (payloadJson: string, meta?: SessionEnvPayloadMeta) => void;
+  stop: () => Promise<void>;
+};
+
+/** Reported after an upstream response is forwarded — surfaces response-side scrubbing. */
+export type ProxyResponseInfo = {
+  host: string;
+  method: string;
+  path: string;
+  statusCode: number;
+  /** Managed item keys (names) whose real value appeared in the response and was scrubbed back to a placeholder. */
+  scrubbedKeys: Array<string>;
+  /** True for an unbounded/streamed body (scrubbed chunk-by-chunk). */
+  streamed?: boolean;
+};
+
+export type StartLocalProxyRuntimeInput = {
+  managedItems: Array<ProxyManagedItem>;
+  rules: Array<ProxyRule>;
+  egressMode: ProxyEgressMode;
+  /**
+   * Registered transform schemes, keyed by scheme name. Defaults to
+   * the built-in hmac schemes; the command layer passes the graph's registry so
+   * plugin-provided schemes (e.g. aws-sigv4) are available.
+   */
+  transformSchemes?: Record<string, ProxyTransformSchemeDef>;
+  onActivity?: (activity: ProxyActivity) => void;
+  /** Called after an upstream response is forwarded, with any keys scrubbed from it. */
+  onResponse?: (info: ProxyResponseInfo) => void;
+  /**
+   * Called when a request matches a `require-approval` rule. Must fail closed
+   * (deny on timeout/error). Absent ⇒ require-approval requests are denied.
+   */
+  approvalProvider?: ApprovalProvider;
+  /**
+   * Enables the `varlock.internal` internal endpoint, which serves the current
+   * session-env payload (child-view env + graph; never wire real values) so an
+   * attaching `proxy run` can adopt this session's env without resolving
+   * anything itself. Requests to the internal host are answered by the proxy,
+   * never forwarded upstream, and not reported as egress activity. The token is
+   * a dedicated endpoint credential stored in the 0600 session record (never
+   * displayed anywhere), so this gates at same-uid — the same trust level as
+   * the record itself, not a hard boundary. Loopback peers only, asserted even
+   * though the listener is loopback-bound, so a future non-loopback data-plane
+   * bind (sandbox bridging) can't silently expose the control plane.
+   */
+  internalEndpoint?: {
+    token: string;
+    /** A request presented a missing/invalid token (or came from a non-loopback peer) — surface to the owner. */
+    onAuthFailure?: () => void;
+    /** The session env payload was served; meta comes from the matching setSessionEnvPayloadJson call. */
+    onServed?: (meta?: SessionEnvPayloadMeta) => void;
+  };
+  /**
+   * Fixed loopback port for the proxy listener (the HTTP(S)_PROXY port a caller
+   * wires tools to). Omitted ⇒ an ephemeral port. A busy fixed port fails to start
+   * with a clear error rather than silently falling back.
+   */
+  port?: number;
+  /**
+   * Directory to write the CA cert into (`ca-cert.pem` + `combined-ca.pem`),
+   * instead of a fresh temp dir — so a caller can point tools at a known CA path
+   * before the proxy starts. Created if missing. On stop, only the cert files we
+   * wrote are removed (an ephemeral temp dir is removed whole).
+   */
+  certDir?: string;
+  /**
+   * Keep the CA (cert **and private key**) in `certDir` and reuse it on the next
+   * start, so a restart doesn't invalidate clients that already trust this CA.
+   * For long-lived brokers; requires `certDir`. Off by default: the key normally
+   * never touches disk.
+   */
+  persistCa?: boolean;
+  /**
+   * Address the proxy listener binds. Defaults to loopback (`127.0.0.1`). Binding
+   * a non-loopback address (e.g. `0.0.0.0`, to reach the proxy from a remote
+   * sandbox) exposes the data plane off-host, so it REQUIRES `dataPlaneToken` —
+   * the runtime throws otherwise. The control endpoint stays loopback-only
+   * regardless of this.
+   */
+  listenHost?: string;
+  /**
+   * Per-session data-plane credential. When set, a non-loopback peer must present
+   * it as `Proxy-Authorization: Basic base64(varlock:<token>)`; loopback peers are
+   * exempt (same-uid trust, unchanged). Distinct from the control-endpoint token.
+   */
+  dataPlaneToken?: string;
+};
+
+/** Command-side metadata attached to the served payload (for owner-terminal visibility). */
+export type SessionEnvPayloadMeta = {
+  /** Count of sensitive items served with their REAL value (@proxy=passthrough). */
+  passthroughCount?: number;
+};
+
+type HostInfo = { host: string, port: number };
+
+type HeaderTransformFn = (value: string, name: string) => string;
+
+function parseHostPort(value: string): HostInfo | null {
+  // Parse via URL so bracketed IPv6 literals (`[::1]:443`) are handled — a plain
+  // `split(':')` mangles them. The hostname comes back bracketed for IPv6; strip
+  // the brackets so the bare address flows to tls.connect / checkServerIdentity /
+  // the IP-SAN cert minting (all of which expect `::1`, not `[::1]`).
+  try {
+    const url = new URL(`http://${value}`);
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    if (!host) return null;
+    const port = url.port ? Number(url.port) : 443;
+    if (Number.isNaN(port)) return null;
+    return { host, port };
+  } catch {
+    return null;
+  }
+}
+
+function hostMatchesProxyRules(host: string, rules: Array<ProxyRule>): boolean {
+  return rules.some((rule) => rule.domain.some((d) => domainMatches(d, host)));
+}
+
+/**
+ * Invariant #1: bind secret injection to the *verified upstream TLS identity*,
+ * not the requested name. Opens a TLS connection to the rule-matched host, proves
+ * the chain validates against the public PKI AND the cert identity matches that
+ * host, and returns the **verified peer IP**. The secret-bearing request is then
+ * pinned to that exact IP (see processProxiedRequest).
+ *
+ * Why not just rely on `https.request`'s own pre-write identity check? Some
+ * runtimes — notably Bun's `https.request`, which the compiled CLI binary runs on
+ * — flush the request (the `Authorization` header and body) to a wrong-identity
+ * upstream *before* `checkServerIdentity` rejects, leaking the secret. So we
+ * verify here, on a connection we control, and then pin the request to the proven
+ * IP. A poisoned DNS/Host name fails this verification (we abort, secret never
+ * sent); pinning the IP for the real request defeats a DNS-rebind between the two
+ * connections — the secret only ever reaches an address already proven to hold a
+ * valid cert for the rule host.
+ */
+function verifyUpstreamIdentity(host: string, port: number): Promise<{ address: string }> {
+  return new Promise((resolve, reject) => {
+    // SNI for DNS names; omitted for IP literals (setting `servername` to an IP
+    // throws). Identity is verified against `host` either way below.
+    const servername = net.isIP(host) ? undefined : host;
+    const socket = tls.connect({
+      host,
+      port,
+      ...(servername ? { servername } : {}),
+      rejectUnauthorized: true,
+      ALPNProtocols: ['http/1.1'],
+      // Default trust store (system roots + NODE_EXTRA_CA_CERTS), but also honor
+      // any process-global CAs the user configured on the https agent (e.g. a
+      // corporate root) so we trust the same upstreams the rest of their stack
+      // does. Undefined in the common case → default roots.
+      ca: https.globalAgent.options.ca,
+    });
+    const fail = (err: Error) => {
+      socket.destroy();
+      reject(err);
+    };
+    socket.once('error', fail);
+    socket.once('secureConnect', () => {
+      socket.removeListener('error', fail);
+      // (a) public-PKI chain must validate
+      if (!socket.authorized) {
+        fail(socket.authorizationError ?? new Error('upstream TLS chain not authorized'));
+        return;
+      }
+      // (b) cert identity must match the host we dialed (= the rule-matched host).
+      // checkServerIdentity handles both DNS names (dNSName SANs) and IP literals
+      // (iPAddress SANs) when given the host.
+      const identityError = tls.checkServerIdentity(host, socket.getPeerCertificate());
+      if (identityError) {
+        fail(identityError);
+        return;
+      }
+      const address = socket.remoteAddress;
+      socket.destroy();
+      if (!address) {
+        reject(new Error('verified upstream has no remote address'));
+        return;
+      }
+      resolve({ address });
+    });
+  });
+}
+
+/**
+ * Run the request-bound approval gate (Invariant #8). Builds an ApprovalRequest
+ * committed to this exact request, asks the provider, and returns whether the
+ * decision actually authorizes it. Fails closed: no provider, a throwing
+ * provider, a nonce mismatch, or an expired/denied decision all return false.
+ */
+async function runApprovalGate(input: {
+  approvalProvider: ApprovalProvider | undefined;
+  method: string;
+  host: string;
+  path: string;
+  body: Buffer;
+  ruleId?: string;
+  each?: ProxyApprovalEach;
+  maxDurationMs?: number;
+  injectedKeys: Array<string>;
+}): Promise<boolean> {
+  if (!input.approvalProvider) return false;
+  const request = createApprovalRequest({
+    method: input.method,
+    host: input.host,
+    path: input.path,
+    body: input.body,
+    ruleId: input.ruleId,
+    each: input.each,
+    maxDurationMs: input.maxDurationMs,
+    injectedKeys: input.injectedKeys,
+  });
+  try {
+    const decision = await input.approvalProvider.requestApproval(request);
+    return isApprovalValid(request, decision);
+  } catch {
+    return false;
+  }
+}
+
+/** One managed placeholder occurrence located in a request surface. */
+type PlaceholderMatch = { item: ProxyManagedItem; index: number };
+
+/**
+ * Every managed placeholder occurrence in `value`, left to right, matched
+ * **leftmost-longest** across all of `allItems` and never overlapping.
+ *
+ * This is the single source of truth for "where are the placeholders", shared by
+ * the guard and the substitution so the two can never disagree. That matters
+ * because placeholders can contain one another (`ensureUnique` resolves a
+ * collision by appending `_1`, and explicit `@placeholder` values can overlap
+ * freely): a per-item substring search would charge the shorter item for bytes
+ * that belong to the longer one, and substitution would then leave those bytes
+ * alone, so the guard could block a request in which nothing would have been
+ * substituted at all.
+ *
+ * Scanning is an indexOf sweep per placeholder with each item's next match cached,
+ * rather than a `split`, so an agent repeating a placeholder many times can't make
+ * this allocate proportionally to the match count in the common (no-match) case.
+ */
+function findPlaceholderMatches(value: string, allItems: Array<ProxyManagedItem>): Array<PlaceholderMatch> {
+  // Longest first, so on a tie at the same index the longer placeholder wins.
+  const items = allItems
+    .filter((item) => !!item.placeholder)
+    .sort((a, b) => b.placeholder.length - a.placeholder.length);
+  const matches: Array<PlaceholderMatch> = [];
+  if (!items.length) return matches;
+
+  const nextIndex = items.map((item) => value.indexOf(item.placeholder));
+  let pos = 0;
+  while (true) {
+    let bestIdx = -1;
+    let bestItem = -1;
+    for (let i = 0; i < items.length; i += 1) {
+      // A cached index inside an already-consumed match is stale; re-scan from pos.
+      if (nextIndex[i] !== -1 && nextIndex[i]! < pos) {
+        nextIndex[i] = value.indexOf(items[i]!.placeholder, pos);
+      }
+      const idx = nextIndex[i]!;
+      if (idx === -1) continue;
+      if (bestIdx === -1 || idx < bestIdx) {
+        bestIdx = idx;
+        bestItem = i;
+      }
+    }
+    if (bestIdx === -1) return matches;
+    const item = items[bestItem]!;
+    matches.push({ item, index: bestIdx });
+    pos = bestIdx + item.placeholder.length;
+  }
+}
+
+/** Per-item-key occurrence counts in one surface, using the shared matcher. */
+function countPlaceholderMatches(value: string, allItems: Array<ProxyManagedItem>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const match of findPlaceholderMatches(value, allItems)) {
+    counts.set(match.item.key, (counts.get(match.item.key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/** A request decomposed into the parts the substitution guards inspect. */
+export type SubstitutionGuardRequest = {
+  /** Header name (lower-cased) + value, one entry per header. */
+  headers: Array<{ name: string; value: string }>;
+  /** Request target: path + query string. */
+  requestTarget: string;
+  /** Raw request body text. */
+  body: string;
+  /** Content-type header value, if any (selects the body parser). */
+  contentType?: string;
+};
+
+export type SubstitutionGuardViolation = | { kind: 'location'; item: RequestScopedManagedItem; location: ProxySubstitutionLocation; suggestion: string }
+  /** More than one occurrence at the same substitution target (`target` is its key). */
+  | { kind: 'occurrences'; item: RequestScopedManagedItem; target: string; count: number };
+
+/**
+ * An injected item's placeholder found in a surface its rule has no targets on.
+ * The occurrences are forwarded unsubstituted (an unswapped placeholder is inert
+ * by design) and surfaced in the audit log so probing stays visible.
+ */
+export type SkippedPlaceholder = {
+  item: RequestScopedManagedItem;
+  /** Where the skipped occurrences sat: `body`, `path`, `query`, or `header:<name>`. */
+  locations: Array<string>;
+};
+
+export type SubstitutionGuardResult = {
+  /** Fail-closed violation: the caller blocks the request instead of substituting. */
+  violation?: SubstitutionGuardViolation;
+  /** Keys of items with at least one occurrence at an allowed target (these get substituted). */
+  injectedKeys: Array<string>;
+  /** Per-item placeholder occurrences left inert in untargeted surfaces (empty on violation). */
+  skipped: Array<SkippedPlaceholder>;
+};
+
+/** A string value in a request body, with the dotted path that locates it. */
+type BodyLeaf = { path: string; value: string };
+
+/**
+ * String leaves of a request body, each with its dotted path, so a body-path
+ * target can be checked. JSON objects/arrays produce paths like `client_secret`,
+ * `data.token`, `items[0].key`; form bodies produce one leaf per field (path =
+ * field name). Returns null when the body can't be parsed for the content type —
+ * the guard treats that as "no allowed body occurrences" and fails closed.
+ */
+function bodyStringLeaves(body: string, contentType: string | undefined): Array<BodyLeaf> | null {
+  const ct = (contentType ?? '').toLowerCase();
+  if (ct.includes('application/x-www-form-urlencoded')) {
+    return [...new URLSearchParams(body)].map(([name, value]) => ({ path: name, value }));
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  const out: Array<BodyLeaf> = [];
+  const walk = (node: unknown, prefix: string) => {
+    if (typeof node === 'string') {
+      out.push({ path: prefix, value: node });
+    } else if (Array.isArray(node)) {
+      node.forEach((el, i) => walk(el, `${prefix}[${i}]`));
+    } else if (node && typeof node === 'object') {
+      for (const [k, v] of Object.entries(node)) walk(v, prefix ? `${prefix}.${k}` : k);
+    }
+    // numbers/booleans/null can't contain a placeholder string — skip.
+  };
+  walk(parsed, '');
+  return out;
+}
+
+/** A copy-pasteable `substituteIn=[...]` that keeps the current targets and adds `entry`. */
+function substituteInExample(targets: Array<ProxySubstitutionTarget>, entry: string): string {
+  return `substituteIn=[${[...targets.map(proxySubstitutionTargetKey), entry].join(', ')}]`;
+}
+
+/** Human hint naming the current targets and the exact substituteIn edit to allow the offending location. */
+function locationSuggestion(location: ProxySubstitutionLocation, targets: Array<ProxySubstitutionTarget>): string {
+  const current = targets.map(proxySubstitutionTargetKey);
+  const entry = location === 'body' ? 'body:<path>' : location;
+  const extraByLocation: Partial<Record<ProxySubstitutionLocation, string>> = {
+    body: ' (name the field, e.g. body:client_secret, or body:* to allow anywhere in the body)',
+    query: ' (or query:<param> to pin one parameter)',
+  };
+  const extra = extraByLocation[location] ?? '';
+  return `currently allowed: [${current.join(', ')}]. To allow it in the ${location}, set ${substituteInExample(targets, entry)} on the @proxy rule${extra}`;
+}
+
+/**
+ * Which of an item's targets allows substitution in the named (lower-cased) header,
+ * as a target key, or undefined if none does. The any-header default excludes a
+ * denylist of never-secret forward/log headers; an explicit `header:<name>` target
+ * covers a denied header (so a named denylisted header is still allowed).
+ *
+ * The broadest allowing target wins, so declaring both `header` and `header:x` can't
+ * split one header's occurrences across two targets and double its budget.
+ */
+function headerTargetKey(item: RequestScopedManagedItem, name: string): string | undefined {
+  let anyHeader = false;
+  let named = false;
+  for (const t of item.targets) {
+    if (t.location !== 'header') continue;
+    if (t.name) {
+      if (t.name === name) named = true;
+    } else {
+      anyHeader = true;
+    }
+  }
+  if (anyHeader && !isNeverAutoSubstituteHeader(name)) return 'header';
+  if (named) return `header:${name}`;
+  return undefined;
+}
+
+/** Whether an item's targets allow substitution in the named (lower-cased) header. */
+export function itemAllowsHeader(item: RequestScopedManagedItem, name: string): boolean {
+  return headerTargetKey(item, name) !== undefined;
+}
+
+/**
+ * Evaluate the substitution guards on the injected items for a request, *before*
+ * any placeholder is swapped for its real value.
+ *
+ *  - skip: a placeholder occurrence in a surface the item has NO targets on
+ *    (the body under the default header-only targets, a denylisted header, the URL
+ *    path without a `path` target, ...) is left alone: substitution is scoped per
+ *    surface, so the occurrence reaches the upstream as the literal placeholder,
+ *    which is inert by design. Reported as `skipped` so the audit log keeps probing
+ *    visible. Blocking here would add no protection (the value is never substituted
+ *    there anyway) and bricks legitimate flows where an agent quotes its own
+ *    placeholder, e.g. a conversation transcript echoing an env var.
+ *  - placement guard (fail closed): when the item DOES have targets on a surface
+ *    that can't be substituted surgically (`body:<path>`, `query:<param>`), an
+ *    occurrence off the named path/param blocks the request. Substituting there is
+ *    a blind string-replace across the whole surface, so a stray occurrence would
+ *    either get the real value or require re-serializing the body/query to skip it.
+ *    This is what stops an injected secret being swapped into, say, an email-body
+ *    field on an otherwise-allowed host whose body IS a target at a different path.
+ *  - cardinality guard (fail closed): each target may be substituted at most ONCE
+ *    per request. A second occurrence at the same target is an exfiltration copy
+ *    (duplicate the token into an attacker-visible field while still making a valid
+ *    call), and the proxy can't tell which copy is the real use, so it blocks. The
+ *    budget is per target rather than per request because listing a target is the
+ *    author declaring that spot legitimate: `substituteIn=[header:authorization,
+ *    body:signature]` gets one substitution in each with nothing further to
+ *    configure, while `[header]` still allows only one header in total. Skipped
+ *    occurrences belong to no target and never count.
+ */
+export function checkSubstitutionGuards(
+  req: SubstitutionGuardRequest,
+  hostItems: Array<RequestScopedManagedItem>,
+  /**
+   * Every managed placeholder in the session, so occurrences are attributed exactly
+   * as substitution will attribute them (see `findPlaceholderMatches`). Defaults to
+   * the injected items, which is right only when no other managed placeholder could
+   * appear; the runtime passes the full list.
+   */
+  allItems: Array<ProxyManagedItem> = hostItems,
+): SubstitutionGuardResult {
+  const injectedKeys: Array<string> = [];
+  const skipped: Array<SkippedPlaceholder> = [];
+
+  // Split the request target into the URL path and the query string: they are
+  // separate substitution locations (`path` vs `query`/`query:<param>`).
+  const queryStart = req.requestTarget.indexOf('?');
+  const pathPart = queryStart === -1 ? req.requestTarget : req.requestTarget.slice(0, queryStart);
+  const queryPart = queryStart === -1 ? '' : req.requestTarget.slice(queryStart + 1);
+
+  // Tokenize each surface ONCE, against every managed placeholder, then read
+  // per-item counts out of the result. Doing this per item with a plain substring
+  // search would disagree with substitution whenever one placeholder contains
+  // another.
+  const headerCounts = req.headers.map((h) => ({ name: h.name, counts: countPlaceholderMatches(h.value, allItems) }));
+  const pathCounts = countPlaceholderMatches(pathPart, allItems);
+  const queryCounts = countPlaceholderMatches(queryPart, allItems);
+  const bodyCounts = countPlaceholderMatches(req.body, allItems);
+
+  // Named query params and body paths are only needed when some item targets them,
+  // and parsing is the expensive part, so both are computed at most once and only
+  // on demand. `bodyLeafCounts === null` means the body could not be parsed for its
+  // content type, which allows nothing (fail closed).
+  let queryParamCounts: Map<string, Map<string, number>> | undefined;
+  const getQueryParamCounts = () => {
+    if (!queryParamCounts) {
+      queryParamCounts = new Map();
+      for (const [name, value] of new URLSearchParams(queryPart)) {
+        const existing = queryParamCounts.get(name);
+        const counts = countPlaceholderMatches(value, allItems);
+        if (!existing) {
+          queryParamCounts.set(name, counts);
+        } else {
+          // A repeated param (?a=1&a=2) contributes all of its values.
+          for (const [key, n] of counts) existing.set(key, (existing.get(key) ?? 0) + n);
+        }
+      }
+    }
+    return queryParamCounts;
+  };
+  let bodyLeafCounts: Array<{ path: string; counts: Map<string, number> }> | null | undefined;
+  const getBodyLeafCounts = () => {
+    if (bodyLeafCounts === undefined) {
+      const leaves = bodyStringLeaves(req.body, req.contentType);
+      bodyLeafCounts = leaves
+        ? leaves.map((leaf) => ({ path: leaf.path, counts: countPlaceholderMatches(leaf.value, allItems) }))
+        : null;
+    }
+    return bodyLeafCounts;
+  };
+
+  for (const item of hostItems) {
+    if (!item.placeholder) continue;
+    const { targets } = item;
+    const countFor = (counts: Map<string, number>) => counts.get(item.key) ?? 0;
+    const anyPath = targets.some((t) => t.location === 'path');
+    const anyQuery = targets.some((t) => t.location === 'query' && !t.name);
+    const queryNames = targets.flatMap((t) => (t.location === 'query' && t.name ? [t.name] : []));
+    const bodyPaths = targets.flatMap((t) => (t.location === 'body' ? [t.path] : []));
+    // `body:*` is the explicit escape hatch for bodies we can't parse into a path.
+    const bodyAnywhere = bodyPaths.includes('*');
+    const skippedLocations: Array<string> = [];
+    const violation = (v: SubstitutionGuardViolation): SubstitutionGuardResult => (
+      { violation: v, injectedKeys: [], skipped: [] }
+    );
+    // Occurrences that will be substituted, tallied per target key. Each target
+    // gets a budget of one, so this is also the cardinality check.
+    const perTarget = new Map<string, number>();
+    const countAt = (targetKey: string, n: number) => {
+      if (n > 0) perTarget.set(targetKey, (perTarget.get(targetKey) ?? 0) + n);
+    };
+
+    // Headers: substitution is applied per header value, so a disallowed header
+    // is skipped (left inert) with no surgery needed. Occurrences land on whichever
+    // target allowed that header, so two headers covered by the bare `header` target
+    // share one budget while `header:a` + `header:b` get one each.
+    for (const h of headerCounts) {
+      const c = countFor(h.counts);
+      if (!c) continue;
+      const targetKey = headerTargetKey(item, h.name);
+      if (targetKey) countAt(targetKey, c);
+      else skippedLocations.push(`header:${h.name}`);
+    }
+
+    // URL path: all-or-nothing (`path` allows a token anywhere in the path).
+    const pathTotal = countFor(pathCounts);
+    if (pathTotal > 0) {
+      if (anyPath) countAt('path', pathTotal);
+      else skippedLocations.push('path');
+    }
+
+    // Query string: `query` allows anywhere; `query:<param>` only the named
+    // param's value. An occurrence off the named param fails closed: the query
+    // is substituted as one string, so skipping it would need re-serialization.
+    // No query targets at all ⇒ the query is never substituted ⇒ skip (leave inert).
+    const queryTotal = countFor(queryCounts);
+    if (queryTotal > 0) {
+      if (anyQuery) {
+        countAt('query', queryTotal);
+      } else if (queryNames.length) {
+        const params = getQueryParamCounts();
+        let queryAllowed = 0;
+        for (const name of queryNames) {
+          const perParam = countFor(params.get(name) ?? new Map());
+          countAt(`query:${name}`, perParam);
+          queryAllowed += perParam;
+        }
+        if (queryAllowed < queryTotal) {
+          return violation({
+            kind: 'location', item, location: 'query', suggestion: locationSuggestion('query', targets),
+          });
+        }
+      } else {
+        skippedLocations.push('query');
+      }
+    }
+
+    // Body: `body:*` allows anywhere (no parse needed). With `body:<path>` targets,
+    // an occurrence off an allowed path fails closed (same surgery argument as
+    // query params), and an unparseable body (leaves === null) allows nothing. With
+    // no body targets the body bytes are never touched, so occurrences are skipped.
+    const bodyTotal = countFor(bodyCounts);
+    if (bodyTotal > 0) {
+      if (bodyAnywhere) {
+        countAt('body:*', bodyTotal);
+      } else if (bodyPaths.length) {
+        const leaves = getBodyLeafCounts();
+        let bodyAllowed = 0;
+        if (leaves) {
+          for (const leaf of leaves) {
+            if (!bodyPaths.includes(leaf.path)) continue;
+            const c = countFor(leaf.counts);
+            countAt(`body:${leaf.path}`, c);
+            bodyAllowed += c;
+          }
+        }
+        if (bodyAllowed < bodyTotal) {
+          return violation({
+            kind: 'location', item, location: 'body', suggestion: locationSuggestion('body', targets),
+          });
+        }
+      } else {
+        skippedLocations.push('body');
+      }
+    }
+
+    let allowedTotal = 0;
+    for (const [targetKey, count] of perTarget) {
+      // One substitution per target: a second copy at the same spot is ambiguous
+      // (which one is the real use?) and would put the secret in both.
+      if (count > 1) {
+        return violation({
+          kind: 'occurrences', item, target: targetKey, count,
+        });
+      }
+      allowedTotal += count;
+    }
+    if (allowedTotal > 0) injectedKeys.push(item.key);
+    if (skippedLocations.length) skipped.push({ item, locations: skippedLocations });
+  }
+  return { violation: undefined, injectedKeys, skipped };
+}
+
+/**
+ * Order-insensitive identity for a transform config, used to dedupe/conflict-
+ * check transforms contributed by multiple matching rules: object key order and
+ * string-list order are not semantic differences (an attached and a detached
+ * copy of the same config must compare equal however they were authored).
+ */
+export function canonicalTransformKey(transform: ProxyRuleTransform): string {
+  const entries = Object.entries(transform)
+    .map(([key, value]) => {
+      const canonicalValue = Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+        ? [...value].sort()
+        : value;
+      return [key, canonicalValue] as const;
+    })
+    .sort(([a], [b]) => (a < b ? -1 : 1));
+  return JSON.stringify(entries);
+}
+
+/** Item keys one transform names in a given role, read from its scheme's option specs. */
+export function transformItemKeys(
+  transform: ProxyRuleTransform,
+  transformSchemes: Record<string, ProxyTransformSchemeDef>,
+  role: 'consumed' | 'wire',
+): Array<string> {
+  const spec = transformSchemes[transform.scheme];
+  const optionSpecs = { ...PROXY_TRANSFORM_COMMON_OPTION_SPECS, ...spec?.options };
+  const keys: Array<string> = [];
+  for (const [option, optionSpec] of Object.entries(optionSpecs)) {
+    if (optionSpec.itemRole !== role) continue;
+    const itemName = proxyTransformItemRefName(optionSpec, transform[option]);
+    if (itemName !== undefined) keys.push(itemName);
+  }
+  return keys;
+}
+
+/**
+ * Item keys consumed by transform schemes (credentials and any other
+ * consumed-role options), read from the scheme option specs.
+ */
+export function collectConsumedTransformKeys(
+  rules: Array<ProxyRule>,
+  transformSchemes: Record<string, ProxyTransformSchemeDef>,
+): Set<string> {
+  const keys = new Set<string>();
+  for (const rule of rules) {
+    if (!rule.transform) continue;
+    for (const key of transformItemKeys(rule.transform, transformSchemes, 'consumed')) keys.add(key);
+  }
+  return keys;
+}
+
+/**
+ * Substitute placeholder → real value within ONE request surface (a single header
+ * value, the URL path, the query string, or the body).
+ *
+ * `allItems` is *every* managed placeholder, not just the substitutable ones, and
+ * `substituteKeys` selects which of them this surface may swap. Matching is
+ * leftmost-longest across all of them, which is what keeps overlapping placeholders
+ * honest: one placeholder can be a substring of another (`ensureUnique` resolves a
+ * collision by appending `_1`, and explicit `@placeholder` values can overlap too),
+ * so a shorter placeholder must never match inside its longer sibling. Filtering the
+ * list down to the surface's own items before replacing would do exactly that, and
+ * would rewrite bytes the guard classified as skipped.
+ *
+ * Every match outside `substituteKeys` is re-emitted verbatim, so a skipped
+ * placeholder reaches the upstream byte-for-byte unchanged. Matched regions are
+ * never rescanned, so a real value that happens to contain another placeholder's
+ * text can't be substituted a second time.
+ */
+export function substitutePlaceholdersInSurface(
+  value: string,
+  allItems: Array<ProxyManagedItem>,
+  substituteKeys: ReadonlySet<string>,
+): string {
+  const matches = findPlaceholderMatches(value, allItems);
+  if (!matches.length) return value;
+  let out = '';
+  let pos = 0;
+  for (const match of matches) {
+    out += value.slice(pos, match.index);
+    out += substituteKeys.has(match.item.key) ? match.item.realValue : match.item.placeholder;
+    pos = match.index + match.item.placeholder.length;
+  }
+  return out + value.slice(pos);
+}
+
+/**
+ * Find a managed placeholder present in the outbound request that is NOT being
+ * injected on this route (`injectHere`). Such a placeholder would reach the
+ * upstream un-substituted and fail with a cryptic auth error, and the cause is
+ * the proxy rules (wrong path/method, or wrong host) — so we catch it and
+ * explain, rather than forwarding a doomed request. Placeholders are unique
+ * per item, so a match is unambiguous (no false positives).
+ */
+export function findUninjectedPlaceholder(
+  parts: Array<string>,
+  managedItems: Array<ProxyManagedItem>,
+  injectHere: Array<ProxyManagedItem>,
+): ProxyManagedItem | undefined {
+  const injectedKeys = new Set(injectHere.map((item) => item.key));
+  return managedItems.find(
+    (item) => item.placeholder.length > 0
+      && !injectedKeys.has(item.key)
+      && parts.some((part) => part.includes(item.placeholder)),
+  );
+}
+
+function replaceRealWithPlaceholders(value: string, managedItems: Array<ProxyManagedItem>): string {
+  let next = value;
+  const sortedByRealLength = [...managedItems]
+    .filter((item) => !!item.realValue && !!item.placeholder)
+    .sort((a, b) => b.realValue.length - a.realValue.length);
+  for (const item of sortedByRealLength) {
+    next = next.split(item.realValue).join(item.placeholder);
+  }
+  return next;
+}
+
+/**
+ * Fail-closed response for a blocked/failed request. When `teardown` is set (the
+ * MITM tunnel path), short status-only responses don't reliably flush through the
+ * CONNECT tunnel, so we write a best-effort response and destroy the socket. The
+ * absolute-form (plain http) path ends the response normally.
+ */
+function respondBlocked(
+  res: http.ServerResponse,
+  code: number,
+  message: string,
+  teardown: boolean,
+): void {
+  if (!res.headersSent) {
+    try {
+      if (teardown) {
+        res.writeHead(code, { 'content-type': 'text/plain', connection: 'close' });
+      } else {
+        res.statusCode = code;
+      }
+      res.end(message);
+    } catch { /* response may already be gone */ }
+  } else {
+    try {
+      res.end();
+    } catch { /* ignore */ }
+  }
+  if (teardown) res.socket?.destroy();
+}
+
+/** Constant-time token comparison (length leak is fine; the token is a uuid, not a password). */
+function tokenMatches(provided: unknown, expected: string): boolean {
+  if (typeof provided !== 'string') return false;
+  const providedBuf = Buffer.from(provided);
+  const expectedBuf = Buffer.from(expected);
+  if (providedBuf.length !== expectedBuf.length) return false;
+  return timingSafeEqual(providedBuf, expectedBuf);
+}
+
+function isLoopbackAddress(addr: string | undefined): boolean {
+  if (!addr) return false;
+  return addr === '::1' || addr === '::ffff:127.0.0.1' || addr.startsWith('127.');
+}
+
+/** True if a listen host binds only loopback (so remote peers can't reach it). */
+function isLoopbackBind(host: string): boolean {
+  return host === 'localhost' || isLoopbackAddress(host);
+}
+
+/** Extract the token from a `Proxy-Authorization: Basic base64(user:token)` header. */
+export function parseProxyAuthToken(header: string | Array<string> | undefined): string | undefined {
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value !== 'string') return undefined;
+  const spaceIdx = value.indexOf(' ');
+  if (spaceIdx === -1) return undefined;
+  const scheme = value.slice(0, spaceIdx);
+  const encoded = value.slice(spaceIdx + 1).trim();
+  if (scheme.toLowerCase() !== 'basic' || !encoded) return undefined;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encoded, 'base64').toString('utf8');
+  } catch {
+    return undefined;
+  }
+  const colon = decoded.indexOf(':');
+  // Basic is `user:pass`; the token is the password half (username is cosmetic).
+  return colon === -1 ? decoded : decoded.slice(colon + 1);
+}
+
+/**
+ * Data-plane gate. Loopback peers are same-uid-trusted and always pass (the
+ * historical model). A non-loopback peer — only reachable when the listener is
+ * bound off-loopback — must present the session's `Proxy-Authorization` token.
+ */
+export function dataPlaneAuthOk(
+  peerAddr: string | undefined,
+  header: string | Array<string> | undefined,
+  token: string | undefined,
+): boolean {
+  if (isLoopbackAddress(peerAddr)) return true;
+  if (!token) return false; // non-loopback bind without a token: fail closed
+  return tokenMatches(parseProxyAuthToken(header), token);
+}
+
+/** Transport-specific inputs for a proxied request, shared by the MITM-tunnel and
+ * absolute-form (plain http) handlers so the policy/approval/injection/forwarding
+ * logic lives in one place. */
+type ProxiedRequestTransport = {
+  host: string;
+  port: number;
+  isHttps: boolean;
+  method: string;
+  /** Path component for policy facts/activity (no query). */
+  pathOnly: string;
+  /** Origin-form path+query sent upstream (and scrubbed) — also used as the activity URL. */
+  requestTarget: string;
+  /** When set, override the upstream `Host` header (absolute-form). Undefined = pass the client's through (MITM). */
+  upstreamHostHeader?: string;
+  /** Deny/approval/error responses tear the socket down (MITM tunnel) rather than ending normally. */
+  tunnelTeardown: boolean;
+};
+
+function transformHeaders(
+  headers: http.IncomingHttpHeaders,
+  transformValue: HeaderTransformFn,
+): Record<string, string | Array<string>> {
+  const out: Record<string, string | Array<string>> = {};
+  for (const [key, val] of Object.entries(headers)) {
+    if (val === undefined) continue;
+    // node lower-cases incoming header names, so `key` is already the canonical
+    // (lower-cased) name the substitution targets match on.
+    if (Array.isArray(val)) {
+      out[key] = val.map((v) => transformValue(v, key));
+    } else {
+      out[key] = transformValue(String(val), key);
+    }
+  }
+  return out;
+}
+
+function getHeaderValue(
+  headers: http.IncomingHttpHeaders,
+  key: string,
+): string | undefined {
+  const raw = headers[key.toLowerCase()];
+  if (raw === undefined) return undefined;
+  if (Array.isArray(raw)) return raw[0];
+  return String(raw);
+}
+
+function isUncompressedResponse(headers: http.IncomingHttpHeaders): boolean {
+  const contentEncoding = getHeaderValue(headers, 'content-encoding');
+  if (!contentEncoding) return true;
+  const tokens = contentEncoding.split(',').map((token) => token.trim().toLowerCase()).filter(Boolean);
+  if (!tokens.length) return true;
+  return tokens.every((token) => token === 'identity');
+}
+
+function isTextLikeResponse(headers: http.IncomingHttpHeaders): boolean {
+  const contentType = getHeaderValue(headers, 'content-type')?.toLowerCase();
+  if (!contentType) return false;
+  return contentType.startsWith('text/')
+    || contentType.includes('json')
+    || contentType.includes('xml')
+    || contentType.includes('javascript')
+    || contentType.includes('x-www-form-urlencoded')
+    || contentType.includes('graphql');
+}
+
+// Only buffer-and-redact bounded, reasonably small text bodies. Anything we
+// can't size up front (SSE, chunked streams) or that's too large is streamed
+// straight through — buffering it would break streaming (e.g. LLM token-by-token
+// responses hang until complete) for a low-value protection: the injected secret
+// is in the request, not the response. Header redaction still applies regardless.
+const MAX_REDACT_BODY_BYTES = 2 * 1024 * 1024;
+
+function isStreamingResponse(headers: http.IncomingHttpHeaders): boolean {
+  const contentType = getHeaderValue(headers, 'content-type')?.toLowerCase() ?? '';
+  return contentType.includes('text/event-stream');
+}
+
+function isBoundedRedactableBody(headers: http.IncomingHttpHeaders): boolean {
+  const lenRaw = getHeaderValue(headers, 'content-length');
+  if (lenRaw === undefined) return false; // unknown size — treat as a stream, never buffer
+  const len = Number(lenRaw);
+  return Number.isFinite(len) && len >= 0 && len <= MAX_REDACT_BODY_BYTES;
+}
+
+function shouldRedactResponseBody(headers: http.IncomingHttpHeaders): boolean {
+  return isUncompressedResponse(headers)
+    && isTextLikeResponse(headers)
+    && !isStreamingResponse(headers)
+    && isBoundedRedactableBody(headers);
+}
+
+function redactOutgoingHeaders(
+  headers: http.IncomingHttpHeaders,
+  managedItems: Array<ProxyManagedItem>,
+): Record<string, string | Array<string>> {
+  return transformHeaders(
+    headers,
+    (value) => replaceRealWithPlaceholders(value, managedItems),
+  );
+}
+
+/** Returns the first managed item whose real value still appears in `text` (a leak), if any. */
+function findRealLeak(text: string, managedItems: Array<ProxyManagedItem>): ProxyManagedItem | undefined {
+  return managedItems.find((item) => item.realValue.length > 0 && text.includes(item.realValue));
+}
+
+/** Item keys whose real value appears in `text` — i.e. the keys that get scrubbed back to placeholders. */
+function detectScrubbedKeys(text: string, managedItems: Array<ProxyManagedItem>): Array<string> {
+  const keys: Array<string> = [];
+  for (const item of managedItems) {
+    if (item.realValue.length > 0 && text.includes(item.realValue)) keys.push(item.key);
+  }
+  return keys;
+}
+
+/**
+ * Length of the longest suffix of `text` that is a strict prefix of some real
+ * value — i.e. a partial real value that might complete in the next chunk and
+ * so must be held back. Returns 0 (emit everything) when the text doesn't end
+ * mid-secret, which keeps streaming responsive instead of buffering a fixed
+ * window every chunk.
+ */
+function pendingRealPrefixLen(text: string, managedItems: Array<ProxyManagedItem>): number {
+  let best = 0;
+  for (const item of managedItems) {
+    const real = item.realValue;
+    if (!real) continue;
+    const maxK = Math.min(real.length - 1, text.length);
+    for (let k = maxK; k > best; k -= 1) {
+      if (text.endsWith(real.slice(0, k))) {
+        best = k;
+        break;
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Scrub real values back to placeholders on an *unbounded text stream* (e.g.
+ * SSE), chunk by chunk, so a reflected secret in a streamed response is still
+ * replaced for the child without buffering the whole stream. A StringDecoder
+ * keeps multi-byte UTF-8 chars intact across chunks; only a trailing *partial*
+ * real value is held back, so complete chunks flow through immediately.
+ */
+function createScrubbingTransform(
+  managedItems: Array<ProxyManagedItem>,
+  matchedKeys?: Set<string>,
+): Transform {
+  const decoder = new StringDecoder('utf8');
+  let carry = '';
+  const note = (text: string) => {
+    if (matchedKeys) for (const key of detectScrubbedKeys(text, managedItems)) matchedKeys.add(key);
+  };
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      const decoded = carry + decoder.write(chunk as Buffer);
+      note(decoded);
+      const scrubbed = replaceRealWithPlaceholders(decoded, managedItems);
+      const hold = pendingRealPrefixLen(scrubbed, managedItems);
+      const emitLen = scrubbed.length - hold;
+      carry = scrubbed.slice(emitLen);
+      cb(null, Buffer.from(scrubbed.slice(0, emitLen), 'utf8'));
+    },
+    flush(cb) {
+      const decoded = carry + decoder.end();
+      note(decoded);
+      cb(null, Buffer.from(replaceRealWithPlaceholders(decoded, managedItems), 'utf8'));
+    },
+  });
+}
+
+function forwardUpstreamResponseWithRedaction(
+  upstreamRes: http.IncomingMessage,
+  clientRes: http.ServerResponse,
+  managedItems: Array<ProxyManagedItem>,
+  shouldRedact: boolean,
+  responseCtx?: { host: string; method: string; path: string; onResponse?: (info: ProxyResponseInfo) => void },
+) {
+  const statusCode = upstreamRes.statusCode ?? 502;
+  const onResponse = responseCtx?.onResponse;
+  const report = (scrubbedKeys: Iterable<string>, streamed: boolean) => {
+    if (!onResponse || !responseCtx) return;
+    onResponse({
+      host: responseCtx.host,
+      method: responseCtx.method,
+      path: responseCtx.path,
+      statusCode,
+      scrubbedKeys: [...new Set(scrubbedKeys)],
+      ...(streamed ? { streamed: true } : {}),
+    });
+  };
+  // Detect keys reflected in the (original) response headers, scrubbed regardless of body path.
+  const headerKeys = shouldRedact ? detectScrubbedKeys(JSON.stringify(upstreamRes.headers), managedItems) : [];
+  const outgoingHeaders = shouldRedact
+    ? redactOutgoingHeaders(upstreamRes.headers, managedItems)
+    : { ...upstreamRes.headers };
+
+  if (!shouldRedact || !shouldRedactResponseBody(upstreamRes.headers)) {
+    // Scrub unbounded uncompressed text streams (e.g. SSE) chunk-by-chunk so a
+    // reflected secret is still replaced. Bodies with a content-length take the
+    // buffered path below; compressed/binary bodies can't be scanned without
+    // decompressing and pass through unchanged.
+    const hasContentLength = getHeaderValue(upstreamRes.headers, 'content-length') !== undefined;
+    const canScrubStream = shouldRedact
+      && managedItems.length > 0
+      && !hasContentLength
+      && isUncompressedResponse(upstreamRes.headers)
+      && isTextLikeResponse(upstreamRes.headers);
+
+    clientRes.writeHead(statusCode, outgoingHeaders);
+    if (canScrubStream) {
+      const matched = new Set(headerKeys);
+      const transform = createScrubbingTransform(managedItems, matched);
+      transform.on('end', () => report(matched, true));
+      upstreamRes.pipe(transform).pipe(clientRes);
+    } else {
+      // Passthrough (compressed/binary/unscanned body) — only header reflection is visible.
+      report(headerKeys, false);
+      upstreamRes.pipe(clientRes);
+    }
+    return;
+  }
+
+  const chunks: Array<Buffer> = [];
+  upstreamRes.on('data', (chunk: Buffer | string) => {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+
+  upstreamRes.on('end', () => {
+    const originalBody = Buffer.concat(chunks).toString('utf8');
+    const bodyKeys = detectScrubbedKeys(originalBody, managedItems);
+    const redactedBody = replaceRealWithPlaceholders(originalBody, managedItems);
+
+    // Fail-safe (Invariant #6): if a real value somehow survived scrubbing, do
+    // NOT forward it — fail closed rather than leak a secret to the child.
+    if (findRealLeak(redactedBody, managedItems)) {
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(502, { 'content-type': 'text/plain', connection: 'close' });
+      }
+      clientRes.end('Response withheld: a sensitive value could not be redacted');
+      clientRes.socket?.destroy();
+      return;
+    }
+
+    const redactedBuffer = Buffer.from(redactedBody, 'utf8');
+
+    const headersForWrite = { ...outgoingHeaders };
+    headersForWrite['content-length'] = String(redactedBuffer.byteLength);
+    delete headersForWrite['transfer-encoding'];
+    delete headersForWrite.etag;
+
+    clientRes.writeHead(statusCode, headersForWrite);
+    clientRes.end(redactedBuffer);
+    report([...headerKeys, ...bodyKeys], false);
+  });
+
+  upstreamRes.on('error', () => {
+    if (!clientRes.headersSent) clientRes.statusCode = 502;
+    clientRes.end('Upstream proxy error');
+  });
+}
+
+async function readBody(req: http.IncomingMessage): Promise<Buffer> {
+  const chunks: Array<Buffer> = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
+ * How long a persisted CA is valid. Effectively indefinite (10 years, the same
+ * convention as mkcert/Caddy local roots): any expiry is a scheduled outage for
+ * agents still running when it hits, which is exactly what persisting the CA is
+ * meant to prevent, and it buys no security here. Nothing checks revocation for
+ * this CA, and it is only ever trusted by clients that fetched it from this
+ * broker over an authenticated tunnel, so a leaked key is answered by deleting
+ * the file and restarting, not by waiting. The short-lived material that does
+ * matter is the per-host leaf certs.
+ *
+ * Not literally "no expiry" (RFC 5280's 9999-12-31): a year past 2049 has to be
+ * encoded as GeneralizedTime, a far less trodden path through TLS verifiers, and
+ * a bounded life means a forgotten cert directory does not stay valid forever.
+ */
+const PERSISTED_CA_VALIDITY_DAYS = 3650;
+/** Rotate a persisted CA this far ahead of expiry, so it can't lapse mid-session. */
+const PERSISTED_CA_ROTATE_BEFORE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Reuse the CA in `certDir` if it's still valid, else mint one and persist it.
+ * Reusing keeps clients that already trust this CA working across a restart —
+ * what a long-lived broker needs, and why the private key is written (0600)
+ * rather than kept in memory. An unreadable/corrupt/expiring pair is replaced
+ * rather than fatal: a broker should still come up.
+ */
+async function loadOrCreatePersistedCa(caCertPath: string, caKeyPath: string) {
+  try {
+    const [certPem, keyPem] = await Promise.all([
+      readFile(caCertPath, 'utf8'),
+      readFile(caKeyPath, 'utf8'),
+    ]);
+    const existing = await loadCa(certPem, keyPem);
+    if (existing.notAfter.getTime() - Date.now() > PERSISTED_CA_ROTATE_BEFORE_MS) return existing;
+  } catch { /* no usable CA on disk — mint one below */ }
+
+  const ca = await createEphemeralCa(PERSISTED_CA_VALIDITY_DAYS);
+  await writeFile(caKeyPath, await exportCaPrivateKeyPem(ca), { encoding: 'utf8', mode: 0o600 });
+  return ca;
+}
+
+/**
+ * Local MITM proxy runtime for `varlock proxy run`.
+ * Rewrites placeholder values to real values for requests matching @proxy domains.
+ */
+export async function startLocalProxyRuntime({
+  managedItems: initialManagedItems,
+  rules: initialRules,
+  egressMode: initialEgressMode,
+  transformSchemes: initialTransformSchemes,
+  onActivity,
+  onResponse,
+  approvalProvider,
+  internalEndpoint,
+  port,
+  certDir,
+  persistCa,
+  listenHost,
+  dataPlaneToken,
+}: StartLocalProxyRuntimeInput): Promise<ProxyRuntimeContext> {
+  const bindHost = listenHost ?? LOCALHOST;
+  if (!isLoopbackBind(bindHost) && !dataPlaneToken) {
+    // Belt-and-suspenders: the command layer mints a token whenever it passes a
+    // non-loopback listenHost. If we got here without one, refuse to expose an
+    // unauthenticated proxy off-loopback rather than fail open.
+    throw new Error('varlock proxy: serving the tunnel off-loopback requires a data-plane token.');
+  }
+  // Mutable so `reconfigure` can hot-swap the enforced policy on a live proxy.
+  // The request handlers below close over these bindings, so reassigning them
+  // changes behavior on the next request (in-flight requests already snapshotted).
+  let activeManagedItems = initialManagedItems;
+  let activeRules = initialRules;
+  let activeEgressMode = initialEgressMode;
+  let activeTransformSchemes = initialTransformSchemes ?? BUILT_IN_TRANSFORM_SCHEMES;
+  // Item keys consumed by transform schemes (credentials), per the scheme
+  // option specs. Static per config, so computed here and on reconfigure rather
+  // than per request.
+  let activeConsumedTransformKeys = collectConsumedTransformKeys(activeRules, activeTransformSchemes);
+  // Set via setSessionEnvPayloadJson right after startup (and on each reload).
+  let sessionEnvPayloadJson: string | undefined;
+  let sessionEnvPayloadMeta: SessionEnvPayloadMeta | undefined;
+  // Only the public CA cert is written to disk (for child trust). Private keys
+  // — the CA's and every per-host leaf's — stay in memory; see cert-authority.ts.
+  // A caller-provided certDir gives tools a known CA path to wire up before start;
+  // otherwise use a fresh temp dir. Track which so stop() cleans up appropriately.
+  const certDirIsUserProvided = certDir !== undefined;
+  const certsDir = certDir ?? await mkdtemp(path.join(os.tmpdir(), 'varlock-proxy-certs-'));
+  if (certDirIsUserProvided) await mkdir(certsDir, { recursive: true });
+  const caCertPath = path.join(certsDir, 'ca-cert.pem');
+  const combinedCaPath = path.join(certsDir, 'combined-ca.pem');
+  const caKeyPath = path.join(certsDir, 'ca-key.pem');
+  if (persistCa && !certDirIsUserProvided) {
+    throw new Error('varlock proxy: persisting the CA requires a cert directory to keep it in.');
+  }
+  const ca = persistCa
+    ? await loadOrCreatePersistedCa(caCertPath, caKeyPath)
+    : await createEphemeralCa();
+  await writeFile(caCertPath, ca.certPem, 'utf8');
+  await writeFile(combinedCaPath, `${ca.certPem}\n${tls.rootCertificates.join('\n')}\n`, 'utf8');
+
+  // Internal control endpoint: requests to the magic internal host are answered
+  // by the proxy itself (an attaching `proxy run` fetches the session env here).
+  // Handled before any egress/rule evaluation, never forwarded upstream, and
+  // deliberately not reported as egress activity (it is control plane, not
+  // traffic). Fail order: token first (an unauthenticated caller learns nothing,
+  // not even which paths exist), then path.
+  const handleInternalRequest = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    t: ProxiedRequestTransport,
+  ) => {
+    // Loopback peers only. Redundant today (the listener binds 127.0.0.1) but
+    // deliberate: a future non-loopback data-plane bind (sandbox bridging) must
+    // not silently expose the control plane to a network segment.
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      internalEndpoint?.onAuthFailure?.();
+      respondBlocked(res, 403, 'varlock proxy: internal endpoint is loopback-only', t.tunnelTeardown);
+      return;
+    }
+    if (!internalEndpoint || !tokenMatches(req.headers[PROXY_TOKEN_HEADER], internalEndpoint.token)) {
+      internalEndpoint?.onAuthFailure?.();
+      respondBlocked(res, 403, 'varlock proxy: invalid or missing session token', t.tunnelTeardown);
+      return;
+    }
+    if (t.method !== 'GET' || t.pathOnly !== SESSION_ENV_ENDPOINT_PATH) {
+      respondBlocked(res, 404, 'varlock proxy: unknown internal endpoint', t.tunnelTeardown);
+      return;
+    }
+    if (!sessionEnvPayloadJson) {
+      respondBlocked(res, 503, 'varlock proxy: session env not ready yet', t.tunnelTeardown);
+      return;
+    }
+    try {
+      res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+      res.end(sessionEnvPayloadJson);
+      internalEndpoint.onServed?.(sessionEnvPayloadMeta);
+    } catch { /* client went away */ }
+  };
+
+  // Shared request pipeline for both transports (MITM tunnel + absolute-form http):
+  // egress gate → per-call policy (block) → cleartext guard → approval gate →
+  // scrub+inject → forward upstream (verified identity) → scrub response. Every
+  // failure path fails closed via respondBlocked.
+  const processProxiedRequest = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    t: ProxiedRequestTransport,
+  ) => {
+    if (normalizeHost(t.host) === VARLOCK_INTERNAL_HOST) {
+      handleInternalRequest(req, res, t);
+      return;
+    }
+
+    // Snapshot the hot-swappable policy for this request. `reconfigure()` can
+    // replace these bindings while the request is in flight (body read,
+    // approval gate, upstream verification are all awaits), and a request must
+    // be evaluated, injected, and transformed against ONE consistent policy.
+    const {
+      rules, managedItems, egressMode, transformSchemes, consumedTransformKeys,
+    } = {
+      rules: activeRules,
+      managedItems: activeManagedItems,
+      egressMode: activeEgressMode,
+      transformSchemes: activeTransformSchemes,
+      consumedTransformKeys: activeConsumedTransformKeys,
+    };
+
+    const baseActivity = {
+      host: t.host, method: t.method, path: t.pathOnly, url: t.requestTarget,
+    };
+
+    const shouldRewrite = hostMatchesProxyRules(t.host, rules);
+    const shouldAllowEgress = egressMode === 'permissive' || shouldRewrite;
+    if (!shouldAllowEgress) {
+      onActivity?.({
+        ...baseActivity, matched: shouldRewrite, blocked: true, decision: 'blocked-egress',
+      });
+      respondBlocked(res, 403, `Blocked by the varlock credential proxy: ${t.host} is not allowed by your egress policy (strict mode only permits hosts with a matching @proxy rule). Add a @proxy rule for this host, or use permissive egress, to allow it.`, false);
+      return;
+    }
+
+    // Per-call policy (static authorization): evaluate host + method + path; a
+    // matching `block` rule denies the request and it never reaches upstream.
+    const facts: RequestFacts = { host: t.host, method: t.method, path: t.pathOnly };
+    const policyDecision = shouldRewrite ? evaluateProxyPolicy(facts, rules, egressMode) : undefined;
+    const ruleIdStr = policyDecision?.matchedRule ? describeRule(policyDecision.matchedRule) : undefined;
+    const ruleId = ruleIdStr ? { ruleId: ruleIdStr } : {};
+    if (policyDecision?.verdict === 'deny') {
+      // Two deny kinds: an explicit `block` rule (denylist), or strict egress with
+      // no allow rule matching this method/path on an otherwise-ruled host.
+      const egressStrictDeny = policyDecision.denyKind === 'egress-strict';
+      onActivity?.({
+        ...baseActivity, ...ruleId, matched: true, blocked: true, decision: egressStrictDeny ? 'blocked-egress' : 'deny',
+      });
+      const message = egressStrictDeny
+        ? `Blocked by the varlock credential proxy: no @proxy rule matches ${t.method} ${t.host}${t.pathOnly}. `
+          + 'The host has a @proxy rule, but none matches this method and path, and egress is strict. '
+          + 'Add a matching (or broader) @proxy rule, or use permissive egress.'
+        : `Blocked by the varlock credential proxy: a @proxy block rule denies ${t.method} ${t.host}${t.pathOnly}.`;
+      respondBlocked(res, 403, message, t.tunnelTeardown);
+      return;
+    }
+
+    // Approval-gated keys (contributed only by `@proxy(approval)` rules) are
+    // withheld unless the verdict actually routes through the approval gate below.
+    // A plain-`allow` verdict from a more-specific rule must NOT smuggle a broader
+    // approval rule's secret in without a prompt (see getRequestScopedManagedItems).
+    const hostItems = shouldRewrite
+      ? getRequestScopedManagedItems(facts, rules, managedItems, {
+        includeApprovalGatedKeys: policyDecision?.verdict === 'require-approval',
+      })
+      : [];
+
+    // Every blocked-transform outcome (conflict, leaked secret, missing
+    // credential, transform failure) audits and responds the same way.
+    const blockTransform = (status: number, message: string, matched = true) => {
+      onActivity?.({
+        ...baseActivity, ...ruleId, matched, blocked: true, decision: 'blocked-transform',
+      });
+      respondBlocked(res, status, `Blocked by the varlock credential proxy: ${message}`, t.tunnelTeardown);
+    };
+
+    // Request transform in scope for this request: contributed by
+    // matching non-block rules, mirroring the substitution merge's approval
+    // gating - a transform carried only by an approval rule applies only when the
+    // approval gate actually runs, so a more-specific plain-allow rule can't use
+    // the credential without the prompt the author asked for.
+    const activeTransforms = new Map<string, ProxyRuleTransform>();
+    let approvalWithheldTransform = false;
+    if (shouldRewrite) {
+      for (const rule of rules) {
+        if (!rule.transform || rule.block) continue;
+        if (!ruleMatchesFacts(rule, facts)) continue;
+        if (rule.approval && policyDecision?.verdict !== 'require-approval') {
+          approvalWithheldTransform = true;
+          continue;
+        }
+        activeTransforms.set(canonicalTransformKey(rule.transform), rule.transform);
+      }
+    }
+    // Two different transform configs matching one request is a schema
+    // misconfiguration - a request can't be transformed two ways. Fail closed with
+    // a config-shaped error rather than applying an arbitrary winner.
+    // (Comparison is canonical - key order and list order don't count as
+    // differences, so an attached and a detached copy of the same config merge.)
+    if (activeTransforms.size > 1) {
+      blockTransform(502, `multiple conflicting @proxy transform configs match ${t.method} ${t.host}${t.pathOnly}. `
+        + 'Keep one transform-carrying rule per domain (put policy refinements on separate rules without a transform).');
+      return;
+    }
+    const activeTransform: ProxyRuleTransform | undefined = activeTransforms.values().next().value;
+    // A transform withheld by approval gating with no other transform active
+    // would silently forward the request WITHOUT its credential (a doomed request,
+    // or worse, an unauthenticated call the upstream happens to accept). Unlike withheld
+    // substitution keys there is no placeholder left behind to trip a guard, so
+    // fail closed here instead.
+    if (!activeTransform && approvalWithheldTransform) {
+      blockTransform(403, `this request to ${t.host}${t.pathOnly} matched a transform rule that requires approval, but the approval gate was bypassed by a more specific allow rule - `
+        + 'the request would be forwarded without its credential. Attach the transform (or the approval) to the more specific rule.');
+      return;
+    }
+
+    // Invariant #2/#5: never inject a secret into a cleartext (non-TLS) connection —
+    // no cert means no verifiable identity. Fail closed. (MITM is always https, so
+    // this only fires on the absolute-form http path.) Transforms count: a signature
+    // over cleartext is trivially replayable and the timestamp is attacker-visible.
+    if ((hostItems.length > 0 || activeTransform) && !t.isHttps) {
+      onActivity?.({
+        ...baseActivity, ...ruleId, matched: true, blocked: true, decision: 'blocked-cleartext',
+      });
+      respondBlocked(res, 403, `Blocked by the varlock credential proxy: refusing to ${activeTransform && !hostItems.length ? 'apply a request transform over' : 'inject a secret into'} a cleartext (non-TLS) connection to ${t.host}.`, false);
+      return;
+    }
+
+    const body = await readBody(req);
+    const bodyText = body.toString('utf8');
+    const scanParts = [t.requestTarget, JSON.stringify(req.headers), bodyText];
+
+    // A consumed transform credential never travels - anywhere it is not ALSO
+    // legitimately injectable. Its placeholder appearing in a request it is not
+    // in scope for means the child is trying to send the credential itself (or
+    // was tricked into it); fail closed with a message naming the real cause
+    // instead of letting the generic uninjected-placeholder guard (or the
+    // upstream's auth error) produce something cryptic. An item that another,
+    // non-transform rule injects on THIS request stays substitutable (dual use:
+    // same secret is consumed by a transform for one API and travels to another).
+    const transformCredentialLeak = managedItems.find((item) => consumedTransformKeys.has(item.key)
+      && item.placeholder.length > 0
+      && !hostItems.some((hostItem) => hostItem.key === item.key)
+      && scanParts.some((part) => part.includes(item.placeholder)));
+    if (transformCredentialLeak) {
+      blockTransform(403, `this request to ${t.host}${t.pathOnly} carries the placeholder for ${transformCredentialLeak.key}, `
+        + 'which is a transform credential: the proxy applies the real value itself on matching requests, so the child never sends it. Remove it from the request.', shouldRewrite);
+      return;
+    }
+
+    // Helpful-failure guard: when NO rule injects anything on this route yet the
+    // request carries a managed placeholder, the real value won't be substituted
+    // and the upstream would reject it with a cryptic auth error — and the cause
+    // is the proxy rules (wrong path/method, or wrong host). Explain it instead of
+    // forwarding a doomed request. Scoped to `hostItems.length === 0` so a request
+    // that DOES inject on this route can still carry an unrelated placeholder
+    // (e.g. another item's, bound for a different host) through untouched.
+    const leaked = hostItems.length === 0
+      ? findUninjectedPlaceholder(scanParts, managedItems, hostItems)
+      : undefined;
+    if (leaked) {
+      onActivity?.({
+        ...baseActivity, ...ruleId, matched: shouldRewrite, blocked: true, decision: 'blocked-uninjected',
+      });
+      respondBlocked(res, 403, `Blocked by the varlock credential proxy: this request to ${t.host}${t.pathOnly} carries the placeholder for ${leaked.key}, `
+        + 'but no @proxy rule injects it here — the real value was not substituted and the request would fail upstream. '
+        + 'Add or broaden a @proxy rule so it matches this request (host + path + method).', t.tunnelTeardown);
+      return;
+    }
+
+    // Substitution guards: before any placeholder is swapped for its real value,
+    // enforce *where* (target: header / header:name / query:param / body:path) each
+    // injected secret may appear, and that it appears at most once per target.
+    // Default is any header, once. This is what keeps a clever request from moving
+    // the real secret into an exfiltration-friendly spot (an email body, a
+    // duplicated field) on an otherwise-allowed host: the secret is only ever
+    // substituted where the rule explicitly allows. Occurrences in a surface the
+    // rule has no targets on are skipped (forwarded unsubstituted, inert) rather
+    // than blocked; see checkSubstitutionGuards.
+    let injectedKeys: Array<string> = [];
+    let skippedPlaceholders: Array<{ key: string; locations: Array<string> }> = [];
+    if (shouldRewrite && hostItems.length > 0) {
+      const guardReq: SubstitutionGuardRequest = {
+        headers: Object.entries(req.headers).map(([name, value]) => ({
+          name: name.toLowerCase(),
+          value: Array.isArray(value) ? value.join('\n') : String(value ?? ''),
+        })),
+        requestTarget: t.requestTarget,
+        body: bodyText,
+        contentType: getHeaderValue(req.headers, 'content-type'),
+      };
+      // Pass every managed placeholder, not just the injected ones, so the guard
+      // attributes occurrences exactly as the substitution below will.
+      const guardResult = checkSubstitutionGuards(guardReq, hostItems, managedItems);
+      const { violation } = guardResult;
+      if (violation) {
+        const decision = violation.kind === 'location' ? 'blocked-location' : 'blocked-occurrences';
+        onActivity?.({
+          ...baseActivity, ...ruleId, matched: true, blocked: true, decision,
+        });
+        const message = violation.kind === 'location'
+          ? `Blocked by the varlock credential proxy: ${violation.item.key}'s placeholder appears in the ${violation.location} of this request, off the exact spot its @proxy rule allows. `
+            + `${violation.suggestion}. `
+            + 'If that placement was not intentional, it may be an attempt to place the secret somewhere it could leak.'
+          : `Blocked by the varlock credential proxy: ${violation.item.key}'s placeholder appears ${violation.count} times at the same substitution target (${violation.target}) in this request, but each target may be substituted only once. `
+            + 'A valid request uses the secret once per place it belongs; an extra copy at the same target can exfiltrate it, and the proxy cannot tell which copy is the real use. '
+            + `If this API genuinely carries it in more than one place, name each one so each gets its own substitution: ${substituteInExample(violation.item.targets, '<the-other-place>')}.`;
+        respondBlocked(res, 403, message, t.tunnelTeardown);
+        return;
+      }
+      injectedKeys = guardResult.injectedKeys;
+      skippedPlaceholders = guardResult.skipped.map((c) => ({ key: c.item.key, locations: c.locations }));
+    }
+
+    // Invariant #8: a require-approval rule holds the request for an out-of-band,
+    // request-bound decision. Fail closed (deny) unless explicitly approved.
+    if (policyDecision?.verdict === 'require-approval') {
+      const approved = await runApprovalGate({
+        approvalProvider,
+        method: t.method,
+        host: t.host,
+        path: t.pathOnly,
+        body,
+        ruleId: ruleIdStr,
+        each: policyDecision.matchedRule?.approval?.each,
+        maxDurationMs: policyDecision.matchedRule?.approval?.maxDurationMs,
+        injectedKeys,
+      });
+      if (!approved) {
+        onActivity?.({
+          ...baseActivity, ...ruleId, matched: true, blocked: true, decision: 'approval-denied',
+        });
+        respondBlocked(res, 403, `Blocked by the varlock credential proxy: this request to ${t.host} required approval and it was not granted.`, t.tunnelTeardown);
+        return;
+      }
+    }
+
+    // Substitute placeholder → real value, scoped per surface: a surface only swaps
+    // the items whose targets cover it, so a skipped occurrence (in a surface the
+    // rule doesn't target) stays the literal, inert placeholder. Within a targeted
+    // surface the guard above already proved every occurrence sits at an allowed
+    // spot, so no body/query re-serialization is needed. Every call still matches
+    // against ALL managed placeholders, not just the surface's own, so an
+    // overlapping placeholder can't be clobbered from inside its longer sibling
+    // (see substitutePlaceholdersInSurface).
+    const keysForLocation = (location: ProxySubstitutionLocation) => new Set(
+      hostItems.filter((item) => item.targets.some((tg) => tg.location === location)).map((item) => item.key),
+    );
+    // The body keeps its ORIGINAL bytes unless substitution actually changed it.
+    // Decoding a binary body (an S3 upload, a protobuf payload) mangles invalid
+    // byte sequences into U+FFFD, and a transform signature computed over the
+    // mangled bytes would make the upstream accept silently-corrupted data.
+    const substitutedBodyText = shouldRewrite
+      ? substitutePlaceholdersInSurface(bodyText, managedItems, keysForLocation('body'))
+      : bodyText;
+    const rewrittenBody = substitutedBodyText === bodyText
+      ? body
+      : Buffer.from(substitutedBodyText, 'utf8');
+    let rewrittenPath = t.requestTarget;
+    if (shouldRewrite) {
+      const queryStart = t.requestTarget.indexOf('?');
+      const pathPart = queryStart === -1 ? t.requestTarget : t.requestTarget.slice(0, queryStart);
+      const queryPart = queryStart === -1 ? undefined : t.requestTarget.slice(queryStart + 1);
+      const substitutedPathPart = substitutePlaceholdersInSurface(pathPart, managedItems, keysForLocation('path'));
+      // Policy matched the canonical placeholder-form path (`t.pathOnly`). A value
+      // substituted into it must stay inside its segment: one that carries `/`,
+      // `..`, `?`, `#`, or anything the canonicalizer would rewrite would route
+      // the request somewhere the rules never evaluated. The value is the schema
+      // author's, not the agent's, so this is a misconfiguration, but it fails
+      // closed all the same (and names the key, never the value).
+      if (!substitutedPathKeepsStructure(pathPart, substitutedPathPart)) {
+        const pathKeys = [...keysForLocation('path')].filter((key) => injectedKeys.includes(key));
+        onActivity?.({
+          ...baseActivity, ...ruleId, matched: true, blocked: true, decision: 'blocked-location',
+        });
+        respondBlocked(res, 502, `Blocked by the varlock credential proxy: substituting ${pathKeys.join(', ') || 'a managed item'} into the URL path would change the path's structure (the value contains a path separator, dot segment, query or fragment marker, ";", or a character that needs encoding). `
+          + 'A value carried in the path must be URL-safe; encode it, or substitute it somewhere else.', t.tunnelTeardown);
+        return;
+      }
+      rewrittenPath = substitutedPathPart
+        + (queryPart === undefined
+          ? ''
+          : `?${substitutePlaceholdersInSurface(queryPart, managedItems, keysForLocation('query'))}`);
+    }
+
+    // Response scrubbing puts back the placeholders for the secrets THIS rule
+    // sent: the items it injects, plus a transform's credentials (consumed ones
+    // never travel raw, but a scheme may put a derived form on the wire, added
+    // below). Those are the values this upstream was actually given.
+    //
+    // Scrubbing is substring replacement with no token boundary, so scanning for
+    // every secret the proxy holds would let a value configured for another
+    // route rewrite ordinary text here. Containing it to the matched rules keeps
+    // that blast radius to the route the value belongs to. (Within that route a
+    // low-entropy value can still collide with ordinary content: a string common
+    // enough to appear in a payload is not meaningfully protected by redacting
+    // it, and redacting it will rewrite legitimate text.)
+    //
+    // Reflected placeholders are left alone: they are inert, and an agent
+    // quoting its own env back is ordinary behavior.
+    //
+    // Non-sensitive items are excluded: replacing an ordinary value like a
+    // username would corrupt the payload for no benefit.
+    const scrubKeys = new Set([
+      ...hostItems.map((item) => item.key),
+      ...(activeTransform ? [
+        ...transformItemKeys(activeTransform, transformSchemes, 'consumed'),
+        ...transformItemKeys(activeTransform, transformSchemes, 'wire'),
+      ] : []),
+    ]);
+    const responseScrubItems: Array<ProxyManagedItem> = managedItems.filter(
+      (item) => scrubKeys.has(item.key) && item.isSensitive !== false,
+    );
+
+    const upstreamHeaders = transformHeaders(
+      req.headers,
+      shouldRewrite
+        ? (value, name) => substitutePlaceholdersInSurface(
+          value,
+          managedItems,
+          new Set(hostItems.filter((item) => itemAllowsHeader(item, name)).map((item) => item.key)),
+        )
+        : (value) => value,
+    );
+    delete upstreamHeaders['proxy-connection'];
+    delete upstreamHeaders.connection;
+    // Hop-by-hop: addressed to this proxy, never the upstream. A client with
+    // credentials in its proxy url (e.g. a copied HTTPS_PROXY with userinfo)
+    // must not have them forwarded to the destination host.
+    delete upstreamHeaders['proxy-authorization'];
+    if (t.upstreamHostHeader !== undefined) upstreamHeaders.host = t.upstreamHostHeader;
+    if (rewrittenBody.byteLength !== body.byteLength) {
+      upstreamHeaders['content-length'] = String(rewrittenBody.byteLength);
+    }
+
+    const upstreamPort = t.port || (t.isHttps ? 443 : 80);
+
+    // Invariant #1: for TLS upstreams, verify the identity on a connection we
+    // control BEFORE writing any secret, then pin the request to the proven IP.
+    // We can't reuse the verified socket directly (Bun's https client won't accept
+    // a handed-in socket), so we pin by IP — the secret only ever reaches an
+    // address already proven to hold a valid cert for the rule host, defeating
+    // DNS-poison/rebind. Cleartext (http) upstreams never carry an injected secret
+    // — the cleartext guard above fails closed when hostItems.length > 0 && !isHttps.
+    let verifiedAddress: string | undefined;
+    if (t.isHttps) {
+      try {
+        ({ address: verifiedAddress } = await verifyUpstreamIdentity(t.host, upstreamPort));
+      } catch {
+        // Fail closed: the upstream identity could not be verified, so the secret
+        // was never transmitted.
+        respondBlocked(res, 502, 'Upstream request failed', t.tunnelTeardown);
+        return;
+      }
+    }
+
+    // Request transforms (`transform=`): compute the credential over the FINAL
+    // outbound request - after placeholder substitution, so it covers exactly the
+    // bytes written upstream - and after identity verification, so the timestamp
+    // is as fresh as possible when the request is dialed. The child may have set
+    // these headers itself (an SDK signing with placeholder creds produces a
+    // garbage signature); ours overwrite them, mirroring how iron-style proxies
+    // strip inbound placeholder signatures before re-signing.
+    if (activeTransform) {
+      const schemeDef = transformSchemes[activeTransform.scheme];
+      if (!schemeDef) {
+        blockTransform(502, `cannot apply the transform - scheme "${activeTransform.scheme}" is not registered with this proxy (is its plugin loaded?).`);
+        return;
+      }
+      // Resolve the real values for the scheme's item-role options, driven by
+      // the option specs so a scheme's credential surface is declared once.
+      const optionSpecs = { ...PROXY_TRANSFORM_COMMON_OPTION_SPECS, ...schemeDef.options };
+      const credentials: Record<string, string> = {};
+      for (const [option, optionSpec] of Object.entries(optionSpecs)) {
+        const itemKey = proxyTransformItemRefName(optionSpec, activeTransform[option]);
+        if (itemKey === undefined) continue;
+        const managedItem = managedItems.find((item) => item.key === itemKey);
+        if (!managedItem) {
+          blockTransform(502, `cannot apply the transform - the transform credential ${itemKey} has no resolved value.`);
+          return;
+        }
+        credentials[option] = managedItem.realValue;
+      }
+
+      const rewrittenQueryStart = rewrittenPath.indexOf('?');
+      // Schemes that cover headers see the final outbound set (multi-value
+      // headers pre-joined with `,`, their canonical form).
+      const flatHeaders: Record<string, string> = {};
+      for (const [name, value] of Object.entries(upstreamHeaders)) {
+        flatHeaders[name] = Array.isArray(value) ? value.join(',') : value;
+      }
+      let transformResult: ProxyTransformResult;
+      try {
+        transformResult = await schemeDef.apply(activeTransform, {
+          method: t.method.toUpperCase(),
+          host: t.host,
+          path: rewrittenQueryStart === -1 ? rewrittenPath : rewrittenPath.slice(0, rewrittenQueryStart),
+          query: rewrittenQueryStart === -1 ? '' : rewrittenPath.slice(rewrittenQueryStart + 1),
+          headers: flatHeaders,
+          body: rewrittenBody,
+          credentials,
+        }, Date.now());
+      } catch (err) {
+        transformResult = { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+      if (!transformResult.ok) {
+        blockTransform(transformResult.status ?? 502, `cannot apply the transform - ${transformResult.error}.`);
+        return;
+      }
+      // req.headers keys are lowercased by the HTTP parser, so writing lowercase
+      // names replaces any child-sent value instead of duplicating the header.
+      for (const name of transformResult.removeHeaders ?? []) delete upstreamHeaders[name.toLowerCase()];
+      for (const [name, value] of Object.entries(transformResult.setHeaders)) {
+        upstreamHeaders[name.toLowerCase()] = value;
+      }
+      // A scheme's own reversible output (http-basic's base64 token): the raw
+      // credentials are already covered above, but their encoded form is a
+      // value only the scheme can produce.
+      for (const value of transformResult.scrubFromResponse ?? []) {
+        if (!value) continue;
+        responseScrubItems.push({
+          key: `${activeTransform.scheme} credential`,
+          placeholder: REDACTED_TRANSFORM_VALUE,
+          realValue: value,
+        });
+      }
+    }
+
+    // The success audit entry is recorded only after the transform succeeded - a
+    // transform failure must not leave behind an `allow, transformedWith` record for a
+    // request that never reached the upstream.
+    onActivity?.({
+      ...baseActivity,
+      ...ruleId,
+      matched: shouldRewrite,
+      blocked: false,
+      decision: policyDecision?.verdict === 'require-approval' ? 'approval-granted' : 'allow',
+      ...(injectedKeys.length ? { injectedKeys } : {}),
+      ...(skippedPlaceholders.length ? { skippedPlaceholders } : {}),
+      ...(activeTransform ? { transformedWith: activeTransform.scheme } : {}),
+    });
+
+    // For DNS-name hosts, send SNI for (and re-check identity against) the rule
+    // host even though we dial the pinned IP. For IP-literal hosts there is no SNI.
+    const sni = t.isHttps && !net.isIP(t.host) ? t.host : undefined;
+    const agent = t.isHttps ? https : http;
+    const upstreamReq = agent.request({
+      protocol: t.isHttps ? 'https:' : 'http:',
+      // Pin to the verified peer IP (https) so the request can't be re-resolved to
+      // a different host between verification and send.
+      hostname: verifiedAddress ?? t.host,
+      port: upstreamPort,
+      method: req.method,
+      path: rewrittenPath,
+      headers: upstreamHeaders,
+      ...(t.isHttps
+        ? {
+          ...(sni ? { servername: sni } : {}),
+          rejectUnauthorized: true,
+          // Defense-in-depth: re-check the cert identity against the rule host
+          // (not the pinned IP we dialed). Redundant given the pinned-IP proof,
+          // but cheap. (Some runtimes ignore this; the pinned-IP proof is the
+          // real guarantee — see verifyUpstreamIdentity.)
+          checkServerIdentity: (_sni: string, cert: tls.PeerCertificate) => tls.checkServerIdentity(t.host, cert),
+          ca: https.globalAgent.options.ca,
+        }
+        : {}),
+    }, (upstreamRes) => {
+      const shouldScrubResponse = shouldRewrite || responseScrubItems.length > 0;
+      forwardUpstreamResponseWithRedaction(upstreamRes, res, responseScrubItems, shouldScrubResponse, {
+        host: t.host,
+        method: t.method,
+        path: t.pathOnly,
+        onResponse,
+      });
+    });
+
+    upstreamReq.on('error', () => {
+      // Fail closed: the upstream identity could not be verified (or the connection
+      // failed), so the secret was never transmitted.
+      respondBlocked(res, 502, 'Upstream request failed', t.tunnelTeardown);
+    });
+    upstreamReq.end(rewrittenBody);
+  };
+
+  const handleInterceptRequest = async (req: http.IncomingMessage, res: http.ServerResponse) => {
+    const hostHeader = req.headers.host ?? '';
+    const hostInfo = parseHostPort(hostHeader.includes(':') ? hostHeader : `${hostHeader}:443`);
+    if (!hostInfo) {
+      res.statusCode = 400;
+      res.end('Invalid host');
+      return;
+    }
+    // Canonicalize before anything looks at the path: policy matches the canonical
+    // form and the same form goes upstream, so a `..`/`//`/`%2e` spelling can't
+    // slip a blocked endpoint past a path rule. Malformed targets fail closed.
+    const target = canonicalizeRequestTarget(req.url ?? '/');
+    if (!target.ok) {
+      respondBlocked(res, 400, `Blocked by the varlock credential proxy: ${target.reason}.`, true);
+      return;
+    }
+    await processProxiedRequest(req, res, {
+      host: hostInfo.host,
+      port: hostInfo.port || 443,
+      isHttps: true, // the MITM tunnel is always TLS
+      method: req.method ?? 'GET',
+      pathOnly: target.pathOnly,
+      requestTarget: target.requestTarget,
+      upstreamHostHeader: undefined, // pass the client's Host through
+      tunnelTeardown: true,
+    });
+  };
+
+  // Sockets adopted by the CONNECT handler. Once a request is upgraded to a
+  // tunnel the http server no longer tracks its socket, so closeAllConnections()
+  // skips it while server.close() still waits for it. stop() destroys these
+  // itself so shutdown never depends on the client's or peer's behavior.
+  const tunnelSockets = new Set<net.Socket>();
+  const adoptTunnelSocket = (socket: net.Socket) => {
+    tunnelSockets.add(socket);
+    socket.on('close', () => tunnelSockets.delete(socket));
+  };
+  // Set at the top of stop(): CONNECT handlers still awaiting MITM setup check
+  // it afterwards so they neither bridge a socket nor register a MITM server
+  // that stop() has already looked past.
+  let stopping = false;
+
+  /**
+   * Ties a CONNECT client socket and its peer (the MITM loopback connection or
+   * the raw upstream) together once they are piped. `pipe()` alone leaves a
+   * hole: when one side closes, the pipe is torn down and the other socket's
+   * readable side is left paused, so bytes that arrive after that (e.g. the
+   * client's TLS close_notify once it has read a blocked response) sit unread,
+   * its 'end' never fires, and the socket stays open for good.
+   */
+  const bridgeTunnelSockets = (clientSocket: net.Socket, peerSocket: net.Socket) => {
+    adoptTunnelSocket(peerSocket);
+    peerSocket.on('error', () => clientSocket.destroy());
+    clientSocket.on('error', () => peerSocket.destroy());
+    peerSocket.on('close', () => {
+      // the pipe already ended the client's write side; flush that, then drop it
+      clientSocket.destroySoon();
+    });
+    clientSocket.on('close', () => peerSocket.destroy());
+  };
+
+  type HostMitmServer = { server: https.Server; port: number };
+  const hostMitmServers = new Map<string, HostMitmServer>();
+  // In-flight setups, keyed by host so concurrent CONNECTs to one host share a
+  // server, and awaited by stop() so it is a completion barrier: a setup that
+  // finishes after stop() began tears its server back down before stop() returns.
+  const pendingMitmServers = new Map<string, Promise<HostMitmServer>>();
+  const createHostMitmServer = async (normalized: string): Promise<HostMitmServer> => {
+    const hostCert = await createHostCert(ca, normalized);
+    if (stopping) throw new Error('varlock proxy is stopping');
+    const server = https.createServer({
+      key: hostCert.keyPem,
+      cert: hostCert.certPem,
+      ALPNProtocols: ['http/1.1'],
+    }, (req, res) => {
+      handleInterceptRequest(req, res).catch(() => {
+        if (!res.headersSent) res.statusCode = 502;
+        res.end('Upstream MITM request failed');
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, LOCALHOST, () => {
+        server.off('error', reject);
+        resolve();
+      });
+    });
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') {
+      server.close();
+      throw new Error(`Failed to start MITM TLS server for ${normalized}`);
+    }
+    if (stopping) {
+      // stop() already snapshotted hostMitmServers; don't leak a listener past it
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+      throw new Error('varlock proxy is stopping');
+    }
+
+    const created = { server, port: addr.port };
+    hostMitmServers.set(normalized, created);
+    return created;
+  };
+
+
+  const getOrCreateHostMitmServer = (host: string): Promise<HostMitmServer> => {
+    const normalized = normalizeHost(host);
+    const cached = hostMitmServers.get(normalized);
+    if (cached) return Promise.resolve(cached);
+    const pending = pendingMitmServers.get(normalized);
+    if (pending) return pending;
+    const setup = createHostMitmServer(normalized).finally(() => pendingMitmServers.delete(normalized));
+    pendingMitmServers.set(normalized, setup);
+    return setup;
+  };
+
+  // Handles absolute-form proxy requests (mostly plain HTTP).
+  const proxyServer = http.createServer(async (clientReq, clientRes) => {
+    if (!dataPlaneAuthOk(clientReq.socket.remoteAddress, clientReq.headers['proxy-authorization'], dataPlaneToken)) {
+      clientRes.statusCode = 407;
+      clientRes.setHeader('Proxy-Authenticate', 'Basic realm="varlock"');
+      clientRes.end('Proxy authentication required');
+      return;
+    }
+
+    const urlRaw = clientReq.url;
+    if (!urlRaw) {
+      clientRes.statusCode = 400;
+      clientRes.end('Missing request URL');
+      return;
+    }
+
+    let destination: URL;
+    try {
+      destination = new URL(urlRaw);
+    } catch {
+      clientRes.statusCode = 400;
+      clientRes.end('Invalid proxy request URL');
+      return;
+    }
+
+    const isHttps = destination.protocol === 'https:';
+    const defaultPort = isHttps ? 443 : 80;
+    // WHATWG parsing resolves dot segments but keeps `//` and non-dot escapes;
+    // run the same canonicalization as the tunnel path so both transports match
+    // and forward identical forms.
+    const target = canonicalizeRequestTarget(`${destination.pathname}${destination.search}`);
+    if (!target.ok) {
+      respondBlocked(clientRes, 400, `Blocked by the varlock credential proxy: ${target.reason}.`, false);
+      return;
+    }
+    await processProxiedRequest(clientReq, clientRes, {
+      host: destination.hostname,
+      port: destination.port ? Number(destination.port) : defaultPort,
+      isHttps,
+      method: clientReq.method ?? 'GET',
+      pathOnly: target.pathOnly,
+      requestTarget: target.requestTarget,
+      upstreamHostHeader: destination.host, // absolute-form: client Host may be the proxy
+      tunnelTeardown: false,
+    });
+  });
+
+  proxyServer.on('connect', async (req, clientSocketDuplex, head) => {
+    // typed as Duplex but is a net.Socket at runtime
+    const clientSocket = clientSocketDuplex as net.Socket;
+    const hostInfo = parseHostPort(req.url ?? '');
+    if (!hostInfo) {
+      clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
+    // A CONNECT tunnel to the internal host reaches handleInternalRequest via a
+    // local MITM pipe, where the original peer address is no longer visible — so
+    // the loopback-only assertion for the control plane must happen here.
+    const connectPeer = clientSocket.remoteAddress;
+    if (normalizeHost(hostInfo.host) === VARLOCK_INTERNAL_HOST && !isLoopbackAddress(connectPeer)) {
+      internalEndpoint?.onAuthFailure?.();
+      clientSocket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
+    // Data-plane auth for CONNECT: loopback is exempt, a non-loopback peer must
+    // present the session token. Checked after the varlock.internal loopback gate
+    // (which already rejected non-loopback control-plane attempts).
+    if (!dataPlaneAuthOk(connectPeer, req.headers['proxy-authorization'], dataPlaneToken)) {
+      clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="varlock"\r\nConnection: close\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
+    const shouldRewrite = hostMatchesProxyRules(hostInfo.host, activeRules);
+    const shouldAllowEgress = activeEgressMode === 'permissive' || shouldRewrite;
+    if (!shouldAllowEgress) {
+      // CONNECT only exposes host:port; the per-request audit entry (method/path)
+      // comes later from the MITM handler for allowed hosts. Here we record the
+      // host-level egress denial.
+      onActivity?.({
+        host: hostInfo.host,
+        method: 'CONNECT',
+        path: '/',
+        matched: shouldRewrite,
+        blocked: true,
+        decision: 'blocked-egress',
+      });
+      const blockedBody = `Blocked by the varlock credential proxy: ${hostInfo.host} is not allowed by your egress policy (strict mode only permits hosts with a matching @proxy rule). Add a @proxy rule for this host, or use permissive egress, to allow it.`;
+      clientSocket.write(
+        `HTTP/1.1 403 Forbidden\r\nContent-Length: ${Buffer.byteLength(blockedBody)}\r\nConnection: close\r\n\r\n${blockedBody}`,
+      );
+      clientSocket.destroy();
+      return;
+    }
+
+    // From here on the socket is ours: track it right away so stop() can close
+    // it even while the peer connection (or MITM cert) is still being set up.
+    adoptTunnelSocket(clientSocket);
+
+    // Only MITM for configured proxy domains. Others are tunneled through.
+    if (!shouldRewrite) {
+      const upstreamSocket = net.connect(hostInfo.port, hostInfo.host, () => {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head.length > 0) upstreamSocket.write(head);
+        clientSocket.pipe(upstreamSocket);
+        upstreamSocket.pipe(clientSocket);
+      });
+      bridgeTunnelSockets(clientSocket, upstreamSocket);
+      return;
+    }
+
+    try {
+      const hostMitmServer = await getOrCreateHostMitmServer(hostInfo.host);
+      if (stopping || clientSocket.destroyed) {
+        clientSocket.destroy();
+        return;
+      }
+      const mitmSocket = net.connect(hostMitmServer.port, LOCALHOST, () => {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head.length > 0) {
+          mitmSocket.write(head);
+        }
+        clientSocket.pipe(mitmSocket);
+        mitmSocket.pipe(clientSocket);
+      });
+      bridgeTunnelSockets(clientSocket, mitmSocket);
+    } catch {
+      clientSocket.destroy();
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const onListenError = (err: NodeJS.ErrnoException) => {
+      if (port !== undefined && err.code === 'EADDRINUSE') {
+        reject(new Error(`varlock proxy: port ${port} is already in use. Choose a different --port or free it.`));
+      } else {
+        reject(err);
+      }
+    };
+    proxyServer.once('error', onListenError);
+    proxyServer.listen(port ?? 0, bindHost, () => {
+      proxyServer.off('error', onListenError);
+      resolve();
+    });
+  });
+
+  const address = proxyServer.address();
+  if (!address || typeof address === 'string') {
+    await new Promise<void>((resolve) => {
+      proxyServer.close(() => resolve());
+    });
+    throw new Error('Failed to start local proxy runtime');
+  }
+  const proxyUrl = `http://${LOCALHOST}:${address.port}`;
+
+  // With a data-plane token (off-loopback bind), also serve the CONNECT-over-WS
+  // tunnel on this same listener so a remote sandbox can reach the proxy through
+  // provider HTTP ingress. The bootstrap hands the guest its child-view values
+  // and the CA certs; each `connect` stream is bridged to this proxy's loopback
+  // port (where it's exempt from the token check — the WS handshake already
+  // authenticated it). The combined bundle mirrors what's written to disk.
+  const combinedCaPem = `${ca.certPem}\n${tls.rootCertificates.join('\n')}\n`;
+  const buildTunnelBootstrap = (): TunnelBootstrap => ({
+    // The same encoded child-view payload the control endpoint serves, so a
+    // remote guest adopts exactly what a local attach would (incl. the graph for
+    // redaction). Empty-but-valid until the first setSessionEnvPayloadJson.
+    payloadJson: sessionEnvPayloadJson ?? '{"env":{},"omittedKeys":[],"serializedGraph":{"config":{}}}',
+    certs: { 'ca-cert.pem': ca.certPem, 'combined-ca.pem': combinedCaPem },
+  });
+  const tunnel = dataPlaneToken
+    ? attachTunnelServer(proxyServer, {
+      token: dataPlaneToken,
+      proxyPort: address.port,
+      buildBootstrap: buildTunnelBootstrap,
+      onAuthFailure: () => internalEndpoint?.onAuthFailure?.(),
+    })
+    : undefined;
+
+  return {
+    env: {
+      HTTP_PROXY: proxyUrl,
+      HTTPS_PROXY: proxyUrl,
+      ALL_PROXY: proxyUrl,
+      http_proxy: proxyUrl,
+      https_proxy: proxyUrl,
+      all_proxy: proxyUrl,
+      NO_PROXY: 'localhost,127.0.0.1,::1',
+      no_proxy: 'localhost,127.0.0.1,::1',
+      NODE_EXTRA_CA_CERTS: caCertPath,
+      SSL_CERT_FILE: combinedCaPath,
+      REQUESTS_CA_BUNDLE: combinedCaPath,
+      CURL_CA_BUNDLE: combinedCaPath,
+      GIT_SSL_CAINFO: combinedCaPath,
+      CARGO_HTTP_CAINFO: combinedCaPath,
+      // Node's built-in fetch (undici) ignores HTTP(S)_PROXY unless this flag
+      // is set (node >= 24; older nodes ignore the flag and still bypass).
+      // Without it, fetch traffic silently goes DIRECT to the upstream,
+      // skipping substitution and egress policy entirely.
+      NODE_USE_ENV_PROXY: '1',
+      // Deno honors HTTP(S)_PROXY but reads its CA trust from DENO_CERT,
+      // not SSL_CERT_FILE.
+      DENO_CERT: combinedCaPath,
+    },
+    setSessionEnvPayloadJson: (payloadJson, meta) => {
+      sessionEnvPayloadJson = payloadJson;
+      sessionEnvPayloadMeta = meta;
+    },
+    reconfigure: (next) => {
+      activeManagedItems = next.managedItems;
+      activeRules = next.rules;
+      activeEgressMode = next.egressMode;
+      if (next.transformSchemes) activeTransformSchemes = next.transformSchemes;
+      activeConsumedTransformKeys = collectConsumedTransformKeys(activeRules, activeTransformSchemes);
+    },
+    stop: async () => {
+      stopping = true;
+      // Detach the tunnel WS server first so it stops accepting upgrades.
+      tunnel?.close();
+      // A CONNECT handler still setting up a MITM server finishes (and tears it
+      // back down, see createHostMitmServer) before the snapshot below.
+      await Promise.allSettled([...pendingMitmServers.values()]);
+      // `server.close()` only calls back once every connection has drained, and
+      // an idle keep-alive socket never closes on its own, so without forcing
+      // connections closed, stop() (and the daemon's SIGTERM cleanup) hangs
+      // forever. Destroy live sockets first so close() resolves promptly.
+      // CONNECT tunnels are not in the http server's connection list, so they
+      // are destroyed from our own set.
+      for (const socket of tunnelSockets) socket.destroy();
+      tunnelSockets.clear();
+      proxyServer.closeAllConnections?.();
+      for (const { server } of hostMitmServers.values()) server.closeAllConnections?.();
+      await Promise.all([
+        new Promise<void>((resolve) => {
+          proxyServer.close(() => resolve());
+        }),
+        new Promise<void>((resolve) => {
+          Promise.all(
+            [...hostMitmServers.values()].map(({ server }) => new Promise<void>((innerResolve) => {
+              server.close(() => innerResolve());
+            })),
+          ).then(() => resolve());
+        }),
+      ]);
+      // A temp dir we created is removed wholesale; for a caller-provided dir,
+      // remove only the cert files we wrote so we don't delete a dir the user owns.
+      // With --persist-ca the whole point is that they outlive the session, so
+      // everything (including ca-key.pem) stays put.
+      if (persistCa) {
+        // keep the persisted CA for the next start
+      } else if (certDirIsUserProvided) {
+        await rm(caCertPath, { force: true });
+        await rm(combinedCaPath, { force: true });
+      } else {
+        await rm(certsDir, { recursive: true, force: true });
+      }
+    },
+  };
+}

@@ -1,0 +1,3419 @@
+use super::*;
+use crate::parameter_analysis::{Location, Param};
+use crate::target_parser::Target;
+use crate::target_parser::parse_target;
+use axum::{
+    Router,
+    extract::{Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::get,
+};
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
+use tokio::time::{Duration, sleep};
+
+#[derive(Clone)]
+struct TestState {
+    stored_payload: String,
+}
+
+/// Inject through a default client and a throwaway WAF streak; returns the
+/// classified kind and the response text.
+async fn reflect(
+    target: &Target,
+    param: &Param,
+    payload: &str,
+    args: &crate::cmd::scan::ScanArgs,
+) -> (Option<ReflectionKind>, Option<String>) {
+    let client = target.build_client_or_default();
+    let streak = std::sync::atomic::AtomicU32::new(0);
+    let (kind, body, ..) =
+        check_reflection_with_response(&client, target, param, payload, args, &streak).await;
+    (kind, body.map(|b| b.text))
+}
+
+fn make_param() -> Param {
+    Param::new("q".to_string(), "seed".to_string(), Location::Query)
+}
+
+fn default_scan_args() -> crate::cmd::scan::ScanArgs {
+    crate::cmd::scan::ScanArgs {
+        insecure: Some(true),
+        format: "json".to_string(),
+        silence: true,
+        workers: 10,
+        max_concurrent_targets: 10,
+        encoders: vec!["url".to_string(), "html".to_string(), "base64".to_string()],
+        waf_min_confidence: 0.0,
+        ..Default::default()
+    }
+}
+
+fn make_target(addr: SocketAddr, path: &str) -> Target {
+    let target = format!("http://{}:{}{}?q=seed", addr.ip(), addr.port(), path);
+    parse_target(&target).expect("valid target")
+}
+
+fn html_named_encode_all(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '&' => "&amp;".to_string(),
+            '"' => "&quot;".to_string(),
+            '\'' => "&apos;".to_string(),
+            _ => c.to_string(),
+        })
+        .collect::<String>()
+}
+
+async fn raw_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<div>{}</div>", q))
+}
+
+async fn html_entity_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<div>{}</div>", html_named_encode_all(&q)))
+}
+
+/// A WAF block page that echoes the (entity-escaped) payload back with a 403.
+/// Used to pin that the crate-private status path threads the 4xx status out.
+async fn block_echo_handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::FORBIDDEN,
+        Html(format!("<div>blocked: {}</div>", html_named_encode_all(&q))),
+    )
+}
+
+/// Mirrors brutelogic c1: reflects the param into a JS string literal
+/// after HTML-encoding `'` and `<`. Browser does not decode entities
+/// inside `<script>` so the reflection is inert.
+async fn js_string_apos_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!(
+        "<html><body><script>var c1 = '{}';</script></body></html>",
+        html_named_encode_all(&q)
+    ))
+}
+
+async fn url_encoded_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    Html(format!("<div>{}</div>", urlencoding::encode(&q)))
+}
+
+async fn form_urlencoded_handler(Query(params): Query<HashMap<String, String>>) -> Html<String> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    let encoded = urlencoding::encode(&q).to_string().replace("%20", "+");
+    Html(format!("<div>{}</div>", encoded))
+}
+
+async fn none_handler() -> Html<&'static str> {
+    Html("<div>not reflected</div>")
+}
+
+async fn json_handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        format!("{{\"echo\":\"{}\"}}", q),
+    )
+}
+
+async fn sxss_handler(State(state): State<TestState>) -> Html<String> {
+    Html(format!("<div>{}</div>", state.stored_payload))
+}
+
+/// Returns 302 with Location containing the decoded `q` param. Simulates a
+/// server that parses the query string and rebuilds the redirect URL.
+async fn redirect_decoded_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::FOUND,
+        [("location", format!("/final?next={}", q))],
+    )
+}
+
+/// 302 whose body declares `application/json` but whose `Location` header
+/// echoes the payload. The inert-data content-type gate must NOT fire here:
+/// the body content-type describes the (empty) redirect body, not the redirect
+/// target, so the Location reflection must still be caught.
+async fn redirect_json_ct_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::FOUND,
+        [
+            ("location", format!("/final?next={}", q)),
+            ("content-type", "application/json".to_string()),
+        ],
+    )
+}
+
+/// 302 to a fixed page whose (never-rendered) HTML body echoes `q`.
+async fn redirect_body_echo_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::FOUND,
+        [("location", "/elsewhere"), ("content-type", "text/html")],
+        format!("<html><body>{q}</body></html>"),
+    )
+}
+
+/// The same body echo on a 302 without `Location`: browsers render it.
+async fn redirect_body_echo_no_location_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let q = params.get("q").cloned().unwrap_or_default();
+    (
+        StatusCode::FOUND,
+        [("content-type", "text/html")],
+        format!("<html><body>{q}</body></html>"),
+    )
+}
+
+/// Echo the raw request body back inside an HTML shell so a reflection check
+/// can see whatever multipart fields the request actually carried.
+async fn multipart_echo_handler(body: String) -> Html<String> {
+    Html(format!("<div>{}</div>", body))
+}
+
+async fn start_mock_server(stored_payload: &str) -> SocketAddr {
+    let app = Router::new()
+        .route("/reflect/raw", get(raw_handler))
+        .route("/reflect/html-entity", get(html_entity_handler))
+        .route("/reflect/block-echo", get(block_echo_handler))
+        .route("/reflect/js-string-apos", get(js_string_apos_handler))
+        .route("/reflect/url-encoded", get(url_encoded_handler))
+        .route("/reflect/form-url-encoded", get(form_urlencoded_handler))
+        .route("/reflect/none", get(none_handler))
+        .route("/reflect/json", get(json_handler))
+        .route("/sxss/stored", get(sxss_handler))
+        .route("/redirect/decoded", get(redirect_decoded_handler))
+        .route("/redirect/json-ct", get(redirect_json_ct_handler))
+        .route("/redirect/body-echo", get(redirect_body_echo_handler))
+        .route(
+            "/redirect/body-echo-no-location",
+            get(redirect_body_echo_no_location_handler),
+        )
+        .route(
+            "/reflect/multipart-echo",
+            axum::routing::post(multipart_echo_handler),
+        )
+        .with_state(TestState {
+            stored_payload: stored_payload.to_string(),
+        });
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+    sleep(Duration::from_millis(20)).await;
+    addr
+}
+
+/// The reflection-scan multipart injection must send the payload even when the
+/// scanned param is absent from the captured body, or the request carries no
+/// injection and a real reflection is missed. Exercises the `if !found`
+/// fallback in `fetch_injection_response`'s MultipartBody arm.
+#[tokio::test]
+async fn test_fetch_injection_multipart_injects_absent_param() {
+    let addr = start_mock_server("stored").await;
+    let mut target = make_target(addr, "/reflect/multipart-echo");
+    target.method = "POST".to_string();
+    // Captured body carries a different field; the scanned param `q` is absent.
+    target.data = Some("other=seed".to_string());
+    let mut param = make_param();
+    param.location = Location::MultipartBody;
+    let args = default_scan_args();
+    let streak = std::sync::atomic::AtomicU32::new(0);
+    let client = target.build_client_or_default();
+
+    let body = fetch_injection_response(&client, &target, &param, "PAYMARK", &args, &streak)
+        .await
+        .body
+        .expect("injection response");
+    let text = body.renderable_text().unwrap_or_default();
+    assert!(
+        text.contains("PAYMARK"),
+        "absent multipart param must still be injected, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_early_return_when_skip() {
+    let target = parse_target("https://example.com/?q=1").unwrap();
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.skip_xss_scanning = true;
+    let res = reflect(&target, &param, "PAY", &args).await.0.is_some();
+    assert!(
+        !res,
+        "should early-return false when skip_xss_scanning=true"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_with_response_early_return_when_skip() {
+    let target = parse_target("https://example.com/?q=1").unwrap();
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.skip_xss_scanning = true;
+    let res = reflect(&target, &param, "PAY", &args).await;
+    assert_eq!(
+        res,
+        (None, None),
+        "should early-return (None, None) when skip_xss_scanning=true"
+    );
+}
+
+#[test]
+fn test_decode_html_entities_basic() {
+    let s = "&#x3c;script&#x3e;alert(1)&#x3c;/script&#x3e;";
+    let d = decode_html_entities(s);
+    assert!(d.contains("<script>"));
+    assert!(d.contains("</script>"));
+}
+
+#[test]
+fn test_decode_html_entities_uppercase_hex_x() {
+    let s = "&#X3C;img src=x onerror=alert(1)&#X3E;";
+    let d = decode_html_entities(s);
+    assert!(d.contains("<img src=x onerror=alert(1)>"));
+}
+
+#[test]
+fn test_decode_html_entities_named_common() {
+    let s = "&lt;svg onload=alert(1)&gt; &amp; &quot; &apos;";
+    let d = decode_html_entities(s);
+    assert!(d.contains("<svg onload=alert(1)>"));
+    assert!(d.contains("&"));
+    assert!(d.contains("\""));
+    assert!(d.contains("'"));
+}
+
+#[test]
+fn test_decode_html_entities_decimal_and_hex_mix() {
+    let s = "&#60;img src=x&#62; and &#x3C;svg&#x3E;";
+    let d = decode_html_entities(s);
+    assert_eq!(d, "<img src=x> and <svg>");
+}
+
+#[test]
+fn test_decode_html_entities_named_case_insensitive() {
+    let s = "&LT;script&GT;1&LT;/script&GT; &QuOt;ok&QuOt;";
+    let d = decode_html_entities(s);
+    assert!(d.contains("<script>1</script>"));
+    assert!(d.contains("\"ok\""));
+}
+
+#[test]
+fn test_decode_html_entities_ignores_invalid_numeric_sequences() {
+    let s = "&#xZZ; &#;";
+    let d = decode_html_entities(s);
+    assert_eq!(d, s);
+}
+
+#[test]
+fn test_decode_html_entities_preserves_unrepresentable_numeric() {
+    // Codepoints outside Unicode scalar value or too large for char::from_u32
+    // must be preserved verbatim (unified "never lose bytes" semantics shared
+    // with DOM verification decoder).
+    let too_large = "&#x110000;";
+    assert_eq!(decode_html_entities(too_large), too_large);
+    let big_decimal = "&#99999999;";
+    assert_eq!(decode_html_entities(big_decimal), big_decimal);
+    // Mixed with good content
+    let mixed = "x&#x110000;y";
+    assert_eq!(decode_html_entities(mixed), mixed);
+}
+
+#[test]
+fn test_decode_html_entities_zero_padded_hex() {
+    // Output shape of `html_entity_zero_padded_encode` — 7 hex digits per char.
+    // The regex must accept this length so the resulting payload classifies
+    // as entity-encoded by the same safe-context guard the 4-digit form uses.
+    let s = "&#x0000003c;script&#x0000003e;alert(1)&#x0000003c;/script&#x0000003e;";
+    let d = decode_html_entities(s);
+    assert_eq!(d, "<script>alert(1)</script>");
+}
+
+#[test]
+fn test_decode_html_entities_eight_digit_hex_boundary() {
+    // 8 hex digits is the new upper bound. Verify it still decodes and that
+    // 9-digit sequences fall through as literal text (regex must not match).
+    assert_eq!(decode_html_entities("&#x0000003e;"), ">");
+    let nine = "&#x000000003e;";
+    assert_eq!(decode_html_entities(nine), nine);
+}
+
+#[test]
+fn test_classify_reflection_prefers_raw_match() {
+    let payload = "<script>alert(1)</script>";
+    let resp = format!("raw:{} encoded:{}", payload, urlencoding::encode(payload));
+    assert_eq!(
+        classify_reflection(&resp, payload),
+        Some(ReflectionKind::Raw)
+    );
+}
+
+#[test]
+fn test_is_payload_reflected_html_encoded_in_script_is_inert() {
+    // Entity-encoded reflection nested inside a <script> JS string. The JS
+    // tokenizer does NOT perform HTML character-reference decoding (HTML5
+    // "script data" state), so `var x = '&#x3c;script&#x3e;…'` assigns the
+    // literal six-byte text `&#x3c;script&#x3e;…` to `x` — no `<script>`
+    // element, no execution. This must demote to None; surfacing it as
+    // HtmlEntityDecoded was a false positive (corpus cases 5019/5289).
+    let payload = "<script>alert(1)</script>";
+    let resp = "<script>var x = '&#x3c;script&#x3e;alert(1)&#x3c;/script&#x3e;';</script>";
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_is_payload_reflected_html_encoded_in_style_is_inert() {
+    // Same principle for <style> raw-text: the CSS tokenizer does not decode
+    // HTML entities, so an entity-escaped break-out attempt is inert.
+    let payload = "</style><svg onload=alert(1)>";
+    let resp = "<style>.x{content:'&lt;/style&gt;&lt;svg onload=alert(1)&gt;';}</style>";
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_is_payload_reflected_html_encoded_in_safe_context_demoted() {
+    // Same payload, but reflected into HTML body — the browser keeps the
+    // entities as literal characters, the reflection is not exploitable,
+    // and classification must demote to `None` (no R Info noise).
+    let payload = "<script>alert(1)</script>";
+    let resp = "<div>prefix &#x3c;script&#x3e;alert(1)&#x3c;/script&#x3e; suffix</div>";
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_is_payload_reflected_html_encoded_in_attribute_value_demoted() {
+    // Realistic shape of an Open Graph meta-tag reflecting the query string
+    // back with HTML-entity escaping. Both `&quot;` and `&lt;`/`&gt;` are
+    // present — the attribute value cannot be broken out of, so the
+    // reflection must demote.
+    let payload = "\">'><IMG src=x onerror=alert(1)>\"";
+    let resp = concat!(
+        "<meta property=\"og:url\" ",
+        "content=\"https://example.com/?s=&quot;&gt;&#39;&gt;&lt;IMG src=x onerror=alert(1)&gt;&quot;\">"
+    );
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_entity_encoded_payload_in_html_body() {
+    // The payload itself is HTML-entity encoded (e.g. encoder produced
+    // `&#x003c;br&#x003e;`). The server reflects it verbatim into HTML body
+    // context. Browsers decode the entities into literal text characters
+    // and do NOT re-parse them as markup, so no `<br>` element is created.
+    // Classification must demote — surfacing this as [R] is the false
+    // positive we are trying to eliminate.
+    let payload = "&#x003c;br&#x003e;";
+    let resp = "<div>Hello &#x003c;br&#x003e; world</div>";
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_entity_encoded_named_payload_in_html_body() {
+    // Same idea using named entities. `&lt;img src=x onerror=alert(1)&gt;`
+    // reflected verbatim into body context renders as visible text, not as
+    // an `<img>` element.
+    let payload = "&lt;img src=x onerror=alert(1)&gt;";
+    let resp = format!("<p>echo: {} done</p>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_keeps_entity_encoded_payload_in_event_handler() {
+    // Inside an `on*=` attribute the browser decodes HTML entities before
+    // handing the value to the JS parser, so an entity-encoded payload
+    // landing there IS exploitable. The reflection must survive.
+    let payload = "&#x27;-alert(1)-&#x27;";
+    let resp = "<button onclick=\"x=&#x27;-alert(1)-&#x27;\">x</button>";
+    assert_eq!(
+        classify_reflection(resp, payload),
+        Some(ReflectionKind::Raw)
+    );
+}
+
+#[test]
+fn test_classify_reflection_demotes_url_encoded_payload_in_html_body() {
+    // The `url` adaptive encoder produces `%3Cbr%3E`. Reflected verbatim
+    // in HTML body context, no HTML / JS / CSS parser decodes percent
+    // sequences, so the reflection is inert. Without this guard the fast
+    // path returned `Raw` and surfaced as [R] Info noise.
+    let payload = "%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+    let resp = format!("<div>echo {} done</div>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_double_url_encoded_payload_in_html_body() {
+    // `2url` encoder doubles the percent layer (`%253C…`). Iterative URL
+    // decode via `payload_variants` collapses both layers and ultimately
+    // produces `<>` — the guard must demote.
+    let payload = "%253Cscript%253Ealert(1)%253C%252Fscript%253E";
+    let resp = format!("<p>{}</p>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_url_encoded_payload_in_event_handler() {
+    // `%XX` is NOT decoded by the HTML parser inside attribute values, so
+    // it is also inert in event-handler contexts. Unlike entity-encoded
+    // payloads, URL-encoded payloads can be safely demoted here too.
+    let payload = "%3Cscript%3E";
+    let resp = "<button onclick=\"x='%3Cscript%3E'\">x</button>";
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_url_encoded_payload_in_script_block() {
+    // Inside `<script>` the JS parser sees `%XX` as literal characters
+    // (likely a syntax error), never as `<` or `>`. Safe.
+    let payload = "%3Cscript%3E";
+    let resp = "<script>var x = '%3Cscript%3E';</script>";
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_keeps_url_encoded_javascript_scheme_in_href() {
+    // URL-valued attributes are the one context where the browser DOES
+    // percent-decode the value (when parsing the URL on navigation). A
+    // payload decoding to `javascript:alert(1)` reflected in `href` IS
+    // exploitable — the finding must survive.
+    let payload = "javascript%3Aalert%281%29";
+    let resp = format!("<a href=\"{}\">click</a>", payload);
+    assert_eq!(
+        classify_reflection(&resp, payload),
+        Some(ReflectionKind::Raw)
+    );
+}
+
+#[test]
+fn test_classify_reflection_keeps_url_encoded_data_html_in_href() {
+    // `data:text/html` URLs execute inline content on navigation.
+    let payload = "data%3Atext%2Fhtml%2C%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+    let resp = format!("<iframe src=\"{}\"></iframe>", payload);
+    assert_eq!(
+        classify_reflection(&resp, payload),
+        Some(ReflectionKind::Raw)
+    );
+}
+
+#[test]
+fn test_classify_reflection_demotes_url_encoded_javascript_scheme_outside_url_attr() {
+    // Same `javascript:`-scheme payload but reflected only in body text.
+    // Without a URL attribute boundary the browser never navigates to
+    // it — pure text rendering, safe.
+    let payload = "javascript%3Aalert%281%29";
+    let resp = format!("<div>visit {} please</div>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_url_encoded_javascript_scheme_in_non_url_attr() {
+    // `title` is not a URL-valued attribute, so the browser never
+    // percent-decodes its content for URL parsing. URL-encoded
+    // `javascript:` here just renders as a tooltip string — safe.
+    let payload = "javascript%3Aalert%281%29";
+    let resp = format!("<span title=\"{}\">x</span>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_fullwidth_payload_in_html_body() {
+    // `unicode` adaptive encoder maps ASCII to fullwidth (U+FF01-U+FF5E).
+    // `<br>` becomes `＜br＞`. Browsers never normalize fullwidth to ASCII,
+    // so the reflection cannot start a tag — must demote.
+    let payload = "\u{ff1c}br\u{ff1e}";
+    let resp = format!("<div>echo {} done</div>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_fullwidth_payload_in_event_handler() {
+    // Fullwidth bytes are inert in every parser, including the JS parser
+    // reached via event-handler entity decoding.
+    let payload = "\u{ff1c}script\u{ff1e}alert(1)\u{ff1c}/script\u{ff1e}";
+    let resp = format!("<button onclick=\"x='{}'\">x</button>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_fullwidth_payload_in_script_block() {
+    let payload = "\u{ff1c}svg onload=alert(1)\u{ff1e}";
+    let resp = format!("<script>var x = '{}';</script>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_demotes_fullwidth_payload_in_href() {
+    // Even URL-valued attributes are safe — fullwidth `:` (U+FF1A) isn't
+    // recognized as a scheme delimiter by URL parsers.
+    let payload = "javascript\u{ff1a}alert(1)";
+    let resp = format!("<a href=\"{}\">x</a>", payload);
+    assert_eq!(classify_reflection(&resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_keeps_mixed_fullwidth_and_raw_specials() {
+    // A payload mixing fullwidth and raw `<` still has the raw structural
+    // char, so reflection IS exploitable. Guard must not demote.
+    let payload = "\u{ff1c}br\u{ff1e}<script>alert(1)</script>";
+    let resp = format!("<div>{}</div>", payload);
+    assert_eq!(
+        classify_reflection(&resp, payload),
+        Some(ReflectionKind::Raw)
+    );
+}
+
+#[test]
+fn test_payload_is_fully_fullwidth_encoded_detection() {
+    assert!(payload_is_fully_fullwidth_encoded("\u{ff1c}br\u{ff1e}"));
+    assert!(payload_is_fully_fullwidth_encoded(
+        "\u{ff1c}script\u{ff1e}alert(1)\u{ff1c}/script\u{ff1e}"
+    ));
+    // Fullwidth `:` enough to gate — covers fullwidth `javascript:` URLs
+    // which the URL parser also refuses to recognize as a scheme.
+    assert!(payload_is_fully_fullwidth_encoded(
+        "javascript\u{ff1a}alert(1)"
+    ));
+    // Raw `<` present — not fully encoded
+    assert!(!payload_is_fully_fullwidth_encoded("<br>"));
+    // No fullwidth chars at all
+    assert!(!payload_is_fully_fullwidth_encoded("plain text"));
+    // A non-fullwidth non-ASCII char (CJK) by itself doesn't qualify —
+    // the guard is specifically for the U+FF01-U+FF5E ASCII-fullwidth
+    // block produced by `unicode_fullwidth_encode`.
+    assert!(!payload_is_fully_fullwidth_encoded("\u{4e2d}"));
+}
+
+#[test]
+fn test_payload_is_fully_url_encoded_detection() {
+    assert!(payload_is_fully_url_encoded("%3Cscript%3E"));
+    // `javascript:`-scheme payload: decoded form differs even though it
+    // contains no raw `<>"'`. The URL-attr-scheme check downstream is
+    // responsible for keeping these when reflected in href/src/etc.
+    assert!(payload_is_fully_url_encoded("javascript%3Aalert%281%29"));
+    // Double-URL form decodes to another encoded layer — still differs.
+    assert!(payload_is_fully_url_encoded("%253Cscript%253E"));
+    // Raw `<` present — not fully encoded
+    assert!(!payload_is_fully_url_encoded("<script>%3C"));
+    // No percent encoding — URL decode is a no-op.
+    assert!(!payload_is_fully_url_encoded("plain text"));
+}
+
+#[test]
+fn test_classify_reflection_keeps_mixed_payload_with_raw_specials() {
+    // The payload mixes entity-encoded fragments with raw `<` / `>`, so the
+    // raw portion creates real markup when reflected. The full-entity guard
+    // must NOT demote here.
+    let payload = "&#x003c;br&#x003e;<script>alert(1)</script>";
+    let resp = format!("<div>{}</div>", payload);
+    assert_eq!(
+        classify_reflection(&resp, payload),
+        Some(ReflectionKind::Raw)
+    );
+}
+
+#[test]
+fn test_classify_reflection_demotes_zero_padded_entity_payload_in_html_body() {
+    // `html_entity_zero_padded_encode` is a common WAF-bypass encoder. With
+    // the entity regex bumped to {2,8}, these payloads decode the same way
+    // 4-digit hex entities do, so the entity-encoded safe-context guard
+    // automatically demotes verbatim reflections in HTML body context.
+    let payload = "&#x0000003c;br&#x0000003e;";
+    let resp = "<div>echo &#x0000003c;br&#x0000003e; done</div>";
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_classify_reflection_keeps_zero_padded_entity_payload_in_event_handler() {
+    // Same context rule as the 4-digit case: zero-padded entities decoded
+    // inside an `on*=` attribute can still produce JS-significant chars,
+    // so the reflection must survive.
+    let payload = "&#x00000027;-alert(1)-&#x00000027;";
+    let resp = "<button onclick=\"x=&#x00000027;-alert(1)-&#x00000027;\">x</button>";
+    assert_eq!(
+        classify_reflection(resp, payload),
+        Some(ReflectionKind::Raw)
+    );
+}
+
+#[test]
+fn test_payload_is_fully_entity_encoded_detection() {
+    assert!(payload_is_fully_entity_encoded("&#x003c;br&#x003e;"));
+    assert!(payload_is_fully_entity_encoded(
+        "&lt;script&gt;alert(1)&lt;/script&gt;"
+    ));
+    // Has raw `<` — not fully encoded
+    assert!(!payload_is_fully_entity_encoded("<br>"));
+    // Has no entities at all
+    assert!(!payload_is_fully_entity_encoded("plain text"));
+    // Entity decodes to something with no HTML-significant chars — not the
+    // shape this guard cares about (won't change reflection semantics).
+    assert!(!payload_is_fully_entity_encoded("&#x41;"));
+}
+
+#[test]
+fn test_is_payload_reflected_html_encoded_in_event_handler_kept() {
+    // The browser decodes entities inside an `on*=…` attribute value before
+    // handing the result to the JS parser, so entity escaping is not
+    // sufficient there — the reflection must remain visible.
+    let payload = "alert(1)";
+    let resp = "<button onclick=\"&#x61;lert&#40;1&#41;\">x</button>";
+    assert_eq!(
+        classify_reflection(resp, payload),
+        Some(ReflectionKind::HtmlEntityDecoded)
+    );
+}
+
+#[test]
+fn test_is_payload_reflected_url_encoded() {
+    let payload = "<img src=x onerror=alert(1)>";
+    let encoded = urlencoding::encode(payload).to_string();
+    let resp = format!("ok {} end", encoded);
+    assert_eq!(
+        classify_reflection(&resp, payload),
+        Some(ReflectionKind::UrlDecoded)
+    );
+}
+
+#[test]
+fn test_is_payload_reflected_form_urlencoded_plus_spaces() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let resp = "<img+src=x+onerror=alert(1)+class=dalfox>";
+    assert_eq!(
+        classify_reflection(resp, payload),
+        Some(ReflectionKind::UrlDecoded)
+    );
+}
+
+#[test]
+fn test_is_payload_reflected_percent_encoded_with_plus_spaces() {
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let resp = "%3Cimg+src%3Dx+onerror%3Dalert%281%29+class%3Ddalfox%3E";
+    assert_eq!(
+        classify_reflection(resp, payload),
+        Some(ReflectionKind::UrlDecoded)
+    );
+}
+
+#[test]
+fn test_is_payload_reflected_quadruple_encoded_payload_variant() {
+    let payload =
+        crate::encoding::quadruple_url_encode("<img src=x onerror=alert(1) class=dalfox>");
+    let resp = "<img+src=x+onerror=alert(1)+class=dalfox>";
+    assert_eq!(
+        classify_reflection(resp, &payload),
+        Some(ReflectionKind::UrlDecoded)
+    );
+}
+
+#[test]
+fn test_is_payload_reflected_double_layer_percent_entity_then_url() {
+    // Server returns percent sign as HTML-entity, which then precedes URL-encoded payload
+    let payload = "<script>alert(1)</script>";
+    // Build a string like: &#37;3Cscript%3Ealert(1)%3C%2Fscript%3E
+    let url_once = urlencoding::encode(payload).to_string();
+    let resp = url_once.replace("%", "&#37;");
+    assert_eq!(
+        classify_reflection(&resp, payload),
+        Some(ReflectionKind::HtmlThenUrlDecoded)
+    );
+}
+
+#[test]
+fn test_is_payload_reflected_negative() {
+    let payload = "<svg/onload=alert(1)>";
+    let resp = "benign content without the thing";
+    assert_eq!(classify_reflection(resp, payload), None);
+}
+
+#[test]
+fn test_is_payload_reflected_html_named_uppercase() {
+    // Uppercase named entities must still decode for classification. Placed
+    // inside an `on*=` event-handler attribute — the one context where the
+    // browser decodes entities before JS execution, so the unsafe-context
+    // gate keeps the reflection visible. Body/`<script>`/`<style>` placement
+    // would (correctly) demote because those contexts never decode entities.
+    let payload = "<svg onload=alert(1)>";
+    let resp = "<button onclick=\"x='&LT;svg onload=alert(1)&GT;'\">go</button>";
+    assert_eq!(
+        classify_reflection(resp, payload),
+        Some(ReflectionKind::HtmlEntityDecoded)
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_detects_raw_response() {
+    let payload = "<script>alert(1)</script>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/raw");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let found = reflect(&target, &param, payload, &args).await.0.is_some();
+    assert!(found, "raw reflection should be detected");
+}
+
+#[tokio::test]
+async fn test_check_reflection_demotes_html_entity_response_in_safe_context() {
+    // The mock handler entity-encodes the payload and reflects it into a
+    // plain `<div>` — a safe HTML body context. Entity escaping makes the
+    // reflection inert, so classification must demote to `None` and
+    // `check_reflection` must report no reflection found.
+    let payload = "<img src=x onerror=alert(1)>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/html-entity");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let found = reflect(&target, &param, payload, &args).await.0.is_some();
+    assert!(
+        !found,
+        "entity-encoded reflection inside a safe body context should be demoted"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_suppresses_inert_js_string_apos_reflection() {
+    // brutelogic c1 fixture: payload `'-alert(1)-'` reflected as
+    // `var c1 = '&apos;-alert(1)-&apos;';` inside <script>. Inside a
+    // script block HTML entities never decode, so this is inert text
+    // and must not produce an R finding.
+    let payload = "'-alert(1)-'";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/js-string-apos");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (kind, body) = reflect(&target, &param, payload, &args).await;
+    assert_eq!(
+        kind, None,
+        "apos-encoded JS-string reflection should be classified inert (no R)"
+    );
+    assert!(
+        body.unwrap_or_default().contains("&apos;"),
+        "fixture should reflect the encoded form"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_demotes_url_encoded_tag_echo() {
+    // `<div>%3Csvg+onload%3Dalert%281%29%3E</div>`: the server percent-encoded
+    // our whole payload into element content, where a browser renders it as the
+    // literal text `%3Csvg…`. `is_escaped_echo` proves that (whole payload, no
+    // raw variant anywhere, every occurrence in a position a browser can do
+    // nothing with), so the report gate demotes it instead of minting an [R].
+    // A payload the server reflects *live* — even with edits — fails the
+    // whole-payload decoded match, and the DOM/AST phase still runs.
+    let payload = "<svg onload=alert(1)>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/url-encoded");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let found = reflect(&target, &param, payload, &args).await.0.is_some();
+    assert!(
+        !found,
+        "percent-encoded tag echo in element content is inert — no [R]"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_demotes_form_urlencoded_tag_echo_but_keeps_body() {
+    // Same proof through the form-style (`+` for space) encoder: inert echo, no
+    // [R] — but the body is still handed back so the DOM/AST phase and the
+    // caller's evidence rendering can inspect it.
+    let payload = "<img src=x onerror=alert(1) class=dalfox>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/form-url-encoded");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (kind, body) = reflect(&target, &param, payload, &args).await;
+    assert_eq!(kind, None, "form-encoded tag echo is an inert escaped echo");
+    assert!(
+        body.unwrap_or_default()
+            .contains("%3Cimg+src%3Dx+onerror%3Dalert%281%29+class%3Ddalfox%3E"),
+        "form-style encoded response should be preserved for inspection"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_returns_false_when_not_reflected() {
+    let payload = "<svg/onload=alert(1)>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/none");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let found = reflect(&target, &param, payload, &args).await.0.is_some();
+    assert!(!found, "non-reflective response should not be detected");
+}
+
+#[tokio::test]
+async fn test_check_reflection_with_response_demotes_safe_html_entity_reflection() {
+    // The handler entity-encodes the payload into HTML body — a safe
+    // context. Classification must return `None` while the actual response
+    // body is still returned (callers may need it for AST analysis even
+    // when the reflection itself is not exploitable).
+    let payload = "<script>alert(1)</script>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/html-entity");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (kind, body) = reflect(&target, &param, payload, &args).await;
+    assert_eq!(
+        kind, None,
+        "safe-context entity reflection must not produce a reflection kind"
+    );
+    assert!(
+        body.unwrap_or_default().contains("&lt;script&gt;"),
+        "response body should still be propagated to callers"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_with_response_not_reflected() {
+    let payload = "<script>alert(1)</script>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/none");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (kind, body) = reflect(&target, &param, payload, &args).await;
+    assert_eq!(kind, None);
+    assert!(
+        body.is_some(),
+        "request succeeded so response body should be returned"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_sxss_uses_secondary_url() {
+    let payload = "STORED_XSS_PAYLOAD";
+    let addr = start_mock_server(payload).await;
+    let target = make_target(addr, "/reflect/none");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = Some(format!("http://{}:{}/sxss/stored", addr.ip(), addr.port()));
+
+    let found = reflect(&target, &param, payload, &args).await.0.is_some();
+    assert!(found, "sxss mode should verify reflection via sxss_url");
+}
+
+/// Regression: in SXSS mode the retrieval loop used to return the first
+/// non-empty body without verifying the payload was in it. When the highest-
+/// priority candidate (form_origin_url) returns an unrelated page (login
+/// redirect, empty list, etc.) the loop exited before trying form_action_url
+/// or target.url — even when those URLs contained the stored payload. Each
+/// candidate body must now be classified before we give up.
+#[tokio::test]
+async fn test_check_reflection_sxss_skips_junk_url_and_finds_later_candidate() {
+    let payload = "STORED_XSS_PAYLOAD";
+    let addr = start_mock_server(payload).await;
+    // Injection target points at /reflect/none, but the stored payload only
+    // surfaces at /sxss/stored. form_origin_url points at a junk URL
+    // (/reflect/none returns "<div>not reflected</div>") and form_action_url
+    // is the real retrieval URL. The fix must continue past the junk URL.
+    let target = make_target(addr, "/reflect/none");
+    let mut param = make_param();
+    param.form_origin_url = Some(format!("http://{}:{}/reflect/none", addr.ip(), addr.port()));
+    param.form_action_url = Some(format!("http://{}:{}/sxss/stored", addr.ip(), addr.port()));
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = None;
+    // Single retry per candidate keeps the test fast.
+    args.sxss_retries = 1;
+
+    let found = reflect(&target, &param, payload, &args).await.0.is_some();
+    assert!(
+        found,
+        "sxss retrieval must continue past a candidate URL whose body lacks the payload"
+    );
+}
+
+/// Inline-stored sink: the write-response body itself renders the stored
+/// value (think POST /comments returning the rendered /comments page).
+/// None of the retrieval URLs surface the payload, but the inject response
+/// does — the SXSS path must catch this via the inject-body fallback.
+#[tokio::test]
+async fn test_check_reflection_sxss_falls_back_to_inject_response_body() {
+    let payload = "STORED_XSS_PAYLOAD";
+    let addr = start_mock_server("ignored").await;
+    // target.url is /reflect/raw, which echoes the q param back in its
+    // body. The inject GET to /reflect/raw?q=PAYLOAD therefore returns a
+    // body containing the payload. The SXSS retrieval candidates all fail
+    // to surface it (the original target.url uses q=seed, form_origin_url
+    // points at /reflect/none).
+    let target = make_target(addr, "/reflect/raw");
+    let mut param = make_param();
+    param.form_origin_url = Some(format!("http://{}:{}/reflect/none", addr.ip(), addr.port()));
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = None;
+    args.sxss_retries = 1;
+
+    let found = reflect(&target, &param, payload, &args).await.0.is_some();
+    assert!(
+        found,
+        "sxss must fall back to the inject-response body when retrieval URLs miss the payload"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_sxss_without_url_returns_false() {
+    let payload = "STORED_XSS_PAYLOAD";
+    let addr = start_mock_server(payload).await;
+    // Point target at a handler that does NOT echo the query param, so
+    // neither the retrieval fallback (GET target.url) nor the inject-body
+    // fallback surface the payload. This isolates the "no SXSS signal
+    // anywhere" case — distinct from the inline-stored-sink fallback test
+    // above, which deliberately uses /reflect/raw to exercise the fallback.
+    let target = make_target(addr, "/reflect/none");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_url = None;
+
+    let found = reflect(&target, &param, payload, &args).await.0.is_some();
+    assert!(!found, "sxss mode without sxss_url should return false");
+}
+
+#[tokio::test]
+async fn test_check_reflection_catches_decoded_payload_in_redirect_location() {
+    // Server URL-decodes the query and echoes the raw payload back into the
+    // Location header. The gate used to only match the encoded form, so
+    // this reflection was silently missed. It must now be caught.
+    let payload = "<svg/onload=alert(1)>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/redirect/decoded");
+    let param = make_param();
+    let args = default_scan_args();
+    assert!(
+        reflect(&target, &param, payload, &args).await.0.is_some(),
+        "reflection check must catch the raw payload appearing in Location"
+    );
+}
+
+#[tokio::test]
+async fn test_redirect_location_body_is_not_renderable_and_carries_no_markup() {
+    // Regression: a marker-bearing payload echoed into a 3xx `Location:` used
+    // to come back wrapped as `<html><body>{location}</body></html>`. That
+    // stand-in parses as valid HTML, so the static V upgrade's DOM-marker
+    // selector matched it and minted a Verified/High finding whose "response"
+    // evidence the server never sent — browsers don't render redirect bodies
+    // at all. The body must now be flagged non-renderable (keeping every
+    // execution-inferring consumer off it) and must not fabricate markup.
+    let payload = "<svg/onload=alert(1) class=dalfox>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/redirect/decoded");
+    let param = make_param();
+    let args = default_scan_args();
+    let streak = std::sync::atomic::AtomicU32::new(0);
+
+    let (kind, body, ..) = check_reflection_with_response(
+        &target.build_client_or_default(),
+        &target,
+        &param,
+        payload,
+        &args,
+        &streak,
+    )
+    .await;
+
+    assert!(
+        kind.is_some(),
+        "Location-header reflection must still be reported as R"
+    );
+    let body = body.expect("redirect reflection must return a body");
+    assert!(
+        !body.renderable,
+        "a 3xx Location stand-in is not a browser-rendered document"
+    );
+    assert_eq!(
+        body.renderable_text(),
+        None,
+        "execution-inferring consumers must not be handed the stand-in"
+    );
+    assert!(
+        !body.text.contains("<html>") && !body.text.contains("<body>"),
+        "stand-in must not fabricate markup that never came off the wire: {}",
+        body.text
+    );
+    assert!(
+        body.text.contains(payload),
+        "stand-in must still contain the payload so R classification works: {}",
+        body.text
+    );
+}
+
+#[tokio::test]
+async fn test_redirect_body_echo_is_not_renderable_while_location_is_set() {
+    // A 3xx whose `Location` does NOT carry the payload fell through to the
+    // body read and came back `renderable`, so a payload echoed into the
+    // redirect's body minted a Verified/High finding. A browser follows the
+    // `Location` and never renders that body; only without one does it show.
+    let payload = "<svg onload=alert(1) class=dlxmarker>";
+    let addr = start_mock_server("stored").await;
+    let param = make_param();
+    let args = default_scan_args();
+    let streak = std::sync::atomic::AtomicU32::new(0);
+    for (path, renders) in [
+        ("/redirect/body-echo", false),
+        ("/redirect/body-echo-no-location", true),
+    ] {
+        let target = make_target(addr, path);
+        let (kind, body, ..) = check_reflection_with_response(
+            &target.build_client_or_default(),
+            &target,
+            &param,
+            payload,
+            &args,
+            &streak,
+        )
+        .await;
+        assert!(
+            kind.is_some(),
+            "{path}: the body echo is still a reflection"
+        );
+        let body = body.expect("reflection body");
+        assert_eq!(body.renderable, renders, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn test_sxss_redirect_body_echo_is_not_renderable() {
+    // The `--sxss` retrieval path read a followed redirect's body as
+    // renderable, unlike the normal path above.
+    let payload = "<svg onload=alert(1) class=dlxmarker>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/none");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.sxss = true;
+    args.sxss_retries = 1;
+    let mut url = reqwest::Url::parse(&format!("http://{addr}/redirect/body-echo")).unwrap();
+    url.query_pairs_mut().append_pair("q", payload);
+    args.sxss_url = Some(url.to_string());
+    let streak = std::sync::atomic::AtomicU32::new(0);
+    let (kind, body, ..) = check_reflection_with_response(
+        &target.build_client_or_default(),
+        &target,
+        &param,
+        payload,
+        &args,
+        &streak,
+    )
+    .await;
+    assert!(kind.is_some(), "the stored body echo is still a reflection");
+    assert!(!body.expect("reflection body").renderable);
+}
+
+#[tokio::test]
+async fn test_redirect_location_stand_in_yields_no_dom_marker_evidence() {
+    // The precise false-positive mechanism: `classify_dom_evidence` finds the
+    // `dalfox` marker in the old synthetic wrapper. Pin that the text now
+    // handed to that classifier (i.e. the renderable text) is absent, so no
+    // V upgrade is reachable from a redirect.
+    let payload = "<svg/onload=alert(1) class=dalfox>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/redirect/decoded");
+    let param = make_param();
+    let args = default_scan_args();
+    let streak = std::sync::atomic::AtomicU32::new(0);
+
+    let (_, body, ..) = check_reflection_with_response(
+        &target.build_client_or_default(),
+        &target,
+        &param,
+        payload,
+        &args,
+        &streak,
+    )
+    .await;
+    let body = body.expect("redirect reflection must return a body");
+
+    let evidence = body.renderable_text().and_then(|text| {
+        crate::scanning::check_dom_verification::classify_dom_evidence(payload, text)
+    });
+    assert!(
+        evidence.is_none(),
+        "a redirect must never produce DOM-marker evidence (no browser renders it)"
+    );
+}
+
+#[tokio::test]
+async fn test_inert_data_gate_does_not_swallow_redirect_location_reflection() {
+    // A 302 whose body is declared `application/json` still echoes the payload
+    // in its `Location` header. The inert-data content-type gate must skip
+    // redirects (the body CT is irrelevant to the Location vector), so the
+    // reflection is still reported.
+    let payload = "<svg/onload=alert(1)>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/redirect/json-ct");
+    let param = make_param();
+    let args = default_scan_args();
+    assert!(
+        reflect(&target, &param, payload, &args).await.0.is_some(),
+        "inert-data gate must not suppress a Location-header reflection on a JSON-CT redirect"
+    );
+}
+
+#[tokio::test]
+async fn test_check_reflection_suppresses_json_content_type_reflection() {
+    // The mock `/reflect/json` echoes `q` into an `application/json` body. A
+    // browser navigating to a genuine JSON response renders it as data, never
+    // as markup, so a reflected `<svg onload>` cannot execute — the inert-data
+    // content-type gate must suppress it (corpus negatives 5050 / 5284). This
+    // replaces the former assertion that JSON reflections surface as [R].
+    let payload = "<svg/onload=alert(1)>";
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/json");
+    let param = make_param();
+    let args = default_scan_args();
+
+    let (kind, _body) = reflect(&target, &param, payload, &args).await;
+    assert_eq!(kind, None, "application/json reflection must be suppressed");
+}
+
+// --- Safe context filtering tests ---
+
+#[test]
+fn test_safe_context_textarea() {
+    let payload = "<script>alert(1)</script>";
+    let html = format!("<html><textarea>{}</textarea></html>", payload);
+    assert!(is_in_safe_context(&html, payload));
+}
+
+// A hostile page can echo the payload an unbounded number of times inside a
+// safe tag. Without the per-occurrence cap, vetting every echo against the
+// safe ranges is an O(n·m) CPU hang (body analysis runs after the response is
+// read, so the request timeout doesn't bound it). With the cap, the scan stops
+// early and returns `false` — the fail-toward-reporting answer — so the finding
+// is kept rather than the worker hanging.
+#[test]
+fn test_safe_context_occurrence_cap_bails_toward_reporting() {
+    let payload = "<x>";
+    // > MAX_PAYLOAD_OCCURRENCES echoes, all genuinely inside a safe <textarea>.
+    let inner = payload.repeat(MAX_PAYLOAD_OCCURRENCES + 50);
+    let html = format!("<html><textarea>{inner}</textarea></html>");
+    // Returns promptly (no hang) and does NOT suppress: cap flips the otherwise
+    // "all safe" verdict to `false`.
+    assert!(!is_in_safe_context(&html, payload));
+}
+
+#[test]
+fn test_safe_context_noscript() {
+    let payload = "<img src=x onerror=alert(1)>";
+    let html = format!("<html><noscript>{}</noscript></html>", payload);
+    assert!(is_in_safe_context(&html, payload));
+}
+
+#[test]
+fn test_safe_context_title() {
+    let payload = "<script>alert(1)</script>";
+    let html = format!("<html><head><title>{}</title></head></html>", payload);
+    assert!(is_in_safe_context(&html, payload));
+}
+
+#[test]
+fn test_safe_context_style() {
+    // Style is intentionally NOT a safe context — CSS injection can break
+    // out via </style> and inject executable HTML.
+    let payload = "expression(alert(1))";
+    let html = format!("<html><style>{}</style></html>", payload);
+    assert!(
+        !is_in_safe_context(&html, payload),
+        "style should NOT be a safe context"
+    );
+}
+
+#[test]
+fn test_safe_context_mixed_safe_and_unsafe() {
+    let payload = "<script>alert(1)</script>";
+    let html = format!(
+        "<html><textarea>{}</textarea><div>{}</div></html>",
+        payload, payload
+    );
+    assert!(
+        !is_in_safe_context(&html, payload),
+        "mixed context should NOT be considered safe"
+    );
+}
+
+#[test]
+fn test_safe_context_outside_safe_tag() {
+    let payload = "<script>alert(1)</script>";
+    let html = format!("<html><div>{}</div></html>", payload);
+    assert!(!is_in_safe_context(&html, payload));
+}
+
+#[test]
+fn test_safe_context_no_payload() {
+    assert!(is_in_safe_context(
+        "<html><body>nothing</body></html>",
+        "PAYLOAD"
+    ));
+}
+
+#[test]
+fn test_safe_context_title_breakout() {
+    let payload = "</title><IMG src=x onerror=alert(1) ClAss=dlxtest>";
+    let html = format!(
+        "<html><head><title>{}</title></head><body></body></html>",
+        payload
+    );
+    // Breakout payload closes the title tag, so the IMG is outside the safe context
+    assert!(
+        !is_in_safe_context(&html, payload),
+        "title breakout payload should NOT be considered safe"
+    );
+}
+
+#[test]
+fn test_safe_context_textarea_breakout() {
+    let payload = "</textarea><IMG src=x onerror=alert(1) ClAss=dlxtest>";
+    let html = format!("<html><body><textarea>{}</textarea></body></html>", payload);
+    assert!(
+        !is_in_safe_context(&html, payload),
+        "textarea breakout payload should NOT be considered safe"
+    );
+}
+
+// Regression: full-width unicode payloads (e.g. `＜svg…＞` produced by the
+// `unicode` bypass encoder) must not panic the slice loop when reflected.
+// Each full-width char is 3 bytes in UTF-8, so an `abs_pos + 1` advance would
+// previously land inside a multi-byte codepoint and panic `html[idx..]`.
+#[test]
+fn test_safe_context_fullwidth_payload_no_panic() {
+    let payload = "＜ｓｖｇ／ｏｎｌｏａｄ＝ａｌｅｒｔ（１）＞";
+    let html = format!("<html><body><textarea>{}</textarea></body></html>", payload);
+    // Inside <textarea>, so it is in a safe context — and must not panic.
+    assert!(is_in_safe_context(&html, payload));
+}
+
+#[test]
+fn test_safe_context_fullwidth_payload_outside_textarea() {
+    let payload = "＜ｓｖｇ／ｏｎｌｏａｄ＝ａｌｅｒｔ（１）＞";
+    let html = format!("<html><body><div>{}</div></body></html>", payload);
+    // Outside any safe tag — must report unsafe without panicking.
+    assert!(!is_in_safe_context(&html, payload));
+}
+
+#[test]
+fn test_safe_context_fullwidth_payload_in_title() {
+    // Matches the firing range `/reflected/parameter/title` case that triggered
+    // the original panic at byte 23 ("inside ＜ bytes 22..25").
+    let payload = "＜ｓｖｇ／ｏｎｌｏａｄ＝ａｌｅｒｔ（１）＞";
+    let html = format!(
+        "<html>\n  <head><title>{}</title>\n  </head>\n  <body></body>\n</html>",
+        payload
+    );
+    assert!(is_in_safe_context(&html, payload));
+}
+
+// --- Inert-in-script-block heuristic ---
+
+#[test]
+fn test_inert_in_scripts_entity_encoded_payload_in_js_string() {
+    // Mirrors brutelogic c5/c6: server reflects the entity-encoded payload
+    // verbatim inside a JS string literal — not exploitable in JS context.
+    let payload = "&#x0027;-alert(1)-&#x0027;";
+    let html = format!("<script>var c5 = '{}';</script>", payload);
+    assert!(
+        is_payload_inert_in_scripts(&html, payload),
+        "entity-encoded payload reflected only inside a JS string should be inert"
+    );
+    assert!(
+        is_in_safe_context_decoded(&html, payload),
+        "should classify as safe so the reflection is not reported"
+    );
+}
+
+#[test]
+fn test_inert_in_scripts_does_not_suppress_real_js_breakout() {
+    // c2-style real exploit: payload introduces an `alert(1)` call inside
+    // the JS — this MUST NOT be suppressed.
+    let payload = "\"-alert(1)-\"";
+    let html = format!("<script>var c2 = \"{}\";</script>", payload);
+    assert!(
+        !is_payload_inert_in_scripts(&html, payload),
+        "exploitable JS-context payload must not be classified inert"
+    );
+}
+
+#[test]
+fn test_inert_in_scripts_requires_all_occurrences_inside_script() {
+    let payload = "&#x0027;ZZZ&#x0027;";
+    let html = format!(
+        "<div>{}</div><script>var x = '{}';</script>",
+        payload, payload
+    );
+    assert!(
+        !is_payload_inert_in_scripts(&html, payload),
+        "if the payload is also reflected outside a script block it is not inert"
+    );
+}
+
+#[test]
+fn test_inert_in_scripts_no_script_block_in_response() {
+    let payload = "&#x0027;ZZZ&#x0027;";
+    let html = format!("<div>{}</div>", payload);
+    assert!(
+        !is_payload_inert_in_scripts(&html, payload),
+        "without any script block this heuristic should not apply"
+    );
+}
+
+#[test]
+fn test_inert_in_scripts_handles_entity_encoded_html_payload_in_js_string() {
+    // Mirrors brutelogic c6 with the marker payload: server HTML-encodes
+    // `<` to `&lt;` and reflects inside a JS string. Browser does not
+    // decode entities inside <script>, so the payload is just text.
+    let payload = "<img src=x onerror=alert(1) class=dlxtest>";
+    let html = "<script>var c6 = \"&lt;img src=x onerror=alert(1) class=dlxtest>\";</script>";
+    assert!(
+        is_payload_inert_in_scripts(html, payload),
+        "entity-encoded HTML payload reflected only inside JS string should be inert"
+    );
+}
+
+#[test]
+fn test_inert_in_scripts_handles_apos_encoded_quote_in_js_string() {
+    // Mirrors brutelogic c1: the server HTML-encodes the `'` chars of
+    // `'-alert(1)-'` to `&apos;` before reflecting into a JS string.
+    // Inside <script> entities never decode, so the reflection is text.
+    let payload = "'-alert(1)-'";
+    let html = "<script>var c1 = '&apos;-alert(1)-&apos;';</script>";
+    assert!(
+        is_payload_inert_in_scripts(html, payload),
+        "apos-encoded JS-context payload reflected inside JS string should be inert"
+    );
+    assert!(
+        is_in_safe_context_decoded(html, payload),
+        "should classify safe so the R finding is suppressed"
+    );
+}
+
+#[test]
+fn test_inert_in_scripts_handles_url_encoded_payload_variant() {
+    // Encoder policy often produces a URL-encoded variant of the original
+    // payload; the server then URL-decodes once and reflects the decoded
+    // form. The suppression heuristic must inspect that decoded form, not
+    // the URL-encoded payload string verbatim.
+    let payload = "%27-alert%281%29-%27"; // URL-encoded `'-alert(1)-'`
+    let html = "<script>var c1 = '&apos;-alert(1)-&apos;';</script>";
+    assert!(
+        !html.contains(payload),
+        "URL-encoded form should not appear"
+    );
+    assert!(
+        is_payload_inert_in_scripts(html, payload),
+        "URL-encoded JS-context payload reflected as decoded text inside JS string should be inert"
+    );
+}
+
+#[test]
+fn test_inert_in_scripts_url_encoded_does_not_suppress_real_breakout() {
+    // URL-encoded form of `"-alert(1)-"` decodes to a real exploitable
+    // breakout. Must NOT be suppressed.
+    let payload = "%22-alert%281%29-%22";
+    let html = "<script>var c2 = \"\"-alert(1)-\"\";</script>";
+    assert!(
+        !is_payload_inert_in_scripts(html, payload),
+        "exploitable breakout via URL-decoded form must keep its finding"
+    );
+}
+
+#[test]
+fn test_inert_in_scripts_full_brutelogic_response() {
+    // Full real-world response capture: c1 reflection inside a multi-block
+    // script context with form inputs and HTML comments. Should be inert.
+    let payload = "'-alert(1)-'";
+    let html = r#"<!DOCTYPE html>
+<head>
+<!-- XSS in 11 URL parameters (a, b1, b2, b3, b4, b5, b6, c1, c2, c3, c4, c5 and c6) + URL itself -->
+<title>XSS Test Page</title>
+</head>
+<body>
+<form>
+<input type="text" name="b1" value="">
+<input type="text" name="b2" value=''>
+</form>
+<script>
+	var c1 = '&apos;-alert(1)-&apos;';
+	var c2 = "1";
+	var c3 = '1';
+	var c4 = "1";
+	var c5 = '1';
+	var c6 = "1";
+</script>
+</body>"#;
+    assert!(!html.contains(payload), "payload should not appear raw");
+    assert!(
+        is_payload_inert_in_scripts(html, payload),
+        "full-page response should still classify the apos-encoded reflection as inert"
+    );
+}
+
+// --- Path-injection status-code filter ---
+
+#[test]
+fn test_suppress_path_reflection_on_404() {
+    assert!(should_suppress_path_reflection(&Location::Path, 404));
+    assert!(should_suppress_path_reflection(&Location::Path, 500));
+    assert!(should_suppress_path_reflection(&Location::Path, 301));
+}
+
+#[test]
+fn test_keep_path_reflection_on_2xx() {
+    assert!(!should_suppress_path_reflection(&Location::Path, 200));
+    assert!(!should_suppress_path_reflection(&Location::Path, 204));
+}
+
+#[test]
+fn test_non_path_locations_are_unaffected() {
+    assert!(!should_suppress_path_reflection(&Location::Query, 404));
+    assert!(!should_suppress_path_reflection(&Location::Header, 500));
+    assert!(!should_suppress_path_reflection(&Location::Body, 404));
+}
+
+// --- Body-aware path reflection (4xx/5xx exploitable XSS preservation) ---
+
+#[test]
+fn test_url_attr_only_classifier_recognizes_anchor_href() {
+    // `<a href="/foo/MARKER/bar">` — pure URL echo, no exploit surface.
+    let html = "<html><a href=\"/users/MARKER/posts\">profile</a></html>";
+    assert!(marker_reflects_in_url_attr_only(html, "MARKER"));
+}
+
+#[test]
+fn test_url_attr_only_classifier_recognizes_canonical_link() {
+    let html = "<head><link rel=\"canonical\" href=\"/p/MARKER\"></head>";
+    assert!(marker_reflects_in_url_attr_only(html, "MARKER"));
+}
+
+#[test]
+fn test_url_attr_only_classifier_rejects_text_content() {
+    // Firing-range 404 pattern: URI rendered inside `<td>` — exploitable.
+    let html = "<html><body><tr><td>/no/MARKER/route</td></tr></body></html>";
+    assert!(
+        !marker_reflects_in_url_attr_only(html, "MARKER"),
+        "text-content reflection must NOT be classified as url-echo"
+    );
+}
+
+#[test]
+fn test_url_attr_only_classifier_rejects_non_url_attr() {
+    // `value="MARKER"` is exploitable (attribute-value injection).
+    let html = "<input type=\"text\" value=\"MARKER\">";
+    assert!(
+        !marker_reflects_in_url_attr_only(html, "MARKER"),
+        "non-URL attribute reflection must NOT be classified as url-echo"
+    );
+}
+
+#[test]
+fn test_url_attr_only_classifier_mixed_occurrences_keep_finding() {
+    // Marker appears in both a href AND in `<td>`. Single text-content
+    // occurrence is enough to keep the finding — be conservative.
+    let html = "<a href=\"/x/MARKER\">hi</a><td>/x/MARKER</td>";
+    assert!(!marker_reflects_in_url_attr_only(html, "MARKER"));
+}
+
+#[test]
+fn test_url_attr_only_classifier_handles_single_quoted_attr() {
+    let html = "<a href='/foo/MARKER'>x</a>";
+    assert!(marker_reflects_in_url_attr_only(html, "MARKER"));
+}
+
+#[test]
+fn test_url_attr_only_classifier_handles_unquoted_attr() {
+    let html = "<a href=/foo/MARKER>x</a>";
+    assert!(marker_reflects_in_url_attr_only(html, "MARKER"));
+}
+
+#[test]
+fn test_url_attr_only_returns_false_when_no_match() {
+    let html = "<html>no marker here</html>";
+    assert!(!marker_reflects_in_url_attr_only(html, "MARKER"));
+}
+
+#[test]
+fn test_should_suppress_with_body_keeps_exploitable_404() {
+    // 404 page echoing URI inside `<td>` — should NOT be suppressed even
+    // on 4xx. Regression for the firing-range / App Engine error template
+    // pattern.
+    let body = "<html><body><tr><td>/no/PAY/route</td></tr></body></html>";
+    assert!(!should_suppress_path_reflection_with_body(
+        &Location::Path,
+        404,
+        body,
+        "PAY",
+    ));
+}
+
+#[test]
+fn test_should_suppress_with_body_drops_url_echo_404() {
+    // Generic 404 page that just echoes the path inside `<a href>` —
+    // unexploitable URL echo, drop it.
+    let body =
+        "<html><body><p>Not found. Did you mean <a href=\"/old/PAY\">this</a>?</p></body></html>";
+    assert!(should_suppress_path_reflection_with_body(
+        &Location::Path,
+        404,
+        body,
+        "PAY",
+    ));
+}
+
+#[test]
+fn test_should_suppress_with_body_2xx_never_suppresses() {
+    // 2xx always survives regardless of where the reflection lands; the
+    // V/R upgrade pipeline decides correctness from there.
+    let body = "<a href=\"/foo/PAY\">link</a>";
+    assert!(!should_suppress_path_reflection_with_body(
+        &Location::Path,
+        200,
+        body,
+        "PAY",
+    ));
+}
+
+#[test]
+fn test_should_suppress_with_body_non_path_never_suppresses() {
+    let body = "<a href=\"/foo/PAY\">link</a>";
+    assert!(!should_suppress_path_reflection_with_body(
+        &Location::Query,
+        404,
+        body,
+        "PAY",
+    ));
+}
+
+#[test]
+fn test_should_suppress_with_body_drops_percent_encoded_only_echo() {
+    // Firing-range / App Engine 404: server URL-encodes the echoed path
+    // (`%3Csvg…%3E`). The upstream reflection detector still finds the
+    // payload via URL-decoded matching, but the browser would render the
+    // percent escapes as literal text — no `<` tag is parsed, no XSS.
+    // Suppress to avoid the false positive even though status is 4xx.
+    let body = "<html><body><tr><th>URI:</th><td>/foo/%3Csvg/onload=alert(1)%3E/bar</td></tr></body></html>";
+    let raw_payload = "<svg/onload=alert(1)>";
+    assert!(
+        !body.contains(raw_payload),
+        "test fixture must contain only the percent-encoded form"
+    );
+    assert!(should_suppress_path_reflection_with_body(
+        &Location::Path,
+        404,
+        body,
+        raw_payload,
+    ));
+}
+
+#[test]
+fn test_should_suppress_with_body_empty_body_falls_back_to_strict() {
+    // No body to classify — preserve the legacy conservative behaviour so
+    // we don't surface findings from responses we can't actually inspect.
+    assert!(should_suppress_path_reflection_with_body(
+        &Location::Path,
+        404,
+        "",
+        "PAY",
+    ));
+}
+
+#[tokio::test]
+async fn test_path_reflection_suppressed_on_non_html_content_type() {
+    // Mirrors brutelogic: path-injected URL returns 200 application/javascript
+    // with the payload echoed in the JS body. Not exploitable as XSS — should
+    // be filtered.
+    async fn js_handler() -> impl IntoResponse {
+        (
+            StatusCode::OK,
+            [("content-type", "application/javascript")],
+            "// echo: <script>alert(1)</script>\nvar x = 1;",
+        )
+    }
+    let app = Router::new().route("/path/echo", get(js_handler));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let target = parse_target(&format!("http://{}/path/echo", addr)).expect("target");
+    let mut param = make_param();
+    param.name = "path_segment_0".to_string();
+    param.location = Location::Path;
+    let args = default_scan_args();
+
+    let (kind, _body) = reflect(&target, &param, "<script>alert(1)</script>", &args).await;
+    assert_eq!(
+        kind, None,
+        "path-injection reflection on application/javascript should be suppressed"
+    );
+}
+
+/// A response whose body dies after the headers arrived is a payload that was
+/// sent but never tested; it must show up in `failed_requests` instead of
+/// reading as "no reflection" on a clean scan.
+#[tokio::test]
+async fn test_mid_body_failure_counts_as_failed_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut scratch = [0u8; 2048];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n<html><body>partial",
+                )
+                .await;
+            let _ = sock.flush().await;
+        }
+    });
+
+    let target = parse_target(&format!("http://{}/?q=a", addr)).expect("target");
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let c = counter.clone();
+    let (kind, body) = crate::REQUEST_FAILURE_COUNT_JOB
+        .scope(counter, async {
+            reflect(&target, &make_param(), "<xss>", &default_scan_args()).await
+        })
+        .await;
+    assert_eq!((kind, body), (None, None));
+    assert!(
+        c.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "a body that fails mid-read must be counted as a failed request"
+    );
+}
+
+// ---- adaptive WAF cooldown policy (waf_block_cooldown_ms) ----
+
+#[test]
+fn content_block_does_not_cooldown_in_default_mode() {
+    // 403 / 406 are per-request content blocks: in default mode (no
+    // --waf-evasion) the scanner must keep churning payloads, never sleep —
+    // otherwise a facade that 403s most payloads burns the whole scan-timeout.
+    for status in [403u16, 406] {
+        for consecutive in [WAF_BACKOFF_THRESHOLD, WAF_BACKOFF_THRESHOLD + 10, 999] {
+            assert_eq!(
+                waf_block_cooldown_ms(status, consecutive, false),
+                0,
+                "status {status} should not cool down in default mode (n={consecutive})"
+            );
+        }
+    }
+}
+
+#[test]
+fn content_block_cools_down_under_waf_evasion() {
+    // With --waf-evasion the user opts into cautious pacing, so content blocks
+    // get the escalating cooldown once past the threshold.
+    assert_eq!(
+        waf_block_cooldown_ms(403, WAF_BACKOFF_THRESHOLD - 1, true),
+        0,
+        "below threshold = no cooldown even under evasion"
+    );
+    assert_eq!(
+        waf_block_cooldown_ms(403, WAF_BACKOFF_THRESHOLD, true),
+        WAF_BACKOFF_BASE_MS,
+        "first over-threshold block = base delay"
+    );
+    assert!(
+        waf_block_cooldown_ms(403, WAF_BACKOFF_THRESHOLD + 1, true) > WAF_BACKOFF_BASE_MS,
+        "cooldown escalates with consecutive blocks"
+    );
+}
+
+#[test]
+fn rate_limit_always_cools_down() {
+    // 429 / 503 are genuine "slow down" signals — honored regardless of mode.
+    for status in [429u16, 503] {
+        assert_eq!(
+            waf_block_cooldown_ms(status, WAF_BACKOFF_THRESHOLD, false),
+            WAF_BACKOFF_BASE_MS,
+            "status {status} must cool down even in default mode"
+        );
+        assert_eq!(
+            waf_block_cooldown_ms(status, WAF_BACKOFF_THRESHOLD - 1, false),
+            0,
+            "status {status} stays quiet below the transient threshold"
+        );
+    }
+}
+
+#[test]
+fn cooldown_is_capped_and_ignores_non_block_status() {
+    // Escalation plateaus at the absolute ceiling.
+    assert_eq!(
+        waf_block_cooldown_ms(429, 100, true),
+        WAF_BACKOFF_CAP_MS,
+        "a long block streak is capped at WAF_BACKOFF_CAP_MS"
+    );
+    // Non-block statuses never cool down.
+    for status in [200u16, 301, 404, 500] {
+        assert_eq!(waf_block_cooldown_ms(status, 999, true), 0);
+    }
+}
+
+// --- Inert encoded-echo report-gate (is_inert_encoded_reflection) ---
+// Suppression cases (server escaped its output) + soundness boundaries that
+// MUST keep the finding (regression guards for the adversarial-review FNs).
+
+#[test]
+fn test_inert_encoded_reflection_url_encoded_quote_in_body() {
+    // Server percent-encodes a quote break-out's `"` into body text:
+    // `<div>Search: %22;alert(1)//</div>`. A browser renders `%22` literally,
+    // so the reflection is inert and suppressed.
+    let payload = "\";alert(1)//";
+    let html = "<div>Search: %22;alert(1)//</div>";
+    assert!(!html.contains(payload), "raw quote payload must not appear");
+    assert!(
+        is_inert_encoded_reflection(html, payload),
+        "percent-encoded quote echo in body must be inert"
+    );
+    assert!(is_in_safe_context_decoded(html, payload));
+}
+
+#[test]
+fn test_inert_encoded_reflection_skips_tag_payloads() {
+    // Out of scope: a tag-injecting payload (raw `<`/`>` in a variant) is left
+    // to the DOM/AST verification path even when fully escaped, because a byte
+    // gate cannot distinguish a dead echo from a live element. Must NOT suppress.
+    let payload = "<svg onload=alert(1) class=dlxtest>";
+    let html = "<div>%3Csvg%20onload%3Dalert%281%29%20class%3Ddlxtest%3E</div>";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "tag payloads are out of scope for this gate and must be kept"
+    );
+}
+
+#[test]
+fn test_inert_encoded_reflection_entity_quote_breakout_in_body() {
+    // Quote break-out payload reflected with its `"` entity-encoded into a
+    // search-results body: `Results for: &quot;;alert(1)//`. The browser shows
+    // a literal quote — no attribute/string break-out — so it is inert.
+    let payload = "\";alert(1)//";
+    let html = "<p>Results for: &quot;;alert(1)//</p>";
+    assert!(!html.contains(payload), "raw quote payload must not appear");
+    assert!(
+        is_inert_encoded_reflection(html, payload),
+        "entity-encoded quote break-out in body must be inert"
+    );
+    assert!(is_in_safe_context_decoded(html, payload));
+}
+
+#[test]
+fn test_inert_encoded_reflection_keeps_raw_breakout() {
+    // The server did NOT escape: the raw payload variant is present in the
+    // body, so this is a genuine reflection and must not be suppressed.
+    let payload = "<svg onload=alert(1)>";
+    let html = "<div><svg onload=alert(1)></div>";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "a raw un-escaped reflection is exploitable and must survive"
+    );
+    assert!(!is_in_safe_context_decoded(html, payload));
+}
+
+#[test]
+fn test_inert_encoded_reflection_keeps_quote_echo_in_url_attr() {
+    // A percent-encoded quote break-out inside an href value — the one context
+    // a browser percent-decodes — must be kept (cond d), unlike the same echo
+    // in body text which is demoted.
+    let payload = "\";alert(1)//";
+    let html = "<a href=\"%22;alert(1)//\">x</a>";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "encoded quote echo inside a URL attribute must be kept"
+    );
+}
+
+#[test]
+fn test_inert_encoded_reflection_keeps_xlink_href_scheme() {
+    // Regression (review finding E): xlink:href is an exec-capable SVG URL sink.
+    // A percent-encoded javascript: scheme there must be kept, like href.
+    let payload = "javascript:alert(1)";
+    let html = "<svg><a xlink:href=\"javascript%3Aalert%281%29\"><text>x</text></a></svg>";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "javascript: scheme inside xlink:href must be kept"
+    );
+}
+
+#[test]
+fn test_inert_encoded_reflection_keeps_event_handler_entity_breakout() {
+    // Regression (review finding A): an entity-encoded quote break-out landing
+    // in an on*= handler value. The HTML parser decodes `&#39;`/`&quot;` while
+    // building the handler, so the JS engine sees a live break-out -> executes.
+    let payload = "');alert(1)//";
+    let html = "<div onclick=\"greet('&#39;);alert(1)//')\">click</div>";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "entity-encoded break-out in an event-handler attribute must be kept"
+    );
+    let payload2 = "\";alert(1)//";
+    let html2 = "<a onmouseover=\"x=&quot;&quot;;alert(1)//&quot;\">x</a>";
+    assert!(
+        !is_inert_encoded_reflection(html2, payload2),
+        "quot-encoded break-out in onmouseover must be kept"
+    );
+}
+
+#[test]
+fn test_inert_encoded_reflection_keeps_live_tag_masked_by_encoded_echo() {
+    // Regression (review finding B): a LIVE element from the payload is present
+    // raw but not byte-exact (server added id=x), while an encoded copy exists
+    // elsewhere. The global "an encoded echo exists" decision must not hide the
+    // live tag — the raw `<svg` opener keeps the finding.
+    let payload = "<svg onload=alert(1)>";
+    let html = "<div><svg id=x onload=alert(1)></div><!-- %3Csvg%20onload%3Dalert(1)%3E -->";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "a live tag (extra attrs) co-existing with an encoded echo must be kept"
+    );
+    // Canonical-link masking: live <img onerror> + encoded copy in <link href>.
+    let p2 = "<img src=x onerror=alert(1)>";
+    let h2 = "<h1><img src=x onerror=alert(1) data-q=1></h1><link rel=canonical href=\"/s?q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E\">";
+    assert!(
+        !is_inert_encoded_reflection(h2, p2),
+        "canonical-link encoded copy must not mask a live onerror reflection"
+    );
+}
+
+#[test]
+fn test_inert_encoded_reflection_keeps_case_folded_live_with_echo() {
+    // Regression (review finding C): a case-folded live element (servers that
+    // upper/lower-case markup; tag/attr names are case-insensitive) co-existing
+    // with an encoded copy must be kept. Marker payload so detection is via the
+    // case-fold path.
+    let payload = "<svg onload=alert(1) class=dalfox>";
+    let html = "<div><SVG ONLOAD=alert(1) CLASS=DALFOX></div>--%3Csvg%20onload%3Dalert(1)%20class%3Ddalfox%3E";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "case-folded live tag must be kept despite a co-existing encoded echo"
+    );
+}
+
+#[test]
+fn test_inert_encoded_reflection_keeps_plus_only_form_decode_breakout() {
+    // Regression (review finding D): a `+`->space form-decode un-escapes no
+    // HTML-active char, so it is not evidence of server escaping. The raw
+    // `<svg/onload=alert(1)>` (the `/` is a valid attr separator) is live.
+    let payload = "<svg/onload=alert(1)> z";
+    let html = "<div><svg/onload=alert(1)>+z</div>";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "a bare +->space form-decode must not suppress a live raw tag"
+    );
+}
+
+#[test]
+fn test_inert_encoded_reflection_keeps_case_folded_reflection_no_echo() {
+    // The original soundness claim: a case-folded reflection matched via the
+    // marker fallback (decoding surfaces nothing) is never an encoded echo.
+    let payload = "<svg onload=alert(1) class=dalfox>";
+    let html = "<div><SVG ONLOAD=alert(1) CLASS=DALFOX></div>";
+    assert!(
+        !is_inert_encoded_reflection(html, payload),
+        "case-folded live reflection must not be suppressed"
+    );
+}
+
+// ---- issue #1153: inert dangerous-scheme reflection (self-/canonical-link
+// echo, body text, non-URL attr) must be demoted; an executable scheme-start
+// in a URL-valued attribute must be kept. ----
+
+#[test]
+fn test_scheme_fp_suppresses_self_link_query_encoded() {
+    // Issue #1153 exact shape: ASP.NET-style canonical/self link echoes the raw
+    // percent-encoded query string, so `javascript:` sits in the QUERY position
+    // of the link's URL (the page's own http scheme), never navigating to it.
+    let payload = "javascript:alert(1)";
+    let html = "<head><link rel=\"canonical\" href=\"/About.aspx?hello=visitor&any=javascript%3Aalert%281%29\"></head><body><a href=\"/About.aspx?any=javascript%3Aalert%281%29\">home</a></body>";
+    assert!(
+        dangerous_scheme_reflection_is_inert(html, payload),
+        "scheme in a self-link query position is inert"
+    );
+    assert!(
+        is_in_safe_context_decoded(html, payload),
+        "issue #1153 self-link [R] FP must be suppressed"
+    );
+}
+
+#[test]
+fn test_scheme_fp_suppresses_tab_obfuscated_scheme_in_self_link() {
+    // WAF-evasion mutation: a TAB inside the scheme (`java\tscript:`). Browsers
+    // strip TAB/LF/CR from URLs, so it is the same `javascript:` scheme — and in
+    // a self-link query position it is just as inert.
+    let payload = "java\tscript:alert(1)";
+    let html = "<a href=\"/About.aspx?any=java%09script%3Aalert%281%29\">home</a>";
+    assert!(
+        dangerous_scheme_reflection_is_inert(html, payload),
+        "tab-obfuscated scheme in a self-link query position is inert"
+    );
+    assert!(is_in_safe_context_decoded(html, payload));
+    // ...but still kept at a real href scheme-start.
+    let exec = "<a href=\"java\tscript:alert(1)\">x</a>";
+    assert!(!dangerous_scheme_reflection_is_inert(exec, payload));
+}
+
+#[test]
+fn test_scheme_fp_suppresses_self_link_query_raw() {
+    let payload = "javascript:alert(1)";
+    let html = "<a href=\"/p?next=javascript:alert(1)\">go</a>";
+    assert!(dangerous_scheme_reflection_is_inert(html, payload));
+    assert!(is_in_safe_context_decoded(html, payload));
+}
+
+#[test]
+fn test_scheme_fp_suppresses_body_text() {
+    // Bare scheme rendered as plain body text never navigates.
+    let payload = "javascript:alert(1)";
+    for html in [
+        "<div>You searched for: javascript:alert(1)</div>",
+        "<div>You searched for: javascript%3Aalert%281%29</div>",
+        "<p data-note=\"javascript:alert(1)\">x</p>", // non-URL attribute
+    ] {
+        assert!(
+            dangerous_scheme_reflection_is_inert(html, payload),
+            "inert scheme echo must be demoted: {html}"
+        );
+        assert!(is_in_safe_context_decoded(html, payload));
+    }
+}
+
+#[test]
+fn test_scheme_fp_keeps_executable_scheme_start() {
+    // A scheme at the start of a URL-valued attribute value navigates/executes
+    // and MUST be kept (no false negative).
+    let payload = "javascript:alert(1)";
+    for html in [
+        "<a href=\"javascript:alert(1)\">x</a>",
+        "<a href=javascript:alert(1)>x</a>", // unquoted
+        "<iframe src=\"javascript:alert(1)\"></iframe>",
+        "<a href=\"  javascript:alert(1)\">x</a>", // browser strips leading ws
+        "<a href=\"\tjavascript:alert(1)\">x</a>", // TAB stripped from URLs
+        "<svg><a xlink:href=\"javascript%3Aalert%281%29\"><text>x</text></a></svg>",
+        "<form action=\"javascript:alert(1)\"></form>",
+    ] {
+        assert!(
+            !dangerous_scheme_reflection_is_inert(html, payload),
+            "executable scheme-start must be kept: {html}"
+        );
+        assert!(
+            !is_in_safe_context_decoded(html, payload),
+            "executable scheme-start must not be suppressed: {html}"
+        );
+    }
+}
+
+#[test]
+fn test_scheme_fp_suppresses_strip_mutation_in_inert_positions() {
+    // dalfox's own protocol generator emits single-pass strip-bypass mutations
+    // (`javasscriptcript:` survives `replace("script","")`,
+    // `javascriptjavascript:` survives `replace("javascript","")`). Reflected
+    // VERBATIM (no server strip), the mutation is not a real scheme and is inert
+    // — e.g. echoed into a quoted NON-URL attribute (`<input value="...">`), body
+    // text, or a `data-*` attribute. It must be demoted exactly like the
+    // canonical `javascript:` is. Before this fix it surfaced as a [R] false
+    // positive (the sole finding on a properly quote-escaped `value=` route).
+    for (payload, html) in [
+        (
+            "javasscriptcript:alert(1)",
+            "<input value=\"javasscriptcript:alert(1)\">",
+        ),
+        (
+            "javascriptjavascript:alert(1)",
+            "<input value=\"javascriptjavascript:alert(1)\">",
+        ),
+        (
+            "javasscriptcript:alert(1)",
+            "<div>You searched for: javasscriptcript:alert(1)</div>",
+        ),
+        (
+            "javascriptjavascript:alert(1)",
+            "<p data-note=\"javascriptjavascript:alert(1)\">x</p>",
+        ),
+    ] {
+        assert!(
+            dangerous_scheme_reflection_is_inert(html, payload),
+            "inert strip-mutation echo must be demoted: payload={payload} html={html}"
+        );
+        assert!(
+            is_in_safe_context_decoded(html, payload),
+            "inert strip-mutation echo must be suppressed end-to-end: payload={payload} html={html}"
+        );
+    }
+}
+
+#[test]
+fn test_scheme_fp_keeps_strip_mutation_at_url_scheme_start() {
+    // The SAME mutation at a URL-valued attribute scheme-start is a live
+    // WAF-bypass candidate: if the server strips the doubling it reconstructs
+    // `javascript:` and navigates. It must be kept (no false negative).
+    for payload in ["javasscriptcript:alert(1)", "javascriptjavascript:alert(1)"] {
+        for html in [
+            format!("<a href=\"{payload}\">x</a>"),
+            format!("<iframe src=\"{payload}\"></iframe>"),
+        ] {
+            assert!(
+                !dangerous_scheme_reflection_is_inert(&html, payload),
+                "strip-mutation at a URL scheme-start must be kept: {html}"
+            );
+            assert!(
+                !is_in_safe_context_decoded(&html, payload),
+                "strip-mutation at a URL scheme-start must not be suppressed: {html}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_scheme_fp_keeps_scheme_in_script_navigation_sink() {
+    // A dangerous scheme echoed inside a <script> block can feed a JS navigation
+    // sink (`location.href = "javascript:..."`) and execute, even though it never
+    // sits at a URL-attribute scheme-start. The inert-scheme gate MUST NOT
+    // suppress it — let the JS-context / AST path decide executability.
+    //
+    // This drives the FULL `is_in_safe_context_decoded` path, not just the
+    // dangerous-scheme helper: `is_payload_inert_in_scripts` runs *first* there
+    // and, before the dangerous-scheme guard was added, suppressed all three of
+    // these end-to-end (its AST sink-call check does not model a passive scheme
+    // value assigned to `location.href`), making the helper-level carve-out dead
+    // code. Asserting through `is_in_safe_context_decoded` pins the real behavior.
+    let payload = "javascript:alert(1)";
+    for html in [
+        "<script>location.href = \"javascript:alert(1)\";</script>",
+        "<script>window.location = 'javascript:alert(1)';</script>",
+        "<script>var u = \"javascript:alert(1)\"; location.assign(u);</script>",
+    ] {
+        assert!(
+            !dangerous_scheme_reflection_is_inert(html, payload),
+            "scheme inside <script> must not be demoted as inert: {html}"
+        );
+        assert!(
+            !is_payload_inert_in_scripts(html, payload),
+            "is_payload_inert_in_scripts must not mask a <script> nav-sink scheme: {html}"
+        );
+        assert!(
+            !is_in_safe_context_decoded(html, payload),
+            "<script> nav-sink scheme must survive the full suppression pipeline: {html}"
+        );
+    }
+}
+
+#[test]
+fn test_scheme_fp_non_javascript_schemes_keep_at_scheme_start() {
+    // The other dangerous-scheme families (`data:text/html`, `data:image/svg`,
+    // `vbscript:`) were only exercised on the SUPPRESS path; pin the
+    // executable-KEEP direction too so a typo in those literals or a
+    // scheme-start regression can't silently drop their [R]/static-V.
+    for (payload, exec_html) in [
+        (
+            "data:text/html;base64,PHN2Zz4=",
+            "<iframe src=\"data:text/html;base64,PHN2Zz4=\"></iframe>",
+        ),
+        (
+            "data:image/svg+xml;base64,PHN2Zz4=",
+            "<object data=\"data:image/svg+xml;base64,PHN2Zz4=\"></object>",
+        ),
+        ("vbscript:msgbox(1)", "<a href=\"vbscript:msgbox(1)\">x</a>"),
+    ] {
+        assert!(
+            !dangerous_scheme_reflection_is_inert(exec_html, payload),
+            "scheme at a URL-attr value start must be kept: {exec_html}"
+        );
+        assert!(
+            !is_in_safe_context_decoded(exec_html, payload),
+            "executable scheme-start must not be suppressed: {exec_html}"
+        );
+        // ...and the same scheme echoed in a self-link query position is inert.
+        let inert_html = format!("<a href=\"/p?next={payload}\">go</a>");
+        assert!(
+            dangerous_scheme_reflection_is_inert(&inert_html, payload),
+            "scheme in a self-link query position is inert: {inert_html}"
+        );
+    }
+}
+
+#[test]
+fn test_scheme_fp_keeps_when_both_inert_and_executable_present() {
+    // An inert query echo co-existing with a real scheme-start href: keep.
+    let payload = "javascript:alert(1)";
+    let html =
+        "<a href=\"javascript:alert(1)\">x</a><link href=\"/s?u=javascript%3Aalert%281%29\">";
+    assert!(!dangerous_scheme_reflection_is_inert(html, payload));
+}
+
+#[test]
+fn test_scheme_fp_ignores_non_scheme_payloads() {
+    // The gate is scoped to dangerous URL schemes; other payloads are untouched.
+    assert!(!dangerous_scheme_reflection_is_inert(
+        "<div>hello world</div>",
+        "hello world"
+    ));
+    // Tag-bearing data: payload is out of scope (DOM/AST path handles it).
+    assert!(!dangerous_scheme_reflection_is_inert(
+        "<div>data:text/html,&lt;script&gt;</div>",
+        "data:text/html,<script>alert(1)</script>"
+    ));
+}
+
+#[test]
+fn test_scheme_at_url_attr_value_start_positions() {
+    // Direct unit coverage of the position helper.
+    let exec = "<a href=\"javascript:alert(1)\">"; // scheme at value start
+    let pos = exec.find("javascript:").unwrap();
+    assert!(scheme_at_url_attr_value_start(exec.as_bytes(), pos));
+
+    let query = "<a href=\"/p?x=javascript:alert(1)\">"; // mid-value (query)
+    let pos = query.find("javascript:").unwrap();
+    assert!(!scheme_at_url_attr_value_start(query.as_bytes(), pos));
+
+    let body = "<div>javascript:alert(1)</div>"; // not in any attribute
+    let pos = body.find("javascript:").unwrap();
+    assert!(!scheme_at_url_attr_value_start(body.as_bytes(), pos));
+}
+
+#[test]
+fn test_trapped_in_url_value_suppresses_scheme_mutations() {
+    // WAF-evasion scheme mutations a server echoes verbatim into a self-link
+    // query are inert (no quote/angle, not at scheme-start). Issue #1153.
+    let html = "<link rel=\"canonical\" href=\"/About.aspx?any=PAYLOAD\"><a href=\"/About.aspx?any=PAYLOAD\">home</a>";
+    for p in [
+        "javasscriptcript:alert(1)",
+        "java\tscript:alert(1)",
+        "vbscript:msgbox(1)",
+        "data:text/html;base64,x",
+    ] {
+        let h = html.replace("PAYLOAD", p);
+        assert!(
+            reflection_trapped_in_url_value(&h, p),
+            "verbatim self-link echo must be inert: {p}"
+        );
+        assert!(is_in_safe_context_decoded(&h, p));
+    }
+}
+
+#[test]
+fn test_trapped_in_url_value_keeps_breakout_and_scheme_start() {
+    // A quote in the payload could close the attribute -> keep.
+    let q = "<a href=\"/p?x=\";alert(1)\">x</a>";
+    assert!(!reflection_trapped_in_url_value(q, "\";alert(1)"));
+    // Scheme at the value start navigates -> keep.
+    let exec = "<a href=\"javascript:alert(1)\">x</a>";
+    assert!(!reflection_trapped_in_url_value(
+        exec,
+        "javascript:alert(1)"
+    ));
+    // Reflected in body text (not a URL attr) -> not this gate's job.
+    let body = "<div>foobar123</div>";
+    assert!(!reflection_trapped_in_url_value(body, "foobar123"));
+}
+
+#[test]
+fn test_trapped_in_url_value_suppresses_encoded_scheme_with_quotes_in_self_link() {
+    // Residual #1153 FP (verified against the live binary on a faithful ASP.NET
+    // repro): an entity-encoded, keyword-obfuscated `javascript:` WAF mutation —
+    // here `javascript:a["b"]`, whose *decoded* form carries `"` — is reflected
+    // PERCENT-encoded inside a self-link href query. The raw `"` never appears
+    // (only `%22` inside `%26%23x22%3B`), so it is inert text in the link's
+    // query and must be demoted. The original fix bailed on the decoded `"`.
+    let payload = "&#x6a;&#x61;&#x76;&#x61;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x3a;&#x61;&#x5b;&#x22;&#x62;&#x22;&#x5d;";
+    // Sanity: the html-entity-decoded form really does contain a break-out quote.
+    assert!(decode_html_entities(payload).contains('"'));
+    let html = format!(
+        "<link rel=\"canonical\" href=\"/About.aspx?any={enc}\"><a href=\"/About.aspx?any={enc}\">home</a>",
+        enc = urlencoding::encode(payload)
+    );
+    assert!(
+        reflection_trapped_in_url_value(&html, payload),
+        "encoded scheme-with-quotes trapped in a self-link query is inert"
+    );
+    // Drive the FULL gate chain, not just the helper (an earlier gate could
+    // mask this one — see the gate-chain masking lesson).
+    assert!(
+        is_in_safe_context_decoded(&html, payload),
+        "residual #1153 self-link [R] FP must be suppressed end-to-end"
+    );
+}
+
+#[test]
+fn test_trapped_in_url_value_keeps_literal_decoded_quote_breakout() {
+    // Counterpart (no false negative): when a payload's break-out form is
+    // reflected LITERALLY (a raw `"` that can close the attribute) the trapping
+    // gate must NOT suppress it — it is left to the tag/quote-aware gates / the
+    // reporter. The narrow new suppression only ever fires on the *encoded* form.
+    let payload = "&#x6a;&#x61;&#x76;&#x61;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x3a;&#x61;&#x5b;&#x22;&#x62;&#x22;&#x5d;";
+    let decoded = decode_html_entities(payload); // javascript:a["b"]
+    assert!(decoded.contains('"'));
+    let html = format!("<a href=\"/p?x={decoded}\">x</a>");
+    assert!(
+        !reflection_trapped_in_url_value(&html, payload),
+        "a literally-reflected raw quote must keep the trapping gate from suppressing"
+    );
+    // And a genuine tag break-out reflected literally is likewise never trapped.
+    let tag = "\"><img src=x onerror=alert(1)>";
+    let tag_html = format!("<a href=\"/p?x={tag}\">x</a>");
+    assert!(!reflection_trapped_in_url_value(&tag_html, tag));
+    assert!(!is_in_safe_context_decoded(&tag_html, tag));
+}
+
+#[test]
+fn test_trapped_in_url_value_keeps_encoded_scheme_at_value_start() {
+    // No false negative: an entity-encoded scheme at the href value START
+    // decodes to `javascript:` in the browser and executes — must be kept even
+    // though it is encoded in the source.
+    let payload = "&#x6a;&#x61;&#x76;&#x61;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x3a;&#x61;&#x6c;&#x65;&#x72;&#x74;&#x28;&#x31;&#x29;";
+    let html = format!("<a href=\"{payload}\">x</a>");
+    assert!(
+        !reflection_trapped_in_url_value(&html, payload),
+        "entity scheme at the value start is executable and must be kept"
+    );
+    assert!(!is_in_safe_context_decoded(&html, payload));
+}
+
+#[test]
+fn test_occurrence_inside_url_attr_value_handles_query_string() {
+    // The href value contains `=`/`?`/`&`; the occurrence is still inside it.
+    let h = "<a href=\"/About.aspx?hello=visitor&any=zzmarker\">x</a>";
+    let pos = h.find("zzmarker").unwrap();
+    assert!(occurrence_inside_url_attr_value(h.as_bytes(), pos));
+    // Non-URL attribute value -> false.
+    let h2 = "<input value=\"zzmarker\">";
+    let pos2 = h2.find("zzmarker").unwrap();
+    assert!(!occurrence_inside_url_attr_value(h2.as_bytes(), pos2));
+    // Body text -> false.
+    let h3 = "<p>zzmarker</p>";
+    let pos3 = h3.find("zzmarker").unwrap();
+    assert!(!occurrence_inside_url_attr_value(h3.as_bytes(), pos3));
+}
+
+/// One long quoted URL value holding many echoes made every occurrence walk
+/// back to the opening quote (occurrences x value length). The walk is floored
+/// like its siblings; past the floor the finding is kept, never suppressed.
+#[test]
+fn test_url_value_backwalk_is_bounded_and_keeps_the_finding() {
+    let payload = "x onmouseover=alert(1) y";
+    let filler = "A".repeat(MAX_ATTR_BACKWALK + 1024);
+    let mut html = String::from("<a href=\"/");
+    for _ in 0..500 {
+        html.push_str(&filler);
+        html.push_str(payload);
+    }
+    html.push_str("\">x</a>");
+
+    let start = std::time::Instant::now();
+    assert!(
+        !is_in_safe_context_decoded(&html, payload),
+        "an echo the walk cannot place must keep the finding"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "backwalk took {:?}",
+        start.elapsed()
+    );
+
+    // Within the floor the verdict is unchanged: trapped in the href value.
+    let short = format!("<a href=\"/{payload}\">x</a>");
+    let pos = short.find(payload).unwrap();
+    assert!(occurrence_inside_url_attr_value(short.as_bytes(), pos));
+}
+
+/// `-e base64` / `-e zwsp` output echoed verbatim by a page that escapes its
+/// output is inert; it must not surface as [R]. Probe markers and plain
+/// alphanumeric tokens still classify, and a ZWSP payload that carries a raw
+/// structural character is left to the existing gates.
+#[test]
+fn test_classify_reflection_demotes_inert_base64_and_zwsp_echo() {
+    use crate::encoding::{base64_encode, zero_width_encode};
+    let b64 = base64_encode("javascript:alert(1)");
+    let zw = zero_width_encode("data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==");
+    assert!(zw.contains('\u{200B}'));
+    for payload in [b64.as_str(), zw.as_str()] {
+        let html = format!("<input value=\"{payload}\">");
+        assert_eq!(classify_reflection(&html, payload), None, "{payload:?}");
+    }
+
+    for marker in [
+        NUMERIC_PROBE_MARKER,
+        crate::scanning::markers::bracketed_marker(),
+        "abcdefgh12345678",
+    ] {
+        let html = format!("<p>{marker}</p>");
+        assert_eq!(
+            classify_reflection(&html, marker),
+            Some(ReflectionKind::Raw),
+            "{marker}"
+        );
+    }
+
+    let structural = zero_width_encode("<svg/onload=alert(1)>");
+    let html = format!("<p>{structural}</p>");
+    assert_eq!(
+        classify_reflection(&html, &structural),
+        Some(ReflectionKind::Raw)
+    );
+}
+
+#[test]
+fn test_attr_name_before_eq_is_bounded() {
+    assert_eq!(
+        attr_name_before_eq(b"<a href=", 7),
+        Some(b"href".as_slice())
+    );
+    let mut long = vec![b'A'; MAX_ATTR_NAME_LEN + 10];
+    long.push(b'=');
+    assert_eq!(attr_name_before_eq(&long, long.len() - 1), None);
+}
+
+// ---------------------------------------------------------------------------
+// `check_reflection_with_hpp_url` — the request path behind `--hpp`.
+//
+// This function had no test at all: every one of its branches (the
+// skip/ignore-status early returns, the redirect-Location check, the capped
+// body read, the safe-context demotion) was exercised only by a live `--hpp`
+// scan. It is also the one reflection entry point that takes a pre-built URL
+// string instead of deriving it from the target, so a malformed URL from
+// `build_hpp_url` degrades here rather than at the call site.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hpp_response_gate_requires_a_browser_executable_response_type() {
+    let markup_payload = "<script>alert(1)</script>";
+    let json = format!("{{\"q\":\"{markup_payload}\"}}");
+    assert!(!hpp_response_has_executable_reflection(
+        markup_payload,
+        "application/json",
+        &json
+    ));
+    assert!(!hpp_response_has_executable_reflection(
+        markup_payload,
+        "text/plain; charset=utf-8",
+        markup_payload
+    ));
+    assert!(hpp_response_has_executable_reflection(
+        markup_payload,
+        "text/html",
+        markup_payload
+    ));
+    assert!(!hpp_response_has_executable_reflection(
+        markup_payload,
+        "application/javascript",
+        markup_payload
+    ));
+    assert!(hpp_response_has_executable_reflection(
+        "alert(1);foo",
+        "application/javascript",
+        "alert(1);foo({\"data\":1})"
+    ));
+}
+
+/// Happy path: the duplicated-parameter URL is sent verbatim and the payload
+/// echoed by the server is classified as a reflection, with the body returned
+/// as evidence.
+#[tokio::test]
+async fn test_hpp_reflection_detects_echo_and_returns_body() {
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/raw");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+    // What `build_hpp_url(.., HppPosition::Last)` produces for this target.
+    let hpp_url = format!(
+        "http://{}:{}/reflect/raw?q=seed&q=DALFOXHPP",
+        addr.ip(),
+        addr.port()
+    );
+
+    let (kind, body) =
+        check_reflection_with_hpp_url(&client, &target, &param, "DALFOXHPP", &hpp_url, &args).await;
+
+    assert!(
+        kind.is_some(),
+        "duplicated param echo must classify as a reflection"
+    );
+    assert!(
+        body.unwrap_or_default().contains("DALFOXHPP"),
+        "the response body must be returned as evidence"
+    );
+}
+
+/// `--skip-xss-scanning` must short-circuit before any request is made, or the
+/// analysis-only modes (preflight, REST/MCP preflight) would still attack.
+#[tokio::test]
+async fn test_hpp_reflection_respects_skip_xss_scanning() {
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/raw");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.skip_xss_scanning = true;
+    let client = target.build_client_or_default();
+    let hpp_url = format!(
+        "http://{}:{}/reflect/raw?q=seed&q=DALFOXHPP",
+        addr.ip(),
+        addr.port()
+    );
+
+    let (kind, body) =
+        check_reflection_with_hpp_url(&client, &target, &param, "DALFOXHPP", &hpp_url, &args).await;
+
+    assert!(kind.is_none() && body.is_none());
+}
+
+/// A status code in `--ignore-return` must suppress the finding even though the
+/// body reflects — this is how users mute WAF block pages that echo the input.
+#[tokio::test]
+async fn test_hpp_reflection_honors_ignore_return() {
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/raw");
+    let param = make_param();
+    let mut args = default_scan_args();
+    args.ignore_return = vec![200];
+    let client = target.build_client_or_default();
+    let hpp_url = format!(
+        "http://{}:{}/reflect/raw?q=seed&q=DALFOXHPP",
+        addr.ip(),
+        addr.port()
+    );
+
+    let (kind, body) =
+        check_reflection_with_hpp_url(&client, &target, &param, "DALFOXHPP", &hpp_url, &args).await;
+
+    assert!(
+        kind.is_none() && body.is_none(),
+        "an ignored status must not produce a finding or leak the body"
+    );
+}
+
+/// A redirect whose `Location` carries the payload is a reflection too: the
+/// body is empty, so only the header check can catch it.
+#[tokio::test]
+async fn test_hpp_reflection_detects_payload_in_redirect_location() {
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/redirect/decoded");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+    let hpp_url = format!(
+        "http://{}:{}/redirect/decoded?q=seed&q=DALFOXHPP",
+        addr.ip(),
+        addr.port()
+    );
+
+    let (kind, evidence) =
+        check_reflection_with_hpp_url(&client, &target, &param, "DALFOXHPP", &hpp_url, &args).await;
+
+    assert!(
+        kind.is_some(),
+        "payload echoed into Location must be detected"
+    );
+    let evidence = evidence.unwrap_or_default();
+    assert!(
+        evidence.starts_with("/final?next=") && evidence.contains("DALFOXHPP"),
+        "the Location header must be returned as the evidence, got: {evidence}"
+    );
+}
+
+/// No echo -> no finding, but the body still comes back so callers can log it.
+#[tokio::test]
+async fn test_hpp_reflection_reports_no_kind_when_not_reflected() {
+    let addr = start_mock_server("stored").await;
+    let target = make_target(addr, "/reflect/none");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+    let hpp_url = format!(
+        "http://{}:{}/reflect/none?q=seed&q=DALFOXHPP",
+        addr.ip(),
+        addr.port()
+    );
+
+    let (kind, body) =
+        check_reflection_with_hpp_url(&client, &target, &param, "DALFOXHPP", &hpp_url, &args).await;
+
+    assert!(kind.is_none());
+    assert!(body.unwrap_or_default().contains("not reflected"));
+}
+
+/// The HPP URL arrives as an already-serialized string. If it fails to parse,
+/// the scan must fall back to the target URL rather than panic or skip the
+/// param silently — `build_hpp_url` writes raw payload bytes into the query, so
+/// an unparseable result is reachable, not theoretical.
+#[tokio::test]
+async fn test_hpp_reflection_falls_back_to_target_url_when_hpp_url_is_unparseable() {
+    let addr = start_mock_server("stored").await;
+    // Target URL already carries `?q=seed`, so the fallback request reflects
+    // "seed" and not the payload.
+    let target = make_target(addr, "/reflect/raw");
+    let param = make_param();
+    let args = default_scan_args();
+    let client = target.build_client_or_default();
+
+    let (kind, body) = check_reflection_with_hpp_url(
+        &client,
+        &target,
+        &param,
+        "DALFOXHPP",
+        ":::not a url:::",
+        &args,
+    )
+    .await;
+
+    assert!(
+        kind.is_none(),
+        "the fallback request carries no payload, so nothing must be reported"
+    );
+    assert!(
+        body.unwrap_or_default().contains("seed"),
+        "the fallback must have hit the target URL"
+    );
+}
+
+// --- URL-attribute back-walk budget ----------------------------------------
+
+#[test]
+fn url_attr_backwalk_length_is_bounded() {
+    // `MAX_PAYLOAD_OCCURRENCES` caps how many times the back-walk is *started*
+    // per body; it said nothing about how far each one runs. On a body with no
+    // `=`, `<` or `>` every walk ran to offset 0, so cost was
+    // occurrences × body-size — tens of seconds of byte comparison per
+    // parameter on a body a hostile target serves for free.
+    //
+    // This calls the looping helper directly and deliberately: the public
+    // `is_in_safe_context_decoded` chain is an ordered OR, and an earlier gate
+    // short-circuits before this loop is reached, while
+    // `marker_reflects_in_url_attr_only` returns after its first occurrence.
+    // Neither can expose the blowup, so neither is a valid regression site.
+    // Must decode to a dangerous scheme, or the function early-returns before
+    // ever reaching the occurrence loop this test is about.
+    let payload = "%6A%61%76%61%73%63%72%69%70%74%3Aalert1";
+    let filler = "A".repeat(1024);
+    let mut body = String::with_capacity(5 * 1024 * 1024);
+    for _ in 0..4200 {
+        body.push_str(&filler);
+        body.push_str(payload);
+    }
+    let start = std::time::Instant::now();
+    let _ = url_encoded_payload_reflects_in_unsafe_url_context(&body, payload);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs() < 5,
+        "bounded back-walk took {elapsed:?} on a {} MiB body",
+        body.len() / (1024 * 1024)
+    );
+}
+
+#[test]
+fn url_attr_backwalk_verdicts_are_unchanged_for_normal_markup() {
+    // The budget must not alter the answer for ordinary attribute distances.
+    let payload = "%6A%61%76%61%73%63%72%69%70%74%3Aalert(1)";
+    let in_href = format!(r#"<html><body><a href="{payload}">x</a></body></html>"#);
+    assert!(
+        url_encoded_payload_reflects_in_unsafe_url_context(&in_href, payload),
+        "an encoded javascript: URL inside href is an unsafe URL context"
+    );
+    let in_text = format!("<html><body><div>{payload}</div></body></html>");
+    assert!(
+        !url_encoded_payload_reflects_in_unsafe_url_context(&in_text, payload),
+        "the same bytes in body text are not"
+    );
+}
+
+#[test]
+fn payload_marker_present_detects_transformed_reflection() {
+    let class = crate::scanning::markers::class_marker();
+    // A doubled-angle payload the server collapsed to a single-angle tag: the
+    // whole payload no longer matches byte-exact, but the unique marker survived.
+    let payload = format!("<<svg class={class} onload=alert(1)>>");
+    let resp = format!("<body><svg class={class} onload=alert(1)></body>");
+    assert!(
+        classify_reflection(&resp, &payload).is_none(),
+        "byte-exact classification must miss the transformed payload (the gap this covers)"
+    );
+    assert!(
+        payload_marker_present(&resp, &payload),
+        "the surviving marker must be recognised as a reflection signal"
+    );
+    // Case-folded server (uppercased reflection) still matches.
+    assert!(
+        payload_marker_present(&resp.to_uppercase(), &payload),
+        "marker presence must tolerate ASCII case-folding"
+    );
+}
+
+#[test]
+fn payload_marker_present_is_false_without_the_marker() {
+    let class = crate::scanning::markers::class_marker();
+    // Payload carries the marker but the response does not echo it: not reflected.
+    let payload = format!("<<svg class={class} onload=alert(1)>>");
+    assert!(!payload_marker_present(
+        "<body>nothing here</body>",
+        &payload
+    ));
+    // Payload carries no marker at all: the predicate must never fire (it would
+    // otherwise match an unrelated `dalfox` substring in arbitrary page text).
+    assert!(!payload_marker_present(
+        "<body>class=dalfoxeries onload=alert(1)</body>",
+        "<svg onload=alert(1)>"
+    ));
+}
+
+/// `injection_response_suppressed` is the single copy of the status/header gates
+/// that the normal reflection branch and the `--sxss` branch both run. The
+/// `--sxss` branch previously had no gates at all, so these cases pin the shared
+/// contract directly rather than only through one branch's integration test.
+mod injection_response_gates {
+    use super::*;
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).expect("header name"),
+                HeaderValue::from_str(v).expect("header value"),
+            );
+        }
+        h
+    }
+
+    fn param(location: Location) -> Param {
+        Param::new("q", "seed", location)
+    }
+
+    fn ct(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, HeaderValue::from_str(value).expect("value"));
+        h
+    }
+
+    #[test]
+    fn ignore_return_suppresses_whatever_the_body_says() {
+        let mut args = default_scan_args();
+        args.ignore_return = vec![404];
+        assert!(injection_response_suppressed(
+            404,
+            &ct("text/html"),
+            &param(Location::Query),
+            &args
+        ));
+        // A status the operator did not exclude still goes through.
+        assert!(!injection_response_suppressed(
+            200,
+            &ct("text/html"),
+            &param(Location::Query),
+            &args
+        ));
+    }
+
+    #[test]
+    fn inert_data_content_types_are_suppressed_for_non_path_locations() {
+        let args = default_scan_args();
+        for location in [Location::Query, Location::Body, Location::Header] {
+            assert!(
+                injection_response_suppressed(
+                    200,
+                    &ct("application/json"),
+                    &param(location.clone()),
+                    &args
+                ),
+                "a JSON body renders as data, never markup ({:?})",
+                location
+            );
+        }
+        assert!(!injection_response_suppressed(
+            200,
+            &ct("text/html; charset=utf-8"),
+            &param(Location::Query),
+            &args
+        ));
+        // JSONP stays detectable — `application/javascript` is deliberately not
+        // treated as inert data.
+        assert!(!injection_response_suppressed(
+            200,
+            &ct("application/javascript"),
+            &param(Location::Query),
+            &args
+        ));
+    }
+
+    #[test]
+    fn text_plain_is_inert_with_or_without_nosniff() {
+        // `nosniff` is not what makes `text/plain` inert: a *supplied*
+        // `text/plain` can never be sniffed into `text/html` (see
+        // `content_type_is_never_markup`). Both spellings must
+        // suppress.
+        let args = default_scan_args();
+        assert!(injection_response_suppressed(
+            200,
+            &ct("text/plain"),
+            &param(Location::Query),
+            &args
+        ));
+        assert!(injection_response_suppressed(
+            200,
+            &headers(&[
+                ("content-type", "text/plain"),
+                ("x-content-type-options", "nosniff"),
+            ]),
+            &param(Location::Query),
+            &args
+        ));
+        // The carve-out stays: a typeless response IS sniffed, so it stays live.
+        assert!(!injection_response_suppressed(
+            200,
+            &headers(&[]),
+            &param(Location::Query),
+            &args
+        ));
+    }
+
+    #[test]
+    fn redirects_skip_the_inert_check_so_the_location_header_is_still_read() {
+        let args = default_scan_args();
+        // The body content-type describes the (usually empty) redirect body, not
+        // the redirect target, so it must not veto the caller's Location check.
+        assert!(!injection_response_suppressed(
+            302,
+            &ct("application/json"),
+            &param(Location::Query),
+            &args
+        ));
+    }
+
+    #[test]
+    fn path_injection_drops_redirects_and_non_markup_bodies() {
+        let args = default_scan_args();
+        let path = param(Location::Path);
+        assert!(injection_response_suppressed(
+            302,
+            &ct("text/html"),
+            &path,
+            &args
+        ));
+        assert!(injection_response_suppressed(
+            200,
+            &ct("application/json"),
+            &path,
+            &args
+        ));
+        assert!(!injection_response_suppressed(
+            200,
+            &ct("text/html; charset=utf-8"),
+            &path,
+            &args
+        ));
+        // A generated SVG executes inline scripts on top-level navigation.
+        assert!(!injection_response_suppressed(
+            200,
+            &ct("image/svg+xml"),
+            &path,
+            &args
+        ));
+        // No content-type at all: nothing to judge, let the body checks decide.
+        assert!(!injection_response_suppressed(
+            200,
+            &HeaderMap::new(),
+            &path,
+            &args
+        ));
+    }
+}
+
+/// `is_escaped_echo` answers one question — "did the server hand our exact
+/// payload back, escaped, in a position a browser can do nothing with?" — for
+/// two callers: the scan phases' inert-echo budgets (a *cost* signal, letting
+/// them see the transformed-but-inert echoes `classify_reflection` reports as
+/// no reflection) and the report gate (where such an echo is not a finding).
+/// Its safety is entirely in the cases it REFUSES to claim, so those get the
+/// most coverage here — a sanitizer that strips markup, a truncated echo, a
+/// `+`→space form decode, an event handler, a URL scheme position, an already
+/// executable URL value, an HTML-parsed `srcdoc`, a framework innerHTML sink.
+/// The status the reflection-phase budget needs rides on the return tuple of
+/// `check_reflection_with_response`, NOT on the public `ReflectionBody` —
+/// adding a required field there would break external exhaustive matches.
+/// These pin that the status is threaded correctly.
+mod status_path {
+    use super::*;
+
+    #[tokio::test]
+    async fn status_path_threads_200() {
+        let payload = "<svg/onload=alert(1)>";
+        let addr = start_mock_server("stored").await;
+        let target = make_target(addr, "/reflect/raw");
+        let param = make_param();
+        let args = default_scan_args();
+        let streak = std::sync::atomic::AtomicU32::new(0);
+
+        let (kind, _body, status, _) = check_reflection_with_response(
+            &target.build_client_or_default(),
+            &target,
+            &param,
+            payload,
+            &args,
+            &streak,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a 200 injection response must thread status 200"
+        );
+        assert!(kind.is_some(), "raw reflection must classify");
+    }
+
+    #[tokio::test]
+    async fn status_path_threads_4xx_block_status() {
+        // A 403 block page that echoes the escaped payload: the status path must
+        // surface 403 so the reflection budget can exclude it (a variant may
+        // still bypass). Reporting is unchanged — no finding either way.
+        let payload = "<svg/onload=alert(1)>";
+        let addr = start_mock_server("stored").await;
+        let target = make_target(addr, "/reflect/block-echo");
+        let param = make_param();
+        let args = default_scan_args();
+        let streak = std::sync::atomic::AtomicU32::new(0);
+
+        let (_kind, _body, status, _) = check_reflection_with_response(
+            &target.build_client_or_default(),
+            &target,
+            &param,
+            payload,
+            &args,
+            &streak,
+        )
+        .await;
+        assert_eq!(status, 403, "a 4xx block must thread its status out");
+    }
+}
+
+mod escaped_echo {
+    use super::*;
+
+    /// The DOM catalog's canonical tag payload shape, marker included.
+    const TAG_PAYLOAD: &str = "<svg onload=alert(1) class=dlxtest01>";
+    /// A quote break-out (no raw angle brackets).
+    const QUOTE_PAYLOAD: &str = "\";alert(1)//";
+
+    fn entity_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    }
+
+    fn page(inner: &str) -> String {
+        format!("<html><body><h1>Search</h1><div id=\"out\">{inner}</div></body></html>")
+    }
+
+    // --- Claims an escaped echo (the case the budget exists for) ---
+
+    #[test]
+    fn entity_escaped_tag_payload_is_an_escaped_echo() {
+        // The uniformly-escaping endpoint: `html.escape()` over the whole value.
+        // This is the shape that previously advanced no budget at all and made
+        // the DOM phase run its entire catalog for zero findings.
+        let html = page(&entity_escape(TAG_PAYLOAD));
+        assert!(
+            !html.contains(TAG_PAYLOAD),
+            "fixture must not contain the raw payload"
+        );
+        assert!(
+            classify_reflection(&html, TAG_PAYLOAD).is_none(),
+            "an entity-escaped echo is correctly not a reported reflection"
+        );
+        assert!(
+            is_escaped_echo(&html, TAG_PAYLOAD),
+            "a whole-payload entity-escaped echo must advance the inert budget"
+        );
+    }
+
+    #[test]
+    fn percent_escaped_tag_payload_is_an_escaped_echo() {
+        // The other output-escaping flavour: the value is percent-encoded into
+        // body text (a `%3Csvg…` echo renders as literal characters).
+        let encoded = TAG_PAYLOAD
+            .replace('<', "%3C")
+            .replace('>', "%3E")
+            .replace(' ', "%20")
+            .replace('(', "%28")
+            .replace(')', "%29")
+            .replace('=', "%3D");
+        let html = page(&encoded);
+        assert!(!html.contains(TAG_PAYLOAD));
+        assert!(
+            is_escaped_echo(&html, TAG_PAYLOAD),
+            "a whole-payload percent-escaped echo must advance the inert budget"
+        );
+    }
+
+    #[test]
+    fn entity_escaped_quote_breakout_is_an_escaped_echo() {
+        let html = page(&entity_escape(QUOTE_PAYLOAD));
+        assert!(
+            is_escaped_echo(&html, QUOTE_PAYLOAD),
+            "an entity-escaped quote break-out echo is inert and countable"
+        );
+    }
+
+    // --- Refuses to claim (recall guards) ---
+
+    #[test]
+    fn sanitizer_stripped_output_is_not_an_escaped_echo() {
+        // A whitelisting sanitizer REMOVES the dangerous markup instead of
+        // escaping it. Counting this would let the DOM phase retire before a
+        // late whitelisted verifier (the `<a href=javascript:>` class) is
+        // reached — the exact recall loss the strict byte-exact signal used to
+        // prevent by abstaining from every escaped reflection.
+        let stripped = page("<svg class=\"dlxtest01\"></svg>");
+        assert!(
+            !is_escaped_echo(&stripped, TAG_PAYLOAD),
+            "sanitizer-stripped markup must not be counted as an escaped echo"
+        );
+
+        // Same endpoint, the whitelisted shape that DOES survive: still not an
+        // escaped echo of the payload we sent.
+        let whitelisted = page("<a href=\"javascript:alert(1)\">x</a>");
+        assert!(!is_escaped_echo(&whitelisted, TAG_PAYLOAD));
+    }
+
+    #[test]
+    fn attribute_stripping_sanitizer_is_not_an_escaped_echo() {
+        // Escapes the tag but drops the handler — our bytes did not come back
+        // whole, so the endpoint is transforming, not merely escaping, and a
+        // different payload shape may still get through.
+        let html = page(&entity_escape("<svg class=dlxtest01>"));
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "an echo missing part of the payload must not be counted"
+        );
+    }
+
+    #[test]
+    fn truncated_echo_is_not_an_escaped_echo() {
+        // Server-side length limit: only a prefix comes back. The match must
+        // cover the whole payload, never a prefix.
+        let escaped = entity_escape(TAG_PAYLOAD);
+        let truncated = &escaped[..escaped.len() / 2];
+        let html = page(truncated);
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "a truncated echo must not be counted"
+        );
+    }
+
+    #[test]
+    fn raw_reflection_is_not_an_escaped_echo() {
+        // A byte-exact echo is `classify_reflection`'s business; this gate only
+        // covers the transformed case, so the two signals never double-count.
+        let html = page(TAG_PAYLOAD);
+        assert!(classify_reflection(&html, TAG_PAYLOAD).is_some());
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "a raw echo is already covered by classify_reflection"
+        );
+    }
+
+    #[test]
+    fn plus_to_space_form_decoding_alone_is_not_an_escaped_echo() {
+        // `+`→space neutralises nothing, so a view that only differs by that
+        // substitution is not evidence the server escaped its output.
+        let payload = "alert(1)+confirm(1)";
+        let html = page("alert(1) confirm(1)");
+        assert!(
+            !is_escaped_echo(&html, payload),
+            "a whitespace-only form decode must not count as escaping"
+        );
+    }
+
+    #[test]
+    fn unrelated_body_is_not_an_escaped_echo() {
+        let html = page("no results found");
+        assert!(!is_escaped_echo(&html, TAG_PAYLOAD));
+        assert!(!is_escaped_echo(&html, QUOTE_PAYLOAD));
+        assert!(!is_escaped_echo("", TAG_PAYLOAD));
+    }
+
+    #[test]
+    fn event_handler_context_is_not_an_escaped_echo() {
+        // The HTML parser decodes character references while building an `on*=`
+        // value and only then hands it to the JS engine, so an entity-escaped
+        // echo there executes — it is live, not inert.
+        let html = format!(
+            "<html><body><div onclick=\"{}\">x</div></body></html>",
+            entity_escape(QUOTE_PAYLOAD)
+        );
+        assert!(
+            !is_escaped_echo(&html, QUOTE_PAYLOAD),
+            "an escaped echo inside an event handler is live and must not be counted"
+        );
+    }
+
+    #[test]
+    fn url_attr_scheme_position_is_not_an_escaped_echo() {
+        // The echo IS the URL: the value starts with our payload, so a decoded
+        // executable scheme there navigates. Not provably inert.
+        let html = "<html><body><a href=\"%22;alert(1)//\">x</a></body></html>";
+        assert!(
+            !is_escaped_echo(html, QUOTE_PAYLOAD),
+            "an encoded echo at a URL attribute's scheme position must be kept"
+        );
+    }
+
+    #[test]
+    fn escaped_echo_in_a_self_link_query_is_inert() {
+        // The canonical/self-link shape: the href is rebuilt server-side from a
+        // hard-coded relative path plus the percent-encoded input, so the echo
+        // sits in the QUERY of a relative URL — the scheme position is
+        // unreachable and the escaped bytes cannot close the attribute. This is
+        // the `[R] reflected after URL/form decoding` false positive
+        // (`self_link`, `search_shell`, `meta_refresh`, `redirect_relative`).
+        let html = format!(
+            "<html><body><a href=\"/page/self_link?q={}\">permalink</a></body></html>",
+            urlencoding::encode(TAG_PAYLOAD)
+        );
+        assert!(
+            is_escaped_echo(&html, TAG_PAYLOAD),
+            "a percent-encoded echo in a relative URL's query is inert"
+        );
+    }
+
+    #[test]
+    fn escaped_echo_inside_an_executable_url_value_is_kept() {
+        // The attribute value already opens an executable scheme, so the
+        // browser decodes the entities INTO the document it executes — the echo
+        // is live even though it is not at the scheme position itself.
+        let html = format!(
+            "<html><body><a href=\"data:text/html,{}\">x</a></body></html>",
+            entity_escape(TAG_PAYLOAD)
+        );
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "an escaped echo inside a data:text/html URL is live and must be kept"
+        );
+    }
+
+    #[test]
+    fn escaped_echo_in_a_script_src_url_is_kept() {
+        // XSSMaze `domsource-level4`: the server only reflects into the
+        // `<script src>` URL, and the script reads it back out of
+        // `document.currentScript.src` into `document.write`. The echo is
+        // escaped and mid-URL, but it is a DOM taint source, not inert text.
+        let html = format!(
+            "<html><body><script src=\"/boot.js?msg={}\"></script></body></html>",
+            urlencoding::encode(TAG_PAYLOAD)
+        );
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "a payload in a <script src> URL is readable back as a DOM source"
+        );
+    }
+
+    #[test]
+    fn escaped_echo_in_an_iframe_src_url_is_kept() {
+        let html = format!(
+            "<html><body><iframe src=\"/frame?msg={}\"></iframe></body></html>",
+            urlencoding::encode(TAG_PAYLOAD)
+        );
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "a framed document can read back the URL it was loaded with"
+        );
+    }
+
+    #[test]
+    fn escaped_echo_inside_srcdoc_is_kept() {
+        // `srcdoc` is entity-decoded and then HTML-PARSED, so an escaped tag
+        // payload landing there becomes real markup in the iframe's document.
+        let html = format!(
+            "<html><body><iframe srcdoc=\"{}\"></iframe></body></html>",
+            entity_escape(TAG_PAYLOAD)
+        );
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "an escaped tag payload inside srcdoc is live and must be kept"
+        );
+    }
+
+    #[test]
+    fn marker_attribute_payload_echoed_in_text_is_demoted() {
+        // `x onmouseover=alert(1) class=dlx…` rendered as a text node: it has no
+        // structural character of its own, so it cannot open a tag and — with
+        // no quote — cannot leave a quoted attribute either. The `class=` marker
+        // it carries only means anything as an attribute of an injected element.
+        let payload = format!(
+            "x onmouseover=alert(1) class={}",
+            crate::scanning::markers::class_marker()
+        );
+        let html =
+            format!("<html><body><p>No results for <strong>{payload}</strong>.</p></body></html>");
+        assert!(
+            is_in_safe_context_decoded(&html, &payload),
+            "a marker attribute payload echoed as text must be demoted"
+        );
+    }
+
+    #[test]
+    fn marker_attribute_payload_inside_a_tag_is_kept() {
+        // The same payload after an UNQUOTED attribute value: the browser parses
+        // it as new attributes on that element, so the handler is live.
+        let payload = format!(
+            "x onmouseover=alert(1) class={}",
+            crate::scanning::markers::class_marker()
+        );
+        let html = format!("<html><body><input value={payload}></body></html>");
+        assert!(
+            !is_in_safe_context_decoded(&html, &payload),
+            "an attribute payload inside a tag must stay reported"
+        );
+    }
+
+    #[test]
+    fn one_in_tag_occurrence_keeps_a_mostly_textual_echo() {
+        // Multi-echo page: every occurrence has to be inert, not most of them.
+        let payload = format!(
+            "x onmouseover=alert(1) class={}",
+            crate::scanning::markers::class_marker()
+        );
+        let html = format!("<html><body><p>{payload}</p><input value={payload}></body></html>");
+        assert!(
+            !is_in_safe_context_decoded(&html, &payload),
+            "a single in-tag occurrence must keep the finding"
+        );
+    }
+
+    #[test]
+    fn quote_free_probe_markers_are_never_demoted_by_the_text_gate() {
+        // The reflection PROBES are quote-free and land in text — there a text
+        // echo is the signal the pipeline runs on, so the gate must not touch
+        // them. (`is_in_safe_context_decoded` may still demote them for another
+        // reason; this asserts the text gate itself abstains.)
+        for probe in [
+            crate::scanning::markers::bracketed_marker().to_string(),
+            "DALFOXHPP".to_string(),
+            "STORED_XSS_PAYLOAD".to_string(),
+        ] {
+            let html = format!("<html><body><p>{probe}</p></body></html>");
+            assert!(
+                !crate::scanning::check_reflection::raw_reflection_inert_in_text(&html, &probe),
+                "probe marker {probe} must not be demoted as an inert text echo"
+            );
+        }
+    }
+
+    #[test]
+    fn script_block_echo_of_a_marker_payload_is_kept_by_the_text_gate() {
+        // A quote-free payload inside <script> is live JavaScript; that context
+        // belongs to `is_payload_inert_in_scripts` and its AST check, not here.
+        let payload = format!("-alert(1)-{}", crate::scanning::markers::class_marker());
+        let html = format!("<html><body><script>var q = {payload};</script></body></html>");
+        assert!(
+            !crate::scanning::check_reflection::raw_reflection_inert_in_text(&html, &payload),
+            "a script-block echo must not be treated as an inert text echo"
+        );
+    }
+
+    #[test]
+    fn report_gate_demotes_an_inert_escaped_echo_and_keeps_a_live_one() {
+        // End-to-end through the ordered OR-chain the scan actually calls, not
+        // just the helper: an earlier gate must not mask this one, and a live
+        // landing site must survive the whole chain.
+        let inert = format!(
+            "<html><body><a href=\"/s?q={}\">x</a><p>{}</p></body></html>",
+            urlencoding::encode(TAG_PAYLOAD),
+            entity_escape(TAG_PAYLOAD)
+        );
+        assert!(
+            is_in_safe_context_decoded(&inert, TAG_PAYLOAD),
+            "a whole-payload escaped echo in inert positions must be demoted"
+        );
+
+        let live = format!(
+            "<html><body><iframe srcdoc=\"{}\"></iframe></body></html>",
+            entity_escape(TAG_PAYLOAD)
+        );
+        assert!(
+            !is_in_safe_context_decoded(&live, TAG_PAYLOAD),
+            "an escaped echo in an HTML-parsed attribute must stay reported"
+        );
+    }
+
+    #[test]
+    fn short_payloads_are_never_an_escaped_echo() {
+        // A couple of bytes occur incidentally in any decoded view of a real
+        // page, so a whole-payload match on one proves nothing.
+        let html = page("&quot;&gt;");
+        assert!(!is_escaped_echo(&html, "\">"));
+        assert!(!is_escaped_echo(&html, "'>"));
+        assert!(!is_escaped_echo(&html, ""));
+    }
+
+    // --- Framework innerHTML sinks (v-html / ng-bind-html / [innerHTML] /
+    //     Knockout html:) decode entities into markup at runtime, so an
+    //     entity-escaped tag payload landing in one is LIVE, not inert, and must
+    //     never be counted toward the budget. ---
+
+    #[test]
+    fn entity_escaped_payload_in_vhtml_is_not_an_escaped_echo() {
+        // `<div v-html="&lt;svg onload=alert(1)&gt;">`: Vue entity-decodes the
+        // binding and assigns it to innerHTML, so the svg fires.
+        let html = format!(
+            "<html><body><div v-html=\"{}\"></div></body></html>",
+            entity_escape(TAG_PAYLOAD)
+        );
+        assert!(
+            !html.contains(TAG_PAYLOAD),
+            "fixture must carry only the escaped form"
+        );
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "an escaped tag payload inside a v-html sink is live and must be kept"
+        );
+    }
+
+    #[test]
+    fn entity_escaped_payload_in_knockout_html_binding_is_not_an_escaped_echo() {
+        // Server reflects into a Knockout `html:` clause value; the HTML parser
+        // decodes the entities while building the `data-bind` attribute, so
+        // Knockout sets innerHTML to `<svg onload=alert(1)>` and it fires.
+        let html = format!(
+            "<html><body><div data-bind=\"html: '{}'\"></div></body></html>",
+            entity_escape(TAG_PAYLOAD)
+        );
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "an escaped payload inside a Knockout html: binding must be kept"
+        );
+    }
+
+    #[test]
+    fn entity_escaped_payload_in_ng_bind_html_is_not_an_escaped_echo() {
+        let html = format!(
+            "<html><body><div ng-bind-html=\"{}\"></div></body></html>",
+            entity_escape(TAG_PAYLOAD)
+        );
+        assert!(
+            !is_escaped_echo(&html, TAG_PAYLOAD),
+            "an escaped tag payload inside ng-bind-html is live and must be kept"
+        );
+    }
+
+    #[test]
+    fn escaped_echo_in_plain_text_still_counts_despite_a_framework_page() {
+        // Control: the SAME escaped payload in ordinary body text (no sink
+        // binding on the element it lands in) is genuinely inert and must still
+        // count — the framework carve-out must not swallow the common case.
+        let html = format!(
+            "<html><body><div id=\"out\">{}</div></body></html>",
+            entity_escape(TAG_PAYLOAD)
+        );
+        assert!(
+            is_escaped_echo(&html, TAG_PAYLOAD),
+            "an escaped echo in plain text is inert and must still advance the budget"
+        );
+    }
+}
+
+/// The stored-XSS check fetches each candidate URL with the operator's headers
+/// and cookies attached, so a page-derived `form_action_url` pointing off-origin
+/// must not become a candidate. `--sxss-url` is deliberately exempt: that one is
+/// the operator's own choice.
+#[test]
+fn resolve_sxss_check_urls_drops_a_cross_origin_form_action() {
+    let target = parse_target("https://example.com/page").unwrap();
+    let args = default_scan_args();
+
+    for action in [
+        "https://attacker.example/collect",
+        "https://attacker.example\\@example.com/collect",
+    ] {
+        let param = Param {
+            form_action_url: Some(action.to_string()),
+            form_origin_url: Some("https://example.com/page".to_string()),
+            ..Param::new("comment", "", Location::Body)
+        };
+        let urls = resolve_sxss_check_urls(&target, &param, &args);
+        assert!(
+            urls.iter().all(|u| u.host_str() == Some("example.com")),
+            "cross-origin action {action} leaked into the sxss check URLs: {:?}",
+            urls.iter().map(|u| u.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    // A same-origin action is still checked, so the assertion above cannot pass
+    // by the list simply being empty.
+    let param = Param {
+        form_action_url: Some("https://example.com/stored".to_string()),
+        form_origin_url: Some("https://example.com/page".to_string()),
+        ..Param::new("comment", "", Location::Body)
+    };
+    let urls = resolve_sxss_check_urls(&target, &param, &args);
+    assert!(
+        urls.iter()
+            .any(|u| u.as_str() == "https://example.com/stored"),
+        "same-origin action must still be checked, got {:?}",
+        urls.iter().map(|u| u.as_str()).collect::<Vec<_>>()
+    );
+}
+
+/// Counterpart to the cross-origin test: a same-host `http` -> `https` action is
+/// not foreign, and must still be fetched as a stored-XSS check URL.
+#[test]
+fn resolve_sxss_check_urls_keeps_a_same_host_tls_upgrade() {
+    let target = parse_target("http://example.com/page").unwrap();
+    let param = Param {
+        form_action_url: Some("https://example.com/stored".to_string()),
+        form_origin_url: Some("http://example.com/page".to_string()),
+        ..Param::new("comment", "", Location::Body)
+    };
+    let urls = resolve_sxss_check_urls(&target, &param, &default_scan_args());
+    assert!(
+        urls.iter()
+            .any(|u| u.as_str() == "https://example.com/stored"),
+        "TLS-upgraded action must still be checked, got {:?}",
+        urls.iter().map(|u| u.as_str()).collect::<Vec<_>>()
+    );
+}
+
+/// The script range starts after the open tag's real `>`: an attribute value
+/// holding `>` is not script content.
+#[test]
+fn test_script_block_ranges_skip_quoted_gt_in_open_tag() {
+    let html = r#"<script data-x="a>b">var x=1;</script>"#;
+    let ranges = script_block_ranges(html);
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(&html[ranges[0].0..ranges[0].1], "var x=1;");
+}

@@ -1,0 +1,655 @@
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
+/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;
+/*!40103 SET TIME_ZONE='+00:00' */;
+/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;
+/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;
+/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;
+DELIMITER ;;
+
+--
+-- Dumping routines for database 'echoCTF'
+--
+DROP FUNCTION IF EXISTS `NTOHS` ;;
+CREATE FUNCTION `NTOHS`(n SMALLINT UNSIGNED) RETURNS smallint(5) unsigned
+    DETERMINISTIC
+return ((((n & 0xFF)) << 8) | ((n & 0xFF00) >> 8)) ;;
+
+DROP FUNCTION IF EXISTS `SPLIT_STR` ;;
+CREATE FUNCTION `SPLIT_STR`(x VARCHAR(255), delim VARCHAR(12),  pos INT) RETURNS varchar(255) CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci
+    DETERMINISTIC
+RETURN REPLACE(SUBSTRING(SUBSTRING_INDEX(x, delim, pos),
+       LENGTH(SUBSTRING_INDEX(x, delim, pos -1)) + 1),
+       delim, '') ;;
+
+DROP FUNCTION IF EXISTS `target_solved_percentage` ;;
+CREATE FUNCTION `target_solved_percentage`(n INT UNSIGNED) RETURNS float
+    READS SQL DATA
+BEGIN
+  DECLARE average_pct float;
+  SET average_pct=(select ((select count(*) from headshot where target_id=n)*100)/count(distinct player_id) from stream where (model='finding' and model_id in (select id from finding where target_id=n)) or (model='treasure' and model_id in (select id from treasure where target_id=n)));
+  RETURN average_pct;
+  END ;;
+
+DROP FUNCTION IF EXISTS `target_started_count` ;;
+CREATE FUNCTION `target_started_count`(n INT UNSIGNED) RETURNS int(11)
+    READS SQL DATA
+BEGIN
+DECLARE counter INT;
+SET counter=(select count(distinct player_id) from stream where (model='finding' and model_id in (select id from finding where target_id=n)) or (model='treasure' and model_id in (select id from treasure where target_id=n)));
+RETURN counter;
+END ;;
+
+
+DROP FUNCTION IF EXISTS `TS_AGO` ;;
+CREATE FUNCTION `TS_AGO`(x TIMESTAMP) RETURNS varchar(255) CHARSET utf8mb4 COLLATE utf8mb4_unicode_ci
+    DETERMINISTIC
+BEGIN
+  DECLARE minutes,seconds,hours,months,days INTEGER;
+  DECLARE msg CHAR(255);
+  SET seconds=timestampdiff(SECOND,x,now())%60;
+  set months=timestampdiff(MONTH,x,now());
+  set days=timestampdiff(DAY,x,now());
+  set minutes=timestampdiff(MINUTE,x,now())%60;
+  set hours=timestampdiff(HOUR,x,now())%24;
+  SET msg='';
+  IF months>1 THEN
+  RETURN CONCAT(months,' months ago');
+  ELSEIF months>0 THEN
+  RETURN CONCAT(months,' month ago');
+  END IF;
+
+  IF days>1 THEN
+  RETURN CONCAT(days,' days ago');
+  elseif days>0 then
+  RETURN CONCAT(days,' day ago');
+  END IF;
+
+  IF hours>1 THEN
+  RETURN CONCAT(hours,' hours ago');
+  ELSEIF hours>0 THEN
+  RETURN CONCAT(hours,' hour ago');
+  END IF;
+
+  IF minutes>1 THEN
+  RETURN CONCAT(minutes, ' minutes ago');
+  ELSEIF minutes>0 THEN
+  RETURN CONCAT(minutes, ' minute ago');
+  END IF;
+
+  IF seconds>1 THEN
+  RETURN CONCAT(seconds, ' seconds ago');
+  END IF;
+  RETURN CONCAT(' just now');
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `add_badge_stream` ;;
+CREATE PROCEDURE `add_badge_stream`(IN usid BIGINT, IN tbl VARCHAR(255), IN recid INT)
+BEGIN
+  DECLARE ltitle,lpubtitle VARCHAR(255);
+  DECLARE lmessage,lpubmessage TEXT;
+  DECLARE pts BIGINT;
+  SELECT name,pubname,description,pubdescription,points INTO ltitle,lpubtitle,lmessage,lpubmessage,pts FROM badge WHERE id=recid;
+  INSERT INTO stream (player_id,model,model_id,points,title,message,pubtitle,pubmessage,ts) VALUES (usid,'badge',recid,pts,ltitle,lmessage,lpubtitle,lpubmessage,now());
+END ;;
+
+DROP PROCEDURE IF EXISTS `add_finding_stream` ;;
+CREATE PROCEDURE `add_finding_stream`(IN usid BIGINT, IN tbl VARCHAR(255), IN recid INT, IN pts FLOAT)
+BEGIN
+  DECLARE ltitle,lpubtitle VARCHAR(255);
+  DECLARE lmessage,lpubmessage TEXT;
+  DECLARE ltid BIGINT;
+  SELECT name,pubname,description,pubdescription,target_id INTO ltitle,lpubtitle,lmessage,lpubmessage,ltid FROM finding WHERE id=recid;
+  INSERT INTO stream (player_id,model,model_id,points,title,message,pubtitle,pubmessage,ts) VALUES (usid,'finding',recid,pts,ltitle,lmessage,lpubtitle,lpubmessage,now());
+END ;;
+
+DROP PROCEDURE IF EXISTS `add_player_finding_hint` ;;
+CREATE PROCEDURE `add_player_finding_hint`(p_id INT,f_id INT)
+BEGIN
+  INSERT INTO player_hint(player_id,hint_id)
+  SELECT p_id, id
+  FROM hint
+  WHERE
+    id NOT IN (SELECT hint_id FROM player_hint WHERE player_id = p_id)
+     AND finding_id=f_id
+     AND badge_id IS NULL
+     AND treasure_id IS NULL
+     AND `active`=1;
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `add_player_treasure_hint` ;;
+CREATE PROCEDURE `add_player_treasure_hint`(p_id INT,f_id INT)
+BEGIN
+  INSERT INTO player_hint(player_id,hint_id)
+  SELECT p_id, id	FROM hint
+  WHERE id NOT IN (SELECT hint_id FROM player_hint WHERE player_id = p_id)
+  AND treasure_id=f_id
+  AND badge_id IS NULL
+  AND finding_id IS NULL
+  AND `active`=1;
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `add_question_stream` ;;
+CREATE PROCEDURE `add_question_stream`(IN usid BIGINT, IN tbl VARCHAR(255), IN recid INT)
+BEGIN
+  DECLARE lname VARCHAR(255);
+  DECLARE ldescription TEXT;
+  DECLARE divider INTEGER DEFAULT 1;
+  DECLARE pts BIGINT;
+  SELECT name,description,points INTO lname,ldescription,pts FROM question WHERE id=recid;
+  INSERT INTO stream (player_id,model,model_id,points,title,message,pubtitle,pubmessage,ts) VALUES (usid,'question',recid,pts,lname,ldescription,lname,ldescription,now());
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `add_report_stream` ;;
+CREATE PROCEDURE `add_report_stream`(IN usid BIGINT, IN tbl VARCHAR(255), IN recid INT)
+BEGIN
+  DECLARE `ltitle`, `lstatus`,`lpubtitle` VARCHAR(255);
+  DECLARE lbody,lmodcomment,lpubbody TEXT;
+  DECLARE pts BIGINT;
+  select  `title`, `body`, `status`, `points`, `modcomment`, `pubtitle`, `pubbody` INTO `ltitle`, `lbody`, `lstatus`, `pts`, `lmodcomment`, `lpubtitle`, `lpubbody`  FROM report WHERE id=recid;
+  INSERT INTO stream (player_id,model,model_id,points,title,message,pubtitle,pubmessage,ts) VALUES (usid,'report',recid,pts,ltitle,lbody,lpubtitle,lpubbody,now());
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `add_stream` ;;
+CREATE PROCEDURE `add_stream`(IN usid BIGINT, IN tbl VARCHAR(255), IN recid INT)
+BEGIN
+  CASE tbl
+--  WHEN 'user' THEN CALL add_user_stream(usid,tbl,recid);
+  WHEN 'finding' THEN CALL add_finding_stream(usid,tbl,recid);
+  WHEN 'treasure' THEN CALL add_treasure_stream(usid,tbl,recid);
+  WHEN 'question' THEN CALL add_question_stream(usid,tbl,recid);
+  WHEN 'badge' THEN CALL add_badge_stream(usid,tbl,recid);
+--  WHEN 'headshot' THEN CALL add_headshot_stream(usid,tbl,recid);
+--  WHEN 'challenge' THEN CALL add_challenge_stream(usid,tbl,recid);
+  WHEN 'report' THEN CALL add_report_stream(usid,tbl,recid);
+  END CASE;
+END ;;
+
+DROP PROCEDURE IF EXISTS `add_treasure_stream` ;;
+CREATE PROCEDURE `add_treasure_stream`(IN usid BIGINT, IN tbl VARCHAR(255), IN recid INT, IN pts FLOAT)
+BEGIN
+  DECLARE ltitle,lpubtitle VARCHAR(255);
+  DECLARE lmessage,lpubmessage TEXT;
+  DECLARE divider INTEGER DEFAULT 1;
+  DECLARE ltid BIGINT;
+
+  SELECT name,pubname,description,pubdescription,target_id INTO ltitle,lpubtitle,lmessage,lpubmessage,ltid FROM treasure WHERE id=recid;
+  INSERT INTO stream (player_id,model,model_id,points,title,message,pubtitle,pubmessage,ts) VALUES (usid,'treasure',recid,pts,ltitle,lmessage,lpubtitle,lpubmessage,now());
+END ;;
+
+DROP PROCEDURE IF EXISTS `calculate_country_rank` ;;
+CREATE PROCEDURE `calculate_country_rank`()
+BEGIN
+  IF (SELECT val FROM sysconfig WHERE id='country_rankings') = 1 THEN
+    DROP TABLE IF EXISTS player_country_rank_new;
+    CREATE TABLE player_country_rank_new (
+      `id` int(11) NOT NULL DEFAULT 0,
+      `player_id` int(11) unsigned NOT NULL,
+      `country` varchar(3) NOT NULL,
+      PRIMARY KEY (`id`,`country`),
+      UNIQUE KEY `idx-player_country_rank-player_id` (`player_id`)
+    ) ENGINE=MEMORY DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+    INSERT INTO player_country_rank_new (id, player_id, country)
+    SELECT ROW_NUMBER() OVER (PARTITION BY COALESCE(t3.country, 'UNK') ORDER BY t.points DESC, t.ts ASC, t.player_id ASC),
+           t3.player_id, COALESCE(t3.country, 'UNK')
+    FROM player_score t
+    JOIN player t2 ON t.player_id = t2.id
+    JOIN profile t3 ON t.player_id = t3.player_id
+    WHERE t2.active = 1 AND t2.status = 10;
+
+    RENAME TABLE player_country_rank TO player_country_rank_old, player_country_rank_new TO player_country_rank;
+    DROP TABLE player_country_rank_old;
+  END IF;
+END ;;
+
+DROP PROCEDURE IF EXISTS `calculate_ranks` ;;
+CREATE PROCEDURE `calculate_ranks`()
+BEGIN
+  DROP TABLE IF EXISTS player_rank_new;
+  CREATE TABLE player_rank_new (
+    `id` int(11) unsigned NOT NULL DEFAULT 0,
+    `player_id` int(11) NOT NULL,
+    PRIMARY KEY (`id`,`player_id`) USING BTREE,
+    UNIQUE KEY `player_id` (`player_id`) USING BTREE
+  ) ENGINE=MEMORY DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  INSERT INTO player_rank_new (id, player_id)
+  SELECT ROW_NUMBER() OVER (PARTITION BY t2.academic ORDER BY t.points DESC, t.ts ASC, t.player_id ASC), t.player_id
+  FROM player_score t
+  JOIN player t2 ON t.player_id=t2.id
+  WHERE t2.active=1 AND t2.status=10;
+
+  RENAME TABLE player_rank TO player_rank_old, player_rank_new TO player_rank;
+  DROP TABLE player_rank_old;
+END ;;
+
+DROP PROCEDURE IF EXISTS `calculate_team_ranks` ;;
+CREATE PROCEDURE `calculate_team_ranks`()
+BEGIN
+  IF (SELECT val FROM sysconfig WHERE id='teams') = 1 THEN
+    DROP TABLE IF EXISTS team_rank_new;
+    CREATE TABLE team_rank_new (
+      `id` int(11) NOT NULL DEFAULT 0,
+      `team_id` int(11) NOT NULL,
+      PRIMARY KEY (`id`,`team_id`) USING BTREE,
+      UNIQUE KEY `team_id` (`team_id`) USING BTREE
+    ) ENGINE=MEMORY DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+    INSERT INTO team_rank_new (id, team_id)
+    SELECT ROW_NUMBER() OVER (PARTITION BY t2.academic ORDER BY t.points DESC, t.ts ASC, t.team_id ASC), t.team_id
+    FROM team_score t
+    JOIN team t2 ON t.team_id=t2.id;
+
+    RENAME TABLE team_rank TO team_rank_old, team_rank_new TO team_rank;
+    DROP TABLE team_rank_old;
+  END IF;
+END ;;
+
+DROP PROCEDURE IF EXISTS `expire_player_tokens` ;;
+CREATE PROCEDURE `expire_player_tokens`()
+BEGIN
+  DECLARE tnow TIMESTAMP;
+  SET tnow=NOW();
+  IF (SELECT COUNT(*) FROM player_token WHERE expires_at<tnow and `type`='API')>0 THEN
+    START TRANSACTION;
+    INSERT INTO notification (player_id,category,title,body,archived,created_at,updated_at) SELECT player_id,'info','Token expiration',CONCAT(type,' Token [',description,'] expired at ',expires_at),0,tnow,tnow FROM player_token WHERE expires_at<tnow and `type`='API';
+    DELETE FROM player_token WHERE expires_at<tnow and `type`='API';
+    COMMIT;
+  END IF;
+  IF (SELECT COUNT(*) FROM player_token WHERE expires_at<tnow)>0 THEN
+    DELETE FROM player_token WHERE expires_at<tnow;
+  END IF;
+END ;;
+
+DROP PROCEDURE IF EXISTS `give_all_challenge_solver` ;;
+CREATE PROCEDURE `give_all_challenge_solver`()
+BEGIN
+  DECLARE done INT DEFAULT FALSE;
+  DECLARE lpid,lcid,local_challenge_id INT DEFAULT 0;
+  DECLARE cur1 CURSOR FOR SELECT t.player_id,t2.challenge_id FROM player_question t LEFT JOIN question AS t2 ON t2.id=t.question_id GROUP BY t.player_id,t2.challenge_id;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+  OPEN cur1;
+  read_loop: LOOP
+    FETCH cur1 INTO lpid,lcid;
+    IF done THEN
+      LEAVE read_loop;
+    END IF;
+    CALL give_challenge_solver(lpid,lcid,0);
+  END LOOP;
+
+  CLOSE cur1;
+END ;;
+
+DROP PROCEDURE IF EXISTS `give_challenge_solver` ;;
+CREATE PROCEDURE `give_challenge_solver`(IN pid INT, IN tid INT, IN ttimer INT)
+BEGIN
+  DECLARE completed INT default null;
+  DECLARE min_question,max_question, max_val, min_val DATETIME default null;
+
+  SET completed=(select true as completed FROM challenge as t left join question as t2 on t2.challenge_id=t.id LEFT JOIN player_question as t4 on t4.question_id=t2.id and t4.player_id=pid WHERE t.id=tid GROUP BY t.id HAVING count(distinct t2.id)=count(distinct t4.question_id));
+  IF completed IS NOT NULL and completed=true THEN
+    SELECT min(ts),max(ts) INTO min_question,max_question FROM player_question WHERE player_id=pid AND question_id IN (SELECT id FROM question WHERE challenge_id=tid);
+    SELECT GREATEST(max_question, min_question), LEAST(min_question, max_question) INTO max_val,min_val;
+    INSERT IGNORE INTO challenge_solver (player_id,challenge_id,created_at,timer) VALUES (pid,tid,max_val,UNIX_TIMESTAMP(max_val)-UNIX_TIMESTAMP(min_val));
+    IF ROW_COUNT()>0 THEN
+      INSERT INTO stream (player_id,model,model_id,points,title,message,pubtitle,pubmessage,ts) VALUES (pid,'challenge',tid,0,'','','','',max_val);
+    END IF;
+  END IF;
+
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `give_headshot` ;;
+CREATE PROCEDURE `give_headshot`(IN usid BIGINT, IN tid INT, IN ttimer INT)
+BEGIN
+  INSERT IGNORE INTO player_finding (player_id,finding_id) SELECT usid,id FROM finding WHERE target_id=tid ORDER BY id DESC;
+  INSERT IGNORE INTO player_treasure (player_id,treasure_id) SELECT usid,id FROM treasure WHERE target_id=tid ORDER BY id DESC;
+  IF ttimer>0 THEN
+    UPDATE headshot SET timer=ttimer WHERE player_id=usid AND target_id=tid;
+  END IF;
+END ;;
+
+DROP PROCEDURE IF EXISTS `init_mysql` ;;
+CREATE PROCEDURE `init_mysql`()
+BEGIN
+  IF (SELECT val FROM sysconfig WHERE id='time_zone') IS NOT NULL THEN
+    SET GLOBAL time_zone=(SELECT val FROM sysconfig WHERE id='time_zone');
+  END IF;
+  call populate_memcache();
+  call calculate_ranks();
+  call calculate_country_rank();
+  call calculate_team_ranks();
+END ;;
+
+DROP PROCEDURE IF EXISTS `player_maintenance` ;;
+CREATE PROCEDURE `player_maintenance`()
+BEGIN
+  DECLARE player_require_approval INT;
+  SET player_require_approval=memc_get('sysconfig:player_require_approval');
+  SET @player_delete_inactive_after=memc_get('sysconfig:player_delete_inactive_after');
+  SET @player_delete_deleted_after=memc_get('sysconfig:player_delete_deleted_after');
+  SET @player_changed_to_deleted_after=memc_get('sysconfig:player_changed_to_deleted_after');
+  SET @player_delete_rejected_after=memc_get('sysconfig:player_delete_rejected_after');
+
+  IF player_require_approval IS NOT NULL AND player_require_approval>0 AND @player_delete_rejected_after IS NOT NULL THEN
+    SET @sql_cmd=CONCAT('DELETE FROM `player` WHERE `status`=9 AND approval=4 AND `ts` < NOW() - INTERVAL ',@player_delete_rejected_after);
+    EXECUTE IMMEDIATE @sql_cmd;
+  END IF;
+  IF @player_delete_inactive_after IS NOT NULL THEN
+    SET @sql_cmd=CONCAT('DELETE FROM `player` WHERE `status`=9 AND`ts` < NOW() - INTERVAL ',@player_delete_inactive_after);
+    EXECUTE IMMEDIATE @sql_cmd;
+  END IF;
+  IF @player_delete_deleted_after IS NOT NULL THEN
+    SET @sql_cmd=CONCAT('DELETE FROM `player` WHERE `status`=0 AND `ts` < NOW() - INTERVAL ',@player_delete_deleted_after);
+    EXECUTE IMMEDIATE @sql_cmd;
+  END IF;
+  IF @player_changed_to_deleted_after IS NOT NULL THEN
+    SET @sql_cmd=CONCAT('UPDATE player SET status=0 WHERE status=8 AND ts < NOW() - INTERVAL ',@player_changed_to_deleted_after);
+    EXECUTE IMMEDIATE @sql_cmd;
+  END IF;
+END ;;
+
+DROP PROCEDURE IF EXISTS `populate_memcache` ;;
+CREATE PROCEDURE `populate_memcache`()
+BEGIN
+  select memc_servers_set('127.0.0.1') INTO @memc_server_set_status;
+  INSERT INTO devnull SELECT memc_set(CONCAT('player:',id),id) FROM player;
+  INSERT INTO devnull SELECT memc_set(CONCAT('player_type:',id),`type`) FROM player;
+  INSERT INTO devnull SELECT memc_set(CONCAT('team_player:',player_id),team_id) FROM team_player;
+  INSERT INTO devnull SELECT memc_set(CONCAT('team_finding:',t2.team_id, ':', t1.finding_id),t1.player_id) FROM player_finding AS t1 LEFT JOIN team_player AS t2 ON t2.player_id=t1.player_id;
+  INSERT INTO devnull SELECT memc_set(CONCAT('player_finding:',player_id, ':', finding_id),player_id) FROM player_finding;
+  INSERT INTO devnull SELECT memc_set(CONCAT('target:',ip),id) FROM target;
+  INSERT INTO devnull SELECT memc_set(CONCAT('target:',id),ip) FROM target;
+  INSERT INTO devnull SELECT memc_set(CONCAT('sysconfig:',id),val) FROM sysconfig;
+  INSERT INTO devnull SELECT memc_set(CONCAT('finding:',protocol,':',ifnull(port,0), ':', target_id ),id) FROM finding;
+  DO memc_set('sysconfig_json',(SELECT CONCAT('[',GROUP_CONCAT(JSON_OBJECT('id', id,'val',val) ORDER BY id),']') FROM sysconfig WHERE id NOT LIKE 'CA%' and id NOT IN ('disabled_routes','frontpage_scenario','routes','writeup_rules','vpn-ta.key') ORDER BY id));
+END ;;
+
+DROP PROCEDURE IF EXISTS `repopulate_team_stream` ;;
+CREATE PROCEDURE `repopulate_team_stream`(IN tid INT)
+BEGIN
+  DECLARE `_rollback` BOOL DEFAULT false;
+  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET `_rollback` = true;
+  IF (SELECT count(*) FROM sysconfig WHERE id='teams' AND val=1)>0 AND (SELECT count(*) FROM team WHERE id=tid)>0 THEN
+    START TRANSACTION;
+    UPDATE team_score SET points=0 WHERE team_id=tid;
+    DELETE FROM team_stream WHERE team_id=tid;
+    INSERT INTO team_stream (stream_id,player_id,team_id,model,model_id,points,ts)
+      SELECT id, player_id, tid, model, model_id, points, ts
+      FROM (
+        SELECT s.*,
+          ROW_NUMBER() OVER (PARTITION BY model, model_id ORDER BY ts ASC, id ASC) AS rn
+        FROM stream s
+        WHERE model != 'user'
+          AND player_id IN (SELECT player_id FROM team_player WHERE team_id = tid AND approved=1)
+      ) t
+      WHERE rn = 1
+      ORDER BY id, ts;
+    IF `_rollback` THEN
+        ROLLBACK;
+    ELSE
+        COMMIT;
+    END IF;
+  END IF;
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `reset_gamedata` ;;
+CREATE PROCEDURE `reset_gamedata`()
+BEGIN
+  DELETE FROM `badge`;
+  ALTER TABLE `badge` AUTO_INCREMENT=1;
+
+  DELETE FROM `finding`;
+  ALTER TABLE `finding` AUTO_INCREMENT=1;
+
+  DELETE FROM `treasure`;
+  ALTER TABLE `treasure` AUTO_INCREMENT=1;
+
+  DELETE FROM `hint` where id>1;
+  ALTER TABLE `hint` AUTO_INCREMENT=1;
+
+  CALL reset_playdata();
+
+  DELETE FROM `target`;
+  ALTER TABLE `target` AUTO_INCREMENT=1;
+
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `reset_playdata` ;;
+CREATE PROCEDURE `reset_playdata`()
+BEGIN
+  DELETE FROM `player`;
+  ALTER TABLE `player` AUTO_INCREMENT=1;
+
+  DELETE FROM `team`;
+  ALTER TABLE `team` AUTO_INCREMENT=1;
+
+  TRUNCATE report;
+  TRUNCATE team_score;
+  TRUNCATE player_score;
+  TRUNCATE sessions;
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `reset_player_progress` ;;
+CREATE PROCEDURE `reset_player_progress`()
+BEGIN
+  TRUNCATE report;
+  TRUNCATE team_score;
+  TRUNCATE player_score;
+  TRUNCATE player_finding;
+  TRUNCATE player_treasure;
+  TRUNCATE player_question;
+  TRUNCATE player_hint;
+  TRUNCATE player_badge;
+  TRUNCATE sessions;
+  TRUNCATE stream;
+  insert into team_score (team_id,points) select id,0 from team;
+  insert into player_score (player_id,points) select id,0 from player;
+END ;;
+
+DROP PROCEDURE IF EXISTS `rotate_notifications` ;;
+CREATE PROCEDURE `rotate_notifications`(IN archived_interval_minute INT, IN pending_interval_minute INT)
+BEGIN
+  DELETE FROM `notification` WHERE
+    (`archived`=1 AND DATE(`updated_at`) < NOW() - INTERVAL archived_interval_minute MINUTE) OR
+    (created_at IS null AND updated_at IS null) OR
+    (title LIKE '%target%' and DATE(created_at) < NOW() - INTERVAL pending_interval_minute MINUTE);
+END ;;
+
+
+DROP PROCEDURE IF EXISTS `time_headshot` ;;
+CREATE PROCEDURE `time_headshot`(IN pid INT, IN tid INT)
+BEGIN
+  DECLARE min_finding,min_treasure,max_finding,max_treasure, max_val, min_val DATETIME;
+  SELECT min(ts),max(ts) INTO min_finding,max_finding FROM `player_finding` WHERE `player_id`=pid AND `finding_id` IN (SELECT `id` FROM `finding` WHERE `target_id`=tid);
+  SELECT min(ts),max(ts) INTO min_treasure,max_treasure FROM `player_treasure` WHERE `player_id`=pid AND `treasure_id` IN (SELECT `id` FROM `treasure` WHERE `target_id`=tid);
+  SELECT GREATEST(max_finding, max_treasure), LEAST(min_finding, min_treasure) INTO max_val,min_val;
+  UPDATE `headshot` SET `timer`=UNIX_TIMESTAMP(max_val)-UNIX_TIMESTAMP(min_val) WHERE `player_id`=pid AND `target_id`=tid;
+END ;;
+
+DROP PROCEDURE IF EXISTS `time_headshot_with_player` ;;
+CREATE PROCEDURE `time_headshot_with_player`(IN pid INT, IN tid INT, IN aspid INT)
+BEGIN
+  DECLARE min_finding,min_treasure,max_finding,max_treasure, max_val, min_val DATETIME;
+  SELECT min(ts),max(ts) INTO min_finding,max_finding FROM player_finding WHERE player_id IN (pid, aspid) AND finding_id IN (SELECT id FROM finding WHERE target_id=tid);
+  SELECT min(ts),max(ts) INTO min_treasure,max_treasure FROM player_treasure WHERE player_id IN (pid,aspid) AND treasure_id IN (SELECT id FROM treasure WHERE target_id=tid);
+  SELECT GREATEST(max_finding, max_treasure), LEAST(min_finding, min_treasure) INTO max_val,min_val;
+  UPDATE `headshot` SET timer=UNIX_TIMESTAMP(max_val)-UNIX_TIMESTAMP(min_val) WHERE player_id=pid AND target_id=tid;
+END ;;
+
+DROP PROCEDURE IF EXISTS `repopulate_all_team_streams` ;;
+CREATE PROCEDURE `repopulate_all_team_streams`()
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE tid INT;
+  DECLARE cur CURSOR FOR SELECT id FROM team;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+  OPEN cur;
+  read_loop: LOOP
+    FETCH cur INTO tid;
+    IF done THEN
+      LEAVE read_loop;
+    END IF;
+    CALL repopulate_team_stream(tid);
+  END LOOP;
+  CLOSE cur;
+END ;;
+
+
+DROP PROCEDURE IF EXISTS get_player_pf_networks ;;
+CREATE PROCEDURE get_player_pf_networks(IN usid INT)
+BEGIN
+DECLARE tid INTEGER;
+SELECT team_id INTO tid FROM team_player WHERE player_id=usid;
+
+  SELECT codename as netname FROM network WHERE (codename IS NOT NULL AND active=1) AND (public=1 or id IN (SELECT network_id FROM network_player WHERE player_id=usid))
+  UNION
+  SELECT LOWER(CONCAT(t2.name,'_',player_id)) as netname
+  FROM target_instance AS t1
+  LEFT JOIN target AS t2 ON t1.target_id = t2.id
+  WHERE player_id = usid
+    OR player_id IN (
+      SELECT tp1.player_id
+      FROM team_player tp1
+      JOIN team_player tp2 ON tp1.team_id = tp2.team_id
+      WHERE tp2.player_id = usid
+        AND tp1.approved = 1
+        AND (
+          memc_get('sysconfig:team_visible_instances') IS NOT NULL
+          OR team_allowed = 1
+        )
+    )
+    UNION
+    SELECT name FROM private_network
+    WHERE player_id=usid
+     OR (team_accessible=1
+           AND player_id IN (
+            SELECT player_id
+            FROM team_player
+            WHERE team_id=tid AND approved=1
+        )
+    );
+END ;;
+
+DROP PROCEDURE IF EXISTS expire_player_products ;;
+CREATE PROCEDURE expire_player_products()
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE rid,lplayer_id INT;
+  DECLARE lprice_id VARCHAR(64);
+  DECLARE product_name VARCHAR(256);
+  DECLARE notification_body text;
+  DECLARE notification_title text;
+  DECLARE cur CURSOR FOR SELECT id,player_id,price_id FROM player_product WHERE ending < NOW() - INTERVAL 1 DAY;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+  OPEN cur;
+  read_loop: LOOP
+    FETCH cur INTO rid,lplayer_id,lprice_id;
+    IF done THEN
+      LEAVE read_loop;
+    END IF;
+    SELECT product.name INTO product_name FROM price LEFT JOIN product on price.product_id=product.id WHERE price.id=lprice_id;
+    set notification_title='{product_name} expired';
+    set notification_body='Your {product_name} has expired. Feel free to get a new one any time. Thank you for your time';
+    INSERT INTO notification (player_id,category,title,body,created_at) VALUES (lplayer_id,'swal:info',REPLACE(notification_title,'{product_name}',product_name),REPLACE(notification_body,'{product_name}',product_name),NOW());
+    DELETE FROM player_product WHERE id=rid;
+  END LOOP;
+  CLOSE cur;
+END;;
+
+DROP PROCEDURE IF EXISTS apply_failed_claim_penalties ;;
+CREATE PROCEDURE `apply_failed_claim_penalties`()
+BEGIN
+  DECLARE free_fail_allowance INT DEFAULT 0;
+  DECLARE penalty_per_fail INT DEFAULT 0;
+
+  SET free_fail_allowance = memc_get('sysconfig:free_fail_allowance');
+  SET penalty_per_fail   = memc_get('sysconfig:penalty_per_fail');
+
+  CREATE TEMPORARY TABLE tmp_penalties ENGINE=MEMORY AS
+  SELECT
+      t.owner_id,
+      tp.team_id,
+      COUNT(DISTINCT tp.player_id) AS player_count,
+      COALESCE(SUM(pcn.counter), 0) AS total_failed_claims,
+      GREATEST(0, (COALESCE(SUM(pcn.counter), 0) - free_fail_allowance * COUNT(DISTINCT tp.player_id))) * penalty_per_fail AS penalty
+  FROM team_player tp
+  JOIN team t ON t.id = tp.team_id
+  LEFT JOIN player_counter_nf pcn
+      ON pcn.player_id = tp.player_id
+      AND pcn.metric = 'failed_claims'
+  WHERE tp.approved = 1
+  GROUP BY tp.team_id, t.owner_id
+  HAVING total_failed_claims >= free_fail_allowance * player_count;
+
+  INSERT INTO stream (player_id, model, model_id, points, title, message, pubtitle, pubmessage, ts)
+  SELECT
+      p.owner_id,
+      'team',
+      p.team_id,
+      -1 * p.penalty,
+      CONCAT('Got penalized for ', p.total_failed_claims, ' failed claims'),
+      CONCAT('Got penalized for ', p.total_failed_claims, ' failed claims'),
+      CONCAT('Got penalized for ', p.total_failed_claims, ' failed claims'),
+      CONCAT('Got penalized for ', p.total_failed_claims, ' failed claims'),
+      NOW()
+  FROM tmp_penalties p;
+
+  DROP TEMPORARY TABLE IF EXISTS tmp_penalties;
+END;;
+
+
+-- set_multi(kv_string TEXT, delim VARCHAR(10)): splits kv_string on delim
+-- (NULL = ','), splits each pair on '=>', calls memc_set(key, val).
+-- Requires memc_set UDF already registered.
+DROP PROCEDURE IF EXISTS set_multi ;;
+CREATE PROCEDURE set_multi(IN kv_string TEXT, IN delim VARCHAR(10))
+BEGIN
+  DECLARE remaining TEXT DEFAULT kv_string;
+  DECLARE pair TEXT;
+  DECLARE k VARCHAR(255);
+  DECLARE v VARCHAR(255);
+  DECLARE pos INT;
+
+  SET delim = IFNULL(delim, ',');
+
+  WHILE LENGTH(remaining) > 0 DO
+    SET pos = LOCATE(delim, remaining);
+    IF pos > 0 THEN
+      SET pair = SUBSTRING(remaining, 1, pos - 1);
+      SET remaining = SUBSTRING(remaining, pos + LENGTH(delim));
+    ELSE
+      SET pair = remaining;
+      SET remaining = '';
+    END IF;
+
+    SET k = TRIM(SUBSTRING_INDEX(pair, '=>', 1));
+    SET v = TRIM(SUBSTRING_INDEX(pair, '=>', -1));
+
+    DO memc_set(k, v);
+  END WHILE;
+END;;
+
+DROP PROCEDURE IF EXISTS `VPN_BANDWIDTH_LOG`;;
+CREATE PROCEDURE `VPN_BANDWIDTH_LOG`(IN usid BIGINT, IN assignedIP INT UNSIGNED, IN bytesReceived BIGINT UNSIGNED, IN bytesSent BIGINT UNSIGNED, IN sessionDuration INT UNSIGNED)
+BEGIN
+  IF (SELECT COUNT(*) FROM player WHERE id=usid AND status=10)>0 THEN
+    INSERT INTO player_bandwidth (player_id, vpn_local_address, bytes_received, bytes_sent, duration) VALUES (usid, assignedIP, bytesReceived, bytesSent, sessionDuration);
+  END IF;
+END;;
+
+DELIMITER ;
+/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
+/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;
+/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;
+/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;

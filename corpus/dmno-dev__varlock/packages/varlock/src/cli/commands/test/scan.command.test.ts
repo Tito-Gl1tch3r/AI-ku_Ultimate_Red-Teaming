@@ -1,0 +1,299 @@
+import {
+  describe, test, expect, beforeEach, afterEach, vi,
+} from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { execFileSync } from 'node:child_process';
+import {
+  scanFileForValues, walkDirectory, walkDirectoryAll, resolveTargetPaths, installHook,
+} from '../scan.command';
+
+describe('scanFileForValues', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'varlock-scan-test-'));
+  });
+
+  afterEach(() => {
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('returns no findings for a clean file', async () => {
+    const filePath = path.join(tempDir, 'clean.ts');
+    fs.writeFileSync(filePath, 'const x = "hello world";\nconsole.log(x);\n');
+    const sensitiveValues = new Map([['DB_PASSWORD', 'super-secret-password']]);
+    const findings = await scanFileForValues(filePath, sensitiveValues);
+    expect(findings).toHaveLength(0);
+  });
+
+  test('detects a sensitive value in a file', async () => {
+    const filePath = path.join(tempDir, 'config.ts');
+    const secretVal = 'my-real-secret-token-abc123';
+    fs.writeFileSync(filePath, `const token = "${secretVal}";\n`);
+    const sensitiveValues = new Map([['API_TOKEN', secretVal]]);
+    const findings = await scanFileForValues(filePath, sensitiveValues);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].sensitiveKeyName).toBe('API_TOKEN');
+    expect(findings[0].sensitiveValue).toBe(secretVal);
+    expect(findings[0].lineNumber).toBe(1);
+    // secret starts at column 16 (after `const token = "`)
+    expect(findings[0].columnNumber).toBe(16);
+  });
+
+  test('detects multiple sensitive values across multiple lines', async () => {
+    const filePath = path.join(tempDir, 'secrets.ts');
+    const dbPassword = 'my-db-password-xyz';
+    const apiKey = 'my-api-key-abc';
+    fs.writeFileSync(filePath, [
+      `const dbUrl = "postgres://user:${dbPassword}@host";`,
+      `const apiKey = "${apiKey}";`,
+      'const normalVar = "hello";',
+    ].join('\n'));
+    const sensitiveValues = new Map([
+      ['DB_PASSWORD', dbPassword],
+      ['API_KEY', apiKey],
+    ]);
+    const findings = await scanFileForValues(filePath, sensitiveValues);
+    expect(findings).toHaveLength(2);
+    expect(findings[0].sensitiveKeyName).toBe('DB_PASSWORD');
+    expect(findings[0].lineNumber).toBe(1);
+    // password starts at column 32 (after `const dbUrl = "postgres://user:`)
+    expect(findings[0].columnNumber).toBe(32);
+    expect(findings[1].sensitiveKeyName).toBe('API_KEY');
+    expect(findings[1].lineNumber).toBe(2);
+    // apiKey starts at column 17 (after `const apiKey = "`)
+    expect(findings[1].columnNumber).toBe(17);
+  });
+
+  test('returns no findings for a non-existent file', async () => {
+    const sensitiveValues = new Map([['MY_SECRET', 'some-secret-value']]);
+    const findings = await scanFileForValues(path.join(tempDir, 'does-not-exist.ts'), sensitiveValues);
+    expect(findings).toHaveLength(0);
+  });
+
+  test('skips binary files (files with null bytes)', async () => {
+    const filePath = path.join(tempDir, 'binary.bin');
+    const secretVal = 'secret-value-123';
+    // Write file content with null byte: starts with secret value but has null byte embedded
+    const buf = Buffer.concat([
+      Buffer.from(secretVal),
+      Buffer.from([0x00]), // null byte marks it as binary
+      Buffer.from(' extra data'),
+    ]);
+    fs.writeFileSync(filePath, buf);
+    const sensitiveValues = new Map([['MY_SECRET', secretVal]]);
+    const findings = await scanFileForValues(filePath, sensitiveValues);
+    // The file is skipped because it contains a null byte
+    expect(findings).toHaveLength(0);
+
+    // Confirm the same content without the null byte WOULD be detected
+    const textFilePath = path.join(tempDir, 'text-with-secret.ts');
+    fs.writeFileSync(textFilePath, `const val = "${secretVal}";`);
+    const textFindings = await scanFileForValues(textFilePath, sensitiveValues);
+    expect(textFindings).toHaveLength(1);
+    expect(textFindings[0].sensitiveKeyName).toBe('MY_SECRET');
+  });
+
+  test('only reports one finding per line even if multiple sensitive values match', async () => {
+    const filePath = path.join(tempDir, 'multi.env');
+    const secret1 = 'first-secret-abc';
+    const secret2 = 'second-secret-xyz';
+    // One line containing both sensitive values
+    fs.writeFileSync(filePath, `COMBINED="${secret1}${secret2}"\n`);
+    const sensitiveValues = new Map([
+      ['SECRET_1', secret1],
+      ['SECRET_2', secret2],
+    ]);
+    const findings = await scanFileForValues(filePath, sensitiveValues);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].lineNumber).toBe(1);
+  });
+
+  test('returns no findings when sensitiveValues map is empty', async () => {
+    const filePath = path.join(tempDir, 'any.ts');
+    fs.writeFileSync(filePath, 'const x = "some value";\n');
+    const findings = await scanFileForValues(filePath, new Map());
+    expect(findings).toHaveLength(0);
+  });
+});
+
+describe('walkDirectory', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'varlock-walk-test-'));
+  });
+
+  afterEach(() => {
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('finds files in directory', async () => {
+    fs.writeFileSync(path.join(tempDir, 'file1.ts'), 'content');
+    fs.writeFileSync(path.join(tempDir, 'file2.ts'), 'content');
+    const files = await walkDirectory(tempDir);
+    expect(files).toHaveLength(2);
+  });
+
+  test('skips node_modules directory', async () => {
+    fs.writeFileSync(path.join(tempDir, 'file.ts'), 'content');
+    fs.mkdirSync(path.join(tempDir, 'node_modules'));
+    fs.writeFileSync(path.join(tempDir, 'node_modules', 'dep.js'), 'content');
+    const files = await walkDirectory(tempDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toContain('file.ts');
+  });
+
+  test('skips binary file extensions', async () => {
+    fs.writeFileSync(path.join(tempDir, 'image.png'), 'fake png content');
+    fs.writeFileSync(path.join(tempDir, 'script.ts'), 'real content');
+    const files = await walkDirectory(tempDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toContain('script.ts');
+  });
+});
+
+describe('walkDirectoryAll', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'varlock-walkall-test-'));
+  });
+
+  afterEach(() => {
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('finds files in nested directories including build-output dirs', async () => {
+    fs.writeFileSync(path.join(tempDir, 'index.ts'), 'content');
+    fs.mkdirSync(path.join(tempDir, 'dist'));
+    fs.writeFileSync(path.join(tempDir, 'dist', 'bundle.js'), 'build output');
+    fs.mkdirSync(path.join(tempDir, 'node_modules'));
+    fs.writeFileSync(path.join(tempDir, 'node_modules', 'dep.js'), 'dep');
+    const files = await walkDirectoryAll(tempDir);
+    // Should include files inside dist AND node_modules (no directory is skipped)
+    expect(files).toHaveLength(3);
+    const names = files.map((f) => path.basename(f)).sort();
+    expect(names).toEqual(['bundle.js', 'dep.js', 'index.ts'].sort());
+  });
+
+  test('still skips binary file extensions', async () => {
+    fs.writeFileSync(path.join(tempDir, 'image.png'), 'fake png content');
+    fs.writeFileSync(path.join(tempDir, 'script.ts'), 'real content');
+    const files = await walkDirectoryAll(tempDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toContain('script.ts');
+  });
+});
+
+describe('resolveTargetPaths', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'varlock-resolve-test-'));
+  });
+
+  afterEach(() => {
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test('resolves an explicit directory', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'content');
+    fs.writeFileSync(path.join(tempDir, 'b.ts'), 'content');
+    const files = await resolveTargetPaths([tempDir], tempDir);
+    expect(files).toHaveLength(2);
+  });
+
+  test('resolves an explicit file', async () => {
+    const filePath = path.join(tempDir, 'a.ts');
+    fs.writeFileSync(filePath, 'content');
+    const files = await resolveTargetPaths([filePath], tempDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toBe(filePath);
+  });
+
+  test('skips non-existent paths silently', async () => {
+    const files = await resolveTargetPaths([path.join(tempDir, 'does-not-exist')], tempDir);
+    expect(files).toHaveLength(0);
+  });
+
+  test('deduplicates files when a file appears via multiple targets', async () => {
+    const filePath = path.join(tempDir, 'a.ts');
+    fs.writeFileSync(filePath, 'content');
+    // Pass both the directory and the file explicitly — should still yield one result
+    const files = await resolveTargetPaths([tempDir, filePath], tempDir);
+    expect(files).toHaveLength(1);
+  });
+
+  test('resolves glob patterns', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'content');
+    fs.writeFileSync(path.join(tempDir, 'b.ts'), 'content');
+    fs.writeFileSync(path.join(tempDir, 'c.md'), 'content');
+    const files = await resolveTargetPaths(['*.ts'], tempDir);
+    expect(files).toHaveLength(2);
+    for (const f of files) expect(f.endsWith('.ts')).toBe(true);
+  });
+
+  test('resolves a build-output directory (not skipped by SKIP_DIRS)', async () => {
+    // Simulate a dist folder which would normally be skipped by walkDirectory
+    const distDir = path.join(tempDir, 'dist');
+    fs.mkdirSync(distDir);
+    fs.writeFileSync(path.join(distDir, 'bundle.js'), 'build output');
+    const files = await resolveTargetPaths([distDir], tempDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toContain('bundle.js');
+  });
+});
+
+describe('installHook', () => {
+  let tempDir: string;
+  const git = (cwd: string, ...args: Array<string>) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+  beforeEach(() => {
+    // isolate from the user's global/system git config (e.g. a global core.hooksPath)
+    // - installHook spawns git with the inherited env, so stub process.env itself
+    vi.stubEnv('GIT_CONFIG_GLOBAL', '/dev/null');
+    vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+    vi.stubEnv('GIT_CONFIG_COUNT', '0');
+    tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'varlock-hook-test-')));
+    const mainRepo = path.join(tempDir, 'main');
+    fs.mkdirSync(mainRepo);
+    git(mainRepo, 'init', '-q');
+    git(mainRepo, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'init');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test('installs into the main repo hooks dir from a linked worktree', async () => {
+    const mainRepo = path.join(tempDir, 'main');
+    const worktree = path.join(tempDir, 'wt');
+    git(mainRepo, 'worktree', 'add', '-q', worktree);
+
+    await installHook(worktree);
+
+    expect(fs.existsSync(path.join(mainRepo, '.git', 'hooks', 'pre-commit'))).toBe(true);
+  });
+
+  test('respects a relative core.hooksPath', async () => {
+    const mainRepo = path.join(tempDir, 'main');
+    git(mainRepo, 'config', 'core.hooksPath', 'custom-hooks');
+
+    await installHook(mainRepo);
+
+    expect(fs.existsSync(path.join(mainRepo, 'custom-hooks', 'pre-commit'))).toBe(true);
+    expect(fs.existsSync(path.join(mainRepo, '.git', 'hooks', 'pre-commit'))).toBe(false);
+  });
+});

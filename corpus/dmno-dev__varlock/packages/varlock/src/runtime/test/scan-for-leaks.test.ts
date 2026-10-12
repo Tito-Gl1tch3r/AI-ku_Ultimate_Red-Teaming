@@ -1,0 +1,163 @@
+import {
+  describe, it, expect, beforeEach,
+} from 'vitest';
+import { scanForLeaks, resetRedactionMap, redactSensitiveConfig } from '../env';
+import type { SerializedEnvGraph } from '../../env-graph';
+
+/** helper to set up redaction state with a known secret */
+function setSecret(key: string, value: string) {
+  resetRedactionMap({
+    config: {
+      [key]: { isSensitive: true, isDynamic: true, value },
+    },
+  } as unknown as SerializedEnvGraph);
+}
+
+describe('scanForLeaks', () => {
+  const SECRET_KEY = 'API_KEY';
+  const SECRET_VALUE = 'super-secret-value-12345';
+
+  beforeEach(() => {
+    setSecret(SECRET_KEY, SECRET_VALUE);
+  });
+
+  // --- strings ---
+  it('detects a leaked secret in a plain string', () => {
+    expect(() => scanForLeaks(`hello ${SECRET_VALUE} world`))
+      .toThrow(/DETECTED LEAKED SENSITIVE CONFIG/);
+  });
+
+  it('passes a clean string through unchanged', () => {
+    const clean = 'nothing secret here';
+    expect(scanForLeaks(clean)).toBe(clean);
+  });
+
+  // --- Buffer (Node) ---
+  it('detects a leaked secret in a Buffer', () => {
+    const buf = Buffer.from(`payload ${SECRET_VALUE} end`);
+    expect(() => scanForLeaks(buf as any)).toThrow(/DETECTED LEAKED SENSITIVE CONFIG/);
+  });
+
+  it('passes a clean Buffer through unchanged', () => {
+    const buf = Buffer.from('safe content');
+    expect(scanForLeaks(buf as any)).toBe(buf);
+  });
+
+  // --- Uint8Array / ArrayBufferView (edge runtimes like Cloudflare Workers) ---
+  it('detects a leaked secret in a Uint8Array', () => {
+    const encoder = new TextEncoder();
+    const arr = encoder.encode(`payload ${SECRET_VALUE} end`);
+    expect(() => scanForLeaks(arr as any)).toThrow(/DETECTED LEAKED SENSITIVE CONFIG/);
+  });
+
+  it('passes a clean Uint8Array through unchanged', () => {
+    const encoder = new TextEncoder();
+    const arr = encoder.encode('safe content');
+    expect(scanForLeaks(arr as any)).toBe(arr);
+  });
+
+  // --- ReadableStream ---
+  it('detects a leaked secret in a ReadableStream chunk', async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data ${SECRET_VALUE}`));
+        controller.close();
+      },
+    });
+
+    const scanned = scanForLeaks(stream as any) as ReadableStream;
+    const reader = scanned.getReader();
+
+    await expect(reader.read()).rejects.toThrow(/DETECTED LEAKED SENSITIVE CONFIG/);
+  });
+
+  it('detects a leaked secret split across ReadableStream chunks', async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data ${SECRET_VALUE.slice(0, 10)}`));
+        controller.enqueue(new TextEncoder().encode(SECRET_VALUE.slice(10)));
+        controller.close();
+      },
+    });
+
+    const scanned = scanForLeaks(stream as any) as ReadableStream;
+    const reader = scanned.getReader();
+
+    await expect((async () => {
+      // first chunk holds only a partial value, so the read after it is the one that throws
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) return;
+      }
+    })()).rejects.toThrow(/DETECTED LEAKED SENSITIVE CONFIG/);
+  });
+
+  it('passes a stream whose chunks split a multi-byte character through intact', async () => {
+    const text = 'héllo wörld 🔐';
+    const bytes = new TextEncoder().encode(text);
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, 2)); // splits the 2-byte é
+        controller.enqueue(bytes.slice(2));
+        controller.close();
+      },
+    });
+
+    const scanned = scanForLeaks(stream as any) as ReadableStream;
+    const reader = scanned.getReader();
+    const received: Array<number> = [];
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      received.push(...value);
+    }
+    expect(new TextDecoder().decode(new Uint8Array(received))).toBe(text);
+  });
+
+  it('passes a clean ReadableStream through', async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('safe'));
+        controller.close();
+      },
+    });
+
+    const scanned = scanForLeaks(stream as any) as ReadableStream;
+    const reader = scanned.getReader();
+    const { value } = await reader.read();
+    expect(new TextDecoder().decode(value)).toBe('safe');
+  });
+
+  // --- null / undefined ---
+  it('returns null for null input', () => {
+    expect(scanForLeaks(null)).toBeNull();
+  });
+});
+
+describe('scanForLeaks with per-item preventLeaks opt-out', () => {
+  const LEAKY_VALUE = 'allowed-to-leave-67890';
+  const NORMAL_VALUE = 'still-protected-12345';
+
+  beforeEach(() => {
+    resetRedactionMap({
+      config: {
+        LEAKY: { isSensitive: true, value: LEAKY_VALUE, preventLeaks: false },
+        NORMAL: { isSensitive: true, value: NORMAL_VALUE },
+      },
+    } as unknown as SerializedEnvGraph);
+  });
+
+  it('does not throw when an opted-out secret appears in output', () => {
+    const out = `response body contains ${LEAKY_VALUE}`;
+    expect(scanForLeaks(out)).toBe(out);
+  });
+
+  it('still throws for other sensitive values that did not opt out', () => {
+    expect(() => scanForLeaks(`oops ${NORMAL_VALUE}`))
+      .toThrow(/DETECTED LEAKED SENSITIVE CONFIG/);
+  });
+
+  it('still redacts the opted-out secret in logs (opt-out is leak-detection only)', () => {
+    expect(redactSensitiveConfig(`logging ${LEAKY_VALUE}`)).not.toContain(LEAKY_VALUE);
+  });
+});

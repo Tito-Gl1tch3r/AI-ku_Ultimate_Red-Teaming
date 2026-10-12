@@ -1,0 +1,614 @@
+// MIT License
+//
+// Copyright (c) [2025] [c3rb3ru5d3d53c]
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+use crate::Architecture;
+use crate::Configuration;
+use crate::formats::File;
+use crate::formats::Image;
+use crate::formats::{Symbol as BlSymbol, symbol::SymbolKind};
+use crate::hashing::SHA256;
+use crate::hashing::SSDeep;
+use crate::hashing::TLSH;
+use lief::Binary;
+use lief::generic::{Section, Symbol};
+use lief::macho::commands::{Command, LoadCommandTypes};
+use lief::macho::header::CpuType as MachoCpuType;
+use lief::macho::section::Flags as SectionFlags;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Error, ErrorKind};
+use std::path::PathBuf;
+
+pub const N_STAB: u8 = 0xE0;
+pub const N_TYPE: u8 = 0x0E;
+pub const N_SECT: u8 = 0x0E;
+pub const VM_PROT_EXECUTE: u8 = 0x04;
+
+pub struct MACHO {
+    macho: lief::macho::FatBinary,
+    pub file: File,
+    pub config: Configuration,
+}
+
+pub struct MachoSlice<'a> {
+    macho: &'a MACHO,
+    index: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MachoSection {
+    pub name: String,
+    pub segment_name: String,
+    pub file_offset: u64,
+    pub size: u64,
+    pub virtual_address: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl<'a> MachoSlice<'a> {
+    pub fn bytes(&self) -> Vec<u8> {
+        self.macho.bytes()
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn relative_virtual_address_to_virtual_address(
+        &self,
+        relative_virtual_address: u64,
+    ) -> Option<u64> {
+        self.macho
+            .relative_virtual_address_to_virtual_address(relative_virtual_address, self.index)
+    }
+
+    pub fn file_offset_to_virtual_address(&self, file_offset: u64) -> Option<u64> {
+        self.macho
+            .file_offset_to_virtual_address(file_offset, self.index)
+    }
+
+    pub fn entrypoint_virtual_address(&self) -> Option<u64> {
+        self.macho.entrypoint_virtual_address(self.index)
+    }
+
+    pub fn imagebase(&self) -> Option<u64> {
+        self.macho.imagebase(self.index)
+    }
+
+    pub fn sizeofheaders(&self) -> Option<u64> {
+        self.macho.sizeofheaders(self.index)
+    }
+
+    pub fn architecture(&self) -> Architecture {
+        self.macho.architecture(self.index)
+    }
+
+    pub fn symbols(&self) -> BTreeMap<u64, BlSymbol> {
+        self.macho.symbols(self.index)
+    }
+
+    pub fn sections(&self) -> Vec<MachoSection> {
+        self.macho.sections(self.index)
+    }
+
+    pub fn section_name_to_section(&self, name: &str) -> Option<MachoSection> {
+        self.macho.section_name_to_section(name, self.index)
+    }
+
+    pub fn segment_and_section_name_to_section(
+        &self,
+        segment_name: &str,
+        section_name: &str,
+    ) -> Option<MachoSection> {
+        self.macho
+            .segment_and_section_name_to_section(segment_name, section_name, self.index)
+    }
+
+    pub fn virtual_address_to_symbol(&self, virtual_address: u64) -> Option<BlSymbol> {
+        self.macho
+            .virtual_address_to_symbol(virtual_address, self.index)
+    }
+
+    pub fn symbol_name_to_virtual_address(&self, name: &str) -> Option<u64> {
+        self.macho.symbol_name_to_virtual_address(name, self.index)
+    }
+
+    pub fn symbol_name_to_file_offset(&self, name: &str) -> Option<u64> {
+        self.macho.symbol_name_to_file_offset(name, self.index)
+    }
+
+    pub fn relative_virtual_address_to_symbol(
+        &self,
+        relative_virtual_address: u64,
+    ) -> Option<BlSymbol> {
+        self.macho
+            .relative_virtual_address_to_symbol(relative_virtual_address, self.index)
+    }
+
+    pub fn file_offset_to_symbol(&self, file_offset: u64) -> Option<BlSymbol> {
+        self.macho.file_offset_to_symbol(file_offset, self.index)
+    }
+
+    pub fn entrypoint_virtual_addresses(&self) -> BTreeSet<u64> {
+        self.macho.entrypoint_virtual_addresses(self.index)
+    }
+
+    pub fn export_virtual_addresses(&self) -> BTreeSet<u64> {
+        self.macho.export_virtual_addresses(self.index)
+    }
+
+    pub fn executable_virtual_address_ranges(&self) -> BTreeMap<u64, u64> {
+        self.macho.executable_virtual_address_ranges(self.index)
+    }
+
+    pub fn image(&self) -> Result<Image, Error> {
+        self.macho.image(self.index)
+    }
+}
+
+impl MACHO {
+    /// Creates a new `MACHO` instance from a byte vector containing Mach-O file data.
+    pub fn new(bytes: Vec<u8>, config: Configuration) -> Result<Self, Error> {
+        let file = File::from_bytes(bytes, config.clone());
+        let mut cursor = Cursor::new(&file.data);
+        if let Some(Binary::MachO(macho)) = Binary::from(&mut cursor) {
+            return Ok(Self {
+                macho,
+                file,
+                config,
+            });
+        }
+        Err(Error::new(ErrorKind::InvalidInput, "invalid macho file"))
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.file.data.clone()
+    }
+
+    pub fn relative_virtual_address_to_virtual_address(
+        &self,
+        relative_virtual_address: u64,
+        slice: usize,
+    ) -> Option<u64> {
+        Some(self.imagebase(slice)? + relative_virtual_address)
+    }
+
+    pub fn file_offset_to_virtual_address(&self, file_offset: u64, slice: usize) -> Option<u64> {
+        let binding = self.macho.iter().nth(slice);
+        binding.as_ref()?;
+        for segment in binding.unwrap().segments() {
+            let start = segment.file_offset();
+            let end = start + segment.file_size();
+            if file_offset >= start && file_offset < end {
+                return Some(segment.virtual_address() + (file_offset - start));
+            }
+        }
+        None
+    }
+
+    pub fn virtual_address_to_file_offset(
+        &self,
+        virtual_address: u64,
+        slice: usize,
+    ) -> Option<u64> {
+        let binding = self.macho.iter().nth(slice);
+        binding.as_ref()?;
+        for segment in binding.unwrap().segments() {
+            let start = segment.virtual_address();
+            let end = start + segment.virtual_size();
+            if virtual_address >= start && virtual_address < end {
+                return Some(segment.file_offset() + (virtual_address - start));
+            }
+        }
+        None
+    }
+
+    /// Returns the number of binaries contained in the MachO binary.
+    ///
+    /// # Returns
+    /// A `usize` containing the number of binaries in the MachO binary.
+    pub fn number_of_slices(&self) -> usize {
+        self.macho.iter().count()
+    }
+
+    pub fn slice(&self, index: usize) -> Option<MachoSlice<'_>> {
+        if index >= self.number_of_slices() {
+            return None;
+        }
+        Some(MachoSlice { macho: self, index })
+    }
+
+    pub fn slices(&self) -> impl Iterator<Item = MachoSlice<'_>> {
+        (0..self.number_of_slices()).filter_map(move |index| self.slice(index))
+    }
+
+    /// Returns the entrypoint of the MachO binary by index.
+    ///
+    /// # Returns
+    /// A `Option<u64>` representing the entrypoint of the binary.
+    pub fn entrypoint_virtual_address(&self, slice: usize) -> Option<u64> {
+        let entrypoint_file_offset = self.macho.iter().nth(slice)?.main_command()?.entrypoint();
+        self.file_offset_to_virtual_address(entrypoint_file_offset, slice)
+    }
+
+    /// Returns the imagebase of the MachO binary by index.
+    ///
+    /// # Returns
+    /// A `Option<u64>` representing the imagebase of the binary.
+    pub fn imagebase(&self, slice: usize) -> Option<u64> {
+        let binding = self.macho.iter().nth(slice)?;
+        for segment in binding.segments() {
+            if segment.name() == "__TEXT" {
+                return Some(segment.virtual_address());
+            }
+        }
+        Some(0)
+    }
+
+    /// Returns the size of the headers for the MachO slice.
+    ///
+    /// # Returns
+    /// A `Option<u64>` representing the size of the headers for the MachO slice.
+    pub fn sizeofheaders(&self, slice: usize) -> Option<u64> {
+        let binding = self.macho.iter().nth(slice)?;
+        let architecture = self.architecture(slice);
+        let macho_header_size: u32 = match architecture {
+            Architecture::AMD64 | Architecture::ARM64 => 32,
+            Architecture::I386 => 28,
+            _ => {
+                return None;
+            }
+        };
+        Some(macho_header_size as u64 + binding.header().sizeof_cmds() as u64)
+    }
+
+    /// Returns the architecture of the MachO binary by index.
+    ///
+    /// # Returns
+    /// An `Architecture` representing the architecture of the binary.
+    pub fn architecture(&self, slice: usize) -> Architecture {
+        let Some(cpu_type) = self.macho.iter().nth(slice).map(|b| b.header().cpu_type()) else {
+            return Architecture::UNKNOWN;
+        };
+        match cpu_type {
+            MachoCpuType::X86 => Architecture::I386,
+            MachoCpuType::X86_64 => Architecture::AMD64,
+            MachoCpuType::ARM64 => Architecture::ARM64,
+            _ => Architecture::UNKNOWN,
+        }
+    }
+
+    /// Checks if the symbol n_type is a function.
+    ///
+    /// # Returns
+    /// A `bool` representing if the n_type is a function or not.
+    pub fn is_function_symbol_type(n_type: u8) -> bool {
+        (n_type & N_STAB) == 0 && (n_type & N_TYPE) == N_SECT
+    }
+
+    pub fn symbols(&self, slice: usize) -> BTreeMap<u64, BlSymbol> {
+        let mut symbols = BTreeMap::<u64, BlSymbol>::new();
+        let binding = self.macho.iter().nth(slice);
+        if binding.is_none() {
+            return symbols;
+        }
+        for symbol in binding.unwrap().symbols() {
+            if !MACHO::is_function_symbol_type(symbol.get_type()) {
+                continue;
+            }
+            let virtual_address = symbol.value();
+            let offset = self
+                .virtual_address_to_file_offset(virtual_address, slice)
+                .unwrap_or(0);
+            symbols.insert(
+                virtual_address,
+                BlSymbol {
+                    name: symbol.name(),
+                    file_offset: offset,
+                    virtual_address: Some(virtual_address),
+                    relative_virtual_address: self
+                        .imagebase(slice)
+                        .map(|imagebase| virtual_address - imagebase),
+                    kind: SymbolKind::Function,
+                },
+            );
+        }
+        symbols
+    }
+
+    pub fn sections(&self, slice: usize) -> Vec<MachoSection> {
+        let mut sections = Vec::new();
+        let binding = self.macho.iter().nth(slice);
+        let Some(binary) = binding else {
+            return sections;
+        };
+        for segment in binary.segments() {
+            for section in segment.sections() {
+                sections.push(MachoSection {
+                    name: section.name(),
+                    segment_name: section.segment_name(),
+                    file_offset: section.offset(),
+                    size: section.size(),
+                    virtual_address: section.virtual_address(),
+                    bytes: section.content().to_vec(),
+                });
+            }
+        }
+        sections
+    }
+
+    pub fn section_name_to_section(&self, name: &str, slice: usize) -> Option<MachoSection> {
+        self.sections(slice)
+            .into_iter()
+            .find(|section| section.name == name)
+    }
+
+    pub fn segment_and_section_name_to_section(
+        &self,
+        segment_name: &str,
+        section_name: &str,
+        slice: usize,
+    ) -> Option<MachoSection> {
+        self.sections(slice)
+            .into_iter()
+            .find(|section| section.segment_name == segment_name && section.name == section_name)
+    }
+
+    pub fn virtual_address_to_symbol(
+        &self,
+        virtual_address: u64,
+        slice: usize,
+    ) -> Option<BlSymbol> {
+        self.symbols(slice).get(&virtual_address).cloned()
+    }
+
+    pub fn symbol_name_to_virtual_address(&self, name: &str, slice: usize) -> Option<u64> {
+        self.symbols(slice)
+            .into_iter()
+            .find_map(|(virtual_address, symbol)| (symbol.name == name).then_some(virtual_address))
+    }
+
+    pub fn symbol_name_to_file_offset(&self, name: &str, slice: usize) -> Option<u64> {
+        self.symbols(slice)
+            .into_values()
+            .find_map(|symbol| (symbol.name == name).then_some(symbol.file_offset))
+    }
+
+    pub fn relative_virtual_address_to_symbol(
+        &self,
+        relative_virtual_address: u64,
+        slice: usize,
+    ) -> Option<BlSymbol> {
+        let virtual_address =
+            self.relative_virtual_address_to_virtual_address(relative_virtual_address, slice)?;
+        self.virtual_address_to_symbol(virtual_address, slice)
+    }
+
+    pub fn file_offset_to_symbol(&self, file_offset: u64, slice: usize) -> Option<BlSymbol> {
+        self.symbols(slice)
+            .into_values()
+            .find(|symbol| symbol.file_offset == file_offset)
+    }
+
+    /// Returns a set of function addresses identified in the MachO slice.
+    ///
+    /// # Returns
+    /// A `BTreeSet` of function addresses for the MachO slice.
+    pub fn entrypoint_virtual_addresses(&self, slice: usize) -> BTreeSet<u64> {
+        let mut entrypoints = BTreeSet::<u64>::new();
+        if self.entrypoint_virtual_address(slice).is_some() {
+            entrypoints.insert(self.entrypoint_virtual_address(slice).unwrap());
+        }
+        entrypoints.extend(self.symbols(slice).keys());
+        entrypoints.extend(self.export_virtual_addresses(slice));
+        entrypoints
+    }
+
+    /// Checks if the provided segment flags contain the executable flag.
+    ///
+    /// # Arguments
+    ///
+    /// `segment_flags` The segment flags as a `u32`
+    ///
+    /// # Returns
+    /// A `bool` representing if the segment flags contain the executable flag or not.
+    pub fn is_segment_flags_executable(segment_flags: u32) -> bool {
+        (segment_flags & VM_PROT_EXECUTE as u32) != 0
+    }
+
+    /// Checks if the symbol n_type is a function.
+    ///
+    /// # Arguments
+    ///
+    /// `slice` The index representing a binary contained in the MacO fat binary format.
+    ///
+    /// # Returns
+    /// A `BTreeSet<u64>` containing the virtual addresses of function export addresses.
+    pub fn export_virtual_addresses(&self, slice: usize) -> BTreeSet<u64> {
+        let mut result = BTreeSet::<u64>::new();
+        let binding = self.macho.iter().nth(slice);
+        if binding.is_none() {
+            return result;
+        }
+        let binding = binding.unwrap();
+        let dyld_exports_trie = binding.dyld_exports_trie();
+        if dyld_exports_trie.is_none() {
+            return result;
+        }
+        for export in dyld_exports_trie.unwrap().exports() {
+            result.insert(self.imagebase(slice).unwrap() + export.address());
+        }
+        result
+    }
+
+    pub fn executable_virtual_address_ranges(&self, slice: usize) -> BTreeMap<u64, u64> {
+        let mut result = BTreeMap::<u64, u64>::new();
+        let binding = self.macho.iter().nth(slice);
+        if binding.is_none() {
+            return result;
+        }
+        for segment in binding.unwrap().segments() {
+            if !MACHO::is_segment_flags_executable(segment.init_protection()) {
+                continue;
+            }
+            for section in segment.sections() {
+                if [
+                    "__cstring",
+                    "__const",
+                    "__info_plist",
+                    "__unwind_info",
+                    "__eh_frame",
+                    "__stubs",
+                    "__stub_helper",
+                ]
+                .contains(&section.name().as_str())
+                {
+                    continue;
+                }
+                if !section.flags().contains(SectionFlags::PURE_INSTRUCTIONS) {
+                    continue;
+                }
+                if !section.flags().contains(SectionFlags::SOME_INSTRUCTIONS) {
+                    continue;
+                }
+                let start = section.virtual_address();
+                let end = start + section.size();
+                result.insert(start, end);
+            }
+        }
+        result
+    }
+
+    /// Caches the MachO file contents and returns an `Image` object.
+    ///
+    /// # Parameters
+    /// - `slice`: The MachoO binary slice.
+    ///
+    /// # Returns
+    /// A `Result` containing the `Image` object on success or an `Error` on failure.
+    pub fn image(&self, slice: usize) -> Result<Image, Error> {
+        let pathbuf = PathBuf::from(self.config.mmap.directory.clone()).join(format!(
+            "{}.slice-{}.mapped-v2",
+            self.file.sha256_no_config().unwrap(),
+            slice
+        ));
+
+        let mut tempmap = Image::new(pathbuf, self.config.mmap.cache.enabled)?;
+        let image_base = self.imagebase(slice).unwrap_or(0);
+        tempmap.set_base(image_base);
+
+        if tempmap.is_cached() {
+            return Ok(tempmap);
+        }
+
+        let sizeofheaders = self.sizeofheaders(slice);
+        tempmap.seek_to_end()?;
+        tempmap.write(&self.file.data[0..sizeofheaders.unwrap() as usize])?;
+
+        let binary = match self.macho.iter().nth(slice) {
+            Some(binary) => binary,
+            None => {
+                return Err(Error::new(ErrorKind::InvalidData, "Invalid Mach-O slice"));
+            }
+        };
+
+        for segment in binary.segments() {
+            let segment_virtual_address = segment.virtual_address().saturating_sub(image_base);
+            if segment_virtual_address > tempmap.size()? {
+                let padding_length = segment_virtual_address - tempmap.size()?;
+                tempmap.seek_to_end()?;
+                tempmap.write_padding(padding_length as usize)?;
+            }
+            if !matches!(
+                segment.command_type(),
+                LoadCommandTypes::Segment | LoadCommandTypes::Segment64
+            ) {
+                continue;
+            }
+            let segment_file_offset = segment.file_offset() as usize;
+            let segment_size = segment.file_size() as usize;
+            if segment_file_offset + segment_size <= self.file.data.len() {
+                tempmap.seek_to_end()?;
+                tempmap.write(
+                    &self.file.data[segment_file_offset..segment_file_offset + segment_size],
+                )?;
+            } else {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "macho slice segment size exceeds file data length",
+                ));
+            }
+        }
+
+        Ok(tempmap)
+    }
+
+    /// Returns the size of the MACHO file.
+    ///
+    /// # Returns
+    /// The size of the file as a `u64`.
+    #[allow(dead_code)]
+    pub fn size(&self) -> u64 {
+        self.file.size()
+    }
+
+    /// Returns the entropy of the MACHO file.
+    ///
+    /// # Returns
+    /// The entropy of the file as a `Option<f64>`.
+    #[allow(dead_code)]
+    pub fn entropy(&self) -> Option<f64> {
+        self.file.entropy()
+    }
+
+    /// Returns the TLS (Thread Local Storage) hash value if present in the MACHO file.
+    ///
+    /// # Returns
+    /// An `Option<TLSH>` containing the TLSH helper if present, otherwise `None`.
+    #[allow(dead_code)]
+    pub fn tlsh(&self) -> Option<TLSH<'_>> {
+        self.file.tlsh()
+    }
+
+    /// Returns the SHA-256 hash value of the MACHO file.
+    ///
+    /// # Returns
+    /// An `Option<SHA256>` containing the SHA-256 helper if available, otherwise `None`.
+    #[allow(dead_code)]
+    pub fn sha256(&self) -> Option<SHA256<'_>> {
+        self.file.sha256()
+    }
+
+    /// Returns the ssdeep hash value of the MACHO file.
+    #[allow(dead_code)]
+    pub fn ssdeep(&self) -> Option<SSDeep<'_>> {
+        self.file.ssdeep()
+    }
+
+    /// Returns the underlying file metadata helper associated with the Mach-O.
+    ///
+    /// # Returns
+    /// A borrowed [`File`] reference for the Mach-O input.
+    #[allow(dead_code)]
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+}

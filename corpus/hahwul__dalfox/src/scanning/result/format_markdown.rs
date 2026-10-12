@@ -1,0 +1,379 @@
+//! `format_markdown` output serialization for [`Result`].
+//!
+//! One `impl Result` block per output format keeps format-specific work
+//! isolated; the shared model and helpers live in the parent module.
+
+use super::*;
+
+/// Neutralize Markdown syntax in ordinary text that came off the target — a
+/// parameter name (page forms / parameter mining apply no filter), a URL, or
+/// an evidence string.
+///
+/// Pipes and newlines must not change the table or document structure, while
+/// the inline syntax characters must not turn target text into explicit links,
+/// emphasis, or raw HTML. Control bytes go through the same
+/// [`sanitize_display`](crate::utils::term::sanitize_display) rule the
+/// terminal renderer uses.
+fn md_cell(value: &str) -> String {
+    let value = crate::utils::term::sanitize_display(value);
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '!' | '<' | '>' | '#' | '~' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Render exact payload/parameter text in an inline code span. A fixed
+/// one-backtick span can be closed by a target-derived parameter name (or by a
+/// generated payload containing a backtick), leaving the rest active Markdown.
+/// Escape table pipes separately, as Markdown tables split them before parsing
+/// inline code spans.
+fn md_code_cell(value: &str) -> String {
+    let body = crate::utils::term::sanitize_display(value).replace('|', "\\|");
+    // An empty span renders as a literal pair of backticks; page-level AST and
+    // uncorrelated OOB findings have no parameter.
+    if body.is_empty() {
+        return "-".to_string();
+    }
+    let fence = "`".repeat(longest_backtick_run(&body) + 1);
+    // A body edge that is a space or a backtick needs one space of padding:
+    // a backtick there would merge with the fence into a longer run and leave
+    // the span unclosed. CommonMark strips one padding space from each side.
+    let edge = |c: char| c == ' ' || c == '`';
+    let padding =
+        if !body.trim_matches(' ').is_empty() && (body.starts_with(edge) || body.ends_with(edge)) {
+            " "
+        } else {
+            ""
+        };
+    format!("{fence}{padding}{body}{padding}{fence}")
+}
+
+/// Pick a fence long enough to contain `body`. A response echoed under
+/// `--include-response` can contain ``` and would otherwise close the fence
+/// early, spilling the rest of the body into the document as Markdown.
+fn code_fence_for(body: &str) -> String {
+    "`".repeat(longest_backtick_run(body).max(2) + 1)
+}
+
+/// Length of the longest run of consecutive backticks in `body`.
+fn longest_backtick_run(body: &str) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for ch in body.chars() {
+        if ch == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
+}
+
+impl Result {
+    /// Serialize a slice of Result into Markdown string.
+    ///
+    /// For backward compatibility (public API surface under `dalfox::scanning::result`),
+    /// the 3-argument form omits the scan metadata envelope (equivalent to `meta=None`).
+    /// Use the `_with_meta` variant to include `## Scan Metadata` + target summary tables.
+    pub fn results_to_markdown(
+        results: &[Result],
+        include_request: bool,
+        include_response: bool,
+    ) -> String {
+        Self::results_to_markdown_with_meta(results, include_request, include_response, None)
+    }
+
+    /// Serialize ... with optional scan metadata (see `results_to_markdown`).
+    pub(crate) fn results_to_markdown_with_meta(
+        results: &[Result],
+        include_request: bool,
+        include_response: bool,
+        meta: Option<&ScanMetadata>,
+    ) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(results.len() * 512 + 256);
+
+        // Add header
+        out.push_str("# Dalfox Scan Results\n\n");
+
+        // Inject scan metadata envelope when provided (for parity with JSON/JSONL)
+        if let Some(m) = meta {
+            out.push_str("## Scan Metadata\n\n");
+            out.push_str("| Field | Value |\n");
+            out.push_str("|-------|-------|\n");
+            let _ = writeln!(out, "| **Dalfox Version** | {} |", m.dalfox_version);
+            let _ = writeln!(out, "| **Targets** | {} |", md_cell(&m.targets.join(", ")));
+            let _ = writeln!(out, "| **Scan Duration** | {} ms |", m.scan_duration_ms);
+            let _ = writeln!(out, "| **Total Requests** | {} |", m.total_requests);
+            if m.failed_requests > 0 {
+                let _ = writeln!(out, "| **Failed Requests** | {} |", m.failed_requests);
+            }
+            let _ = writeln!(out, "| **Findings Count** | {} |", m.findings_count);
+            // Only shown when dedup actually dropped something: a collapsed
+            // input list must be visible in the report, but the common
+            // "nothing collapsed" case doesn't need a row.
+            if m.targets_deduplicated > 0 {
+                let _ = writeln!(
+                    out,
+                    "| **Targets Deduplicated** | {} ({} mode) |",
+                    m.targets_deduplicated, m.dedup_mode
+                );
+            }
+            // Same rule as the dedup row: shown only when part of the input
+            // list was actually thrown away.
+            if m.targets_unparsable > 0 {
+                let _ = writeln!(
+                    out,
+                    "| **Targets Unparsable** | {} list line(s) skipped |",
+                    m.targets_unparsable
+                );
+            }
+            if let Some(b) = &m.baseline {
+                let cell = if let Some(w) = b.get("warning").and_then(|v| v.as_str()) {
+                    format!("disabled — {}", w)
+                } else {
+                    format!(
+                        "{} (mode: {}, new: {}, known: {})",
+                        b.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+                        b.get("mode").and_then(|v| v.as_str()).unwrap_or("?"),
+                        b.get("new").and_then(|v| v.as_u64()).unwrap_or(0),
+                        b.get("known").and_then(|v| v.as_u64()).unwrap_or(0),
+                    )
+                };
+                let _ = writeln!(out, "| **Baseline** | {} |", md_cell(&cell));
+            }
+            // Same rule as the dedup row: a report covering a fraction of the
+            // input list because the rest was already done must say so.
+            if let Some(r) = &m.resumed
+                && r.get("targets_skipped_completed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    > 0
+            {
+                let _ = writeln!(
+                    out,
+                    "| **Resumed** | {} target(s) skipped as already completed (state file: {}) |",
+                    r.get("targets_skipped_completed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    md_cell(r.get("state_file").and_then(|v| v.as_str()).unwrap_or("?"))
+                );
+            }
+            // Shown whenever the flag was set, like the JSON envelope: a report
+            // whose findings were all filtered must not read as a clean scan.
+            if let Some(c) = &m.min_confidence {
+                let _ = writeln!(
+                    out,
+                    "| **Min Confidence** | {} ({} finding(s) dropped) |",
+                    md_cell(c.get("level").and_then(|v| v.as_str()).unwrap_or("?")),
+                    c.get("dropped").and_then(|v| v.as_u64()).unwrap_or(0)
+                );
+            }
+            // Only rendered when true — a "Complete: yes" row on every clean
+            // report is noise, but its absence must never be what signals a
+            // truncated run, so the true case is spelled out loudly.
+            if m.incomplete {
+                let _ = writeln!(
+                    out,
+                    "| **Incomplete** | ⚠️ yes — at least one target was not fully tested (see Target Summary) |"
+                );
+            }
+            out.push('\n');
+
+            // Per-target summary table (includes status, findings_count, WAF when present)
+            if !m.target_summary.is_empty() {
+                out.push_str("### Target Summary\n\n");
+                out.push_str("| Target | Status | Findings | WAF |\n");
+                out.push_str("|--------|--------|----------|-----|\n");
+                for t in &m.target_summary {
+                    let url = t.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+                    // Method first: one URL can carry several targets (#1527).
+                    let tgt = match t.get("method").and_then(|v| v.as_str()) {
+                        Some(m) => format!("{} {}", m, url),
+                        None => url.to_string(),
+                    };
+                    let st = t.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                    let fc = t
+                        .get("findings_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let status_cell = if let Some(ec) = t.get("error_code").and_then(|e| e.as_str())
+                    {
+                        format!("{} ({})", st, ec)
+                    } else {
+                        st.to_string()
+                    };
+                    let waf_str = if let Some(w) = t.get("waf") {
+                        // Real shape (from analysis.rs + render_results): "detected": [{ "type": "..", "confidence": N, ...}, ...]
+                        // plus optional "bypass". Support legacy test mock shape {detected: bool, name} too.
+                        if let Some(dets) = w.get("detected").and_then(|d| d.as_array()) {
+                            if !dets.is_empty() {
+                                dets[0]
+                                    .get("type")
+                                    .and_then(|ty| ty.as_str())
+                                    .unwrap_or("detected")
+                                    .to_string()
+                            } else {
+                                "none".to_string()
+                            }
+                        } else if w.get("detected").and_then(|d| d.as_bool()).unwrap_or(false) {
+                            w.get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("detected")
+                                .to_string()
+                        } else {
+                            "none".to_string()
+                        }
+                    } else {
+                        "none".to_string()
+                    };
+                    let _ = writeln!(
+                        out,
+                        "| {} | {} | {} | {} |",
+                        md_cell(&tgt),
+                        md_cell(&status_cell),
+                        fc,
+                        md_cell(&waf_str)
+                    );
+                }
+                out.push('\n');
+            }
+        }
+
+        // Add summary
+        let v_count = results
+            .iter()
+            .filter(|r| r.result_type == FindingType::Verified)
+            .count();
+        let r_count = results
+            .iter()
+            .filter(|r| r.result_type == FindingType::Reflected)
+            .count();
+        out.push_str("## Summary\n\n");
+        let _ = writeln!(out, "- **Total Findings**: {}", results.len());
+        let _ = writeln!(out, "- **Vulnerabilities (V)**: {}", v_count);
+        let _ = writeln!(out, "- **Reflections (R)**: {}", r_count);
+        // A and I only when present, so Total is the sum of the listed counts
+        // without adding two always-zero lines to a typical report.
+        for (tier, label) in [
+            (FindingType::AstDetected, "AST-detected (A)"),
+            (FindingType::Informational, "Informational (I)"),
+        ] {
+            let n = results.iter().filter(|r| r.result_type == tier).count();
+            if n > 0 {
+                let _ = writeln!(out, "- **{label}**: {n}");
+            }
+        }
+        out.push('\n');
+
+        // Add findings table
+        if !results.is_empty() {
+            out.push_str("## Findings\n\n");
+
+            for (idx, result) in results.iter().enumerate() {
+                let _ = write!(
+                    out,
+                    "### {}. {} - {} ({})\n\n", // double newline intentional
+                    idx + 1,
+                    match result.result_type {
+                        FindingType::Verified => "Vulnerability",
+                        FindingType::AstDetected => "AST-detected",
+                        FindingType::Reflected => "Reflection",
+                        FindingType::Informational => "Informational",
+                    },
+                    md_code_cell(&result.param),
+                    md_cell(&result.inject_type)
+                );
+
+                out.push_str("| Field | Value |\n");
+                out.push_str("|-------|-------|\n");
+                let _ = writeln!(out, "| **Type** | {} |", result.result_type);
+                let _ = writeln!(
+                    out,
+                    "| **Type Description** | {} |",
+                    md_cell(result.result_type.long_description())
+                );
+                let _ = writeln!(out, "| **Parameter** | {} |", md_code_cell(&result.param));
+                let _ = writeln!(out, "| **Method** | {} |", md_cell(&result.method));
+                let _ = writeln!(
+                    out,
+                    "| **Injection Type** | {} |",
+                    md_cell(&result.inject_type)
+                );
+                let _ = writeln!(
+                    out,
+                    "| **Detected By** | {} |",
+                    md_cell(result.detection_method.as_str())
+                );
+                if let Some(grade) = result.confidence {
+                    let cell = if result.confidence_reason.is_empty() {
+                        grade.as_str().to_string()
+                    } else {
+                        format!(
+                            "{} ({})",
+                            grade.as_str(),
+                            md_cell(&result.confidence_reason)
+                        )
+                    };
+                    let _ = writeln!(out, "| **Confidence** | {} |", cell);
+                }
+                if let Some(is_new) = result.new_since_baseline {
+                    let _ = writeln!(
+                        out,
+                        "| **New** | {} |",
+                        if is_new { "yes" } else { "no (in baseline)" }
+                    );
+                }
+                let _ = writeln!(out, "| **Severity** | {} |", md_cell(&result.severity));
+                let _ = writeln!(out, "| **CWE** | {} |", md_cell(&result.cwe));
+                let _ = writeln!(out, "| **URL** | {} |", md_cell(&result.data));
+                let _ = writeln!(out, "| **Payload** | {} |", md_code_cell(&result.payload));
+
+                if !result.evidence.is_empty() {
+                    let _ = writeln!(out, "| **Evidence** | {} |", md_cell(&result.evidence));
+                }
+                // R only, like plain: why a reflection didn't verify is the
+                // manual follow-up. Machine formats carry it on every finding.
+                if result.result_type == FindingType::Reflected
+                    && let Some(filter) = &result.filter
+                {
+                    let _ = writeln!(out, "| **Filter** | {} |", md_code_cell(&filter.summary()));
+                }
+
+                out.push('\n');
+
+                // Include request if requested
+                // Raw target bytes: escape terminal controls (this renders
+                // to stdout too), keeping CRLF line structure.
+                if include_request && let Some(req) = &result.request {
+                    let req = crate::utils::term::sanitize_display_block(req);
+                    let fence = code_fence_for(&req);
+                    let _ = write!(out, "**Request:**\n\n{}http\n", fence);
+                    out.push_str(&req);
+                    let _ = write!(out, "\n{}\n\n", fence);
+                }
+
+                // Include response if requested
+                if include_response && let Some(resp) = &result.response {
+                    let resp = crate::utils::term::sanitize_display_block(resp);
+                    let fence = code_fence_for(&resp);
+                    let _ = write!(out, "**Response:**\n\n{}http\n", fence);
+                    out.push_str(&resp);
+                    let _ = write!(out, "\n{}\n\n", fence);
+                }
+
+                out.push_str("---\n\n");
+            }
+        }
+
+        out
+    }
+}

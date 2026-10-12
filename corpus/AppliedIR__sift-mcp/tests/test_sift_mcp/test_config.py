@@ -1,0 +1,58 @@
+"""Tests for sift_mcp.config."""
+
+from sift_mcp.config import SiftConfig, get_config
+
+
+class TestSiftConfig:
+    def test_defaults(self):
+        cfg = SiftConfig()
+        assert cfg.default_timeout == 600
+        assert "/usr/local/bin" in cfg.tool_paths
+        assert cfg.case_dir == ""
+
+    def test_from_env(self, monkeypatch, tmp_path):
+        case_dir = tmp_path / "test-case"
+        case_dir.mkdir()
+        (case_dir / "CASE.yaml").write_text("case_id: test\n")
+        monkeypatch.setenv("VHIR_CASE_DIR", str(case_dir))
+        monkeypatch.setenv("SIFT_TIMEOUT", "120")
+        cfg = SiftConfig.from_env()
+        assert cfg.case_dir == str(case_dir)
+        assert cfg.default_timeout == 120
+
+    def test_extra_tool_paths(self, monkeypatch):
+        monkeypatch.setenv("SIFT_TOOL_PATHS", "/opt/custom:/opt/other")
+        cfg = SiftConfig.from_env()
+        assert cfg.tool_paths[0] == "/opt/custom"
+        assert cfg.tool_paths[1] == "/opt/other"
+
+    def test_share_root_default(self):
+        cfg = SiftConfig()
+        assert cfg.share_root == ""
+
+    def test_share_root_from_env(self, monkeypatch):
+        monkeypatch.setenv("VHIR_SHARE_ROOT", "/mnt/wintools")
+        cfg = SiftConfig.from_env()
+        assert cfg.share_root == "/mnt/wintools"
+
+    def test_response_byte_budget_default(self):
+        cfg = SiftConfig()
+        assert cfg.response_byte_budget == 10_240
+
+    def test_max_output_bytes_default(self):
+        cfg = SiftConfig()
+        assert cfg.max_output_bytes == 52_428_800  # 50MB
+
+    def test_response_budget_from_env(self, monkeypatch):
+        monkeypatch.setenv("SIFT_RESPONSE_BUDGET", "20480")
+        cfg = SiftConfig.from_env()
+        assert cfg.response_byte_budget == 20480
+
+    def test_response_budget_invalid_env(self, monkeypatch):
+        monkeypatch.setenv("SIFT_RESPONSE_BUDGET", "not_a_number")
+        cfg = SiftConfig.from_env()
+        assert cfg.response_byte_budget == 10_240  # stays default
+
+    def test_get_config(self):
+        cfg = get_config()
+        assert isinstance(cfg, SiftConfig)

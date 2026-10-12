@@ -1,0 +1,1690 @@
+import { AI_TOOLS_VIEW, AI_TOOLS_GROUP } from '@shared/app-space-handoff'
+import { useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react'
+import { createPortal } from 'react-dom'
+import { useTranslation } from 'react-i18next'
+import { useNavigate, useLocation } from 'react-router-dom'
+import {
+  Copy,
+  X,
+  Monitor,
+  Globe,
+  AppWindow,
+  Gamepad2,
+  Trash2,
+  Link2Off,
+  Database,
+  Variable,
+  Fingerprint,
+  Search,
+  Sparkles,
+  ChevronRight,
+  ChevronDown,
+  ArrowUpDown,
+  Folder,
+  FolderOpen,
+  AlertTriangle,
+  ShieldAlert,
+  Loader2
+} from 'lucide-react'
+import { PageHeader } from '@/components/layout/PageHeader'
+import { ScanProgress } from '@/components/shared/ScanProgress'
+import { ConfirmDialog } from '@/components/shared/ConfirmDialog'
+import { EmptyState } from '@/components/shared/EmptyState'
+import { CleanSummary } from '@/components/cleaner/CleanSummary'
+import { cn, formatBytes, formatNumber } from '@/lib/utils'
+import { cleanInBatches } from '@/lib/cleaner-batches'
+import { filterCleanerResults, splitSearchHighlight } from '@/lib/cleaner-results'
+import { useScanStore } from '@/stores/scan-store'
+import { useStatsStore } from '@/stores/stats-store'
+import { useHistoryStore } from '@/stores/history-store'
+import { useSettingsStore } from '@/stores/settings-store'
+import { usePlatform } from '@/hooks/usePlatform'
+import { ScanStatus, CleanerType } from '@shared/enums'
+import type { CleanerBlocker, ScanResult } from '@shared/types'
+import type { LucideIcon } from 'lucide-react'
+import { toast } from 'sonner'
+
+/** Check whether a path looks like an absolute filesystem path (not a label like "Recycle Bin" or "PATH → …"). */
+const isAbsolutePath = (p: string) => /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('/')
+
+interface CategoryDef {
+  type: CategoryType
+  labelKey: string
+  icon: LucideIcon
+  descriptionKey: string
+}
+
+type CategoryType = CleanerType | typeof AI_TOOLS_VIEW
+
+const categories: CategoryDef[] = [
+  {
+    type: CleanerType.System,
+    labelKey: 'categorySystem',
+    icon: Monitor,
+    descriptionKey: 'categorySystemDescription'
+  },
+  {
+    type: CleanerType.Browser,
+    labelKey: 'categoryBrowsers',
+    icon: Globe,
+    descriptionKey: 'categoryBrowsersDescription'
+  },
+  {
+    type: CleanerType.App,
+    labelKey: 'categoryApplications',
+    icon: AppWindow,
+    descriptionKey: 'categoryApplicationsDescription'
+  },
+  {
+    type: AI_TOOLS_VIEW,
+    labelKey: 'categoryAiTools',
+    icon: Sparkles,
+    descriptionKey: 'categoryAiToolsDescription'
+  },
+  {
+    type: CleanerType.Gaming,
+    labelKey: 'categoryGaming',
+    icon: Gamepad2,
+    descriptionKey: 'categoryGamingDescription'
+  },
+  {
+    type: CleanerType.RecycleBin,
+    labelKey: 'categoryRecycleBin',
+    icon: Trash2,
+    descriptionKey: 'categoryRecycleBinDescription'
+  },
+  {
+    type: CleanerType.Shortcut,
+    labelKey: 'categoryShortcuts',
+    icon: Link2Off,
+    descriptionKey: 'categoryShortcutsDescription'
+  },
+  {
+    type: CleanerType.Environment,
+    labelKey: 'categoryEnvironment',
+    icon: Variable,
+    descriptionKey: 'categoryEnvironmentDescription'
+  },
+  {
+    type: CleanerType.Database,
+    labelKey: 'categoryDatabases',
+    icon: Database,
+    descriptionKey: 'categoryDatabasesDescription'
+  },
+  {
+    type: CleanerType.PrivacyTraces,
+    labelKey: 'categoryPrivacyTraces',
+    icon: Fingerprint,
+    descriptionKey: 'categoryPrivacyTracesDescription'
+  }
+]
+
+const scannerCategories = categories.filter(
+  (category): category is CategoryDef & { type: CleanerType } => category.type !== AI_TOOLS_VIEW
+)
+
+type SortMode = 'default' | 'size-desc' | 'size-asc'
+
+const SORT_LABEL_KEYS: Record<SortMode, string> = {
+  default: 'sortDefault',
+  'size-desc': 'sortSizeDesc',
+  'size-asc': 'sortSizeAsc'
+}
+
+function blockerNames(blockers: CleanerBlocker[], moreLabel: (count: number) => string): string {
+  const visible = blockers.slice(0, 4).map((blocker) => blocker.name)
+  if (blockers.length > visible.length) visible.push(moreLabel(blockers.length - visible.length))
+  return visible.join(', ')
+}
+
+const MENU_VIEWPORT_MARGIN = 8
+
+interface CleanerContextMenuState {
+  x: number
+  y: number
+  label: string
+  ids: string[]
+}
+
+function sizeForIds(results: ScanResult[], ids: string[]): number {
+  const idSet = new Set(ids)
+  return results.reduce(
+    (sum, r) =>
+      sum + r.items.filter((item) => idSet.has(item.id)).reduce((s, item) => s + item.size, 0),
+    0
+  )
+}
+
+function CleanerContextMenu({
+  menu,
+  size,
+  onClean,
+  onClose,
+  cleanLabel
+}: {
+  menu: CleanerContextMenuState
+  size: number
+  onClean: () => void
+  onClose: () => void
+  cleanLabel: string
+}) {
+  const menuRef = useRef<HTMLDivElement>(null)
+  const [position, setPosition] = useState({ left: menu.x, top: menu.y, visible: false })
+
+  useLayoutEffect(() => {
+    const el = menuRef.current
+    if (!el) return
+    const maxLeft = window.innerWidth - el.offsetWidth - MENU_VIEWPORT_MARGIN
+    const maxTop = window.innerHeight - el.offsetHeight - MENU_VIEWPORT_MARGIN
+    setPosition({
+      left: Math.max(MENU_VIEWPORT_MARGIN, Math.min(menu.x, maxLeft)),
+      top: Math.max(MENU_VIEWPORT_MARGIN, Math.min(menu.y, maxTop)),
+      visible: true
+    })
+  }, [menu.x, menu.y])
+
+  useEffect(() => {
+    const handleDismiss = () => onClose()
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('mousedown', handleDismiss)
+    window.addEventListener('keydown', handleKey)
+    window.addEventListener('scroll', handleDismiss, true)
+    return () => {
+      window.removeEventListener('mousedown', handleDismiss)
+      window.removeEventListener('keydown', handleKey)
+      window.removeEventListener('scroll', handleDismiss, true)
+    }
+  }, [onClose])
+
+  return createPortal(
+    <div
+      ref={menuRef}
+      className="fixed z-[9999] min-w-[200px] max-w-[320px] rounded-xl py-1 shadow-xl"
+      style={{
+        left: position.left,
+        top: position.top,
+        visibility: position.visible ? 'visible' : 'hidden',
+        background: '#1e1e22',
+        border: '1px solid var(--border-strong)'
+      }}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <button
+        type="button"
+        onClick={onClean}
+        className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-[12px] transition-colors hover:bg-white/5"
+        style={{ color: 'var(--accent-hover)' }}
+      >
+        <Sparkles className="h-3.5 w-3.5 shrink-0" strokeWidth={2} />
+        <span className="min-w-0 truncate">{cleanLabel}</span>
+        <span
+          className="ml-auto shrink-0 font-mono text-[11px]"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          {formatBytes(size)}
+        </span>
+      </button>
+    </div>,
+    document.body
+  )
+}
+
+export function CleanerPage() {
+  const { t } = useTranslation(['cleaner', 'settings'])
+  const navigate = useNavigate()
+  const { platform } = usePlatform()
+  const store = useScanStore()
+  const recomputeStats = useStatsStore((s) => s.recompute)
+  const historyStore = useHistoryStore()
+  const createRestorePointEnabled = useSettingsStore((s) => s.settings.cleaner.createRestorePoint)
+  const closeBrowsersBeforeClean = useSettingsStore(
+    (s) => s.settings.cleaner.closeBrowsersBeforeClean
+  )
+  const protectRecycleBin = useSettingsStore((s) => s.settings.cleaner.protectRecycleBin)
+  const scannableCategories = protectRecycleBin
+    ? scannerCategories.filter((c) => c.type !== CleanerType.RecycleBin)
+    : scannerCategories
+  const location = useLocation()
+  const [activeCategory, setActiveCategory] = useState<CategoryType>(() => {
+    const requested = location.state?.appSpaceCategory
+    return [AI_TOOLS_VIEW, CleanerType.App, CleanerType.Gaming, CleanerType.Browser].includes(
+      requested
+    )
+      ? requested
+      : CleanerType.System
+  })
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchScope, setSearchScope] = useState<'category' | 'all'>(
+    location.state?.appSpaceAll === true ? 'all' : 'category'
+  )
+  const [selectedOnly, setSelectedOnly] = useState(false)
+  const [visibleLimits, setVisibleLimits] = useState<Record<string, number>>({})
+  const [collapsedMatches, setCollapsedMatches] = useState<Set<string>>(new Set())
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [blockers, setBlockers] = useState<CleanerBlocker[]>([])
+  const [confirmBlockers, setConfirmBlockers] = useState<CleanerBlocker[]>([])
+  const [checkingBlockers, setCheckingBlockers] = useState(false)
+  const [preparingClean, setPreparingClean] = useState(false)
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
+  const cleanStartRef = useRef<number>(0)
+  const blockerRequestRef = useRef(0)
+  const scopedBlockerRequestRef = useRef(0)
+  const [scanningCategory, setScanningCategory] = useState<CleanerType | null>(null)
+  const [sortMode, setSortMode] = useState<SortMode>('default')
+  const [showSortMenu, setShowSortMenu] = useState(false)
+  const sortMenuRef = useRef<HTMLDivElement>(null)
+  const [contextMenu, setContextMenu] = useState<CleanerContextMenuState | null>(null)
+  const [scopedClean, setScopedClean] = useState<{ ids: string[]; label: string } | null>(null)
+
+  const scanIndexRef = useRef(0)
+  const cleanIndexRef = useRef(0)
+  const cleanTotalRef = useRef(1)
+
+  useEffect(() => {
+    if (!window.kudu?.onScanProgress) return
+    return window.kudu.onScanProgress((data) => {
+      // Each cleaner reports 0-100% independently. Scale to overall progress
+      // based on which category we're currently processing.
+      if (data.phase === 'cleaning') {
+        const total = cleanTotalRef.current
+        const base = (cleanIndexRef.current / total) * 100
+        const slice = data.progress / total
+        store.setProgress({ ...data, progress: base + slice })
+      } else {
+        const total = scannableCategories.length
+        const base = (scanIndexRef.current / total) * 100
+        const slice = data.progress / total
+        store.setProgress({ ...data, progress: base + slice })
+      }
+    })
+  }, [protectRecycleBin])
+
+  // Close the sort menu when clicking anywhere outside it.
+  useEffect(() => {
+    if (!showSortMenu) return
+    const handler = (e: globalThis.MouseEvent) => {
+      if (sortMenuRef.current && !sortMenuRef.current.contains(e.target as Node)) {
+        setShowSortMenu(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showSortMenu])
+
+  const [failedCategories, setFailedCategories] = useState<string[]>([])
+  const [elevationSkipped, setElevationSkipped] = useState<string[]>([])
+
+  // Check the default selection after each scan. Selection changes are
+  // revalidated when Clean is clicked, avoiding an OS query on every checkbox.
+  useEffect(() => {
+    if (
+      platform !== 'win32' ||
+      store.status !== ScanStatus.Complete ||
+      store.cleanSummary ||
+      store.selectedItems.size === 0 ||
+      !window.kudu?.cleanerBlockers
+    ) {
+      setBlockers([])
+      setCheckingBlockers(false)
+      return
+    }
+
+    const requestId = ++blockerRequestRef.current
+    let cancelled = false
+    setCheckingBlockers(true)
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await window.kudu.cleanerBlockers([...store.selectedItems])
+        if (!cancelled && blockerRequestRef.current === requestId) setBlockers(result)
+      } catch {
+        if (!cancelled && blockerRequestRef.current === requestId) setBlockers([])
+      } finally {
+        if (!cancelled && blockerRequestRef.current === requestId) setCheckingBlockers(false)
+      }
+    }, 250)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [platform, store.status, store.cleanSummary])
+
+  const handleRelaunch = useCallback(() => {
+    window.kudu.elevationRelaunch()
+  }, [])
+
+  const handleScan = useCallback(async () => {
+    store.setStatus(ScanStatus.Scanning)
+    store.setResults([])
+    store.setCleanSummary(null)
+    setExpandedGroups(new Set())
+    setVisibleLimits({})
+    setCollapsedMatches(new Set())
+    setFailedCategories([])
+    setElevationSkipped([])
+    const failed: string[] = []
+    const skippedForElevation: string[] = []
+    try {
+      const scanFns: Partial<Record<CleanerType, () => Promise<ScanResult[]>>> = {
+        [CleanerType.System]: () => window.kudu.systemScan(),
+        [CleanerType.Browser]: () => window.kudu.browserScan(),
+        [CleanerType.App]: () => window.kudu.appScan(),
+        [CleanerType.Gaming]: () => window.kudu.gamingScan(),
+        [CleanerType.RecycleBin]: () => window.kudu.recycleBinScan(),
+        [CleanerType.Shortcut]: () => window.kudu.shortcutScan(),
+        [CleanerType.Environment]: () => window.kudu.environmentScan(),
+        [CleanerType.Database]: () => window.kudu.databaseScan(),
+        [CleanerType.PrivacyTraces]: () => window.kudu.privacyTracesScan()
+      }
+      for (let ci = 0; ci < scannableCategories.length; ci++) {
+        const cat = scannableCategories[ci]
+        scanIndexRef.current = ci
+        setScanningCategory(cat.type)
+        try {
+          const scanFn = scanFns[cat.type]
+          if (!scanFn) continue
+          const results = await scanFn()
+          // Extract elevation-required markers before adding to store
+          const elevationMarker = results.find((r) => r.subcategory === '__elevation_required')
+          if (elevationMarker?.group) {
+            skippedForElevation.push(...elevationMarker.group.split(', '))
+          }
+          store.addResults(results.filter((r) => r.subcategory !== '__elevation_required'))
+        } catch {
+          failed.push(t(cat.labelKey))
+        }
+      }
+      if (failed.length > 0) setFailedCategories(failed)
+      if (skippedForElevation.length > 0) setElevationSkipped(skippedForElevation)
+      setScanningCategory(null)
+      store.setStatus(ScanStatus.Complete)
+    } catch {
+      setScanningCategory(null)
+      store.setStatus(ScanStatus.Error)
+    }
+    store.setProgress(null)
+  }, [protectRecycleBin])
+
+  const handleCleanRequest = useCallback(
+    async (scope?: { ids: string[]; label: string }) => {
+      const selectedIds = scope?.ids ?? store.getSelectedIds()
+      if (selectedIds.length === 0) return
+
+      setScopedClean(scope ?? null)
+      setPreparingClean(true)
+      // Scoped requests track their own counter so they neither cancel the
+      // page-wide blocker check nor overwrite its banner, which always describes
+      // the globally selected items.
+      const requestRef = scope ? scopedBlockerRequestRef : blockerRequestRef
+      const requestId = ++requestRef.current
+      let latest: CleanerBlocker[] = []
+      try {
+        if (platform === 'win32' && window.kudu?.cleanerBlockers) {
+          latest = await window.kudu.cleanerBlockers(selectedIds)
+        }
+      } catch {
+        // Advisory preflight failures must not prevent the confirmation dialog.
+      } finally {
+        if (requestRef.current === requestId) {
+          if (!scope) {
+            setBlockers(latest)
+            setCheckingBlockers(false)
+          }
+          setConfirmBlockers(latest)
+          setShowConfirm(true)
+          setPreparingClean(false)
+        }
+      }
+    },
+    [platform]
+  )
+
+  const handleClean = useCallback(async () => {
+    const shouldCloseDetectedBrowsers =
+      closeBrowsersBeforeClean && confirmBlockers.some((blocker) => blocker.isBrowser)
+    setShowConfirm(false)
+    setConfirmBlockers([])
+    store.setStatus(ScanStatus.Cleaning)
+    cleanStartRef.current = Date.now()
+    try {
+      if (shouldCloseDetectedBrowsers) {
+        try {
+          await window.kudu.cleanerPrepareClean()
+        } catch {
+          // Browser closing is best-effort; individual cleaners still report
+          // any files that remain locked.
+        }
+      }
+
+      // Create a system restore point before cleaning if enabled
+      if (createRestorePointEnabled) {
+        try {
+          const rpResult = await window.kudu.createRestorePoint(
+            `Kudu clean — ${new Date().toLocaleString()}`
+          )
+          if (rpResult.success) {
+            toast.success(t('toastRestorePointCreated'))
+          } else {
+            toast.warning(t('toastRestorePointSkipped'), { description: rpResult.error })
+          }
+        } catch {
+          toast.warning(t('toastRestorePointSkipped'), {
+            description: t('toastRestorePointSkippedDescription')
+          })
+        }
+      }
+
+      const selectedIds = scopedClean?.ids ?? store.getSelectedIds()
+      setScopedClean(null)
+      const selectedIdSet = new Set(selectedIds)
+      const cleanFns: Partial<Record<CleanerType, (ids: string[]) => Promise<any>>> = {
+        [CleanerType.System]: (ids) => window.kudu.systemClean(ids),
+        [CleanerType.Browser]: (ids) => window.kudu.browserClean(ids),
+        [CleanerType.App]: (ids) => window.kudu.appClean(ids),
+        [CleanerType.Gaming]: (ids) => window.kudu.gamingClean(ids),
+        [CleanerType.RecycleBin]: () => window.kudu.recycleBinClean(),
+        [CleanerType.Shortcut]: (ids) => window.kudu.shortcutClean(ids),
+        [CleanerType.Environment]: (ids) => window.kudu.environmentClean(ids),
+        [CleanerType.Database]: (ids) => window.kudu.databaseClean(ids),
+        [CleanerType.PrivacyTraces]: (ids) => window.kudu.privacyTracesClean(ids)
+      }
+      let totalCleaned = 0,
+        totalFiles = 0,
+        totalSkipped = 0,
+        anyNeedsElevation = false
+      const allErrors: { path: string; reason: string }[] = []
+      const categoryBreakdown: Array<{
+        name: string
+        type: string
+        found: number
+        cleaned: number
+        space: number
+      }> = []
+
+      // Build the category plan once with O(1) selection lookups. Large scans
+      // can hold tens of thousands of IDs, so repeatedly calling includes()
+      // here made preparation quadratic. Reclaim the largest selections first
+      // so protected system paths cannot delay all useful cleanup behind their
+      // retry window.
+      const categoryPlans = scannableCategories.map((cat) => {
+        const catResults = store.results.filter((r) => r.category === cat.type)
+        const catItemsAll = catResults.flatMap((r) => r.items)
+        const selectedItems = catItemsAll.filter((item) => selectedIdSet.has(item.id))
+        return {
+          cat,
+          catResults,
+          catItemsAll,
+          catItemIds: selectedItems.map((item) => item.id),
+          selectedSize: selectedItems.reduce((sum, item) => sum + item.size, 0)
+        }
+      })
+      const activePlans = categoryPlans
+        .filter((plan) => plan.catItemIds.length > 0)
+        .sort((a, b) => b.selectedSize - a.selectedSize)
+      cleanTotalRef.current = Math.max(activePlans.length, 1)
+      let activeIndex = 0
+
+      store.setProgress({
+        phase: 'cleaning',
+        category: '',
+        currentPath: '',
+        progress: 0,
+        itemsFound: 0,
+        sizeFound: 0
+      })
+
+      for (const { cat, catResults, catItemIds } of activePlans) {
+        cleanIndexRef.current = activeIndex
+        // Some cleaners (notably the Windows Recycle Bin) perform one
+        // blocking platform operation and therefore have no per-file
+        // callbacks. Announce the category before invoking it so the UI
+        // never leaves the previous cleaner's path and 100% progress on
+        // screen while the next category is still working.
+        store.setProgress({
+          phase: 'cleaning',
+          category: cat.type,
+          currentPath: t(cat.labelKey),
+          progress: (activeIndex / cleanTotalRef.current) * 100,
+          itemsFound: catResults.reduce((sum, scan) => sum + scan.itemCount, 0),
+          sizeFound: totalCleaned
+        })
+        try {
+          const cleanFn = cleanFns[cat.type]
+          if (!cleanFn) continue
+          const cleaned = await cleanInBatches(catItemIds, cleanFn)
+          const result = cleaned.result
+          if (result.receiptSaved === false) toast.warning(t('history:receipts.saveError'))
+          totalCleaned += result.totalCleaned
+          totalFiles += result.filesDeleted
+          totalSkipped += result.filesSkipped
+          if (result.needsElevation) anyNeedsElevation = true
+          if (result.errors.length) allErrors.push(...result.errors)
+          if (cleaned.error) {
+            const reason =
+              cleaned.error instanceof Error ? cleaned.error.message : String(cleaned.error)
+            allErrors.push({ path: t(cat.labelKey), reason })
+          }
+          categoryBreakdown.push({
+            name: t(cat.labelKey),
+            type: cat.type,
+            found: catResults.reduce((sum, scan) => sum + scan.itemCount, 0),
+            cleaned: result.filesDeleted,
+            space: result.totalCleaned
+          })
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          allErrors.push({ path: t(cat.labelKey), reason })
+          categoryBreakdown.push({
+            name: t(cat.labelKey),
+            type: cat.type,
+            found: catResults.reduce((sum, scan) => sum + scan.itemCount, 0),
+            cleaned: 0,
+            space: 0
+          })
+        }
+        activeIndex++
+      }
+
+      for (const { cat, catResults, catItemsAll, catItemIds } of categoryPlans) {
+        if (catItemIds.length === 0 && catItemsAll.length > 0) {
+          categoryBreakdown.push({
+            name: t(cat.labelKey),
+            type: cat.type,
+            found: catResults.reduce((sum, scan) => sum + scan.itemCount, 0),
+            cleaned: 0,
+            space: 0
+          })
+        }
+      }
+
+      const totalFound = store.results.reduce((s, r) => s + r.itemCount, 0)
+      const duration = Date.now() - cleanStartRef.current
+      await historyStore.addEntry({
+        id: Date.now().toString(),
+        type: 'cleaner',
+        timestamp: new Date().toISOString(),
+        duration,
+        // Window the deletion log by, so History can list the exact paths this
+        // run removed across all the per-category clean calls above.
+        cleanedFrom: new Date(cleanStartRef.current).toISOString(),
+        cleanedTo: new Date().toISOString(),
+        totalItemsFound: totalFound,
+        totalItemsCleaned: totalFiles,
+        totalItemsSkipped: totalSkipped,
+        totalSpaceSaved: totalCleaned,
+        categories: categoryBreakdown.map((d) => ({
+          name: d.name,
+          type: d.type,
+          itemsFound: d.found,
+          itemsCleaned: d.cleaned,
+          spaceSaved: d.space
+        })),
+        errorCount: allErrors.length
+      })
+      recomputeStats()
+
+      store.setCleanSummary({
+        totalCleaned,
+        filesDeleted: totalFiles,
+        filesSkipped: totalSkipped,
+        errors: allErrors,
+        needsElevation: anyNeedsElevation,
+        categories: categoryBreakdown,
+        duration,
+        totalSizeBefore: store.getTotalSize()
+      })
+      store.setStatus(ScanStatus.Complete)
+    } catch {
+      store.setStatus(ScanStatus.Error)
+    }
+    store.setProgress(null)
+  }, [
+    store.results,
+    createRestorePointEnabled,
+    protectRecycleBin,
+    closeBrowsersBeforeClean,
+    confirmBlockers,
+    scopedClean
+  ])
+
+  const categoryResults = (type: CategoryType) => {
+    if (type === AI_TOOLS_VIEW) {
+      return store.results.filter(
+        (r) => r.category === CleanerType.App && r.group === AI_TOOLS_GROUP
+      )
+    }
+    if (type === CleanerType.App) {
+      return store.results.filter(
+        (r) => r.category === CleanerType.App && r.group !== AI_TOOLS_GROUP
+      )
+    }
+    return store.results.filter((r) => r.category === type)
+  }
+  // Privacy traces such as registry lists are counted in entries, not bytes.
+  const entryCountLabel = (count: number) =>
+    t(count === 1 ? 'traceEntryCount' : 'traceEntryCountPlural', { count: formatNumber(count) })
+
+  const categoryItemCount = (type: CategoryType) =>
+    categoryResults(type).reduce((sum, r) => sum + r.itemCount, 0)
+
+  const resultCategoryLabel = (result: ScanResult) =>
+    t(
+      categories.find((category) =>
+        result.group === AI_TOOLS_GROUP
+          ? category.type === AI_TOOLS_VIEW
+          : category.type === result.category
+      )?.labelKey ?? ''
+    )
+  const scopedResults =
+    searchScope === 'all'
+      ? store.results.filter(
+          (result) => !protectRecycleBin || result.category !== CleanerType.RecycleBin
+        )
+      : protectRecycleBin && activeCategory === CleanerType.RecycleBin
+        ? []
+        : categoryResults(activeCategory)
+  const visibleResults = filterCleanerResults(
+    scopedResults,
+    searchQuery,
+    store.selectedItems,
+    selectedOnly,
+    resultCategoryLabel
+  )
+  const visibleIds = visibleResults.flatMap((result) => result.items.map((item) => item.id))
+  const visibleIdSet = new Set(visibleIds)
+  const selectedHere = visibleIds.filter((id) => store.selectedItems.has(id)).length
+  const selectedElsewhere = [...store.selectedItems].filter((id) => !visibleIdSet.has(id)).length
+  const isFiltering = !!searchQuery.trim() || selectedOnly
+  const viewKey = JSON.stringify([activeCategory, searchScope, searchQuery, selectedOnly])
+  // Privacy traces remain a deliberate group-by-group opt-in.
+  const bulkSelectableIds = visibleResults
+    .filter((result) => result.category !== CleanerType.PrivacyTraces)
+    .flatMap((result) => result.items.map((item) => item.id))
+  const highlight = (text: string) =>
+    splitSearchHighlight(text, searchQuery).map((part, index) =>
+      part.match ? (
+        <mark key={index} className="rounded-sm bg-amber-500/20 text-inherit">
+          {part.text}
+        </mark>
+      ) : (
+        <span key={index}>{part.text}</span>
+      )
+    )
+
+  const toggleGroup = (key: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  const toggleResultGroup = (groupKey: string, displayKey: string) => {
+    if (isFiltering) {
+      setCollapsedMatches((previous) => {
+        const next = new Set(previous)
+        if (next.has(displayKey)) next.delete(displayKey)
+        else next.add(displayKey)
+        return next
+      })
+    } else toggleGroup(groupKey)
+  }
+
+  const toggleSubcategorySelection = (result: ScanResult) => {
+    if (isFiltering || searchScope === 'all') {
+      store.setItemsSelected(
+        result.items.map((item) => item.id),
+        !result.items.every((item) => store.selectedItems.has(item.id))
+      )
+    } else {
+      store.toggleSubcategory(result)
+    }
+  }
+
+  // Sort results by aggregate size, keeping the scanner's order when 'default'.
+  const sortResults = (list: ScanResult[]): ScanResult[] => {
+    if (sortMode === 'default') return list
+    const dir = sortMode === 'size-desc' ? -1 : 1
+    return [...list].sort((a, b) => dir * (a.totalSize - b.totalSize))
+  }
+
+  const isScanning = store.status === ScanStatus.Scanning
+  const isCleaning = store.status === ScanStatus.Cleaning
+  const hasResults = store.results.length > 0
+  const isRecycleBinProtected =
+    protectRecycleBin && activeCategory === CleanerType.RecycleBin && searchScope === 'category'
+  const confirmCleanIds = scopedClean?.ids ?? store.getSelectedIds()
+  const confirmCleanSize = scopedClean
+    ? sizeForIds(store.results, scopedClean.ids)
+    : store.getSelectedSize()
+
+  const openContextMenu = useCallback(
+    (event: React.MouseEvent, label: string, ids: string[]) => {
+      if (!hasResults || isScanning || isCleaning || preparingClean || ids.length === 0) return
+      event.preventDefault()
+      event.stopPropagation()
+      setContextMenu({ x: event.clientX, y: event.clientY, label, ids })
+    },
+    [hasResults, isScanning, isCleaning, preparingClean]
+  )
+
+  const closeContextMenu = useCallback(() => setContextMenu(null), [])
+
+  const handleContextMenuClean = useCallback(() => {
+    if (!contextMenu) return
+    const { ids, label } = contextMenu
+    closeContextMenu()
+    void handleCleanRequest({ ids, label })
+  }, [contextMenu, closeContextMenu, handleCleanRequest])
+
+  return (
+    <div className="feature-page cleaner-page animate-fade-in">
+      <PageHeader
+        title={t('pageTitle')}
+        description={t('pageDescription')}
+        action={
+          <div className="flex items-center gap-2.5">
+            <button
+              onClick={handleScan}
+              disabled={isScanning || isCleaning || preparingClean}
+              className={cn(
+                'pulse-scan-action flex items-center gap-2 rounded-xl px-5 py-2.5 text-[13px] font-medium text-zinc-300 transition-all disabled:opacity-40',
+                !hasResults && 'pulse-primary-action'
+              )}
+              style={{ background: 'var(--bg-hover)', border: '1px solid var(--border-medium)' }}
+            >
+              <Search className="h-4 w-4" strokeWidth={1.8} />
+              {t('scanButton')}
+            </button>
+            <button
+              onClick={() => void handleCleanRequest()}
+              disabled={
+                !hasResults ||
+                isScanning ||
+                isCleaning ||
+                checkingBlockers ||
+                preparingClean ||
+                store.getSelectedIds().length === 0
+              }
+              className="pulse-primary-action flex items-center gap-2 rounded-xl px-5 py-2.5 text-[13px] font-semibold transition-all disabled:opacity-30"
+              style={{
+                background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)',
+                color: 'var(--text-on-accent)',
+                boxShadow: hasResults ? '0 4px 20px rgba(245,158,11,0.2)' : 'none'
+              }}
+            >
+              {preparingClean ? (
+                <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
+              ) : (
+                <Sparkles className="h-4 w-4" strokeWidth={2} />
+              )}
+              {preparingClean ? t('checkingRunningApps') : t('cleanButton')}
+            </button>
+          </div>
+        }
+      />
+
+      <div className="cleaner-workspace flex gap-5">
+        {/* Category sidebar */}
+        <div className="cleaner-categories w-56 shrink-0 space-y-1.5">
+          {categories.map((cat) => {
+            const count = categoryItemCount(cat.type)
+            const isActive = searchScope === 'category' && activeCategory === cat.type
+            const isProtected = protectRecycleBin && cat.type === CleanerType.RecycleBin
+            return (
+              <button
+                key={cat.type}
+                onClick={() => {
+                  setActiveCategory(cat.type)
+                  setSearchScope('category')
+                }}
+                onContextMenu={(e) => {
+                  // Privacy traces are opt-in per item: no clean-everything shortcut.
+                  if (isProtected || cat.type === CleanerType.PrivacyTraces) return
+                  const ids = categoryResults(cat.type).flatMap((r) =>
+                    r.items.map((item) => item.id)
+                  )
+                  openContextMenu(e, t(cat.labelKey), ids)
+                }}
+                className="relative flex w-full items-center gap-3 rounded-xl px-4 py-3 text-left transition-all"
+                style={{
+                  background: isActive ? 'var(--accent-muted-bg)' : 'transparent',
+                  color: isActive ? 'var(--warning)' : 'var(--text-muted)'
+                }}
+              >
+                {isActive && (
+                  <div
+                    className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full"
+                    style={{ background: 'var(--accent)' }}
+                  />
+                )}
+                {scanningCategory === cat.type ||
+                (cat.type === AI_TOOLS_VIEW && scanningCategory === CleanerType.App) ? (
+                  <Loader2
+                    className="h-[17px] w-[17px] shrink-0 animate-spin text-amber-400"
+                    strokeWidth={1.8}
+                  />
+                ) : (
+                  <cat.icon className="h-[17px] w-[17px] shrink-0" strokeWidth={1.8} />
+                )}
+                <div className="flex-1 min-w-0">
+                  <span className="text-[13px] font-medium">{t(cat.labelKey)}</span>
+                  <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                    {isProtected ? t('settings:protectRecycleBinLabel') : t(cat.descriptionKey)}
+                  </p>
+                </div>
+                {count > 0 && (
+                  <span
+                    className="rounded-md px-1.5 py-0.5 font-mono text-[11px]"
+                    style={{ background: 'var(--bg-hover-2)', color: 'var(--text-muted)' }}
+                  >
+                    {count}
+                  </span>
+                )}
+              </button>
+            )
+          })}
+        </div>
+
+        {/* Item panel */}
+        <div className="cleaner-results flex-1 min-w-0">
+          {hasResults && (
+            <section className="pulse-cleaner-summary" aria-label={t('totalRecoverable')}>
+              <div>
+                <span>{t('totalRecoverable')}</span>
+                <strong>{formatBytes(store.getTotalSize())}</strong>
+              </div>
+              <div>
+                <span>
+                  {t('itemsCount', {
+                    count: formatNumber(
+                      store.results.reduce((sum, result) => sum + result.itemCount, 0)
+                    )
+                  })}
+                </span>
+                <strong>
+                  {t('selectedLabel')}: {formatBytes(store.getSelectedSize())}
+                </strong>
+              </div>
+            </section>
+          )}
+          {(isScanning || isCleaning) && store.progress && (
+            <ScanProgress
+              status={isScanning ? 'scanning' : 'cleaning'}
+              progress={store.progress.progress}
+              currentPath={store.progress.currentPath}
+              itemsFound={store.progress.itemsFound}
+              sizeFound={store.progress.sizeFound}
+              className="mb-5"
+            />
+          )}
+
+          {failedCategories.length > 0 && store.status === ScanStatus.Complete && (
+            <div
+              className="mb-5 flex items-center gap-3 rounded-2xl px-4 py-3"
+              style={{
+                background: 'var(--accent-muted-bg)',
+                border: '1px solid rgba(245,158,11,0.12)'
+              }}
+            >
+              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" strokeWidth={1.8} />
+              <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                {t('scannersFailed')}{' '}
+                <span className="text-amber-400 font-medium">{failedCategories.join(', ')}</span>
+              </p>
+            </div>
+          )}
+
+          {elevationSkipped.length > 0 &&
+            store.status === ScanStatus.Complete &&
+            !store.cleanSummary && (
+              <div
+                className="mb-5 flex items-center gap-3 rounded-2xl px-4 py-3"
+                style={{
+                  background: 'var(--accent-muted-bg)',
+                  border: '1px solid var(--accent-muted-border)'
+                }}
+              >
+                <ShieldAlert className="h-4 w-4 shrink-0 text-amber-400" strokeWidth={1.8} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-[12px] text-zinc-300">
+                    <span className="font-medium">
+                      {t('categoriesSkipped', { count: elevationSkipped.length })}
+                    </span>
+                    <span style={{ color: 'var(--text-muted)' }}>
+                      {' '}
+                      {t('categoriesSkippedSuffix')}
+                    </span>
+                  </p>
+                  <p className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>
+                    {elevationSkipped.slice(0, 4).join(', ')}
+                    {elevationSkipped.length > 4
+                      ? ` ${t('categoriesSkippedMore', { count: elevationSkipped.length - 4 })}`
+                      : ''}
+                  </p>
+                </div>
+                {platform !== 'darwin' && (
+                  <button
+                    onClick={handleRelaunch}
+                    className="shrink-0 rounded-lg px-3 py-1.5 text-[12px] font-medium text-amber-400 transition-colors hover:bg-amber-500/15"
+                    style={{ border: '1px solid rgba(245,158,11,0.2)' }}
+                  >
+                    {t('relaunchAsAdmin')}
+                  </button>
+                )}
+              </div>
+            )}
+
+          {(checkingBlockers || blockers.length > 0) &&
+            store.status === ScanStatus.Complete &&
+            !store.cleanSummary && (
+              <div
+                className="mb-5 flex items-start gap-3 rounded-2xl px-4 py-3"
+                style={{
+                  background: 'var(--accent-muted-bg)',
+                  border: '1px solid var(--accent-muted-border)'
+                }}
+              >
+                {checkingBlockers ? (
+                  <Loader2
+                    className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-400"
+                    strokeWidth={1.8}
+                  />
+                ) : (
+                  <AlertTriangle
+                    className="mt-0.5 h-4 w-4 shrink-0 text-amber-400"
+                    strokeWidth={1.8}
+                  />
+                )}
+                <div className="min-w-0 flex-1">
+                  <p className="text-[12px] font-medium text-zinc-200">
+                    {checkingBlockers
+                      ? t('checkingRunningApps')
+                      : t('closeAppsBeforeCleaning', {
+                          apps: blockerNames(blockers, (count) => t('moreApps', { count }))
+                        })}
+                  </p>
+                  {!checkingBlockers && (
+                    <p className="mt-0.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                      {closeBrowsersBeforeClean && blockers.every((blocker) => blocker.isBrowser)
+                        ? t('blockersAutoCloseDescription')
+                        : t('blockersDescription')}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+          {store.cleanSummary && store.status === ScanStatus.Complete && (
+            <CleanSummary
+              summary={store.cleanSummary}
+              onRelaunchAsAdmin={handleRelaunch}
+              platform={platform}
+            />
+          )}
+
+          {isRecycleBinProtected && !isScanning && !isCleaning && (
+            <EmptyState
+              icon={ShieldAlert}
+              title={t('settings:protectRecycleBinLabel')}
+              description={t('settings:protectRecycleBinDesc')}
+              action={
+                <button
+                  onClick={() => navigate('/settings')}
+                  className="flex items-center gap-2 rounded-xl px-5 py-2.5 text-[13px] font-semibold transition-all"
+                  style={{
+                    background: 'var(--bg-hover)',
+                    border: '1px solid var(--border-medium)',
+                    color: 'var(--text-secondary)'
+                  }}
+                >
+                  {t('settings:sectionCleaningPreferences')}
+                </button>
+              }
+            />
+          )}
+
+          {!hasResults && !isScanning && !isRecycleBinProtected && (
+            <EmptyState
+              icon={Search}
+              title={t('noScanResultsTitle')}
+              description={t('noScanResultsDescription')}
+              action={
+                <button
+                  onClick={handleScan}
+                  disabled={isCleaning || preparingClean}
+                  className="pulse-primary-action pulse-scan-action flex items-center gap-2 rounded-xl px-5 py-2.5 text-[13px] font-semibold transition-all disabled:opacity-40"
+                  style={{
+                    background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)',
+                    color: 'var(--text-on-accent)'
+                  }}
+                >
+                  <Search className="h-4 w-4" strokeWidth={1.8} />
+                  {t('startScan')}
+                </button>
+              }
+            />
+          )}
+
+          {hasResults && (
+            <fieldset
+              disabled={isScanning || isCleaning || preparingClean}
+              className="mb-4 space-y-3 rounded-xl border p-3 disabled:opacity-50"
+              style={{ borderColor: 'var(--border-default)', background: 'var(--card-bg)' }}
+            >
+              <legend className="sr-only">{t('searchResults')}</legend>
+              <div className="flex flex-wrap items-center gap-2">
+                <div
+                  className="relative flex min-w-48 flex-1 items-center gap-2 rounded-lg border px-3 py-2"
+                  style={{ borderColor: 'var(--border-medium)' }}
+                >
+                  <Search className="h-4 w-4 shrink-0" style={{ color: 'var(--text-muted)' }} />
+                  <input
+                    type="search"
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    placeholder={t('searchResultsPlaceholder')}
+                    aria-label={t('searchResults')}
+                    className="min-w-0 flex-1 bg-transparent text-[13px] outline-none [&::-webkit-search-cancel-button]:hidden"
+                    style={{ color: 'var(--text-primary)' }}
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      aria-label={t('clearSearch')}
+                      onClick={() => setSearchQuery('')}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  )}
+                </div>
+                <select
+                  aria-label={t('searchScope')}
+                  value={searchScope}
+                  onChange={(event) => setSearchScope(event.target.value as 'category' | 'all')}
+                  className="rounded-lg border px-3 py-2 text-[12px]"
+                  style={{
+                    borderColor: 'var(--border-medium)',
+                    background: 'var(--card-bg)',
+                    color: 'var(--text-secondary)'
+                  }}
+                >
+                  <option value="category">{t('currentCategory')}</option>
+                  <option value="all">{t('allCleanupCategories')}</option>
+                </select>
+                <label
+                  className="flex items-center gap-2 text-[12px]"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedOnly}
+                    onChange={(event) => setSelectedOnly(event.target.checked)}
+                    className="accent-amber-500"
+                  />
+                  {t('selectedOnly')}
+                </label>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[12px]">
+                <p role="status" style={{ color: 'var(--text-muted)' }}>
+                  {t('resultSelectionSummary', {
+                    count: formatNumber(visibleIds.length),
+                    selected: formatNumber(selectedHere),
+                    elsewhere: formatNumber(selectedElsewhere)
+                  })}
+                </p>
+                <div className="flex gap-3 text-amber-500">
+                  <button
+                    type="button"
+                    disabled={!bulkSelectableIds.length}
+                    onClick={() => store.setItemsSelected(bulkSelectableIds, true)}
+                    className="disabled:opacity-40"
+                  >
+                    {t(isFiltering ? 'selectMatches' : 'selectInView')}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!selectedHere}
+                    onClick={() => store.setItemsSelected(visibleIds, false)}
+                    className="disabled:opacity-40"
+                  >
+                    {t(isFiltering ? 'deselectMatches' : 'deselectInView')}
+                  </button>
+                </div>
+              </div>
+              <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                {t('searchSelectionHint')}
+              </p>
+              {visibleResults.some((result) => result.category === CleanerType.PrivacyTraces) && (
+                <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  {t('privacyBulkSelectionHint')}
+                </p>
+              )}
+            </fieldset>
+          )}
+
+          {hasResults && !isRecycleBinProtected && (
+            <div key={activeCategory} className="space-y-2">
+              <div className="mb-3 flex items-center justify-between px-1">
+                <span
+                  className="text-[11px] font-medium uppercase tracking-wider"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  {t('categoryItemsHeading', {
+                    category:
+                      searchScope === 'all'
+                        ? t('allCleanupCategories')
+                        : t(categories.find((c) => c.type === activeCategory)?.labelKey ?? '')
+                  })}
+                </span>
+                <div className="flex items-center gap-3">
+                  <div className="relative" ref={sortMenuRef}>
+                    <button
+                      onClick={() => setShowSortMenu((v) => !v)}
+                      className="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[12px] font-medium transition-colors"
+                      style={{
+                        color: 'var(--text-muted)',
+                        border: '1px solid var(--border-medium)'
+                      }}
+                    >
+                      <ArrowUpDown className="h-3 w-3" strokeWidth={1.8} />
+                      {t(SORT_LABEL_KEYS[sortMode])}
+                      <ChevronDown
+                        className={cn('h-3 w-3 transition-transform', showSortMenu && 'rotate-180')}
+                        strokeWidth={2}
+                      />
+                    </button>
+                    {showSortMenu && (
+                      <div
+                        className="absolute right-0 top-full z-50 mt-1 rounded-xl py-1 shadow-xl"
+                        style={{
+                          background: '#1e1e22',
+                          border: '1px solid var(--border-strong)',
+                          minWidth: 140
+                        }}
+                      >
+                        {(Object.keys(SORT_LABEL_KEYS) as SortMode[]).map((mode) => (
+                          <button
+                            key={mode}
+                            onClick={() => {
+                              setSortMode(mode)
+                              setShowSortMenu(false)
+                            }}
+                            className="flex w-full items-center gap-2 px-4 py-2 text-[12px] transition-colors hover:bg-white/5"
+                            style={{
+                              color:
+                                sortMode === mode ? 'var(--accent-hover)' : 'var(--text-secondary)'
+                            }}
+                          >
+                            {t(SORT_LABEL_KEYS[mode])}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {visibleResults.length === 0 && (
+                <div
+                  className="py-12 text-center text-[13px]"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  {t(isFiltering ? 'noMatchingResults' : 'noItemsInCategory')}
+                </div>
+              )}
+
+              {(() => {
+                const results = visibleResults
+                // Group results by group label (ungrouped first, then grouped
+                // sections); each section is sorted independently so sort
+                // order never interleaves group sections.
+                const ungrouped =
+                  activeCategory === AI_TOOLS_VIEW && searchScope === 'category'
+                    ? sortResults(results)
+                    : sortResults(results.filter((r) => !r.group))
+                const grouped = new Map<string, ScanResult[]>()
+                if (activeCategory !== AI_TOOLS_VIEW || searchScope === 'all') {
+                  for (const r of results) {
+                    if (!r.group) continue
+                    if (!grouped.has(r.group)) grouped.set(r.group, [])
+                    grouped.get(r.group)!.push(r)
+                  }
+                }
+                for (const [label, items] of grouped) grouped.set(label, sortResults(items))
+
+                const sections: { label?: string; items: ScanResult[] }[] = []
+                if (ungrouped.length > 0) sections.push({ items: ungrouped })
+                for (const [label, items] of grouped) sections.push({ label, items })
+
+                return sections.map((section) => (
+                  <div key={section.label || '_ungrouped'}>
+                    {section.label && (
+                      <div className="mt-4 mb-2 flex items-center gap-2 px-1">
+                        <span
+                          className="text-[11px] font-semibold uppercase tracking-wider"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
+                          {highlight(section.label)}
+                        </span>
+                        <div className="flex-1 h-px" style={{ background: 'var(--bg-hover-2)' }} />
+                        <span
+                          className="text-[11px] font-mono"
+                          style={{ color: 'var(--text-muted)' }}
+                        >
+                          {formatBytes(section.items.reduce((s, r) => s + r.totalSize, 0))}
+                        </span>
+                      </div>
+                    )}
+                    <div className="space-y-1.5">
+                      {section.items.map((result) => {
+                        const groupKey = JSON.stringify([
+                          result.category,
+                          result.group,
+                          result.subcategory
+                        ])
+                        const displayKey = viewKey + groupKey
+                        const visibleLimit = visibleLimits[displayKey] ?? 50
+                        const isExpanded = isFiltering
+                          ? !collapsedMatches.has(displayKey)
+                          : expandedGroups.has(groupKey)
+                        const selectedInGroup = result.items.filter((item) =>
+                          store.selectedItems.has(item.id)
+                        ).length
+                        const allSelected = selectedInGroup === result.items.length
+                        const someSelected = selectedInGroup > 0 && !allSelected
+
+                        return (
+                          <div
+                            key={groupKey}
+                            className="rounded-xl overflow-hidden"
+                            style={{
+                              background: 'var(--card-bg)',
+                              border: '1px solid var(--border-default)'
+                            }}
+                          >
+                            {/* Group header */}
+                            <div
+                              className="flex items-center gap-3 px-4 py-3.5 cursor-pointer"
+                              onClick={() => toggleResultGroup(groupKey, displayKey)}
+                              onContextMenu={(e) => {
+                                // The quick-clean menu would clear traces without selecting them.
+                                if (result.category === CleanerType.PrivacyTraces) return
+                                const ids = result.items.map((item) => item.id)
+                                openContextMenu(e, result.subcategory, ids)
+                              }}
+                              onMouseEnter={(e) => {
+                                e.currentTarget.style.background = 'var(--bg-subtle)'
+                              }}
+                              onMouseLeave={(e) => {
+                                e.currentTarget.style.background = 'transparent'
+                              }}
+                            >
+                              {/* Checkbox */}
+                              <button
+                                type="button"
+                                role="checkbox"
+                                aria-checked={someSelected ? 'mixed' : allSelected}
+                                aria-label={t('selectGroup', { name: result.subcategory })}
+                                disabled={isScanning || isCleaning || preparingClean}
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  toggleSubcategorySelection(result)
+                                }}
+                                className="flex items-center disabled:opacity-40"
+                              >
+                                <div
+                                  className="flex h-[18px] w-[18px] items-center justify-center rounded-[5px] cursor-pointer"
+                                  style={{
+                                    background:
+                                      allSelected || someSelected
+                                        ? 'var(--accent)'
+                                        : 'var(--bg-hover-2)',
+                                    border:
+                                      allSelected || someSelected
+                                        ? 'none'
+                                        : '1.5px solid var(--border-stronger)'
+                                  }}
+                                >
+                                  {allSelected && (
+                                    <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none">
+                                      <path
+                                        d="M2.5 6l2.5 2.5 4.5-5"
+                                        stroke="var(--text-on-accent)"
+                                        strokeWidth="2"
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                      />
+                                    </svg>
+                                  )}
+                                  {someSelected && (
+                                    <div
+                                      className="h-[2px] w-2 rounded-full"
+                                      style={{ background: 'var(--text-on-accent)' }}
+                                    />
+                                  )}
+                                </div>
+                              </button>
+
+                              {/* Expand arrow */}
+                              <button
+                                type="button"
+                                aria-label={t('toggleGroupDetails', { name: result.subcategory })}
+                                aria-expanded={isExpanded}
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  toggleResultGroup(groupKey, displayKey)
+                                }}
+                                className="shrink-0 rounded p-1 hover:bg-[var(--bg-hover)]"
+                              >
+                                <ChevronRight
+                                  className={cn(
+                                    'h-3.5 w-3.5 transition-transform',
+                                    isExpanded && 'rotate-90'
+                                  )}
+                                  style={{ color: 'var(--text-muted)' }}
+                                  strokeWidth={2}
+                                />
+                              </button>
+
+                              {/* Folder icon */}
+                              <Folder
+                                className="h-4 w-4 shrink-0"
+                                style={{
+                                  color: allSelected ? 'var(--accent)' : 'var(--text-muted)'
+                                }}
+                                strokeWidth={1.8}
+                              />
+
+                              {/* Label */}
+                              <div className="flex-1 min-w-0">
+                                <span className="text-[13px] font-medium text-zinc-300">
+                                  {highlight(result.subcategory)}
+                                </span>
+                                {searchScope === 'all' && (
+                                  <p
+                                    className="mt-0.5 text-[11px]"
+                                    style={{ color: 'var(--text-muted)' }}
+                                  >
+                                    {highlight(resultCategoryLabel(result))}
+                                  </p>
+                                )}
+                                {result.descriptionKey && (
+                                  <p
+                                    className="mt-1 text-[11px]"
+                                    style={{ color: 'var(--text-muted)' }}
+                                  >
+                                    {t(result.descriptionKey)}
+                                  </p>
+                                )}
+                                {result.items[0]?.cleanupAction && (
+                                  <p
+                                    className="mt-1 text-[11px]"
+                                    style={{ color: 'var(--text-muted)' }}
+                                  >
+                                    {result.items[0].cleanupAction === 'windows-components'
+                                      ? t('maintenanceComponentsNote', {
+                                          defaultValue:
+                                            'Removes older Windows component versions immediately. May take a while; savings are not included in totals.'
+                                        })
+                                      : t('maintenanceNativeNote', {
+                                          defaultValue:
+                                            'Uses the built-in cleanup tool. Savings are not included in totals.'
+                                        })}
+                                  </p>
+                                )}
+                              </div>
+
+                              {/* Stats */}
+                              <span
+                                className="rounded-md px-2 py-0.5 font-mono text-[11px] shrink-0"
+                                style={{
+                                  background: 'var(--bg-subtle-2)',
+                                  color: 'var(--text-secondary)'
+                                }}
+                              >
+                                {t(result.itemCount === 1 ? 'itemCount' : 'itemCountPlural', {
+                                  count: formatNumber(result.itemCount)
+                                })}
+                              </span>
+                              <span
+                                className="font-mono text-[12px] font-medium shrink-0"
+                                style={{ color: 'var(--text-muted)' }}
+                              >
+                                {result.items.some((item) => item.cleanupAction)
+                                  ? t('maintenanceSizeUnknown', { defaultValue: 'Savings vary' })
+                                  : result.items.length > 0 &&
+                                      result.items.every((item) => item.entryCount !== undefined)
+                                    ? entryCountLabel(
+                                        result.items.reduce(
+                                          (sum, item) => sum + (item.entryCount ?? 0),
+                                          0
+                                        )
+                                      )
+                                    : formatBytes(result.totalSize)}
+                              </span>
+
+                              {/* Open location */}
+                              {result.items.length > 0 && isAbsolutePath(result.items[0].path) && (
+                                <button
+                                  type="button"
+                                  title={t('openLocation')}
+                                  className="shrink-0 p-1 rounded transition-colors hover:bg-[var(--bg-hover-2)]"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    window.kudu?.cleanerOpenLocation?.(result.items[0].path)
+                                  }}
+                                >
+                                  <FolderOpen
+                                    className="h-3.5 w-3.5"
+                                    style={{ color: 'var(--text-muted)' }}
+                                  />
+                                </button>
+                              )}
+                            </div>
+
+                            {/* Expanded item list */}
+                            {isExpanded && (
+                              <div style={{ borderTop: '1px solid var(--border-subtle)' }}>
+                                {result.items.slice(0, visibleLimit).map((item) => {
+                                  const checked = store.selectedItems.has(item.id)
+                                  const pathLabel =
+                                    item.path.split(/[/\\]/).slice(-2).join('/') || item.path
+                                  return (
+                                    <label
+                                      key={item.id}
+                                      className="flex items-center gap-3 px-4 py-2 pl-14 cursor-pointer transition-colors"
+                                      style={{
+                                        background: checked
+                                          ? 'rgba(245,158,11,0.03)'
+                                          : 'transparent'
+                                      }}
+                                      onMouseEnter={(e) => {
+                                        e.currentTarget.style.background = checked
+                                          ? 'rgba(245,158,11,0.05)'
+                                          : 'var(--bg-subtle)'
+                                      }}
+                                      onMouseLeave={(e) => {
+                                        e.currentTarget.style.background = checked
+                                          ? 'rgba(245,158,11,0.03)'
+                                          : 'transparent'
+                                      }}
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        checked={checked}
+                                        disabled={isScanning || isCleaning || preparingClean}
+                                        onChange={() => {
+                                          if (isFiltering || searchScope === 'all')
+                                            store.setItemsSelected([item.id], !checked)
+                                          else store.toggleItem(item.id)
+                                        }}
+                                        className="sr-only peer"
+                                      />
+                                      <div
+                                        className="flex h-[16px] w-[16px] items-center justify-center rounded-[4px] shrink-0"
+                                        style={{
+                                          background: checked
+                                            ? 'var(--accent)'
+                                            : 'var(--bg-hover-2)',
+                                          border: checked
+                                            ? 'none'
+                                            : '1.5px solid var(--border-stronger)'
+                                        }}
+                                      >
+                                        {checked && (
+                                          <svg
+                                            className="h-2.5 w-2.5"
+                                            viewBox="0 0 12 12"
+                                            fill="none"
+                                          >
+                                            <path
+                                              d="M2.5 6l2.5 2.5 4.5-5"
+                                              stroke="var(--text-on-accent)"
+                                              strokeWidth="2"
+                                              strokeLinecap="round"
+                                              strokeLinejoin="round"
+                                            />
+                                          </svg>
+                                        )}
+                                      </div>
+                                      <span
+                                        title={item.path}
+                                        className="flex-1 min-w-0 text-[12px] font-mono"
+                                        style={{ color: 'var(--text-secondary)' }}
+                                      >
+                                        {item.cleanupAction ? (
+                                          t('maintenanceOptional', {
+                                            defaultValue: 'Optional maintenance'
+                                          })
+                                        ) : (
+                                          <>
+                                            <span className="block truncate">
+                                              {highlight(pathLabel)}
+                                            </span>
+                                            <span
+                                              className="mt-0.5 block break-all select-text text-[10px]"
+                                              style={{ color: 'var(--text-muted)' }}
+                                            >
+                                              {highlight(item.path)}
+                                            </span>
+                                          </>
+                                        )}
+                                      </span>
+                                      <span
+                                        className="font-mono text-[11px] shrink-0"
+                                        style={{ color: 'var(--text-muted)' }}
+                                      >
+                                        {item.cleanupAction
+                                          ? t('maintenanceSizeUnknown', {
+                                              defaultValue: 'Savings vary'
+                                            })
+                                          : item.entryCount !== undefined
+                                            ? entryCountLabel(item.entryCount)
+                                            : formatBytes(item.size)}
+                                      </span>
+                                      <button
+                                        type="button"
+                                        title={t('copyPath')}
+                                        aria-label={t('copyPath')}
+                                        className="shrink-0 rounded p-1 hover:bg-[var(--bg-hover-2)]"
+                                        onClick={(event) => {
+                                          event.preventDefault()
+                                          event.stopPropagation()
+                                          void navigator.clipboard
+                                            .writeText(item.path)
+                                            .then(() => toast.success(t('pathCopied')))
+                                            .catch(() => toast.error(t('pathCopyFailed')))
+                                        }}
+                                      >
+                                        <Copy
+                                          className="h-3.5 w-3.5"
+                                          style={{ color: 'var(--text-muted)' }}
+                                        />
+                                      </button>
+                                      {isAbsolutePath(item.path) && (
+                                        <button
+                                          type="button"
+                                          title={t('openLocation')}
+                                          className="shrink-0 p-0.5 rounded transition-colors hover:bg-[var(--bg-hover-2)]"
+                                          onClick={(e) => {
+                                            e.preventDefault()
+                                            e.stopPropagation()
+                                            window.kudu?.cleanerOpenLocation?.(item.path)
+                                          }}
+                                        >
+                                          <FolderOpen
+                                            className="h-3.5 w-3.5"
+                                            style={{ color: 'var(--text-muted)' }}
+                                          />
+                                        </button>
+                                      )}
+                                    </label>
+                                  )
+                                })}
+                                {result.items.length > visibleLimit && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setVisibleLimits((previous) => ({
+                                        ...previous,
+                                        [displayKey]: visibleLimit + 50
+                                      }))
+                                    }
+                                    className="w-full px-4 py-2.5 text-left pl-14 text-[12px] text-amber-500 hover:bg-[var(--bg-hover)]"
+                                  >
+                                    {t('showMoreItems', {
+                                      count: formatNumber(
+                                        Math.min(50, result.items.length - visibleLimit)
+                                      ),
+                                      remaining: formatNumber(result.items.length - visibleLimit)
+                                    })}
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                ))
+              })()}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <ConfirmDialog
+        open={showConfirm}
+        onConfirm={handleClean}
+        onCancel={() => {
+          setShowConfirm(false)
+          setConfirmBlockers([])
+          setScopedClean(null)
+        }}
+        title={
+          scopedClean
+            ? t('confirmCleanCategoryTitle', { name: scopedClean.label })
+            : t('confirmCleanTitle')
+        }
+        description={`${t('confirmCleanDescription', { count: formatNumber(confirmCleanIds.length), size: formatBytes(confirmCleanSize) })}${!scopedClean && selectedElsewhere > 0 ? ` ${t('confirmHiddenSelection', { count: formatNumber(selectedElsewhere) })}` : ''}${confirmBlockers.length > 0 ? ` ${t('confirmCloseApps', { apps: blockerNames(confirmBlockers, (count) => t('moreApps', { count })) })}` : ''}`}
+        confirmLabel={t('confirmCleanLabel')}
+        variant="warning"
+      />
+
+      {contextMenu && (
+        <CleanerContextMenu
+          menu={contextMenu}
+          size={sizeForIds(store.results, contextMenu.ids)}
+          onClean={handleContextMenuClean}
+          onClose={closeContextMenu}
+          cleanLabel={t('contextMenuClean', { name: contextMenu.label })}
+        />
+      )}
+    </div>
+  )
+}

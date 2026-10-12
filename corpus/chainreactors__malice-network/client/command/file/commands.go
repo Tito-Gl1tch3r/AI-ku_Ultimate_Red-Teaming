@@ -1,0 +1,147 @@
+package file
+
+import (
+	"fmt"
+	"github.com/chainreactors/IoM-go/client"
+	"github.com/chainreactors/IoM-go/consts"
+	"github.com/chainreactors/IoM-go/proto/client/clientpb"
+	"github.com/chainreactors/malice-network/client/core"
+	"github.com/chainreactors/malice-network/helper/intermediate"
+	"github.com/chainreactors/malice-network/helper/utils/output"
+	"path/filepath"
+
+	"github.com/carapace-sh/carapace"
+	"github.com/chainreactors/IoM-go/proto/services/clientrpc"
+	"github.com/chainreactors/malice-network/client/command/common"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+func Commands(con *core.Console) []*cobra.Command {
+	downloadCmd := &cobra.Command{
+		Use:   consts.ModuleDownload + " [implant_file]",
+		Short: "Download file",
+		Long:  "download file in implant",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return DownloadCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleDownload,
+		},
+		Example: `~~~
+download ./file.txt
+~~~`,
+	}
+
+	common.BindArgCompletions(downloadCmd, nil,
+		carapace.ActionValues().Usage("file name"),
+		carapace.ActionValues().Usage("download file source path"))
+
+	common.BindFlag(downloadCmd, func(f *pflag.FlagSet) {
+		f.BoolP("dir", "r", false, "download dir")
+	})
+
+	uploadCmd := &cobra.Command{
+		Use:   consts.ModuleUpload + " [local] [remote]",
+		Short: "Upload file",
+		Long:  "upload local file to remote implant",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return UploadCmd(cmd, con)
+		},
+		Annotations: map[string]string{
+			"depend": consts.ModuleUpload,
+		},
+		Example: `~~~
+upload ./file.txt /tmp/file.txt
+~~~`,
+	}
+
+	common.BindArgCompletions(uploadCmd, nil,
+		carapace.ActionFiles().Usage("file source path"),
+		carapace.ActionValues().Usage("file target path"))
+
+	common.BindFlag(uploadCmd, func(f *pflag.FlagSet) {
+		f.String("priv", "0644", "file privilege")
+		f.BoolP("hidden", "", false, "hidden file")
+	})
+
+	return []*cobra.Command{
+		downloadCmd,
+		uploadCmd,
+	}
+}
+
+func Register(con *core.Console) {
+	con.RegisterImplantFunc(
+		consts.ModuleDownload,
+		Download,
+		"bdownload",
+		Download,
+		output.ParseStatus,
+		nil)
+
+	intermediate.RegisterInternalDoneCallback(consts.ModuleDownload, func(content *clientpb.TaskContext) (string, error) {
+		return fmt.Sprintf("download block %d/%d success", content.Task.Cur, content.Task.Total), nil
+	})
+
+	con.AddCommandFuncHelper(
+		consts.ModuleDownload,
+		consts.ModuleDownload,
+		consts.ModuleDownload+"(active(),`file.txt`)",
+		[]string{
+			"session: special session",
+			"path: file path",
+			"id_dir: download_dir",
+		},
+		[]string{"task"})
+
+	con.RegisterImplantFunc(
+		consts.ModuleUpload,
+		Upload,
+		"bupload",
+		func(rpc clientrpc.MaliceRPCClient, sess *client.Session, path string) (*clientpb.Task, error) {
+			return Upload(rpc, sess, path, filepath.Base(path), "0644", false)
+		},
+		output.ParseStatus,
+		nil)
+
+	con.RegisterImplantFunc(
+		"uploadraw",
+		UploadRaw,
+		"buploadraw",
+		func(rpc clientrpc.MaliceRPCClient, sess *client.Session, data, target_path string) (*clientpb.Task, error) {
+			return UploadRaw(rpc, sess, data, target_path, "0644", false)
+		},
+		output.ParseStatus,
+		nil)
+
+	intermediate.RegisterInternalDoneCallback(consts.ModuleUpload, func(content *clientpb.TaskContext) (string, error) {
+		return fmt.Sprintf("upload block %d/%d success", content.Task.Cur, content.Task.Total), nil
+	})
+
+	con.AddCommandFuncHelper(
+		consts.ModuleUpload,
+		consts.ModuleUpload,
+		consts.ModuleUpload+`(active(),"/source/path","/target/path",parse_octal("644"),false)`,
+		[]string{
+			"session: special session",
+			"path: source path",
+			"target: target path",
+			"priv",
+			"hidden",
+		},
+		[]string{"task"})
+
+	con.AddCommandFuncHelper(
+		"bupload",
+		"bupload",
+		`bupload(active(),"/source/path")`,
+		[]string{
+			"session: special session",
+			"path: source path",
+		},
+		[]string{"task"})
+
+}

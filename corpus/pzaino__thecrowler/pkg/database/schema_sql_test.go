@@ -1,0 +1,623 @@
+package database
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestInformationSeedSchemaSQLContainsFreshInstallAndUpgradeCoverage(t *testing.T) {
+	t.Parallel()
+
+	commonFragments := []string{
+		"status VARCHAR(50)",
+		"priority VARCHAR(64)",
+		"engine VARCHAR(256)",
+		"last_processed_at",
+		"last_error_at",
+		"attempts",
+		"CREATE TABLE IF NOT EXISTS InformationSeedCandidate",
+		"normalized_url",
+		"decision_status",
+		"run_attempt",
+		"discovery_provider",
+		"discovery_query",
+		"discovery_rank",
+		"candidate_score",
+		"candidate_reason",
+		"discovery_metadata",
+		"idx_informationseed_claim_queue",
+		"idx_informationseed_engine_status",
+		"idx_informationseedcandidate_seed_decision",
+		"idx_informationseedcandidate_normalized_url",
+		"idx_sourceinformationseedindex_seed_source",
+		"idx_sourceinformationseedindex_provider_rank",
+	}
+
+	files := []string{
+		"postgresql-setup.pgsql",
+		"mysql-setup.mysql",
+		"sqlite-setup.sqlite3",
+	}
+
+	for _, file := range files {
+		file := file
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+			content, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("read %s: %v", file, err)
+			}
+			upperContent := strings.ToUpper(string(content))
+			for _, fragment := range commonFragments {
+				if !strings.Contains(upperContent, strings.ToUpper(fragment)) {
+					t.Fatalf("%s missing schema fragment %q", file, fragment)
+				}
+			}
+			for _, table := range []string{"TimeSeriesObservations", "TimeSeriesAggregates"} {
+				start := strings.Index(upperContent, "CREATE TABLE IF NOT EXISTS "+strings.ToUpper(table))
+				if start < 0 {
+					t.Fatalf("%s missing %s", file, table)
+				}
+				end := strings.Index(upperContent[start:], ");")
+				if end < 0 || !strings.Contains(upperContent[start:start+end], "SOURCE_ID") ||
+					!strings.Contains(upperContent[start:start+end], "REFERENCES SOURCES(SOURCE_ID) ON DELETE CASCADE") {
+					t.Fatalf("%s %s source_id is not owned with ON DELETE CASCADE", file, table)
+				}
+			}
+		})
+	}
+}
+
+func TestTimeSeriesRelease113MigrationsReplaceSourceOwnership(t *testing.T) {
+	t.Parallel()
+	files := []string{
+		"db_migrations/postgresql-migration-v1.13.pgsql",
+		"db_migrations/mysql-migration-v1.13.mysql",
+		"db_migrations/sqlite-migration-v1.13.sqlite3",
+	}
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		upper := strings.ToUpper(string(content))
+		for _, table := range []string{"TIMESERIESOBSERVATIONS", "TIMESERIESAGGREGATES"} {
+			if !strings.Contains(upper, table) || !strings.Contains(upper, "REFERENCES SOURCES(SOURCE_ID) ON DELETE CASCADE") {
+				t.Fatalf("%s does not migrate %s source ownership", file, table)
+			}
+		}
+	}
+}
+
+func TestTimeSeriesRelease114CardinalityState(t *testing.T) {
+	t.Parallel()
+	files := []string{"postgresql-setup.pgsql", "mysql-setup.mysql", "sqlite-setup.sqlite3", "db_migrations/postgresql-migration-v1.14.pgsql", "db_migrations/mysql-migration-v1.14.mysql", "db_migrations/sqlite-migration-v1.14.sqlite3"}
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		upper := strings.ToUpper(string(content))
+		for _, fragment := range []string{"TIMESERIESACTIVESERIES", "TIMESERIESACTIVEDIMENSIONVALUES", "REFERENCE_COUNT", "PRIMARY KEY"} {
+			if !strings.Contains(upper, fragment) {
+				t.Errorf("%s missing exact cardinality state fragment %q", file, fragment)
+			}
+		}
+	}
+}
+
+func TestTimeSeriesRelease115NormalizedMembership(t *testing.T) {
+	t.Parallel()
+	files := []string{"postgresql-setup.pgsql", "mysql-setup.mysql", "sqlite-setup.sqlite3", "db_migrations/postgresql-migration-v1.15.pgsql", "db_migrations/mysql-migration-v1.15.mysql", "db_migrations/sqlite-migration-v1.15.sqlite3"}
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upper := strings.ToUpper(string(content))
+		for _, fragment := range []string{"TIMESERIESOBSERVATIONSERIES", "TIMESERIESOBSERVATIONDIMENSIONS", "OBSERVATION_ID", "IDX_TS_OBSERVATION_SERIES_IDENTITY", "IDX_TS_OBSERVATION_DIMENSIONS_IDENTITY"} {
+			if !strings.Contains(upper, fragment) {
+				t.Errorf("%s missing normalized membership fragment %q", file, fragment)
+			}
+		}
+	}
+}
+
+func TestPostgresTimeSeriesRelease114Indexes(t *testing.T) {
+	t.Parallel()
+
+	files := []string{"postgresql-setup.pgsql", "db_migrations/postgresql-migration-v1.14.pgsql"}
+	wanted := []string{
+		"idx_timeseriesobservations_active_metric_observed",
+		"ON TimeSeriesObservations(metric_id, observed_at, observation_id)",
+		"idx_timeseriesobservations_active_metric_effective",
+		"ON TimeSeriesObservations(metric_id, effective_at, observation_id)",
+		"idx_timeseriesobservations_active_metric_source_updated",
+		"ON TimeSeriesObservations(metric_id, source_updated_at, observation_id)",
+		"idx_timeseriesaggregates_active_metric_bucket",
+		"ON TimeSeriesAggregates(metric_id, bucket_start, aggregate_id)",
+		"WHERE deleted_at IS NULL",
+	}
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		for _, fragment := range wanted {
+			if !strings.Contains(strings.ToUpper(string(content)), strings.ToUpper(fragment)) {
+				t.Errorf("%s missing index fragment %q", file, fragment)
+			}
+		}
+	}
+
+	migration, err := os.ReadFile("db_migrations/postgresql-migration-v1.14.pgsql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper := strings.ToUpper(string(migration))
+	if !strings.Contains(upper, "DROP INDEX IF EXISTS IDX_TIMESERIESAGGREGATES_METRIC_BUCKET") {
+		t.Error("migration must replace the aggregate index whose prefix is equivalent")
+	}
+	if strings.Contains(upper, "CREATE INDEX CONCURRENTLY") {
+		t.Error("transactional migration must not contain CREATE INDEX CONCURRENTLY")
+	}
+}
+
+func TestPostgresTimeSeriesRelease114SeriesHashRollout(t *testing.T) {
+	t.Parallel()
+	setup, err := os.ReadFile("postgresql-setup.pgsql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.ToUpper(string(setup)), "SERIES_HASH VARCHAR(64) NOT NULL") {
+		t.Fatal("fresh schema does not enforce the derived series hash")
+	}
+	migration, err := os.ReadFile("db_migrations/postgresql-migration-v1.14.pgsql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper := strings.ToUpper(string(migration))
+	ordered := []string{
+		"ADD COLUMN IF NOT EXISTS SERIES_HASH VARCHAR(64)",
+		"UPDATE TIMESERIESOBSERVATIONS O SET SERIES_HASH",
+		"CHECK (SERIES_HASH IS NOT NULL) NOT VALID",
+		"VALIDATE CONSTRAINT TIMESERIESOBSERVATIONS_SERIES_HASH_PRESENT",
+		"ALTER COLUMN SERIES_HASH SET NOT NULL",
+		"IDX_TIMESERIESOBSERVATIONS_SERIES_HISTORY",
+		"ON TIMESERIESOBSERVATIONS(SERIES_HASH, OBSERVED_AT, OBSERVATION_ID)",
+	}
+	position := -1
+	for _, fragment := range ordered {
+		next := strings.Index(upper, fragment)
+		if next < 0 {
+			t.Fatalf("migration missing rollout fragment %q", fragment)
+		}
+		if next <= position {
+			t.Fatalf("migration rollout fragment %q is out of order", fragment)
+		}
+		position = next
+	}
+	if strings.Contains(upper, "UNIQUE INDEX") || strings.Contains(upper, "UNIQUE (SERIES_HASH") {
+		t.Fatal("series_hash must not redefine grouping or uniqueness")
+	}
+}
+
+func TestSourceSubPriorityFreshInstallAndUpgradeCoverage(t *testing.T) {
+	t.Parallel()
+	files := []string{
+		"postgresql-setup.pgsql", "mysql-setup.mysql", "sqlite-setup.sqlite3",
+		"db_migrations/postgresql-migration-v1.13.pgsql",
+		"db_migrations/mysql-migration-v1.13.mysql",
+		"db_migrations/sqlite-migration-v1.13.sqlite3",
+	}
+	for _, file := range files {
+		file := file
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+			content, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("read %s: %v", file, err)
+			}
+			upper := strings.ToUpper(string(content))
+			for _, fragment := range []string{"SUB_PRIORITY", "IDX_SOURCES_PRIORITY_SUB_PRIORITY"} {
+				if !strings.Contains(upper, fragment) {
+					t.Fatalf("%s missing schema fragment %q", file, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestPostgresInformationSeedClaimFunctionIsAtomicAndUpgradeSafe(t *testing.T) {
+	t.Parallel()
+
+	files := []string{"postgresql-setup.pgsql", "db_migrations/postgresql-migration-v1.10.pgsql"}
+	fragments := []string{
+		"CREATE OR REPLACE FUNCTION update_informationseed(",
+		"FOR UPDATE SKIP LOCKED",
+		"UPDATE InformationSeed AS claimed_seed",
+		"SET status = 'processing'",
+		"engine = p_engineID",
+		"last_processed_at = NOW()",
+		"attempts = COALESCE(claimed_seed.attempts, 0) + 1",
+		"RETURNING claimed_seed.information_seed_id",
+	}
+
+	for _, file := range files {
+		file := file
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+			content, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("read %s: %v", file, err)
+			}
+			upperContent := strings.ToUpper(string(content))
+			for _, fragment := range fragments {
+				if !strings.Contains(upperContent, strings.ToUpper(fragment)) {
+					t.Fatalf("%s missing atomic Information Seed claim fragment %q", file, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestTimeSeriesSchemaSQLContainsFreshInstallAndUpgradeCoverage(t *testing.T) {
+	t.Parallel()
+
+	commonFragments := []string{
+		"CREATE TABLE IF NOT EXISTS TimeSeriesMetrics",
+		"metric_key",
+		"display_name",
+		"source_kind",
+		"value_type",
+		"aggregate",
+		"bucket",
+		"time_basis",
+		"dedupe_scope",
+		"failure_policy",
+		"retention_policy",
+		"cardinality_policy",
+		"store_value_text",
+		"hash_only",
+		"CREATE TABLE IF NOT EXISTS TimeSeriesObservations",
+		"observed_at",
+		"effective_at",
+		"collected_at",
+		"source_updated_at",
+		"information_seed_candidate_id",
+		"source_information_seed_id",
+		"subject_type",
+		"correlation_rule_id",
+		"value_numeric",
+		"value_integer",
+		"value_boolean",
+		"value_text",
+		"value_json",
+		"value_timestamp",
+		"previous_value_hash",
+		"is_changed",
+		"change_delta_numeric",
+		"dedupe_key",
+		"provenance",
+		"CREATE TABLE IF NOT EXISTS TimeSeriesAggregates",
+		"numeric_sum",
+		"numeric_avg",
+		"percentile_50",
+		"percentile_90",
+		"percentile_95",
+		"percentile_99",
+		"first_observation_id",
+		"last_observation_id",
+		"change_count",
+		"aggregate_hash",
+		"idx_timeseriesobservations_metric_bucket",
+		"idx_timeseriesobservations_seed_candidate",
+		"idx_timeseriesobservations_subject",
+		"idx_timeseriesobservations_correlation_rule",
+		"idx_timeseriesaggregates_aggregate_hash",
+		"ON DELETE SET NULL",
+	}
+
+	files := []string{
+		"postgresql-setup.pgsql",
+		"mysql-setup.mysql",
+		"sqlite-setup.sqlite3",
+	}
+
+	for _, file := range files {
+		file := file
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+			content, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("read %s: %v", file, err)
+			}
+			upperContent := strings.ToUpper(string(content))
+			for _, fragment := range commonFragments {
+				if !strings.Contains(upperContent, strings.ToUpper(fragment)) {
+					t.Fatalf("%s missing time-series schema fragment %q", file, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestTimeSeriesSchemaSQLUsesDialectAppropriateJSON(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		file      string
+		fragments []string
+	}{
+		{
+			file: "db_migrations/postgresql-migration-v1.09.pgsql",
+			fragments: []string{
+				"selector JSONB NOT NULL",
+				"dimensions JSONB",
+				"USING GIN(dimensions)",
+			},
+		},
+		{
+			file: "db_migrations/mysql-migration-v1.09.mysql",
+			fragments: []string{
+				"selector JSON NOT NULL",
+				"dimensions JSON",
+				"KEY idx_timeseriesobservations_metric_bucket",
+			},
+		},
+		{
+			file: "db_migrations/sqlite-migration-v1.09.sqlite3",
+			fragments: []string{
+				"canonical JSON encoded in TEXT",
+				"selector TEXT NOT NULL",
+				"dimensions TEXT",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.file, func(t *testing.T) {
+			t.Parallel()
+			content, err := os.ReadFile(test.file)
+			if err != nil {
+				t.Fatalf("read %s: %v", test.file, err)
+			}
+			upperContent := strings.ToUpper(string(content))
+			for _, fragment := range test.fragments {
+				if !strings.Contains(upperContent, strings.ToUpper(fragment)) {
+					t.Fatalf("%s missing dialect fragment %q", test.file, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestEmailStateSchemaSQLContainsFreshInstallAndUpgradeCoverage(t *testing.T) {
+	t.Parallel()
+
+	commonFragments := []string{
+		"CREATE TABLE IF NOT EXISTS EmailMailboxState",
+		"source_id",
+		"provider",
+		"account_key",
+		"mailbox_key",
+		"cursor_token",
+		"cursor_history_id",
+		"cursor_uid",
+		"cursor_uid_validity",
+		"checkpoint_schema_version",
+		"config_fingerprint",
+		"message_status",
+		"version",
+		"lease_owner",
+		"lease_expires_at",
+		"fencing_token",
+		"last_reconciled_at",
+		"listener_healthy_at",
+		"reset_reason",
+		"watch_subscription_id",
+		"watch_resource_path",
+		"watch_renewal_status",
+		"watch_last_renewed_at",
+		"watch_expires_at",
+		"watch_last_attempt_at",
+		"watch_renewal_failure_count",
+		"watch_renewal_last_error",
+		"idx_emailmailboxstate_watch_expiration",
+		"CREATE TABLE IF NOT EXISTS EmailMessageState",
+		"provider_message_key",
+		"document_id",
+		"provider_version",
+		"content_hash",
+		"disposition",
+		"failure_count",
+		"last_observed_at",
+		"deleted_at",
+		"quarantined_at",
+		"ON DELETE CASCADE",
+		"idx_emailmailboxstate_lease",
+		"idx_emailmessagestate_observed",
+		"idx_emailmessagestate_disposition",
+	}
+
+	files := []string{
+		"postgresql-setup.pgsql",
+		"mysql-setup.mysql",
+		"sqlite-setup.sqlite3",
+		"db_migrations/postgresql-migration-v1.11.pgsql",
+		"db_migrations/mysql-migration-v1.11.mysql",
+		"db_migrations/sqlite-migration-v1.11.sqlite3",
+	}
+
+	for _, file := range files {
+		file := file
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+			content, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatalf("read %s: %v", file, err)
+			}
+			upperContent := strings.ToUpper(string(content))
+			for _, fragment := range commonFragments {
+				if !strings.Contains(upperContent, strings.ToUpper(fragment)) {
+					t.Fatalf("%s missing email state schema fragment %q", file, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestPostgresSourceClaimFunctionIsAtomic(t *testing.T) {
+	t.Parallel()
+	content, err := os.ReadFile("postgresql-setup.pgsql")
+	if err != nil {
+		t.Fatalf("read PostgreSQL setup: %v", err)
+	}
+	upperContent := strings.ToUpper(string(content))
+	for _, fragment := range []string{
+		"CREATE OR REPLACE FUNCTION update_sources(",
+		"LOWER(TRIM(s.status)) = 'pending'",
+		"FOR UPDATE SKIP LOCKED",
+		"SET status = 'processing'",
+		"engine = p_engineID",
+		"RETURNING Sources.source_id",
+	} {
+		if !strings.Contains(upperContent, strings.ToUpper(fragment)) {
+			t.Fatalf("PostgreSQL source claim function missing atomic fragment %q", fragment)
+		}
+	}
+}
+
+func TestPostgresSourceClaimUsesSubPriorityOrdering(t *testing.T) {
+	t.Parallel()
+	for _, file := range []string{"postgresql-setup.pgsql", "db_migrations/postgresql-migration-v1.13.pgsql"} {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		upper := strings.ToUpper(string(content))
+		for _, fragment := range []string{
+			"CREATE OR REPLACE FUNCTION UPDATE_SOURCES(",
+			"ORDER BY S.SUB_PRIORITY DESC, S.SOURCE_ID ASC",
+			"FOR UPDATE SKIP LOCKED",
+			"RETURNING",
+			"SOURCES.SUB_PRIORITY",
+		} {
+			if !strings.Contains(upper, fragment) {
+				t.Fatalf("%s source scheduling missing %q", file, fragment)
+			}
+		}
+	}
+}
+
+// TestPostgresStatementLevelCleanupTriggerContract pins the v1.16 artifact
+// cleanup design: fresh installs and upgrades must ship the identical shared
+// statement-level function, the legacy per-row function must be gone from the
+// setup file (the migration drops it explicitly), and dialects without
+// transition tables must keep their per-row triggers.
+func TestPostgresStatementLevelCleanupTriggerContract(t *testing.T) {
+	t.Parallel()
+
+	setup, err := os.ReadFile("postgresql-setup.pgsql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := os.ReadFile("db_migrations/postgresql-migration-v1.16.pgsql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupStr, migrationStr := string(setup), string(migration)
+
+	const fnName = "cleanup_artifact_data_set()"
+	extractBody := func(s string) string {
+		start := strings.Index(s, "CREATE OR REPLACE FUNCTION "+fnName)
+		if start < 0 {
+			return ""
+		}
+		end := strings.Index(s[start:], "$$ LANGUAGE plpgsql;")
+		if end < 0 {
+			return ""
+		}
+		return s[start : start+end]
+	}
+	setupBody := extractBody(setupStr)
+	migrationBody := extractBody(migrationStr)
+	if setupBody == "" {
+		t.Fatal("postgresql-setup.pgsql missing cleanup_artifact_data_set()")
+	}
+	if migrationBody == "" {
+		t.Fatal("postgresql-migration-v1.16.pgsql missing cleanup_artifact_data_set()")
+	}
+	if setupBody != migrationBody {
+		t.Fatal("cleanup_artifact_data_set() body differs between setup and migration (fresh installs must equal upgrades)")
+	}
+
+	for _, fragment := range []string{
+		"REFERENCING OLD TABLE AS deleted_artifacts",
+		"FOR EACH STATEMENT",
+		"EXECUTE format(",
+	} {
+		if !strings.Contains(setupStr, fragment) {
+			t.Errorf("postgresql-setup.pgsql missing %q", fragment)
+		}
+		if !strings.Contains(migrationStr, fragment) {
+			t.Errorf("postgresql-migration-v1.16.pgsql missing %q", fragment)
+		}
+	}
+	if strings.Contains(setupStr, "EXECUTE FUNCTION cleanup_artifact_data(") {
+		t.Error("postgresql-setup.pgsql still attaches the legacy per-row cleanup_artifact_data()")
+	}
+	if !strings.Contains(setupStr, "DROP FUNCTION IF EXISTS cleanup_artifact_data()") {
+		t.Error("postgresql-setup.pgsql must drop the legacy cleanup_artifact_data() on re-runs")
+	}
+	for _, fragment := range []string{
+		"DROP TRIGGER IF EXISTS trg_cleanup_webobject",
+		"DROP FUNCTION IF EXISTS cleanup_artifact_data()",
+	} {
+		if !strings.Contains(migrationStr, fragment) {
+			t.Errorf("postgresql-migration-v1.16.pgsql missing legacy cleanup %q", fragment)
+		}
+	}
+
+	// SQLite has no transition tables and must keep the per-row equivalents.
+	sqlite, err := os.ReadFile("sqlite-setup.sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, trigger := range []string{"trg_cleanup_webobject", "trg_cleanup_netinfo", "trg_cleanup_httpinfo"} {
+		if !strings.Contains(string(sqlite), trigger) {
+			t.Errorf("sqlite-setup.sqlite3 missing %s", trigger)
+		}
+	}
+	if strings.Contains(string(sqlite), "REFERENCING OLD TABLE") {
+		t.Error("sqlite-setup.sqlite3 must not use PostgreSQL transition tables")
+	}
+}
+
+// TestPostgresSchemaVersion116LedgerCoverage keeps every base setup and
+// v1.16 migration file advertising the same schema version the writer
+// requires, so fresh installs, upgrades, and the compatibility check agree.
+func TestPostgresSchemaVersion116LedgerCoverage(t *testing.T) {
+	t.Parallel()
+
+	files := []string{
+		"postgresql-setup.pgsql", "mysql-setup.mysql", "sqlite-setup.sqlite3",
+		"db_migrations/postgresql-migration-v1.16.pgsql",
+		"db_migrations/mysql-migration-v1.16.mysql",
+		"db_migrations/sqlite-migration-v1.16.sqlite3",
+	}
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(content), "'1.16'") && !strings.Contains(string(content), "\"1.16\"") {
+			t.Errorf("%s missing schema version 1.16 stamp", file)
+		}
+	}
+	if RequiredSchemaVersion != "1.16" {
+		t.Fatalf("RequiredSchemaVersion = %q, want 1.16", RequiredSchemaVersion)
+	}
+}

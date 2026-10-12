@@ -1,0 +1,216 @@
+/*
+  Tests for the patched ServerResponse leak scanner in redactInsteadOfThrow mode
+  (how the nextjs integration applies it in dev), exercised through a real HTTP
+  server so pass-through integrity is verified end-to-end.
+
+  Kept separate from patch-server-response.test.ts because the prototype patch
+  captures its options once per process (vitest isolates files into separate workers).
+*/
+import http from 'node:http';
+import zlib from 'node:zlib';
+import {
+  describe, it, expect, beforeAll, afterAll,
+} from 'vitest';
+
+import { patchGlobalServerResponse } from '../patch-server-response';
+import { redactSensitiveConfig, resetRedactionMap } from '../env';
+import { makeRand, randomChunks, writeChunks } from './fuzz-helpers';
+
+const SECRET = 'redact-mode-secret-xyz789';
+// `@sensitive={redact=false}`: exempt from log redaction, but still leak-scanned
+const PRINTED_SECRET = 'printed-secret-abc123456';
+
+const FAKE_GRAPH = {
+  sources: [],
+  settings: {},
+  config: {
+    SECRET_KEY: { value: SECRET, isSensitive: true },
+    PRINTED_KEY: { value: PRINTED_SECRET, isSensitive: true, redact: false },
+  },
+} as any;
+
+const htmlClean = `<html><body>${'filler '.repeat(100)}no secrets here</body></html>`;
+const htmlWithSecret = `<html><body>leak: ${SECRET}</body></html>`;
+// multi-byte chars exercise the decoder-alignment paths alongside redaction
+const fuzzLeakText = `<html>héllo 🔐 leak: ${SECRET} more ünïcode text</html>`;
+
+let server: http.Server;
+let baseUrl: string;
+
+beforeAll(async () => {
+  resetRedactionMap(FAKE_GRAPH);
+  patchGlobalServerResponse({ redactInsteadOfThrow: true });
+
+  server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html');
+    if (req.url === '/string-leak') {
+      res.write(htmlWithSecret);
+      res.end();
+    } else if (req.url === '/log-exempt-leak') {
+      res.end(`<html>leak: ${PRINTED_SECRET}</html>`);
+    } else if (req.url === '/gzip-clean') {
+      res.setHeader('content-encoding', 'gzip');
+      const gz = zlib.gzipSync(htmlClean);
+      // write in two chunks to exercise incremental decode + pass-through
+      res.write(gz.subarray(0, 15));
+      res.write(gz.subarray(15));
+      res.end();
+    } else if (req.url === '/split-write-end') {
+      // secret straddles the write/end boundary - neither chunk contains it on its own
+      res.write(`<html>leak: ${SECRET.slice(0, 10)}`);
+      res.end(`${SECRET.slice(10)}</html>`);
+    } else if (req.url === '/split-write-write') {
+      res.write(`<html>leak: ${SECRET.slice(0, 10)}`);
+      res.write(`${SECRET.slice(10)}</html>`);
+      res.end();
+    } else if (req.url === '/split-char-by-char') {
+      res.write('<html>leak: ');
+      for (const char of SECRET) res.write(char);
+      res.end('</html>');
+    } else if (req.url === '/content-length-leak') {
+      // how next.js sends a non-streamed payload: Content-Length set, then a single end()
+      const body = `<html>leak: ${SECRET}</html>`;
+      res.setHeader('content-length', Buffer.byteLength(body));
+      res.end(body);
+    } else if (req.url === '/content-length-split-leak') {
+      const body = `<html>leak: ${SECRET}</html>`;
+      res.setHeader('content-length', Buffer.byteLength(body));
+      res.write(`<html>leak: ${SECRET.slice(0, 10)}`);
+      res.end(`${SECRET.slice(10)}</html>`);
+    } else if (req.url === '/partial-lookalike') {
+      // ends mid-lookalike but never completes the secret - must arrive intact
+      res.write(`<html>${SECRET.slice(0, 12)}`);
+      res.end('-not-a-secret</html>');
+    } else if (req.url === '/multibyte-split-then-redact') {
+      // first chunk ends mid-character (its lead byte must not go out raw), and the
+      // chunk completing it contains a secret, so the rest gets re-encoded on redaction
+      const buf = Buffer.from(`<html>é leak: ${SECRET}</html>`);
+      const mid = buf.indexOf(0xc3) + 1; // one byte into the 2-byte é
+      res.write(buf.subarray(0, mid));
+      res.end(buf.subarray(mid));
+    } else if (req.url === '/gzip-leak') {
+      res.setHeader('content-encoding', 'gzip');
+      try {
+        res.write(zlib.gzipSync(htmlWithSecret));
+        res.end();
+      } catch (err) {
+        // compressed chunks can't be scrubbed, so the patched write fails closed —
+        // kill the connection like a framework's error handling would
+        res.destroy();
+      }
+    } else if (req.url?.startsWith('/fuzz-redact')) {
+      const seed = Number(new URL(req.url, 'http://localhost').searchParams.get('seed'));
+      const rand = makeRand(seed);
+      writeChunks(res, randomChunks(fuzzLeakText, rand), rand);
+    } else {
+      res.end('not found');
+    }
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('expected address info');
+  }
+  baseUrl = `http://127.0.0.1:${address.port}`;
+});
+
+afterAll(async () => {
+  await new Promise((resolve) => {
+    server.close(resolve);
+  });
+});
+
+describe('patchGlobalServerResponse with redactInsteadOfThrow', () => {
+  it('redacts a leaked secret in an uncompressed response', async () => {
+    const resp = await fetch(`${baseUrl}/string-leak`);
+    const body = await resp.text();
+    expect(body).not.toContain(SECRET);
+    expect(body).toContain('▒'); // redaction marker in place of the secret
+  });
+
+  it('still scrubs values exempt from log redaction (redact=false)', async () => {
+    const body = await (await fetch(`${baseUrl}/log-exempt-leak`)).text();
+    expect(body).not.toContain(PRINTED_SECRET);
+    expect(body).toContain('▒');
+  });
+
+  it('redacts a secret split across write() and end()', async () => {
+    const body = await (await fetch(`${baseUrl}/split-write-end`)).text();
+    expect(body).not.toContain(SECRET);
+    expect(body).toContain('▒');
+  });
+
+  it('redacts a secret split across two write() calls', async () => {
+    const body = await (await fetch(`${baseUrl}/split-write-write`)).text();
+    expect(body).not.toContain(SECRET);
+    expect(body).toContain('▒');
+  });
+
+  it('redacts a secret written one character at a time', async () => {
+    const body = await (await fetch(`${baseUrl}/split-char-by-char`)).text();
+    expect(body).not.toContain(SECRET);
+    expect(body).toContain('▒');
+  });
+
+  it('corrects Content-Length when redaction shortens the body', async () => {
+    // a stale Content-Length leaves the client waiting on bytes that never arrive
+    const resp = await fetch(`${baseUrl}/content-length-leak`);
+    const body = await resp.text();
+    expect(body).not.toContain(SECRET);
+    expect(body).toContain('▒');
+    expect(resp.headers.get('content-length')).toBe(String(Buffer.byteLength(body)));
+  });
+
+  it('switches from Content-Length when a split response may be redacted', async () => {
+    const resp = await fetch(`${baseUrl}/content-length-split-leak`);
+    const body = await resp.text();
+    expect(body).not.toContain(SECRET);
+    expect(body).toContain('▒');
+    expect(resp.headers.get('content-length')).toBeNull();
+    expect(resp.headers.get('transfer-encoding')).toBe('chunked');
+  });
+
+  it('does not duplicate bytes when a chunk splits a character before a redaction', async () => {
+    const body = await (await fetch(`${baseUrl}/multibyte-split-then-redact`)).text();
+    expect(body).not.toContain(SECRET);
+    expect(body).toContain('▒');
+    // a duplicated lead byte would decode as a replacement char before the é
+    expect(body.startsWith('<html>é leak: ')).toBe(true);
+    expect(body).not.toContain('�');
+  });
+
+  it('fuzz: random chunkings redact the secret and leave everything else intact', async () => {
+    const expected = redactSensitiveConfig(fuzzLeakText);
+    expect(expected).not.toContain(SECRET);
+    for (let seed = 1; seed <= 30; seed++) {
+      const body = await (await fetch(`${baseUrl}/fuzz-redact?seed=${seed}`)).text();
+      expect(body, `seed ${seed}`).toBe(expected);
+    }
+  });
+
+  it('leaves text that only looks like the start of a secret intact', async () => {
+    const body = await (await fetch(`${baseUrl}/partial-lookalike`)).text();
+    expect(body).toBe(`<html>${SECRET.slice(0, 12)}-not-a-secret</html>`);
+  });
+
+  it('passes a clean gzip response through intact', async () => {
+    const resp = await fetch(`${baseUrl}/gzip-clean`);
+    const body = await resp.text(); // fetch auto-decompresses
+    expect(body).toBe(htmlClean);
+  });
+
+  it('fails closed on a leak in a gzip response (cannot scrub compressed chunks)', async () => {
+    let failed = false;
+    let body = '';
+    try {
+      const resp = await fetch(`${baseUrl}/gzip-leak`);
+      body = await resp.text();
+    } catch {
+      failed = true;
+    }
+    expect(failed).toBe(true);
+    expect(body).not.toContain(SECRET);
+  });
+});

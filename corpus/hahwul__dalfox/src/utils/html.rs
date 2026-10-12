@@ -1,0 +1,553 @@
+/*!
+Bounded HTML parsing.
+
+Every response dalfox looks at is parsed by html5ever (via `scraper`) several
+times — meta-CSP extraction, injection-context detection, DOM verification,
+inline-script collection. html5ever's tree builder consults the *open elements
+stack* on essentially every tag (the "have element in scope" checks), so its
+cost is `O(depth)` per element and therefore **quadratic in nesting depth** for
+a document that nests without bound. There is no depth limit inside html5ever.
+
+Measured against the real scanner (debug build, localhost server):
+
+| body                       | size    | one scan |
+|----------------------------|---------|----------|
+| 8 000 `<div>` nested       |  88 KiB |    7.2 s |
+| 8 000 `<div>` **siblings** |  96 KiB |    0.26 s |
+| 16 000 `<div>` nested      | 176 KiB |     29 s |
+| 60 000 `<div>` nested      | 660 KiB |  > 150 s |
+
+Size is not the driver — depth is; doubling depth quadruples the time. A single
+hostile (or merely generated) response could therefore stall a scan
+indefinitely, which is a worse outcome than analyzing a truncated document:
+a wedged target is 100% recall loss *plus* a hang.
+
+So: estimate nesting depth with one cheap linear pass, and when a document
+nests past [`MAX_HTML_NESTING_DEPTH`], hand the parser only the prefix up to
+that point. Browsers do the same thing — Blink and Gecko both cap HTML parser
+tree depth in the same ballpark (512) and flatten anything deeper — so markup
+past the bound does not nest the way it claims in a real browser either.
+
+Only the tree-based analyses are bounded by this. The byte/text-level
+reflection checks never parse HTML and always see the full body.
+*/
+
+use std::borrow::Cow;
+
+/// Maximum element nesting depth handed to html5ever. Matches the order of the
+/// caps real browser parsers apply; real-world documents are one to two orders
+/// of magnitude shallower.
+pub(crate) const MAX_HTML_NESTING_DEPTH: usize = 512;
+
+/// Elements that never nest: they have no end tag at all.
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Start tags that implicitly close an already-open element, and the barrier
+/// elements that stop that search.
+///
+/// `(start_tag, closes, barriers)`: seeing `start_tag` pops the stack down to
+/// and including the nearest open element named in `closes`, unless one of
+/// `barriers` is reached first. This is what makes ordinary sloppy markup — a
+/// 600-item `<ul>` whose `<li>`s are never closed, a table whose `<td>`s are
+/// never closed — read as depth 2 rather than depth 601.
+///
+/// The barriers are what keep *deliberately* deep markup honest: `<ul><li>`
+/// repeated 30 000 times really is 30 000 levels deep in a browser, and the
+/// intervening `ul` stops the implied close, so the estimate grows with it.
+/// Without barriers this table would be an attacker's way around the guard.
+const IMPLIED_END_TAGS: &[(&str, &[&str], &[&str])] = &[
+    ("li", &["li"], &["ul", "ol", "menu"]),
+    ("dt", &["dt", "dd"], &["dl"]),
+    ("dd", &["dt", "dd"], &["dl"]),
+    ("p", &["p"], &[]),
+    ("option", &["option"], &["select", "datalist", "optgroup"]),
+    ("optgroup", &["option", "optgroup"], &["select", "datalist"]),
+    ("tr", &["td", "th", "tr"], &["table"]),
+    ("td", &["td", "th"], &["table", "tr"]),
+    ("th", &["td", "th"], &["table", "tr"]),
+    (
+        "thead",
+        &["td", "th", "tr", "thead", "tbody", "tfoot"],
+        &["table"],
+    ),
+    (
+        "tbody",
+        &["td", "th", "tr", "thead", "tbody", "tfoot"],
+        &["table"],
+    ),
+    (
+        "tfoot",
+        &["td", "th", "tr", "thead", "tbody", "tfoot"],
+        &["table"],
+    ),
+    ("rt", &["rt", "rp"], &["ruby"]),
+    ("rp", &["rt", "rp"], &["ruby"]),
+];
+
+/// Elements whose content is raw text, not markup. `<script>if (a<b) {}</script>`
+/// must not be read as opening a `<b>`. Only in HTML content: inside `<svg>` or
+/// `<math>` the tokenizer never switches to raw text, so `<svg><style><g><g>…`
+/// really nests.
+const RAWTEXT_ELEMENTS: &[&str] = &["script", "style", "textarea", "title"];
+
+/// Elements whose start tag begins foreign (SVG/MathML) content.
+const FOREIGN_ROOTS: &[&str] = &["svg", "math"];
+
+/// Foreign elements whose children are parsed as HTML again (the SVG HTML
+/// integration points and the MathML text integration points).
+/// `annotation-xml` only is one with an HTML `encoding`; treating it as one
+/// always errs toward counting more depth, never less.
+const FOREIGN_INTEGRATION_POINTS: &[&str] = &[
+    "foreignobject",
+    "desc",
+    "title",
+    "mi",
+    "mo",
+    "mn",
+    "ms",
+    "mtext",
+    "annotation-xml",
+];
+
+/// HTML start tags that break out of foreign content: the tree builder pops
+/// back to the nearest HTML element or integration point and inserts them as
+/// HTML. (`font` only does with a `color`/`face`/`size` attribute; treating
+/// it as a breakout always errs toward counting more depth.)
+const FOREIGN_BREAKOUT_TAGS: &[&str] = &[
+    "b",
+    "big",
+    "blockquote",
+    "body",
+    "br",
+    "center",
+    "code",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "embed",
+    "font",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "hr",
+    "i",
+    "img",
+    "li",
+    "listing",
+    "menu",
+    "meta",
+    "nobr",
+    "ol",
+    "p",
+    "pre",
+    "ruby",
+    "s",
+    "small",
+    "span",
+    "strong",
+    "strike",
+    "sub",
+    "sup",
+    "table",
+    "tt",
+    "u",
+    "ul",
+    "var",
+];
+
+/// Lowercased ASCII tag name starting at `bytes[i]` (just past `<` or `</`),
+/// plus the offset just after it. Empty when the byte is not a name start.
+fn tag_name_at(bytes: &[u8], i: usize) -> (String, usize) {
+    let mut end = i;
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-') {
+        end += 1;
+    }
+    (
+        String::from_utf8_lossy(&bytes[i..end]).to_ascii_lowercase(),
+        end,
+    )
+}
+
+/// Offset of the byte just past the `>` that ends the tag starting at `from`
+/// (or the end of input).
+///
+/// Quote-aware: a `>` inside a quoted attribute value does not end the tag.
+/// Without that, `<iframe srcdoc="<div><div>…">` ended the tag at the first
+/// `>` inside `srcdoc` and the rest of the attribute value was rescanned as
+/// markup — 600 `<div>`s in an attribute read as 600 open elements and
+/// truncated a 3 KiB document. Raw `<` and `>` are legal inside a quoted
+/// attribute value, and html5ever treats all of it as text.
+///
+/// A quote opens a value only right after `=`, as in the HTML tokenizer
+/// (and [`open_tag_end`]). Anywhere else — `<div x">`, an attribute *name*
+/// containing a quote — it is an ordinary character. Treating it as a value
+/// delimiter let one stray quote swallow the rest of the body, so everything
+/// after it was invisible to the estimator while html5ever nested it.
+/// An unterminated value genuinely runs to the end of input in the tokenizer.
+fn skip_to_gt(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    let mut after_eq = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if after_eq && (b == b'"' || b == b'\'') {
+            match bytes[i + 1..].iter().position(|&c| c == b) {
+                Some(rel) => i += rel + 1,
+                None => return bytes.len(),
+            }
+            after_eq = false;
+        } else if b == b'>' {
+            return i + 1;
+        } else if b == b'=' {
+            after_eq = true;
+        } else if !b.is_ascii_whitespace() {
+            after_eq = false;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Offset just past the end of the comment whose `<!--` ends at `body`
+/// (the first byte of the comment text), or the end of input.
+///
+/// Mirrors the tokenizer rather than searching for `-->`: `<!-->` and
+/// `<!--->` are complete (empty) comments, and `--!>` also ends a comment.
+/// Searching for `-->` alone let a leading `<!-->` hide the whole rest of the
+/// body from the estimator while html5ever parsed it as markup.
+fn skip_comment(bytes: &[u8], body: usize) -> usize {
+    let rest = &bytes[body.min(bytes.len())..];
+    if rest.starts_with(b">") {
+        return body + 1;
+    }
+    if rest.starts_with(b"->") {
+        return body + 2;
+    }
+    let mut i = body;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            if bytes.get(i + 2) == Some(&b'>') {
+                return i + 3;
+            }
+            if bytes[i + 2..].starts_with(b"!>") {
+                return i + 4;
+            }
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Offset just past the first `>` at or after `from`, or the end of input.
+/// Bogus comments (`<?…>`, `<!x…>`) and doctypes end at the first `>`
+/// regardless of quotes.
+fn skip_to_first_gt(bytes: &[u8], from: usize) -> usize {
+    bytes[from.min(bytes.len())..]
+        .iter()
+        .position(|&b| b == b'>')
+        .map_or(bytes.len(), |rel| from + rel + 1)
+}
+
+/// Regex fragment matching a whole `<script …>` open tag. A `>` inside a
+/// quoted attribute value does not end the tag, so `<script data-x="a>b">` is
+/// matched in full instead of stopping at `a>` (which left `b">` as the start
+/// of the script body). A quote only opens a value right after `=`, as in the
+/// HTML tokenizer; an unterminated quote falls back to the first `>`.
+pub(crate) const SCRIPT_OPEN_TAG_PATTERN: &str =
+    r#"<script\b(?:[^>=]|=\s*"[^"]*"|=\s*'[^']*'|=)*>"#;
+
+/// Offset just past the `>` that ends the open tag whose `<` is at `lt`, or
+/// `None` when the tag never ends. The positional counterpart of
+/// [`SCRIPT_OPEN_TAG_PATTERN`]: a quote opens an attribute value only right
+/// after `=`, and a `>` inside that value does not end the tag.
+pub(crate) fn open_tag_end(html: &str, lt: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut i = lt + 1;
+    let mut after_eq = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if after_eq && (b == b'"' || b == b'\'') {
+            match bytes[i + 1..].iter().position(|&c| c == b) {
+                Some(rel) => i += rel + 1,
+                // Unterminated value: fall back to the first `>`, like the
+                // regex form.
+                None => return html[lt..].find('>').map(|rel| lt + rel + 1),
+            }
+            after_eq = false;
+        } else if b == b'>' {
+            return Some(i + 1);
+        } else if b == b'=' {
+            after_eq = true;
+        } else if !b.is_ascii_whitespace() {
+            after_eq = false;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether the tag that ends at `gt_end` (offset just past its `>`) was
+/// self-closing (`<path/>`). Only meaningful for foreign elements: on an HTML
+/// element the tree builder ignores the flag, so `<div/>` opens a `<div>`.
+fn tag_is_self_closing(bytes: &[u8], gt_end: usize) -> bool {
+    gt_end >= 2 && bytes[gt_end - 1] == b'>' && bytes[gt_end - 2] == b'/'
+}
+
+/// Offset of the first ASCII-case-insensitive occurrence of `needle` in
+/// `bytes[from..]`, as an absolute offset.
+///
+/// Allocation-free on purpose. The obvious spelling — lowercasing the rest of
+/// the document and calling `find` — allocates a copy of the *remaining* body
+/// at each call site, so a page with 10 000 `<script>` tags would allocate
+/// 10 000 progressively shorter copies: quadratic memory traffic inside the
+/// very guard that exists to stop a quadratic blowup.
+pub(crate) fn find_ascii_case_insensitive(
+    bytes: &[u8],
+    from: usize,
+    needle: &[u8],
+) -> Option<usize> {
+    if needle.is_empty() || from >= bytes.len() {
+        return None;
+    }
+    let first = needle[0];
+    let end = bytes.len().checked_sub(needle.len())?;
+    (from..=end).find(|&start| {
+        bytes[start].eq_ignore_ascii_case(&first)
+            && bytes[start..start + needle.len()].eq_ignore_ascii_case(needle)
+    })
+}
+
+/// The estimator's open-element stack, with an O(1) "is this name open?" test.
+///
+/// The count map is what lets an end tag unwind without a lookback limit. The
+/// previous version capped the search at 32 entries, which meant an end tag
+/// whose match sat deeper simply popped nothing — so every unclosed inline
+/// element inside it leaked one stack entry *permanently*, and ordinary legacy
+/// markup (20 blog posts each with 35 unclosed `<font>`s) crossed a 512 cap on
+/// a 9 KiB page whose real depth is 3. Here a name that is not open at all is
+/// rejected in O(1), and a name that is open is always unwound to; since every
+/// entry is pushed once and popped once, the total work stays linear.
+///
+/// Each entry also records whether its children are foreign (SVG/MathML)
+/// content, which decides whether a child honours `/>` and whether
+/// `<style>`/`<script>` switch to raw text.
+#[derive(Default)]
+struct OpenElements {
+    stack: Vec<String>,
+    children_foreign: Vec<bool>,
+    counts: std::collections::HashMap<String, usize>,
+}
+
+impl OpenElements {
+    fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn is_open(&self, name: &str) -> bool {
+        self.counts.get(name).is_some_and(|&n| n > 0)
+    }
+
+    /// Whether the current insertion point is inside foreign content.
+    fn in_foreign_content(&self) -> bool {
+        self.children_foreign.last().copied().unwrap_or(false)
+    }
+
+    fn push(&mut self, name: String, children_foreign: bool) {
+        *self.counts.entry(name.clone()).or_insert(0) += 1;
+        self.stack.push(name);
+        self.children_foreign.push(children_foreign);
+    }
+
+    /// Pop everything above `idx`, plus `idx` itself.
+    fn truncate_including(&mut self, idx: usize) {
+        self.children_foreign.truncate(idx);
+        for name in self.stack.drain(idx..) {
+            if let Some(c) = self.counts.get_mut(&name) {
+                *c = c.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Pop back out of foreign content to the nearest HTML element or
+    /// integration point, as the tree builder does for a breakout tag.
+    fn pop_foreign(&mut self) {
+        let keep = self
+            .children_foreign
+            .iter()
+            .rposition(|&foreign| !foreign)
+            .map_or(0, |idx| idx + 1);
+        self.truncate_including(keep);
+    }
+
+    /// Index of the topmost open element named `name`, searching down from the
+    /// top and stopping at any of `barriers`. `None` when a barrier is reached
+    /// first or the name is not open.
+    fn nearest(&self, names: &[&str], barriers: &[&str]) -> Option<usize> {
+        if !names.iter().any(|n| self.is_open(n)) {
+            return None;
+        }
+        self.stack
+            .iter()
+            .rposition(|open| names.contains(&open.as_str()) || barriers.contains(&open.as_str()))
+            .filter(|&idx| names.contains(&self.stack[idx].as_str()))
+    }
+}
+
+/// Byte offset of the `<` whose element would push nesting past `limit`, or
+/// `None` when the document stays within it.
+///
+/// A deliberately approximate scanner: it models only what drives html5ever's
+/// cost (how deep the open-elements stack gets). Where it is inexact it is
+/// inexact toward *under*-estimating, because an over-estimate truncates a
+/// legitimate page and silently costs findings, while an under-estimate only
+/// costs parse time. (An earlier version got this backwards — see
+/// [`OpenElements`].)
+fn nesting_overflow_offset(html: &str, limit: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut open = OpenElements::default();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let tag_start = i;
+        let next = i + 1;
+        if next >= bytes.len() {
+            break;
+        }
+        match bytes[next] {
+            // Comment, doctype, CDATA, processing instruction: no element.
+            b'!' | b'?' => {
+                i = if bytes[next..].starts_with(b"!--") {
+                    skip_comment(bytes, next + 3)
+                } else if open.in_foreign_content() && bytes[next..].starts_with(b"![CDATA[") {
+                    // Real CDATA only exists in foreign content; in HTML
+                    // content it is a bogus comment ending at the first `>`.
+                    match html[next..].find("]]>") {
+                        Some(rel) => next + rel + 3,
+                        None => bytes.len(),
+                    }
+                } else {
+                    // Doctype or bogus comment: ends at the first `>`, quotes
+                    // and all.
+                    skip_to_first_gt(bytes, next)
+                };
+            }
+            // End tag: unwind to the matching open element if there is one.
+            // Doing this for *every* name is what clears the inline elements a
+            // `</td>` or `</div>` implicitly closes.
+            b'/' => {
+                let (name, name_end) = tag_name_at(bytes, next + 1);
+                i = skip_to_gt(bytes, name_end);
+                if name.is_empty() || !open.is_open(&name) {
+                    continue;
+                }
+                if let Some(idx) = open.stack.iter().rposition(|o| *o == name) {
+                    open.truncate_including(idx);
+                }
+            }
+            _ => {
+                let (name, name_end) = tag_name_at(bytes, next);
+                if name.is_empty() {
+                    // A bare `<` in text ("a < b"): not a tag at all.
+                    i = next;
+                    continue;
+                }
+                let gt_end = skip_to_gt(bytes, name_end);
+                if open.in_foreign_content() && FOREIGN_BREAKOUT_TAGS.contains(&name.as_str()) {
+                    open.pop_foreign();
+                }
+                let foreign = open.in_foreign_content() || FOREIGN_ROOTS.contains(&name.as_str());
+                if !foreign && RAWTEXT_ELEMENTS.contains(&name.as_str()) {
+                    // Jump over the raw-text content wholesale; its `<`s are
+                    // data. The search starts at `gt_end`, which is already
+                    // past this tag's `>`, so the cursor always advances.
+                    let close = format!("</{name}");
+                    i = find_ascii_case_insensitive(bytes, gt_end, close.as_bytes())
+                        .unwrap_or(bytes.len());
+                    continue;
+                }
+                i = gt_end;
+                if VOID_ELEMENTS.contains(&name.as_str())
+                    || (foreign && tag_is_self_closing(bytes, gt_end))
+                {
+                    continue;
+                }
+                // Implied end tags: `<li>` after an open `<li>` closes it, and
+                // so does `<td>` after an open `<td>` — unless a barrier
+                // (`<ul>`, `<table>`, …) says the new one is genuinely nested.
+                if !foreign
+                    && let Some((_, closes, barriers)) = IMPLIED_END_TAGS
+                        .iter()
+                        .find(|(start, _, _)| *start == name.as_str())
+                    && let Some(idx) = open.nearest(closes, barriers)
+                {
+                    open.truncate_including(idx);
+                }
+                let children_foreign =
+                    foreign && !FOREIGN_INTEGRATION_POINTS.contains(&name.as_str());
+                open.push(name, children_foreign);
+                if open.len() > limit {
+                    return Some(tag_start);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `html`, truncated just before the point where its element nesting would
+/// exceed [`MAX_HTML_NESTING_DEPTH`]. Borrows unchanged in the overwhelmingly
+/// common case that the document is within the bound.
+pub(crate) fn bound_html_nesting(html: &str) -> Cow<'_, str> {
+    match nesting_overflow_offset(html, MAX_HTML_NESTING_DEPTH) {
+        Some(cut) => {
+            crate::dbg_log!(
+                "html nesting exceeds {} levels at byte {}; parsing the prefix only",
+                MAX_HTML_NESTING_DEPTH,
+                cut
+            );
+            Cow::Borrowed(&html[..cut])
+        }
+        None => Cow::Borrowed(html),
+    }
+}
+
+/// `scraper::Html::parse_document` with the nesting guard applied. Use this
+/// anywhere the input is (or could be) a response body.
+pub(crate) fn parse_document_bounded(html: &str) -> scraper::Html {
+    scraper::Html::parse_document(&bound_html_nesting(html))
+}
+
+/// `scraper::Html::parse_fragment` with the same nesting guard.
+///
+/// html5ever's tree building is O(depth^2), so an unbounded parse of a deeply
+/// nested fragment is a denial of service against the scanner itself. Measured
+/// on `<div>`*N + a sink element + `</div>`*N:
+///
+/// ```text
+/// depth  1000:  46 ms unbounded,  12 ms bounded
+/// depth  5000: 995 ms unbounded,  11 ms bounded
+/// depth 20000:  15.2 s unbounded, 11 ms bounded
+/// ```
+///
+/// Payload text is not "trusted input" just because dalfox usually generates
+/// it: `--custom-payload` is a file, and `--remote-payloads` fetches a list
+/// from a third party. One pathological entry in either is enough, because the
+/// callers parse *per payload*.
+pub(crate) fn parse_fragment_bounded(html: &str) -> scraper::Html {
+    scraper::Html::parse_fragment(&bound_html_nesting(html))
+}
+
+#[cfg(test)]
+mod tests;
